@@ -1,0 +1,25 @@
+node_modules
+**/node_modules
+.git
+.gitignore
+
+# Secrets — must come from env_file at runtime, never baked into image
+.env
+.env.*
+
+# Generated SQLite state. Schemas come via setup script on first boot,
+# data lives in named volumes.
+packages/*/data/*.db
+packages/*/data/*.db-journal
+packages/*/data/*.db-wal
+packages/*/data/*.db-shm
+
+# Gmail attachments — runtime data, not part of image
+storage
+
+# Build / OS / editor
+dist
+*.log
+.DS_Store
+.idea
+.vscode

@@ -1,0 +1,29 @@
+{
+  "name": "mcp-tools",
+  "version": "0.1.0",
+  "description": "Personal-agent system: an MCP server (integrations) + an agent harness (heartbeat + DB).",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "mcp:serve": "tsx packages/mcp/src/server.ts",
+    "heartbeat:start": "tsx packages/agent/src/heartbeat/start.ts",
+    "agent:start": "tsx packages/agent/src/supervisor.ts",
+    "db:init": "pnpm db:init:mcp && pnpm db:init:agent",
+    "db:init:mcp": "mkdir -p packages/mcp/data && sqlite3 packages/mcp/data/tokens.db < packages/mcp/data/schema.sql",
+    "db:init:agent": "mkdir -p packages/agent/data && sqlite3 packages/agent/data/agent.db < packages/agent/data/schema.sql",
+    "setup": "pnpm setup:mcp && pnpm setup:agent",
+    "setup:mcp": "tsx packages/mcp/src/scripts/setup.ts",
+    "setup:agent": "tsx packages/agent/src/scripts/setup.ts",
+    "gmail:auth": "tsx packages/mcp/src/services/gmail/cli-auth.ts",
+    "gmail:list-unread": "tsx packages/mcp/src/services/gmail/cli-list-unread.ts",
+    "telegram:get-chat-id": "tsx packages/mcp/src/services/telegram/cli-get-chat-id.ts",
+    "userbot:auth": "tsx packages/mcp/src/services/telegram/userbot/cli-auth.ts",
+    "monobank:txns": "tsx packages/mcp/src/services/monobank/cli-txns.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^22.9.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.6.3"
+  }
+}

@@ -1,0 +1,45 @@
+# Two-container deploy: integrations (mcp) and the agent supervisor are
+# isolated from each other. The agent never touches Telegram/Gmail/Monobank
+# credentials, the Gmail attachments storage, the skill files, or the MCP
+# database — it has only its own agent.db and the network link to mcp:3000.
+#
+# Named volumes persist across `docker compose down`; only `down -v` wipes
+# them. On first creation, Docker copies the image's content into the empty
+# volume (this is how the bundled skills/ get into mcp-skills volume).
+
+services:
+  mcp:
+    build: .
+    image: mcp-tools-image
+    command: sh -c "pnpm setup:mcp && pnpm mcp:serve"
+    env_file: .env.mcp
+    environment:
+      MCP_TRANSPORT: http
+      MCP_PORT: "3000"
+    volumes:
+      - mcp-data:/app/packages/mcp/data        # tokens.db, OAuth, signals, watermarks
+      - mcp-storage:/app/storage               # Gmail attachments
+      - mcp-skills:/app/skills                 # editable by dreaming sessions
+    expose:
+      - "3000"
+    restart: unless-stopped
+
+  agent:
+    build: .
+    image: mcp-tools-image
+    command: sh -c "pnpm setup:agent && pnpm agent:start"
+    env_file: .env.agent
+    environment:
+      MCP_TRANSPORT: http
+      MCP_URL: http://mcp:3000/mcp
+    volumes:
+      - agent-data:/app/packages/agent/data    # agent.db only — no other host paths
+    depends_on:
+      - mcp
+    restart: unless-stopped
+
+volumes:
+  mcp-data:
+  mcp-storage:
+  mcp-skills:
+  agent-data:

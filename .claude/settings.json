@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__mcp-tools__list_nashdom_mails",
+      "mcp__mcp-tools__download_gmail_attachment",
+      "mcp__mcp-tools__send_telegram_message",
+      "mcp__mcp-tools__edit_telegram_message",
+      "mcp__mcp-tools__list_monobank_transactions",
+
+      "Bash(sqlite3 packages/agent/data/agent.db *)",
+      "Bash(sqlite3 -json packages/agent/data/agent.db *)",
+
+      "Bash(rm -r storage/gmail/*)",
+      "Bash(rm -rf storage/gmail/*)",
+      "Bash(rm -r ./storage/gmail/*)",
+      "Bash(rm -rf ./storage/gmail/*)"
+    ]
+  }
+}

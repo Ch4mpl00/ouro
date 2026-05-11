@@ -1,0 +1,21 @@
+node_modules/
+dist/
+.env
+.env.local
+.env.mcp
+.env.agent
+*.log
+
+# Local attachment / blob storage
+storage/
+
+# Generated SQLite databases (schema.sql is the source of truth)
+packages/*/data/*.db
+packages/*/data/*.db-journal
+packages/*/data/*.db-wal
+packages/*/data/*.db-shm
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
