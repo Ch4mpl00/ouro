@@ -68,6 +68,30 @@ CREATE TABLE IF NOT EXISTS news_digest_kv (
   value  TEXT NOT NULL
 );
 
+-- Telegram channel posts harvested by the userbot poller. The poller runs
+-- every ~30min, walks every channel the userbot is subscribed to via
+-- listDialogs, and upserts new posts here (UNIQUE on chat_id+tg_message_id
+-- de-dupes). Consumed by `list_channel_posts` for digests and ad-hoc reads.
+-- `posted_at` is the message's original publication date from gramjs;
+-- `fetched_at` is when our poller saw it.
+CREATE TABLE IF NOT EXISTS channel_posts (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  chat_id       TEXT NOT NULL,
+  chat_title    TEXT,
+  chat_username TEXT,
+  tg_message_id INTEGER NOT NULL,
+  posted_at     TEXT NOT NULL,
+  text          TEXT NOT NULL,
+  views         INTEGER,
+  forwards      INTEGER,
+  fetched_at    TEXT NOT NULL DEFAULT (datetime('now')),
+  UNIQUE (chat_id, tg_message_id)
+);
+CREATE INDEX IF NOT EXISTS channel_posts_posted_at
+  ON channel_posts(posted_at);
+CREATE INDEX IF NOT EXISTS channel_posts_chat_posted_at
+  ON channel_posts(chat_id, posted_at);
+
 -- User-facing settings KV. Currently holds `timezone` (IANA name, e.g.
 -- 'Europe/Kiev'). All poller schedule evaluations, cron firings, and
 -- human-facing date formatting read this. Default when unset: UTC.

@@ -83,6 +83,29 @@ function runMigrations(db: Database.Database): void {
     `CREATE INDEX IF NOT EXISTS scheduled_tasks_pending
        ON scheduled_tasks(recurring, last_run_at)`,
   );
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS channel_posts (
+      id            INTEGER PRIMARY KEY AUTOINCREMENT,
+      chat_id       TEXT NOT NULL,
+      chat_title    TEXT,
+      chat_username TEXT,
+      tg_message_id INTEGER NOT NULL,
+      posted_at     TEXT NOT NULL,
+      text          TEXT NOT NULL,
+      views         INTEGER,
+      forwards      INTEGER,
+      fetched_at    TEXT NOT NULL DEFAULT (datetime('now')),
+      UNIQUE (chat_id, tg_message_id)
+    )
+  `);
+  db.exec(
+    `CREATE INDEX IF NOT EXISTS channel_posts_posted_at
+       ON channel_posts(posted_at)`,
+  );
+  db.exec(
+    `CREATE INDEX IF NOT EXISTS channel_posts_chat_posted_at
+       ON channel_posts(chat_id, posted_at)`,
+  );
 }
 
 export function closeDb(): void {

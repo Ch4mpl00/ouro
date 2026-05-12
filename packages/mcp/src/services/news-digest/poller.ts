@@ -1,6 +1,6 @@
-import { getDb } from "../../db/client";
 import { recordSignal } from "../signals";
 import { localTime } from "../settings";
+import { getKv, setKv } from "./storage";
 
 // Daily news-digest poller. Fires the curated topical news signal that
 // pulls posts from the user's subscribed Telegram channels (via gramjs
@@ -24,22 +24,6 @@ function targetHour(): number {
   const n = Number(raw);
   if (!Number.isFinite(n) || n < 0 || n > 23) return 9;
   return Math.floor(n);
-}
-
-function getKv(key: string): string | null {
-  const row = getDb()
-    .prepare(`SELECT value FROM news_digest_kv WHERE key = ?`)
-    .get(key) as { value: string } | undefined;
-  return row?.value ?? null;
-}
-
-function setKv(key: string, value: string): void {
-  getDb()
-    .prepare(
-      `INSERT INTO news_digest_kv (key, value) VALUES (?, ?)
-       ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
-    )
-    .run(key, value);
 }
 
 function tick(): void {

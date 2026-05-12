@@ -21,6 +21,7 @@ import { startNewsPoller } from "./services/news";
 import { startDreamingPoller } from "./services/dreaming";
 import { startNewsDigestPoller } from "./services/news-digest";
 import { startSchedulerPoller } from "./services/scheduler";
+import { startUserbotPoller } from "./services/telegram/userbot";
 
 export function createServer(): McpServer {
   const server = new McpServer({
@@ -130,6 +131,7 @@ async function main(): Promise<void> {
   startDreamingPoller();
   startNewsDigestPoller();
   startSchedulerPoller();
+  startUserbotPoller();
 }
 
 main().catch((err) => {

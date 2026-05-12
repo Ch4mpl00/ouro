@@ -139,16 +139,7 @@ If genuinely unclear ("новости" alone), default to Mode 1.
 
 ## Protocol
 
-1. **Discover subscriptions:**
-
-   ```
-   list_userbot_dialogs(type="channel", limit=200)
-   ```
-
-   If the tool errors with "not authorized", reply once explaining that
-   the user needs to run `pnpm userbot:auth`, and stop.
-
-2. **Pull recent digest history (anti-duplication).** Before composing
+1. **Pull recent digest history (anti-duplication).** Before composing
    anything, fetch the last ~30 messages from the Telegram chat:
 
    ```
@@ -166,25 +157,39 @@ If genuinely unclear ("новости" alone), default to Mode 1.
    repeating bullets if you already answered a similar topical query
    earlier today.
 
-3. **Fetch recent posts.** For each channel, in parallel:
+2. **Read harvested channel posts.** The userbot poller has already
+   collected posts from every subscribed channel into the local store —
+   you don't need to discover channels or do per-channel fetches.
+   First grab the watermark from the previous read:
 
    ```
-   fetch_channel_messages(channel="<username>", limit=30)
+   get_last_news_read_at()  → { lastReadAt: "<ISO>" | null }
    ```
 
-   30 messages × N channels — adjust limit if a particular channel
-   posts > 30/24h.
+   Then query the store starting from that point:
 
-4. **Filter to last 24h.** Drop anything with `date < now - 24h`.
+   ```
+   list_channel_posts(since=<lastReadAt>)
+   ```
 
-5. **Drop already-covered events.** Cross-reference each remaining
-   candidate against step 2's extracted history. If the same event /
-   announcement / strike / statement was already in a previous digest,
-   drop it. Use semantic match, not literal text — "Трамп продлил
-   перемирие" and "Зазначає, що перемир'я може бути продовжене" cover
-   the same event.
+   If `lastReadAt` is null (first ever run), bootstrap with `now - 24h`
+   as `since`. Posts come back across all channels chronologically, each
+   with `chat_title`, `chat_username`, `posted_at`, `text`, `views`,
+   `forwards`. For an ad-hoc one-channel question (Mode 3), pass
+   `channel="<username or chat_id>"`.
 
-6. **Score each post against the four categories.** For every remaining
+   Stale-data note: the userbot poller refreshes every ~30min, so posts
+   published in the last few minutes may not be there yet. That's fine
+   for daily digests; if the user clearly wants something "right now",
+   say so.
+
+3. **Drop already-covered events.** Cross-reference each post against
+   step 1's extracted history. If the same event / announcement / strike
+   / statement was already in a previous digest, drop it. Use semantic
+   match, not literal text — "Трамп продлил перемирие" and "Зазначає,
+   що перемир'я може бути продовжене" cover the same event.
+
+4. **Score each post against the four categories.** For every remaining
    post, decide:
    - which category (if any) it fits — be strict, prefer skipping over
      stretching
@@ -193,7 +198,7 @@ If genuinely unclear ("новости" alone), default to Mode 1.
    - whether other posts cover the same or similar event — these must
      be **consolidated**, not listed separately (see section below)
 
-7. **Compose ONE Telegram message.** Plain text, **always in Russian** —
+5. **Compose ONE Telegram message.** Plain text, **always in Russian** —
    even if the source post was in Ukrainian, English, or any other
    language, the digest itself goes in Russian. Translate / paraphrase
    the gist, don't copy-paste foreign-language fragments. Format:
@@ -237,11 +242,25 @@ If genuinely unclear ("новости" alone), default to Mode 1.
      follow-up "ссылку" / "источник" requests as referring to the
      items you just sent.
 
-8. **Send to Telegram:**
+6. **Send to Telegram:**
 
    ```
    send_telegram_message(text="<digest>")
    ```
+
+7. **Stamp the read watermark.** After the digest is sent (or after an
+   ad-hoc/Mode-3 read with no digest — the watermark moves regardless,
+   it's about what posts you've already consumed):
+
+   ```
+   set_last_news_read_at(timestamp=<the timestamp you used as `since`'s upper bound, typically now()>)
+   ```
+
+   Skip this step **only** for narrow one-channel queries where you
+   don't want to advance the global watermark (e.g. user asked "что
+   там в @tginsider за последний час" — you read one channel, you
+   don't want tomorrow's full digest to skip everything older than
+   right now). When in doubt, do stamp it.
 
 ## Significance bar — the "would I care?" test
 

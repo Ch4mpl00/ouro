@@ -1,9 +1,7 @@
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import {
-  fetchChannelMessages,
-  listDialogs,
-} from "../services/telegram/userbot";
+import { listDialogs, listChannelPosts } from "../services/telegram/userbot";
+import { getLastNewsReadAt, setLastNewsReadAt } from "../services/news-digest";
 import { jsonResult } from "../result";
 
 export function registerUserbotTools(server: McpServer): void {
@@ -13,9 +11,10 @@ export function registerUserbotTools(server: McpServer): void {
       title: "List userbot dialogs (chats / channels)",
       description:
         "List the personal Telegram account's dialogs (channels, groups, " +
-        "private chats) the userbot is subscribed to. Use to discover what " +
-        "channels are available before calling fetch_channel_messages. " +
-        "Requires `pnpm userbot:auth` to have been run once.",
+        "private chats) the userbot is subscribed to. Mostly useful for " +
+        "discovery / debugging — for reading posts use `list_channel_posts`, " +
+        "the userbot poller already harvests every subscribed channel in " +
+        "the background. Requires `pnpm userbot:auth` to have been run once.",
       inputSchema: {
         type: z
           .enum(["channel", "group", "user", "all"])
@@ -40,39 +39,81 @@ export function registerUserbotTools(server: McpServer): void {
   );
 
   server.registerTool(
-    "fetch_channel_messages",
+    "list_channel_posts",
     {
-      title: "Fetch messages from a Telegram channel",
+      title: "Read harvested Telegram channel posts",
       description:
-        "Read recent messages from a Telegram channel/group via the userbot " +
-        "account (gramjs/MTProto). The channel can be a username (with or " +
-        "without `@`) or a t.me URL. Returns chronologically ordered messages " +
-        "with id, date, text and engagement counters (views/forwards). Pass " +
-        "`sinceMessageId` to get only messages newer than the boundary.",
+        "Query the local store of channel posts the userbot poller has " +
+        "already collected. Returns posts with `posted_at > since` ordered " +
+        "by `posted_at` ascending. Use this — not a live fetch — for digests " +
+        "and ad-hoc reads; the background poller refreshes every ~30min so " +
+        "data is at most that stale. Each row includes chat_id, chat_title, " +
+        "chat_username, tg_message_id, posted_at (the original publication " +
+        "date), text, views, forwards.",
       inputSchema: {
-        channel: z.string().describe("Channel handle or t.me URL (e.g. 'tginsider' or '@tginsider')."),
-        sinceMessageId: z
-          .number()
-          .int()
+        since: z
+          .string()
+          .describe(
+            "ISO timestamp. Only posts with posted_at > since are returned. " +
+              "Typical use: now - 24h for a daily digest.",
+          ),
+        channel: z
+          .string()
           .optional()
-          .describe("Return only messages with id > sinceMessageId. Omit for the last `limit`."),
+          .describe(
+            "Restrict to one channel. Match is on chat_username or chat_id. " +
+              "Omit to read across every subscribed channel.",
+          ),
         limit: z
           .number()
           .int()
           .min(1)
-          .max(200)
+          .max(2000)
           .optional()
-          .describe("Max messages. Default 30."),
+          .describe("Max rows. Default 500."),
       },
     },
-    async ({ channel, sinceMessageId, limit }) => {
-      const result = await fetchChannelMessages({ channel, sinceMessageId, limit });
-      return jsonResult({
-        channel: result.channel,
-        count: result.messages.length,
-        messages: result.messages,
-      });
+    async ({ since, channel, limit }) => {
+      const posts = listChannelPosts({ since, channel, limit });
+      return jsonResult({ count: posts.length, posts });
     },
   );
 
+  server.registerTool(
+    "get_last_news_read_at",
+    {
+      title: "Get the watermark for previously-read channel posts",
+      description:
+        "Returns the ISO timestamp the agent last stamped via " +
+        "`set_last_news_read_at`. Use this as the `since` argument to " +
+        "`list_channel_posts` so each digest only sees posts published " +
+        "after the previous one (no overlap, no missed posts). Returns " +
+        "{ lastReadAt: null } on the very first run — bootstrap with " +
+        "now - 24h in that case.",
+      inputSchema: {},
+    },
+    async () => {
+      return jsonResult({ lastReadAt: getLastNewsReadAt() });
+    },
+  );
+
+  server.registerTool(
+    "set_last_news_read_at",
+    {
+      title: "Stamp the watermark for previously-read channel posts",
+      description:
+        "Persist the news-read watermark. Call this once at the end of a " +
+        "successful digest / channel-posts read, with `now` (an ISO " +
+        "timestamp). The NEXT digest will then pass this value to " +
+        "`list_channel_posts` as `since`. Idempotent — overwrites the " +
+        "previous value.",
+      inputSchema: {
+        timestamp: z.string().describe("ISO timestamp to store as last_read_at."),
+      },
+    },
+    async ({ timestamp }) => {
+      setLastNewsReadAt(timestamp);
+      return jsonResult({ ok: true, lastReadAt: timestamp });
+    },
+  );
 }
