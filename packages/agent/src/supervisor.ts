@@ -9,11 +9,18 @@ import { createEngine, type Engine } from "./engine";
 //   loop forever:
 //     {signal, pendingAfter} = mcp.get_next_signal
 //     if signal is null: sleep
-//     else: open session with signal.systemPrompt, push signal.content
-//           as user message, run.
+//     else: open session with signal.systemPrompt + handoff.md,
+//           push signal.content as user message, run.
 //
 // All side effects (replying to Telegram, marking bills, etc.) are tool
 // calls the LLM makes inside the session.
+//
+// Reasoning effort is **not** picked per source here. Every session starts
+// at the weak default (`reasoning_effort=disabled`); the model itself
+// decides whether to escalate via the in-session `handoff` tool, guided
+// by `skills/handoff.md` (loaded below and appended to every system
+// prompt). Keeps routing rules in markdown so dreaming can revise them
+// without a code change.
 
 const POLL_INTERVAL_MS = 2_000;
 
@@ -34,15 +41,20 @@ function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-// Some signal sources need a stronger model than the default (e.g. dreaming
-// edits skills based on free-form pattern recognition; thinking-tier is
-// worth the cost there). Resolution: env override per-source first, then
-// fall through to the engine default. Add new entries here as needed.
-function resolveModelForSource(source: string): string | undefined {
-  if (source === "dreaming") {
-    return process.env.DREAMING_MODEL ?? "deepseek-reasoner";
+// Fetched per signal via the generic `read_skill` MCP tool — keeps MCP
+// unaware of handoff (it's a pure agent-side concept) and lets dreaming's
+// edits to skills/handoff.md take effect on the very next signal without
+// restarting the supervisor.
+async function loadHandoffSkill(engine: Engine): Promise<string | null> {
+  try {
+    const raw = await engine.mcp.callTool("read_skill", { name: "handoff" });
+    if (raw.startsWith("[tool error]")) return null;
+    const parsed = JSON.parse(raw) as { content?: string };
+    return parsed.content ?? null;
+  } catch (err) {
+    console.error("[supervisor] failed to load handoff skill:", err);
+    return null;
   }
-  return undefined;
 }
 
 async function runSignal(engine: Engine, signal: PendingSignal): Promise<void> {
@@ -51,10 +63,15 @@ async function runSignal(engine: Engine, signal: PendingSignal): Promise<void> {
     return;
   }
 
+  const handoffSkill = await loadHandoffSkill(engine);
+  const systemPrompt = handoffSkill
+    ? `${signal.systemPrompt}\n\n---\n\n${handoffSkill}`
+    : signal.systemPrompt;
+
   const session = engine.startSession({
     id: `${signal.source}:${signal.id}`,
-    systemPrompt: signal.systemPrompt,
-    model: resolveModelForSource(signal.source),
+    systemPrompt,
+    reasoningEffort: "disabled",
   });
   session.messages.push({ role: "user", content: signal.content });
 

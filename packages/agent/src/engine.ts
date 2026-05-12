@@ -32,7 +32,10 @@ export class Engine {
     }
     const session = new Session(this, opts);
     this.sessions.set(opts.id, session);
-    this.log(opts.id, `session opened (model=${opts.model ?? this.defaultModel}${opts.parentId ? `, parent=${opts.parentId}` : ""})`);
+    this.log(
+      opts.id,
+      `session opened (model=${opts.model ?? this.defaultModel}, effort=${opts.reasoningEffort ?? "disabled"}${opts.parentId ? `, parent=${opts.parentId}` : ""})`,
+    );
     return session;
   }
 
