@@ -1,4 +1,5 @@
 import "dotenv/config";
+import type { ChatCompletionMessageParam } from "openai/resources/chat/completions";
 import { createEngine, type Engine } from "./engine";
 
 // Long-running process. The agent has no signal sources of its own — every
@@ -79,6 +80,48 @@ async function runSignal(engine: Engine, signal: PendingSignal): Promise<void> {
     await session.run();
   } catch (err) {
     console.error(`[supervisor] session ${session.id} crashed:`, err);
+    await reportFailureToUser(engine, signal, session.messages, err).catch((err2) => {
+      console.error(`[supervisor] recovery for ${session.id} also failed:`, err2);
+    });
+  } finally {
+    engine.endSession(session.id);
+  }
+}
+
+// Spawned when a primary session throws. A fresh session is used because
+// the crashed message buffer may contain a malformed assistant turn that
+// would re-crash on every retry — recovery reads the dead transcript as
+// plain text instead of replaying it through the API.
+const RECOVERY_PROMPT = [
+  "The previous session handling a signal crashed. Read the message log and the error",
+  "below, then send ONE short Russian message via send_telegram_message to the default",
+  "chat from the environment context describing what was being done and roughly what",
+  "broke. No stack traces, no error codes, no JSON. Plain language, 1–3 sentences.",
+].join(" ");
+
+async function reportFailureToUser(
+  engine: Engine,
+  signal: PendingSignal,
+  failedMessages: ChatCompletionMessageParam[],
+  err: unknown,
+): Promise<void> {
+  const errMsg = err instanceof Error ? err.message : String(err);
+  const briefing = `Error: ${errMsg}\n\nMessage log:\n${JSON.stringify(failedMessages, null, 2)}`;
+  // signal.systemPrompt is appended for the env addendum (default chat id).
+  const systemPrompt = signal.systemPrompt
+    ? `${RECOVERY_PROMPT}\n\n---\n\n${signal.systemPrompt}`
+    : RECOVERY_PROMPT;
+
+  const session = engine.startSession({
+    id: `recovery:${signal.source}:${signal.id}`,
+    systemPrompt,
+    reasoningEffort: "disabled",
+    maxIterations: 5,
+  });
+  session.messages.push({ role: "user", content: briefing });
+
+  try {
+    await session.run();
   } finally {
     engine.endSession(session.id);
   }
