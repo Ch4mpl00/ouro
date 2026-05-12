@@ -1,7 +1,6 @@
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { listDialogs, listChannelPosts } from "../services/telegram/userbot";
-import { getLastNewsReadAt, setLastNewsReadAt } from "../services/news-digest";
 import { jsonResult } from "../result";
 
 export function registerUserbotTools(server: McpServer): void {
@@ -79,41 +78,4 @@ export function registerUserbotTools(server: McpServer): void {
     },
   );
 
-  server.registerTool(
-    "get_last_news_read_at",
-    {
-      title: "Get the watermark for previously-read channel posts",
-      description:
-        "Returns the ISO timestamp the agent last stamped via " +
-        "`set_last_news_read_at`. Use this as the `since` argument to " +
-        "`list_channel_posts` so each digest only sees posts published " +
-        "after the previous one (no overlap, no missed posts). Returns " +
-        "{ lastReadAt: null } on the very first run — bootstrap with " +
-        "now - 24h in that case.",
-      inputSchema: {},
-    },
-    async () => {
-      return jsonResult({ lastReadAt: getLastNewsReadAt() });
-    },
-  );
-
-  server.registerTool(
-    "set_last_news_read_at",
-    {
-      title: "Stamp the watermark for previously-read channel posts",
-      description:
-        "Persist the news-read watermark. Call this once at the end of a " +
-        "successful digest / channel-posts read, with `now` (an ISO " +
-        "timestamp). The NEXT digest will then pass this value to " +
-        "`list_channel_posts` as `since`. Idempotent — overwrites the " +
-        "previous value.",
-      inputSchema: {
-        timestamp: z.string().describe("ISO timestamp to store as last_read_at."),
-      },
-    },
-    async ({ timestamp }) => {
-      setLastNewsReadAt(timestamp);
-      return jsonResult({ ok: true, lastReadAt: timestamp });
-    },
-  );
 }

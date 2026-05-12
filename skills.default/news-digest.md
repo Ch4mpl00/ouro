@@ -159,20 +159,18 @@ If genuinely unclear ("новости" alone), default to Mode 1.
 
 2. **Read harvested channel posts.** The userbot poller has already
    collected posts from every subscribed channel into the local store —
-   you don't need to discover channels or do per-channel fetches.
-   First grab the watermark from the previous read:
+   you don't need to discover channels or do per-channel fetches. The
+   read watermark from the previous digest is **already in your system
+   prompt** under `Current context` → `News last read at`. Do NOT call
+   a separate tool to fetch it.
+
+   Query the store starting from that point:
 
    ```
-   get_last_news_read_at()  → { lastReadAt: "<ISO>" | null }
+   list_channel_posts(since=<News last read at from context>)
    ```
 
-   Then query the store starting from that point:
-
-   ```
-   list_channel_posts(since=<lastReadAt>)
-   ```
-
-   If `lastReadAt` is null (first ever run), bootstrap with `now - 24h`
+   If the context says `never (bootstrap with now - 24h)`, use `now - 24h`
    as `since`. Posts come back across all channels chronologically, each
    with `chat_title`, `chat_username`, `posted_at`, `text`, `views`,
    `forwards`. For an ad-hoc one-channel question (Mode 3), pass
@@ -250,11 +248,15 @@ If genuinely unclear ("новости" alone), default to Mode 1.
 
 7. **Stamp the read watermark.** After the digest is sent (or after an
    ad-hoc/Mode-3 read with no digest — the watermark moves regardless,
-   it's about what posts you've already consumed):
+   it's about what posts you've already consumed), persist it via the
+   agent-side memory KV:
 
    ```
-   set_last_news_read_at(timestamp=<the timestamp you used as `since`'s upper bound, typically now()>)
+   set_memory(key="news_digest.last_read_at", value="<ISO timestamp, typically now()>")
    ```
+
+   The supervisor will inject this value back into the next session's
+   `Current context` block automatically.
 
    Skip this step **only** for narrow one-channel queries where you
    don't want to advance the global watermark (e.g. user asked "что
@@ -276,9 +278,10 @@ when the post is in a "news" channel:
 
 - ❌ "Парень с травмой члена после секса с мужчиной (Овидиопольский р-н)"
   — pure tabloid trivia, zero relevance.
-- ❌ "Мёртвая пенсионерка с разбитой головой на ул. Базарная" — single
-  petty crime. One death is not news unless it signals a pattern, a
-  public-safety threat, or has political dimensions.
+- ❌ Единичное бытовое преступление или несчастный случай (убийство,
+  ограбление, ДТП с одним пострадавшим и т.п.) — одиночный инцидент не
+  новость, если за ним не стоит тренд, угроза общественной безопасности
+  или политическая подоплёка.
 - ❌ "Победный номер «Красной Звезды» — одесская полоса" — historical
   reference / cultural trivia. Meaningless for *daily* news.
 - ❌ "Археологи начали сезонные раскопки в городе" — routine cultural
@@ -358,4 +361,4 @@ When in doubt between "consolidate or skip", prefer skip. A clean
 - Don't include "good morning"-style filler, even from news channels.
 - Don't summarize channels of type other than `channel`.
 - Don't re-send events that already appeared in a recent digest (see
-  Protocol step 2 + step 5).
+  Protocol step 1 + step 3).

@@ -13,26 +13,14 @@ no other skill should ever modify `skills/<source>.md`.
 
 ## Protocol
 
-0. **Escalate first.** Reflection is heavy and you start at the weak
-   default. Before any other tool call, switch tier:
-
-   ```
-   handoff(reasoning_effort="max", reason="dreaming reflection")
-   ```
-
-   That ends the turn — the next one will be on the strong tier.
-
 1. **Inventory the skills.**
 
    ```
    list_skills()
    ```
 
-   You'll get the names of all skills currently active. Most skills map
+   You'll get the names of all skills currently active. Each skill maps
    1-to-1 to a signal source (`telegram`, `nashdom-bill`, `tech-digest`).
-   `handoff.md` is a cross-cutting skill — it is appended to every
-   session's system prompt and may be edited when the escalation rules
-   need adjusting (see `Editing rules` below).
 
 2. **Pull the recent activity.**
 

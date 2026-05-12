@@ -26,10 +26,10 @@ COPY --from=deps /app/node_modules ./node_modules
 COPY --from=deps /app/packages/mcp/node_modules ./packages/mcp/node_modules
 COPY --from=deps /app/packages/agent/node_modules ./packages/agent/node_modules
 
-# Source. .dockerignore strips data/, storage/, .env*, node_modules.
-# skills/ IS included so first-mount of the named volume gets bootstrapped
-# with the bundled skill files (Docker copies image content into an empty
-# volume on first attach).
+# Source. .dockerignore strips data/, storage/, .env*, node_modules, and
+# skills/ (local-dev live overlay). The shipped skills baseline lives in
+# skills.default/ which IS copied — the agent reads it as a fallback when
+# the live overlay (mounted volume) has no entry for a given skill.
 COPY . .
 
 EXPOSE 3000

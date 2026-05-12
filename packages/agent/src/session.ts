@@ -1,5 +1,7 @@
 import type { ChatCompletionMessageParam, ChatCompletionTool } from "openai/resources/chat/completions";
 import type { Engine } from "./engine";
+import { setMemory } from "./db/memory";
+import { listSkills, loadSkill, saveSkill } from "./skills";
 
 // One isolated conversation thread. Owns its own message buffer, system
 // prompt, model and iteration budget. Shares the engine's OpenAI client
@@ -61,6 +63,125 @@ interface HandoffArgs {
   reasoning_effort?: ReasoningEffort;
   model?: string;
   reason?: string;
+}
+
+// Second synthetic tool — agent-side writes to the local memory KV
+// (`agent.db memory`). Bypasses MCP so the integration server stays
+// stateless w.r.t. agent reasoning state. Reads happen via the
+// `Current context` block in the system prompt, populated by the
+// supervisor at session start — no `get_memory` tool needed.
+const SET_MEMORY_TOOL_NAME = "set_memory";
+const SET_MEMORY_TOOL: ChatCompletionTool = {
+  type: "function",
+  function: {
+    name: SET_MEMORY_TOOL_NAME,
+    description:
+      "Persist a small piece of agent-side state to the local memory KV. " +
+      "Use for watermarks, last-seen markers, counters, or any note the " +
+      "agent wants to recall in a future session. Well-known keys (e.g. " +
+      "`news_digest.last_read_at`) are auto-injected into the `Current " +
+      "context` block of future system prompts. Values are stored as " +
+      "strings — JSON-stringify complex payloads yourself.",
+    parameters: {
+      type: "object",
+      properties: {
+        key: {
+          type: "string",
+          description: "Memory key, e.g. `news_digest.last_read_at`.",
+        },
+        value: {
+          type: "string",
+          description: "Value to store. Use ISO timestamps for time markers.",
+        },
+      },
+      required: ["key", "value"],
+    },
+  },
+};
+
+interface SetMemoryArgs {
+  key?: string;
+  value?: string;
+}
+
+// Skill tools are agent-side because skills are agent reasoning config,
+// not integration state — there's no point round-tripping through MCP to
+// reach files the agent process can read directly. `loadSkill` resolves
+// the live overlay (`skills/<name>.md`) with fallback to the shipped
+// default (`skills.default/<name>.md`); `saveSkill` always writes to the
+// overlay, leaving defaults untouched as a reset point.
+const READ_SKILL_TOOL_NAME = "read_skill";
+const READ_SKILL_TOOL: ChatCompletionTool = {
+  type: "function",
+  function: {
+    name: READ_SKILL_TOOL_NAME,
+    description:
+      "Return the raw text of a skill (`skills/<name>.md`). Reads the live " +
+      "overlay if present, otherwise falls back to the shipped default " +
+      "(`skills.default/<name>.md`). Use this to consult another skill's " +
+      "rules mid-session (e.g. the telegram handler reading `news-digest` " +
+      "before composing a digest).",
+    parameters: {
+      type: "object",
+      properties: {
+        name: {
+          type: "string",
+          description: "Skill name without .md extension (matches signal source).",
+        },
+      },
+      required: ["name"],
+    },
+  },
+};
+
+const WRITE_SKILL_TOOL_NAME = "write_skill";
+const WRITE_SKILL_TOOL: ChatCompletionTool = {
+  type: "function",
+  function: {
+    name: WRITE_SKILL_TOOL_NAME,
+    description:
+      "Overwrite a skill with new content. Always writes to the live " +
+      "overlay — the shipped default stays intact, so deleting the live " +
+      "file at any time restores the original. Used by the `dreaming` " +
+      "skill to revise instructions based on observed patterns. Pass the " +
+      "complete new body; the file is replaced, not patched.",
+    parameters: {
+      type: "object",
+      properties: {
+        name: {
+          type: "string",
+          description: "Skill name without .md extension.",
+        },
+        content: {
+          type: "string",
+          description: "Full new content of the skill file.",
+        },
+      },
+      required: ["name", "content"],
+    },
+  },
+};
+
+const LIST_SKILLS_TOOL_NAME = "list_skills";
+const LIST_SKILLS_TOOL: ChatCompletionTool = {
+  type: "function",
+  function: {
+    name: LIST_SKILLS_TOOL_NAME,
+    description:
+      "List all available skills (union of live overlay + shipped defaults). " +
+      "Each entry includes `source: 'live'|'default'` showing which layer " +
+      "is active for that name. Useful for the `dreaming` skill to survey " +
+      "what's edit-able before deciding what to revise.",
+    parameters: { type: "object", properties: {} },
+  },
+};
+
+interface SkillNameArg {
+  name?: string;
+}
+interface WriteSkillArgs {
+  name?: string;
+  content?: string;
 }
 
 // DeepSeek extends OpenAI's assistant message shape with `reasoning_content`
@@ -133,7 +254,14 @@ export class Session {
       const body = {
         model: this.model,
         messages: this.messages,
-        tools: [...mcp.tools, HANDOFF_TOOL],
+        tools: [
+          ...mcp.tools,
+          HANDOFF_TOOL,
+          SET_MEMORY_TOOL,
+          READ_SKILL_TOOL,
+          WRITE_SKILL_TOOL,
+          LIST_SKILLS_TOOL,
+        ],
         ...(this.reasoningEffort === "disabled"
           ? { thinking: { type: "disabled" as const } }
           : { thinking: { type: "enabled" as const }, reasoning_effort: this.reasoningEffort }),
@@ -155,10 +283,21 @@ export class Session {
         const args = JSON.parse(call.function.arguments || "{}") as Record<string, unknown>;
         this.engine.log(this.id, `→ ${call.function.name}(${JSON.stringify(args)})`);
 
-        const result =
-          call.function.name === HANDOFF_TOOL_NAME
-            ? this.applyHandoff(args as HandoffArgs)
-            : await mcp.callTool(call.function.name, args);
+        let result: string;
+        const name = call.function.name;
+        if (name === HANDOFF_TOOL_NAME) {
+          result = this.applyHandoff(args as HandoffArgs);
+        } else if (name === SET_MEMORY_TOOL_NAME) {
+          result = this.applySetMemory(args as SetMemoryArgs);
+        } else if (name === READ_SKILL_TOOL_NAME) {
+          result = await this.applyReadSkill(args as SkillNameArg);
+        } else if (name === WRITE_SKILL_TOOL_NAME) {
+          result = await this.applyWriteSkill(args as WriteSkillArgs);
+        } else if (name === LIST_SKILLS_TOOL_NAME) {
+          result = await this.applyListSkills();
+        } else {
+          result = await mcp.callTool(name, args);
+        }
 
         this.engine.log(this.id, `← ${result.length}b: ${result}`);
 
@@ -171,6 +310,63 @@ export class Session {
     }
 
     throw new Error(`session ${this.id} exceeded maxIterations=${this.maxIterations}`);
+  }
+
+  private async applyReadSkill(args: SkillNameArg): Promise<string> {
+    if (typeof args.name !== "string" || args.name.length === 0) {
+      return `[read_skill error] name must be a non-empty string`;
+    }
+    try {
+      const content = await loadSkill(args.name);
+      if (content === null) {
+        return JSON.stringify({ name: args.name, found: false, content: null });
+      }
+      return JSON.stringify({
+        name: args.name,
+        found: true,
+        content,
+        sizeBytes: Buffer.byteLength(content, "utf-8"),
+      });
+    } catch (err) {
+      return `[read_skill error] ${(err as Error).message}`;
+    }
+  }
+
+  private async applyWriteSkill(args: WriteSkillArgs): Promise<string> {
+    if (typeof args.name !== "string" || args.name.length === 0) {
+      return `[write_skill error] name must be a non-empty string`;
+    }
+    if (typeof args.content !== "string" || args.content.length === 0) {
+      return `[write_skill error] content must be a non-empty string`;
+    }
+    try {
+      const written = await saveSkill(args.name, args.content);
+      this.engine.log(this.id, `write_skill ${args.name} (${written.sizeBytes}b → ${written.path})`);
+      return JSON.stringify({ ok: true, name: args.name, ...written });
+    } catch (err) {
+      return `[write_skill error] ${(err as Error).message}`;
+    }
+  }
+
+  private async applyListSkills(): Promise<string> {
+    try {
+      const skills = await listSkills();
+      return JSON.stringify({ count: skills.length, skills });
+    } catch (err) {
+      return `[list_skills error] ${(err as Error).message}`;
+    }
+  }
+
+  private applySetMemory(args: SetMemoryArgs): string {
+    if (typeof args.key !== "string" || args.key.length === 0) {
+      return `[set_memory error] key must be a non-empty string`;
+    }
+    if (typeof args.value !== "string") {
+      return `[set_memory error] value must be a string (got ${typeof args.value})`;
+    }
+    setMemory(args.key, args.value);
+    this.engine.log(this.id, `set_memory ${args.key} = ${args.value.slice(0, 80)}`);
+    return `ok — stored ${args.key}`;
   }
 
   private applyHandoff(args: HandoffArgs): string {

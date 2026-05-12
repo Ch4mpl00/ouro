@@ -1,16 +1,24 @@
 import "dotenv/config";
 import type { ChatCompletionMessageParam } from "openai/resources/chat/completions";
 import { createEngine, type Engine } from "./engine";
+import { buildSessionContext } from "./session-context";
+import { loadSkill } from "./skills";
 
 // Long-running process. The agent has no signal sources of its own — every
 // external event (Telegram, Gmail, cron, webhook) lives inside the MCP
-// server, which queues signals into its own DB and serves them with their
-// matching skill instructions baked in. The agent's only job is:
+// server, which queues signals into its own DB. Skill instructions live
+// on the agent side (`skills/` with `skills.default/` fallback) — the
+// supervisor loads `skills/<signal.source>.md` per session. The agent's
+// only job is:
 //
 //   loop forever:
 //     {signal, pendingAfter} = mcp.get_next_signal
 //     if signal is null: sleep
-//     else: open session with signal.systemPrompt + handoff.md,
+//     else: open session with:
+//             - session-context block (time, tz, watermarks)
+//             - skills/<source>.md (live or default)
+//             - signal.envContext (integration env from MCP)
+//             - skills/handoff.md
 //           push signal.content as user message, run.
 //
 // All side effects (replying to Telegram, marking bills, etc.) are tool
@@ -29,7 +37,7 @@ interface PendingSignal {
   id: number;
   source: string;
   content: string;
-  systemPrompt: string | null;
+  envContext: string | null;
   created_at: string;
 }
 
@@ -42,32 +50,27 @@ function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-// Fetched per signal via the generic `read_skill` MCP tool — keeps MCP
-// unaware of handoff (it's a pure agent-side concept) and lets dreaming's
-// edits to skills/handoff.md take effect on the very next signal without
-// restarting the supervisor.
-async function loadHandoffSkill(engine: Engine): Promise<string | null> {
-  try {
-    const raw = await engine.mcp.callTool("read_skill", { name: "handoff" });
-    if (raw.startsWith("[tool error]")) return null;
-    const parsed = JSON.parse(raw) as { content?: string };
-    return parsed.content ?? null;
-  } catch (err) {
-    console.error("[supervisor] failed to load handoff skill:", err);
-    return null;
-  }
-}
-
 async function runSignal(engine: Engine, signal: PendingSignal): Promise<void> {
-  if (!signal.systemPrompt) {
-    console.error(`[supervisor] signal #${signal.id} source=${signal.source}: no skill, skipping`);
+  const [sourceSkill, handoffSkill, sessionContext] = await Promise.all([
+    loadSkill(signal.source),
+    loadSkill("handoff"),
+    buildSessionContext(engine),
+  ]);
+
+  if (!sourceSkill) {
+    console.error(
+      `[supervisor] signal #${signal.id} source=${signal.source}: no skill (skills/${signal.source}.md and skills.default/${signal.source}.md both missing), skipping`,
+    );
     return;
   }
 
-  const handoffSkill = await loadHandoffSkill(engine);
-  const systemPrompt = handoffSkill
-    ? `${signal.systemPrompt}\n\n---\n\n${handoffSkill}`
-    : signal.systemPrompt;
+  // Order: context block first (so the model sees "current state" up front),
+  // then the per-source skill, then the integration env, then the handoff
+  // appendix.
+  const parts: string[] = [sessionContext, sourceSkill];
+  if (signal.envContext) parts.push(signal.envContext);
+  if (handoffSkill) parts.push(handoffSkill);
+  const systemPrompt = parts.join("\n\n---\n\n");
 
   const session = engine.startSession({
     id: `${signal.source}:${signal.id}`,
@@ -107,9 +110,10 @@ async function reportFailureToUser(
 ): Promise<void> {
   const errMsg = err instanceof Error ? err.message : String(err);
   const briefing = `Error: ${errMsg}\n\nMessage log:\n${JSON.stringify(failedMessages, null, 2)}`;
-  // signal.systemPrompt is appended for the env addendum (default chat id).
-  const systemPrompt = signal.systemPrompt
-    ? `${RECOVERY_PROMPT}\n\n---\n\n${signal.systemPrompt}`
+  // signal.envContext is appended so the recovery session knows the
+  // default chat id to notify.
+  const systemPrompt = signal.envContext
+    ? `${RECOVERY_PROMPT}\n\n---\n\n${signal.envContext}`
     : RECOVERY_PROMPT;
 
   const session = engine.startSession({

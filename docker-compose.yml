@@ -1,11 +1,18 @@
 # Two-container deploy: integrations (mcp) and the agent supervisor are
 # isolated from each other. The agent never touches Telegram/Gmail/Monobank
-# credentials, the Gmail attachments storage, the skill files, or the MCP
-# database — it has only its own agent.db and the network link to mcp:3000.
+# credentials, the Gmail attachments storage, or the MCP database — it
+# only has its own agent.db, the live skills overlay, and the network
+# link to mcp:3000.
+#
+# Skill files now live on the agent side (the agent's reasoning config,
+# not integration state). Two layers:
+#   - skills.default/ — shipped in the image, read-only fallback
+#   - skills/         — live overlay, persisted in `agent-skills` volume
+#                       and mutated by the `dreaming` signal-handler
 #
 # Named volumes persist across `docker compose down`; only `down -v` wipes
 # them. On first creation, Docker copies the image's content into the empty
-# volume (this is how the bundled skills/ get into mcp-skills volume).
+# volume — that's how the bundled skills/ get into agent-skills.
 
 services:
   mcp:
@@ -19,7 +26,6 @@ services:
     volumes:
       - mcp-data:/app/packages/mcp/data        # tokens.db, OAuth, signals, watermarks
       - mcp-storage:/app/storage               # Gmail attachments
-      - mcp-skills:/app/skills                 # editable by dreaming sessions
     expose:
       - "3000"
     restart: unless-stopped
@@ -33,7 +39,8 @@ services:
       MCP_TRANSPORT: http
       MCP_URL: http://mcp:3000/mcp
     volumes:
-      - agent-data:/app/packages/agent/data    # agent.db only — no other host paths
+      - agent-data:/app/packages/agent/data    # agent.db (bills, memory)
+      - agent-skills:/app/skills               # live skills overlay (dreaming writes here)
     depends_on:
       - mcp
     restart: unless-stopped
@@ -41,5 +48,5 @@ services:
 volumes:
   mcp-data:
   mcp-storage:
-  mcp-skills:
   agent-data:
+  agent-skills:

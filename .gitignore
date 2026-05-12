@@ -9,6 +9,11 @@ dist/
 # Local attachment / blob storage
 storage/
 
+# Live (runtime) skills — mutable, edited by the `dreaming` signal-handler.
+# Defaults checked in under skills.default/ act as fallback when a live
+# file is absent.
+/skills/
+
 # Generated SQLite databases (schema.sql is the source of truth)
 packages/*/data/*.db
 packages/*/data/*.db-journal
