@@ -63,6 +63,23 @@ interface HandoffArgs {
   reason?: string;
 }
 
+// DeepSeek extends OpenAI's assistant message shape with `reasoning_content`
+// (the thinking text). Required in the request history whenever the next
+// call uses thinking-mode — even if it's empty.
+type DeepSeekAssistantHistory = ChatCompletionMessageParam & {
+  reasoning_content?: string;
+};
+
+function ensureReasoningContentOnHistory(messages: ChatCompletionMessageParam[]): void {
+  for (const m of messages) {
+    if (m.role !== "assistant") continue;
+    const extended = m as DeepSeekAssistantHistory;
+    if (extended.reasoning_content === undefined) {
+      extended.reasoning_content = "";
+    }
+  }
+}
+
 export class Session {
   readonly id: string;
   readonly parentId?: string;
@@ -103,6 +120,16 @@ export class Session {
     const { llm, mcp } = this.engine;
 
     for (let i = 0; i < this.maxIterations; i++) {
+      // DeepSeek's thinking mode requires every prior assistant turn in the
+      // history to carry a `reasoning_content` field. Turns produced under
+      // `thinking=disabled` lack it, so once we escalate via `handoff`, the
+      // very next request 400s with "reasoning_content must be passed back".
+      // Stamp an empty string on every assistant message missing the field
+      // whenever we're about to send in thinking-enabled mode.
+      if (this.reasoningEffort !== "disabled") {
+        ensureReasoningContentOnHistory(this.messages);
+      }
+
       const body = {
         model: this.model,
         messages: this.messages,
