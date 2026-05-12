@@ -68,6 +68,30 @@ CREATE TABLE IF NOT EXISTS news_digest_kv (
   value  TEXT NOT NULL
 );
 
+-- User-facing settings KV. Currently holds `timezone` (IANA name, e.g.
+-- 'Europe/Kiev'). All poller schedule evaluations, cron firings, and
+-- human-facing date formatting read this. Default when unset: UTC.
+CREATE TABLE IF NOT EXISTS settings (
+  key        TEXT PRIMARY KEY,
+  value      TEXT NOT NULL,
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- Scheduled task registry — agent-managed reminders and recurring jobs.
+-- Cron expression is the only time spec (5-field, evaluated in the
+-- configured `timezone` setting). One-shot tasks have recurring=0 and
+-- are filtered out once `last_run_at` is set. Cancel via DELETE.
+CREATE TABLE IF NOT EXISTS scheduled_tasks (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  cron_expr   TEXT NOT NULL,
+  recurring   INTEGER NOT NULL CHECK (recurring IN (0, 1)),
+  prompt      TEXT NOT NULL,
+  last_run_at INTEGER,
+  created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS scheduled_tasks_pending
+  ON scheduled_tasks(recurring, last_run_at);
+
 -- Signal queue. MCP-internal pollers (Telegram, Gmail, cron, webhooks)
 -- enqueue rows; the agent consumes via get_next_signal which atomically
 -- pops the oldest pending row. consumed_at IS NULL means pending.

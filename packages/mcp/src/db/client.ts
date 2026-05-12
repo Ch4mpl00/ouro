@@ -62,6 +62,27 @@ function runMigrations(db: Database.Database): void {
       value TEXT NOT NULL
     )
   `);
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS settings (
+      key        TEXT PRIMARY KEY,
+      value      TEXT NOT NULL,
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    )
+  `);
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS scheduled_tasks (
+      id          INTEGER PRIMARY KEY AUTOINCREMENT,
+      cron_expr   TEXT NOT NULL,
+      recurring   INTEGER NOT NULL CHECK (recurring IN (0, 1)),
+      prompt      TEXT NOT NULL,
+      last_run_at INTEGER,
+      created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+    )
+  `);
+  db.exec(
+    `CREATE INDEX IF NOT EXISTS scheduled_tasks_pending
+       ON scheduled_tasks(recurring, last_run_at)`,
+  );
 }
 
 export function closeDb(): void {

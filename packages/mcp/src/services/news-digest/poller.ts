@@ -1,5 +1,6 @@
 import { getDb } from "../../db/client";
 import { recordSignal } from "../signals";
+import { localTime } from "../settings";
 
 // Daily news-digest poller. Fires the curated topical news signal that
 // pulls posts from the user's subscribed Telegram channels (via gramjs
@@ -25,11 +26,6 @@ function targetHour(): number {
   return Math.floor(n);
 }
 
-function todayLocalDate(): string {
-  const d = new Date();
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
-}
-
 function getKv(key: string): string | null {
   const row = getDb()
     .prepare(`SELECT value FROM news_digest_kv WHERE key = ?`)
@@ -47,9 +43,9 @@ function setKv(key: string, value: string): void {
 }
 
 function tick(): void {
-  const today = todayLocalDate();
+  const { date: today, hour } = localTime();
   if (getKv(LAST_FIRE_DATE_KEY) === today) return;
-  if (new Date().getHours() < targetHour()) return;
+  if (hour < targetHour()) return;
 
   setKv(LAST_FIRE_DATE_KEY, today);
   recordSignal({
@@ -67,7 +63,7 @@ function tick(): void {
 export function startNewsDigestPoller(): void {
   console.log(`${logPrefix()} started (digest at ${targetHour()}:00 local time, daily)`);
   if (getKv(LAST_FIRE_DATE_KEY) === null) {
-    setKv(LAST_FIRE_DATE_KEY, todayLocalDate());
+    setKv(LAST_FIRE_DATE_KEY, localTime().date);
     console.log(`${logPrefix()} bootstrapped watermark to today, no emit until tomorrow`);
   }
   tick();

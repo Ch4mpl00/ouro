@@ -14,11 +14,13 @@ import { registerSignalsTools } from "./tools/signals";
 import { registerNewsTools } from "./tools/news";
 import { registerDreamingTools } from "./tools/dreaming";
 import { registerUserbotTools } from "./tools/userbot";
+import { registerSchedulerTools } from "./tools/scheduler";
 import { startTelegramPoller } from "./services/telegram";
 import { startGmailPoller } from "./services/gmail";
 import { startNewsPoller } from "./services/news";
 import { startDreamingPoller } from "./services/dreaming";
 import { startNewsDigestPoller } from "./services/news-digest";
+import { startSchedulerPoller } from "./services/scheduler";
 
 export function createServer(): McpServer {
   const server = new McpServer({
@@ -35,6 +37,7 @@ export function createServer(): McpServer {
   registerNewsTools(server);
   registerDreamingTools(server);
   registerUserbotTools(server);
+  registerSchedulerTools(server);
 
   return server;
 }
@@ -126,6 +129,7 @@ async function main(): Promise<void> {
   startNewsPoller();
   startDreamingPoller();
   startNewsDigestPoller();
+  startSchedulerPoller();
 }
 
 main().catch((err) => {

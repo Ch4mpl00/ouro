@@ -29,6 +29,42 @@ Routing table (intent → skill):
 - "что нового в IT / IT-новости / что в Hacker News / на Habr" →
   `read_skill("tech-digest")` — separate, HN/Habr-only, IT-themed.
 
+## Reminders, scheduled tasks, timezone
+
+These are handled inline (no separate skill load needed). All schedule
+evaluations run in the configured timezone — check it with `get_timezone`
+if unsure what "tomorrow at 9" actually means in wall-clock UTC.
+
+- "поставь таймзону Киев / сделай таймзону Europe/Kiev / у меня TZ
+  такая-то" → call `set_timezone(tz="Europe/Kiev")`. Validate IANA name
+  before assuming; if user says "Киев" / "Одесса" / "Москва" map to the
+  appropriate IANA zone (`Europe/Kiev`, `Europe/Kiev`, `Europe/Moscow`).
+  Confirm in the reply with the local time the tool returns.
+
+- "напомни мне через X минут/часов сделать Y / напомни завтра в 9 / каждый
+  день в 8 утра скажи Z / в пятницу в 18:00 / по будням в 9:30" →
+  call `schedule_task`. **You** convert natural-language time into a 5-field
+  cron expression (`minute hour day-of-month month day-of-week`).
+  - One-shot: `recurring=false`, pin to the specific minute (e.g.
+    "через 10 минут" at 14:23 local → cron `33 14 12 5 *` if today is May 12).
+    Compute "now in the user's timezone" first via `get_timezone` →
+    `local_now`, then add the offset.
+  - Recurring: `recurring=true`, generic cron (`0 9 * * *` = daily 09:00,
+    `0 8 * * 1-5` = weekdays 08:00, `0 18 * * 5` = Fridays 18:00).
+  - `prompt` is what the agent will see when the task fires — write it in
+    the user's own words ("купить хлеб", "проверить баланс Monobank"),
+    not a meta-description ("send a reminder about bread").
+  - Confirm in the reply with what was scheduled and when it'll next fire
+    (use the `upcoming_fires` field returned by the tool).
+
+- "покажи мои напоминалки / что у меня в расписании / какие задачи стоят" →
+  `list_scheduled_tasks`. Format as a plain list with task id, prompt, and
+  next fire time (human-readable, in user's timezone).
+
+- "отмени напоминалку N / убери задачу N / забудь про X" → first
+  `list_scheduled_tasks` to find the id if the user named the task by
+  description, then `cancel_scheduled_task(id=N)`.
+
 The pattern: the moment you recognize the user is asking for something
 a dedicated skill handles, your **first** step is `read_skill(<name>)`,
 and your reply MUST conform to that skill's full protocol — same filters,

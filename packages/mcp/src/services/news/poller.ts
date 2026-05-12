@@ -1,4 +1,5 @@
 import { recordSignal } from "../signals";
+import { localTime } from "../settings";
 import { getKv, setKv } from "./storage";
 
 // Daily digest poller. Once per local-time day, after the configured hour,
@@ -22,19 +23,9 @@ function targetHour(): number {
   return Math.floor(n);
 }
 
-function todayLocalDate(): string {
-  const d = new Date();
-  const year = d.getFullYear();
-  const month = String(d.getMonth() + 1).padStart(2, "0");
-  const day = String(d.getDate()).padStart(2, "0");
-  return `${year}-${month}-${day}`;
-}
-
 function tick(): void {
-  const today = todayLocalDate();
+  const { date: today, hour } = localTime();
   if (getKv(LAST_DIGEST_KEY) === today) return;
-
-  const hour = new Date().getHours();
   if (hour < targetHour()) return;
 
   setKv(LAST_DIGEST_KEY, today);
@@ -58,7 +49,7 @@ export function startNewsPoller(): void {
   // unscheduled digest. The first real digest fires at NEWS_DIGEST_HOUR
   // tomorrow.
   if (getKv(LAST_DIGEST_KEY) === null) {
-    setKv(LAST_DIGEST_KEY, todayLocalDate());
+    setKv(LAST_DIGEST_KEY, localTime().date);
     console.log(`${logPrefix()} bootstrapped watermark to today, no emit until tomorrow`);
   }
   tick();

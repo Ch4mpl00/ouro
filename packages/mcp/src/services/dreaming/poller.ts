@@ -1,4 +1,5 @@
 import { recordSignal } from "../signals";
+import { localTime } from "../settings";
 import { getKv, setKv, getLastDreamingAt } from "./storage";
 
 // Daily dreaming poller. Once per local-time day, after the configured
@@ -27,15 +28,10 @@ function targetHour(): number {
   return Math.floor(n);
 }
 
-function todayLocalDate(): string {
-  const d = new Date();
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
-}
-
 function tick(): void {
-  const today = todayLocalDate();
+  const { date: today, hour } = localTime();
   if (getKv(LAST_FIRE_DATE_KEY) === today) return;
-  if (new Date().getHours() < targetHour()) return;
+  if (hour < targetHour()) return;
 
   const since = getLastDreamingAt();
   const nowIso = new Date().toISOString();
@@ -62,7 +58,7 @@ function tick(): void {
 export function startDreamingPoller(): void {
   console.log(`${logPrefix()} started (dream at ${targetHour()}:00 local time, daily)`);
   if (getKv(LAST_FIRE_DATE_KEY) === null) {
-    setKv(LAST_FIRE_DATE_KEY, todayLocalDate());
+    setKv(LAST_FIRE_DATE_KEY, localTime().date);
     console.log(`${logPrefix()} bootstrapped watermark to today, no emit until tomorrow`);
   }
   tick();
