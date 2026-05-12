@@ -51,8 +51,14 @@ function sleep(ms: number): Promise<void> {
 }
 
 async function runSignal(engine: Engine, signal: PendingSignal): Promise<void> {
-  const [sourceSkill, handoffSkill, sessionContext] = await Promise.all([
+  // Two meta-skills are always loaded alongside the source skill:
+  //   - routing — "if the request matches a different domain than the
+  //     signal source's, read that skill via read_skill and apply it"
+  //   - handoff — "when to escalate reasoning_effort / model"
+  // Both are domain-agnostic guidance the agent needs on every signal.
+  const [sourceSkill, routingSkill, handoffSkill, sessionContext] = await Promise.all([
     loadSkill(signal.source),
+    loadSkill("routing"),
     loadSkill("handoff"),
     buildSessionContext(engine),
   ]);
@@ -65,10 +71,11 @@ async function runSignal(engine: Engine, signal: PendingSignal): Promise<void> {
   }
 
   // Order: context block first (so the model sees "current state" up front),
-  // then the per-source skill, then the integration env, then the handoff
-  // appendix.
+  // then the per-source skill, then the integration env, then the
+  // always-loaded meta-skills (routing, handoff).
   const parts: string[] = [sessionContext, sourceSkill];
   if (signal.envContext) parts.push(signal.envContext);
+  if (routingSkill) parts.push(routingSkill);
   if (handoffSkill) parts.push(handoffSkill);
   const systemPrompt = parts.join("\n\n---\n\n");
 
