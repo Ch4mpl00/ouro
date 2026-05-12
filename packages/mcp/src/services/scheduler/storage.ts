@@ -10,6 +10,7 @@ export interface ScheduledTaskRow {
   cron_expr: string;
   recurring: number; // 0 | 1
   prompt: string;
+  source: string | null; // null → signal source 'scheduler' (user-created)
   last_run_at: number | null;
   created_at: string;
 }
@@ -18,13 +19,19 @@ export function insertScheduledTask(input: {
   cron_expr: string;
   recurring: boolean;
   prompt: string;
+  source?: string | null;
 }): ScheduledTaskRow {
   const stmt = getDb().prepare(
-    `INSERT INTO scheduled_tasks (cron_expr, recurring, prompt)
-     VALUES (?, ?, ?)
-     RETURNING id, cron_expr, recurring, prompt, last_run_at, created_at`,
+    `INSERT INTO scheduled_tasks (cron_expr, recurring, prompt, source)
+     VALUES (?, ?, ?, ?)
+     RETURNING id, cron_expr, recurring, prompt, source, last_run_at, created_at`,
   );
-  return stmt.get(input.cron_expr, input.recurring ? 1 : 0, input.prompt) as ScheduledTaskRow;
+  return stmt.get(
+    input.cron_expr,
+    input.recurring ? 1 : 0,
+    input.prompt,
+    input.source ?? null,
+  ) as ScheduledTaskRow;
 }
 
 // Tasks that may still fire — recurring (always) or one-shots that haven't
@@ -33,7 +40,7 @@ export function insertScheduledTask(input: {
 export function listActiveTasks(): ScheduledTaskRow[] {
   return getDb()
     .prepare(
-      `SELECT id, cron_expr, recurring, prompt, last_run_at, created_at
+      `SELECT id, cron_expr, recurring, prompt, source, last_run_at, created_at
          FROM scheduled_tasks
         WHERE recurring = 1 OR last_run_at IS NULL
         ORDER BY id ASC`,
@@ -44,7 +51,7 @@ export function listActiveTasks(): ScheduledTaskRow[] {
 export function getScheduledTask(id: number): ScheduledTaskRow | null {
   const row = getDb()
     .prepare(
-      `SELECT id, cron_expr, recurring, prompt, last_run_at, created_at
+      `SELECT id, cron_expr, recurring, prompt, source, last_run_at, created_at
          FROM scheduled_tasks WHERE id = ?`,
     )
     .get(id) as ScheduledTaskRow | undefined;

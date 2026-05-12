@@ -1,8 +1,10 @@
 # Dreaming signal handling
 
 You are reacting to a `source=dreaming` signal — a periodic reflection
-window. The signal `content` (your first user message) tells you the
-previous `last_dreaming_at` watermark and the current timestamp.
+window. The signal `content` (your first user message) has a header
+with `Previous fire: <ISO | "never">` — that's the watermark to scope
+your review from. The scheduler-poller advances it automatically when
+the next slot fires; you don't need to set it yourself.
 
 ## Goal
 
@@ -25,11 +27,13 @@ no other skill should ever modify `skills/<source>.md`.
 2. **Pull the recent activity.**
 
    ```
-   list_signals(since="<the timestamp from the signal content>", limit=500)
+   list_signals(since="<Previous fire value from the signal header>", limit=500)
    ```
 
    This is the full window of signals the agent has processed (or is
    processing) since the last dreaming. Group them mentally by `source`.
+   On the first ever fire (`Previous fire: never`), default `since` to
+   `now - 24h` so the very first reflection has something to look at.
 
 3. **Reflect skill-by-skill.** For each skill that has signals in the
    window:
@@ -76,16 +80,6 @@ no other skill should ever modify `skills/<source>.md`.
       Pass the **complete** new file body — `write_skill` overwrites.
       Preserve the existing structure (sections, examples, rules) and
       surgical-add or remove. Don't rewrite from scratch.
-
-4. **Stamp the watermark.** Once finished (whether you edited anything
-   or not):
-
-   ```
-   set_last_dreaming_at(timestamp="<the 'Now is:' value from the signal content>")
-   ```
-
-   This is what tells the next dreaming session where to start. Skip
-   this and you'll re-process the same window forever.
 
 ## Editing rules
 

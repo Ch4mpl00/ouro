@@ -1,9 +1,12 @@
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { listSignals } from "../services/signals";
-import { setLastDreamingAt } from "../services/dreaming";
 import { jsonResult } from "../result";
 
+// "dreaming tools" is a historical name — only `list_signals` lives here
+// now. The previous fire timestamp the dreaming skill needs is delivered
+// directly in the signal content (header `Previous fire: …`), so no
+// separate watermark KV / tool is required.
 export function registerDreamingTools(server: McpServer): void {
   server.registerTool(
     "list_signals",
@@ -27,24 +30,6 @@ export function registerDreamingTools(server: McpServer): void {
     async ({ since, source, limit }) => {
       const rows = listSignals({ since, source, limit });
       return jsonResult({ count: rows.length, signals: rows });
-    },
-  );
-
-  server.registerTool(
-    "set_last_dreaming_at",
-    {
-      title: "Stamp the dreaming watermark",
-      description:
-        "Persist `last_dreaming_at` so the next dreaming session knows the " +
-        "cutoff. Call this once at the end of a successful dreaming session, " +
-        "with the timestamp shown in the signal content (the 'Now is:' value).",
-      inputSchema: {
-        timestamp: z.string().describe("ISO timestamp to store as last_dreaming_at."),
-      },
-    },
-    async ({ timestamp }) => {
-      setLastDreamingAt(timestamp);
-      return jsonResult({ ok: true, lastDreamingAt: timestamp });
     },
   );
 }

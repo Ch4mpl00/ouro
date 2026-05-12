@@ -17,9 +17,6 @@ import { registerUserbotTools } from "./tools/userbot";
 import { registerSchedulerTools } from "./tools/scheduler";
 import { startTelegramPoller } from "./services/telegram";
 import { startGmailPoller } from "./services/gmail";
-import { startNewsPoller } from "./services/news";
-import { startDreamingPoller } from "./services/dreaming";
-import { startNewsDigestPoller } from "./services/news-digest";
 import { startSchedulerPoller } from "./services/scheduler";
 import { startUserbotPoller } from "./services/telegram/userbot";
 
@@ -127,9 +124,6 @@ async function main(): Promise<void> {
 
   startTelegramPoller();
   startGmailPoller();
-  startNewsPoller();
-  startDreamingPoller();
-  startNewsDigestPoller();
   startSchedulerPoller();
   startUserbotPoller();
 }

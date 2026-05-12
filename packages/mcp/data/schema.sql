@@ -110,6 +110,7 @@ CREATE TABLE IF NOT EXISTS scheduled_tasks (
   cron_expr   TEXT NOT NULL,
   recurring   INTEGER NOT NULL CHECK (recurring IN (0, 1)),
   prompt      TEXT NOT NULL,
+  source      TEXT,                              -- signal source on fire; NULL = "scheduler"
   last_run_at INTEGER,
   created_at  TEXT NOT NULL DEFAULT (datetime('now'))
 );
