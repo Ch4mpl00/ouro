@@ -35,16 +35,31 @@ function buildTransport(): Transport {
   });
 }
 
-export async function connectMcp(): Promise<McpHandle> {
-  const transport = buildTransport();
+// MCP sessions live in-memory on the server side. Any time the MCP container
+// restarts (rebuild, crash, healthcheck), the agent's cached session-id is
+// dead and every call comes back with "No valid session id; send an
+// initialize request first." We detect that, drop the dead client, and
+// transparently reconnect once before retrying the call.
+function isSessionLostError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  return msg.includes("No valid session id") || msg.includes("Session not found");
+}
 
+async function openClient(): Promise<Client> {
   const client = new Client(
     { name: "agent-loop", version: "0.1.0" },
     { capabilities: {} },
   );
+  await client.connect(buildTransport());
+  return client;
+}
 
-  await client.connect(transport);
+export async function connectMcp(): Promise<McpHandle> {
+  let client = await openClient();
 
+  // Tool schemas are stable across MCP restarts (we deploy mcp+agent in
+  // lockstep), so we list once at boot and reuse. If we ever change that,
+  // re-list inside the reconnect path.
   const { tools: mcpTools } = await client.listTools();
 
   const tools: ChatCompletionTool[] = mcpTools.map((t) => ({
@@ -60,7 +75,20 @@ export async function connectMcp(): Promise<McpHandle> {
     name: string,
     args: Record<string, unknown>,
   ): Promise<string> {
-    const result = await client.callTool({ name, arguments: args });
+    let result;
+    try {
+      result = await client.callTool({ name, arguments: args });
+    } catch (err) {
+      if (!isSessionLostError(err)) throw err;
+      console.warn("[mcp-client] session lost, reconnecting…");
+      try {
+        await client.close();
+      } catch {
+        /* dead session, close may itself fail — ignore */
+      }
+      client = await openClient();
+      result = await client.callTool({ name, arguments: args });
+    }
 
     const parts = Array.isArray(result.content) ? result.content : [];
     const text = parts
