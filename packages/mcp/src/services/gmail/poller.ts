@@ -1,5 +1,6 @@
 import { getDb } from "../../db/client";
-import { listMessages, type MessageSummary } from "./messages";
+import { findAttachments } from "./attachments";
+import { getRawMessage, listMessages, type MessageSummary } from "./messages";
 import { recordSignal } from "../signals";
 import { getKv, setKv } from "./storage";
 import { GMAIL_SUBSCRIPTIONS, type GmailSubscription } from "./subscriptions";
@@ -64,7 +65,13 @@ async function pollSubscription(sub: GmailSubscription, accountKey: string): Pro
     const md = Number(m.internalDate ?? 0);
     if (md <= watermarkMs) continue; // gmail's `after:` is non-strict (in seconds), dedupe defensively
 
-    recordSignal({ source: sub.signalSource, content: sub.buildContent(m) });
+    // Enrich the bare metadata with attachment refs so the agent gets a
+    // self-contained signal (messageId + attachmentId inline) — no need
+    // to re-query list_nashdom_mails and hunt for the matching row.
+    const raw = await getRawMessage(accountKey, m.id);
+    const attachments = findAttachments(raw);
+
+    recordSignal({ source: sub.signalSource, content: sub.buildContent(m, attachments) });
     emitted++;
     if (md > newWatermark) newWatermark = md;
   }
