@@ -1,7 +1,7 @@
 {
   "name": "@mcp-tools/agent",
   "version": "0.1.0",
-  "description": "Agent harness — DB + heartbeat scheduler. Spawns claude -p for triage and worker tiers.",
+  "description": "Agent supervisor — signal-driven loop that pulls events from the MCP queue, loads the matching skill, and runs one DeepSeek session per signal.",
   "private": true,
   "type": "module",
   "dependencies": {

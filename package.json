@@ -1,13 +1,12 @@
 {
   "name": "mcp-tools",
   "version": "0.1.0",
-  "description": "Personal-agent system: an MCP server (integrations) + an agent harness (heartbeat + DB).",
+  "description": "Personal-agent system: an MCP server (integrations) + an agent supervisor (signal-driven, DB-backed).",
   "private": true,
   "type": "module",
   "scripts": {
     "typecheck": "tsc --noEmit",
     "mcp:serve": "tsx packages/mcp/src/server.ts",
-    "heartbeat:start": "tsx packages/agent/src/heartbeat/start.ts",
     "agent:start": "tsx packages/agent/src/supervisor.ts",
     "db:init": "pnpm db:init:mcp && pnpm db:init:agent",
     "db:init:mcp": "mkdir -p packages/mcp/data && sqlite3 packages/mcp/data/tokens.db < packages/mcp/data/schema.sql",

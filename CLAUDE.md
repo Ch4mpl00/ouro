@@ -1,18 +1,42 @@
 # mcp-tools
 
-A personal-agent system structured as two independent projects in one pnpm workspace:
+A personal-agent system structured as two independent processes in one pnpm workspace:
 
-- **`packages/mcp`** — stateless MCP server. Wraps Gmail / Telegram / Monobank as primitive tools. Knows nothing about the agent.
-- **`packages/agent`** — agent harness. DB (domain memory) + heartbeat scheduler. Knows nothing about MCP internals — only the actions exposed by the MCP protocol.
+- **`packages/mcp`** — stateless MCP server. Wraps Gmail / Telegram / Monobank
+  as primitive tools and runs the pollers that turn external events into
+  signals on a queue. Knows nothing about the agent.
+- **`packages/agent`** — agent supervisor. Pulls one signal at a time from
+  MCP, loads the matching skill, runs one DeepSeek session, and stops.
+  Knows nothing about MCP internals — only the actions exposed by the
+  MCP protocol.
 
-Both communicate strictly through the MCP protocol when Claude is invoked. Neither imports code from the other.
+Both communicate strictly through the MCP protocol. Neither imports code from
+the other. Deployed as two containers (`docker-compose.yml`).
 
-## How a tick happens
+## How a signal turns into action
 
-1. **Heartbeat** (`pnpm heartbeat:start`) fires every minute (`HEARTBEAT_INTERVAL_MS`).
-2. The heartbeat spawns one `claude -p` (Haiku 4.5 by default — cheap, capable) pointed at `HEARTBEAT.md`.
-3. Claude reads `HEARTBEAT.md` fresh, runs the listed jobs (each with a precondition so most ticks are no-ops), and replies with a one-line summary.
-4. **Agent jobs grow by editing `HEARTBEAT.md`** — add a numbered job with a precondition + action. No code change in the heartbeat. Claude re-reads the file fresh on every tick.
+1. A poller inside `packages/mcp` fires on its own cadence — Gmail (1 min),
+   Telegram bot getUpdates (long-poll), userbot channels (30 min),
+   scheduler (30s, fires cron rows from `scheduled_tasks`).
+2. When it sees something new, it calls `recordSignal({ source, content,
+   envContext })` which inserts a row into the `signals` queue in
+   `packages/mcp/data/tokens.db`.
+3. The supervisor (`packages/agent/src/supervisor.ts`) loops on
+   `get_next_signal`. When a signal pops, it loads three things:
+   - `skills/<signal.source>.md` (with `skills.default/` fallback) — the
+     primary domain skill.
+   - `skills/routing.md` — always loaded; tells the model to delegate to
+     another skill if the prompt matches a different domain.
+   - `skills/handoff.md` — always loaded; rules for escalating reasoning
+     effort mid-session.
+4. Plus a session-context block (local time, tz, watermarks) and the signal's
+   `envContext` (per-source env addendum, e.g. default Telegram chat id).
+5. The signal's `content` is pushed as the first user message. DeepSeek
+   runs the session; every side effect (Telegram reply, DB write) is a
+   tool call.
+
+To add a new domain: drop a `skills.default/<name>.md` + emit signals with
+`source=<name>` from a new poller. No supervisor change.
 
 ## Layout
 
@@ -21,72 +45,114 @@ mcp-tools/
 ├── pnpm-workspace.yaml
 ├── package.json            workspace orchestration scripts only
 ├── tsconfig.json           shared TS config (covers both packages)
-├── .mcp.json               registers packages/mcp with Claude Code
-├── .env, .env.example      shared by both packages
-├── HEARTBEAT.md            heartbeat instructions (per-tick job list); edit to extend
-├── .claude/skills/         {check-nashdom-bills, reconcile-bill-payments}
+├── .mcp.json               registers packages/mcp with Claude Code (stdio)
+├── .env.mcp                MCP container env (integration creds)
+├── .env.agent              agent container env (DeepSeek key, model)
+├── .env.example, .env.mcp.example, .env.agent.example
+├── docker-compose.yml      two services: mcp + agent
+├── Dockerfile              one image for both
+├── skills.default/         shipped skills (git-tracked, read-only fallback)
+├── skills/                 live overlay, gitignored; dreaming writes here
 ├── storage/                downloaded Gmail attachments (gitignored)
 └── packages/
     ├── mcp/
-    │   ├── data/{schema.sql, tokens.db}        OAuth state only
-    │   └── src/{server, result, db, tools/*, services/{gmail,telegram,monobank}}
+    │   ├── data/{schema.sql, tokens.db}     OAuth, watermarks, signals, scheduled_tasks
+    │   └── src/
+    │       ├── server.ts                    starts pollers + HTTP/stdio transport
+    │       ├── tools/                       MCP-exposed actions
+    │       └── services/{gmail,telegram,monobank,scheduler,news,pdf,signals,settings}
     └── agent/
-        ├── data/{schema.sql, agent.db}         domain state (bills, memory)
-        └── src/{db, heartbeat/start.ts}
+        ├── data/{schema.sql, agent.db}      agent-side state (memory KV)
+        └── src/
+            ├── supervisor.ts                main loop
+            ├── engine.ts, session.ts        DeepSeek runner + synthetic tools
+            ├── mcp-client.ts                StreamableHTTP client
+            ├── session-context.ts           markdown context block builder
+            ├── skills.ts                    two-layer loader (live → default)
+            └── db/{client.ts, memory.ts}    KV helpers
 ```
 
 ## Stack
 
 - TypeScript (ESM, `module: Preserve`, `moduleResolution: Bundler`)
-- `@modelcontextprotocol/sdk` (stdio transport, in `packages/mcp`)
-- `better-sqlite3` for Node code; `sqlite3` CLI from Bash for Claude
-- `googleapis` + `google-auth-library` (Gmail, read-only)
+- `@modelcontextprotocol/sdk` (stdio + StreamableHTTP transport)
+- `better-sqlite3` for Node code; `sqlite3` CLI from Bash for ad-hoc queries
+- `googleapis` + `google-auth-library` (Gmail)
+- `telegram` (gramjs / MTProto) for userbot channel reading
+- `cron-parser` v5 for scheduled tasks
+- `openai` SDK pointed at DeepSeek (OpenAI-compatible)
 
-## DB context (Claude's memory)
+## Two databases — split by ownership
 
-Two databases. **Claude's domain state lives in `packages/agent/data/agent.db`.** MCP's `tokens.db` is internal — don't read or write it from skills.
+- **`packages/mcp/data/tokens.db`** — MCP's private state. OAuth tokens,
+  Gmail watermarks, Telegram poll cursors, the `signals` queue, the
+  `scheduled_tasks` table, userbot channel watermarks. Don't read or write
+  this from agent code — go through MCP tools.
+- **`packages/agent/data/agent.db`** — agent's domain state. Currently
+  only `memory` (freeform KV, e.g. `news_digest.last_read_at`). A `bills`
+  table exists in schema as a leftover from earlier reconciliation work
+  but is no longer populated.
 
-Schema: see `packages/agent/data/schema.sql`. Re-apply with `pnpm db:init:agent` (idempotent).
+Schemas: `packages/mcp/data/schema.sql`, `packages/agent/data/schema.sql`.
+Re-apply with `pnpm db:init` (idempotent).
 
-Tables in `agent.db`:
-
-- **`bills`** — tracked NashDom bills. Dedup on `message_id`. Fields: `id`, `message_id`, `subject`, `from`, `date`, `invoice_date` (YYYY-MM), `account`, `address`, `type`, `amount`, `currency`, `ibans` (JSON array string), `telegram_chat_id`, `telegram_message_id`, `paid` (0|1), `paid_at`, `paid_transaction_id`, `notes`, `created_at`, `updated_at`. The reconciler writes `paid*`; everything else is set on first ingestion.
-- **`memory`** — freeform `(key, value)` KV. Use for anything you want to remember that doesn't fit a typed table (e.g. "last seen Monobank txn id"). `value` is a JSON string by convention.
-
-Query conventions:
+For ad-hoc queries during development:
 
 ```bash
-sqlite3 -json packages/agent/data/agent.db "SELECT ... FROM bills WHERE paid = 0"
-sqlite3      packages/agent/data/agent.db "UPDATE bills SET paid = 1, paid_at = datetime('now') WHERE id = 7"
+sqlite3 -json packages/agent/data/agent.db "SELECT * FROM memory"
+sqlite3      packages/agent/data/agent.db "UPDATE memory SET value=? WHERE key=?"
 ```
 
-For multi-line / quote-heavy SQL, use a heredoc. Always single-quote string literals; double single quotes inside (`'O''Brien'`).
+For multi-line / quote-heavy SQL, use a heredoc. Always single-quote
+string literals; double single quotes inside (`'O''Brien'`).
 
-## MCP tools (exposed actions)
+## MCP tools (signal-emitting + agent-callable)
 
-- `list_nashdom_mails(limit?)` — unread NashDom emails with PDF attachments. No side effects.
-- `download_gmail_attachment(messageId, attachmentId, filename?)` — saves to `./storage/gmail/<account>/<messageId>/...`, returns absolute filePath.
-- `send_telegram_message(text, chatId?)` — send via assistant bot. Returns the Telegram `messageId` — persist it on the relevant bill row so the reconciler can later edit-in-place.
-- `edit_telegram_message(chatId, messageId, text)` — edit a previously-sent message (e.g. mark a bill PAID).
-- `list_monobank_transactions(accountId?, days?)` — recent transactions. Default account `'0'`, default 7d, max 31d. Rate-limited 1 req / 60s / account.
+Defined in `packages/mcp/src/tools/`. The agent calls these via MCP; you
+also see them when running `claude` locally with `.mcp.json` registered.
 
-## Skills
+- **Gmail** — `list_nashdom_mails`, `download_gmail_attachment`
+- **Telegram bot** — `send_telegram_message`, `edit_telegram_message`,
+  `send_telegram_chat_action`, `get_telegram_chat_history`
+- **Telegram userbot (read-only MTProto)** — `list_userbot_dialogs`,
+  `list_channel_posts`
+- **Monobank** — `list_monobank_transactions` (no poller; reactive only)
+- **News** — `list_news_headlines`, `fetch_article` (HN, Habr)
+- **PDF** — `read_pdf`
+- **Files** — `read_file`
+- **Signals queue** — `get_next_signal`, `list_signals`
+- **Scheduler** — `schedule_task`, `list_scheduled_tasks`,
+  `cancel_scheduled_task`
+- **Env** — `get_timezone`, `set_timezone`
 
-- `check-nashdom-bills` — ingest new bills from Gmail into `agent.db` and notify via Telegram. Used by HEARTBEAT.md job #1 and also user-invocable.
-- `reconcile-bill-payments` — match Monobank txns against unpaid bills, mark paid, update Telegram. Used by HEARTBEAT.md job #2 and also user-invocable.
+## Agent skills
+
+Live under `skills.default/` (git-tracked, shipped in image) with an
+optional live overlay in `skills/` (gitignored, mounted as a Docker
+volume — written by the `dreaming` skill when it self-revises).
+
+`loadSkill(name)` reads `skills/<name>.md` first, falls back to
+`skills.default/<name>.md`. Naming is signal-source-based:
+
+- `nashdom-bill`, `news-digest`, `tech-digest`, `dreaming`, `scheduler`,
+  `telegram` — primary domain skills, loaded per signal.source.
+- `routing`, `handoff` — always loaded on top.
 
 ## Running
 
-- `pnpm db:init` — apply both schemas (mcp/tokens.db + agent/agent.db). Idempotent.
-- `pnpm mcp:serve` — start the integrations MCP (also auto-launched by Claude Code via `.mcp.json`).
-- `pnpm heartbeat:start` — long-running agent loop. Keep alive in tmux/launchd.
-- `pnpm gmail:auth` — one-time OAuth bootstrap. Writes to `packages/mcp/data/tokens.db`.
+- `pnpm db:init` — apply both schemas (mcp/tokens.db + agent/agent.db).
+- `pnpm mcp:serve` — start the MCP server. **Do not run locally if the
+  droplet is also running it** — Telegram getUpdates is exclusive and the
+  second poller causes 409 Conflict.
+- `pnpm agent:start` — start the supervisor (long-running loop).
+- `pnpm gmail:auth` — one-time OAuth bootstrap. Writes to
+  `packages/mcp/data/tokens.db`.
 - `pnpm gmail:list-unread` — debug helper.
-- `pnpm telegram:get-chat-id` — discover your chat id (after sending any message to your bot).
+- `pnpm telegram:get-chat-id` — discover your chat id (after sending any
+  message to your bot).
+- `pnpm userbot:auth` — one-time MTProto login (phone + code).
 - `pnpm typecheck` — typecheck both packages.
 
-## Heartbeat env
-
-- `HEARTBEAT_INTERVAL_MS` (default `60000`) — tick interval.
-- `HEARTBEAT_TIMEOUT_MS` (default `300000`) — per-tick max wall time.
-- `HEARTBEAT_MODEL` (default `claude-haiku-4-5-20251001`) — model spawned every tick. Switch to `claude-sonnet-4-6` if you need more reasoning power.
+Deploy: see `docker-compose.yml`. `docker compose up -d --build` on the
+droplet; named volumes (`mcp-data`, `mcp-storage`, `agent-data`,
+`agent-skills`) persist state across rebuilds.

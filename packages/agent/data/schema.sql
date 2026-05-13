@@ -1,4 +1,4 @@
--- Agent-side state. Domain memory for the heartbeat-driven agent.
+-- Agent-side state. Domain memory for the signal-driven supervisor.
 -- Re-run via `pnpm db:init:agent`. Idempotent (IF NOT EXISTS).
 
 PRAGMA journal_mode = WAL;
