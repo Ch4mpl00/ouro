@@ -1,12 +1,17 @@
-import { Langfuse, type LangfuseTraceClient } from "langfuse";
+import {
+  Langfuse,
+  type LangfuseGenerationClient,
+  type LangfuseSpanClient,
+  type LangfuseTraceClient,
+} from "langfuse";
 import type {
   Generation,
   GenerationStartOpts,
   Span,
   SpanStartOpts,
   Trace,
+  TraceContextUpdate,
   TraceStartOpts,
-  TraceUpdate,
   Tracer,
 } from "./tracing";
 
@@ -26,32 +31,47 @@ export function createLangfuseTracer(client: Langfuse): Tracer {
 
 function wrapTrace(t: LangfuseTraceClient): Trace {
   return {
-    update(data: TraceUpdate): void {
+    update(data: TraceContextUpdate): void {
       t.update(data);
     },
     generation(opts: GenerationStartOpts): Generation {
-      const g = t.generation({ ...opts, startTime: new Date() });
-      return {
-        end(end) {
-          g.end({
-            output: end.output,
-            level: end.level,
-            statusMessage: end.statusMessage,
-            usage: end.usage ? { ...end.usage, unit: "TOKENS" } : undefined,
-          });
-        },
-      };
+      return wrapGeneration(t.generation({ ...opts, startTime: new Date() }));
     },
     span(opts: SpanStartOpts): Span {
-      const s = t.span({ ...opts, startTime: new Date() });
-      return {
-        update(data) {
-          s.update(data);
-        },
-        end(end) {
-          s.end(end);
-        },
-      };
+      return wrapSpan(t.span({ ...opts, startTime: new Date() }));
+    },
+  };
+}
+
+function wrapSpan(s: LangfuseSpanClient): Span {
+  return {
+    update(data: TraceContextUpdate): void {
+      s.update(data);
+    },
+    end(opts): void {
+      s.end(opts);
+    },
+    // Spans host their own nested generations/spans — this is what enables
+    // a sub-agent's iter-N generations to render inside the parent's
+    // `invoke_sub_agent` span instead of in a separate top-level trace.
+    generation(opts: GenerationStartOpts): Generation {
+      return wrapGeneration(s.generation({ ...opts, startTime: new Date() }));
+    },
+    span(opts: SpanStartOpts): Span {
+      return wrapSpan(s.span({ ...opts, startTime: new Date() }));
+    },
+  };
+}
+
+function wrapGeneration(g: LangfuseGenerationClient): Generation {
+  return {
+    end(end): void {
+      g.end({
+        output: end.output,
+        level: end.level,
+        statusMessage: end.statusMessage,
+        usage: end.usage ? { ...end.usage, unit: "TOKENS" } : undefined,
+      });
     },
   };
 }

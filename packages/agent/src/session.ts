@@ -2,7 +2,7 @@ import type { ChatCompletionMessageParam } from "openai/resources/chat/completio
 import type { Engine } from "./engine";
 import { setMemory } from "./db/memory";
 import { listSkills, readSkill, saveSkill } from "./skills";
-import type { Trace } from "./tracing";
+import type { TraceContext } from "./tracing";
 import {
   SYNTHETIC_TOOLS,
   SYNTHETIC_TOOLS_BY_NAME,
@@ -61,6 +61,13 @@ export interface SessionOpts {
   // for the primary session AND its recovery — so a crashed run and its
   // user-facing error report end up side-by-side under one session.
   sessionId?: string;
+  // Pre-created trace scope from a caller. When present, this session
+  // nests its generations and tool spans inside the given scope instead
+  // of creating a new top-level trace. Used for sub-agents — the parent's
+  // `invoke_sub_agent` tool span IS the child's scope, so a sub-agent's
+  // iters/tool calls render under the parent's trace in the UI. Omit for
+  // top-level sessions (primary + recovery).
+  traceScope?: TraceContext;
 }
 
 const DEFAULT_MAX_ITERATIONS = 100;
@@ -106,7 +113,16 @@ export class Session {
   private model: string;
   private reasoningEffort: ReasoningEffort;
   private readonly maxIterations: number;
-  private readonly trace: Trace;
+  // Trace surface for this session. For top-level sessions this is a Trace
+  // created from `engine.tracer.trace(...)`; for sub-agents it's the parent's
+  // `invoke_sub_agent` span passed in via `opts.traceScope`. The Session
+  // API is the same either way — both implement TraceContext.
+  private readonly scope: TraceContext;
+  // True when this session owns its trace scope (top-level). Sub-agents
+  // (`ownsScope=false`) don't touch the scope's input/output/error fields —
+  // those belong to the parent's tool span and are already populated by
+  // the parent's dispatch loop.
+  private readonly ownsScope: boolean;
   private subAgentCounter = 0;
   private closed = false;
 
@@ -133,30 +149,53 @@ export class Session {
       this.messages.push({ role: "system", content: combinedSystem });
     }
 
-    // One trace per session. Generations + tool spans get attached to it
-    // inside `runUntilSettled`. Output + final status are updated when the
-    // loop exits (success, error, or maxIterations). `trace.input` is
-    // intentionally NOT set here — it's populated in `runUntilSettled`
-    // from the first user message so the Session-replay UI shows a clean
-    // `user → assistant` exchange instead of the long system prompt.
-    // System prompt + skills live in metadata. When tracing is disabled
-    // the engine's tracer is a no-op, so the .trace()/.generation()/.span()
-    // calls below stay safe and Session itself doesn't null-check.
-    this.trace = engine.tracer.trace({
-      id: this.id,
-      name: this.id,
-      sessionId: opts.sessionId,
-      tags: opts.tags,
-      metadata: {
-        ...opts.metadata,
-        systemPrompt: opts.systemPrompt,
-        skills: skillsMap,
-        model: this.model,
-        reasoningEffort: this.reasoningEffort,
-        maxIterations: this.maxIterations,
-        parentId: this.parentId,
-      },
-    });
+    // Set up the trace scope. Two paths:
+    //   - top-level: create a new Trace (and own its input/output/metadata).
+    //   - sub-agent: reuse the parent's `invoke_sub_agent` span so all the
+    //     child's iter generations + tool spans render nested inside the
+    //     parent's trace. We don't take ownership of the scope's
+    //     input/output — those describe the tool call from the parent's
+    //     POV — but we annotate it with sub-agent identity & config so the
+    //     UI can show what was loaded into the child.
+    if (opts.traceScope) {
+      this.scope = opts.traceScope;
+      this.ownsScope = false;
+      this.scope.update({
+        metadata: {
+          sub_agent_id: this.id,
+          sub_agent_skills: skillsMap,
+          sub_agent_model: this.model,
+          sub_agent_reasoning_effort: this.reasoningEffort,
+          sub_agent_max_iterations: this.maxIterations,
+        },
+      });
+    } else {
+      // Generations + tool spans get attached to this trace inside
+      // `runUntilSettled`. Output + final status are updated when the
+      // loop exits (success, error, or maxIterations). `trace.input` is
+      // intentionally NOT set here — it's populated in `runUntilSettled`
+      // from the first user message so the Session-replay UI shows a clean
+      // `user → assistant` exchange instead of the long system prompt.
+      // System prompt + skills live in metadata. When tracing is disabled
+      // the engine's tracer is a no-op, so the .generation()/.span() calls
+      // below stay safe and Session itself doesn't null-check.
+      this.scope = engine.tracer.trace({
+        id: this.id,
+        name: this.id,
+        sessionId: opts.sessionId,
+        tags: opts.tags,
+        metadata: {
+          ...opts.metadata,
+          systemPrompt: opts.systemPrompt,
+          skills: skillsMap,
+          model: this.model,
+          reasoningEffort: this.reasoningEffort,
+          maxIterations: this.maxIterations,
+          parentId: this.parentId,
+        },
+      });
+      this.ownsScope = true;
+    }
   }
 
   async send(userText: string): Promise<string> {
@@ -178,10 +217,14 @@ export class Session {
     // Surface the user's prompt on the trace so the Session-replay UI
     // renders a real `user → assistant` exchange. Done here (not in the
     // constructor) because the caller pushes the user message AFTER
-    // startSession returns.
-    const firstUserMessage = this.messages.find((m) => m.role === "user");
-    if (firstUserMessage) {
-      this.trace.update({ input: firstUserMessage.content });
+    // startSession returns. Skip for sub-agents — their scope is the
+    // parent's tool span and the input there is the tool args, not the
+    // user message; overwriting would erase the parent's view.
+    if (this.ownsScope) {
+      const firstUserMessage = this.messages.find((m) => m.role === "user");
+      if (firstUserMessage) {
+        this.scope.update({ input: firstUserMessage.content });
+      }
     }
 
     try {
@@ -216,7 +259,7 @@ export class Session {
         // input — its full content already lives in `trace.metadata.
         // systemPrompt` and `trace.metadata.skills`, so repeating it in
         // every iter just floods the UI.
-        const generation = this.trace.generation({
+        const generation = this.scope.generation({
           name: `iter-${i}`,
           model: this.model,
           modelParameters: {
@@ -257,7 +300,9 @@ export class Session {
         this.engine.log(this.id, `iter ${i} finish=${choice.finish_reason} tool_calls=${message.tool_calls?.length ?? 0}`);
 
         if (!message.tool_calls?.length) {
-          this.trace.update({ output: message.content ?? "" });
+          if (this.ownsScope) {
+            this.scope.update({ output: message.content ?? "" });
+          }
           return message.content ?? "";
         }
 
@@ -271,7 +316,7 @@ export class Session {
             // Span per tool call. We open it BEFORE parsing args so a
             // malformed-JSON throw still leaves a measurable, attributed
             // span in the trace.
-            const span = this.trace.span({
+            const span = this.scope.span({
               name: call.function.name,
               input: { raw_arguments: call.function.arguments },
             });
@@ -285,7 +330,10 @@ export class Session {
               const name = call.function.name;
               const synthetic = SYNTHETIC_TOOLS_BY_NAME.get(name);
               if (synthetic) {
-                result = await synthetic.handle(this, args);
+                // Pass the span as the third arg — `invoke_sub_agent` reuses
+                // it as the child session's trace scope so the sub-agent's
+                // iters render nested here in the UI.
+                result = await synthetic.handle(this, args, span);
               } else {
                 result = await mcp.callTool(name, args);
               }
@@ -319,10 +367,15 @@ export class Session {
       // Trace-level error marker. Individual generation/span errors are
       // already attributed above; this surfaces failed sessions in the
       // tracing list view (sort by metadata.error or filter by output.error).
-      this.trace.update({
-        output: { error: (err as Error).message },
-        metadata: { error: true },
-      });
+      // Sub-agents skip this — the parent's `invoke_sub_agent` span will
+      // capture the error via its own `.end({ level: ERROR })` once the
+      // exception propagates back to the dispatch loop.
+      if (this.ownsScope) {
+        this.scope.update({
+          output: { error: (err as Error).message },
+          metadata: { error: true },
+        });
+      }
       throw err;
     }
   }
@@ -372,7 +425,7 @@ export class Session {
     }
   }
 
-  async applyInvokeSubAgent(args: InvokeSubAgentArgs): Promise<string> {
+  async applyInvokeSubAgent(args: InvokeSubAgentArgs, parentSpan: TraceContext): Promise<string> {
     if (!Array.isArray(args.skills) || args.skills.length === 0) {
       return `[invoke_sub_agent error] "skills" must be a non-empty string array`;
     }
@@ -384,10 +437,9 @@ export class Session {
     }
 
     this.subAgentCounter += 1;
-    // `__sub` (double underscore) keeps the id ASCII-only and avoids
-    // `/` — some tracing-backend path/upsert semantics got confused when
-    // the trace id contained a slash, leaving the parent's name overwritten
-    // by the child's. Plain underscores stay safe.
+    // `__sub` (double underscore) keeps the id ASCII-only and unique
+    // (used for log lines and metadata; not a trace id anymore — the
+    // sub-agent renders inside the parent's `invoke_sub_agent` span).
     const childId = `${this.id}__sub${this.subAgentCounter}`;
 
     let child: Session;
@@ -404,15 +456,11 @@ export class Session {
         reasoningEffort: args.reasoning_effort ?? "disabled",
         maxIterations: args.max_iterations ?? 50,
         parentId: this.id,
-        // Inherit the parent's trace-grouping session so the child
-        // trace lands in the same Sessions-view row.
         sessionId: this.sessionId,
-        tags: ["sub-agent", ...args.skills],
-        metadata: {
-          parent_id: this.id,
-          parent_session_id: this.sessionId,
-          invoked_skills: args.skills,
-        },
+        // Nest the sub-agent inside the parent's `invoke_sub_agent` span.
+        // All iter generations + tool spans the child opens land here, so
+        // the parent's trace view shows the whole sub-session inline.
+        traceScope: parentSpan,
       });
     } catch (err) {
       return `[invoke_sub_agent error] failed to start: ${(err as Error).message}`;

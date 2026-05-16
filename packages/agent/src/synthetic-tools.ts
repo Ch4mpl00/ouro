@@ -1,5 +1,6 @@
 import type { ChatCompletionTool } from "openai/resources/chat/completions";
 import type { ReasoningEffort, Session } from "./session";
+import type { TraceContext } from "./tracing";
 
 // Agent-side synthetic tools — intercepted inside the Session loop and
 // never forwarded to the MCP server. Each tool is declared as the
@@ -256,9 +257,15 @@ export interface InvokeSubAgentArgs {
 export interface SyntheticTool {
   def: ChatCompletionTool;
   visibleTo?: (session: Session) => boolean;
+  // `span` is the trace span the dispatch loop opened for this tool call.
+  // Most handlers ignore it; `invoke_sub_agent` reuses it as the child
+  // session's trace scope so the sub-agent's iter/tool spans nest inside
+  // the parent's `invoke_sub_agent` span (one trace per top-level session
+  // instead of one per session).
   handle: (
     session: Session,
     args: Record<string, unknown>,
+    span: TraceContext,
   ) => Promise<string> | string;
 }
 
@@ -289,7 +296,7 @@ export const SYNTHETIC_TOOLS: SyntheticTool[] = [
     // can't finish without further delegation, the parent picked the
     // wrong skill — not a job for recursion.
     visibleTo: (s) => s.parentId === undefined,
-    handle: (s, args) => s.applyInvokeSubAgent(args as InvokeSubAgentArgs),
+    handle: (s, args, span) => s.applyInvokeSubAgent(args as InvokeSubAgentArgs, span),
   },
 ];
 

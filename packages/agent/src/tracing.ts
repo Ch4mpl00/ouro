@@ -3,9 +3,10 @@
 // that returns objects matching these shapes. Replacing the backend means
 // adding a new adapter and swapping it in `createEngine`; no Session edits.
 //
-// The shape mirrors the standard trace → (generation|span) hierarchy used
-// by most LLM-observability tools: one trace per session, one generation
-// per LLM call, one span per tool call.
+// Hierarchy: a `TraceContext` is anything that can host nested children
+// (generations and spans). The root of a session is a Trace; spans can
+// themselves host children, enabling deep nesting (e.g. a sub-agent's
+// iterations rendered inside the parent's `invoke_sub_agent` span).
 
 export interface TokenUsage {
   input: number;
@@ -23,16 +24,11 @@ export interface GenerationEndOpts extends SpanEndOpts {
   usage?: TokenUsage;
 }
 
-export interface Span {
-  update(data: { input?: unknown }): void;
-  end(opts: SpanEndOpts): void;
-}
-
 export interface Generation {
   end(opts: GenerationEndOpts): void;
 }
 
-export interface TraceUpdate {
+export interface TraceContextUpdate {
   input?: unknown;
   output?: unknown;
   metadata?: Record<string, unknown>;
@@ -53,11 +49,24 @@ export interface SpanStartOpts {
   input?: unknown;
 }
 
-export interface Trace {
-  update(data: TraceUpdate): void;
+// Anything that can hold nested generations/spans and have its own
+// input/output/metadata updated. Both a Trace (session root) and a Span
+// (nested unit of work) qualify.
+export interface TraceContext {
+  update(data: TraceContextUpdate): void;
   generation(opts: GenerationStartOpts): Generation;
   span(opts: SpanStartOpts): Span;
 }
+
+// A Span is a TraceContext with a lifecycle terminator. Use `end` to set
+// the final output + status; `update` for intermediate refinements.
+export interface Span extends TraceContext {
+  end(opts: SpanEndOpts): void;
+}
+
+// Trace is the session-level root. Same shape as TraceContext — no
+// separate `end` because traces close implicitly when their tracer flushes.
+export type Trace = TraceContext;
 
 export interface TraceStartOpts {
   id: string;
@@ -75,13 +84,14 @@ export interface Tracer {
 
 // No-op tracer used when external tracing is disabled. Returning concrete
 // no-op objects (instead of forcing every call site to null-check) keeps
-// Session free of `?.` chains.
+// Session free of `?.` chains. The NOOP_SPAN self-reference works because
+// the property is a function — by the time it runs, the const exists.
+const NOOP_GENERATION: Generation = { end() {} };
 const NOOP_SPAN: Span = {
   update() {},
   end() {},
-};
-const NOOP_GENERATION: Generation = {
-  end() {},
+  generation: () => NOOP_GENERATION,
+  span: () => NOOP_SPAN,
 };
 const NOOP_TRACE: Trace = {
   update() {},
