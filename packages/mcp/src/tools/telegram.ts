@@ -7,6 +7,8 @@ import {
   getDefaultChatId,
   recordMessage,
   getChatHistory,
+  startTyping,
+  stopTyping,
 } from "../services/telegram";
 import { jsonResult } from "../result";
 
@@ -48,6 +50,9 @@ export function registerTelegramTools(server: McpServer): void {
         );
       }
       const sent = await sendMessage({ chatId: target, text, messageThreadId });
+      // Outgoing message clears the bot's typing indicator client-side;
+      // also stop our keep-alive so it doesn't bleed into the next session.
+      stopTyping(target, messageThreadId);
       recordMessage({
         chatId: sent.chat.id,
         tgMessageId: sent.message_id,
@@ -91,15 +96,60 @@ export function registerTelegramTools(server: McpServer): void {
   );
 
   server.registerTool(
+    "start_typing",
+    {
+      title: "Start typing indicator (auto-refresh until reply)",
+      description:
+        "Show a chat action indicator (typing by default) in a Telegram chat " +
+        "and keep it alive. MCP re-sends the action every ~4s in the " +
+        "background — call this ONCE at the start of a session, no need to " +
+        "ping it on every reasoning round. The indicator clears " +
+        "automatically when your `send_telegram_message` to the same chat/" +
+        "thread is delivered. A safety TTL stops the keep-alive after " +
+        "5 minutes if no message ever ships.",
+      inputSchema: {
+        chatId: z.string().describe("Telegram chat id."),
+        action: z
+          .enum([
+            "typing",
+            "upload_photo",
+            "record_video",
+            "upload_video",
+            "record_voice",
+            "upload_voice",
+            "upload_document",
+            "choose_sticker",
+            "find_location",
+            "record_video_note",
+            "upload_video_note",
+          ])
+          .optional()
+          .describe("Chat action to display. Defaults to 'typing'."),
+        messageThreadId: z
+          .number()
+          .int()
+          .optional()
+          .describe("Forum topic thread_id (display the indicator inside a specific topic)."),
+      },
+    },
+    async ({ chatId, action, messageThreadId }) => {
+      await startTyping(chatId, action ?? "typing", messageThreadId);
+      return jsonResult({ started: true });
+    },
+  );
+
+  // Kept as an escape hatch for one-off, non-typing actions (e.g. a single
+  // `upload_photo` blip right before posting an image). For typing during a
+  // multi-step reasoning round, use `start_typing` — it self-refreshes.
+  server.registerTool(
     "send_telegram_chat_action",
     {
-      title: "Send Telegram chat action (typing indicator etc)",
+      title: "Send a one-shot Telegram chat action (no auto-refresh)",
       description:
-        "Send a transient chat action (typing, upload_photo, etc) to a Telegram chat. " +
-        "Telegram displays the indicator for ~5 seconds, then it disappears. " +
-        "Call this in parallel with other tool calls when you're about to do " +
-        "time-consuming work, and again at the start of each subsequent reasoning " +
-        "round so the indicator stays alive until you reply.",
+        "Send a single chat action ping (~5s lifespan, no keep-alive). " +
+        "Prefer `start_typing` for the common 'show typing while I work' " +
+        "case — this one is for one-off non-typing actions like a brief " +
+        "`upload_photo` before sending an image.",
       inputSchema: {
         chatId: z.string().describe("Telegram chat id."),
         action: z
@@ -117,11 +167,7 @@ export function registerTelegramTools(server: McpServer): void {
             "upload_video_note",
           ])
           .describe("Chat action to display."),
-        messageThreadId: z
-          .number()
-          .int()
-          .optional()
-          .describe("Forum topic thread_id (display the indicator inside a specific topic)."),
+        messageThreadId: z.number().int().optional(),
       },
     },
     async ({ chatId, action, messageThreadId }) => {

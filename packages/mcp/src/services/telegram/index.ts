@@ -25,4 +25,6 @@ export {
   type Role,
 } from "./storage";
 
+export { startTyping, stopTyping } from "./typing";
+
 export { startTelegramPoller } from "./poller";

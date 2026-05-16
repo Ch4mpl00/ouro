@@ -68,8 +68,8 @@ Examples that **should stay** `disabled`:
 If the user is waiting (Telegram) and the escalation will take a few
 seconds:
 
-1. Send `send_telegram_chat_action(action: "typing", …)` — visible
-   feedback that you're working.
+1. Send `start_typing(chatId, messageThreadId?)` — visible feedback
+   that you're working; MCP keeps the indicator alive until your reply.
 2. Optionally send a one-liner like *"минутку, собираю"* via
    `send_telegram_message`.
 3. Call `handoff(reasoning_effort: "max", reason: "…")`.

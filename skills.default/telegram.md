@@ -6,10 +6,10 @@ is a forum) which **topic thread_id** the message came from, plus the new
 message text.
 
 **Topic discipline:** if the signal mentions a `thread_id`, every Telegram
-call you make in this session — `send_telegram_chat_action`,
-`get_telegram_chat_history`, `send_telegram_message` — MUST pass the same
-`messageThreadId`/`threadId`. Otherwise your typing indicator and reply
-will land in the wrong topic (or in General).
+call you make in this session — `start_typing`, `get_telegram_chat_history`,
+`send_telegram_message` — MUST pass the same `messageThreadId`/`threadId`.
+Otherwise your typing indicator and reply will land in the wrong topic
+(or in General).
 
 ## On-demand delegation to other skills
 
@@ -44,10 +44,10 @@ with the normal protocol below.
 ## Protocol
 
 1. **Show the user you're working.** The very first thing you do — issue
-   `send_telegram_chat_action(chatId="<id>", action="typing", messageThreadId=<thread_id from signal, if any>)`
-   **in parallel with** the rest of your tool calls in this round. The
-   indicator only lasts ~5 seconds, so call it again at the start of every
-   subsequent reasoning round until you've sent the reply.
+   `start_typing(chatId="<id>", messageThreadId=<thread_id from signal, if any>)`
+   **in parallel with** the rest of your tool calls in this round. ONE
+   call is enough — MCP keeps the indicator alive in the background until
+   your `send_telegram_message` ships, then clears it automatically.
 
 2. **Decide whether you need older context.** If the new message is
    self-contained (a one-off question or command), skip this step.
