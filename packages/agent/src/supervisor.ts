@@ -120,7 +120,7 @@ async function reportFailureToUser(
     maxIterations: 5,
     tags: ["recovery", signal.source],
     // Same sessionId as the primary so the crashed trace + recovery trace
-    // sit together in the Langfuse session view.
+    // sit together in the tracing UI's session view.
     sessionId: `${signal.source}:${signal.id}`,
     metadata: {
       signal_id: signal.id,

@@ -1,12 +1,14 @@
 import OpenAI from "openai";
-import { Langfuse } from "langfuse";
 import { connectMcp, type McpHandle } from "./mcp-client";
 import { Session, type SessionOpts } from "./session";
 import { readSkill } from "./skills";
+import { nullTracer, type Tracer } from "./tracing";
+import { createLangfuseTracer, langfuseFromEnv } from "./tracing-langfuse";
 
 // Process-level singleton. Owns shared, expensive resources:
 //   - one OpenAI client (one API key, one rate-limit bucket)
 //   - one MCP connection (one stdio child process for the integrations server)
+//   - one Tracer (observability backend; defaults to no-op)
 // Hands out Sessions on demand. Each Session has its own context buffer,
 // system prompt and iteration budget but reuses these shared resources.
 
@@ -24,10 +26,10 @@ export interface EngineOpts {
   // overlay edits (e.g. by the `dreaming` skill) take effect on the very
   // next session without an engine restart.
   skills?: string[];
-  // Optional Langfuse client for tracing. Sessions create one trace each
-  // (per-LLM-call generations + per-tool-call spans). When null, all
-  // tracing calls in `session.ts` short-circuit to no-ops.
-  langfuse?: Langfuse | null;
+  // Optional tracer for observability. Omit → auto-config from env (currently
+  // Langfuse, see `tracing-langfuse.ts`). Pass `nullTracer` to disable
+  // explicitly, or any other `Tracer` to swap backends (testing, etc.).
+  tracer?: Tracer;
 }
 
 export class Engine {
@@ -35,7 +37,7 @@ export class Engine {
   readonly mcp: McpHandle;
   readonly defaultModel: string;
   readonly skills: readonly string[];
-  readonly langfuse: Langfuse | null;
+  readonly tracer: Tracer;
   private sessions = new Map<string, Session>();
 
   constructor(
@@ -43,13 +45,13 @@ export class Engine {
     mcp: McpHandle,
     defaultModel: string,
     skills: readonly string[],
-    langfuse: Langfuse | null,
+    tracer: Tracer,
   ) {
     this.llm = llm;
     this.mcp = mcp;
     this.defaultModel = defaultModel;
     this.skills = skills;
-    this.langfuse = langfuse;
+    this.tracer = tracer;
   }
 
   async startSession(opts: SessionOpts): Promise<Session> {
@@ -112,9 +114,9 @@ export class Engine {
 
   async shutdown(): Promise<void> {
     for (const id of [...this.sessions.keys()]) this.endSession(id);
-    // shutdownAsync flushes all batched events. Without this, traces from
-    // the final session(s) before SIGTERM are silently dropped.
-    if (this.langfuse) await this.langfuse.shutdownAsync();
+    // Flush buffered tracer events. Without this, traces from the final
+    // session(s) before SIGTERM are silently dropped.
+    await this.tracer.shutdown();
     await this.mcp.close();
   }
 }
@@ -129,24 +131,20 @@ export async function createEngine(opts: EngineOpts): Promise<Engine> {
 
   const mcp = await connectMcp();
 
-  // Caller may pass `langfuse: null` to explicitly disable. If `undefined`
-  // (the common case), auto-configure from env. Missing keys → no tracing,
-  // logged once at startup.
-  let langfuse: Langfuse | null;
-  if (opts.langfuse !== undefined) {
-    langfuse = opts.langfuse;
+  // Tracer: caller override > env auto-config > null. Logged once at startup.
+  let tracer: Tracer;
+  if (opts.tracer) {
+    tracer = opts.tracer;
   } else {
-    const secretKey = process.env.LANGFUSE_SECRET_KEY;
-    const publicKey = process.env.LANGFUSE_PUBLIC_KEY;
-    const baseUrl = process.env.LANGFUSE_BASE_URL;
-    if (secretKey && publicKey) {
-      langfuse = new Langfuse({ secretKey, publicKey, baseUrl });
-      console.log(`[engine] langfuse tracing enabled (${baseUrl ?? "default host"})`);
+    const lf = langfuseFromEnv();
+    if (lf) {
+      tracer = createLangfuseTracer(lf);
+      console.log(`[engine] tracing enabled (langfuse, ${process.env.LANGFUSE_BASE_URL ?? "default host"})`);
     } else {
-      langfuse = null;
-      console.log("[engine] langfuse tracing disabled (LANGFUSE_*_KEY not set)");
+      tracer = nullTracer;
+      console.log("[engine] tracing disabled (LANGFUSE_*_KEY not set)");
     }
   }
 
-  return new Engine(llm, mcp, opts.defaultModel ?? "deepseek-v4-pro", opts.skills ?? [], langfuse);
+  return new Engine(llm, mcp, opts.defaultModel ?? "deepseek-v4-pro", opts.skills ?? [], tracer);
 }

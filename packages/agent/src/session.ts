@@ -1,8 +1,8 @@
 import type { ChatCompletionMessageParam } from "openai/resources/chat/completions";
-import type { LangfuseTraceClient } from "langfuse";
 import type { Engine } from "./engine";
 import { setMemory } from "./db/memory";
 import { listSkills, readSkill, saveSkill } from "./skills";
+import type { Trace } from "./tracing";
 import {
   SYNTHETIC_TOOLS,
   SYNTHETIC_TOOLS_BY_NAME,
@@ -38,8 +38,8 @@ export interface SessionOpts {
   // Pre-resolved skill contents (name → markdown). Set by the engine
   // after readSkill; Session uses these to (a) compose the actual system
   // message sent to the LLM and (b) expose each skill separately on
-  // `trace.metadata.skills` so the Langfuse UI isn't flooded with
-  // skill text in every generation's input.
+  // `trace.metadata.skills` so the tracing UI isn't flooded with skill
+  // text in every generation's input.
   resolvedSkills?: Record<string, string>;
   // Opt out of engine-level meta-skills (`routing`, `handoff`) for this
   // session. Default true. Sub-agents set this to false so they get only
@@ -49,15 +49,16 @@ export interface SessionOpts {
   reasoningEffort?: ReasoningEffort;
   maxIterations?: number;
   parentId?: string;
-  // Optional Langfuse trace metadata. `tags` show up as filter chips in the
-  // UI (use for `signal.source` so you can slice by domain); `metadata` is
+  // Optional trace metadata. `tags` show up as filter chips in the UI
+  // (use for `signal.source` so you can slice by domain); `metadata` is
   // freeform key/value (use for `signal.id`, watermarks, anything you'd
-  // grep traces for later). No-op when `engine.langfuse` is null.
+  // grep traces for later). No-op when the engine's tracer is the
+  // null tracer.
   tags?: string[];
   metadata?: Record<string, unknown>;
-  // Langfuse session id. Traces sharing a sessionId group together in the
-  // UI's "Sessions" view. We use `${signal.source}:${signal.id}` for the
-  // primary session AND its recovery — so a crashed run and its
+  // Trace-grouping session id. Traces sharing a sessionId group together in
+  // the tracing UI's "Sessions" view. We use `${signal.source}:${signal.id}`
+  // for the primary session AND its recovery — so a crashed run and its
   // user-facing error report end up side-by-side under one session.
   sessionId?: string;
 }
@@ -72,7 +73,7 @@ type DeepSeekAssistantHistory = ChatCompletionMessageParam & {
   reasoning_content?: string;
 };
 
-// Replace the system message content with a short stub for Langfuse
+// Replace the system message content with a short stub for trace
 // logging. The full text is already in `trace.metadata` — repeating it
 // in every generation's `input` just buries the actual conversation.
 function redactSystemForTrace(
@@ -97,15 +98,15 @@ function ensureReasoningContentOnHistory(messages: ChatCompletionMessageParam[])
 export class Session {
   readonly id: string;
   readonly parentId?: string;
-  // Langfuse session id. Stored so spawned sub-agents can inherit it
-  // (their child trace lands in the same Langfuse session as the parent).
+  // Trace-grouping session id. Stored so spawned sub-agents can inherit it
+  // (their child trace lands in the same group as the parent's).
   readonly sessionId?: string;
   readonly messages: ChatCompletionMessageParam[] = [];
   private readonly engine: Engine;
   private model: string;
   private reasoningEffort: ReasoningEffort;
   private readonly maxIterations: number;
-  private readonly trace: LangfuseTraceClient | null;
+  private readonly trace: Trace;
   private subAgentCounter = 0;
   private closed = false;
 
@@ -121,7 +122,7 @@ export class Session {
     // Compose the actual system message sent to the LLM: caller's prompt
     // first, then each resolved skill body, joined with `---`. Skills
     // additionally land in `trace.metadata.skills` as a name→content
-    // dict so the Langfuse UI can present them structured instead of as
+    // dict so the tracing UI can present them structured instead of as
     // one giant blob inside every generation's input.
     const skillsMap = opts.resolvedSkills ?? {};
     const systemParts: string[] = [];
@@ -132,29 +133,30 @@ export class Session {
       this.messages.push({ role: "system", content: combinedSystem });
     }
 
-    // One Langfuse trace per session. Generations + tool spans get
-    // attached to it inside `runUntilSettled`. Output + final status are
-    // updated when the loop exits (success, error, or maxIterations).
-    // `trace.input` is intentionally NOT set here — it's populated in
-    // `runUntilSettled` from the first user message so the Langfuse
-    // Session-replay shows a clean `user → assistant` exchange instead of
-    // the long system prompt. System prompt + skills live in metadata.
-    this.trace =
-      engine.langfuse?.trace({
-        id: this.id,
-        name: this.id,
-        sessionId: opts.sessionId,
-        tags: opts.tags,
-        metadata: {
-          ...opts.metadata,
-          systemPrompt: opts.systemPrompt,
-          skills: skillsMap,
-          model: this.model,
-          reasoningEffort: this.reasoningEffort,
-          maxIterations: this.maxIterations,
-          parentId: this.parentId,
-        },
-      }) ?? null;
+    // One trace per session. Generations + tool spans get attached to it
+    // inside `runUntilSettled`. Output + final status are updated when the
+    // loop exits (success, error, or maxIterations). `trace.input` is
+    // intentionally NOT set here — it's populated in `runUntilSettled`
+    // from the first user message so the Session-replay UI shows a clean
+    // `user → assistant` exchange instead of the long system prompt.
+    // System prompt + skills live in metadata. When tracing is disabled
+    // the engine's tracer is a no-op, so the .trace()/.generation()/.span()
+    // calls below stay safe and Session itself doesn't null-check.
+    this.trace = engine.tracer.trace({
+      id: this.id,
+      name: this.id,
+      sessionId: opts.sessionId,
+      tags: opts.tags,
+      metadata: {
+        ...opts.metadata,
+        systemPrompt: opts.systemPrompt,
+        skills: skillsMap,
+        model: this.model,
+        reasoningEffort: this.reasoningEffort,
+        maxIterations: this.maxIterations,
+        parentId: this.parentId,
+      },
+    });
   }
 
   async send(userText: string): Promise<string> {
@@ -173,12 +175,12 @@ export class Session {
   private async runUntilSettled(): Promise<string> {
     const { llm, mcp } = this.engine;
 
-    // Surface the user's prompt on the trace so Langfuse Session-replay
+    // Surface the user's prompt on the trace so the Session-replay UI
     // renders a real `user → assistant` exchange. Done here (not in the
     // constructor) because the caller pushes the user message AFTER
     // startSession returns.
     const firstUserMessage = this.messages.find((m) => m.role === "user");
-    if (firstUserMessage && this.trace) {
+    if (firstUserMessage) {
       this.trace.update({ input: firstUserMessage.content });
     }
 
@@ -208,13 +210,13 @@ export class Session {
             : { thinking: { type: "enabled" as const }, reasoning_effort: this.reasoningEffort }),
         };
 
-        // Generation span = one LLM call. Langfuse computes latency from
-        // startTime/endTime and stores prompt/completion tokens from `usage`.
-        // The system message itself is redacted from the logged input —
-        // its full content already lives in `trace.metadata.systemPrompt`
-        // and `trace.metadata.skills`, so repeating it in every iter just
-        // floods the UI.
-        const generation = this.trace?.generation({
+        // Generation span = one LLM call. The tracer computes latency from
+        // start/end timestamps and stores prompt/completion tokens from
+        // `usage`. The system message itself is redacted from the logged
+        // input — its full content already lives in `trace.metadata.
+        // systemPrompt` and `trace.metadata.skills`, so repeating it in
+        // every iter just floods the UI.
+        const generation = this.trace.generation({
           name: `iter-${i}`,
           model: this.model,
           modelParameters: {
@@ -222,7 +224,6 @@ export class Session {
             thinking: this.reasoningEffort === "disabled" ? "disabled" : "enabled",
           },
           input: redactSystemForTrace(this.messages),
-          startTime: new Date(),
         });
 
         let response;
@@ -230,7 +231,7 @@ export class Session {
           // @ts-expect-error DeepSeek extends ChatCompletionCreateParams with `thinking` + `reasoning_effort`.
           response = await llm.chat.completions.create(body);
         } catch (err) {
-          generation?.end({
+          generation.end({
             output: { error: (err as Error).message },
             level: "ERROR",
             statusMessage: (err as Error).message,
@@ -242,14 +243,13 @@ export class Session {
         const { message } = choice;
         this.messages.push(message);
 
-        generation?.end({
+        generation.end({
           output: message,
           usage: response.usage
             ? {
                 input: response.usage.prompt_tokens,
                 output: response.usage.completion_tokens,
                 total: response.usage.total_tokens,
-                unit: "TOKENS",
               }
             : undefined,
         });
@@ -257,7 +257,7 @@ export class Session {
         this.engine.log(this.id, `iter ${i} finish=${choice.finish_reason} tool_calls=${message.tool_calls?.length ?? 0}`);
 
         if (!message.tool_calls?.length) {
-          this.trace?.update({ output: message.content ?? "" });
+          this.trace.update({ output: message.content ?? "" });
           return message.content ?? "";
         }
 
@@ -271,16 +271,15 @@ export class Session {
             // Span per tool call. We open it BEFORE parsing args so a
             // malformed-JSON throw still leaves a measurable, attributed
             // span in the trace.
-            const span = this.trace?.span({
+            const span = this.trace.span({
               name: call.function.name,
               input: { raw_arguments: call.function.arguments },
-              startTime: new Date(),
             });
 
             let result: string;
             try {
               const args = JSON.parse(call.function.arguments || "{}") as Record<string, unknown>;
-              span?.update({ input: args });
+              span.update({ input: args });
               this.engine.log(this.id, `→ ${call.function.name}(${JSON.stringify(args)})`);
 
               const name = call.function.name;
@@ -291,7 +290,7 @@ export class Session {
                 result = await mcp.callTool(name, args);
               }
             } catch (err) {
-              span?.end({
+              span.end({
                 output: { error: (err as Error).message },
                 level: "ERROR",
                 statusMessage: (err as Error).message,
@@ -299,7 +298,7 @@ export class Session {
               throw err;
             }
 
-            span?.end({ output: result });
+            span.end({ output: result });
             this.engine.log(this.id, `← ${call.function.name} ${result.length}b: ${result}`);
 
             return { call, result };
@@ -319,8 +318,8 @@ export class Session {
     } catch (err) {
       // Trace-level error marker. Individual generation/span errors are
       // already attributed above; this surfaces failed sessions in the
-      // Langfuse list view (sort by metadata.error or filter by output.error).
-      this.trace?.update({
+      // tracing list view (sort by metadata.error or filter by output.error).
+      this.trace.update({
         output: { error: (err as Error).message },
         metadata: { error: true },
       });
@@ -386,8 +385,8 @@ export class Session {
 
     this.subAgentCounter += 1;
     // `__sub` (double underscore) keeps the id ASCII-only and avoids
-    // `/` — some Langfuse path/upsert semantics got confused when the
-    // trace id contained a slash, leaving the parent's name overwritten
+    // `/` — some tracing-backend path/upsert semantics got confused when
+    // the trace id contained a slash, leaving the parent's name overwritten
     // by the child's. Plain underscores stay safe.
     const childId = `${this.id}__sub${this.subAgentCounter}`;
 
@@ -405,8 +404,8 @@ export class Session {
         reasoningEffort: args.reasoning_effort ?? "disabled",
         maxIterations: args.max_iterations ?? 50,
         parentId: this.id,
-        // Inherit the parent's Langfuse session so the child trace
-        // lands in the same Sessions-view row.
+        // Inherit the parent's trace-grouping session so the child
+        // trace lands in the same Sessions-view row.
         sessionId: this.sessionId,
         tags: ["sub-agent", ...args.skills],
         metadata: {
