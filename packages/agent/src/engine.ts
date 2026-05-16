@@ -58,47 +58,38 @@ export class Engine {
     }
 
     const sessionSkillNames = opts.skills ?? [];
-    const engineSkillNames = this.skills ?? []
+    const engineSkillNames = this.skills ?? [];
 
-    // Session-level skills are required: missing one is a signal-handling
-    // error and the caller decides whether to skip. Engine-level skills
-    // are best-effort: a missing meta-skill is logged and dropped so a
-    // typo in engine config doesn't take down every session.
-    const sessionSkillContents = await Promise.all(
-      sessionSkillNames.map(async (name) => {
-        const content = await readSkill(name);
-        if (content === null) {
-          throw new Error(
-            `session skill "${name}" not found (skills/${name}.md and skills.default/${name}.md both missing)`,
-          );
-        }
-        return content;
-      }),
-    );
+    // Resolve session-level skills first (required: missing one is a
+    // signal-handling error). Then engine-level skills (best-effort:
+    // missing meta-skill is logged and dropped so a typo in engine
+    // config doesn't take down every session).
+    //
+    // Final iteration order (Object insertion order) is preserved:
+    // session domain skills → engine meta-skills. The Session uses this
+    // ordering when composing the actual system message.
+    const resolvedSkills: Record<string, string> = {};
+    for (const name of sessionSkillNames) {
+      const content = await readSkill(name);
+      if (content === null) {
+        throw new Error(
+          `session skill "${name}" not found (skills/${name}.md and skills.default/${name}.md both missing)`,
+        );
+      }
+      resolvedSkills[name] = content;
+    }
+    for (const name of engineSkillNames) {
+      const content = await readSkill(name);
+      if (content === null) {
+        this.log(opts.id, `[warn] engine skill "${name}" not found, skipping`);
+        continue;
+      }
+      resolvedSkills[name] = content;
+    }
 
-    const engineSkillContents = (
-      await Promise.all(
-        engineSkillNames.map(async (name) => {
-          const content = await readSkill(name);
-          if (content === null) {
-            this.log(opts.id, `[warn] engine skill "${name}" not found, skipping`);
-            return null;
-          }
-          return content;
-        }),
-      )
-    ).filter((c): c is string => c !== null);
-
-    // Final order: caller-built context (state, env) → session skills
-    // (primary domain) → engine skills (always-on meta-skills).
-    const parts: string[] = [];
-    if (opts.systemPrompt) parts.push(opts.systemPrompt);
-    parts.push(...sessionSkillContents, ...engineSkillContents);
-    const systemPrompt = parts.join("\n\n---\n\n");
-
-    const session = new Session(this, { ...opts, systemPrompt });
+    const session = new Session(this, { ...opts, resolvedSkills });
     this.sessions.set(opts.id, session);
-    const skillsList = [...sessionSkillNames, ...engineSkillNames].join(",");
+    const skillsList = Object.keys(resolvedSkills).join(",");
     this.log(
       opts.id,
       `session opened (model=${opts.model ?? this.defaultModel}, effort=${opts.reasoningEffort ?? "disabled"}, skills=[${skillsList}]${opts.parentId ? `, parent=${opts.parentId}` : ""})`,

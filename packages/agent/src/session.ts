@@ -21,12 +21,17 @@ export interface SessionOpts {
   systemPrompt?: string;
   // Per-session skills — typically the primary domain skill matching the
   // signal source (e.g. `nashdom-bill`). The engine resolves these via
-  // `readSkill` at `startSession` time and prepends their content into the
-  // system prompt. Missing here is a hard error — the caller decides
-  // whether to skip the signal. Engine-level meta-skills (`routing`,
-  // `handoff`) come from `EngineOpts.skills` and are added on top unless
-  // `includeEngineSkills: false`.
+  // `readSkill` at `startSession` time. Missing here is a hard error —
+  // the caller decides whether to skip the signal. Engine-level
+  // meta-skills (`routing`, `handoff`) come from `EngineOpts.skills` and
+  // are added on top unless `includeEngineSkills: false`.
   skills?: string[];
+  // Pre-resolved skill contents (name → markdown). Set by the engine
+  // after readSkill; Session uses these to (a) compose the actual system
+  // message sent to the LLM and (b) expose each skill separately on
+  // `trace.metadata.skills` so the Langfuse UI isn't flooded with
+  // skill text in every generation's input.
+  resolvedSkills?: Record<string, string>;
   model?: string;
   reasoningEffort?: ReasoningEffort;
   maxIterations?: number;
@@ -215,6 +220,18 @@ type DeepSeekAssistantHistory = ChatCompletionMessageParam & {
   reasoning_content?: string;
 };
 
+// Replace the system message content with a short stub for Langfuse
+// logging. The full text is already in `trace.metadata` — repeating it
+// in every generation's `input` just buries the actual conversation.
+function redactSystemForTrace(
+  messages: ChatCompletionMessageParam[],
+): ChatCompletionMessageParam[] {
+  return messages.map((m) => {
+    if (m.role !== "system") return m;
+    return { ...m, content: "[system prompt + skills — see trace metadata]" };
+  });
+}
+
 function ensureReasoningContentOnHistory(messages: ChatCompletionMessageParam[]): void {
   for (const m of messages) {
     if (m.role !== "assistant") continue;
@@ -244,8 +261,18 @@ export class Session {
     this.reasoningEffort = opts.reasoningEffort ?? "disabled";
     this.maxIterations = opts.maxIterations ?? DEFAULT_MAX_ITERATIONS;
 
-    if (opts.systemPrompt) {
-      this.messages.push({ role: "system", content: opts.systemPrompt });
+    // Compose the actual system message sent to the LLM: caller's prompt
+    // first, then each resolved skill body, joined with `---`. Skills
+    // additionally land in `trace.metadata.skills` as a name→content
+    // dict so the Langfuse UI can present them structured instead of as
+    // one giant blob inside every generation's input.
+    const skillsMap = opts.resolvedSkills ?? {};
+    const systemParts: string[] = [];
+    if (opts.systemPrompt) systemParts.push(opts.systemPrompt);
+    for (const content of Object.values(skillsMap)) systemParts.push(content);
+    const combinedSystem = systemParts.join("\n\n---\n\n");
+    if (combinedSystem.length > 0) {
+      this.messages.push({ role: "system", content: combinedSystem });
     }
 
     // One Langfuse trace per session. Generations + tool spans get
@@ -254,8 +281,7 @@ export class Session {
     // `trace.input` is intentionally NOT set here — it's populated in
     // `runUntilSettled` from the first user message so the Langfuse
     // Session-replay shows a clean `user → assistant` exchange instead of
-    // the long system prompt. System prompt lives in metadata for the
-    // rare cases where you need to inspect it.
+    // the long system prompt. System prompt + skills live in metadata.
     this.trace =
       engine.langfuse?.trace({
         id: this.id,
@@ -265,6 +291,7 @@ export class Session {
         metadata: {
           ...opts.metadata,
           systemPrompt: opts.systemPrompt,
+          skills: skillsMap,
           model: this.model,
           reasoningEffort: this.reasoningEffort,
           maxIterations: this.maxIterations,
@@ -328,6 +355,10 @@ export class Session {
 
         // Generation span = one LLM call. Langfuse computes latency from
         // startTime/endTime and stores prompt/completion tokens from `usage`.
+        // The system message itself is redacted from the logged input —
+        // its full content already lives in `trace.metadata.systemPrompt`
+        // and `trace.metadata.skills`, so repeating it in every iter just
+        // floods the UI.
         const generation = this.trace?.generation({
           name: `iter-${i}`,
           model: this.model,
@@ -335,7 +366,7 @@ export class Session {
             reasoning_effort: this.reasoningEffort,
             thinking: this.reasoningEffort === "disabled" ? "disabled" : "enabled",
           },
-          input: this.messages,
+          input: redactSystemForTrace(this.messages),
           startTime: new Date(),
         });
 
