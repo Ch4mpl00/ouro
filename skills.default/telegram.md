@@ -13,33 +13,37 @@ Otherwise your typing indicator and reply will land in the wrong topic
 
 ## On-demand delegation to other skills
 
-When the user's request maps to a dedicated skill, **load that skill's
-rules via `read_skill` and follow them in full** before composing the
-reply. The dedicated skills carry the filters, format, and language
-rules that this generic Telegram skill doesn't repeat.
+When the user's request maps to a dedicated skill, **hand it off via
+`invoke_sub_agent`** — don't load the other skill into your own
+context. The sub-agent runs with that skill loaded, performs the work
+end-to-end (including sending the user-facing Telegram reply itself),
+and returns its final result here.
 
-Routing table (intent → skill):
+Routing table (intent → sub-agent skill):
 
 - "что нового / какие новости / дайджест / что важного / что в Одессе /
   что в каналах / что у нас / что в мире / что по конфликту /
-  что там с <тема>" → `read_skill("news-digest")` — applies its
-  scope-detection (full / category / ad-hoc topic), significance bar,
-  consolidation, Russian-only, no-links rules. The news-digest skill
-  is the **only** path for Telegram-channel-based news.
+  что там с <тема>" → `invoke_sub_agent(skills=["news-digest"], …)`.
 - "что нового в IT / IT-новости / что в Hacker News / на Habr" →
-  `read_skill("tech-digest")` — separate, HN/Habr-only, IT-themed.
+  `invoke_sub_agent(skills=["tech-digest"], …)`.
 
 The pattern: the moment you recognize the user is asking for something
-a dedicated skill handles, your **first** step is `read_skill(<name>)`,
-and your reply MUST conform to that skill's full protocol — same filters,
-same format, same language rules. Don't half-apply, don't improvise the
-format, don't fall back to per-channel grouping just because that's
-what the raw data looks like. If a digest skill says "always Russian"
-or "no channel-name groupings", that applies even when invoked from
-Telegram on-demand.
+a dedicated skill handles, your **first** step is `invoke_sub_agent`.
+Pass the user's message verbatim as the prompt, plus any context the
+sub-agent needs (chat id, thread id) — its skill does the rest.
 
-If the request is generic chat (not matching any digest skill), proceed
-with the normal protocol below.
+```
+invoke_sub_agent(
+  skills=["news-digest"],
+  prompt="<user's request verbatim>\n\nctx: chatId=<id>, threadId=<thread, if any>",
+)
+```
+
+After the sub-agent returns: its skill already sent the Telegram reply
+itself. **Don't re-send.** You're done; let the session terminate.
+
+If the request is generic chat (not matching any sub-agent skill),
+proceed with the normal protocol below.
 
 ## Protocol
 

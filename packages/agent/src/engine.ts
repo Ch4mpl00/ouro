@@ -58,7 +58,8 @@ export class Engine {
     }
 
     const sessionSkillNames = opts.skills ?? [];
-    const engineSkillNames = this.skills ?? [];
+    const includeEngineSkills = opts.includeEngineSkills ?? true;
+    const engineSkillNames = includeEngineSkills ? (this.skills ?? []) : [];
 
     // Resolve session-level skills first (required: missing one is a
     // signal-handling error). Then engine-level skills (best-effort:

@@ -32,6 +32,10 @@ export interface SessionOpts {
   // `trace.metadata.skills` so the Langfuse UI isn't flooded with
   // skill text in every generation's input.
   resolvedSkills?: Record<string, string>;
+  // Opt out of engine-level meta-skills (`routing`, `handoff`) for this
+  // session. Default true. Sub-agents set this to false so they get only
+  // the focused per-task skill set without the always-on parent extras.
+  includeEngineSkills?: boolean;
   model?: string;
   reasoningEffort?: ReasoningEffort;
   maxIterations?: number;
@@ -213,6 +217,70 @@ interface WriteSkillArgs {
   content?: string;
 }
 
+// Sub-agent: a fresh child Session spawned mid-loop with a focused skill
+// set and no inherited message history. The parent only sees the
+// sub-agent's final string result, which keeps its own context lean —
+// instead of growing by the size of the sub-agent's full transcript,
+// the parent grows by the sub-agent's distilled answer.
+const INVOKE_SUB_AGENT_TOOL_NAME = "invoke_sub_agent";
+const INVOKE_SUB_AGENT_TOOL: ChatCompletionTool = {
+  type: "function",
+  function: {
+    name: INVOKE_SUB_AGENT_TOOL_NAME,
+    description:
+      "Delegate a focused task to a sub-agent with a clean context. The " +
+      "sub-agent loads ONLY the skills you name (no routing, no handoff, " +
+      "no parent history), has access to every MCP tool, runs to " +
+      "completion, and returns its final text result here as the tool " +
+      "output. Use this whenever the user's request maps to a dedicated " +
+      "domain skill — e.g. `news-digest`, `tech-digest`, `channel-digest`, " +
+      "`nashdom-bill`. DO NOT also `read_skill` that skill yourself: " +
+      "delegation replaces local loading, keeping your own context lean. " +
+      "Side effects performed inside the sub-agent (Telegram messages, " +
+      "memory writes, etc.) take effect immediately — if the sub-agent's " +
+      "skill sends the user-facing reply itself, you don't need to " +
+      "forward its output again.",
+    parameters: {
+      type: "object",
+      properties: {
+        skills: {
+          type: "array",
+          items: { type: "string" },
+          description:
+            "Skill names to load in the sub-agent (e.g. [\"news-digest\"]). " +
+            "At least one. The sub-agent's system message is composed " +
+            "from these alone — no engine meta-skills.",
+        },
+        prompt: {
+          type: "string",
+          description:
+            "Task description to hand to the sub-agent. Should carry the " +
+            "user's intent verbatim plus any context the sub-agent needs " +
+            "(chat id, thread id, etc) that wouldn't otherwise be in its " +
+            "skills.",
+        },
+        max_iterations: {
+          type: "number",
+          description: "Optional iteration budget for the sub-agent. Default 50.",
+        },
+        reasoning_effort: {
+          type: "string",
+          enum: ["disabled", "high", "max"],
+          description: "Optional reasoning effort. Default `disabled`.",
+        },
+      },
+      required: ["skills", "prompt"],
+    },
+  },
+};
+
+interface InvokeSubAgentArgs {
+  skills?: string[];
+  prompt?: string;
+  max_iterations?: number;
+  reasoning_effort?: ReasoningEffort;
+}
+
 // DeepSeek extends OpenAI's assistant message shape with `reasoning_content`
 // (the thinking text). Required in the request history whenever the next
 // call uses thinking-mode — even if it's empty.
@@ -245,18 +313,23 @@ function ensureReasoningContentOnHistory(messages: ChatCompletionMessageParam[])
 export class Session {
   readonly id: string;
   readonly parentId?: string;
+  // Langfuse session id. Stored so spawned sub-agents can inherit it
+  // (their child trace lands in the same Langfuse session as the parent).
+  readonly sessionId?: string;
   readonly messages: ChatCompletionMessageParam[] = [];
   private readonly engine: Engine;
   private model: string;
   private reasoningEffort: ReasoningEffort;
   private readonly maxIterations: number;
   private readonly trace: LangfuseTraceClient | null;
+  private subAgentCounter = 0;
   private closed = false;
 
   constructor(engine: Engine, opts: SessionOpts) {
     this.engine = engine;
     this.id = opts.id;
     this.parentId = opts.parentId;
+    this.sessionId = opts.sessionId;
     this.model = opts.model ?? engine.defaultModel;
     this.reasoningEffort = opts.reasoningEffort ?? "disabled";
     this.maxIterations = opts.maxIterations ?? DEFAULT_MAX_ITERATIONS;
@@ -347,6 +420,7 @@ export class Session {
             READ_SKILL_TOOL,
             WRITE_SKILL_TOOL,
             LIST_SKILLS_TOOL,
+            INVOKE_SUB_AGENT_TOOL,
           ],
           ...(this.reasoningEffort === "disabled"
             ? { thinking: { type: "disabled" as const } }
@@ -439,6 +513,8 @@ export class Session {
                 result = await this.applyWriteSkill(args as WriteSkillArgs);
               } else if (name === LIST_SKILLS_TOOL_NAME) {
                 result = await this.applyListSkills();
+              } else if (name === INVOKE_SUB_AGENT_TOOL_NAME) {
+                result = await this.applyInvokeSubAgent(args as InvokeSubAgentArgs);
               } else {
                 result = await mcp.callTool(name, args);
               }
@@ -522,6 +598,58 @@ export class Session {
       return JSON.stringify({ count: skills.length, skills });
     } catch (err) {
       return `[list_skills error] ${(err as Error).message}`;
+    }
+  }
+
+  private async applyInvokeSubAgent(args: InvokeSubAgentArgs): Promise<string> {
+    if (!Array.isArray(args.skills) || args.skills.length === 0) {
+      return `[invoke_sub_agent error] "skills" must be a non-empty string array`;
+    }
+    if (args.skills.some((s) => s.length === 0)) {
+      return `[invoke_sub_agent error] every entry in "skills" must be a non-empty string`;
+    }
+    if (typeof args.prompt !== "string" || args.prompt.length === 0) {
+      return `[invoke_sub_agent error] "prompt" must be a non-empty string`;
+    }
+
+    this.subAgentCounter += 1;
+    const childId = `${this.id}/sub${this.subAgentCounter}`;
+
+    let child: Session;
+    try {
+      child = await this.engine.startSession({
+        id: childId,
+        // Intentionally NO systemPrompt: sub-agent's context = just its
+        // skills + the prompt as a user message. No session-context, no
+        // envContext, no engine meta-skills. This is the entire point —
+        // a slim, focused worker.
+        skills: args.skills,
+        includeEngineSkills: false,
+        reasoningEffort: args.reasoning_effort ?? "disabled",
+        maxIterations: args.max_iterations ?? 50,
+        parentId: this.id,
+        // Inherit the parent's Langfuse session so the child trace
+        // lands in the same Sessions-view row.
+        sessionId: this.sessionId,
+        tags: ["sub-agent", ...args.skills],
+        metadata: {
+          parent_id: this.id,
+          parent_session_id: this.sessionId,
+          invoked_skills: args.skills,
+        },
+      });
+    } catch (err) {
+      return `[invoke_sub_agent error] failed to start: ${(err as Error).message}`;
+    }
+
+    child.messages.push({ role: "user", content: args.prompt });
+
+    try {
+      return await child.run();
+    } catch (err) {
+      return `[invoke_sub_agent error] sub-agent crashed: ${(err as Error).message}`;
+    } finally {
+      this.engine.endSession(childId);
     }
   }
 
