@@ -240,13 +240,10 @@ If genuinely unclear ("новости" alone), default to Mode 1.
      follow-up "ссылку" / "источник" requests as referring to the
      items you just sent.
 
-6. **Send to Telegram:**
-
-   ```
-   send_telegram_message(text="<digest>")
-   ```
-
-7. **Stamp the read watermark.** After the digest is sent (or after an
+6. **Stamp the read watermark FIRST** (before the final emission below —
+   once you emit the digest text without any tool calls the loop
+   terminates and set_memory wouldn't run). After composing the digest
+   (or after an
    ad-hoc/Mode-3 read with no digest — the watermark moves regardless,
    it's about what posts you've already consumed), persist it via the
    agent-side memory KV:
@@ -263,6 +260,15 @@ If genuinely unclear ("новости" alone), default to Mode 1.
    там в @tginsider за последний час" — you read one channel, you
    don't want tomorrow's full digest to skip everything older than
    right now). When in doubt, do stamp it.
+
+7. **Return the composed digest as your final answer.** After the
+   `set_memory` tool returns, emit the digest body as your assistant
+   message **with no tool calls** — that terminates the sub-agent loop
+   and hands the text back to the parent. Do NOT call
+   `send_telegram_message` yourself: the parent owns Telegram delivery.
+   The text you return is exactly what gets forwarded to the user, so
+   make sure it's already formatted per the rules above (header,
+   sections, bullets, Russian-only, no links).
 
 ## Significance bar — the "would I care?" test
 

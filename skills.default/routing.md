@@ -33,18 +33,22 @@ invoke_sub_agent(
   message, otherwise a short trigger description.
 
 The sub-agent runs with **only** that skill loaded (no routing, no
-handoff, no parent history), has access to every MCP tool, performs the
-work end-to-end (including any user-facing side effects the skill
-defines — e.g. sending the Telegram message), and returns its final
-text answer here as the tool result.
+handoff, no parent history), has access to every MCP tool, and returns
+its final text answer here as the tool result.
 
-After the sub-agent returns:
+**Default split of responsibility:** the sub-agent COMPOSES the result
+(digest, summary, parsed data), the PARENT delivers it to the user
+(`send_telegram_message`). This keeps each side's context narrow — the
+sub-agent doesn't need to know your chatId/threadId and the parent
+doesn't need to re-load the domain skill's wall of formatting rules.
 
-- If its skill already delivered the user-facing output (most domain
-  skills do — they end with `send_telegram_message`), **don't re-send**.
-  You're done; let the session terminate.
-- If its skill returned only data and you still need to deliver it,
-  forward the relevant parts via `send_telegram_message` yourself.
+Tell the sub-agent explicitly in `system_prompt`: "верни мне готовый
+текст, не вызывай send_telegram_message сам". Then after it returns,
+call `send_telegram_message(text=<return value>, ...)` yourself.
+
+(Some legacy skills still call `send_telegram_message` from inside —
+when delegating to one of those, omit the no-send instruction. But for
+new work, prefer the compose-and-return pattern.)
 
 Common cases (skill name → typical triggers):
 

@@ -35,17 +35,20 @@ sub-agent needs (chat id, thread id) — its skill does the rest.
 ```
 invoke_sub_agent(
   skills=["news-digest"],
-  system_prompt="Сделай сводку новостей для пользователя по правилам скилла news-digest. Отправь её в Telegram chatId=<id> threadId=<thread, if any>. После отправки верни короткий статус.",
+  system_prompt="Подготовь сводку новостей по правилам скилла news-digest и верни её мне готовым текстом. НЕ вызывай send_telegram_message — я сам отправлю результат пользователю.",
   prompt="<user's request verbatim>",
 )
 ```
 
-The sub-agent's skill already handles HOW (filters, format, language) —
-your `system_prompt` only adds parent-side context (delivery target,
-scope hint, anything the skill itself doesn't know).
+The sub-agent's skill handles HOW (filters, format, language) and
+returns the composed digest as its final text. Then **you** forward it
+via `send_telegram_message(text=<sub-agent return value>, chatId=<id>,
+messageThreadId=<thread, if any>)`. This keeps the sub-agent's job
+narrow (compose only) and the parent's context lean (one outgoing
+message, no replay of the digest body through skill instructions).
 
-After the sub-agent returns: its skill already sent the Telegram reply
-itself. **Don't re-send.** You're done; let the session terminate.
+After the send succeeds your session terminates naturally — no further
+work needed.
 
 If the request is generic chat (not matching any sub-agent skill),
 proceed with the normal protocol below.
