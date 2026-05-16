@@ -47,8 +47,18 @@ messageThreadId=<thread, if any>)`. This keeps the sub-agent's job
 narrow (compose only) and the parent's context lean (one outgoing
 message, no replay of the digest body through skill instructions).
 
-After the send succeeds your session terminates naturally — no further
-work needed.
+After a successful send for a news-digest delegation, advance the
+global read watermark so the next digest skips what this one already
+covered:
+
+```
+set_memory(key="news_digest.last_read_at", value="<current ISO timestamp>")
+```
+
+You can issue `send_telegram_message` and `set_memory` in parallel —
+they're independent. Skip the `set_memory` step for narrow ad-hoc
+topic queries that shouldn't shift the global watermark (e.g. "что там
+по такой-то теме за час" — single-topic peek). When in doubt, stamp it.
 
 If the request is generic chat (not matching any sub-agent skill),
 proceed with the normal protocol below.

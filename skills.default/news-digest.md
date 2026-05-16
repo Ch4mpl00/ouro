@@ -240,33 +240,15 @@ If genuinely unclear ("новости" alone), default to Mode 1.
      follow-up "ссылку" / "источник" requests as referring to the
      items you just sent.
 
-6. **Stamp the read watermark FIRST** (before the final emission below —
-   once you emit the digest text without any tool calls the loop
-   terminates and set_memory wouldn't run). After composing the digest
-   (or after an
-   ad-hoc/Mode-3 read with no digest — the watermark moves regardless,
-   it's about what posts you've already consumed), persist it via the
-   agent-side memory KV:
-
-   ```
-   set_memory(key="news_digest.last_read_at", value="<ISO timestamp, typically now()>")
-   ```
-
-   The supervisor will inject this value back into the next session's
-   `Current context` block automatically.
-
-   Skip this step **only** for narrow one-channel queries where you
-   don't want to advance the global watermark (e.g. user asked "что
-   там в @tginsider за последний час" — you read one channel, you
-   don't want tomorrow's full digest to skip everything older than
-   right now). When in doubt, do stamp it.
-
-7. **Return the composed digest as your final answer.** After the
-   `set_memory` tool returns, emit the digest body as your assistant
-   message **with no tool calls** — that terminates the loop and hands
-   the text back to whoever invoked you. Do NOT call any delivery /
-   notification tool yourself: the caller owns delivery. The text you
-   return is exactly what gets forwarded to the user, so make sure it's
+6. **Return the composed digest as your final answer.** Emit the
+   digest body as your assistant message **with no tool calls** — that
+   terminates the loop and hands the text back to whoever invoked you.
+   Do NOT call any delivery / notification tool yourself: the caller
+   owns delivery. Do NOT stamp the read watermark either — the caller
+   decides whether this read should advance the global watermark (a
+   different process might be peeking at posts without wanting to
+   skip them on the next digest). The text you return is exactly what
+   gets forwarded to the user, so make sure it's
    already formatted per the rules above (header, sections, bullets,
    Russian-only, no links).
 
