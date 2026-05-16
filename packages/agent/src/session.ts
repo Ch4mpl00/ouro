@@ -406,49 +406,59 @@ export class Session {
           return message.content ?? "";
         }
 
-        for (const call of message.tool_calls) {
-          // Span per tool call. We open it BEFORE parsing args so a
-          // malformed-JSON throw still leaves a measurable, attributed
-          // span in the trace.
-          const span = this.trace?.span({
-            name: call.function.name,
-            input: { raw_arguments: call.function.arguments },
-            startTime: new Date(),
-          });
-
-          let result: string;
-          try {
-            const args = JSON.parse(call.function.arguments || "{}") as Record<string, unknown>;
-            span?.update({ input: args });
-            this.engine.log(this.id, `→ ${call.function.name}(${JSON.stringify(args)})`);
-
-            const name = call.function.name;
-            if (name === HANDOFF_TOOL_NAME) {
-              result = this.applyHandoff(args as HandoffArgs);
-            } else if (name === SET_MEMORY_TOOL_NAME) {
-              result = this.applySetMemory(args as SetMemoryArgs);
-            } else if (name === READ_SKILL_TOOL_NAME) {
-              result = await this.applyReadSkill(args as SkillNameArg);
-            } else if (name === WRITE_SKILL_TOOL_NAME) {
-              result = await this.applyWriteSkill(args as WriteSkillArgs);
-            } else if (name === LIST_SKILLS_TOOL_NAME) {
-              result = await this.applyListSkills();
-            } else {
-              result = await mcp.callTool(name, args);
-            }
-          } catch (err) {
-            span?.end({
-              output: { error: (err as Error).message },
-              level: "ERROR",
-              statusMessage: (err as Error).message,
+        // Dispatch all tool calls in this round in parallel. The model
+        // expects parallel-tool-call semantics — if it emits 3 tool_calls,
+        // running them sequentially adds N×latency for no reason. Results
+        // are still pushed in the original tool_calls order so the
+        // message buffer is deterministic regardless of completion order.
+        const toolResults = await Promise.all(
+          message.tool_calls.map(async (call) => {
+            // Span per tool call. We open it BEFORE parsing args so a
+            // malformed-JSON throw still leaves a measurable, attributed
+            // span in the trace.
+            const span = this.trace?.span({
+              name: call.function.name,
+              input: { raw_arguments: call.function.arguments },
+              startTime: new Date(),
             });
-            throw err;
-          }
 
-          span?.end({ output: result });
+            let result: string;
+            try {
+              const args = JSON.parse(call.function.arguments || "{}") as Record<string, unknown>;
+              span?.update({ input: args });
+              this.engine.log(this.id, `→ ${call.function.name}(${JSON.stringify(args)})`);
 
-          this.engine.log(this.id, `← ${result.length}b: ${result}`);
+              const name = call.function.name;
+              if (name === HANDOFF_TOOL_NAME) {
+                result = this.applyHandoff(args as HandoffArgs);
+              } else if (name === SET_MEMORY_TOOL_NAME) {
+                result = this.applySetMemory(args as SetMemoryArgs);
+              } else if (name === READ_SKILL_TOOL_NAME) {
+                result = await this.applyReadSkill(args as SkillNameArg);
+              } else if (name === WRITE_SKILL_TOOL_NAME) {
+                result = await this.applyWriteSkill(args as WriteSkillArgs);
+              } else if (name === LIST_SKILLS_TOOL_NAME) {
+                result = await this.applyListSkills();
+              } else {
+                result = await mcp.callTool(name, args);
+              }
+            } catch (err) {
+              span?.end({
+                output: { error: (err as Error).message },
+                level: "ERROR",
+                statusMessage: (err as Error).message,
+              });
+              throw err;
+            }
 
+            span?.end({ output: result });
+            this.engine.log(this.id, `← ${call.function.name} ${result.length}b: ${result}`);
+
+            return { call, result };
+          }),
+        );
+
+        for (const { call, result } of toolResults) {
           this.messages.push({
             role: "tool",
             tool_call_id: call.id,
