@@ -251,6 +251,11 @@ export class Session {
     // One Langfuse trace per session. Generations + tool spans get
     // attached to it inside `runUntilSettled`. Output + final status are
     // updated when the loop exits (success, error, or maxIterations).
+    // `trace.input` is intentionally NOT set here — it's populated in
+    // `runUntilSettled` from the first user message so the Langfuse
+    // Session-replay shows a clean `user → assistant` exchange instead of
+    // the long system prompt. System prompt lives in metadata for the
+    // rare cases where you need to inspect it.
     this.trace =
       engine.langfuse?.trace({
         id: this.id,
@@ -259,12 +264,12 @@ export class Session {
         tags: opts.tags,
         metadata: {
           ...opts.metadata,
+          systemPrompt: opts.systemPrompt,
           model: this.model,
           reasoningEffort: this.reasoningEffort,
           maxIterations: this.maxIterations,
           parentId: this.parentId,
         },
-        input: opts.systemPrompt ? { systemPrompt: opts.systemPrompt } : undefined,
       }) ?? null;
   }
 
@@ -283,6 +288,15 @@ export class Session {
 
   private async runUntilSettled(): Promise<string> {
     const { llm, mcp } = this.engine;
+
+    // Surface the user's prompt on the trace so Langfuse Session-replay
+    // renders a real `user → assistant` exchange. Done here (not in the
+    // constructor) because the caller pushes the user message AFTER
+    // startSession returns.
+    const firstUserMessage = this.messages.find((m) => m.role === "user");
+    if (firstUserMessage && this.trace) {
+      this.trace.update({ input: firstUserMessage.content });
+    }
 
     try {
       for (let i = 0; i < this.maxIterations; i++) {
