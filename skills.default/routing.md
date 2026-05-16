@@ -33,8 +33,8 @@ invoke_sub_agent(
   message, otherwise a short trigger description.
 
 The sub-agent runs with **only** that skill loaded (no routing, no
-handoff, no parent history), has access to every MCP tool, and returns
-its final text answer here as the tool result.
+parent history), has access to every MCP tool, and returns its final
+text answer here as the tool result.
 
 **Default split of responsibility:** the sub-agent COMPOSES the result
 (digest, summary, parsed data), the PARENT delivers it to the user

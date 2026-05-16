@@ -6,7 +6,6 @@ import type { Trace, TraceContext } from "./tracing";
 import {
   SYNTHETIC_TOOLS,
   SYNTHETIC_TOOLS_BY_NAME,
-  type HandoffArgs,
   type InvokeSubAgentArgs,
   type SetMemoryArgs,
   type SkillNameArg,
@@ -16,9 +15,6 @@ import {
 // One isolated conversation thread. Owns its own message buffer, system
 // prompt, model and iteration budget. Shares the engine's OpenAI client
 // and MCP connection — does not create or close them.
-//
-// The `model` and `reasoningEffort` fields are mutable: the session may
-// switch tiers mid-loop via the synthetic `handoff` tool (see below).
 
 export type ReasoningEffort = "disabled" | "high" | "max";
 
@@ -32,8 +28,8 @@ export interface SessionOpts {
   // signal source (e.g. `nashdom-bill`). The engine resolves these via
   // `readSkill` at `startSession` time. Missing here is a hard error —
   // the caller decides whether to skip the signal. Engine-level
-  // meta-skills (`routing`, `handoff`) come from `EngineOpts.skills` and
-  // are added on top unless `includeEngineSkills: false`.
+  // meta-skill (`routing`) comes from `EngineOpts.skills` and is added
+  // on top unless `includeEngineSkills: false`.
   skills?: string[];
   // Pre-resolved skill contents (name → markdown). Set by the engine
   // after readSkill; Session uses these to (a) compose the actual system
@@ -41,9 +37,9 @@ export interface SessionOpts {
   // `trace.metadata.skills` so the tracing UI isn't flooded with skill
   // text in every generation's input.
   resolvedSkills?: Record<string, string>;
-  // Opt out of engine-level meta-skills (`routing`, `handoff`) for this
-  // session. Default true. Sub-agents set this to false so they get only
-  // the focused per-task skill set without the always-on parent extras.
+  // Opt out of engine-level meta-skill (`routing`) for this session.
+  // Default true. Sub-agents set this to false so they get only the
+  // focused per-task skill set without the always-on parent extras.
   includeEngineSkills?: boolean;
   model?: string;
   reasoningEffort?: ReasoningEffort;
@@ -98,8 +94,8 @@ export class Session {
   readonly sessionId?: string;
   readonly messages: ChatCompletionMessageParam[] = [];
   private readonly engine: Engine;
-  private model: string;
-  private reasoningEffort: ReasoningEffort;
+  private readonly model: string;
+  private readonly reasoningEffort: ReasoningEffort;
   private readonly maxIterations: number;
   // Trace surface for this session. For top-level sessions this is a Trace
   // created from `engine.tracer.trace(...)`; for sub-agents it's the parent's
@@ -239,12 +235,13 @@ export class Session {
 
     try {
       for (let i = 0; i < this.maxIterations; i++) {
-        // DeepSeek's thinking mode requires every prior assistant turn in the
-        // history to carry a `reasoning_content` field. Turns produced under
-        // `thinking=disabled` lack it, so once we escalate via `handoff`, the
-        // very next request 400s with "reasoning_content must be passed back".
-        // Stamp an empty string on every assistant message missing the field
-        // whenever we're about to send in thinking-enabled mode.
+        // DeepSeek's thinking mode requires every prior assistant turn in
+        // the history to carry a `reasoning_content` field. Turns produced
+        // under `thinking=disabled` lack it — sub-agents launched with
+        // `reasoning_effort: max` would otherwise 400 on their first call
+        // if they inherit any thinking-disabled history. Stamp an empty
+        // string on every assistant message missing the field whenever
+        // we're about to send in thinking-enabled mode.
         if (this.reasoningEffort !== "disabled") {
           ensureReasoningContentOnHistory(this.messages);
         }
@@ -505,20 +502,6 @@ export class Session {
     setMemory(args.key, args.value);
     this.engine.log(this.id, `set_memory ${args.key} = ${args.value.slice(0, 80)}`);
     return `ok — stored ${args.key}`;
-  }
-
-  applyHandoff(args: HandoffArgs): string {
-    const target: ReasoningEffort | undefined = args.reasoning_effort;
-    if (target !== "disabled" && target !== "high" && target !== "max") {
-      return `[handoff error] reasoning_effort must be one of disabled|high|max, got ${JSON.stringify(target)}`;
-    }
-    this.reasoningEffort = target;
-    if (typeof args.model === "string" && args.model.length > 0) {
-      this.model = args.model;
-    }
-    const reason = typeof args.reason === "string" ? args.reason : "(no reason)";
-    this.engine.log(this.id, `handoff → model=${this.model} effort=${this.reasoningEffort} reason=${reason}`);
-    return `ok — switched to model=${this.model} effort=${this.reasoningEffort}`;
   }
 
   close(): void {

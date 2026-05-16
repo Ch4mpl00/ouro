@@ -13,19 +13,14 @@ import { buildSessionContext } from "./session-context";
 //     else: open session with primary skill = signal.source,
 //           push signal.content as user message, run.
 //
-// Skill loading is handled by the engine: meta-skills (routing, handoff)
-// are configured at engine-create time and applied to every session;
+// Skill loading is handled by the engine: meta-skill `routing` is
+// configured at engine-create time and applied to every session;
 // per-signal primary skill (matching `signal.source`) is passed via
 // `SessionOpts.skills`. The supervisor only assembles the session-context
 // + envContext block.
 //
 // All side effects (replying to Telegram, marking bills, etc.) are tool
 // calls the LLM makes inside the session.
-//
-// Reasoning effort is **not** picked per source here. Every session starts
-// at the weak default (`reasoning_effort=disabled`); the model itself
-// decides whether to escalate via the in-session `handoff` tool, guided
-// by `skills/handoff.md` (an engine-level skill).
 
 const POLL_INTERVAL_MS = 2_000;
 
@@ -107,7 +102,7 @@ async function reportFailureToUser(
 ): Promise<void> {
   const errMsg = err instanceof Error ? err.message : String(err);
   const briefing = `Error: ${errMsg}\n\nMessage log:\n${JSON.stringify(failedMessages, null, 2)}`;
-  // Recovery sessions skip engine-level meta-skills (routing, handoff) —
+  // Recovery sessions skip engine-level meta-skills (routing) —
   // RECOVERY_PROMPT is the only instruction we want active here.
   const systemPrompt = signal.envContext
     ? `${RECOVERY_PROMPT}\n\n---\n\n${signal.envContext}`
@@ -145,9 +140,8 @@ async function main(): Promise<void> {
     apiKey,
     defaultModel: process.env.AGENT_MODEL ?? "deepseek-v4-pro",
     // Meta-skills loaded into every session: routing (cross-skill
-    // delegation when intent ≠ source) + handoff (when to escalate
-    // reasoning_effort).
-    skills: ["routing", "handoff"],
+    // delegation when intent ≠ source).
+    skills: ["routing"],
   });
 
   console.log(`[supervisor] mcp tools: ${engine.mcp.tools.map((t) => t.function.name).join(", ")}`);

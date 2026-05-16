@@ -19,8 +19,8 @@ export interface EngineOpts {
   // Engine-level skills — loaded into every session this engine starts
   // (unless a session opts out via `includeEngineSkills: false`). Use for
   // meta-skills that apply across every domain — e.g. `routing` (when to
-  // delegate to another skill), `handoff` (when to escalate reasoning).
-  // Per-session domain skills are passed via `SessionOpts.skills` instead.
+  // delegate to another skill). Per-session domain skills are passed via
+  // `SessionOpts.skills` instead.
   //
   // Resolved at `startSession` time, not engine-create time, so live
   // overlay edits (e.g. by the `dreaming` skill) take effect on the very

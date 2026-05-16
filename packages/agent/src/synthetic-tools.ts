@@ -11,49 +11,6 @@ import type { TraceContext } from "./tracing";
 // SYNTHETIC_TOOLS_BY_NAME — adding a new tool is one new entry here,
 // no changes to session.ts beyond declaring the handler method.
 
-// ─── handoff ─────────────────────────────────────────────────────────
-// Lets the cheap-tier model promote (or demote) the current session's
-// reasoning effort and model. The actual "when to use" rules live in
-// skills/handoff.md, which the engine appends to every session as an
-// engine-level skill.
-export const HANDOFF_TOOL_NAME = "handoff";
-export const HANDOFF_TOOL: ChatCompletionTool = {
-  type: "function",
-  function: {
-    name: HANDOFF_TOOL_NAME,
-    description:
-      "Switch THIS session's reasoning effort (and optionally the model) starting from the next turn. " +
-      "Use this to escalate when the task needs more thinking, or to de-escalate when handing a finished " +
-      "result off to a cheap-tier reply. Consult the handoff skill (appended to your system prompt) for " +
-      "when to use each tier. Takes effect on the next assistant turn; this turn ends with the tool result.",
-    parameters: {
-      type: "object",
-      properties: {
-        reasoning_effort: {
-          type: "string",
-          enum: ["disabled", "high", "max"],
-          description: "Target tier for the next turn.",
-        },
-        model: {
-          type: "string",
-          description: "Optional model override (e.g. 'deepseek-reasoner'). Omit to keep current.",
-        },
-        reason: {
-          type: "string",
-          description: "Short justification (logged).",
-        },
-      },
-      required: ["reasoning_effort", "reason"],
-    },
-  },
-};
-
-export interface HandoffArgs {
-  reasoning_effort?: ReasoningEffort;
-  model?: string;
-  reason?: string;
-}
-
 // ─── set_memory ──────────────────────────────────────────────────────
 // Agent-side writes to the local memory KV (`agent.db memory`). Bypasses
 // MCP so the integration server stays stateless w.r.t. agent reasoning
@@ -187,8 +144,8 @@ export const INVOKE_SUB_AGENT_TOOL: ChatCompletionTool = {
     name: INVOKE_SUB_AGENT_TOOL_NAME,
     description:
       "Delegate a focused task to a sub-agent with a clean context. The " +
-      "sub-agent loads ONLY the skills you name (no routing, no handoff, " +
-      "no parent history), has access to every MCP tool, runs to " +
+      "sub-agent loads ONLY the skills you name (no routing, no parent " +
+      "history), has access to every MCP tool, runs to " +
       "completion, and returns its final text result here as the tool " +
       "output. Use this whenever the user's request maps to a dedicated " +
       "domain skill — e.g. `news-digest`, `tech-digest`, `channel-digest`, " +
@@ -270,10 +227,6 @@ export interface SyntheticTool {
 }
 
 export const SYNTHETIC_TOOLS: SyntheticTool[] = [
-  {
-    def: HANDOFF_TOOL,
-    handle: (s, args) => s.applyHandoff(args as HandoffArgs),
-  },
   {
     def: SET_MEMORY_TOOL,
     handle: (s, args) => s.applySetMemory(args as SetMemoryArgs),
