@@ -12,6 +12,19 @@ import {
 } from "../services/telegram";
 import { jsonResult } from "../result";
 
+// Telegram chat ids are numbers, but the model sometimes emits them as
+// strings and sometimes as numbers. Accept both at the schema layer and
+// normalize to a single shape downstream — otherwise things like the
+// typing-keepalive map key (`${chatId}:${threadId}`) end up with different
+// string vs number keys and stopTyping silently misses.
+const chatIdAsString = z
+  .union([z.string(), z.number().int()])
+  .transform((v) => String(v));
+
+const chatIdAsNumber = z
+  .union([z.string(), z.number().int()])
+  .transform((v) => (typeof v === "string" ? Number(v) : v));
+
 export function registerTelegramTools(server: McpServer): void {
   server.registerTool(
     "send_telegram_message",
@@ -29,8 +42,7 @@ export function registerTelegramTools(server: McpServer): void {
         "stays in sync.",
       inputSchema: {
         text: z.string().min(1).max(4096),
-        chatId: z
-          .string()
+        chatId: chatIdAsString
           .optional()
           .describe("Telegram chat id. Falls back to TELEGRAM_DEFAULT_CHAT_ID if omitted."),
         messageThreadId: z
@@ -79,7 +91,7 @@ export function registerTelegramTools(server: McpServer): void {
         "notification when status changes (e.g. mark as PAID). messageId is the value " +
         "returned by send_telegram_message; chatId is the same chat the message was sent to.",
       inputSchema: {
-        chatId: z.string().describe("Telegram chat id (the one the original message was sent to)."),
+        chatId: chatIdAsString.describe("Telegram chat id (the one the original message was sent to)."),
         messageId: z.number().int().describe("messageId returned by send_telegram_message."),
         text: z.string().min(1).max(4096),
       },
@@ -108,7 +120,7 @@ export function registerTelegramTools(server: McpServer): void {
         "thread is delivered. A safety TTL stops the keep-alive after " +
         "5 minutes if no message ever ships.",
       inputSchema: {
-        chatId: z.string().describe("Telegram chat id."),
+        chatId: chatIdAsString.describe("Telegram chat id."),
         action: z
           .enum([
             "typing",
@@ -151,7 +163,7 @@ export function registerTelegramTools(server: McpServer): void {
         "case — this one is for one-off non-typing actions like a brief " +
         "`upload_photo` before sending an image.",
       inputSchema: {
-        chatId: z.string().describe("Telegram chat id."),
+        chatId: chatIdAsString.describe("Telegram chat id."),
         action: z
           .enum([
             "typing",
@@ -186,7 +198,7 @@ export function registerTelegramTools(server: McpServer): void {
         "(reply context for a topic message). Omit threadId to see all topics " +
         "interleaved.",
       inputSchema: {
-        chatId: z.number().int().describe("Telegram chat id."),
+        chatId: chatIdAsNumber.describe("Telegram chat id."),
         limit: z.number().int().min(1).max(500).optional().describe("Max messages. Default 50."),
         threadId: z
           .number()
