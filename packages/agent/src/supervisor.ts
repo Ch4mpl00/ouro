@@ -61,6 +61,7 @@ async function runSignal(engine: Engine, signal: PendingSignal): Promise<void> {
       skills: [signal.source],
       reasoningEffort: "disabled",
       tags: [signal.source],
+      sessionId: `${signal.source}:${signal.id}`,
       metadata: {
         signal_id: signal.id,
         signal_source: signal.source,
@@ -118,6 +119,9 @@ async function reportFailureToUser(
     reasoningEffort: "disabled",
     maxIterations: 5,
     tags: ["recovery", signal.source],
+    // Same sessionId as the primary so the crashed trace + recovery trace
+    // sit together in the Langfuse session view.
+    sessionId: `${signal.source}:${signal.id}`,
     metadata: {
       signal_id: signal.id,
       signal_source: signal.source,

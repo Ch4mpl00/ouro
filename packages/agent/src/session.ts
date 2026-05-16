@@ -37,6 +37,11 @@ export interface SessionOpts {
   // grep traces for later). No-op when `engine.langfuse` is null.
   tags?: string[];
   metadata?: Record<string, unknown>;
+  // Langfuse session id. Traces sharing a sessionId group together in the
+  // UI's "Sessions" view. We use `${signal.source}:${signal.id}` for the
+  // primary session AND its recovery — so a crashed run and its
+  // user-facing error report end up side-by-side under one session.
+  sessionId?: string;
 }
 
 const DEFAULT_MAX_ITERATIONS = 100;
@@ -250,6 +255,7 @@ export class Session {
       engine.langfuse?.trace({
         id: this.id,
         name: this.id,
+        sessionId: opts.sessionId,
         tags: opts.tags,
         metadata: {
           ...opts.metadata,
