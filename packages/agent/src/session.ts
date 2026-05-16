@@ -2,7 +2,7 @@ import type { ChatCompletionMessageParam } from "openai/resources/chat/completio
 import type { Engine } from "./engine";
 import { setMemory } from "./db/memory";
 import { listSkills, readSkill, saveSkill } from "./skills";
-import type { TraceContext } from "./tracing";
+import type { Trace, TraceContext } from "./tracing";
 import {
   SYNTHETIC_TOOLS,
   SYNTHETIC_TOOLS_BY_NAME,
@@ -118,11 +118,12 @@ export class Session {
   // `invoke_sub_agent` span passed in via `opts.traceScope`. The Session
   // API is the same either way — both implement TraceContext.
   private readonly scope: TraceContext;
-  // True when this session owns its trace scope (top-level). Sub-agents
-  // (`ownsScope=false`) don't touch the scope's input/output/error fields —
-  // those belong to the parent's tool span and are already populated by
-  // the parent's dispatch loop.
-  private readonly ownsScope: boolean;
+  // Non-null when this session owns its trace scope (top-level). Used as
+  // both a "may touch input/output" gate and the handle for explicitly
+  // ending the root trace span at end-of-run (v5/OTel needs it; v3 was
+  // implicit). For sub-agents this is null — the parent's dispatch loop
+  // owns the wrapping span's lifecycle.
+  private readonly trace: Trace | null;
   private subAgentCounter = 0;
   private closed = false;
 
@@ -159,7 +160,7 @@ export class Session {
     //     UI can show what was loaded into the child.
     if (opts.traceScope) {
       this.scope = opts.traceScope;
-      this.ownsScope = false;
+      this.trace = null;
       this.scope.update({
         metadata: {
           sub_agent_id: this.id,
@@ -179,7 +180,7 @@ export class Session {
       // System prompt + skills live in metadata. When tracing is disabled
       // the engine's tracer is a no-op, so the .generation()/.span() calls
       // below stay safe and Session itself doesn't null-check.
-      this.scope = engine.tracer.trace({
+      this.trace = engine.tracer.trace({
         id: this.id,
         name: this.id,
         sessionId: opts.sessionId,
@@ -194,7 +195,7 @@ export class Session {
           parentId: this.parentId,
         },
       });
-      this.ownsScope = true;
+      this.scope = this.trace;
     }
   }
 
@@ -220,7 +221,7 @@ export class Session {
     // startSession returns. Skip for sub-agents — their scope is the
     // parent's tool span and the input there is the tool args, not the
     // user message; overwriting would erase the parent's view.
-    if (this.ownsScope) {
+    if (this.trace) {
       const firstUserMessage = this.messages.find((m) => m.role === "user");
       if (firstUserMessage) {
         this.scope.update({ input: firstUserMessage.content });
@@ -300,7 +301,7 @@ export class Session {
         this.engine.log(this.id, `iter ${i} finish=${choice.finish_reason} tool_calls=${message.tool_calls?.length ?? 0}`);
 
         if (!message.tool_calls?.length) {
-          if (this.ownsScope) {
+          if (this.trace) {
             this.scope.update({ output: message.content ?? "" });
           }
           return message.content ?? "";
@@ -370,13 +371,19 @@ export class Session {
       // Sub-agents skip this — the parent's `invoke_sub_agent` span will
       // capture the error via its own `.end({ level: ERROR })` once the
       // exception propagates back to the dispatch loop.
-      if (this.ownsScope) {
+      if (this.trace) {
         this.scope.update({
           output: { error: (err as Error).message },
           metadata: { error: true },
         });
       }
       throw err;
+    } finally {
+      // Close the root trace span for top-level sessions. v5/OTel keeps
+      // a trace "open" until its root span is explicitly ended, even after
+      // all child observations have closed. Sub-agents skip this — the
+      // parent's dispatch loop ends the wrapping span.
+      this.trace?.end();
     }
   }
 

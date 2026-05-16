@@ -3,7 +3,7 @@ import { connectMcp, type McpHandle } from "./mcp-client";
 import { Session, type SessionOpts } from "./session";
 import { readSkill } from "./skills";
 import { nullTracer, type Tracer } from "./tracing";
-import { createLangfuseTracer, langfuseFromEnv } from "./tracing-langfuse";
+import { langfuseTracerFromEnv } from "./tracing-langfuse";
 
 // Process-level singleton. Owns shared, expensive resources:
 //   - one OpenAI client (one API key, one rate-limit bucket)
@@ -136,10 +136,10 @@ export async function createEngine(opts: EngineOpts): Promise<Engine> {
   if (opts.tracer) {
     tracer = opts.tracer;
   } else {
-    const lf = langfuseFromEnv();
-    if (lf) {
-      tracer = createLangfuseTracer(lf);
-      console.log(`[engine] tracing enabled (langfuse, ${process.env.LANGFUSE_BASE_URL ?? "default host"})`);
+    const auto = langfuseTracerFromEnv();
+    if (auto) {
+      tracer = auto;
+      console.log(`[engine] tracing enabled (langfuse v5, ${process.env.LANGFUSE_BASE_URL ?? "default host"})`);
     } else {
       tracer = nullTracer;
       console.log("[engine] tracing disabled (LANGFUSE_*_KEY not set)");

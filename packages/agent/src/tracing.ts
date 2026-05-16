@@ -40,7 +40,7 @@ export interface GenerationStartOpts {
   // Scalar-only by design: most observability backends index these for
   // filtering, so structured objects don't belong here. Stick to the LLM
   // request parameters (temperature, top_p, reasoning_effort, ...).
-  modelParameters?: Record<string, string | number | boolean | string[] | null>;
+  modelParameters?: Record<string, string | number>;
   input?: unknown;
 }
 
@@ -64,9 +64,14 @@ export interface Span extends TraceContext {
   end(opts: SpanEndOpts): void;
 }
 
-// Trace is the session-level root. Same shape as TraceContext — no
-// separate `end` because traces close implicitly when their tracer flushes.
-export type Trace = TraceContext;
+// Trace is the session-level root. Same shape as TraceContext plus an
+// explicit `end()` — OTel-based backends (Langfuse v5) need the root span
+// closed before flush, or the trace shows up as "in progress" forever.
+// In-process backends with implicit lifecycles (or the null tracer) can
+// treat `end` as a no-op.
+export interface Trace extends TraceContext {
+  end(): void;
+}
 
 export interface TraceStartOpts {
   id: string;
@@ -97,6 +102,7 @@ const NOOP_TRACE: Trace = {
   update() {},
   generation: () => NOOP_GENERATION,
   span: () => NOOP_SPAN,
+  end() {},
 };
 
 export const nullTracer: Tracer = {
