@@ -42,11 +42,17 @@ export interface GenerationStartOpts {
   // request parameters (temperature, top_p, reasoning_effort, ...).
   modelParameters?: Record<string, string | number>;
   input?: unknown;
+  // Per-observation metadata. Use for short identity markers (`agent_id`,
+  // `parent_id`) so the UI can distinguish observations from different
+  // sessions in the same trace — trace.metadata alone makes nested
+  // sub-agent observations look indistinguishable from the parent's.
+  metadata?: Record<string, unknown>;
 }
 
 export interface SpanStartOpts {
   name: string;
   input?: unknown;
+  metadata?: Record<string, unknown>;
 }
 
 // Anything that can hold nested generations/spans and have its own

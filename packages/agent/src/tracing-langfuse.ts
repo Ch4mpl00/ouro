@@ -93,6 +93,7 @@ function startGenerationChild(parent: LangfuseSpan, opts: GenerationStartOpts): 
     input: opts.input,
     model: opts.model,
     modelParameters: opts.modelParameters,
+    metadata: opts.metadata,
   };
   return parent.startObservation(opts.name, attrs, { asType: "generation" });
 }
@@ -106,7 +107,9 @@ function wrapTrace(s: LangfuseSpan): Trace {
       return wrapGeneration(startGenerationChild(s, opts));
     },
     span(opts: SpanStartOpts): Span {
-      return wrapSpan(s.startObservation(opts.name, { input: opts.input }));
+      return wrapSpan(
+        s.startObservation(opts.name, { input: opts.input, metadata: opts.metadata }),
+      );
     },
     end(): void {
       s.end();
@@ -131,7 +134,9 @@ function wrapSpan(s: LangfuseSpan): Span {
       return wrapGeneration(startGenerationChild(s, opts));
     },
     span(opts: SpanStartOpts): Span {
-      return wrapSpan(s.startObservation(opts.name, { input: opts.input }));
+      return wrapSpan(
+        s.startObservation(opts.name, { input: opts.input, metadata: opts.metadata }),
+      );
     },
   };
 }

@@ -80,18 +80,6 @@ type DeepSeekAssistantHistory = ChatCompletionMessageParam & {
   reasoning_content?: string;
 };
 
-// Replace the system message content with a short stub for trace
-// logging. The full text is already in `trace.metadata` — repeating it
-// in every generation's `input` just buries the actual conversation.
-function redactSystemForTrace(
-  messages: ChatCompletionMessageParam[],
-): ChatCompletionMessageParam[] {
-  return messages.map((m) => {
-    if (m.role !== "system") return m;
-    return { ...m, content: "[system prompt + skills — see trace metadata]" };
-  });
-}
-
 function ensureReasoningContentOnHistory(messages: ChatCompletionMessageParam[]): void {
   for (const m of messages) {
     if (m.role !== "assistant") continue;
@@ -161,10 +149,14 @@ export class Session {
     if (opts.traceScope) {
       this.scope = opts.traceScope;
       this.trace = null;
+      // Annotate the parent's `invoke_sub_agent` span with sub-agent
+      // identity. Skills go in as NAMES, not bodies — metadata is for
+      // short K/V; the full skill text already lives in this session's
+      // first generation.input (system message), where it belongs.
       this.scope.update({
         metadata: {
           sub_agent_id: this.id,
-          sub_agent_skills: skillsMap,
+          sub_agent_skills: Object.keys(skillsMap),
           sub_agent_model: this.model,
           sub_agent_reasoning_effort: this.reasoningEffort,
           sub_agent_max_iterations: this.maxIterations,
@@ -180,6 +172,12 @@ export class Session {
       // System prompt + skills live in metadata. When tracing is disabled
       // the engine's tracer is a no-op, so the .generation()/.span() calls
       // below stay safe and Session itself doesn't null-check.
+      // Trace metadata = short key-value filtering fields only. The big
+      // strings (full system prompt, skill bodies) live where they
+      // actually belong: inside generation.input (as the system message
+      // of the first messages array). Stuffing them into metadata both
+      // bloats the UI and misuses the field — Langfuse's propagated
+      // metadata caps values at 200 chars.
       this.trace = engine.tracer.trace({
         id: this.id,
         name: this.id,
@@ -187,12 +185,12 @@ export class Session {
         tags: opts.tags,
         metadata: {
           ...opts.metadata,
-          systemPrompt: opts.systemPrompt,
-          skills: skillsMap,
+          agent_id: this.id,
+          skills: Object.keys(skillsMap),
           model: this.model,
-          reasoningEffort: this.reasoningEffort,
-          maxIterations: this.maxIterations,
-          parentId: this.parentId,
+          reasoning_effort: this.reasoningEffort,
+          max_iterations: this.maxIterations,
+          ...(this.parentId ? { parent_id: this.parentId } : {}),
         },
       });
       this.scope = this.trace;
@@ -210,6 +208,17 @@ export class Session {
   async run(): Promise<string> {
     if (this.closed) throw new Error(`session ${this.id} is closed`);
     return this.runUntilSettled();
+  }
+
+  // Identity stamp written into every observation this session creates
+  // (iter generations + tool spans). Without it, sub-agent observations
+  // are visually indistinguishable from the parent's in the UI — the
+  // observation pane shows only trace.metadata, and that's the parent's.
+  // This way every iter / tool span carries who-ran-it on its own row.
+  private get observationMeta(): Record<string, unknown> {
+    return this.parentId
+      ? { agent_id: this.id, parent_id: this.parentId }
+      : { agent_id: this.id };
   }
 
   private async runUntilSettled(): Promise<string> {
@@ -254,12 +263,12 @@ export class Session {
             : { thinking: { type: "enabled" as const }, reasoning_effort: this.reasoningEffort }),
         };
 
-        // Generation span = one LLM call. The tracer computes latency from
-        // start/end timestamps and stores prompt/completion tokens from
-        // `usage`. The system message itself is redacted from the logged
-        // input — its full content already lives in `trace.metadata.
-        // systemPrompt` and `trace.metadata.skills`, so repeating it in
-        // every iter just floods the UI.
+        // Generation span = one LLM call. The tracer computes latency
+        // from start/end timestamps and stores prompt/completion tokens
+        // from `usage`. Input is the full messages array — system
+        // message included. That's the actual LLM input and the right
+        // place for it (Langfuse UI collapses long content). metadata
+        // stays a short K/V marker (agent_id) for filtering only.
         const generation = this.scope.generation({
           name: `iter-${i}`,
           model: this.model,
@@ -267,7 +276,8 @@ export class Session {
             reasoning_effort: this.reasoningEffort,
             thinking: this.reasoningEffort === "disabled" ? "disabled" : "enabled",
           },
-          input: redactSystemForTrace(this.messages),
+          input: this.messages,
+          metadata: this.observationMeta,
         });
 
         let response;
@@ -320,6 +330,7 @@ export class Session {
             const span = this.scope.span({
               name: call.function.name,
               input: { raw_arguments: call.function.arguments },
+              metadata: this.observationMeta,
             });
 
             let result: string;
