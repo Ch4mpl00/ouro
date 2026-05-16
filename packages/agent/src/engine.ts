@@ -1,4 +1,5 @@
 import OpenAI from "openai";
+import { Langfuse } from "langfuse";
 import { connectMcp, type McpHandle } from "./mcp-client";
 import { Session, type SessionOpts } from "./session";
 import { readSkill } from "./skills";
@@ -23,6 +24,10 @@ export interface EngineOpts {
   // overlay edits (e.g. by the `dreaming` skill) take effect on the very
   // next session without an engine restart.
   skills?: string[];
+  // Optional Langfuse client for tracing. Sessions create one trace each
+  // (per-LLM-call generations + per-tool-call spans). When null, all
+  // tracing calls in `session.ts` short-circuit to no-ops.
+  langfuse?: Langfuse | null;
 }
 
 export class Engine {
@@ -30,13 +35,21 @@ export class Engine {
   readonly mcp: McpHandle;
   readonly defaultModel: string;
   readonly skills: readonly string[];
+  readonly langfuse: Langfuse | null;
   private sessions = new Map<string, Session>();
 
-  constructor(llm: OpenAI, mcp: McpHandle, defaultModel: string, skills: readonly string[]) {
+  constructor(
+    llm: OpenAI,
+    mcp: McpHandle,
+    defaultModel: string,
+    skills: readonly string[],
+    langfuse: Langfuse | null,
+  ) {
     this.llm = llm;
     this.mcp = mcp;
     this.defaultModel = defaultModel;
     this.skills = skills;
+    this.langfuse = langfuse;
   }
 
   async startSession(opts: SessionOpts): Promise<Session> {
@@ -107,6 +120,9 @@ export class Engine {
 
   async shutdown(): Promise<void> {
     for (const id of [...this.sessions.keys()]) this.endSession(id);
+    // shutdownAsync flushes all batched events. Without this, traces from
+    // the final session(s) before SIGTERM are silently dropped.
+    if (this.langfuse) await this.langfuse.shutdownAsync();
     await this.mcp.close();
   }
 }
@@ -121,5 +137,24 @@ export async function createEngine(opts: EngineOpts): Promise<Engine> {
 
   const mcp = await connectMcp();
 
-  return new Engine(llm, mcp, opts.defaultModel ?? "deepseek-v4-pro", opts.skills ?? []);
+  // Caller may pass `langfuse: null` to explicitly disable. If `undefined`
+  // (the common case), auto-configure from env. Missing keys → no tracing,
+  // logged once at startup.
+  let langfuse: Langfuse | null;
+  if (opts.langfuse !== undefined) {
+    langfuse = opts.langfuse;
+  } else {
+    const secretKey = process.env.LANGFUSE_SECRET_KEY;
+    const publicKey = process.env.LANGFUSE_PUBLIC_KEY;
+    const baseUrl = process.env.LANGFUSE_BASE_URL;
+    if (secretKey && publicKey) {
+      langfuse = new Langfuse({ secretKey, publicKey, baseUrl });
+      console.log(`[engine] langfuse tracing enabled (${baseUrl ?? "default host"})`);
+    } else {
+      langfuse = null;
+      console.log("[engine] langfuse tracing disabled (LANGFUSE_*_KEY not set)");
+    }
+  }
+
+  return new Engine(llm, mcp, opts.defaultModel ?? "deepseek-v4-pro", opts.skills ?? [], langfuse);
 }

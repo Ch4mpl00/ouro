@@ -60,6 +60,12 @@ async function runSignal(engine: Engine, signal: PendingSignal): Promise<void> {
       systemPrompt: buildPromptPrefix(sessionContext, signal.envContext),
       skills: [signal.source],
       reasoningEffort: "disabled",
+      tags: [signal.source],
+      metadata: {
+        signal_id: signal.id,
+        signal_source: signal.source,
+        signal_created_at: signal.created_at,
+      },
     });
   } catch (err) {
     console.error(
@@ -111,6 +117,12 @@ async function reportFailureToUser(
     systemPrompt,
     reasoningEffort: "disabled",
     maxIterations: 5,
+    tags: ["recovery", signal.source],
+    metadata: {
+      signal_id: signal.id,
+      signal_source: signal.source,
+      crashed_with: err instanceof Error ? err.message : String(err),
+    },
   });
   session.messages.push({ role: "user", content: briefing });
 

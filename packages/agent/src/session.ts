@@ -1,4 +1,5 @@
 import type { ChatCompletionMessageParam, ChatCompletionTool } from "openai/resources/chat/completions";
+import type { LangfuseTraceClient } from "langfuse";
 import type { Engine } from "./engine";
 import { setMemory } from "./db/memory";
 import { listSkills, readSkill, saveSkill } from "./skills";
@@ -30,6 +31,12 @@ export interface SessionOpts {
   reasoningEffort?: ReasoningEffort;
   maxIterations?: number;
   parentId?: string;
+  // Optional Langfuse trace metadata. `tags` show up as filter chips in the
+  // UI (use for `signal.source` so you can slice by domain); `metadata` is
+  // freeform key/value (use for `signal.id`, watermarks, anything you'd
+  // grep traces for later). No-op when `engine.langfuse` is null.
+  tags?: string[];
+  metadata?: Record<string, unknown>;
 }
 
 const DEFAULT_MAX_ITERATIONS = 100;
@@ -221,6 +228,7 @@ export class Session {
   private model: string;
   private reasoningEffort: ReasoningEffort;
   private readonly maxIterations: number;
+  private readonly trace: LangfuseTraceClient | null;
   private closed = false;
 
   constructor(engine: Engine, opts: SessionOpts) {
@@ -234,6 +242,24 @@ export class Session {
     if (opts.systemPrompt) {
       this.messages.push({ role: "system", content: opts.systemPrompt });
     }
+
+    // One Langfuse trace per session. Generations + tool spans get
+    // attached to it inside `runUntilSettled`. Output + final status are
+    // updated when the loop exits (success, error, or maxIterations).
+    this.trace =
+      engine.langfuse?.trace({
+        id: this.id,
+        name: this.id,
+        tags: opts.tags,
+        metadata: {
+          ...opts.metadata,
+          model: this.model,
+          reasoningEffort: this.reasoningEffort,
+          maxIterations: this.maxIterations,
+          parentId: this.parentId,
+        },
+        input: opts.systemPrompt ? { systemPrompt: opts.systemPrompt } : undefined,
+      }) ?? null;
   }
 
   async send(userText: string): Promise<string> {
@@ -252,76 +278,145 @@ export class Session {
   private async runUntilSettled(): Promise<string> {
     const { llm, mcp } = this.engine;
 
-    for (let i = 0; i < this.maxIterations; i++) {
-      // DeepSeek's thinking mode requires every prior assistant turn in the
-      // history to carry a `reasoning_content` field. Turns produced under
-      // `thinking=disabled` lack it, so once we escalate via `handoff`, the
-      // very next request 400s with "reasoning_content must be passed back".
-      // Stamp an empty string on every assistant message missing the field
-      // whenever we're about to send in thinking-enabled mode.
-      if (this.reasoningEffort !== "disabled") {
-        ensureReasoningContentOnHistory(this.messages);
-      }
-
-      const body = {
-        model: this.model,
-        messages: this.messages,
-        tools: [
-          ...mcp.tools,
-          HANDOFF_TOOL,
-          SET_MEMORY_TOOL,
-          READ_SKILL_TOOL,
-          WRITE_SKILL_TOOL,
-          LIST_SKILLS_TOOL,
-        ],
-        ...(this.reasoningEffort === "disabled"
-          ? { thinking: { type: "disabled" as const } }
-          : { thinking: { type: "enabled" as const }, reasoning_effort: this.reasoningEffort }),
-      };
-      // @ts-expect-error DeepSeek extends ChatCompletionCreateParams with `thinking` + `reasoning_effort`.
-      const response = await llm.chat.completions.create(body);
-
-      const choice = response.choices[0]!;
-      const { message } = choice;
-      this.messages.push(message);
-
-      this.engine.log(this.id, `iter ${i} finish=${choice.finish_reason} tool_calls=${message.tool_calls?.length ?? 0}`);
-
-      if (!message.tool_calls?.length) {
-        return message.content ?? "";
-      }
-
-      for (const call of message.tool_calls) {
-        const args = JSON.parse(call.function.arguments || "{}") as Record<string, unknown>;
-        this.engine.log(this.id, `→ ${call.function.name}(${JSON.stringify(args)})`);
-
-        let result: string;
-        const name = call.function.name;
-        if (name === HANDOFF_TOOL_NAME) {
-          result = this.applyHandoff(args as HandoffArgs);
-        } else if (name === SET_MEMORY_TOOL_NAME) {
-          result = this.applySetMemory(args as SetMemoryArgs);
-        } else if (name === READ_SKILL_TOOL_NAME) {
-          result = await this.applyReadSkill(args as SkillNameArg);
-        } else if (name === WRITE_SKILL_TOOL_NAME) {
-          result = await this.applyWriteSkill(args as WriteSkillArgs);
-        } else if (name === LIST_SKILLS_TOOL_NAME) {
-          result = await this.applyListSkills();
-        } else {
-          result = await mcp.callTool(name, args);
+    try {
+      for (let i = 0; i < this.maxIterations; i++) {
+        // DeepSeek's thinking mode requires every prior assistant turn in the
+        // history to carry a `reasoning_content` field. Turns produced under
+        // `thinking=disabled` lack it, so once we escalate via `handoff`, the
+        // very next request 400s with "reasoning_content must be passed back".
+        // Stamp an empty string on every assistant message missing the field
+        // whenever we're about to send in thinking-enabled mode.
+        if (this.reasoningEffort !== "disabled") {
+          ensureReasoningContentOnHistory(this.messages);
         }
 
-        this.engine.log(this.id, `← ${result.length}b: ${result}`);
+        const body = {
+          model: this.model,
+          messages: this.messages,
+          tools: [
+            ...mcp.tools,
+            HANDOFF_TOOL,
+            SET_MEMORY_TOOL,
+            READ_SKILL_TOOL,
+            WRITE_SKILL_TOOL,
+            LIST_SKILLS_TOOL,
+          ],
+          ...(this.reasoningEffort === "disabled"
+            ? { thinking: { type: "disabled" as const } }
+            : { thinking: { type: "enabled" as const }, reasoning_effort: this.reasoningEffort }),
+        };
 
-        this.messages.push({
-          role: "tool",
-          tool_call_id: call.id,
-          content: result,
+        // Generation span = one LLM call. Langfuse computes latency from
+        // startTime/endTime and stores prompt/completion tokens from `usage`.
+        const generation = this.trace?.generation({
+          name: `iter-${i}`,
+          model: this.model,
+          modelParameters: {
+            reasoning_effort: this.reasoningEffort,
+            thinking: this.reasoningEffort === "disabled" ? "disabled" : "enabled",
+          },
+          input: this.messages,
+          startTime: new Date(),
         });
-      }
-    }
 
-    throw new Error(`session ${this.id} exceeded maxIterations=${this.maxIterations}`);
+        let response;
+        try {
+          // @ts-expect-error DeepSeek extends ChatCompletionCreateParams with `thinking` + `reasoning_effort`.
+          response = await llm.chat.completions.create(body);
+        } catch (err) {
+          generation?.end({
+            output: { error: (err as Error).message },
+            level: "ERROR",
+            statusMessage: (err as Error).message,
+          });
+          throw err;
+        }
+
+        const choice = response.choices[0]!;
+        const { message } = choice;
+        this.messages.push(message);
+
+        generation?.end({
+          output: message,
+          usage: response.usage
+            ? {
+                input: response.usage.prompt_tokens,
+                output: response.usage.completion_tokens,
+                total: response.usage.total_tokens,
+                unit: "TOKENS",
+              }
+            : undefined,
+        });
+
+        this.engine.log(this.id, `iter ${i} finish=${choice.finish_reason} tool_calls=${message.tool_calls?.length ?? 0}`);
+
+        if (!message.tool_calls?.length) {
+          this.trace?.update({ output: message.content ?? "" });
+          return message.content ?? "";
+        }
+
+        for (const call of message.tool_calls) {
+          // Span per tool call. We open it BEFORE parsing args so a
+          // malformed-JSON throw still leaves a measurable, attributed
+          // span in the trace.
+          const span = this.trace?.span({
+            name: call.function.name,
+            input: { raw_arguments: call.function.arguments },
+            startTime: new Date(),
+          });
+
+          let result: string;
+          try {
+            const args = JSON.parse(call.function.arguments || "{}") as Record<string, unknown>;
+            span?.update({ input: args });
+            this.engine.log(this.id, `→ ${call.function.name}(${JSON.stringify(args)})`);
+
+            const name = call.function.name;
+            if (name === HANDOFF_TOOL_NAME) {
+              result = this.applyHandoff(args as HandoffArgs);
+            } else if (name === SET_MEMORY_TOOL_NAME) {
+              result = this.applySetMemory(args as SetMemoryArgs);
+            } else if (name === READ_SKILL_TOOL_NAME) {
+              result = await this.applyReadSkill(args as SkillNameArg);
+            } else if (name === WRITE_SKILL_TOOL_NAME) {
+              result = await this.applyWriteSkill(args as WriteSkillArgs);
+            } else if (name === LIST_SKILLS_TOOL_NAME) {
+              result = await this.applyListSkills();
+            } else {
+              result = await mcp.callTool(name, args);
+            }
+          } catch (err) {
+            span?.end({
+              output: { error: (err as Error).message },
+              level: "ERROR",
+              statusMessage: (err as Error).message,
+            });
+            throw err;
+          }
+
+          span?.end({ output: result });
+
+          this.engine.log(this.id, `← ${result.length}b: ${result}`);
+
+          this.messages.push({
+            role: "tool",
+            tool_call_id: call.id,
+            content: result,
+          });
+        }
+      }
+
+      throw new Error(`session ${this.id} exceeded maxIterations=${this.maxIterations}`);
+    } catch (err) {
+      // Trace-level error marker. Individual generation/span errors are
+      // already attributed above; this surfaces failed sessions in the
+      // Langfuse list view (sort by metadata.error or filter by output.error).
+      this.trace?.update({
+        output: { error: (err as Error).message },
+        metadata: { error: true },
+      });
+      throw err;
+    }
   }
 
   private async applyReadSkill(args: SkillNameArg): Promise<string> {
