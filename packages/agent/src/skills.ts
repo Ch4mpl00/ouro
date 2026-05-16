@@ -7,7 +7,7 @@ import fs from "node:fs/promises";
 //                               writes here when it revises an instruction.
 //   skills.default/<name>.md  — defaults (git-tracked). The shipped baseline.
 //
-// `loadSkill(name)` returns the live version if present, else the default,
+// `readSkill(name)` returns the live version if present, else the default,
 // else null. `saveSkill(name, content)` always writes to the live overlay —
 // defaults are never touched at runtime, which preserves a clean reset
 // point (delete the live file → fall back to default).
@@ -37,7 +37,7 @@ async function readIfExists(file: string): Promise<string | null> {
   }
 }
 
-export async function loadSkill(name: string): Promise<string | null> {
+export async function readSkill(name: string): Promise<string | null> {
   validateName(name);
   const live = await readIfExists(path.join(LIVE_DIR, `${name}.md`));
   if (live !== null) return live;
@@ -63,7 +63,7 @@ export interface SkillEntry {
 }
 
 // Union of live + defaults, with `source` showing which layer is active
-// for each name. If both exist, the live one wins (matches loadSkill).
+// for each name. If both exist, the live one wins (matches readSkill).
 export async function listSkills(): Promise<SkillEntry[]> {
   const [liveEntries, defaultEntries] = await Promise.all([
     readDir(LIVE_DIR, "live"),

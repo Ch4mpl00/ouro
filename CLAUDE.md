@@ -131,7 +131,7 @@ Live under `skills.default/` (git-tracked, shipped in image) with an
 optional live overlay in `skills/` (gitignored, mounted as a Docker
 volume — written by the `dreaming` skill when it self-revises).
 
-`loadSkill(name)` reads `skills/<name>.md` first, falls back to
+`readSkill(name)` reads `skills/<name>.md` first, falls back to
 `skills.default/<name>.md`. Naming is signal-source-based:
 
 - `nashdom-bill`, `news-digest`, `tech-digest`, `dreaming`, `scheduler`,

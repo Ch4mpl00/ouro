@@ -1,7 +1,7 @@
 import type { ChatCompletionMessageParam, ChatCompletionTool } from "openai/resources/chat/completions";
 import type { Engine } from "./engine";
 import { setMemory } from "./db/memory";
-import { listSkills, loadSkill, saveSkill } from "./skills";
+import { listSkills, readSkill, saveSkill } from "./skills";
 
 // One isolated conversation thread. Owns its own message buffer, system
 // prompt, model and iteration budget. Shares the engine's OpenAI client
@@ -14,7 +14,18 @@ export type ReasoningEffort = "disabled" | "high" | "max";
 
 export interface SessionOpts {
   id: string;
+  // Pre-assembled context that goes at the top of the system prompt (e.g.
+  // the session-context block + the signal's envContext). Skills are
+  // resolved separately by the engine and appended after this.
   systemPrompt?: string;
+  // Per-session skills — typically the primary domain skill matching the
+  // signal source (e.g. `nashdom-bill`). The engine resolves these via
+  // `readSkill` at `startSession` time and prepends their content into the
+  // system prompt. Missing here is a hard error — the caller decides
+  // whether to skip the signal. Engine-level meta-skills (`routing`,
+  // `handoff`) come from `EngineOpts.skills` and are added on top unless
+  // `includeEngineSkills: false`.
+  skills?: string[];
   model?: string;
   reasoningEffort?: ReasoningEffort;
   maxIterations?: number;
@@ -26,7 +37,8 @@ const DEFAULT_MAX_ITERATIONS = 100;
 // Synthetic tool intercepted inside the session — never forwarded to MCP.
 // Lets the cheap-tier model promote (or demote) the current session's
 // reasoning effort and model. The actual "when to use" rules live in
-// skills/handoff.md, which the supervisor appends to every system prompt.
+// skills/handoff.md, which the engine appends to every session as an
+// engine-level skill.
 const HANDOFF_TOOL_NAME = "handoff";
 const HANDOFF_TOOL: ChatCompletionTool = {
   type: "function",
@@ -106,7 +118,7 @@ interface SetMemoryArgs {
 
 // Skill tools are agent-side because skills are agent reasoning config,
 // not integration state — there's no point round-tripping through MCP to
-// reach files the agent process can read directly. `loadSkill` resolves
+// reach files the agent process can read directly. `readSkill` resolves
 // the live overlay (`skills/<name>.md`) with fallback to the shipped
 // default (`skills.default/<name>.md`); `saveSkill` always writes to the
 // overlay, leaving defaults untouched as a reset point.
@@ -317,7 +329,7 @@ export class Session {
       return `[read_skill error] name must be a non-empty string`;
     }
     try {
-      const content = await loadSkill(args.name);
+      const content = await readSkill(args.name);
       if (content === null) {
         return JSON.stringify({ name: args.name, found: false, content: null });
       }

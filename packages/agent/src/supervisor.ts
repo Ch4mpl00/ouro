@@ -2,24 +2,22 @@ import "dotenv/config";
 import type { ChatCompletionMessageParam } from "openai/resources/chat/completions";
 import { createEngine, type Engine } from "./engine";
 import { buildSessionContext } from "./session-context";
-import { loadSkill } from "./skills";
 
 // Long-running process. The agent has no signal sources of its own — every
 // external event (Telegram, Gmail, cron, webhook) lives inside the MCP
-// server, which queues signals into its own DB. Skill instructions live
-// on the agent side (`skills/` with `skills.default/` fallback) — the
-// supervisor loads `skills/<signal.source>.md` per session. The agent's
-// only job is:
+// server, which queues signals into its own DB.
 //
 //   loop forever:
 //     {signal, pendingAfter} = mcp.get_next_signal
 //     if signal is null: sleep
-//     else: open session with:
-//             - session-context block (time, tz, watermarks)
-//             - skills/<source>.md (live or default)
-//             - signal.envContext (integration env from MCP)
-//             - skills/handoff.md
+//     else: open session with primary skill = signal.source,
 //           push signal.content as user message, run.
+//
+// Skill loading is handled by the engine: meta-skills (routing, handoff)
+// are configured at engine-create time and applied to every session;
+// per-signal primary skill (matching `signal.source`) is passed via
+// `SessionOpts.skills`. The supervisor only assembles the session-context
+// + envContext block.
 //
 // All side effects (replying to Telegram, marking bills, etc.) are tool
 // calls the LLM makes inside the session.
@@ -27,9 +25,7 @@ import { loadSkill } from "./skills";
 // Reasoning effort is **not** picked per source here. Every session starts
 // at the weak default (`reasoning_effort=disabled`); the model itself
 // decides whether to escalate via the in-session `handoff` tool, guided
-// by `skills/handoff.md` (loaded below and appended to every system
-// prompt). Keeps routing rules in markdown so dreaming can revise them
-// without a code change.
+// by `skills/handoff.md` (an engine-level skill).
 
 const POLL_INTERVAL_MS = 2_000;
 
@@ -50,40 +46,27 @@ function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-async function runSignal(engine: Engine, signal: PendingSignal): Promise<void> {
-  // Two meta-skills are always loaded alongside the source skill:
-  //   - routing — "if the request matches a different domain than the
-  //     signal source's, read that skill via read_skill and apply it"
-  //   - handoff — "when to escalate reasoning_effort / model"
-  // Both are domain-agnostic guidance the agent needs on every signal.
-  const [sourceSkill, routingSkill, handoffSkill, sessionContext] = await Promise.all([
-    loadSkill(signal.source),
-    loadSkill("routing"),
-    loadSkill("handoff"),
-    buildSessionContext(engine),
-  ]);
+function buildPromptPrefix(sessionContext: string, envContext: string | null): string {
+  return envContext ? `${sessionContext}\n\n---\n\n${envContext}` : sessionContext;
+}
 
-  if (!sourceSkill) {
+async function runSignal(engine: Engine, signal: PendingSignal): Promise<void> {
+  const sessionContext = await buildSessionContext(engine);
+
+  let session;
+  try {
+    session = await engine.startSession({
+      id: `${signal.source}:${signal.id}`,
+      systemPrompt: buildPromptPrefix(sessionContext, signal.envContext),
+      skills: [signal.source],
+      reasoningEffort: "disabled",
+    });
+  } catch (err) {
     console.error(
-      `[supervisor] signal #${signal.id} source=${signal.source}: no skill (skills/${signal.source}.md and skills.default/${signal.source}.md both missing), skipping`,
+      `[supervisor] signal #${signal.id} source=${signal.source}: ${(err as Error).message}, skipping`,
     );
     return;
   }
-
-  // Order: context block first (so the model sees "current state" up front),
-  // then the per-source skill, then the integration env, then the
-  // always-loaded meta-skills (routing, handoff).
-  const parts: string[] = [sessionContext, sourceSkill];
-  if (signal.envContext) parts.push(signal.envContext);
-  if (routingSkill) parts.push(routingSkill);
-  if (handoffSkill) parts.push(handoffSkill);
-  const systemPrompt = parts.join("\n\n---\n\n");
-
-  const session = engine.startSession({
-    id: `${signal.source}:${signal.id}`,
-    systemPrompt,
-    reasoningEffort: "disabled",
-  });
   session.messages.push({ role: "user", content: signal.content });
 
   try {
@@ -117,13 +100,13 @@ async function reportFailureToUser(
 ): Promise<void> {
   const errMsg = err instanceof Error ? err.message : String(err);
   const briefing = `Error: ${errMsg}\n\nMessage log:\n${JSON.stringify(failedMessages, null, 2)}`;
-  // signal.envContext is appended so the recovery session knows the
-  // default chat id to notify.
+  // Recovery sessions skip engine-level meta-skills (routing, handoff) —
+  // RECOVERY_PROMPT is the only instruction we want active here.
   const systemPrompt = signal.envContext
     ? `${RECOVERY_PROMPT}\n\n---\n\n${signal.envContext}`
     : RECOVERY_PROMPT;
 
-  const session = engine.startSession({
+  const session = await engine.startSession({
     id: `recovery:${signal.source}:${signal.id}`,
     systemPrompt,
     reasoningEffort: "disabled",
@@ -145,6 +128,10 @@ async function main(): Promise<void> {
   const engine = await createEngine({
     apiKey,
     defaultModel: process.env.AGENT_MODEL ?? "deepseek-v4-pro",
+    // Meta-skills loaded into every session: routing (cross-skill
+    // delegation when intent ≠ source) + handoff (when to escalate
+    // reasoning_effort).
+    skills: ["routing", "handoff"],
   });
 
   console.log(`[supervisor] mcp tools: ${engine.mcp.tools.map((t) => t.function.name).join(", ")}`);
