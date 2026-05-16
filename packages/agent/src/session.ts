@@ -429,16 +429,9 @@ export class Session {
           messages: this.messages,
           tools: [
             ...mcp.tools,
-            HANDOFF_TOOL,
-            SET_MEMORY_TOOL,
-            READ_SKILL_TOOL,
-            WRITE_SKILL_TOOL,
-            LIST_SKILLS_TOOL,
-            // Sub-agents themselves cannot spawn further sub-agents. They
-            // are focused workers — if they need broader help, that's a
-            // signal the parent should have delegated differently, not
-            // that the worker should recurse.
-            ...(this.parentId === undefined ? [INVOKE_SUB_AGENT_TOOL] : []),
+            ...SYNTHETIC_TOOLS.filter((t) => t.visibleTo?.(this) ?? true).map(
+              (t) => t.def,
+            ),
           ],
           ...(this.reasoningEffort === "disabled"
             ? { thinking: { type: "disabled" as const } }
@@ -521,18 +514,9 @@ export class Session {
               this.engine.log(this.id, `→ ${call.function.name}(${JSON.stringify(args)})`);
 
               const name = call.function.name;
-              if (name === HANDOFF_TOOL_NAME) {
-                result = this.applyHandoff(args as HandoffArgs);
-              } else if (name === SET_MEMORY_TOOL_NAME) {
-                result = this.applySetMemory(args as SetMemoryArgs);
-              } else if (name === READ_SKILL_TOOL_NAME) {
-                result = await this.applyReadSkill(args as SkillNameArg);
-              } else if (name === WRITE_SKILL_TOOL_NAME) {
-                result = await this.applyWriteSkill(args as WriteSkillArgs);
-              } else if (name === LIST_SKILLS_TOOL_NAME) {
-                result = await this.applyListSkills();
-              } else if (name === INVOKE_SUB_AGENT_TOOL_NAME) {
-                result = await this.applyInvokeSubAgent(args as InvokeSubAgentArgs);
+              const synthetic = SYNTHETIC_TOOLS_BY_NAME.get(name);
+              if (synthetic) {
+                result = await synthetic.handle(this, args);
               } else {
                 result = await mcp.callTool(name, args);
               }
@@ -574,7 +558,7 @@ export class Session {
     }
   }
 
-  private async applyReadSkill(args: SkillNameArg): Promise<string> {
+  async applyReadSkill(args: SkillNameArg): Promise<string> {
     if (typeof args.name !== "string" || args.name.length === 0) {
       return `[read_skill error] name must be a non-empty string`;
     }
@@ -594,7 +578,7 @@ export class Session {
     }
   }
 
-  private async applyWriteSkill(args: WriteSkillArgs): Promise<string> {
+  async applyWriteSkill(args: WriteSkillArgs): Promise<string> {
     if (typeof args.name !== "string" || args.name.length === 0) {
       return `[write_skill error] name must be a non-empty string`;
     }
@@ -610,7 +594,7 @@ export class Session {
     }
   }
 
-  private async applyListSkills(): Promise<string> {
+  async applyListSkills(): Promise<string> {
     try {
       const skills = await listSkills();
       return JSON.stringify({ count: skills.length, skills });
@@ -619,7 +603,7 @@ export class Session {
     }
   }
 
-  private async applyInvokeSubAgent(args: InvokeSubAgentArgs): Promise<string> {
+  async applyInvokeSubAgent(args: InvokeSubAgentArgs): Promise<string> {
     if (!Array.isArray(args.skills) || args.skills.length === 0) {
       return `[invoke_sub_agent error] "skills" must be a non-empty string array`;
     }
@@ -676,7 +660,7 @@ export class Session {
     }
   }
 
-  private applySetMemory(args: SetMemoryArgs): string {
+  applySetMemory(args: SetMemoryArgs): string {
     if (typeof args.key !== "string" || args.key.length === 0) {
       return `[set_memory error] key must be a non-empty string`;
     }
@@ -688,7 +672,7 @@ export class Session {
     return `ok — stored ${args.key}`;
   }
 
-  private applyHandoff(args: HandoffArgs): string {
+  applyHandoff(args: HandoffArgs): string {
     const target: ReasoningEffort | undefined = args.reasoning_effort;
     if (target !== "disabled" && target !== "high" && target !== "max") {
       return `[handoff error] reasoning_effort must be one of disabled|high|max, got ${JSON.stringify(target)}`;
@@ -706,3 +690,54 @@ export class Session {
     this.closed = true;
   }
 }
+
+// Registry of agent-side synthetic tools. Each entry pairs the OpenAI
+// tool definition (sent to the LLM) with the Session method that runs
+// when the LLM calls it, plus an optional `visibleTo` predicate that
+// hides the tool from sessions where it doesn't belong (e.g. nested
+// sub-agents shouldn't see `invoke_sub_agent`). Adding a new synthetic
+// tool is two steps: declare the tool's NAME / DEFINITION / arg
+// interface above, drop one entry here.
+interface SyntheticTool {
+  def: ChatCompletionTool;
+  visibleTo?: (session: Session) => boolean;
+  handle: (
+    session: Session,
+    args: Record<string, unknown>,
+  ) => Promise<string> | string;
+}
+
+const SYNTHETIC_TOOLS: SyntheticTool[] = [
+  {
+    def: HANDOFF_TOOL,
+    handle: (s, args) => s.applyHandoff(args as HandoffArgs),
+  },
+  {
+    def: SET_MEMORY_TOOL,
+    handle: (s, args) => s.applySetMemory(args as SetMemoryArgs),
+  },
+  {
+    def: READ_SKILL_TOOL,
+    handle: (s, args) => s.applyReadSkill(args as SkillNameArg),
+  },
+  {
+    def: WRITE_SKILL_TOOL,
+    handle: (s, args) => s.applyWriteSkill(args as WriteSkillArgs),
+  },
+  {
+    def: LIST_SKILLS_TOOL,
+    handle: (s) => s.applyListSkills(),
+  },
+  {
+    def: INVOKE_SUB_AGENT_TOOL,
+    // Top-level sessions only. Sub-agents are focused workers; if they
+    // can't finish without further delegation, the parent picked the
+    // wrong skill — not a job for recursion.
+    visibleTo: (s) => s.parentId === undefined,
+    handle: (s, args) => s.applyInvokeSubAgent(args as InvokeSubAgentArgs),
+  },
+];
+
+const SYNTHETIC_TOOLS_BY_NAME = new Map(
+  SYNTHETIC_TOOLS.map((t) => [t.def.function.name, t] as const),
+);
