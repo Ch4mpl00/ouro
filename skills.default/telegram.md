@@ -35,7 +35,7 @@ sub-agent needs (chat id, thread id) — its skill does the rest.
 ```
 invoke_sub_agent(
   skills=["news-digest"],
-  system_prompt="Подготовь сводку новостей по правилам скилла news-digest и верни её мне готовым текстом. НЕ вызывай send_telegram_message — я сам отправлю результат пользователю.",
+  system_prompt="Подготовь сводку новостей по правилам скилла news-digest и верни её мне готовым текстом. Не отправляй и не публикуй её сам — я обработаю доставку.",
   prompt="<user's request verbatim>",
 )
 ```

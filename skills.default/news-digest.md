@@ -263,12 +263,12 @@ If genuinely unclear ("новости" alone), default to Mode 1.
 
 7. **Return the composed digest as your final answer.** After the
    `set_memory` tool returns, emit the digest body as your assistant
-   message **with no tool calls** — that terminates the sub-agent loop
-   and hands the text back to the parent. Do NOT call
-   `send_telegram_message` yourself: the parent owns Telegram delivery.
-   The text you return is exactly what gets forwarded to the user, so
-   make sure it's already formatted per the rules above (header,
-   sections, bullets, Russian-only, no links).
+   message **with no tool calls** — that terminates the loop and hands
+   the text back to whoever invoked you. Do NOT call any delivery /
+   notification tool yourself: the caller owns delivery. The text you
+   return is exactly what gets forwarded to the user, so make sure it's
+   already formatted per the rules above (header, sections, bullets,
+   Russian-only, no links).
 
 ## Significance bar — the "would I care?" test
 

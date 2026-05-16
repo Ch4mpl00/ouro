@@ -43,12 +43,13 @@ sub-agent doesn't need to know your chatId/threadId and the parent
 doesn't need to re-load the domain skill's wall of formatting rules.
 
 Tell the sub-agent explicitly in `system_prompt`: "верни мне готовый
-текст, не вызывай send_telegram_message сам". Then after it returns,
-call `send_telegram_message(text=<return value>, ...)` yourself.
+текст, не отправляй и не публикуй его сам". Then after it returns,
+forward the value to the user through whatever channel applies in your
+own skill's protocol.
 
-(Some legacy skills still call `send_telegram_message` from inside —
-when delegating to one of those, omit the no-send instruction. But for
-new work, prefer the compose-and-return pattern.)
+(Some legacy skills still call delivery tools from inside — when
+delegating to one of those, omit the no-send instruction. But for new
+work, prefer the compose-and-return pattern.)
 
 Common cases (skill name → typical triggers):
 
