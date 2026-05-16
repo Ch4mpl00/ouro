@@ -434,7 +434,11 @@ export class Session {
             READ_SKILL_TOOL,
             WRITE_SKILL_TOOL,
             LIST_SKILLS_TOOL,
-            INVOKE_SUB_AGENT_TOOL,
+            // Sub-agents themselves cannot spawn further sub-agents. They
+            // are focused workers — if they need broader help, that's a
+            // signal the parent should have delegated differently, not
+            // that the worker should recurse.
+            ...(this.parentId === undefined ? [INVOKE_SUB_AGENT_TOOL] : []),
           ],
           ...(this.reasoningEffort === "disabled"
             ? { thinking: { type: "disabled" as const } }
