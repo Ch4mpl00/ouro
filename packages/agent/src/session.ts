@@ -251,13 +251,26 @@ const INVOKE_SUB_AGENT_TOOL: ChatCompletionTool = {
             "At least one. The sub-agent's system message is composed " +
             "from these alone — no engine meta-skills.",
         },
+        system_prompt: {
+          type: "string",
+          description:
+            "Optional goal / framing / constraints the PARENT wants the " +
+            "sub-agent to follow on top of its skill. Goes into the " +
+            "sub-agent's system message ahead of the skill content. Use " +
+            "this to set scope (\"only fetch X, not Y\"), output format " +
+            "(\"return JSON\", \"reply in Russian\"), delivery target " +
+            "(\"send to chat=<id> thread=<n>\"), or any other context the " +
+            "skill itself doesn't know about. Skip when the skill is " +
+            "self-sufficient.",
+        },
         prompt: {
           type: "string",
           description:
-            "Task description to hand to the sub-agent. Should carry the " +
-            "user's intent verbatim plus any context the sub-agent needs " +
-            "(chat id, thread id, etc) that wouldn't otherwise be in its " +
-            "skills.",
+            "Task / user-facing request to hand to the sub-agent — goes in " +
+            "as a user message and shows up as the sub-agent's trace " +
+            "input. Use the user's verbatim wording when possible. For " +
+            "self-initiated tasks (no user message) put the trigger " +
+            "description here.",
         },
         max_iterations: {
           type: "number",
@@ -276,6 +289,7 @@ const INVOKE_SUB_AGENT_TOOL: ChatCompletionTool = {
 
 interface InvokeSubAgentArgs {
   skills?: string[];
+  system_prompt?: string;
   prompt?: string;
   max_iterations?: number;
   reasoning_effort?: ReasoningEffort;
@@ -619,10 +633,11 @@ export class Session {
     try {
       child = await this.engine.startSession({
         id: childId,
-        // Intentionally NO systemPrompt: sub-agent's context = just its
-        // skills + the prompt as a user message. No session-context, no
-        // envContext, no engine meta-skills. This is the entire point —
-        // a slim, focused worker.
+        // Sub-agent's system message = optional parent-provided framing
+        // + the named skills' content. NO session-context, NO envContext,
+        // NO engine meta-skills. This is the entire point — a slim,
+        // focused worker with exactly what the parent decided it needs.
+        systemPrompt: args.system_prompt,
         skills: args.skills,
         includeEngineSkills: false,
         reasoningEffort: args.reasoning_effort ?? "disabled",

@@ -35,9 +35,14 @@ sub-agent needs (chat id, thread id) — its skill does the rest.
 ```
 invoke_sub_agent(
   skills=["news-digest"],
-  prompt="<user's request verbatim>\n\nctx: chatId=<id>, threadId=<thread, if any>",
+  system_prompt="Сделай сводку новостей для пользователя по правилам скилла news-digest. Отправь её в Telegram chatId=<id> threadId=<thread, if any>. После отправки верни короткий статус.",
+  prompt="<user's request verbatim>",
 )
 ```
+
+The sub-agent's skill already handles HOW (filters, format, language) —
+your `system_prompt` only adds parent-side context (delivery target,
+scope hint, anything the skill itself doesn't know).
 
 After the sub-agent returns: its skill already sent the Telegram reply
 itself. **Don't re-send.** You're done; let the session terminate.

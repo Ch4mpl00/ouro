@@ -14,11 +14,23 @@ domain skill, call:
 ```
 invoke_sub_agent(
   skills=["<name>"],
-  prompt="<the user's intent verbatim, plus any context the sub-agent needs
-           (chat id, thread id, signal source, etc) that wouldn't be
-           obvious from the skill itself>",
+  system_prompt="<the GOAL you want the sub-agent to achieve, plus any
+                 framing the skill itself doesn't know: delivery target
+                 (chat id, thread id), output format, scope limits,
+                 anything the parent uniquely knows from its context>",
+  prompt="<the user's intent verbatim, OR for cron/self-initiated tasks
+           a one-line trigger description>",
 )
 ```
+
+- `system_prompt` is YOUR brief to the sub-agent. Treat it like writing
+  a task description for a junior teammate who already knows the
+  playbook (their skill) but doesn't know which chat to send to,
+  whether the user wants a one-off vs a full digest, etc. Skip it only
+  when the skill is fully self-sufficient.
+- `prompt` becomes the sub-agent's first user message and shows as its
+  trace input — use the user's verbatim words when there's a user
+  message, otherwise a short trigger description.
 
 The sub-agent runs with **only** that skill loaded (no routing, no
 handoff, no parent history), has access to every MCP tool, performs the
