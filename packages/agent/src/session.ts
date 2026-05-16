@@ -627,7 +627,11 @@ export class Session {
     }
 
     this.subAgentCounter += 1;
-    const childId = `${this.id}/sub${this.subAgentCounter}`;
+    // `__sub` (double underscore) keeps the id ASCII-only and avoids
+    // `/` — some Langfuse path/upsert semantics got confused when the
+    // trace id contained a slash, leaving the parent's name overwritten
+    // by the child's. Plain underscores stay safe.
+    const childId = `${this.id}__sub${this.subAgentCounter}`;
 
     let child: Session;
     try {
