@@ -14,6 +14,7 @@ domain skill, call:
 ```
 invoke_sub_agent(
   skills=["<name>"],
+  reasoning_effort="max",   // see "Reasoning effort" below
   system_prompt="<the GOAL you want the sub-agent to achieve, plus any
                  framing the skill itself doesn't know: delivery target
                  (chat id, thread id), output format, scope limits,
@@ -22,6 +23,25 @@ invoke_sub_agent(
            a one-line trigger description>",
 )
 ```
+
+### Reasoning effort
+
+Default is `disabled` (cheap, no thinking). Pass `reasoning_effort="max"`
+when the sub-agent does **real editorial / judgment work** — filtering
+against a quality bar, semantic dedup, multi-step consolidation,
+schema parsing where mistakes are damaging:
+
+- `news-digest` → `max` (filtering + dedup + consolidation against
+  chat history).
+- `tech-digest` → `max` (ranking HN/Habr signal, TL;DR composition).
+- `nashdom-bill` → `max` (parsing PDF amounts; wrong number is worse
+  than no reply).
+- Generic one-off lookups / simple text manipulation → leave at default
+  (`disabled`).
+
+When in doubt for a digest / parsing task, prefer `max`. Cheap-tier
+output for these is consistently noisier and prone to hallucinated
+numbers.
 
 - `system_prompt` is YOUR brief to the sub-agent. Treat it like writing
   a task description for a junior teammate who already knows the

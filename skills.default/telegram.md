@@ -23,10 +23,16 @@ wrong topic.
 When the user's intent maps to a digest skill, fetch the context they
 need yourself and hand the composed text job to a sub-agent:
 
-| User says | Sub-agent skill |
-|---|---|
-| "что нового / какие новости / дайджест / что важного / что в Одессе / что в каналах / что в мире / что по конфликту / что там с <тема>" | `news-digest` |
-| "что нового в IT / IT-новости / Hacker News / на Habr" | `tech-digest` |
+| User says | Sub-agent skill | `reasoning_effort` |
+|---|---|---|
+| "что нового / какие новости / дайджест / что важного / что в Одессе / что в каналах / что в мире / что по конфликту / что там с <тема>" | `news-digest` | `max` |
+| "что нового в IT / IT-новости / Hacker News / на Habr" | `tech-digest` | `max` |
+
+Both digests do non-trivial editorial work (filtering against a
+significance bar, semantic dedup against chat history, consolidating
+near-duplicates across channels) — pass `reasoning_effort="max"` so the
+sub-agent runs in thinking mode. Cheap-tier (`disabled`) digests stuff
+the feed with noise.
 
 ### Pattern
 
@@ -41,6 +47,7 @@ get_telegram_chat_history(chatId=<id>, threadId=<thread_id if any>, limit=30)
 ```
 invoke_sub_agent(
   skills=["news-digest"],          // or "tech-digest"
+  reasoning_effort="max",          // see table above
   system_prompt="""
 Environment:
 - Date: <today, local>
