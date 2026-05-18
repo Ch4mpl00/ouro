@@ -71,6 +71,35 @@ own skill's protocol.
 delegating to one of those, omit the no-send instruction. But for new
 work, prefer the compose-and-return pattern.)
 
+### After delegation: emit delivery + bookkeeping as ONE assistant turn
+
+Once the sub-agent returns the composed text, the remaining work is
+mechanical — typically:
+
+- a delivery call (`send_telegram_message`, write to a queue, etc.) AND
+- a bookkeeping call (`set_memory` to stamp a watermark, mark a record
+  processed, etc.).
+
+**Emit both tool calls in the SAME assistant turn (parallel-tool-calls
+semantics) — not in separate iterations.** They are independent: the
+watermark doesn't need to wait for the send to succeed (and if the send
+fails you'll see the tool result and can retry; not bumping the
+watermark on failure is recoverable separately).
+
+Wrong (two round-trips, ~5–10s of dead latency):
+```
+iter-N:   send_telegram_message(...)
+iter-N+1: set_memory(news_digest.last_read_at, ...)
+```
+
+Right (one round-trip):
+```
+iter-N: send_telegram_message(...) + set_memory(...)
+```
+
+This is the **default for all delegated work** — applies whether the
+trigger was a Telegram message, a scheduler tick, or any other source.
+
 Common cases (skill name → typical triggers):
 
 - `news-digest` — "что нового / какие новости / дайджест /
