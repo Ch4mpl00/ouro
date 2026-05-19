@@ -24,29 +24,78 @@ Recurring: yes | no (one-shot)
 
 ## Protocol
 
-1. **Read the body (everything after the blank line).** It is the user's
+1. **Read the body** (everything after the blank line). It is the user's
    own words from when they set the reminder (e.g. *"напомни купить
-   хлеб"*, *"check Monobank balance and message me if negative"*). Treat
-   it as the task description.
+   хлеб"*, *"check Monobank balance and message me if negative"*).
 
-2. **Decide the action.** The prompt itself dictates what to do:
-   - If it is a reminder / notification — send a Telegram message to the
-     default chat (`send_telegram_message`). Format it as a short Russian
-     reminder. Do **not** prefix with `[reminder]` or similar noise —
-     the message stands on its own.
-   - If it is an action ("check X / fetch Y / post Z") — perform the
-     action with the appropriate tools, then send a Telegram summary.
+2. **Does the body map to a digest / delegated skill?** (per `routing.md`
+   table — typical triggers: "сводка новостей / news-digest tick",
+   "IT-новости / tech-digest", "квитанции / nashdom-bill"). If yes, go
+   to **§3 Delegated path**. Otherwise **§4 Inline path**.
 
-3. **One signal = one user-visible outcome.** Don't chain into other
-   skills, don't send a digest, don't kick off unrelated work.
+3. **§3 Delegated path — fetch chat context yourself, then invoke
+   sub-agent.** Same pattern `telegram.md` uses: sub-agents have no
+   Telegram tools and no env-context block. Pre-fetch chat history
+   yourself with one call before delegating:
 
-4. **Recurring tasks fire again automatically.** Don't try to re-schedule
-   them. One-shot tasks auto-deactivate after this single fire — check
-   the `Recurring: …` line in the header.
+   ```
+   get_telegram_chat_history(chatId=<default chat id from your env>, limit=30)
+   ```
+
+   Then:
+
+   ```
+   invoke_sub_agent(
+     skills=["news-digest"],          // or "tech-digest"
+     reasoning_effort="max",
+     system_prompt="""
+   Environment:
+   - Date: <today, local>
+   - Timezone: <from `get_timezone` if needed, else local time from your context>
+   - Output language: Russian
+   - news_digest.last_read_at: <from current-context, or "never (bootstrap with now − 24h)">
+
+   Recent chat history (last 30 messages — scan assistant messages
+   starting with 📰 Новости / 🧠 IT-дайджест to avoid duplicates):
+   <JSON output of get_telegram_chat_history>
+
+   Goal: compose the digest per skill rules. Return as plain text — do
+   not call any Telegram tool, do not stamp the watermark. I deliver.
+   """,
+     prompt="<the user's prompt body verbatim from the signal>",
+   )
+   ```
+
+   After the sub-agent returns the composed text, **send delivery +
+   bookkeeping in ONE assistant turn** (parallel tool calls, see
+   `routing.md`):
+
+   ```
+   send_telegram_message(text=<sub-agent return value>, chatId=<id>)
+       +
+   set_memory(key="news_digest.last_read_at", value="<current ISO timestamp>")
+   ```
+
+   (Skip `set_memory` for `tech-digest` or for narrow Topic-mode peeks
+   that shouldn't shift the global watermark.)
+
+4. **§4 Inline path — handle the task yourself.**
+   - **Reminder / notification.** Send one short Russian Telegram
+     message to the default chat. Don't prefix with `[reminder]` or
+     similar noise — the message stands on its own.
+   - **Action** ("check X / fetch Y / post Z"). Perform with whatever
+     tools fit, then send a Telegram summary.
+
+5. **One signal = one user-visible outcome.** Whether delegated or
+   inline, end with exactly one outgoing Telegram message.
+
+6. **Recurring tasks fire again automatically.** Don't try to
+   re-schedule them. One-shot tasks auto-deactivate after this single
+   fire — check the `Recurring: …` header.
 
 ## Style
 
-- Russian, terse, friendly. Same conventions as `telegram.md` (no tables,
-  no Markdown, no t.me links).
+- Russian, terse, friendly. Same conventions as `telegram.md` (no
+  tables, no Markdown, no t.me links).
 - The user already knows what they asked you to remind them of — don't
   echo the cron expression or the scheduling metadata back.
