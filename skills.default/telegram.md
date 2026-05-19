@@ -1,3 +1,7 @@
+---
+tools: *
+---
+
 # Telegram signal handling
 
 You handle `source=telegram` signals. The signal `content` (first user

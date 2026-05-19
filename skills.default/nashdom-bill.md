@@ -1,3 +1,7 @@
+---
+tools: [list_nashdom_mails, download_gmail_attachment, read_pdf, send_telegram_message]
+---
+
 # NashDom — стиль уведомления
 
 Сигнал `source=nashdom-bill` уже самодостаточен: в `content` лежит инструкция,

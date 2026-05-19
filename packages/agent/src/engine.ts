@@ -1,7 +1,7 @@
 import OpenAI from "openai";
 import { connectMcp, type McpHandle } from "./mcp-client";
 import { Session, type SessionOpts } from "./session";
-import { readSkill } from "./skills";
+import { readSkill, validateAllSkills } from "./skills";
 import { nullTracer, type Tracer } from "./tracing";
 import { langfuseTracerFromEnv } from "./tracing-langfuse";
 
@@ -70,32 +70,50 @@ export class Engine {
     //
     // Final iteration order (Object insertion order) is preserved:
     // session domain skills → engine meta-skills. The Session uses this
-    // ordering when composing the actual system message.
+    // ordering when composing the actual system message. The union of
+    // each skill's frontmatter `tools:` list defines what MCP tools
+    // this session is allowed to see — synthetic agent-side tools
+    // (set_memory, read_skill, invoke_sub_agent, ...) stay always-on.
     const resolvedSkills: Record<string, string> = {};
+    const accumulated = new Set<string>();
+    let wildcard = false;
+    const mergeSkill = (skill: { body: string; tools: string[] | "*" }, name: string) => {
+      resolvedSkills[name] = skill.body;
+      if (skill.tools === "*") {
+        wildcard = true;
+      } else {
+        for (const t of skill.tools) accumulated.add(t);
+      }
+    };
     for (const name of sessionSkillNames) {
-      const content = await readSkill(name);
-      if (content === null) {
+      const skill = await readSkill(name);
+      if (skill === null) {
         throw new Error(
           `session skill "${name}" not found (skills/${name}.md and skills.default/${name}.md both missing)`,
         );
       }
-      resolvedSkills[name] = content;
+      mergeSkill(skill, name);
     }
     for (const name of engineSkillNames) {
-      const content = await readSkill(name);
-      if (content === null) {
+      const skill = await readSkill(name);
+      if (skill === null) {
         this.log(opts.id, `[warn] engine skill "${name}" not found, skipping`);
         continue;
       }
-      resolvedSkills[name] = content;
+      mergeSkill(skill, name);
     }
 
-    const session = new Session(this, { ...opts, resolvedSkills });
+    // Wildcard from ANY loaded skill collapses the union to "all MCP tools" —
+    // expressed as a null allow-list (Session treats null as no filter).
+    const allowedTools = wildcard ? null : accumulated;
+
+    const session = new Session(this, { ...opts, resolvedSkills, allowedTools });
     this.sessions.set(opts.id, session);
     const skillsList = Object.keys(resolvedSkills).join(",");
+    const toolsLabel = allowedTools === null ? "*" : String(allowedTools.size);
     this.log(
       opts.id,
-      `session opened (model=${opts.model ?? this.defaultModel}, effort=${opts.reasoningEffort ?? "disabled"}, skills=[${skillsList}]${opts.parentId ? `, parent=${opts.parentId}` : ""})`,
+      `session opened (model=${opts.model ?? this.defaultModel}, effort=${opts.reasoningEffort ?? "disabled"}, skills=[${skillsList}], tools=${toolsLabel}${opts.parentId ? `, parent=${opts.parentId}` : ""})`,
     );
     return session;
   }
@@ -130,6 +148,14 @@ export async function createEngine(opts: EngineOpts): Promise<Engine> {
   });
 
   const mcp = await connectMcp();
+
+  // Validate every skill on disk against the live MCP registry. Crashes
+  // early with a precise error if any skill is missing frontmatter, has
+  // a malformed `tools:` line, or names a tool that doesn't exist —
+  // instead of failing mid-signal handling.
+  const mcpToolNames = mcp.tools.map((t) => t.function.name);
+  await validateAllSkills(mcpToolNames);
+  console.log(`[engine] skill validation passed (mcp tools: ${mcpToolNames.length})`);
 
   // Tracer: caller override > env auto-config > null. Logged once at startup.
   let tracer: Tracer;

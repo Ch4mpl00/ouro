@@ -86,13 +86,9 @@ async function runSignal(engine: Engine, signal: PendingSignal): Promise<void> {
 // Spawned when a primary session throws. A fresh session is used because
 // the crashed message buffer may contain a malformed assistant turn that
 // would re-crash on every retry — recovery reads the dead transcript as
-// plain text instead of replaying it through the API.
-const RECOVERY_PROMPT = [
-  "The previous session handling a signal crashed. Read the message log and the error",
-  "below, then send ONE short Russian message via send_telegram_message to the default",
-  "chat from the environment context describing what was being done and roughly what",
-  "broke. No stack traces, no error codes, no JSON. Plain language, 1–3 sentences.",
-].join(" ");
+// plain text instead of replaying it through the API. Instructions
+// (what to say, how to phrase it) live in skills.default/recovery.md;
+// here we only inject env-context (chat id, timezone, etc.).
 
 async function reportFailureToUser(
   engine: Engine,
@@ -102,15 +98,15 @@ async function reportFailureToUser(
 ): Promise<void> {
   const errMsg = err instanceof Error ? err.message : String(err);
   const briefing = `Error: ${errMsg}\n\nMessage log:\n${JSON.stringify(failedMessages, null, 2)}`;
-  // Recovery sessions skip engine-level meta-skills (routing) —
-  // RECOVERY_PROMPT is the only instruction we want active here.
-  const systemPrompt = signal.envContext
-    ? `${RECOVERY_PROMPT}\n\n---\n\n${signal.envContext}`
-    : RECOVERY_PROMPT;
 
   const session = await engine.startSession({
     id: `recovery:${signal.source}:${signal.id}`,
-    systemPrompt,
+    // recovery.md carries instructions + its own minimal tools list
+    // (send_telegram_message). Engine-level skills are skipped — the
+    // recovery flow has no business delegating or thinking hard.
+    skills: ["recovery"],
+    includeEngineSkills: false,
+    systemPrompt: signal.envContext ?? undefined,
     reasoningEffort: "disabled",
     maxIterations: 5,
     tags: ["recovery", signal.source],

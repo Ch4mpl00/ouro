@@ -37,6 +37,13 @@ export interface SessionOpts {
   // `trace.metadata.skills` so the tracing UI isn't flooded with skill
   // text in every generation's input.
   resolvedSkills?: Record<string, string>;
+  // Union of `tools:` from every loaded skill's frontmatter. Set by the
+  // engine; Session uses it to filter `mcp.tools` per LLM call so the
+  // model only sees tools relevant to this session's skills. Synthetic
+  // agent-side tools are NOT affected — they stay always-available
+  // regardless of frontmatter. `null` means "no filter, all MCP tools
+  // available" (used when any loaded skill has `tools: *`).
+  allowedTools?: Set<string> | null;
   // Opt out of engine-level meta-skill (`routing`) for this session.
   // Default true. Sub-agents set this to false so they get only the
   // focused per-task skill set without the always-on parent extras.
@@ -108,6 +115,10 @@ export class Session {
   // implicit). For sub-agents this is null — the parent's dispatch loop
   // owns the wrapping span's lifecycle.
   private readonly trace: Trace | null;
+  // MCP tool allow-list, derived from union of loaded skills' frontmatter.
+  // null = legacy "all tools" fallback (used when caller skipped skills
+  // entirely; not expected in current call sites but kept as a sane default).
+  private readonly allowedTools: ReadonlySet<string> | null;
   private subAgentCounter = 0;
   private closed = false;
 
@@ -119,6 +130,7 @@ export class Session {
     this.model = opts.model ?? engine.defaultModel;
     this.reasoningEffort = opts.reasoningEffort ?? "disabled";
     this.maxIterations = opts.maxIterations ?? DEFAULT_MAX_ITERATIONS;
+    this.allowedTools = opts.allowedTools ?? null;
 
     // Compose the actual system message sent to the LLM: caller's prompt
     // first, then each resolved skill body, joined with `---`. Skills
@@ -246,11 +258,20 @@ export class Session {
           ensureReasoningContentOnHistory(this.messages);
         }
 
+        // MCP tools filtered by the per-session allow-list (union of
+        // loaded skills' frontmatter). Synthetic agent-side tools are
+        // not gated by skill frontmatter — they're cheap and universal
+        // (set_memory, read_skill, list_skills, write_skill,
+        // invoke_sub_agent — the last one stays parent-only via its own
+        // `visibleTo` predicate).
+        const mcpTools = this.allowedTools === null
+          ? mcp.tools
+          : mcp.tools.filter((t) => this.allowedTools!.has(t.function.name));
         const body = {
           model: this.model,
           messages: this.messages,
           tools: [
-            ...mcp.tools,
+            ...mcpTools,
             ...SYNTHETIC_TOOLS.filter((t) => t.visibleTo?.(this) ?? true).map(
               (t) => t.def,
             ),
@@ -400,15 +421,17 @@ export class Session {
       return `[read_skill error] name must be a non-empty string`;
     }
     try {
-      const content = await readSkill(args.name);
-      if (content === null) {
+      const skill = await readSkill(args.name);
+      if (skill === null) {
         return JSON.stringify({ name: args.name, found: false, content: null });
       }
       return JSON.stringify({
         name: args.name,
         found: true,
-        content,
-        sizeBytes: Buffer.byteLength(content, "utf-8"),
+        content: skill.body,
+        tools: skill.tools,
+        source: skill.source,
+        sizeBytes: Buffer.byteLength(skill.body, "utf-8"),
       });
     } catch (err) {
       return `[read_skill error] ${(err as Error).message}`;

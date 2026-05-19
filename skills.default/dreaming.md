@@ -1,3 +1,7 @@
+---
+tools: [list_signals, get_telegram_chat_history]
+---
+
 # Dreaming signal handling
 
 You are reacting to a `source=dreaming` signal — a periodic reflection

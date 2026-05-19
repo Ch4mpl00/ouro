@@ -1,3 +1,7 @@
+---
+tools: [list_news_headlines, fetch_article, read_file]
+---
+
 # Tech-digest signal handling
 
 You compose an IT news digest from Hacker News + Habr. Parent delivers

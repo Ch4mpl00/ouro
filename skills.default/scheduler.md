@@ -1,3 +1,7 @@
+---
+tools: *
+---
+
 # Scheduler signal handling
 
 You are reacting to a `source=scheduler` signal. MCP fires this when one of

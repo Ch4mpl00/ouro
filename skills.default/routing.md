@@ -1,3 +1,7 @@
+---
+tools: []
+---
+
 # Skill routing (always loaded)
 
 You have a registry of skills under `skills/<name>.md`. Each skill is a
