@@ -53,7 +53,9 @@ Recurring: yes | no (one-shot)
    - Date: <today, local>
    - Timezone: <from `get_timezone` if needed, else local time from your context>
    - Output language: Russian
-   - news_digest.last_read_at: <from current-context, or "never (bootstrap with now − 24h)">
+   - <watermark key>: <from current-context, or "never (bootstrap with now − 24h)">
+     # news-digest → news_digest.last_read_at
+     # tech-digest → tech_digest.last_read_at
 
    Recent chat history (last 30 messages — scan assistant messages
    starting with 📰 Новости / 🧠 IT-дайджест to avoid duplicates):
@@ -68,16 +70,17 @@ Recurring: yes | no (one-shot)
 
    After the sub-agent returns the composed text, **send delivery +
    bookkeeping in ONE assistant turn** (parallel tool calls, see
-   `routing.md`):
+   `routing.md`). The watermark key matches the digest:
 
    ```
    send_telegram_message(text=<sub-agent return value>, chatId=<id>)
        +
-   set_memory(key="news_digest.last_read_at", value="<current ISO timestamp>")
+   set_memory(key="<news_digest.last_read_at | tech_digest.last_read_at>",
+              value="<current ISO timestamp>")
    ```
 
-   (Skip `set_memory` for `tech-digest` or for narrow Topic-mode peeks
-   that shouldn't shift the global watermark.)
+   Skip `set_memory` only for narrow Topic-mode peeks ("что там по такой-то
+   теме за час") that shouldn't shift the global watermark.
 
 4. **§4 Inline path — handle the task yourself.**
    - **Reminder / notification.** Send one short Russian Telegram

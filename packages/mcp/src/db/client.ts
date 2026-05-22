@@ -133,10 +133,15 @@ function seedSystemTasks(db: Database.Database): void {
     `INSERT INTO scheduled_tasks (cron_expr, recurring, prompt, source)
      VALUES (?, 1, ?, ?)`,
   );
-  const DEFAULTS: { cron: string; source: string; prompt: string }[] = [
+  // `source: null` → fires as a generic `scheduler` signal. The scheduler
+  // skill recognises the prompt body (per its §2 mapping table) and
+  // delegates to the right composer sub-agent. Only `dreaming` still uses
+  // a dedicated source because its skill is the top-level itself (no
+  // sub-agent split — it writes skill files directly).
+  const DEFAULTS: { cron: string; source: string | null; prompt: string }[] = [
     {
       cron: "0 9 * * *",
-      source: "news-digest",
+      source: null,
       prompt:
         "Daily news-digest tick. Read posts from the user's subscribed " +
         "Telegram channels since the watermark in your session context, " +
@@ -145,7 +150,7 @@ function seedSystemTasks(db: Database.Database): void {
     },
     {
       cron: "0 8 * * *",
-      source: "tech-digest",
+      source: null,
       prompt:
         "Daily tech-digest tick. Compose a personalized IT news digest " +
         "for the user (Hacker News, Habr) and post to Telegram. Use " +
