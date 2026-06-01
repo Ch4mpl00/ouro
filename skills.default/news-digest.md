@@ -35,25 +35,20 @@ Your invoker (parent agent) provides in your system prompt:
 You do **not** fetch chat history yourself. You do **not** call any
 Telegram tool. You read channel posts and compose.
 
-## Modes
+## Scope
 
-| Mode | Trigger | Output |
-|---|---|---|
-| **Full** | cron tick / generic "что нового / новости / что важного" | all four categories below, skipping empty ones |
-| **Category** | user names a predefined category (mapping below) | exactly one category + its bullets |
-| **Topic** | user asks about a specific subject not in the four categories | single-section digest focused on that topic |
+This skill produces the **full 24-hour digest** across all four
+categories below. Triggered by:
 
-Category mapping:
+- The daily cron tick (signal `source=news-digest`).
+- User explicitly asking for a complete sweep: "новости / что нового
+  / дайджест / сводка / что важного / что произошло за день".
 
-| User says | Category |
-|---|---|
-| "что в Одессе / по Украине / что у нас" | 🇺🇦 Одесса / Украина |
-| "что в ПМР / Молдова / Тирасполь" | 🇲🇩 ПМР / Молдова |
-| "что по войне / по фронту / по конфликту / по СВО" | ⚔️ Конфликт РФ-Украина |
-| "что в мире / мировые / на западе" | 🌍 Мир |
-
-Ambiguous between Category and Topic → prefer the narrower Topic. Plain
-"новости" → Full.
+For narrow ad-hoc topical questions ("шо там Одесса", "что про
+Сирию", "что говорит Трамп") parent delegates to **`news-query`**,
+not here. If you got invoked with a single-topic prompt, you can
+still produce a single-category output, but the parent should have
+routed correctly — flag any obvious misroute in your reply.
 
 ## Categories (significance + skip rules)
 
@@ -92,16 +87,15 @@ care about this for decisions / safety / finances / freedom of movement
 
 ## Protocol
 
-1. **Read channel posts.** One call:
+1. **Read channel posts** — chronological scan across all channels:
 
    ```
    list_news(source="channel", sinceISO=<news_digest.last_read_at from your system prompt>)
    ```
 
-   If the watermark is `never`, use `now − 24h`. Posts come back across
-   all channels chronologically. For a single-channel Topic query, pass
-   `channel="<username or chat_id>"`. The background news poller refreshes
-   every ~30min so data is at most that stale; do not try to fetch live.
+   If the watermark is `never`, use `now − 24h`. The background news
+   poller refreshes every ~30min so data is at most that stale; do
+   not try to fetch live.
 
 2. **Drop already-covered events** by cross-referencing parent-provided
    chat history. Semantic match, not literal: "Трамп продлил перемирие"
@@ -133,11 +127,6 @@ care about this for decisions / safety / finances / freedom of movement
 
    - Group by **topical category**, never by channel.
    - Skip empty categories — don't write "ничего важного".
-   - For Category mode: only the one heading.
-   - For Topic mode: header `📰 Новости · <D месяца> · <topic>` + one
-     section (no category heading). Emoji for the topic if obvious
-     (🪖 ТЦК, 🇮🇱 Израиль, 💰 курсы). If no matching posts:
-     `По теме «<topic>» за последние сутки ничего значимого`.
 
 5. **Return the message as your final assistant text.** No tool call.
    The parent delivers and stamps the watermark.

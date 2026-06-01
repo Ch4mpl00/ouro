@@ -22,21 +22,31 @@ wrong topic.
 2. **One reply per signal.** One well-formed message — not several
    `send_telegram_message` calls in a row.
 
-## Routing: delegate digests to sub-agents
+## Routing: delegate to a sub-agent
 
-When the user's intent maps to a digest skill, fetch the context they
-need yourself and hand the composed text job to a sub-agent:
+When the user's intent maps to a news skill, fetch the context the
+sub-agent needs yourself and hand off the composition job:
 
-| User says | Sub-agent skill | `reasoning_effort` |
+| User says | Sub-agent | `reasoning_effort` |
 |---|---|---|
-| "что нового / какие новости / дайджест / что важного / что в Одессе / что в каналах / что в мире / что по конфликту / что там с <тема>" | `news-digest` | `max` |
-| "что нового в IT / IT-новости / Hacker News / на Habr" | `tech-digest` | `max` |
+| **Full digest** — "что нового / какие новости / дайджест / сводка / что важного / что произошло за день / что в каналах" | `news-digest` | `max` |
+| **Topical question** — "шо там Одесса / что в Одессе / что по фронту / что у Зеленского / что говорит Трамп / какие новости про OpenAI / что слышно про Сирию / что там с ПМР / есть что-то про Anthropic / что в Иране / что у Китая" | `news-query` | `max` |
+| **Tech digest** — "что нового в IT / IT-новости / Hacker News / на Habr / IT-дайджест" | `tech-digest` | `max` |
 
-Both digests do non-trivial editorial work (filtering against a
-significance bar, semantic dedup against chat history, consolidating
-near-duplicates across channels) — pass `reasoning_effort="max"` so the
-sub-agent runs in thinking mode. Cheap-tier (`disabled`) digests stuff
-the feed with noise.
+Rule of thumb to choose between digest and query:
+
+- User wants the **full sweep across all topics** → `news-digest`.
+- User names a **specific subject / region / person / event** and
+  wants the latest on it → `news-query`.
+- Ambiguous between full digest and a single topic → prefer the
+  narrower `news-query`. ("что в мире" reads more like a topical
+  peek than a 4-category dump — query).
+
+All three do real editorial work (filtering against a significance
+bar, semantic dedup against chat history, consolidating
+near-duplicates) — pass `reasoning_effort="max"` so the sub-agent
+runs in thinking mode. Cheap-tier (`disabled`) versions stuff the
+feed with noise.
 
 ### Pattern
 
@@ -50,7 +60,7 @@ get_telegram_chat_history(chatId=<id>, threadId=<thread_id if any>, limit=30)
 
 ```
 invoke_sub_agent(
-  skills=["news-digest"],          // or "tech-digest"
+  skills=["news-digest"],          // or "news-query" or "tech-digest"
   reasoning_effort="max",          // see table above
   system_prompt="""
 Environment:
@@ -63,8 +73,8 @@ Recent chat history (last 30 messages — scan assistant messages
 starting with 📰 Новости / 🧠 IT-дайджест to avoid duplicates):
 <JSON output of get_telegram_chat_history>
 
-Goal: compose the digest per skill rules. Return as plain text — do
-not call any Telegram tool, do not stamp the watermark. I deliver.
+Goal: compose per skill rules. Return as plain text — do not call
+any Telegram tool, do not stamp the watermark. I deliver.
 """,
   prompt="<user's request verbatim>",
 )
@@ -76,15 +86,17 @@ After the sub-agent returns the composed text:
 send_telegram_message(text=<sub-agent return value>, chatId=<id>, messageThreadId=<thread, if any>)
 ```
 
-For `news-digest` delegations, **after a successful send**, advance the
-watermark in parallel with the send:
+For `news-digest` delegations only, **after a successful send**,
+advance the watermark in parallel with the send:
 
 ```
 set_memory(key="news_digest.last_read_at", value="<current ISO timestamp>")
 ```
 
-Skip `set_memory` for narrow Topic-mode peeks ("что там по такой-то теме
-за час") — those shouldn't shift the global watermark.
+**Do NOT stamp the watermark for `news-query` or `tech-digest`** —
+the watermark is for the full daily sweep, and a topical peek
+shouldn't reset it (the next full digest still needs to know what's
+new since the last full digest).
 
 If the request is generic chat (not a digest), proceed with the inline
 protocol below.

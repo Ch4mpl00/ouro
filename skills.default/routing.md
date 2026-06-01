@@ -37,6 +37,8 @@ schema parsing where mistakes are damaging:
 
 - `news-digest` → `max` (filtering + dedup + consolidation against
   chat history).
+- `news-query` → `max` (query reformulation, semantic dedup,
+  consolidating multi-channel coverage of the same event).
 - `tech-digest` → `max` (ranking HN/Habr signal, TL;DR composition).
 - `nashdom-bill` → `max` (parsing PDF amounts; wrong number is worse
   than no reply).
@@ -106,12 +108,21 @@ trigger was a Telegram message, a scheduler tick, or any other source.
 
 Common cases (skill name → typical triggers):
 
-- `news-digest` — "что нового / какие новости / дайджест /
-  расскажи что произошло / что в Одессе / что в мире / что по
-  конфликту / новости за день / сводка новостей". Cron tasks
-  about "сводка новостей" / "news digest" — even when fired as
-  a generic `scheduler` signal.
-- `tech-digest` — "что нового в IT / hacker news / habr".
+- `news-digest` — full daily sweep across all four categories
+  (Одесса/Україна, ПМР, фронт, мир). Triggers: "что нового /
+  какие новости / дайджест / сводка / что важного / новости за
+  день". Also: cron tasks about "сводка новостей" / "news digest"
+  — even when fired as a generic `scheduler` signal.
+- `news-query` — ad-hoc topical question with semantic search.
+  User names a specific subject and wants the latest on it.
+  Triggers: "шо там Одесса / что в Одессе / что по фронту / что
+  про Сирию / что говорит Трамп / какие новости про OpenAI / что
+  слышно про <X> / что в Иране / что у Зеленского / есть что-то
+  про <X> / что нового про <X>".
+- `tech-digest` — daily IT sweep from HN/Habr. Triggers: "что
+  нового в IT / IT-новости / Hacker News / на Habr / IT-дайджест".
+  For *topical* tech questions ("что писали про Anthropic") use
+  `news-query`, not `tech-digest`.
 - `nashdom-bill` — "глянь почту, есть квитанции / квартплата /
   оплата НашДома". Cron tasks about checking utility bills.
 - `scheduler` — generic reminders / cron-driven custom prompts.
