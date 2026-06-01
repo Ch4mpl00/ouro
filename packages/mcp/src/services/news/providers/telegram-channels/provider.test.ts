@@ -137,7 +137,9 @@ describe("telegram-channels provider", () => {
       {
         source: "channel",
         externalId: "100:7",
-        title: "Channel One",
+        // Channel posts always have title=null — chat_title would be
+        // the same string repeated per post and would pollute embeddings.
+        title: null,
         url: "https://t.me/channel_one/7",
         body: "body text",
         metadata: {

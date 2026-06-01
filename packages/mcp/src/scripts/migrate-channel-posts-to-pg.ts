@@ -26,7 +26,7 @@ function toNewsItem(r: OldRow): NewsItem {
   return {
     source: "channel",
     externalId: `${r.chat_id}:${r.tg_message_id}`,
-    title: r.chat_title,
+    title: null,
     url: r.chat_username
       ? `https://t.me/${r.chat_username}/${r.tg_message_id}`
       : null,

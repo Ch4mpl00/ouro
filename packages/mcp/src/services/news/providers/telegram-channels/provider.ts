@@ -109,8 +109,12 @@ export function createTelegramChannelsProvider(
         for (const m of messages) {
           collected.push({
             source: SOURCE,
+            // Title intentionally null for channel posts: chat_title is
+            // the channel name (repeated across every post of the same
+            // channel) and pollutes the embedding signal. The channel
+            // name lives in metadata.chat_title for display.
             externalId: externalId(ch.chatId, m.id),
-            title: ch.title,
+            title: null,
             url: ch.username ? `https://t.me/${ch.username}/${m.id}` : null,
             body: m.text,
             metadata: {

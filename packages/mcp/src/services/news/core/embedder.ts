@@ -36,10 +36,10 @@ export function createNewsEmbedder(deps: NewsEmbedderDeps): NewsEmbedder {
   const { db, embeddings } = deps;
 
   const buildText = (row: EmbedRow): string => {
-    const title = (row.title ?? "").trim();
-    const body = row.body.trim();
-    if (title && body) return `${title}\n\n${body}`;
-    return title || body;
+    return [
+      (row.title ?? "").trim(),
+      row.body.trim()
+    ].filter(Boolean).join("\n\n");
   };
 
   const embed = async (rows: EmbedRow[]): Promise<EmbedResult> => {
