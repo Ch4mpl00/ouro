@@ -12,8 +12,7 @@ export interface ExtractedArticle {
 // Returns a cleaned plaintext rendition of an article. Uses Mozilla
 // Readability via @extractus/article-extractor under the hood. We strip
 // any residual HTML the extractor may leave behind so the LLM gets a
-// compact text blob (the agent has 1M context, but article bodies still
-// shouldn't carry markup noise).
+// compact text blob.
 export async function fetchArticle(url: string): Promise<ExtractedArticle> {
   const article = await extract(url);
   if (!article) throw new Error(`No article extracted from ${url}`);
@@ -25,6 +24,30 @@ export async function fetchArticle(url: string): Promise<ExtractedArticle> {
     publishedAt: article.published ?? undefined,
     author: article.author ?? undefined,
   };
+}
+
+// Two retries on top of the initial attempt (3 total). Returns null on
+// terminal failure so the caller can drop the item.
+export async function fetchArticleWithRetry(
+  url: string,
+  attempts = 3,
+): Promise<ExtractedArticle | null> {
+  let lastErr: unknown;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      return await fetchArticle(url);
+    } catch (err) {
+      lastErr = err;
+      if (i < attempts - 1) {
+        await new Promise((r) => setTimeout(r, 500 * (i + 1)));
+      }
+    }
+  }
+  console.warn(
+    `[news-article] failed to fetch ${url} after ${attempts} attempts:`,
+    lastErr instanceof Error ? lastErr.message : lastErr,
+  );
+  return null;
 }
 
 function stripHtml(html: string): string {

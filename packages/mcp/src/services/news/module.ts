@@ -1,19 +1,29 @@
 import type { Database } from "../../db/pg/client";
-import { createEmbeddingsModule } from "../embeddings/module";
-import type { EmbeddingService } from "../embeddings/service";
-import { createNewsItemsRepository } from "./embedding-repository";
-import { createNewsStorage, type NewsStorage } from "./storage";
-import { performSearch, type SearchOpts, type SearchResult } from "./search";
+import { truncateChunker } from "../embeddings/chunker";
+import { getDefaultOpenAIProvider } from "../embeddings/provider";
+import { createEmbeddingService } from "../embeddings/service";
+import { createNewsEmbedder } from "./core/embedder";
+import type { NewsProvider } from "./core/provider";
+import { createNewsRepository, type NewsRepository } from "./core/repository";
+import {
+  createHackerNewsProvider,
+  defaultHackerNewsDeps,
+} from "./providers/hackernews";
+import { createHabrProvider, defaultHabrDeps } from "./providers/habr";
+import {
+  createTelegramChannelsProvider,
+  defaultTelegramChannelsDeps,
+} from "./providers/telegram-channels";
+import { startNewsPoller } from "./poller";
 
-// Domain module for news. Owns its EmbeddingService (configured against
-// news_items), the article-side storage (HN/Habr), and the search
-// entry point. Instantiated once in the composition root; consumers
-// receive the assembled NewsModule via DI.
+// Composition root for the news domain. Wires embeddings + embedder
+// into a NewsRepository, instantiates the default providers with their
+// default deps, starts the shared poller. Tests can build their own
+// composition using non-default deps and skip startNewsModule.
 
 export interface NewsModule {
-  embeddings: EmbeddingService;
-  storage: NewsStorage;
-  search(opts: SearchOpts): Promise<SearchResult[]>;
+  repository: NewsRepository;
+  providers: NewsProvider[];
 }
 
 export interface NewsModuleDeps {
@@ -22,11 +32,23 @@ export interface NewsModuleDeps {
 
 export function createNewsModule(deps: NewsModuleDeps): NewsModule {
   const { db } = deps;
-  const embeddings = createEmbeddingsModule({ repo: createNewsItemsRepository(db) });
-  const storage = createNewsStorage(db);
-  return {
-    embeddings,
-    storage,
-    search: (opts) => performSearch(opts, { db, embeddings }),
-  };
+
+  const embeddings = createEmbeddingService({
+    provider: getDefaultOpenAIProvider(),
+    chunker: truncateChunker(),
+  });
+  const embedder = createNewsEmbedder({ db, embeddings });
+  const repository = createNewsRepository({ db, embeddings, embedder });
+
+  const providers: NewsProvider[] = [
+    createHackerNewsProvider(defaultHackerNewsDeps()),
+    createHabrProvider(defaultHabrDeps()),
+    createTelegramChannelsProvider(defaultTelegramChannelsDeps(db)),
+  ];
+
+  return { repository, providers };
+}
+
+export function startNewsModule(mod: NewsModule): void {
+  startNewsPoller({ providers: mod.providers, repository: mod.repository });
 }

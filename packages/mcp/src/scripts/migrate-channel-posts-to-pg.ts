@@ -1,16 +1,11 @@
 import "dotenv/config";
 import { getDb, closeDb } from "../db/client";
 import { createPgClient } from "../db/pg/client";
-import {
-  CHANNEL_SOURCE,
-  createChannelStorage,
-  type ChannelPostInsert,
-} from "../services/telegram/userbot/storage";
-import { createNewsModule } from "../services/news/module";
+import { createNewsModule, type NewsItem } from "../services/news";
 
-// One-shot migration of legacy sqlite `channel_posts` rows into PG
-// `news_items`, with inline embedding. Idempotent via UNIQUE(source,
-// external_id). Run inside the mcp container:
+// One-shot migration of legacy sqlite `channel_posts` rows into the
+// news store, with inline embedding. Idempotent. Run inside the mcp
+// container:
 //
 //   docker compose exec -w /app mcp pnpm db:migrate:channel-posts
 
@@ -27,11 +22,31 @@ interface OldRow {
 
 const BATCH = 100;
 
+function toNewsItem(r: OldRow): NewsItem {
+  return {
+    source: "channel",
+    externalId: `${r.chat_id}:${r.tg_message_id}`,
+    title: r.chat_title,
+    url: r.chat_username
+      ? `https://t.me/${r.chat_username}/${r.tg_message_id}`
+      : null,
+    body: r.text,
+    metadata: {
+      chat_id: r.chat_id,
+      chat_title: r.chat_title,
+      chat_username: r.chat_username,
+      tg_message_id: r.tg_message_id,
+      views: r.views,
+      forwards: r.forwards,
+    },
+    postedAt: new Date(r.posted_at),
+  };
+}
+
 async function main(): Promise<void> {
   const pg = createPgClient();
   await pg.ensureReady();
-  const news = createNewsModule({ db: pg.db });
-  const channelStorage = createChannelStorage(pg.db);
+  const { repository: news } = createNewsModule({ db: pg.db });
 
   const sqlite = getDb();
   try {
@@ -52,36 +67,22 @@ async function main(): Promise<void> {
       .all() as OldRow[];
     console.log(`[migrate] sqlite has ${all.length} rows to migrate`);
 
-    let inserted = 0;
+    let saved = 0;
     let embeddedTotal = 0;
     let failedTotal = 0;
     for (let i = 0; i < all.length; i += BATCH) {
       const slice = all.slice(i, i + BATCH);
-      const batch: ChannelPostInsert[] = slice.map((r) => ({
-        chat_id: r.chat_id,
-        chat_title: r.chat_title,
-        chat_username: r.chat_username,
-        tg_message_id: r.tg_message_id,
-        posted_at: r.posted_at,
-        text: r.text,
-        views: r.views,
-        forwards: r.forwards,
-      }));
-      const newExternalIds = await channelStorage.insertChannelPosts(batch);
-      inserted += newExternalIds.length;
-      if (newExternalIds.length > 0) {
-        const result = await news.embeddings.embedByTargets(
-          newExternalIds.map((externalId) => ({ source: CHANNEL_SOURCE, externalId })),
-        );
-        embeddedTotal += result.embedded;
-        failedTotal += result.failed;
-      }
+      const items = slice.map(toNewsItem);
+      const result = await news.save(items);
+      saved += result.saved;
+      embeddedTotal += result.embedded;
+      failedTotal += result.failed;
       console.log(
-        `[migrate] batch ${i + slice.length}/${all.length} (new=${newExternalIds.length}, embedded=${embeddedTotal}, failed=${failedTotal})`,
+        `[migrate] batch ${i + slice.length}/${all.length} (saved=${result.saved}, embedded=${embeddedTotal}, failed=${failedTotal})`,
       );
     }
     console.log(
-      `[migrate] done: inserted=${inserted}, embedded=${embeddedTotal}, embed-failed=${failedTotal}`,
+      `[migrate] done: saved=${saved}, embedded=${embeddedTotal}, embed-failed=${failedTotal}`,
     );
   } finally {
     closeDb();

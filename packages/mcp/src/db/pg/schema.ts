@@ -12,9 +12,7 @@ import {
 
 // One row per piece of content (HN/Habr article, Telegram channel post).
 // external_id is the natural id in its source: URL for HN/Habr,
-// "<chat_id>:<tg_message_id>" for channels. body defaults to '' so we
-// can land a title-only record from list_news_headlines and backfill
-// the body later from fetch_article.
+// "<chat_id>:<tg_message_id>" for channels.
 
 export const newsItems = pgTable(
   "news_items",

@@ -153,10 +153,10 @@ function seedSystemTasks(db: Database.Database): void {
       source: null,
       prompt:
         "Daily tech-digest tick. Compose a personalized IT news digest " +
-        "for the user (Hacker News, Habr) and post to Telegram. Use " +
-        "list_news_headlines first (titles only), pick items matching " +
-        "the interests in the system prompt, then fetch_article(url) " +
-        "for each pick before summarizing.",
+        "for the user (Hacker News, Habr) and post to Telegram. Query " +
+        "the news store via search_news with topics matching the " +
+        "interests in the system prompt — the pollers keep it fresh, " +
+        "no need to fetch articles.",
     },
     {
       cron: "0 4 * * *",

@@ -1,5 +1,5 @@
 ---
-tools: [list_channel_posts, fetch_article, read_file]
+tools: [list_news, search_news, read_file]
 ---
 
 # News-digest signal handling
@@ -95,12 +95,13 @@ care about this for decisions / safety / finances / freedom of movement
 1. **Read channel posts.** One call:
 
    ```
-   list_channel_posts(since=<news_digest.last_read_at from your system prompt>)
+   list_news(source="channel", sinceISO=<news_digest.last_read_at from your system prompt>)
    ```
 
    If the watermark is `never`, use `now − 24h`. Posts come back across
    all channels chronologically. For a single-channel Topic query, pass
-   `channel="<username or chat_id>"`.
+   `channel="<username or chat_id>"`. The background news poller refreshes
+   every ~30min so data is at most that stale; do not try to fetch live.
 
 2. **Drop already-covered events** by cross-referencing parent-provided
    chat history. Semantic match, not literal: "Трамп продлил перемирие"

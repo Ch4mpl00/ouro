@@ -20,8 +20,10 @@ client (waste, and divergent rate-limit budgets).
   `{ openaiProvider, logger, clock }` (and other future shared
   singletons).
 - `getDefaultOpenAIProvider` deleted from `embeddings/provider.ts`.
-- `createEmbeddingsModule({ provider, repo, chunker? })` takes the
-  provider explicitly (already the case — just no longer optional).
+- Domains assemble their own embedding service explicitly via
+  `createEmbeddingService({ provider: infra.openaiProvider, chunker })`
+  (which they already do — they'll just take provider from `infra`
+  instead of the global helper).
 - `server.ts main()`:
   ```ts
   const infra = createInfraModule({ config });

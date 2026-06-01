@@ -1,5 +1,7 @@
-export { fetchHeadlines, ALL_SOURCES } from "./sources";
-export { fetchArticle, type ExtractedArticle } from "./article";
-export type { NewsItem, NewsSource } from "./types";
-export type { SearchOpts, SearchResult, SearchFilter } from "./search";
-export { createNewsModule, type NewsModule } from "./module";
+export { createNewsModule, startNewsModule, type NewsModule } from "./module";
+export type { NewsRepository } from "./core/repository";
+export type { NewsProvider } from "./core/provider";
+export type { NewsItem, ListOpts, SaveResult } from "./core/types";
+export type { SearchOpts, SearchResult, SearchFilter } from "./core/repository";
+export type { EmbedResult } from "./core/embedder";
+export { fetchArticle, type ExtractedArticle } from "./core/article";

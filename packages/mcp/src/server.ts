@@ -18,14 +18,11 @@ import { registerSchedulerTools } from "./tools/scheduler";
 import { startTelegramPoller } from "./services/telegram";
 import { startGmailPoller } from "./services/gmail";
 import { startSchedulerPoller } from "./services/scheduler";
-import { startUserbotPoller } from "./services/telegram/userbot";
 import { createPgClient } from "./db/pg/client";
-import { createNewsModule, type NewsModule } from "./services/news";
-import { createChannelStorage, type ChannelStorage } from "./services/telegram/userbot";
+import { createNewsModule, startNewsModule, type NewsRepository } from "./services/news";
 
 export interface ServerDeps {
-  news: NewsModule;
-  channelStorage: ChannelStorage;
+  news: NewsRepository;
 }
 
 export function createServer(deps: ServerDeps): McpServer {
@@ -42,7 +39,7 @@ export function createServer(deps: ServerDeps): McpServer {
   registerSignalsTools(server);
   registerNewsTools(server, deps.news);
   registerDreamingTools(server);
-  registerUserbotTools(server, { channelStorage: deps.channelStorage });
+  registerUserbotTools(server);
   registerSchedulerTools(server);
 
   return server;
@@ -123,10 +120,9 @@ async function main(): Promise<void> {
   const pg = createPgClient();
   await pg.ensureReady();
 
-  const news = createNewsModule({ db: pg.db });
-  const channelStorage = createChannelStorage(pg.db);
+  const newsModule = createNewsModule({ db: pg.db });
 
-  const server = createServer({ news, channelStorage });
+  const server = createServer({ news: newsModule.repository });
   const transport = (process.env.MCP_TRANSPORT ?? "stdio").toLowerCase();
 
   if (transport === "http") {
@@ -141,7 +137,7 @@ async function main(): Promise<void> {
   startTelegramPoller();
   startGmailPoller();
   startSchedulerPoller();
-  startUserbotPoller({ news, channelStorage });
+  startNewsModule(newsModule);
 }
 
 main().catch((err) => {
