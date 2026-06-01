@@ -31,13 +31,16 @@ export const newsItems = pgTable(
     embeddedAt: timestamp("embedded_at", { withTimezone: true }),
     embedding: vector("embedding", { dimensions: 1536 }),
   },
+  // No ANN index on `embedding`: ivfflat with low row counts (<10k)
+  // is effectively a random filter — small clusters + probes=1 default
+  // means most relevant rows live in clusters the query never visits.
+  // Sequential scan + cosineDistance on 1536-dim vectors is sub-ms at
+  // this scale. Add ivfflat (or hnsw) back when the corpus crosses
+  // ~50–100k rows; tune `lists` ≈ sqrt(rows) and bump probes per query.
   (t) => [
     unique("news_items_source_external_uniq").on(t.source, t.externalId),
     index("news_items_posted_at").on(t.postedAt.desc()),
     index("news_items_source_posted").on(t.source, t.postedAt.desc()),
-    index("news_items_embedding_ivf")
-      .using("ivfflat", t.embedding.op("vector_cosine_ops"))
-      .with({ lists: 100 }),
   ],
 );
 

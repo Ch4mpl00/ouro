@@ -8,6 +8,13 @@
       "when": 1780238110688,
       "tag": "0000_init_news",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1780326897486,
+      "tag": "0001_fancy_omega_red",
+      "breakpoints": true
     }
   ]
 }
