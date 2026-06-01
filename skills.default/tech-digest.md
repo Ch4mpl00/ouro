@@ -40,20 +40,43 @@ basic tutorials.
 
 ## Protocol
 
-1. **Search.** One or two calls covering the interests, e.g.:
+1. **Coarse semantic pre-filter.** Run THREE search_news calls in
+   parallel covering the interest spectrum (each is a wide net, not
+   a precise match — we want everything in the rough orbit of the
+   topic):
 
    ```
-   search_news(query="AI LLM frontier labs model release Claude OpenAI DeepSeek",
+   search_news(query="AI LLM frontier labs models Anthropic OpenAI Claude GPT DeepSeek Mistral xAI Gemini",
+               sinceISO=<now - 24h>, k=40)
+   search_news(query="agentic tools planning RAG vector embeddings inference evals prompt training",
                sinceISO=<now - 24h>, k=30)
-   search_news(query="TypeScript Node.js framework React Vue PHP release",
-               sinceISO=<now - 24h>, k=15)
+   search_news(query="TypeScript Node.js framework React Vue PHP library release update",
+               sinceISO=<now - 24h>, k=30)
    ```
 
-   Restrict to HN/Habr with `source` if needed. Results come back with
-   full body snippets — read them, no separate fetch step.
-2. Pick 5–10 items matching the interests. Cross-reference parent chat
-   history; drop anything already sent.
-3. Compose ONE message, plain text:
+   Three narrow queries beat one wide one — each returns its own
+   dense cluster, the union covers more of the interest space than
+   `k=100` on a vague mega-query (which gets diluted at the
+   cluster edge).
+
+   The point of three calls isn't precision — it's reducing 300+
+   raw daily items to ~70–100 candidates *plausibly* on-topic. The
+   strict filter (next step) is your job.
+
+2. **Merge by id, dedup.** Take the union, drop duplicates by `id`.
+
+3. **Strict filter — yours, not the vector's.** From the merged set,
+   keep only items that actually fit the Interests block above.
+   Vague AI hype, business-only stories, basic tutorials → out.
+   Distance is a coarse hint, not a vote — a d=0.45 item can be
+   irrelevant if the body is "5 ways to prompt ChatGPT for emails";
+   a d=0.6 item can be golden if it's a real model release. Read
+   the snippets and judge.
+
+4. Pick 5–10 of the survivors. Cross-reference parent chat history;
+   drop anything already sent.
+
+5. Compose ONE message, plain text:
 
    ```
    🧠 IT-дайджест · <D месяца>
@@ -67,7 +90,7 @@ basic tutorials.
 
    Group by theme. Bare URLs (Telegram auto-renders).
 
-4. Return the message as your final assistant text. No tool call.
+6. Return the message as your final assistant text. No tool call.
 
 ## Rules
 
