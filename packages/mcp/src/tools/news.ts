@@ -147,7 +147,7 @@ export function registerNewsTools(server: McpServer, news: NewsRepository): void
         url,
         body: article.text,
         metadata: { author: article.author, site: article.site },
-        postedAt: article.publishedAt ? new Date(article.publishedAt) : null,
+        postedAt: article.publishedAt,
       };
       try {
         await news.upsert(item);
@@ -159,6 +159,7 @@ export function registerNewsTools(server: McpServer, news: NewsRepository): void
       }
       return jsonResult({
         ...article,
+        publishedAt: article.publishedAt?.toISOString() ?? undefined,
         source,
         sizeChars: article.text.length,
         cached: false,
@@ -166,6 +167,7 @@ export function registerNewsTools(server: McpServer, news: NewsRepository): void
     },
   );
 }
+
 
 function serializeItem(i: NewsItem): Record<string, unknown> {
   return {

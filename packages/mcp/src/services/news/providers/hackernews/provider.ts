@@ -56,7 +56,7 @@ export function createHackerNewsProvider(
               author: h.author ?? article.author,
               site: article.site,
             },
-            postedAt: article.publishedAt ? new Date(article.publishedAt) : h.postedAt,
+            postedAt: article.publishedAt ?? h.postedAt,
           };
         }),
       );

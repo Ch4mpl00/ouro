@@ -18,6 +18,7 @@ describe("habr provider", () => {
         title: "Article title",
         text: "body",
         site: "habr.com",
+        publishedAt: null,
       }),
     });
     const items = await provider.fetch();
@@ -40,7 +41,7 @@ describe("habr provider", () => {
       fetchArticle: async (url) =>
         url === HEADLINE.url
           ? null
-          : { url, title: "t", text: "" },
+          : { url, title: "t", text: "", publishedAt: null },
     });
     expect(await provider.fetch()).toEqual([]);
   });

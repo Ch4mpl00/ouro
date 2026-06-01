@@ -22,7 +22,7 @@ describe("hackernews provider", () => {
         text: "body content",
         site: "example.com",
         author: "bob",
-        publishedAt: "2026-01-02T00:00:00Z",
+        publishedAt: new Date("2026-01-02T00:00:00Z"),
       }),
     });
     const items = await provider.fetch();
@@ -53,6 +53,7 @@ describe("hackernews provider", () => {
         url: HEADLINE.url,
         title: "",
         text: "body",
+        publishedAt: null,
       }),
     });
     const [item] = await provider.fetch();
@@ -65,7 +66,7 @@ describe("hackernews provider", () => {
       fetchArticle: async (url) =>
         url === HEADLINE.url
           ? null
-          : { url, title: "t", text: "ok body" },
+          : { url, title: "t", text: "ok body", publishedAt: null },
     });
     const items = await provider.fetch();
     expect(items).toHaveLength(1);
@@ -75,7 +76,7 @@ describe("hackernews provider", () => {
   it("drops items whose body is whitespace-only", async () => {
     const provider = createHackerNewsProvider({
       fetchHeadlines: async () => [HEADLINE],
-      fetchArticle: async () => ({ url: HEADLINE.url, title: "t", text: "   \n  " }),
+      fetchArticle: async () => ({ url: HEADLINE.url, title: "t", text: "   \n  ", publishedAt: null }),
     });
     expect(await provider.fetch()).toEqual([]);
   });

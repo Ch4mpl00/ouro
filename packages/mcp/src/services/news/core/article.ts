@@ -5,7 +5,10 @@ export interface ExtractedArticle {
   title: string;
   text: string;
   site?: string;
-  publishedAt?: string;
+  // Parsed Date or null — @extractus sometimes returns unparseable
+  // date strings; we drop those rather than poison the news_items row
+  // (drizzle's timestamp serializer throws on Invalid Date).
+  publishedAt: Date | null;
   author?: string;
 }
 
@@ -21,9 +24,15 @@ export async function fetchArticle(url: string): Promise<ExtractedArticle> {
     title: article.title ?? "",
     text: stripHtml(article.content ?? ""),
     site: article.source ?? undefined,
-    publishedAt: article.published ?? undefined,
+    publishedAt: parseDate(article.published),
     author: article.author ?? undefined,
   };
+}
+
+function parseDate(input: string | null | undefined): Date | null {
+  if (!input) return null;
+  const d = new Date(input);
+  return Number.isNaN(d.getTime()) ? null : d;
 }
 
 // Two retries on top of the initial attempt (3 total). Returns null on
