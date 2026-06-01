@@ -21,11 +21,14 @@
     "monobank:txns": "tsx packages/mcp/src/services/monobank/cli-txns.ts",
     "db:generate:pg": "pnpm --filter @mcp-tools/mcp exec drizzle-kit generate",
     "db:migrate:channel-posts": "tsx packages/mcp/src/scripts/migrate-channel-posts-to-pg.ts",
-    "embed:backfill": "tsx packages/mcp/src/scripts/embed-backfill.ts"
+    "embed:backfill": "tsx packages/mcp/src/scripts/embed-backfill.ts",
+    "test": "vitest run",
+    "test:watch": "vitest"
   },
   "devDependencies": {
     "@types/node": "^22.9.0",
     "tsx": "^4.19.2",
-    "typescript": "^5.6.3"
+    "typescript": "^5.6.3",
+    "vitest": "^4.1.8"
   }
 }

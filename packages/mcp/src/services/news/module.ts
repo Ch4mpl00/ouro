@@ -8,12 +8,12 @@ import { createNewsRepository, type NewsRepository } from "./core/repository";
 import {
   createHackerNewsProvider,
   defaultHackerNewsDeps,
-} from "./providers/hackernews";
-import { createHabrProvider, defaultHabrDeps } from "./providers/habr";
+} from "./providers/hackernews/provider";
+import { createHabrProvider, defaultHabrDeps } from "./providers/habr/provider";
 import {
   createTelegramChannelsProvider,
   defaultTelegramChannelsDeps,
-} from "./providers/telegram-channels";
+} from "./providers/telegram-channels/provider";
 import { startNewsPoller } from "./poller";
 
 // Composition root for the news domain. Wires embeddings + embedder

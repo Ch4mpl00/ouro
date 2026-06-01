@@ -21,35 +21,20 @@ const BOOTSTRAP_LIMIT = 50;
 const DELTA_LIMIT = 200;
 const INTER_CHANNEL_DELAY_MS = 200;
 
+export type WatermarkReader = (chatId: string) => Promise<number | null>;
+
 export interface TelegramChannelsProviderDeps {
-  db: Database;
   userbot: UserbotChannelsAdapter;
+  getWatermark: WatermarkReader;
 }
 
 export interface TelegramChannelsProviderOpts {
   cadenceMs?: number;
+  interChannelDelayMs?: number;
 }
 
-export function defaultTelegramChannelsDeps(
-  db: Database,
-): TelegramChannelsProviderDeps {
-  return { db, userbot: createGramjsUserbotAdapter() };
-}
-
-function externalId(chatId: string, tgMessageId: number): string {
-  return `${chatId}:${tgMessageId}`;
-}
-
-const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
-
-export function createTelegramChannelsProvider(
-  deps: TelegramChannelsProviderDeps,
-  opts: TelegramChannelsProviderOpts = {},
-): NewsProvider {
-  const cadenceMs = opts.cadenceMs ?? DEFAULT_CADENCE_MS;
-  const { db, userbot } = deps;
-
-  const getWatermark = async (chatId: string): Promise<number | null> => {
+export function createPgWatermarkReader(db: Database): WatermarkReader {
+  return async (chatId) => {
     const rows = await db
       .select({
         maxId: max(sql<number>`(${newsItems.metadata} ->> 'tg_message_id')::int`),
@@ -64,6 +49,30 @@ export function createTelegramChannelsProvider(
     const value = rows[0]?.maxId;
     return value === undefined || value === null ? null : Number(value);
   };
+}
+
+export function defaultTelegramChannelsDeps(
+  db: Database,
+): TelegramChannelsProviderDeps {
+  return {
+    userbot: createGramjsUserbotAdapter(),
+    getWatermark: createPgWatermarkReader(db),
+  };
+}
+
+function externalId(chatId: string, tgMessageId: number): string {
+  return `${chatId}:${tgMessageId}`;
+}
+
+const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+
+export function createTelegramChannelsProvider(
+  deps: TelegramChannelsProviderDeps,
+  opts: TelegramChannelsProviderOpts = {},
+): NewsProvider {
+  const cadenceMs = opts.cadenceMs ?? DEFAULT_CADENCE_MS;
+  const interChannelDelayMs = opts.interChannelDelayMs ?? INTER_CHANNEL_DELAY_MS;
+  const { userbot, getWatermark } = deps;
 
   return {
     source: SOURCE,
@@ -93,7 +102,7 @@ export function createTelegramChannelsProvider(
           console.warn(
             `[news/telegram-channels] ${ch.title ?? ch.chatId}: fetch failed: ${(err as Error).message}`,
           );
-          await sleep(INTER_CHANNEL_DELAY_MS);
+          if (interChannelDelayMs > 0) await sleep(interChannelDelayMs);
           continue;
         }
 
@@ -115,7 +124,7 @@ export function createTelegramChannelsProvider(
             postedAt: m.date,
           });
         }
-        await sleep(INTER_CHANNEL_DELAY_MS);
+        if (interChannelDelayMs > 0) await sleep(interChannelDelayMs);
       }
       return collected;
     },
