@@ -1,8 +1,9 @@
-# Two-container deploy: integrations (mcp) and the agent supervisor are
-# isolated from each other. The agent never touches Telegram/Gmail/Monobank
-# credentials, the Gmail attachments storage, or the MCP database — it
-# only has its own agent.db, the live skills overlay, and the network
-# link to mcp:3000.
+# Three services: postgres (news + pgvector), mcp (integrations), agent
+# (supervisor). The agent never touches Telegram/Gmail/Monobank credentials,
+# the Gmail attachments storage, the MCP sqlite, or the postgres URL — it
+# only has its own agent.db, the live skills overlay, and the network link
+# to mcp:3000. Postgres lives behind mcp; the agent talks to it solely
+# through MCP tools (search_news, list_channel_posts, …).
 #
 # Skill files now live on the agent side (the agent's reasoning config,
 # not integration state). Two layers:
@@ -15,19 +16,37 @@
 # volume — that's how the bundled skills/ get into agent-skills.
 
 services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    env_file: .env.postgres
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
   mcp:
     build: .
     image: mcp-tools-image
     command: sh -c "pnpm setup:mcp && pnpm mcp:serve"
-    env_file: .env.mcp
+    env_file:
+      - .env.mcp
+      - .env.postgres
     environment:
       MCP_TRANSPORT: http
       MCP_PORT: "3000"
+      DATABASE_URL: postgres://${POSTGRES_USER:-mcp}:${POSTGRES_PASSWORD:-mcp}@postgres:5432/${POSTGRES_DB:-mcp}
     volumes:
       - mcp-data:/app/packages/mcp/data        # tokens.db, OAuth, signals, watermarks
       - mcp-storage:/app/storage               # Gmail attachments
     expose:
       - "3000"
+    depends_on:
+      postgres:
+        condition: service_healthy
     restart: unless-stopped
 
   agent:
@@ -50,3 +69,4 @@ volumes:
   mcp-storage:
   agent-data:
   agent-skills:
+  pg-data:

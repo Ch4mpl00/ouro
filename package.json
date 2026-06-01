@@ -18,7 +18,10 @@
     "gmail:list-unread": "tsx packages/mcp/src/services/gmail/cli-list-unread.ts",
     "telegram:get-chat-id": "tsx packages/mcp/src/services/telegram/cli-get-chat-id.ts",
     "userbot:auth": "tsx packages/mcp/src/services/telegram/userbot/cli-auth.ts",
-    "monobank:txns": "tsx packages/mcp/src/services/monobank/cli-txns.ts"
+    "monobank:txns": "tsx packages/mcp/src/services/monobank/cli-txns.ts",
+    "db:generate:pg": "pnpm --filter @mcp-tools/mcp exec drizzle-kit generate",
+    "db:migrate:channel-posts": "tsx packages/mcp/src/scripts/migrate-channel-posts-to-pg.ts",
+    "embed:backfill": "tsx packages/mcp/src/scripts/embed-backfill.ts"
   },
   "devDependencies": {
     "@types/node": "^22.9.0",

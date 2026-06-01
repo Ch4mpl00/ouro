@@ -1,9 +1,12 @@
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { listDialogs, listChannelPosts } from "../services/telegram/userbot";
+import { listDialogs, type ChannelStorage } from "../services/telegram/userbot";
 import { jsonResult } from "../result";
 
-export function registerUserbotTools(server: McpServer): void {
+export function registerUserbotTools(
+  server: McpServer,
+  deps: { channelStorage: ChannelStorage },
+): void {
   server.registerTool(
     "list_userbot_dialogs",
     {
@@ -73,7 +76,7 @@ export function registerUserbotTools(server: McpServer): void {
       },
     },
     async ({ since, channel, limit }) => {
-      const posts = listChannelPosts({ since, channel, limit });
+      const posts = await deps.channelStorage.listChannelPosts({ since, channel, limit });
       return jsonResult({ count: posts.length, posts });
     },
   );

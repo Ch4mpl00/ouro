@@ -10,9 +10,13 @@
     "better-sqlite3": "^12.9.0",
     "cron-parser": "^5.5.0",
     "dotenv": "^17.4.2",
+    "drizzle-orm": "^0.45.2",
     "google-auth-library": "^9.14.2",
     "googleapis": "^144.0.0",
     "input": "^1.0.1",
+    "lodash": "^4.18.1",
+    "openai": "^4.104.0",
+    "pg": "^8.21.0",
     "rss-parser": "^3.13.0",
     "telegram": "^2.26.22",
     "unpdf": "^0.12.0",
@@ -20,7 +24,10 @@
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.13",
+    "@types/lodash": "^4.17.24",
     "@types/node": "^22.9.0",
+    "@types/pg": "^8.20.0",
+    "drizzle-kit": "^0.31.10",
     "typescript": "^5.6.3"
   }
 }

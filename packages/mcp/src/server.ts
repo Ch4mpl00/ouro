@@ -19,8 +19,16 @@ import { startTelegramPoller } from "./services/telegram";
 import { startGmailPoller } from "./services/gmail";
 import { startSchedulerPoller } from "./services/scheduler";
 import { startUserbotPoller } from "./services/telegram/userbot";
+import { createPgClient } from "./db/pg/client";
+import { createNewsModule, type NewsModule } from "./services/news";
+import { createChannelStorage, type ChannelStorage } from "./services/telegram/userbot";
 
-export function createServer(): McpServer {
+export interface ServerDeps {
+  news: NewsModule;
+  channelStorage: ChannelStorage;
+}
+
+export function createServer(deps: ServerDeps): McpServer {
   const server = new McpServer({
     name: "mcp-tools",
     version: "0.1.0",
@@ -32,9 +40,9 @@ export function createServer(): McpServer {
   registerPdfTools(server);
   registerFsTools(server);
   registerSignalsTools(server);
-  registerNewsTools(server);
+  registerNewsTools(server, deps.news);
   registerDreamingTools(server);
-  registerUserbotTools(server);
+  registerUserbotTools(server, { channelStorage: deps.channelStorage });
   registerSchedulerTools(server);
 
   return server;
@@ -110,7 +118,15 @@ async function runHttpTransport(server: McpServer, port: number): Promise<void> 
 }
 
 async function main(): Promise<void> {
-  const server = createServer();
+  // Postgres must be up and migrated before any tool handler or poller
+  // touches news_items.
+  const pg = createPgClient();
+  await pg.ensureReady();
+
+  const news = createNewsModule({ db: pg.db });
+  const channelStorage = createChannelStorage(pg.db);
+
+  const server = createServer({ news, channelStorage });
   const transport = (process.env.MCP_TRANSPORT ?? "stdio").toLowerCase();
 
   if (transport === "http") {
@@ -125,7 +141,7 @@ async function main(): Promise<void> {
   startTelegramPoller();
   startGmailPoller();
   startSchedulerPoller();
-  startUserbotPoller();
+  startUserbotPoller({ news, channelStorage });
 }
 
 main().catch((err) => {

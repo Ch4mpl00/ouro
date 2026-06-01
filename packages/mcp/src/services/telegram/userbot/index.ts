@@ -10,6 +10,7 @@ export {
 export { normalizeHandle } from "./channels";
 export { startUserbotPoller } from "./poller";
 export {
-  listChannelPosts,
+  createChannelStorage,
+  type ChannelStorage,
   type ChannelPostRow,
 } from "./storage";

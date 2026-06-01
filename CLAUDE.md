@@ -82,19 +82,28 @@ mcp-tools/
 - `cron-parser` v5 for scheduled tasks
 - `openai` SDK pointed at DeepSeek (OpenAI-compatible)
 
-## Two databases — split by ownership
+## Three databases — split by ownership
 
-- **`packages/mcp/data/tokens.db`** — MCP's private state. OAuth tokens,
-  Gmail watermarks, Telegram poll cursors, the `signals` queue, the
-  `scheduled_tasks` table, userbot channel watermarks. Don't read or write
-  this from agent code — go through MCP tools.
-- **`packages/agent/data/agent.db`** — agent's domain state. Currently
-  only `memory` (freeform KV, e.g. `news_digest.last_read_at`). A `bills`
-  table exists in schema as a leftover from earlier reconciliation work
-  but is no longer populated.
+- **`packages/mcp/data/tokens.db`** (sqlite) — MCP's private state. OAuth
+  tokens, Gmail watermarks, Telegram poll cursors, the `signals` queue,
+  the `scheduled_tasks` table, userbot channel watermarks. Don't read or
+  write this from agent code — go through MCP tools.
+- **`packages/agent/data/agent.db`** (sqlite) — agent's domain state.
+  Currently only `memory` (freeform KV, e.g. `news_digest.last_read_at`).
+  A `bills` table exists in schema as a leftover but is no longer
+  populated.
+- **Postgres + pgvector** (containerized, `postgres` service in
+  docker-compose) — the news / RAG store. One table `news_items` unifies
+  HN/Habr articles and harvested Telegram channel posts; rows have a
+  1536-dim `embedding` column (text-embedding-3-small). Owned by MCP;
+  the agent reaches it only through MCP tools (`search_news`,
+  `list_channel_posts`, …). Schema lives in code at
+  `packages/mcp/src/db/pg/schema.ts` (Drizzle ORM); migrations are
+  generated with `pnpm db:generate:pg` and applied on server boot.
 
-Schemas: `packages/mcp/data/schema.sql`, `packages/agent/data/schema.sql`.
-Re-apply with `pnpm db:init` (idempotent).
+Schemas: `packages/mcp/data/schema.sql`, `packages/agent/data/schema.sql`,
+`packages/mcp/src/db/pg/schema.ts`. Re-apply sqlite with `pnpm db:init`
+(idempotent); PG migrations apply automatically when mcp starts.
 
 For ad-hoc queries during development:
 
@@ -105,6 +114,88 @@ sqlite3      packages/agent/data/agent.db "UPDATE memory SET value=? WHERE key=?
 
 For multi-line / quote-heavy SQL, use a heredoc. Always single-quote
 string literals; double single quotes inside (`'O''Brien'`).
+
+## Code structure: modules + DI
+
+Domain code is organised as **modules** with explicit **dependency
+injection**. Every long-lived piece of state (DB pool, OpenAI client,
+EmbeddingService, storage layer) is built once in the composition root
+(`server.ts main()` or a script's `main()`) and passed down. No
+`getX()` singletons, no service locators, no global handles in
+business code.
+
+### Rules
+
+1. **Factory functions, not classes.** State that needs scoping lives
+   in a closure built by `createX(deps)`. Return a plain object with
+   the methods consumers need. No `this`, no `new`.
+
+2. **Every module has a `module.ts`.** It declares a `XxxModule`
+   interface (the public surface) and a `createXxxModule(deps): XxxModule`
+   factory that wires everything inside. See
+   `services/news/module.ts` as the canonical example. Pattern:
+
+   ```ts
+   export interface XxxModule { /* exposed services */ }
+   export interface XxxModuleDeps { /* required deps from outside */ }
+   export function createXxxModule(deps: XxxModuleDeps): XxxModule { … }
+   ```
+
+3. **Generic infrastructure is dependency-free.** A reusable layer
+   (e.g. `services/embeddings/`) declares interfaces (`EmbeddingRepository`,
+   `EmbeddingProvider`, `Chunker`) and a `createEmbeddingsModule({repo, …})`
+   factory that takes them. It never imports a concrete table or
+   domain type. Domain modules supply the implementations.
+
+4. **Repos live with the table they own.** Implementation of
+   `EmbeddingRepository` for `news_items` lives in
+   `news/embedding-repository.ts`, not in `embeddings/`. The interface
+   is in the generic module; the impl is in the domain.
+
+5. **DB handle is injected.** `db/pg/client.ts` exports
+   `createPgClient(): { db, ensureReady, close }` only. Anything that
+   talks to PG accepts `db: Database` (factory parameter) or sits
+   behind a storage/repo factory that does.
+
+6. **Tools and pollers take their deps in the signature.**
+   `registerXxxTools(server, deps)`, `startXxxPoller(deps)`. They
+   never reach for a global handle inside the handler.
+
+7. **Composition root is the only place that knows the full graph.**
+   `server.ts main()` calls the factories in order, threads the
+   result through `createServer({...})` and `startXxxPoller({...})`.
+   Scripts do the same for their narrower scope and `await pg.close()`
+   in `finally`.
+
+8. **Add a new domain → add a new module.** Create
+   `services/<domain>/module.ts` with `createXxxModule({db, ...})`,
+   instantiate it in `server.ts main()`, pass to whoever needs it. Do
+   not extend `NewsModule` with unrelated concerns just because PG is
+   already there.
+
+### Anti-patterns (don't)
+
+- `getPgDb()` / `getXxxModule()` exported helpers that lazy-init a
+  singleton. They look convenient but turn every consumer into a
+  hidden coupling on global mutable state and make tests painful.
+- `class XxxService` with only a constructor and one method — that's
+  a factory function in disguise.
+- Importing a concrete table or schema from `services/<generic>/`.
+  Move the interface up, the impl down.
+- Handlers that pull deps inside their body (`const { news } =
+  getModule()`). The handler's signature must be the contract.
+
+## Task tracking
+
+Planned work and tech debt live under `.claude/tasks/` — one markdown
+file per task with frontmatter-style fields (`Status`, `Priority`,
+`Area`, `Created`). Format is documented in `.claude/tasks/README.md`.
+
+When picking work, scan that directory first — there's usually a
+written-up task with context, rather than starting fresh from a half-
+remembered Slack thread. When agreeing on new tech debt during a
+design discussion, add a file there before moving on, so the decision
+doesn't evaporate.
 
 ## MCP tools (signal-emitting + agent-callable)
 
@@ -117,7 +208,9 @@ also see them when running `claude` locally with `.mcp.json` registered.
 - **Telegram userbot (read-only MTProto)** — `list_userbot_dialogs`,
   `list_channel_posts`
 - **Monobank** — `list_monobank_transactions` (no poller; reactive only)
-- **News** — `list_news_headlines`, `fetch_article` (HN, Habr)
+- **News** — `list_news_headlines`, `fetch_article` (HN, Habr — both
+  upsert into news_items and embed inline), `search_news` (semantic
+  search across the unified store: HN, Habr, channel posts)
 - **PDF** — `read_pdf`
 - **Files** — `read_file`
 - **Signals queue** — `get_next_signal`, `list_signals`
@@ -152,7 +245,17 @@ volume — written by the `dreaming` skill when it self-revises).
   message to your bot).
 - `pnpm userbot:auth` — one-time MTProto login (phone + code).
 - `pnpm typecheck` — typecheck both packages.
+- `pnpm db:generate:pg` — regenerate Drizzle migrations after editing
+  `packages/mcp/src/db/pg/schema.ts`. The new `*.sql` file lands in
+  `packages/mcp/src/db/pg/migrations/` and is applied on next mcp boot.
+- `pnpm db:migrate:channel-posts` — one-shot copy of the legacy sqlite
+  `channel_posts` table into PG `news_items` + inline-embed. Idempotent.
+- `pnpm embed:backfill` — re-attempt embeddings for any `news_items`
+  rows where `embedding IS NULL` (typically left behind by an OpenAI
+  outage during inline embed).
 
 Deploy: see `docker-compose.yml`. `docker compose up -d --build` on the
 droplet; named volumes (`mcp-data`, `mcp-storage`, `agent-data`,
-`agent-skills`) persist state across rebuilds.
+`agent-skills`, `pg-data`) persist state across rebuilds. First boot
+needs `.env.postgres` (POSTGRES_USER / PASSWORD / DB) and
+`OPENAI_API_KEY` in `.env.mcp`.

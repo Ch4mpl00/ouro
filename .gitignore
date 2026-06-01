@@ -4,6 +4,7 @@ dist/
 .env.local
 .env.mcp
 .env.agent
+.env.postgres
 *.log
 
 # Local attachment / blob storage
@@ -24,3 +25,8 @@ packages/*/data/*.db-shm
 .DS_Store
 .idea/
 .vscode/
+
+# Claude Code runtime artefacts (we commit .claude/tasks/* by hand,
+# but not lock files / session state).
+.claude/scheduled_tasks.lock
+.claude/projects/

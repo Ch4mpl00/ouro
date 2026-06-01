@@ -1,18 +1,24 @@
 import { getUserbotClient } from "./client";
 import { getSavedSession } from "./auth";
 import {
-  getChannelWatermark,
-  insertChannelPosts,
+  CHANNEL_SOURCE,
   type ChannelPostInsert,
+  type ChannelStorage,
 } from "./storage";
+import type { NewsModule } from "../../news/module";
 
-// Background poller. Every ~30min, walks every channel-type dialog the
-// userbot is subscribed to, fetches new posts via gramjs, and persists
-// them into channel_posts (UNIQUE(chat_id, tg_message_id) de-dupes).
+export interface UserbotPollerDeps {
+  news: NewsModule;
+  channelStorage: ChannelStorage;
+}
+
+// Walks every channel dialog the userbot is subscribed to, upserts new
+// posts into news_items (source='channel'), and embeds the inserted
+// batch inline.
 //
 // First time we see a channel we backfill BOOTSTRAP_LIMIT recent posts,
-// then subsequent polls use minId=last_seen so each poll only sees the
-// delta. ~200ms pause between channels to stay clear of FLOOD_WAIT.
+// then subsequent polls use minId=last_seen for the delta. ~200ms pause
+// between channels to stay clear of FLOOD_WAIT.
 
 const DEFAULT_INTERVAL_MS = 30 * 60_000;
 const BOOTSTRAP_LIMIT = 50;
@@ -49,12 +55,15 @@ interface RawMessage {
   forwards?: number;
 }
 
-async function pollOnce(): Promise<void> {
+async function pollOnce(deps: UserbotPollerDeps): Promise<void> {
+  const { news, channelStorage } = deps;
   const client = await getUserbotClient();
   const dialogs = await client.getDialogs({ limit: 500 });
 
   let totalChannels = 0;
   let totalInserted = 0;
+  let totalEmbedded = 0;
+  let totalEmbedFailed = 0;
 
   for (const d of dialogs) {
     if (!d.isChannel) continue;
@@ -66,7 +75,7 @@ async function pollOnce(): Promise<void> {
     const chatTitle = d.title ?? entity.title ?? null;
     const chatUsername = entity.username ?? null;
 
-    const watermark = getChannelWatermark(chatId);
+    const watermark = await channelStorage.getChannelWatermark(chatId);
     const limit = watermark === null ? BOOTSTRAP_LIMIT : DELTA_LIMIT;
 
     let raw: RawMessage[];
@@ -99,22 +108,27 @@ async function pollOnce(): Promise<void> {
       });
     }
 
-    const inserted = insertChannelPosts(rows);
-    totalInserted += inserted;
-    if (inserted > 0) {
+    const inserted = await channelStorage.insertChannelPosts(rows);
+    totalInserted += inserted.length;
+    if (inserted.length > 0) {
+      const result = await news.embeddings.embedByTargets(
+        inserted.map((externalId) => ({ source: CHANNEL_SOURCE, externalId })),
+      );
+      totalEmbedded += result.embedded;
+      totalEmbedFailed += result.failed;
       console.log(
-        `${logPrefix()} ${chatTitle ?? chatId}: +${inserted}/${rows.length} (watermark=${watermark ?? "bootstrap"})`,
+        `${logPrefix()} ${chatTitle ?? chatId}: +${inserted.length}/${rows.length} (watermark=${watermark ?? "bootstrap"}, embedded=${result.embedded}, failed=${result.failed})`,
       );
     }
     await sleep(INTER_CHANNEL_DELAY_MS);
   }
 
   console.log(
-    `${logPrefix()} tick complete: ${totalChannels} channels scanned, ${totalInserted} new posts`,
+    `${logPrefix()} tick complete: ${totalChannels} channels scanned, ${totalInserted} new posts, ${totalEmbedded} embedded${totalEmbedFailed ? `, ${totalEmbedFailed} embed-failed` : ""}`,
   );
 }
 
-export function startUserbotPoller(): void {
+export function startUserbotPoller(deps: UserbotPollerDeps): void {
   if (!getSavedSession()) {
     console.warn(
       `${logPrefix()} no saved userbot session — poller disabled. Run \`pnpm userbot:auth\` to enable.`,
@@ -128,7 +142,7 @@ export function startUserbotPoller(): void {
   // then run on the interval. Each tick is async-wrapped so a thrown
   // error doesn't kill the setInterval.
   const tick = (): void => {
-    void pollOnce().catch((err) => {
+    void pollOnce(deps).catch((err) => {
       console.error(`${logPrefix()} pollOnce crashed:`, err);
     });
   };
