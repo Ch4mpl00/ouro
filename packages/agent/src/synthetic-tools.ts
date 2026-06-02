@@ -1,5 +1,6 @@
 import type { ChatCompletionTool } from "openai/resources/chat/completions";
-import type { ReasoningEffort, Session } from "./session";
+import { PRESET_NAMES, type PresetName } from "./models";
+import type { Session } from "./session";
 import type { TraceContext } from "./tracing";
 
 // Agent-side synthetic tools — intercepted inside the Session loop and
@@ -191,10 +192,15 @@ export const INVOKE_SUB_AGENT_TOOL: ChatCompletionTool = {
           type: "number",
           description: "Optional iteration budget for the sub-agent. Default 50.",
         },
-        reasoning_effort: {
+        preset: {
           type: "string",
-          enum: ["disabled", "high", "max"],
-          description: "Optional reasoning effort. Default `disabled`.",
+          enum: [...PRESET_NAMES],
+          description:
+            "Model preset for the sub-agent. `base` — cheap chat model, " +
+            "no thinking (default; use for simple one-offs and lookups). " +
+            "`smart` — DeepSeek with thinking on (use for real editorial / " +
+            "parsing work: digests, semantic dedup, PDF amount extraction). " +
+            "Default `base`.",
         },
       },
       required: ["skills", "prompt"],
@@ -207,7 +213,7 @@ export interface InvokeSubAgentArgs {
   system_prompt?: string;
   prompt?: string;
   max_iterations?: number;
-  reasoning_effort?: ReasoningEffort;
+  preset?: PresetName;
 }
 
 // ─── registry ────────────────────────────────────────────────────────

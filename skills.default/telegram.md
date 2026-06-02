@@ -27,11 +27,11 @@ wrong topic.
 When the user's intent maps to a news skill, fetch the context the
 sub-agent needs yourself and hand off the composition job:
 
-| User says | Sub-agent | `reasoning_effort` |
+| User says | Sub-agent | `preset` |
 |---|---|---|
-| **Full digest** — "что нового / какие новости / дайджест / сводка / что важного / что произошло за день / что в каналах" | `news-digest` | `max` |
-| **Topical question** — "шо там Одесса / что в Одессе / что по фронту / что у Зеленского / что говорит Трамп / какие новости про OpenAI / что слышно про Сирию / что там с ПМР / есть что-то про Anthropic / что в Иране / что у Китая" | `news-query` | `max` |
-| **Tech digest** — "что нового в IT / IT-новости / Hacker News / на Habr / IT-дайджест" | `tech-digest` | `max` |
+| **Full digest** — "что нового / какие новости / дайджест / сводка / что важного / что произошло за день / что в каналах" | `news-digest` | `smart` |
+| **Topical question** — "шо там Одесса / что в Одессе / что по фронту / что у Зеленского / что говорит Трамп / какие новости про OpenAI / что слышно про Сирию / что там с ПМР / есть что-то про Anthropic / что в Иране / что у Китая" | `news-query` | `smart` |
+| **Tech digest** — "что нового в IT / IT-новости / Hacker News / на Habr / IT-дайджест" | `tech-digest` | `smart` |
 
 Rule of thumb to choose between digest and query:
 
@@ -44,9 +44,9 @@ Rule of thumb to choose between digest and query:
 
 All three do real editorial work (filtering against a significance
 bar, semantic dedup against chat history, consolidating
-near-duplicates) — pass `reasoning_effort="max"` so the sub-agent
-runs in thinking mode. Cheap-tier (`disabled`) versions stuff the
-feed with noise.
+near-duplicates) — pass `preset="smart"` so the sub-agent runs in
+thinking mode. The `base` preset on these tasks stuffs the feed
+with noise.
 
 ### Pattern
 
@@ -61,7 +61,7 @@ get_telegram_chat_history(chatId=<id>, threadId=<thread_id if any>, limit=30)
 ```
 invoke_sub_agent(
   skills=["news-digest"],          // or "news-query" or "tech-digest"
-  reasoning_effort="max",          // see table above
+  preset="smart",                  // see table above
   system_prompt="""
 Environment:
 - Date: <today, local>

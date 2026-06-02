@@ -47,7 +47,7 @@ Recurring: yes | no (one-shot)
    ```
    invoke_sub_agent(
      skills=["news-digest"],          // or "tech-digest"
-     reasoning_effort="max",
+     preset="smart",
      system_prompt="""
    Environment:
    - Date: <today, local>

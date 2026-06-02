@@ -1,6 +1,7 @@
 import "dotenv/config";
 import type { ChatCompletionMessageParam } from "openai/resources/chat/completions";
 import { createEngine, type Engine } from "./engine";
+import { DEFAULT_PRESETS } from "./models";
 import { buildSessionContext } from "./session-context";
 
 // Long-running process. The agent has no signal sources of its own — every
@@ -54,7 +55,7 @@ async function runSignal(engine: Engine, signal: PendingSignal): Promise<void> {
       id: `${signal.source}:${signal.id}`,
       systemPrompt: buildPromptPrefix(sessionContext, signal.envContext),
       skills: [signal.source],
-      reasoningEffort: "disabled",
+      preset: "base",
       tags: [signal.source],
       sessionId: `${signal.source}:${signal.id}`,
       metadata: {
@@ -107,7 +108,7 @@ async function reportFailureToUser(
     skills: ["recovery"],
     includeEngineSkills: false,
     systemPrompt: signal.envContext ?? undefined,
-    reasoningEffort: "disabled",
+    preset: "base",
     maxIterations: 5,
     tags: ["recovery", signal.source],
     // Same sessionId as the primary so the crashed trace + recovery trace
@@ -129,12 +130,31 @@ async function reportFailureToUser(
 }
 
 async function main(): Promise<void> {
-  const apiKey = process.env.DEEPSEEK_API_KEY;
-  if (!apiKey) throw new Error("DEEPSEEK_API_KEY is not set in .env");
+  const deepseekApiKey = process.env.DEEPSEEK_API_KEY;
+  if (!deepseekApiKey) throw new Error("DEEPSEEK_API_KEY is not set in .env");
+  const openaiApiKey = process.env.OPENAI_API_KEY;
+  if (!openaiApiKey) throw new Error("OPENAI_API_KEY is not set in .env");
+
+  // Build the preset registry from defaults + per-preset env overrides.
+  // `base` runs on OpenAI (non-thinking — primary replies, recovery,
+  // scheduler dispatch). `smart` runs on DeepSeek with thinking on —
+  // sub-agents that do real editorial / parsing work (news-digest,
+  // tech-digest, nashdom-bill, …).
+  const presets = {
+    base: {
+      ...DEFAULT_PRESETS.base,
+      model: process.env.AGENT_BASE_MODEL ?? DEFAULT_PRESETS.base.model,
+    },
+    smart: {
+      ...DEFAULT_PRESETS.smart,
+      model: process.env.AGENT_SMART_MODEL ?? DEFAULT_PRESETS.smart.model,
+    },
+  };
 
   const engine = await createEngine({
-    apiKey,
-    defaultModel: process.env.AGENT_MODEL ?? "deepseek-v4-pro",
+    deepseekApiKey,
+    openaiApiKey,
+    presets,
     // Meta-skills loaded into every session: routing (cross-skill
     // delegation when intent ≠ source).
     skills: ["routing"],

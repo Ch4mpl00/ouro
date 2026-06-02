@@ -18,7 +18,7 @@ domain skill, call:
 ```
 invoke_sub_agent(
   skills=["<name>"],
-  reasoning_effort="max",   // see "Reasoning effort" below
+  preset="smart",           // see "Model presets" below
   system_prompt="<the GOAL you want the sub-agent to achieve, plus any
                  framing the skill itself doesn't know: delivery target
                  (chat id, thread id), output format, scope limits,
@@ -28,25 +28,31 @@ invoke_sub_agent(
 )
 ```
 
-### Reasoning effort
+### Model presets
 
-Default is `disabled` (cheap, no thinking). Pass `reasoning_effort="max"`
-when the sub-agent does **real editorial / judgment work** — filtering
-against a quality bar, semantic dedup, multi-step consolidation,
-schema parsing where mistakes are damaging:
+The sub-agent runs on one of two presets:
 
-- `news-digest` → `max` (filtering + dedup + consolidation against
+- **`base`** (default) — cheap chat model, no thinking. Use for trivial
+  one-offs, single-tool lookups, simple text manipulation.
+- **`smart`** — DeepSeek with thinking on. Use when the sub-agent does
+  **real editorial / judgment work** — filtering against a quality bar,
+  semantic dedup, multi-step consolidation, schema parsing where
+  mistakes are damaging.
+
+Map per skill:
+
+- `news-digest` → `smart` (filtering + dedup + consolidation against
   chat history).
-- `news-query` → `max` (query reformulation, semantic dedup,
+- `news-query` → `smart` (query reformulation, semantic dedup,
   consolidating multi-channel coverage of the same event).
-- `tech-digest` → `max` (ranking HN/Habr signal, TL;DR composition).
-- `nashdom-bill` → `max` (parsing PDF amounts; wrong number is worse
+- `tech-digest` → `smart` (ranking HN/Habr signal, TL;DR composition).
+- `nashdom-bill` → `smart` (parsing PDF amounts; wrong number is worse
   than no reply).
 - Generic one-off lookups / simple text manipulation → leave at default
-  (`disabled`).
+  (`base`).
 
-When in doubt for a digest / parsing task, prefer `max`. Cheap-tier
-output for these is consistently noisier and prone to hallucinated
+When in doubt for a digest / parsing task, prefer `smart`. The `base`
+model on these tasks is consistently noisier and prone to hallucinated
 numbers.
 
 - `system_prompt` is YOUR brief to the sub-agent. Treat it like writing

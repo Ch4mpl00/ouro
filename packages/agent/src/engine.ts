@@ -1,21 +1,35 @@
 import OpenAI from "openai";
 import { connectMcp, type McpHandle } from "./mcp-client";
+import { DEFAULT_PRESETS, type ModelPreset, type PresetName } from "./models";
 import { Session, type SessionOpts } from "./session";
 import { readSkill, validateAllSkills } from "./skills";
 import { nullTracer, type Tracer } from "./tracing";
 import { langfuseTracerFromEnv } from "./tracing-langfuse";
 
 // Process-level singleton. Owns shared, expensive resources:
-//   - one OpenAI client (one API key, one rate-limit bucket)
+//   - two OpenAI-shaped clients, one per provider (DeepSeek for
+//     thinking-mode sessions, OpenAI for non-thinking — each on its own
+//     API key + rate-limit bucket)
 //   - one MCP connection (one stdio child process for the integrations server)
 //   - one Tracer (observability backend; defaults to no-op)
 // Hands out Sessions on demand. Each Session has its own context buffer,
 // system prompt and iteration budget but reuses these shared resources.
 
+export type ProviderKind = "deepseek" | "openai";
+
+export interface Provider {
+  client: OpenAI;
+  kind: ProviderKind;
+}
+
 export interface EngineOpts {
-  apiKey: string;
-  baseURL?: string;
-  defaultModel?: string;
+  deepseekApiKey: string;
+  openaiApiKey: string;
+  // Optional override for the model-preset registry. Omit to use
+  // DEFAULT_PRESETS from `./models`. Per-preset env overrides
+  // (AGENT_BASE_MODEL / AGENT_SMART_MODEL) are applied by the supervisor
+  // before constructing the engine.
+  presets?: Record<PresetName, ModelPreset>;
   // Engine-level skills — loaded into every session this engine starts
   // (unless a session opts out via `includeEngineSkills: false`). Use for
   // meta-skills that apply across every domain — e.g. `routing` (when to
@@ -33,25 +47,36 @@ export interface EngineOpts {
 }
 
 export class Engine {
-  readonly llm: OpenAI;
   readonly mcp: McpHandle;
-  readonly defaultModel: string;
+  readonly presets: Record<PresetName, ModelPreset>;
   readonly skills: readonly string[];
   readonly tracer: Tracer;
+  private readonly providers: { deepseek: OpenAI; openai: OpenAI };
   private sessions = new Map<string, Session>();
 
   constructor(
-    llm: OpenAI,
+    providers: { deepseek: OpenAI; openai: OpenAI },
     mcp: McpHandle,
-    defaultModel: string,
+    presets: Record<PresetName, ModelPreset>,
     skills: readonly string[],
     tracer: Tracer,
   ) {
-    this.llm = llm;
+    this.providers = providers;
     this.mcp = mcp;
-    this.defaultModel = defaultModel;
+    this.presets = presets;
     this.skills = skills;
     this.tracer = tracer;
+  }
+
+  // Pick the LLM client + provider semantics based on the model name. The
+  // model name is the source of truth — Session resolves a preset name
+  // to a concrete model at construction time; this method only routes
+  // that model to its endpoint.
+  resolveProvider(model: string): Provider {
+    if (model.startsWith("deepseek")) {
+      return { client: this.providers.deepseek, kind: "deepseek" };
+    }
+    return { client: this.providers.openai, kind: "openai" };
   }
 
   async startSession(opts: SessionOpts): Promise<Session> {
@@ -113,7 +138,7 @@ export class Engine {
     const toolsLabel = allowedTools === null ? "*" : String(allowedTools.size);
     this.log(
       opts.id,
-      `session opened (model=${opts.model ?? this.defaultModel}, effort=${opts.reasoningEffort ?? "disabled"}, skills=[${skillsList}], tools=${toolsLabel}${opts.parentId ? `, parent=${opts.parentId}` : ""})`,
+      `session opened (preset=${session.preset} → model=${session.model}, effort=${session.reasoningEffort}, skills=[${skillsList}], tools=${toolsLabel}${opts.parentId ? `, parent=${opts.parentId}` : ""})`,
     );
     return session;
   }
@@ -140,11 +165,15 @@ export class Engine {
 }
 
 export async function createEngine(opts: EngineOpts): Promise<Engine> {
-  if (!opts.apiKey) throw new Error("createEngine: apiKey is required");
+  if (!opts.deepseekApiKey) throw new Error("createEngine: deepseekApiKey is required");
+  if (!opts.openaiApiKey) throw new Error("createEngine: openaiApiKey is required");
 
-  const llm = new OpenAI({
-    apiKey: opts.apiKey,
-    baseURL: opts.baseURL ?? "https://api.deepseek.com",
+  const deepseek = new OpenAI({
+    apiKey: opts.deepseekApiKey,
+    baseURL: "https://api.deepseek.com",
+  });
+  const openai = new OpenAI({
+    apiKey: opts.openaiApiKey,
   });
 
   const mcp = await connectMcp();
@@ -172,5 +201,11 @@ export async function createEngine(opts: EngineOpts): Promise<Engine> {
     }
   }
 
-  return new Engine(llm, mcp, opts.defaultModel ?? "deepseek-v4-pro", opts.skills ?? [], tracer);
+  return new Engine(
+    { deepseek, openai },
+    mcp,
+    opts.presets ?? DEFAULT_PRESETS,
+    opts.skills ?? [],
+    tracer,
+  );
 }

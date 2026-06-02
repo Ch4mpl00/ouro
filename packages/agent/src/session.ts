@@ -1,6 +1,7 @@
 import type { ChatCompletionMessageParam } from "openai/resources/chat/completions";
 import type { Engine } from "./engine";
 import { setMemory } from "./db/memory";
+import type { PresetName, ReasoningEffort } from "./models";
 import { listSkills, readSkill, saveSkill } from "./skills";
 import type { Trace, TraceContext } from "./tracing";
 import {
@@ -15,8 +16,6 @@ import {
 // One isolated conversation thread. Owns its own message buffer, system
 // prompt, model and iteration budget. Shares the engine's OpenAI client
 // and MCP connection — does not create or close them.
-
-export type ReasoningEffort = "disabled" | "high" | "max";
 
 export interface SessionOpts {
   id: string;
@@ -48,8 +47,11 @@ export interface SessionOpts {
   // Default true. Sub-agents set this to false so they get only the
   // focused per-task skill set without the always-on parent extras.
   includeEngineSkills?: boolean;
-  model?: string;
-  reasoningEffort?: ReasoningEffort;
+  // Named entry from the engine's preset registry (see `./models.ts`).
+  // Resolves to a concrete model + reasoning_effort pair at session
+  // start. Default is "base" (cheap chat). Sub-agents that do real
+  // editorial / parsing work pass "smart".
+  preset?: PresetName;
   maxIterations?: number;
   parentId?: string;
   // Optional trace metadata. `tags` show up as filter chips in the UI
@@ -100,9 +102,13 @@ export class Session {
   // (their child trace lands in the same group as the parent's).
   readonly sessionId?: string;
   readonly messages: ChatCompletionMessageParam[] = [];
+  // Resolved preset name + concrete (model, reasoningEffort) it expanded
+  // to. Both exposed so engine logging and trace metadata can show what
+  // the session is actually running with.
+  readonly preset: PresetName;
+  readonly model: string;
+  readonly reasoningEffort: ReasoningEffort;
   private readonly engine: Engine;
-  private readonly model: string;
-  private readonly reasoningEffort: ReasoningEffort;
   private readonly maxIterations: number;
   // Trace surface for this session. For top-level sessions this is a Trace
   // created from `engine.tracer.trace(...)`; for sub-agents it's the parent's
@@ -127,8 +133,13 @@ export class Session {
     this.id = opts.id;
     this.parentId = opts.parentId;
     this.sessionId = opts.sessionId;
-    this.model = opts.model ?? engine.defaultModel;
-    this.reasoningEffort = opts.reasoningEffort ?? "disabled";
+    // Pick a preset from the engine registry. `base` (cheap chat,
+    // non-thinking) is the default — most signals stay here. Callers
+    // pass "smart" for sub-agents that do real editorial / parsing work.
+    this.preset = opts.preset ?? "base";
+    const preset = engine.presets[this.preset];
+    this.model = preset.model;
+    this.reasoningEffort = preset.reasoningEffort;
     this.maxIterations = opts.maxIterations ?? DEFAULT_MAX_ITERATIONS;
     this.allowedTools = opts.allowedTools ?? null;
 
@@ -165,6 +176,7 @@ export class Session {
         metadata: {
           sub_agent_id: this.id,
           sub_agent_skills: Object.keys(skillsMap),
+          sub_agent_preset: this.preset,
           sub_agent_model: this.model,
           sub_agent_reasoning_effort: this.reasoningEffort,
           sub_agent_max_iterations: this.maxIterations,
@@ -195,6 +207,7 @@ export class Session {
           ...opts.metadata,
           agent_id: this.id,
           skills: Object.keys(skillsMap),
+          preset: this.preset,
           model: this.model,
           reasoning_effort: this.reasoningEffort,
           max_iterations: this.maxIterations,
@@ -230,7 +243,11 @@ export class Session {
   }
 
   private async runUntilSettled(): Promise<string> {
-    const { llm, mcp } = this.engine;
+    const { mcp } = this.engine;
+    // Resolve provider once per run. Model is fixed for the session's
+    // lifetime (set in constructor), so the provider does not change
+    // across iterations either.
+    const { client: llm, kind: providerKind } = this.engine.resolveProvider(this.model);
 
     // Surface the user's prompt on the trace so the Session-replay UI
     // renders a real `user → assistant` exchange. Done here (not in the
@@ -253,8 +270,9 @@ export class Session {
         // `reasoning_effort: max` would otherwise 400 on their first call
         // if they inherit any thinking-disabled history. Stamp an empty
         // string on every assistant message missing the field whenever
-        // we're about to send in thinking-enabled mode.
-        if (this.reasoningEffort !== "disabled") {
+        // we're about to send in thinking-enabled mode. OpenAI ignores the
+        // field, but we only hit this branch on the DeepSeek path anyway.
+        if (providerKind === "deepseek" && this.reasoningEffort !== "disabled") {
           ensureReasoningContentOnHistory(this.messages);
         }
 
@@ -267,7 +285,7 @@ export class Session {
         const mcpTools = this.allowedTools === null
           ? mcp.tools
           : mcp.tools.filter((t) => this.allowedTools!.has(t.function.name));
-        const body = {
+        const baseBody = {
           model: this.model,
           messages: this.messages,
           tools: [
@@ -276,10 +294,19 @@ export class Session {
               (t) => t.def,
             ),
           ],
-          ...(this.reasoningEffort === "disabled"
-            ? { thinking: { type: "disabled" as const } }
-            : { thinking: { type: "enabled" as const }, reasoning_effort: this.reasoningEffort }),
         };
+        // Provider-specific extras. DeepSeek understands `thinking` +
+        // `reasoning_effort`; OpenAI rejects both (we use OpenAI only for
+        // non-thinking chat sessions — gpt-5.4-mini and friends — so
+        // there's nothing to pass).
+        const body = providerKind === "deepseek"
+          ? {
+              ...baseBody,
+              ...(this.reasoningEffort === "disabled"
+                ? { thinking: { type: "disabled" as const } }
+                : { thinking: { type: "enabled" as const }, reasoning_effort: this.reasoningEffort }),
+            }
+          : baseBody;
 
         // Generation span = one LLM call. The tracer computes latency
         // from start/end timestamps and stores prompt/completion tokens
@@ -300,7 +327,10 @@ export class Session {
 
         let response;
         try {
-          // @ts-expect-error DeepSeek extends ChatCompletionCreateParams with `thinking` + `reasoning_effort`.
+          // DeepSeek adds `thinking` + `reasoning_effort` on top of the
+          // OpenAI request shape; since `body` is a variable (not an
+          // inline object), TS skips excess-property checks and we don't
+          // need a directive here.
           response = await llm.chat.completions.create(body);
         } catch (err) {
           generation.end({
@@ -491,7 +521,7 @@ export class Session {
         systemPrompt: args.system_prompt,
         skills: args.skills,
         includeEngineSkills: false,
-        reasoningEffort: args.reasoning_effort ?? "disabled",
+        preset: args.preset ?? "base",
         maxIterations: args.max_iterations ?? 50,
         parentId: this.id,
         sessionId: this.sessionId,
