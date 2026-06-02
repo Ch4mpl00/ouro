@@ -1,6 +1,7 @@
 import { readFile } from "node:fs/promises";
 import type { EmbeddingService } from "../services/embeddings/service";
 import { hashCorpusInputs } from "./config";
+import { dedupByPairwiseCosine } from "../services/retrieval";
 import { readCorpusCache, writeCorpusCache } from "./corpus-cache";
 import { buildText } from "./embed";
 import { cosineTopK } from "./search";
@@ -75,10 +76,26 @@ export function createEvalRun(deps: EvalRunDeps): EvalRunModule {
 
       const corpusById = new Map(corpus.map((row) => [row.id, row]));
 
+      const dedupCfg = config.retrieval.dedup;
+      // Dedup walks a wider pool than RETRIEVAL_SIZE so K survivors
+      // remain after near-duplicates are filtered. Empirically 2× headroom
+      // covers the duplicate clusters we see in this corpus.
+      const poolSize = dedupCfg
+        ? Math.max(RETRIEVAL_SIZE * 2, 30)
+        : RETRIEVAL_SIZE;
+
       const perQuery: PerQueryResult[] = [];
       const negativeTests: NegativeTestResult[] = [];
       for (const { q, vec } of pairs) {
-        const topK = cosineTopK(vec, corpusForSearch, RETRIEVAL_SIZE);
+        const pool = cosineTopK(vec, corpusForSearch, poolSize);
+        const afterDedup = dedupCfg
+          ? dedupByPairwiseCosine(
+              pool,
+              (item) => corpusVecs.get(item.id) ?? null,
+              dedupCfg.threshold,
+            )
+          : pool;
+        const topK = afterDedup.slice(0, RETRIEVAL_SIZE);
 
         if (q.gold.length === 0 && q.acceptable.length === 0) {
           negativeTests.push({

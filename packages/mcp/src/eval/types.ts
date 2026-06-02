@@ -1,11 +1,16 @@
 export type BuildTextMode = "title+body" | "body-only";
 
+export interface DedupConfig {
+  threshold: number;
+}
+
 export interface EvalConfig {
   name: string;
   retrieval: {
     embed: { model: string; dimensions: number };
     buildText: BuildTextMode;
     topK: number;
+    dedup: DedupConfig | null;
     rerank: null;
   };
   query: { field: "query" | "reformulation" };

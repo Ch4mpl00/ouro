@@ -1,0 +1,12 @@
+{
+  "name": "baseline-dedup-003",
+  "retrieval": {
+    "embed": { "model": "text-embedding-3-small", "dimensions": 1536 },
+    "buildText": "title+body",
+    "topK": 10,
+    "dedup": { "threshold": 0.03 },
+    "rerank": null
+  },
+  "query": { "field": "reformulation" },
+  "scoring": { "mode": "binary" }
+}

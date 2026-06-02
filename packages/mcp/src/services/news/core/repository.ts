@@ -13,6 +13,10 @@ import {
 import type { Database } from "../../../db/pg/client";
 import { newsItems } from "../../../db/pg/schema";
 import type { EmbeddingService } from "../../embeddings/service";
+import {
+  DEFAULT_DEDUP_THRESHOLD,
+  dedupByPairwiseCosine,
+} from "../../retrieval";
 import type { EmbedResult, NewsEmbedder } from "./embedder";
 import type { ListOpts, NewsItem, SaveResult } from "./types";
 
@@ -34,6 +38,9 @@ export interface SearchOpts {
   query: string;
   k?: number;
   filter?: SearchFilter;
+  // Near-duplicate filtering at retrieval. Defaults to
+  // DEFAULT_DEDUP_THRESHOLD. Pass 0 to disable (e.g. for debugging).
+  dedupThreshold?: number;
 }
 
 export interface SearchResult {
@@ -162,6 +169,12 @@ export function createNewsRepository(deps: NewsRepositoryDeps): NewsRepository {
 
     search: async (opts) => {
       const k = opts.k ?? 10;
+      const threshold = opts.dedupThreshold ?? DEFAULT_DEDUP_THRESHOLD;
+      const dedupEnabled = threshold > 0;
+      // 2× headroom over k (min 30) leaves room for near-duplicates to be
+      // pruned while still leaving k survivors. Tuned on the RAG eval.
+      const poolSize = dedupEnabled ? Math.max(k * 2, 30) : k;
+
       const filter = opts.filter ?? {};
       const queryVector = await embeddings.embed(opts.query);
 
@@ -188,13 +201,18 @@ export function createNewsRepository(deps: NewsRepositoryDeps): NewsRepository {
           metadata: newsItems.metadata,
           postedAt: newsItems.postedAt,
           distance,
+          embedding: newsItems.embedding,
         })
         .from(newsItems)
         .where(and(...filters))
         .orderBy(distance)
-        .limit(k);
+        .limit(poolSize);
 
-      return rows.map((r) => ({
+      const deduped = dedupEnabled
+        ? dedupByPairwiseCosine(rows, (r) => r.embedding, threshold)
+        : rows;
+
+      return deduped.slice(0, k).map((r) => ({
         id: Number(r.id),
         source: r.source,
         title: r.title,

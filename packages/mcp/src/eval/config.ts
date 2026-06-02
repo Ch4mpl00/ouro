@@ -29,6 +29,7 @@ function validateConfig(obj: unknown): EvalConfig {
   if (typeof retrieval.topK !== "number" || retrieval.topK <= 0) {
     throw new Error("config.retrieval.topK must be a positive number");
   }
+  const dedup = parseDedup(retrieval.dedup);
   const query = c.query as Record<string, unknown> | undefined;
   if (!query || (query.field !== "query" && query.field !== "reformulation")) {
     throw new Error("config.query.field must be 'query' or 'reformulation'");
@@ -43,11 +44,24 @@ function validateConfig(obj: unknown): EvalConfig {
       embed: { model: embed.model, dimensions: embed.dimensions },
       buildText: retrieval.buildText,
       topK: retrieval.topK,
+      dedup,
       rerank: null,
     },
     query: { field: query.field },
     scoring: { mode: "binary" },
   };
+}
+
+function parseDedup(raw: unknown): EvalConfig["retrieval"]["dedup"] {
+  if (raw === undefined || raw === null) return null;
+  if (typeof raw !== "object") {
+    throw new Error("config.retrieval.dedup must be an object or null");
+  }
+  const d = raw as Record<string, unknown>;
+  if (typeof d.threshold !== "number" || d.threshold < 0) {
+    throw new Error("config.retrieval.dedup.threshold must be a non-negative number");
+  }
+  return { threshold: d.threshold };
 }
 
 // Hash only the fields that affect corpus embeddings — model, dimensions,
