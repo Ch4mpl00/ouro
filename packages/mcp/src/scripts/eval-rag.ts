@@ -66,8 +66,9 @@ async function main(): Promise<void> {
   console.log(`[eval-rag] ${result.cacheHit ? "cache hit" : "fresh embed"} · ${durationMs}ms`);
   console.log(`[eval-rag] scored queries: ${result.aggregate.scoredQueries}`);
   console.log(`[eval-rag] P@5   ${result.aggregate.precisionAt5.toFixed(3)}   R@5   ${result.aggregate.recallAt5.toFixed(3)}`);
-  console.log(`[eval-rag] P@10  ${result.aggregate.precisionAt10.toFixed(3)}   R@10  ${result.aggregate.recallAt10.toFixed(3)}`);
+  console.log(`[eval-rag] P@10  ${result.aggregate.precisionAt10.toFixed(3)}   R@10  ${result.aggregate.recallAt10.toFixed(3)}   R@30  ${result.aggregate.recallAt30.toFixed(3)}`);
   console.log(`[eval-rag] MRR   ${result.aggregate.mrr.toFixed(3)}`);
+  console.log(`[eval-rag] uniq sources @5/@10  ${result.aggregate.meanUniqueSourcesAt5.toFixed(2)} / ${result.aggregate.meanUniqueSourcesAt10.toFixed(2)}`);
   console.log(`[eval-rag] report → ${reportPath}`);
 }
 
