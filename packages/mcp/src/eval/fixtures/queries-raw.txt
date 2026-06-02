@@ -1,0 +1,33 @@
+# Raw query list for the RAG eval golden set. One query per line; lines
+# starting with `#` and blank lines are ignored. Sources are marked in
+# the comment after each block.
+#
+# Pipeline:
+#   1. `pnpm eval:label-draft` reads this file, runs search_news per
+#      query against fixtures/corpus.jsonl with the baseline config,
+#      writes fixtures/queries-draft.jsonl with top-30 candidates.
+#   2. You hand-label each candidate as gold/acceptable/off.
+#   3. The labelled file becomes fixtures/queries.jsonl — the harness
+#      reads that.
+
+# --- From Langfuse telegram traces (real user phrasings) ---
+Можешь посмотреть динамику по вспышке Эболы в Конго?
+а по ФОП что-то есть?
+шо там Одесса?
+А что Лукашенко, есть новости?
+Что по Зеленскому
+Посмотри что там есть про Трампа в новостях
+а посмотри есть ли новости по ТЦК?
+
+# --- Synthetic (cover categories the live trace log didn't hit) ---
+шо там по фронту
+что говорит Путин
+что в Сирии
+что в ПМР
+что с курсом гривны
+новости про OpenAI
+что нового про Anthropic
+что в Газе
+что в Иране
+санкции против уклонистов
+что в Китае

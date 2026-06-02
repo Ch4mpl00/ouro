@@ -22,6 +22,7 @@
     "db:generate:pg": "pnpm --filter @mcp-tools/mcp exec drizzle-kit generate",
     "db:migrate:channel-posts": "tsx packages/mcp/src/scripts/migrate-channel-posts-to-pg.ts",
     "embed:backfill": "tsx packages/mcp/src/scripts/embed-backfill.ts",
+    "eval:snapshot": "tsx packages/mcp/src/scripts/eval-snapshot.ts",
     "test": "vitest run",
     "test:watch": "vitest"
   },
