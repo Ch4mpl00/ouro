@@ -11,16 +11,22 @@ import {
   recallAtK,
   reciprocalRank,
 } from "./metrics";
-import type {
-  AggregateMetrics,
-  CorpusRow,
-  EvalConfig,
-  EvalResult,
-  NegativeTestResult,
-  PerQueryResult,
-  QueryRow,
-  RetrievedItem,
+import {
+  sourceBucket,
+  type AggregateMetrics,
+  type CorpusRow,
+  type EvalConfig,
+  type EvalResult,
+  type NegativeTestResult,
+  type PerQueryResult,
+  type QueryRow,
+  type RetrievedItem,
 } from "./types";
+
+// Always retrieve this many results so R@30 and the wider window
+// metrics are computable regardless of config.retrieval.topK (which
+// stays as a hint of what a downstream skill would actually show).
+const RETRIEVAL_SIZE = 30;
 
 export interface EvalRunDeps {
   embedFactory: (model: string, dimensions: number) => EmbeddingService;
@@ -67,10 +73,12 @@ export function createEvalRun(deps: EvalRunDeps): EvalRunModule {
         return { q, vec };
       });
 
+      const corpusById = new Map(corpus.map((row) => [row.id, row]));
+
       const perQuery: PerQueryResult[] = [];
       const negativeTests: NegativeTestResult[] = [];
       for (const { q, vec } of pairs) {
-        const topK = cosineTopK(vec, corpusForSearch, config.retrieval.topK);
+        const topK = cosineTopK(vec, corpusForSearch, RETRIEVAL_SIZE);
 
         if (q.gold.length === 0 && q.acceptable.length === 0) {
           negativeTests.push({
@@ -82,7 +90,7 @@ export function createEvalRun(deps: EvalRunDeps): EvalRunModule {
           continue;
         }
 
-        perQuery.push(scoreQuery(q, topK));
+        perQuery.push(scoreQuery(q, topK, corpusById));
       }
 
       return {
@@ -147,9 +155,14 @@ async function prepareCorpus(
   return { vectors, cacheHit: false, configHash };
 }
 
-function scoreQuery(q: QueryRow, topK: RetrievedItem[]): PerQueryResult {
+function scoreQuery(
+  q: QueryRow,
+  topK: RetrievedItem[],
+  corpusById: Map<number, CorpusRow>,
+): PerQueryResult {
   const goldHitsAt5 = countHits(q.gold, topK.slice(0, 5));
   const goldHitsAt10 = countHits(q.gold, topK.slice(0, 10));
+  const goldHitsAt30 = countHits(q.gold, topK.slice(0, 30));
   return {
     qid: q.id,
     query: q.query,
@@ -158,11 +171,26 @@ function scoreQuery(q: QueryRow, topK: RetrievedItem[]): PerQueryResult {
     topK,
     hitAt5: goldHitsAt5,
     hitAt10: goldHitsAt10,
+    hitAt30: goldHitsAt30,
     precisionAt5: goldHitsAt5 / 5,
     precisionAt10: goldHitsAt10 / 10,
+    uniqueSourcesAt5: uniqueSources(topK.slice(0, 5), corpusById),
+    uniqueSourcesAt10: uniqueSources(topK.slice(0, 10), corpusById),
     firstGoldRank: firstGoldRank(q.gold, topK),
     distToFirstGold: distanceToFirstGold(q.gold, topK),
   };
+}
+
+function uniqueSources(
+  items: RetrievedItem[],
+  corpusById: Map<number, CorpusRow>,
+): number {
+  const buckets = new Set<string>();
+  for (const item of items) {
+    const row = corpusById.get(item.id);
+    if (row) buckets.add(sourceBucket(row));
+  }
+  return buckets.size;
 }
 
 function countHits(gold: number[], topK: RetrievedItem[]): number {
@@ -176,8 +204,11 @@ function aggregateMetrics(perQuery: PerQueryResult[]): AggregateMetrics {
   const scored = perQuery.filter((p) => p.goldCount > 0);
   const recall5 = scored.map((p) => recallAtKFromHits(p.hitAt5, p.goldCount));
   const recall10 = scored.map((p) => recallAtKFromHits(p.hitAt10, p.goldCount));
+  const recall30 = scored.map((p) => recallAtKFromHits(p.hitAt30, p.goldCount));
   const precision5 = scored.map((p) => p.precisionAt5);
   const precision10 = scored.map((p) => p.precisionAt10);
+  const uniqAt5 = scored.map((p) => p.uniqueSourcesAt5);
+  const uniqAt10 = scored.map((p) => p.uniqueSourcesAt10);
   const mrrs = scored.map((p) =>
     p.firstGoldRank === null ? 0 : 1 / p.firstGoldRank,
   );
@@ -188,8 +219,11 @@ function aggregateMetrics(perQuery: PerQueryResult[]): AggregateMetrics {
     scoredQueries: scored.length,
     recallAt5: scored.length === 0 ? Number.NaN : mean(recall5),
     recallAt10: scored.length === 0 ? Number.NaN : mean(recall10),
+    recallAt30: scored.length === 0 ? Number.NaN : mean(recall30),
     precisionAt5: scored.length === 0 ? Number.NaN : mean(precision5),
     precisionAt10: scored.length === 0 ? Number.NaN : mean(precision10),
+    meanUniqueSourcesAt5: scored.length === 0 ? Number.NaN : mean(uniqAt5),
+    meanUniqueSourcesAt10: scored.length === 0 ? Number.NaN : mean(uniqAt10),
     mrr: scored.length === 0 ? Number.NaN : mean(mrrs),
     meanDistToFirstGold: distances.length === 0 ? null : mean(distances),
   };

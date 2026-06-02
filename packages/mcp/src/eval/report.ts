@@ -23,7 +23,10 @@ export function renderMarkdown(result: EvalResult): string {
   lines.push(`| Precision@10 | ${fmt(aggregate.precisionAt10)} |`);
   lines.push(`| Recall@5 | ${fmt(aggregate.recallAt5)} |`);
   lines.push(`| Recall@10 | ${fmt(aggregate.recallAt10)} |`);
+  lines.push(`| Recall@30 | ${fmt(aggregate.recallAt30)} |`);
   lines.push(`| MRR | ${fmt(aggregate.mrr)} |`);
+  lines.push(`| Mean unique sources @5 | ${fmt(aggregate.meanUniqueSourcesAt5)} |`);
+  lines.push(`| Mean unique sources @10 | ${fmt(aggregate.meanUniqueSourcesAt10)} |`);
   lines.push(
     `| Mean distance to first gold | ${aggregate.meanDistToFirstGold === null ? "—" : fmt(aggregate.meanDistToFirstGold)} |`,
   );
@@ -31,8 +34,8 @@ export function renderMarkdown(result: EvalResult): string {
 
   lines.push("## Per-query");
   lines.push("");
-  lines.push("| qid | query | gold | hit@5 | hit@10 | P@5 | P@10 | first-gold rank | dist to gold |");
-  lines.push("|---|---|---|---|---|---|---|---|---|");
+  lines.push("| qid | query | gold | hit@5 | hit@10 | hit@30 | P@5 | P@10 | uniq@5 | uniq@10 | first-gold rank | dist to gold |");
+  lines.push("|---|---|---|---|---|---|---|---|---|---|---|---|");
   for (const q of perQuery) {
     lines.push(perQueryRow(q));
   }
@@ -57,11 +60,12 @@ export function renderMarkdown(result: EvalResult): string {
 }
 
 function perQueryRow(q: PerQueryResult): string {
-  const recall5 = q.goldCount > 0 ? `${q.hitAt5}/${q.goldCount}` : "—";
-  const recall10 = q.goldCount > 0 ? `${q.hitAt10}/${q.goldCount}` : "—";
+  const hit5 = q.goldCount > 0 ? `${q.hitAt5}/${q.goldCount}` : "—";
+  const hit10 = q.goldCount > 0 ? `${q.hitAt10}/${q.goldCount}` : "—";
+  const hit30 = q.goldCount > 0 ? `${q.hitAt30}/${q.goldCount}` : "—";
   const rank = q.firstGoldRank === null ? "—" : String(q.firstGoldRank);
   const dist = q.distToFirstGold === null ? "—" : fmt(q.distToFirstGold);
-  return `| ${q.qid} | ${escapePipe(q.query)} | ${q.goldCount} | ${recall5} | ${recall10} | ${fmt(q.precisionAt5)} | ${fmt(q.precisionAt10)} | ${rank} | ${dist} |`;
+  return `| ${q.qid} | ${escapePipe(q.query)} | ${q.goldCount} | ${hit5} | ${hit10} | ${hit30} | ${fmt(q.precisionAt5)} | ${fmt(q.precisionAt10)} | ${q.uniqueSourcesAt5} | ${q.uniqueSourcesAt10} | ${rank} | ${dist} |`;
 }
 
 function fmt(n: number): string {

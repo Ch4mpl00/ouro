@@ -18,6 +18,13 @@ export interface CorpusRow {
   title: string | null;
   body: string;
   postedAt: string | null;
+  metadata?: { chat_title?: string } & Record<string, unknown>;
+}
+
+// What we treat as one "source" for diversity counting: the channel
+// name for Telegram posts, the source name (hackernews/habr) otherwise.
+export function sourceBucket(row: CorpusRow): string {
+  return row.metadata?.chat_title ?? row.source;
 }
 
 export interface QueryRow {
@@ -41,8 +48,11 @@ export interface PerQueryResult {
   topK: RetrievedItem[];
   hitAt5: number;
   hitAt10: number;
+  hitAt30: number;
   precisionAt5: number;
   precisionAt10: number;
+  uniqueSourcesAt5: number;
+  uniqueSourcesAt10: number;
   firstGoldRank: number | null;
   distToFirstGold: number | null;
 }
@@ -58,8 +68,11 @@ export interface AggregateMetrics {
   scoredQueries: number;
   recallAt5: number;
   recallAt10: number;
+  recallAt30: number;
   precisionAt5: number;
   precisionAt10: number;
+  meanUniqueSourcesAt5: number;
+  meanUniqueSourcesAt10: number;
   mrr: number;
   meanDistToFirstGold: number | null;
 }
