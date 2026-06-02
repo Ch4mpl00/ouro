@@ -108,12 +108,26 @@ protocol below.
    ONE call — MCP keeps the indicator alive until your
    `send_telegram_message` ships, then clears it.
 
-2. **Older context (if needed).** Skip for self-contained one-offs.
-   Otherwise:
+2. **Older context.** Pull whenever the signal text isn't self-contained
+   on its own — and default to pulling when in doubt, it's cheap. Strong
+   triggers:
+
+   - Short confirmations referring to an earlier proposal: "давай",
+     "ок", "да", "угу", "продолжай", "хорошо", "валяй".
+   - Pronouns / deictic references with no antecedent in the signal
+     itself: "сделай это", "посмотри ещё", "а по другим?", "а вчера?".
+   - Anything where you can't name the actual subject of the request
+     without looking at prior turns.
 
    ```
    get_telegram_chat_history(chatId=<id>, threadId=<thread if any>, limit=20)
    ```
+
+   Once you have history, the user's referent is almost always the
+   **last assistant turn** — that is what they are responding to. If
+   that turn offered a concrete action ("могу посмотреть за 2 недели",
+   "хочешь, расширю поиск", "сделать дайджест?"), the short
+   confirmation means **do it now**, not "ack and promise" (see Don'ts).
 
 3. **Other tools as needed** — bills (`list_nashdom_mails`, etc),
    monobank, files, scheduling.
@@ -176,3 +190,15 @@ When user schedules a task for a specific time **today**:
 - Don't invent data — fetch via a tool.
 - Don't use tables / columns / space-alignment.
 - Don't silently bump a "today at X" task to tomorrow without confirming.
+- **Don't promise future action without executing it this turn.** The
+  session is one-shot — there is no next turn for you and no follow-up
+  signal will close the loop. Replies like *"посмотрю и пришлю"*,
+  *"сейчас соберу"*, *"проверю и отпишусь"* are silent failures: the
+  user expects a result, gets a placeholder, nothing follows. If a
+  prior assistant turn offered to look something up
+  ("могу расширить поиск", "хочешь, гляну…") and the user confirmed
+  ("давай" / "ок" / "да"), EXECUTE the offered action this turn —
+  usually via `invoke_sub_agent` to the matching domain skill
+  (news-query, news-digest, tech-digest). Either you do the work
+  inline / via sub-agent and reply with the result, or you ask the
+  user to clarify. There is no third option.
