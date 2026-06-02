@@ -1,0 +1,11 @@
+{
+  "name": "baseline-raw-query",
+  "retrieval": {
+    "embed": { "model": "text-embedding-3-small", "dimensions": 1536 },
+    "buildText": "title+body",
+    "topK": 10,
+    "rerank": null
+  },
+  "query": { "field": "query" },
+  "scoring": { "mode": "binary" }
+}
