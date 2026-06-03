@@ -147,6 +147,14 @@ export function createNewsRepository(deps: NewsRepositoryDeps): NewsRepository {
 
     list: async (opts) => {
       const limit = opts.limit ?? 500;
+      const threshold = opts.dedupThreshold ?? DEFAULT_DEDUP_THRESHOLD;
+      const dedupEnabled = threshold > 0;
+      // When dedup is on, pull a 2× pool (capped at the table limit by
+      // the same limit() call) so post-dedup we can still return up to
+      // `limit` survivors. The DB-side LIMIT keeps the upper bound on
+      // traffic; nothing is unbounded.
+      const fetchLimit = dedupEnabled ? Math.min(limit * 2, 2000) : limit;
+
       const filters = [];
       if (opts.source) filters.push(eq(newsItems.source, opts.source));
       if (opts.sinceISO) filters.push(gt(newsItems.postedAt, new Date(opts.sinceISO)));
@@ -163,8 +171,15 @@ export function createNewsRepository(deps: NewsRepositoryDeps): NewsRepository {
         .from(newsItems)
         .where(filters.length > 0 ? and(...filters) : undefined)
         .orderBy(opts.sinceISO ? asc(newsItems.postedAt) : desc(newsItems.postedAt))
-        .limit(limit);
-      return rows.map(toNewsItem);
+        .limit(fetchLimit);
+
+      const deduped = dedupEnabled
+        ? dedupByPairwiseCosine(rows, (r) => r.embedding, threshold, {
+            keepNullVectors: true,
+          })
+        : rows;
+
+      return deduped.slice(0, limit).map(toNewsItem);
     },
 
     search: async (opts) => {

@@ -65,6 +65,19 @@ describe("dedupByPairwiseCosine", () => {
     expect(out.map((x) => x.id)).toEqual([1]);
   });
 
+  it("keepNullVectors=true preserves null-vector items at their original position", () => {
+    const items: Item[] = [
+      { id: 1, embedding: [1, 0, 0] },
+      { id: 2, embedding: null },
+      { id: 3, embedding: [1, 0, 0] },
+      { id: 4, embedding: [0, 1, 0] },
+    ];
+    const out = dedupByPairwiseCosine(items, byEmbedding, 0.05, {
+      keepNullVectors: true,
+    });
+    expect(out.map((x) => x.id)).toEqual([1, 2, 4]);
+  });
+
   it("preserves input order for surviving items", () => {
     const items: Item[] = [
       { id: 1, embedding: [1, 0, 0] },

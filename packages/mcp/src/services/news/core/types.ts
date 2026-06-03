@@ -26,4 +26,9 @@ export interface ListOpts {
   limit?: number;
   // Channel-only convenience: matches metadata.chat_username OR chat_id.
   channel?: string;
+  // Near-duplicate filtering on the returned rows (reposted articles,
+  // channel-noise repeats). Defaults to DEFAULT_DEDUP_THRESHOLD; pass 0
+  // to disable. Items without an embedding are kept regardless — they
+  // just don't participate in dedup comparisons.
+  dedupThreshold?: number;
 }

@@ -1,9 +1,16 @@
 import { cosineDistance } from "./cosine";
 
+export interface DedupOptions {
+  // When true, items whose vector accessor returns null/undefined are
+  // kept in the output (treated as "can't compare, assume unique").
+  // Default false matches the search-stage semantics where a missing
+  // vector means the row shouldn't be there in the first place.
+  keepNullVectors?: boolean;
+}
+
 // Walk a pool of retrieval results in input order (caller is responsible
 // for sorting by ascending distance to query) and keep a candidate only
 // if its pairwise distance to every already-kept item is >= threshold.
-// Items whose vector accessor returns null/undefined are skipped.
 //
 // Generic over the item type so it works on both eval rows (RetrievedItem
 // + vectors-by-id map) and prod search rows (which carry their own
@@ -12,13 +19,18 @@ export function dedupByPairwiseCosine<T>(
   items: T[],
   getVector: (item: T) => number[] | null | undefined,
   threshold: number,
+  options: DedupOptions = {},
 ): T[] {
   if (threshold <= 0) return items.slice();
+  const keepNull = options.keepNullVectors ?? false;
   const kept: T[] = [];
   const keptVecs: number[][] = [];
   for (const cand of items) {
     const candVec = getVector(cand);
-    if (!candVec) continue;
+    if (!candVec) {
+      if (keepNull) kept.push(cand);
+      continue;
+    }
     let tooClose = false;
     for (const kVec of keptVecs) {
       if (cosineDistance(candVec, kVec) < threshold) {
