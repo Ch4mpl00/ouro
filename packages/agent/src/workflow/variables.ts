@@ -1,4 +1,4 @@
-// `${path}` substitution for plan step args, llm_compose inputs, and
+// `${path}` substitution for workflow step args, llm_compose inputs, and
 // llm_*  prompts. Two modes:
 //
 //   "whole string" — the string IS one placeholder, e.g. `"${posts}"`.
@@ -13,7 +13,7 @@
 //     Used for prompts: `"Hello ${name}, today is ${env.date}"`.
 //
 // Missing bindings throw MissingBindingError — never silently expand
-// to "undefined". Planner mistakes should surface loudly in the trace.
+// to "undefined". Compiler mistakes should surface loudly in the trace.
 
 export interface VariableStore {
   get(path: string): unknown;

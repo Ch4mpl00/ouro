@@ -4,7 +4,7 @@ import {
   DuplicateBindingError,
   MissingBindingError,
   substitute,
-} from "./substitute";
+} from "./variables";
 
 describe("createStore", () => {
   it("returns primitive top-level values", () => {

@@ -7,9 +7,9 @@ import type {
   LlmAgentStep,
   LlmComposeStep,
   ParallelStep,
-  Plan,
   Step,
   ToolStep,
+  Workflow,
 } from "./dsl";
 import {
   createStore,
@@ -17,22 +17,23 @@ import {
   MissingBindingError,
   substitute,
   type VariableStore,
-} from "./substitute";
+} from "./variables";
 
-// Plan-then-execute runtime. Given a validated `Plan`, walk its steps
+// Workflow execution runtime. Given a validated `Workflow`, walk its steps
 // in order and execute each one against the engine. Variable store is
 // opt-in: each step declares what bindings it needs in `input`/`args`,
-// the runner resolves `${path}` placeholders, and binds the step's
+// the executor resolves `${path}` placeholders, and binds the step's
 // result back into the store under `bind`.
 //
-// What runner does NOT do:
+// What the executor does NOT do:
 //   - decide whether to fall back to agentic mode (caller decides on
-//     RunFailure)
-//   - emit prompts itself (planner produced the plan; runner just runs it)
+//     ExecResult failure)
+//   - emit prompts itself (the compiler produced the workflow; the
+//     executor just runs it)
 //   - touch conversation history of any previous session (each
 //     llm_compose is a fresh API call; llm_agent spawns a fresh Session)
 
-export type RunFailureReason =
+export type ExecFailureReason =
   | "step_failed"
   | "missing_binding"
   | "duplicate_binding"
@@ -40,21 +41,21 @@ export type RunFailureReason =
   | "tool_error"
   | "llm_error";
 
-export type RunResult =
+export type ExecResult =
   | { ok: true; store: VariableStore }
   | {
       ok: false;
-      reason: RunFailureReason;
+      reason: ExecFailureReason;
       error: Error;
       stepIndex: number;
       step: Step;
       store: VariableStore;
     };
 
-export interface RunContext {
+export interface ExecContext {
   store: VariableStore;
-  // Caller-provided trace scope. Runner opens its own root span inside
-  // for the whole plan, and per-step children inside that.
+  // Caller-provided trace scope. Executor opens its own root span inside
+  // for the whole workflow, and per-step children inside that.
   parentTrace: TraceContext;
   // Free-form label used for log lines and the sub-session id prefix
   // on `llm_agent` spawns. Pass `${signal.source}:${signal.id}` to
@@ -62,11 +63,11 @@ export interface RunContext {
   signalLabel: string;
 }
 
-export interface Runner {
-  run(plan: Plan, ctx: RunContext): Promise<RunResult>;
+export interface Executor {
+  execute(workflow: Workflow, ctx: ExecContext): Promise<ExecResult>;
 }
 
-// Runner depends on only this subset of the engine's surface. The real
+// Executor depends on only this subset of the engine's surface. The real
 // `Engine` class structurally matches; test mocks can be plain objects
 // without faking the full Engine constructor / private state. This
 // avoids `as unknown as Engine` casts in tests.
@@ -83,33 +84,35 @@ export interface EngineSurface {
   endSession(id: string): void;
 }
 
-// Surface of Session that runner touches when running an `llm_agent`
-// step. The real Session has many more methods/fields — we only need
-// these two.
+// Surface of Session that the executor touches when running an
+// `llm_agent` step. The real Session has many more methods/fields — we
+// only need these two.
 export interface SubSessionHandle {
   messages: ChatCompletionMessageParam[];
   run(): Promise<string>;
 }
 
-export interface RunnerDeps {
+export interface ExecutorDeps {
   engine: EngineSurface;
   // Decoupled from skills.ts so tests can pass a stub. Returns the
   // skill body (no frontmatter); null when not found.
   readSkill: (name: string) => Promise<string | null>;
 }
 
-export function createRunner(deps: RunnerDeps): Runner {
+export function createExecutor(deps: ExecutorDeps): Executor {
   return {
-    async run(plan, ctx) {
+    async execute(workflow, ctx) {
       const rootSpan = ctx.parentTrace.span({
+        // Span name kept as "runner" for trace continuity with
+        // pre-rename Langfuse history — do not change to "execute".
         name: "runner",
-        input: { stepCount: plan.steps.length },
-        metadata: { plan_version: plan.version },
+        input: { stepCount: workflow.steps.length },
+        metadata: { workflow_version: workflow.version },
       });
 
       try {
-        for (let i = 0; i < plan.steps.length; i++) {
-          const step = plan.steps[i]!;
+        for (let i = 0; i < workflow.steps.length; i++) {
+          const step = workflow.steps[i]!;
           const outcome = await runOneStep(step, i, ctx.store, rootSpan, ctx, deps);
           if (!outcome.ok) {
             rootSpan.end({
@@ -132,7 +135,7 @@ export function createRunner(deps: RunnerDeps): Runner {
           }
         }
 
-        // No explicit terminal — that's fine, plan ran to end of list.
+        // No explicit terminal — that's fine, workflow ran to end of list.
         rootSpan.end({ output: { ranToEnd: true } });
         return { ok: true, store: ctx.store };
       } catch (err) {
@@ -148,15 +151,15 @@ export function createRunner(deps: RunnerDeps): Runner {
 
 type StepOutcome =
   | { ok: true; stop: boolean }
-  | { ok: false; reason: RunFailureReason; error: Error };
+  | { ok: false; reason: ExecFailureReason; error: Error };
 
 async function runOneStep(
   step: Step,
   index: number,
   store: VariableStore,
   parent: TraceContext,
-  ctx: RunContext,
-  deps: RunnerDeps,
+  ctx: ExecContext,
+  deps: ExecutorDeps,
 ): Promise<StepOutcome> {
   const span = parent.span({
     name: `step[${index}]:${step.kind}`,
@@ -203,7 +206,7 @@ function stepMetadata(step: Step): Record<string, unknown> {
   }
 }
 
-function classifyError(err: Error): RunFailureReason {
+function classifyError(err: Error): ExecFailureReason {
   if (err instanceof MissingBindingError) return "missing_binding";
   if (err instanceof DuplicateBindingError) return "duplicate_binding";
   if (err.name === "SkillNotFoundError") return "skill_not_found";
@@ -216,8 +219,8 @@ async function dispatch(
   step: Step,
   store: VariableStore,
   span: Span,
-  ctx: RunContext,
-  deps: RunnerDeps,
+  ctx: ExecContext,
+  deps: ExecutorDeps,
 ): Promise<boolean> {
   switch (step.kind) {
     case "tool":
@@ -250,7 +253,7 @@ async function execTool(
   step: ToolStep,
   store: VariableStore,
   span: Span,
-  deps: RunnerDeps,
+  deps: ExecutorDeps,
 ): Promise<void> {
   const resolvedArgs = substitute(step.args, store) as Record<string, unknown>;
   span.update({ input: { tool: step.tool, args: resolvedArgs } });
@@ -263,7 +266,7 @@ async function execTool(
   }
 
   // MCP error responses come back as text starting with `[tool error]`.
-  // Surface those as ToolCallError so the runner classifies correctly.
+  // Surface those as ToolCallError so the executor classifies correctly.
   if (raw.startsWith("[tool error]")) {
     throw new ToolCallError(step.tool, raw);
   }
@@ -306,7 +309,7 @@ async function execLlmCompose(
   step: LlmComposeStep,
   store: VariableStore,
   span: Span,
-  deps: RunnerDeps,
+  deps: ExecutorDeps,
 ): Promise<void> {
   const preset = deps.engine.presets[step.preset];
   const provider = deps.engine.resolveProvider(preset.model);
@@ -418,8 +421,8 @@ async function execLlmAgent(
   step: LlmAgentStep,
   store: VariableStore,
   span: Span,
-  ctx: RunContext,
-  deps: RunnerDeps,
+  ctx: ExecContext,
+  deps: ExecutorDeps,
 ): Promise<void> {
   const prompt = substitute(step.prompt, store) as string;
   const allowedTools = new Set(step.tools);
@@ -434,7 +437,7 @@ async function execLlmAgent(
     parentId: ctx.signalLabel,
     toolWhitelist: allowedTools,
     // Nest the sub-session's iters/tool spans under THIS step's span,
-    // not under the runner root — keeps trace tree readable.
+    // not under the executor root — keeps trace tree readable.
     traceScope: span,
   });
 
@@ -457,8 +460,8 @@ async function execParallel(
   step: ParallelStep,
   store: VariableStore,
   span: Span,
-  ctx: RunContext,
-  deps: RunnerDeps,
+  ctx: ExecContext,
+  deps: ExecutorDeps,
 ): Promise<void> {
   await Promise.all(
     step.steps.map(async (child, i) => {
@@ -489,6 +492,6 @@ export const __testing = {
   LlmCallError,
 };
 
-// Re-export the store factory for callers (supervisor) that need to
-// seed env/signal into the variable store before run().
+// Re-export the store factory for callers (the workflow facade) that
+// need to seed env/signal into the variable store before execute().
 export { createStore };
