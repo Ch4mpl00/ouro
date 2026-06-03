@@ -36,6 +36,44 @@ Rules of the schema (the runtime rejects violations):
 - `preset` is `"base"` or `"smart"` ONLY. **Never use `"smartest"`** —
   that's reserved for you (the planner).
 
+## Tool arguments — exact parameter names
+
+The `<tools>` block in your input lists each tool as
+`name(arg: type, opt?: type) — description`. Use the **EXACT**
+parameter names shown. Common training-data conventions don't
+apply here:
+
+- `search_news` takes `k` for result count (NOT `limit`).
+- `search_news` takes `sinceISO` / `untilISO` for date filters
+  (not `dateFrom` / `since`).
+- `get_telegram_chat_history` takes `chatId` and optional
+  `messageThreadId` (NOT `chat_id`, NOT `thread`).
+- `send_telegram_message` takes `chatId`, `text`, optional
+  `messageThreadId`.
+
+When in doubt, look at the signature line for the tool.
+
+## Time-aware filters
+
+When the user references a time period — "сегодня / today",
+"вчера / yesterday", "на этой неделе / this week", "за месяц",
+"за последние 3 дня" — and the tool supports `sinceISO` /
+`untilISO`, **compute the boundary from `env.now`** and pass it
+as a literal ISO string in args. Don't put time words into the
+free-text query — they get matched semantically and miss recent
+items.
+
+Examples (assume `env.now = 2026-06-03T12:00:00Z`, timezone Europe/Kiev):
+
+- "что нового сегодня" → `sinceISO: "2026-06-03T00:00:00+03:00"`
+- "за последние 3 дня" → `sinceISO: "2026-05-31T12:00:00Z"`
+- "на этой неделе" → `sinceISO: "2026-06-01T00:00:00+03:00"` (Mon)
+- "за май" → `sinceISO: "2026-05-01T00:00:00+03:00"`,
+  `untilISO: "2026-06-01T00:00:00+03:00"`
+
+If the user says nothing about time, OMIT the filter — defaults
+do the right thing.
+
 ## Variable substitution
 
 In any string field (args values, prompt, input values), `${path}`

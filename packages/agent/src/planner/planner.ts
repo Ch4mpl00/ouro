@@ -1,5 +1,8 @@
 import type OpenAI from "openai";
-import type { ChatCompletionMessageParam } from "openai/resources/chat/completions";
+import type {
+  ChatCompletionMessageParam,
+  ChatCompletionTool,
+} from "openai/resources/chat/completions";
 import type { ModelPreset, PresetName } from "../models";
 import type { EnvData } from "../session-context";
 import type { Span, TraceContext } from "../tracing";
@@ -57,29 +60,34 @@ export interface PlannerEngineSurface {
 export interface PlannerDeps {
   engine: PlannerEngineSurface;
   readSkill: (name: string) => Promise<string | null>;
-  // Tools that MCP exposes right now. Planner emits only these.
-  knownTools: readonly string[];
+  // Full MCP tool definitions — used to (a) build the schema enum of
+  // legal tool names and (b) render compact `name(arg: type, ...)`
+  // signatures in the user prompt so the planner emits the right
+  // parameter names. Without this the planner would guess args from
+  // training-data conventions (e.g. `limit` instead of `k` on
+  // search_news) and miss filter parameters like `sinceISO`.
+  mcpTools: readonly ChatCompletionTool[];
   // All skills that exist on disk. Planner emits only these.
   knownSkills: readonly string[];
-  // Optional 1-line description per tool — injected into the user
-  // prompt so the planner knows what each tool does. Missing entries
-  // render as empty; planner falls back on tool naming.
-  toolDescriptions?: Record<string, string>;
   // Initial attempt + retries. Default 3 (1 attempt + 2 retries).
   maxAttempts?: number;
 }
 
 export function createPlanner(deps: PlannerDeps): Planner {
   const maxAttempts = deps.maxAttempts ?? 3;
+  const knownTools = deps.mcpTools.map((t) => t.function.name);
   // PlanSchema is rebuilt once per planner instance — tool/skill enums
   // are baked in. If MCP picks up a new tool at runtime, re-create the
   // planner (or accept that the new tool can't appear in plans until
   // restart). The supervisor builds the planner at engine startup, so
   // this matches process lifecycle.
   const { PlanSchema } = createPlanSchema({
-    knownTools: deps.knownTools,
+    knownTools,
     knownSkills: deps.knownSkills,
   });
+  // Pre-render tool signatures once — the same prompt content per
+  // signal, no point doing this in the hot path.
+  const toolSignatures = deps.mcpTools.map(renderToolSignature);
 
   return {
     async plan(req) {
@@ -96,7 +104,7 @@ export function createPlanner(deps: PlannerDeps): Planner {
       const preset = deps.engine.presets[PLANNER_PRESET];
       const provider = deps.engine.resolveProvider(preset.model);
 
-      const initialUserPrompt = renderUserPrompt(req, deps);
+      const initialUserPrompt = renderUserPrompt(req, deps, toolSignatures);
       const messages: ChatCompletionMessageParam[] = [
         { role: "system", content: skill },
         { role: "user", content: initialUserPrompt },
@@ -235,7 +243,11 @@ function pushRetryFeedback(
   });
 }
 
-function renderUserPrompt(req: PlanRequest, deps: PlannerDeps): string {
+function renderUserPrompt(
+  req: PlanRequest,
+  deps: PlannerDeps,
+  toolSignatures: string[],
+): string {
   const lines: string[] = [];
 
   lines.push("<signal>");
@@ -265,9 +277,12 @@ function renderUserPrompt(req: PlanRequest, deps: PlannerDeps): string {
   }
 
   lines.push("<tools>");
-  for (const name of deps.knownTools) {
-    const desc = deps.toolDescriptions?.[name];
-    lines.push(desc ? `- ${name}: ${desc}` : `- ${name}`);
+  lines.push(
+    "Signature format: name(arg: type, opt?: type) — description. " +
+      "Use the EXACT parameter names listed; do not invent aliases.",
+  );
+  for (const sig of toolSignatures) {
+    lines.push(sig);
   }
   lines.push("</tools>");
   lines.push("");
@@ -284,4 +299,67 @@ function renderUserPrompt(req: PlanRequest, deps: PlannerDeps): string {
   );
 
   return lines.join("\n");
+}
+
+// Compact `name(arg: type, opt?: type) — description` line per tool.
+// Keeps the prompt small while giving the planner enough to use the
+// right parameter names — without this it falls back on training-data
+// conventions (e.g. `limit` instead of `k`) and silently produces
+// invalid args that MCP may or may not accept.
+function renderToolSignature(tool: ChatCompletionTool): string {
+  const fn = tool.function;
+  const params = fn.parameters as
+    | {
+        properties?: Record<string, unknown>;
+        required?: string[];
+      }
+    | undefined;
+  const props = params?.properties ?? {};
+  const required = new Set(params?.required ?? []);
+  const paramStrs: string[] = [];
+  for (const [name, schema] of Object.entries(props)) {
+    const type = simplifyJsonSchemaType(schema);
+    const opt = required.has(name) ? "" : "?";
+    paramStrs.push(`${name}${opt}: ${type}`);
+  }
+  const sig = `${fn.name}(${paramStrs.join(", ")})`;
+  const desc = fn.description ? ` — ${truncate(fn.description, 200)}` : "";
+  return `- ${sig}${desc}`;
+}
+
+function truncate(s: string, max: number): string {
+  if (s.length <= max) return s;
+  return s.slice(0, max - 1).trimEnd() + "…";
+}
+
+// Best-effort JSON-Schema → short type string. We don't aim for
+// completeness — the planner LLM just needs enough to pick the right
+// parameter name and shape. Unknown / weird shapes fall through to
+// "any" rather than blocking.
+function simplifyJsonSchemaType(schema: unknown): string {
+  if (!schema || typeof schema !== "object") return "any";
+  const s = schema as {
+    type?: string;
+    enum?: unknown[];
+    items?: unknown;
+    description?: string;
+  };
+  if (Array.isArray(s.enum) && s.enum.length > 0) {
+    return s.enum.map((v) => JSON.stringify(v)).join("|");
+  }
+  switch (s.type) {
+    case "string":
+      return "string";
+    case "number":
+    case "integer":
+      return "number";
+    case "boolean":
+      return "boolean";
+    case "array":
+      return `${simplifyJsonSchemaType(s.items)}[]`;
+    case "object":
+      return "object";
+    default:
+      return "any";
+  }
 }

@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest";
 import type OpenAI from "openai";
-import type { ChatCompletionMessageParam } from "openai/resources/chat/completions";
+import type {
+  ChatCompletionMessageParam,
+  ChatCompletionTool,
+} from "openai/resources/chat/completions";
 import type { ModelPreset, PresetName } from "../models";
 import type { Generation, Span, Trace, TraceContext } from "../tracing";
 import { createPlanner, type PlanRequest } from "./planner";
@@ -113,7 +116,39 @@ const VALID_PLAN_JSON = JSON.stringify({
   ],
 });
 
-const FAKE_TOOLS = ["search_news", "send_telegram_message"];
+const FAKE_TOOLS: ChatCompletionTool[] = [
+  {
+    type: "function",
+    function: {
+      name: "search_news",
+      description: "Vector search over the news store",
+      parameters: {
+        type: "object",
+        properties: {
+          query: { type: "string" },
+          k: { type: "number" },
+          sinceISO: { type: "string" },
+        },
+        required: ["query"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "send_telegram_message",
+      description: "Send a message to a chat",
+      parameters: {
+        type: "object",
+        properties: {
+          chatId: { type: "number" },
+          text: { type: "string" },
+        },
+        required: ["chatId", "text"],
+      },
+    },
+  },
+];
 const FAKE_SKILLS = ["telegram", "news-digest"];
 
 describe("planner.plan — happy path", () => {
@@ -122,7 +157,7 @@ describe("planner.plan — happy path", () => {
     const planner = createPlanner({
       engine: makeEngineSurface(client),
       readSkill: async () => "PLANNER RULES",
-      knownTools: FAKE_TOOLS,
+      mcpTools: FAKE_TOOLS,
       knownSkills: FAKE_SKILLS,
     });
 
@@ -140,9 +175,8 @@ describe("planner.plan — happy path", () => {
     const planner = createPlanner({
       engine: makeEngineSurface(client),
       readSkill: async () => "PLANNER RULES",
-      knownTools: FAKE_TOOLS,
+      mcpTools: FAKE_TOOLS,
       knownSkills: FAKE_SKILLS,
-      toolDescriptions: { search_news: "Vector search over news" },
     });
     await planner.plan(makeReq());
 
@@ -158,9 +192,30 @@ describe("planner.plan — happy path", () => {
     expect(userText).toContain("<envContext>");
     expect(userText).toContain("285083560");
     expect(userText).toContain("<tools>");
-    expect(userText).toContain("search_news: Vector search over news");
+    // Compact signature format with required/optional param names and
+    // types — exactly what the planner needs to use the right keys
+    // (e.g. `k` not `limit`, `sinceISO` for date filters).
+    expect(userText).toMatch(
+      /- search_news\(query: string, k\?: number, sinceISO\?: string\)/,
+    );
     expect(userText).toContain("<skills>");
     expect(userText).toContain("- telegram");
+  });
+
+  it("tool signatures expose required vs optional params correctly", async () => {
+    const { client, calls } = makeMockClient({ llmReplies: [VALID_PLAN_JSON] });
+    const planner = createPlanner({
+      engine: makeEngineSurface(client),
+      readSkill: async () => "RULES",
+      mcpTools: FAKE_TOOLS,
+      knownSkills: FAKE_SKILLS,
+    });
+    await planner.plan(makeReq());
+    const userText = calls[0]!.messages[1]?.content as string;
+    // chatId + text are required, so no `?`
+    expect(userText).toMatch(
+      /- send_telegram_message\(chatId: number, text: string\)/,
+    );
   });
 
   it("uses the smartest preset's model in the request", async () => {
@@ -168,7 +223,7 @@ describe("planner.plan — happy path", () => {
     const planner = createPlanner({
       engine: makeEngineSurface(client),
       readSkill: async () => "RULES",
-      knownTools: FAKE_TOOLS,
+      mcpTools: FAKE_TOOLS,
       knownSkills: FAKE_SKILLS,
     });
     await planner.plan(makeReq());
@@ -185,7 +240,7 @@ describe("planner.plan — skill missing", () => {
     const planner = createPlanner({
       engine: makeEngineSurface(client),
       readSkill: async () => null,
-      knownTools: FAKE_TOOLS,
+      mcpTools: FAKE_TOOLS,
       knownSkills: FAKE_SKILLS,
     });
     const r = await planner.plan(makeReq());
@@ -205,7 +260,7 @@ describe("planner.plan — LLM error", () => {
     const planner = createPlanner({
       engine: makeEngineSurface(client),
       readSkill: async () => "RULES",
-      knownTools: FAKE_TOOLS,
+      mcpTools: FAKE_TOOLS,
       knownSkills: FAKE_SKILLS,
     });
     const r = await planner.plan(makeReq());
@@ -227,7 +282,7 @@ describe("planner.plan — retry loop", () => {
     const planner = createPlanner({
       engine: makeEngineSurface(client),
       readSkill: async () => "RULES",
-      knownTools: FAKE_TOOLS,
+      mcpTools: FAKE_TOOLS,
       knownSkills: FAKE_SKILLS,
     });
     const r = await planner.plan(makeReq());
@@ -258,7 +313,7 @@ describe("planner.plan — retry loop", () => {
     const planner = createPlanner({
       engine: makeEngineSurface(client),
       readSkill: async () => "RULES",
-      knownTools: FAKE_TOOLS,
+      mcpTools: FAKE_TOOLS,
       knownSkills: FAKE_SKILLS,
     });
     const r = await planner.plan(makeReq());
@@ -285,7 +340,7 @@ describe("planner.plan — retry loop", () => {
     const planner = createPlanner({
       engine: makeEngineSurface(client),
       readSkill: async () => "RULES",
-      knownTools: FAKE_TOOLS,
+      mcpTools: FAKE_TOOLS,
       knownSkills: FAKE_SKILLS,
       maxAttempts: 3,
     });
@@ -305,7 +360,7 @@ describe("planner.plan — retry loop", () => {
     const planner = createPlanner({
       engine: makeEngineSurface(client),
       readSkill: async () => "RULES",
-      knownTools: FAKE_TOOLS,
+      mcpTools: FAKE_TOOLS,
       knownSkills: FAKE_SKILLS,
       maxAttempts: 3,
     });
@@ -322,7 +377,7 @@ describe("planner.plan — retry loop", () => {
     const planner = createPlanner({
       engine: makeEngineSurface(client),
       readSkill: async () => "RULES",
-      knownTools: FAKE_TOOLS,
+      mcpTools: FAKE_TOOLS,
       knownSkills: FAKE_SKILLS,
       maxAttempts: 1,
     });

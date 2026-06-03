@@ -309,14 +309,10 @@ async function main(): Promise<void> {
 
   // Build planner once at startup: tool & skill names baked into the
   // plan schema's enums. New tools / skills require an agent restart
-  // to be plan-emittable. Tool descriptions come straight from MCP
-  // tool definitions so the planner knows what each tool does without
-  // a separate registry.
-  const knownTools = engine.mcp.tools.map((t) => t.function.name);
-  const toolDescriptions: Record<string, string> = {};
-  for (const t of engine.mcp.tools) {
-    if (t.function.description) toolDescriptions[t.function.name] = t.function.description;
-  }
+  // to be plan-emittable. The full MCP tool definitions go in so the
+  // planner can render compact `name(arg: type, ...)` signatures in
+  // its user prompt — without those the planner guesses parameter
+  // names from training-data conventions and produces invalid args.
   const skillEntries = await listSkills();
   // Exclude `planner` itself (it's the system prompt) and `routing`
   // (engine-level meta-skill, not directly invokable).
@@ -325,15 +321,14 @@ async function main(): Promise<void> {
     .filter((n) => n !== "planner" && n !== "routing");
 
   console.log(
-    `[supervisor] planner: ${knownTools.length} tools, ${knownSkills.length} skills`,
+    `[supervisor] planner: ${engine.mcp.tools.length} tools, ${knownSkills.length} skills`,
   );
 
   const planner = createPlanner({
     engine,
     readSkill: readSkillBody,
-    knownTools,
+    mcpTools: engine.mcp.tools,
     knownSkills,
-    toolDescriptions,
   });
 
   const runner = createRunner({
