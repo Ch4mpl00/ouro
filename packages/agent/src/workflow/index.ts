@@ -1,5 +1,7 @@
 import type { ChatCompletionTool } from "openai/resources/chat/completions";
+import { setMemory } from "../db/memory";
 import type { EnvData } from "../session-context";
+import { SET_MEMORY_TOOL } from "../synthetic-tools";
 import type { TraceContext } from "../tracing";
 import {
   createCompiler,
@@ -79,13 +81,17 @@ export function createWorkflow(deps: WorkflowDeps): Workflow {
   const compiler = createCompiler({
     engine: deps.engine,
     readSkill: deps.readSkill,
-    mcpTools: deps.mcpTools,
+    // set_memory is a synthetic agent-side tool with no MCP counterpart;
+    // surface it to the compiler too so it appears in the schema enum and
+    // the prompt's tool signatures (the executor dispatches it directly).
+    mcpTools: [...deps.mcpTools, SET_MEMORY_TOOL],
     knownSkills: deps.knownSkills,
     maxAttempts: deps.maxAttempts,
   });
   const executor = createExecutor({
     engine: deps.engine,
     readSkill: deps.readSkill,
+    setMemory,
   });
 
   return {

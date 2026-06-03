@@ -2,6 +2,7 @@ import type OpenAI from "openai";
 import type { ChatCompletionMessageParam } from "openai/resources/chat/completions";
 import type { ModelPreset, PresetName } from "../models";
 import type { SessionOpts } from "../session";
+import { SET_MEMORY_TOOL_NAME } from "../synthetic-tools";
 import type { Span, TraceContext } from "../tracing";
 import type {
   LlmAgentStep,
@@ -97,6 +98,11 @@ export interface ExecutorDeps {
   // Decoupled from skills.ts so tests can pass a stub. Returns the
   // skill body (no frontmatter); null when not found.
   readSkill: (name: string) => Promise<string | null>;
+  // Agent-side memory KV writer (agent.db). A `set_memory` tool step is
+  // dispatched here, NOT to MCP — set_memory is a synthetic agent-side
+  // tool with no MCP counterpart. Injected (rather than imported) so the
+  // executor stays decoupled from db/memory and tests can spy on it.
+  setMemory: (key: string, value: string) => void;
 }
 
 export function createExecutor(deps: ExecutorDeps): Executor {
@@ -258,6 +264,18 @@ async function execTool(
   const resolvedArgs = substitute(step.args, store) as Record<string, unknown>;
   span.update({ input: { tool: step.tool, args: resolvedArgs } });
 
+  // Agent-side builtins are handled in-process, never forwarded to MCP.
+  // Currently just set_memory (writes the agent.db memory KV) — workflows
+  // need it for watermark updates (e.g. news_digest.last_read_at). It is a
+  // synthetic tool with no MCP counterpart, so routing it to mcp.callTool
+  // would fail with "unknown tool".
+  if (step.tool === SET_MEMORY_TOOL_NAME) {
+    const out = execSetMemory(resolvedArgs, deps);
+    if (step.bind) store.set(step.bind, out);
+    span.update({ output: out });
+    return;
+  }
+
   let raw: string;
   try {
     raw = await deps.engine.mcp.callTool(step.tool, resolvedArgs);
@@ -287,6 +305,28 @@ function tryParseJson(raw: string): unknown {
   } catch {
     return raw;
   }
+}
+
+// set_memory — the one synthetic agent-side tool reachable as a direct
+// workflow step (watermark writes, e.g. news_digest.last_read_at). Same
+// validation as Session.applySetMemory; on bad args we throw ToolCallError
+// so the executor classifies it as a tool failure like any other step.
+// The other synthetic tools stay agentic-only: invoke_sub_agent is
+// superseded by the `llm_agent` step kind, and skill read/write is the
+// agentic `dreaming` flow's job.
+function execSetMemory(
+  args: Record<string, unknown>,
+  deps: ExecutorDeps,
+): { ok: true; key: string } {
+  const { key, value } = args;
+  if (typeof key !== "string" || key.length === 0) {
+    throw new ToolCallError("set_memory", "key must be a non-empty string");
+  }
+  if (typeof value !== "string") {
+    throw new ToolCallError("set_memory", `value must be a string (got ${typeof value})`);
+  }
+  deps.setMemory(key, value);
+  return { ok: true, key };
 }
 
 // ─── llm_compose ─────────────────────────────────────────────────────

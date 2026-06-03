@@ -225,6 +225,10 @@ whitelist. Fallback to existing agent behaviour.
 - **Don't reference `${chatId}` or `${env.chatId}`** — chat id lives
   in `envContext` (plain text); inline it as a JSON literal.
 - **Don't use `preset: "smartest"`** in any step.
+- **Don't `read_file` a skill** (e.g. `skills/news-digest.md`). Skills are
+  loaded by name via `llm_compose` / `llm_agent` (`skill: "..."`), with the
+  live→default fallback. `read_file` reads a literal path and the live
+  `skills/` overlay is usually empty — it will fail with ENOENT.
 - **Don't wrap every signal in `llm_agent`** — that defeats the point.
   Use it only when intent is genuinely unclear or unbounded.
 

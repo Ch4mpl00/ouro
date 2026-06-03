@@ -12,10 +12,13 @@ import type { TraceContext } from "./tracing";
 // SYNTHETIC_TOOLS_BY_NAME — adding a new tool is one new entry here,
 // no changes to session.ts beyond declaring the handler method.
 //
-// These live only because Session does — i.e. for the agentic fallback
-// path and `llm_agent` workflow steps. The default workflow path never
-// loads them: tool / llm_compose steps call MCP and the LLM directly,
-// and `set_memory` is expressed as an explicit `tool` step instead.
+// These live for Session — i.e. the agentic fallback path and `llm_agent`
+// workflow steps (a sub-session sees the full set here). The default
+// workflow path does NOT load this registry: its tool / llm_compose steps
+// call MCP and the LLM directly. The one exception is `set_memory`, which
+// a workflow `tool` step also needs (watermark writes) — the executor
+// dispatches it to the same agent.db writer without going through Session
+// (see workflow/execute.ts execSetMemory).
 
 // ─── set_memory ──────────────────────────────────────────────────────
 // Agent-side writes to the local memory KV (`agent.db memory`). Bypasses

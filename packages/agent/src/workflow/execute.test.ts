@@ -159,7 +159,7 @@ describe("executor.execute — tool step", () => {
         list_news: JSON.stringify({ count: 2, items: [{ id: 1 }, { id: 2 }] }),
       },
     });
-    const executor = createExecutor({ engine, readSkill: nullReadSkill() });
+    const executor = createExecutor({ engine, readSkill: nullReadSkill(), setMemory: () => {} });
 
     const plan: Workflow = {
       version: 1,
@@ -189,14 +189,14 @@ describe("executor.execute — tool step", () => {
 
   it("works without bind (fire-and-forget)", async () => {
     const engine = makeMockEngine({
-      toolResponses: { set_memory: "ok" },
+      toolResponses: { send_telegram_message: JSON.stringify({ delivered: true }) },
     });
-    const executor = createExecutor({ engine, readSkill: nullReadSkill() });
+    const executor = createExecutor({ engine, readSkill: nullReadSkill(), setMemory: () => {} });
     const r = await executor.execute(
       {
         version: 1,
         steps: [
-          { kind: "tool", tool: "set_memory", args: { key: "x", value: "y" } },
+          { kind: "tool", tool: "send_telegram_message", args: { chatId: 1, text: "hi" } },
           { kind: "terminal" },
         ],
       },
@@ -209,7 +209,7 @@ describe("executor.execute — tool step", () => {
     const engine = makeMockEngine({
       toolResponses: { ping: "pong" },
     });
-    const executor = createExecutor({ engine, readSkill: nullReadSkill() });
+    const executor = createExecutor({ engine, readSkill: nullReadSkill(), setMemory: () => {} });
     const ctx = baseCtx();
     await executor.execute(
       {
@@ -228,7 +228,7 @@ describe("executor.execute — tool step", () => {
     const engine = makeMockEngine({
       toolResponses: { broken_tool: "[tool error] something broke" },
     });
-    const executor = createExecutor({ engine, readSkill: nullReadSkill() });
+    const executor = createExecutor({ engine, readSkill: nullReadSkill(), setMemory: () => {} });
     const r = await executor.execute(
       {
         version: 1,
@@ -249,7 +249,7 @@ describe("executor.execute — tool step", () => {
 
   it("missing binding in args surfaces as missing_binding reason", async () => {
     const engine = makeMockEngine();
-    const executor = createExecutor({ engine, readSkill: nullReadSkill() });
+    const executor = createExecutor({ engine, readSkill: nullReadSkill(), setMemory: () => {} });
     const r = await executor.execute(
       {
         version: 1,
@@ -272,12 +272,74 @@ describe("executor.execute — tool step", () => {
   });
 });
 
+describe("executor.execute — set_memory step (agent-side builtin)", () => {
+  it("dispatches to the injected setMemory writer, not MCP, and binds an ack", async () => {
+    const engine = makeMockEngine();
+    const memWrites: Array<[string, string]> = [];
+    const executor = createExecutor({
+      engine,
+      readSkill: nullReadSkill(),
+      setMemory: (k, v) => memWrites.push([k, v]),
+    });
+    const ctx = baseCtx();
+    ctx.store.set("now", "2026-06-03T05:05:00Z");
+
+    const r = await executor.execute(
+      {
+        version: 1,
+        steps: [
+          {
+            kind: "tool",
+            tool: "set_memory",
+            args: { key: "news_digest.last_read_at", value: "${now}" },
+            bind: "wm",
+          },
+          { kind: "terminal" },
+        ],
+      },
+      ctx,
+    );
+
+    expect(r.ok).toBe(true);
+    expect(memWrites).toEqual([["news_digest.last_read_at", "2026-06-03T05:05:00Z"]]);
+    // Never forwarded to MCP — set_memory has no MCP counterpart.
+    expect(engine.toolCalls).toEqual([]);
+    expect(ctx.store.get("wm")).toEqual({ ok: true, key: "news_digest.last_read_at" });
+  });
+
+  it("rejects a non-string value as tool_error without writing", async () => {
+    const engine = makeMockEngine();
+    const memWrites: Array<[string, string]> = [];
+    const executor = createExecutor({
+      engine,
+      readSkill: nullReadSkill(),
+      setMemory: (k, v) => memWrites.push([k, v]),
+    });
+
+    const r = await executor.execute(
+      {
+        version: 1,
+        steps: [
+          { kind: "tool", tool: "set_memory", args: { key: "k", value: 123 }, bind: "x" },
+          { kind: "terminal" },
+        ],
+      },
+      baseCtx(),
+    );
+
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.reason).toBe("tool_error");
+    expect(memWrites).toEqual([]);
+  });
+});
+
 describe("executor.execute — llm_compose step", () => {
   it("loads skill as system, builds user from prompt + XML input, calls LLM without tools", async () => {
     const engine = makeMockEngine({ llmResponses: ["composed digest"] });
     const executor = createExecutor({
       engine,
       readSkill: fixedReadSkill({ "news-digest": "RULES go here" }),
+      setMemory: () => {},
     });
 
     const ctx = baseCtx();
@@ -317,7 +379,7 @@ describe("executor.execute — llm_compose step", () => {
 
   it("works with prompt-only (no skill)", async () => {
     const engine = makeMockEngine({ llmResponses: ["A: 5"] });
-    const executor = createExecutor({ engine, readSkill: nullReadSkill() });
+    const executor = createExecutor({ engine, readSkill: nullReadSkill(), setMemory: () => {} });
     const ctx = baseCtx();
     ctx.store.set("question", "what is 2+3");
     const r = await executor.execute(
@@ -347,7 +409,7 @@ describe("executor.execute — llm_compose step", () => {
 
   it("appends XML blocks after prompt when both are present", async () => {
     const engine = makeMockEngine({ llmResponses: ["ok"] });
-    const executor = createExecutor({ engine, readSkill: nullReadSkill() });
+    const executor = createExecutor({ engine, readSkill: nullReadSkill(), setMemory: () => {} });
     const ctx = baseCtx();
     ctx.store.set("items", ["a", "b"]);
     await executor.execute(
@@ -374,7 +436,7 @@ describe("executor.execute — llm_compose step", () => {
 
   it("skill_not_found when skill is named but readSkill returns null", async () => {
     const engine = makeMockEngine();
-    const executor = createExecutor({ engine, readSkill: nullReadSkill() });
+    const executor = createExecutor({ engine, readSkill: nullReadSkill(), setMemory: () => {} });
     const r = await executor.execute(
       {
         version: 1,
@@ -399,7 +461,7 @@ describe("executor.execute — llm_compose step", () => {
 describe("executor.execute — llm_agent step", () => {
   it("spawns child session with toolWhitelist and binds result", async () => {
     const engine = makeMockEngine({ sessionResults: ["agent answer"] });
-    const executor = createExecutor({ engine, readSkill: nullReadSkill() });
+    const executor = createExecutor({ engine, readSkill: nullReadSkill(), setMemory: () => {} });
     const ctx = baseCtx();
     ctx.store.set("query", "что в Одессе");
     const r = await executor.execute(
@@ -435,7 +497,7 @@ describe("executor.execute — llm_agent step", () => {
 
   it("ends the spawned session on success", async () => {
     const engine = makeMockEngine({ sessionResults: ["x"] });
-    const executor = createExecutor({ engine, readSkill: nullReadSkill() });
+    const executor = createExecutor({ engine, readSkill: nullReadSkill(), setMemory: () => {} });
     await executor.execute(
       {
         version: 1,
@@ -470,7 +532,7 @@ describe("executor.execute — llm_agent step", () => {
         },
       };
     };
-    const executor = createExecutor({ engine, readSkill: nullReadSkill() });
+    const executor = createExecutor({ engine, readSkill: nullReadSkill(), setMemory: () => {} });
     const r = await executor.execute(
       {
         version: 1,
@@ -509,7 +571,7 @@ describe("executor.execute — parallel step", () => {
         },
       },
     });
-    const executor = createExecutor({ engine, readSkill: nullReadSkill() });
+    const executor = createExecutor({ engine, readSkill: nullReadSkill(), setMemory: () => {} });
     const ctx = baseCtx();
     const r = await executor.execute(
       {
@@ -543,7 +605,7 @@ describe("executor.execute — parallel step", () => {
         bad: "[tool error] nope",
       },
     });
-    const executor = createExecutor({ engine, readSkill: nullReadSkill() });
+    const executor = createExecutor({ engine, readSkill: nullReadSkill(), setMemory: () => {} });
     const r = await executor.execute(
       {
         version: 1,
@@ -573,7 +635,7 @@ describe("executor.execute — terminal and end-of-list", () => {
     const engine = makeMockEngine({
       toolResponses: { a: "A", b: "B" },
     });
-    const executor = createExecutor({ engine, readSkill: nullReadSkill() });
+    const executor = createExecutor({ engine, readSkill: nullReadSkill(), setMemory: () => {} });
     const ctx = baseCtx();
     const r = await executor.execute(
       {
@@ -596,7 +658,7 @@ describe("executor.execute — terminal and end-of-list", () => {
     const engine = makeMockEngine({
       toolResponses: { a: "A" },
     });
-    const executor = createExecutor({ engine, readSkill: nullReadSkill() });
+    const executor = createExecutor({ engine, readSkill: nullReadSkill(), setMemory: () => {} });
     const ctx = baseCtx();
     const r = await executor.execute(
       {
@@ -615,7 +677,7 @@ describe("executor.execute — duplicate binding", () => {
     const engine = makeMockEngine({
       toolResponses: { a: "A", b: "B" },
     });
-    const executor = createExecutor({ engine, readSkill: nullReadSkill() });
+    const executor = createExecutor({ engine, readSkill: nullReadSkill(), setMemory: () => {} });
     const r = await executor.execute(
       {
         version: 1,
@@ -642,13 +704,17 @@ describe("executor.execute — end-to-end fixture", () => {
         list_news: JSON.stringify({ count: 1, items: [{ id: 1, body: "post" }] }),
         get_telegram_chat_history: JSON.stringify({ messages: [] }),
         send_telegram_message: JSON.stringify({ delivered: true }),
-        set_memory: "ok",
+        // No set_memory here on purpose: it is NOT an MCP tool. It is
+        // dispatched to the injected setMemory writer below, never to
+        // engine.mcp.callTool.
       },
       llmResponses: ["📰 Новости · 3 июня\n• fake digest"],
     });
+    const memWrites: Array<[string, string]> = [];
     const executor = createExecutor({
       engine,
       readSkill: fixedReadSkill({ "news-digest": "DIGEST RULES" }),
+      setMemory: (k, v) => memWrites.push([k, v]),
     });
 
     const ctx = baseCtx();
@@ -717,10 +783,14 @@ describe("executor.execute — end-to-end fixture", () => {
     expect(r.ok).toBe(true);
     expect(ctx.store.get("digest")).toContain("📰 Новости");
 
-    // Telegram + memory both fired.
+    // Telegram fired via MCP; the watermark went to the injected writer,
+    // NOT through engine.mcp.callTool (set_memory has no MCP counterpart).
     const toolNames = engine.toolCalls.map((c) => c.tool);
     expect(toolNames).toContain("send_telegram_message");
-    expect(toolNames).toContain("set_memory");
+    expect(toolNames).not.toContain("set_memory");
+    expect(memWrites).toEqual([
+      ["news_digest.last_read_at", "2026-06-03T05:05:00Z"],
+    ]);
     const send = engine.toolCalls.find((c) => c.tool === "send_telegram_message")!;
     expect(send.args).toEqual({
       chatId: 42,
