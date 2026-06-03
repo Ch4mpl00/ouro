@@ -45,7 +45,7 @@ block — you must give them everything they need in `system_prompt`.
 Pre-fetch chat history yourself (one call), then delegate:
 
 ```
-get_telegram_chat_history(chatId=<id>, threadId=<thread_id if any>, limit=30)
+get_telegram_chat_history(chatId=<id>, threadId=<thread_id if any>, limit=5)
 ```
 
 ```
@@ -58,7 +58,7 @@ Environment:
 - Output language: Russian
 - news_digest.last_read_at: <from your context, or "never (bootstrap with now − 24h)">
 
-Recent chat history (last 30 — dedupe against assistant turns
+Recent chat history (last 5 — dedupe against assistant turns
 starting with 📰 Новости / 🧠 IT-дайджест):
 <get_telegram_chat_history output>
 
