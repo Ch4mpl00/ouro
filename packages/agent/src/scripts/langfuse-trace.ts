@@ -33,7 +33,9 @@ interface Trace {
   input: unknown;
   output: unknown;
   metadata: Record<string, unknown> | null;
-  observations: string[];
+  // /traces?sessionId=... returns IDs; /traces/<id> returns full
+  // Observation objects inline. Handle both.
+  observations: Array<string | Observation>;
   latency: number;
   totalCost: number;
   tags: string[];
@@ -196,10 +198,15 @@ async function main(): Promise<void> {
   }
 
   for (const t of traces) {
-    // Trace list endpoint returns observation IDs; need a follow-up fetch
-    // per-observation to get input/output/usage. Fan out in parallel.
+    // /traces?sessionId returns plain IDs (need a follow-up fetch per
+    // observation), /traces/<id> inlines full Observation objects.
+    // Fan out in parallel — strings get resolved, objects pass through.
     const observations = await Promise.all(
-      t.observations.map((oid) => api<Observation>(`/observations/${oid}`)),
+      t.observations.map((entry) =>
+        typeof entry === "string"
+          ? api<Observation>(`/observations/${entry}`)
+          : Promise.resolve(entry),
+      ),
     );
     renderTrace(t, observations, opts);
   }
