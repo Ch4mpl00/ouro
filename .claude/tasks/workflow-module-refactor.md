@@ -1,6 +1,6 @@
 # Refactor planner/runner → workflow module
 
-**Status:** in progress — Phase A done (rename + facade); Phase B/C pending
+**Status:** in progress — Phase A + B done (rename + facade + supervisor split); Phase C pending
 **Priority:** P1
 **Area:** packages/agent
 **Created:** 2026-06-03
@@ -115,7 +115,7 @@ src/
   `variables.test.ts`, `dsl.test.ts`. Test imports обновляются под новые
   имена. Прогнать `pnpm test packages/agent`.
 
-### Phase B — supervisor split
+### Phase B — supervisor split ✅ DONE
 
 - Создать директорию `packages/agent/src/supervisor/`.
 - `supervisor.ts` → `supervisor/main.ts`. Оставить только: `main()`,

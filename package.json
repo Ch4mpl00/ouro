@@ -7,7 +7,7 @@
   "scripts": {
     "typecheck": "tsc --noEmit",
     "mcp:serve": "tsx packages/mcp/src/server.ts",
-    "agent:start": "tsx packages/agent/src/supervisor.ts",
+    "agent:start": "tsx packages/agent/src/supervisor/main.ts",
     "trace": "tsx packages/agent/src/scripts/langfuse-trace.ts",
     "db:init": "pnpm db:init:mcp && pnpm db:init:agent",
     "db:init:mcp": "mkdir -p packages/mcp/data && sqlite3 packages/mcp/data/tokens.db < packages/mcp/data/schema.sql",
