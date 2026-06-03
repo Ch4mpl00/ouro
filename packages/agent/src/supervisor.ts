@@ -139,7 +139,8 @@ async function main(): Promise<void> {
   // `base` runs on OpenAI (non-thinking — primary replies, recovery,
   // scheduler dispatch). `smart` runs on DeepSeek with thinking on —
   // sub-agents that do real editorial / parsing work (news-digest,
-  // tech-digest, nashdom-bill, …).
+  // tech-digest, nashdom-bill, …). `smartest` is reserved for the
+  // planner role (Phase 2+); current agentic sessions never select it.
   const presets = {
     base: {
       ...DEFAULT_PRESETS.base,
@@ -148,6 +149,10 @@ async function main(): Promise<void> {
     smart: {
       ...DEFAULT_PRESETS.smart,
       model: process.env.AGENT_SMART_MODEL ?? DEFAULT_PRESETS.smart.model,
+    },
+    smartest: {
+      ...DEFAULT_PRESETS.smartest,
+      model: process.env.AGENT_SMARTEST_MODEL ?? DEFAULT_PRESETS.smartest.model,
     },
   };
 

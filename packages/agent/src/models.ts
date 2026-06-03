@@ -18,21 +18,27 @@ export interface ModelPreset {
   reasoningEffort: ReasoningEffort;
 }
 
-export type PresetName = "base" | "smart";
+export type PresetName = "base" | "smart" | "smartest";
 
 // Defaults applied at engine startup when env overrides are absent.
-// `base`  — non-thinking chat, OpenAI provider. Default for primary
-//           Telegram replies, scheduler dispatch, recovery — the bulk
-//           of signals.
-// `smart` — DeepSeek with thinking on. Used for sub-agents that do
-//           real editorial / parsing work (digests, semantic dedup,
-//           PDF amount extraction).
+// `base`     — non-thinking chat, OpenAI provider. Default for primary
+//              Telegram replies, scheduler dispatch, recovery — the
+//              bulk of signals.
+// `smart`    — DeepSeek with thinking on. Used for sub-agents that do
+//              real editorial / parsing work (digests, semantic dedup,
+//              PDF amount extraction).
+// `smartest` — OpenAI full GPT-5.4. Reserved for the planner role
+//              where strict structured-output guarantees and a single
+//              high-quality decision matter more than per-call cost
+//              (the planner emits one compact plan per signal, then
+//              the runtime takes over deterministically).
 export const DEFAULT_PRESETS: Record<PresetName, ModelPreset> = {
   base: { model: "gpt-5.4-mini", reasoningEffort: "disabled" },
   smart: { model: "deepseek-v4-pro", reasoningEffort: "max" },
+  smartest: { model: "gpt-5.4", reasoningEffort: "max" },
 };
 
-export const PRESET_NAMES: readonly PresetName[] = ["base", "smart"];
+export const PRESET_NAMES: readonly PresetName[] = ["base", "smart", "smartest"];
 
 export function isPresetName(value: unknown): value is PresetName {
   return typeof value === "string" && (PRESET_NAMES as readonly string[]).includes(value);
