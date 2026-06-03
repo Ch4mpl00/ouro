@@ -16,6 +16,14 @@ import {
 // One isolated conversation thread. Owns its own message buffer, system
 // prompt, model and iteration budget. Shares the engine's OpenAI client
 // and MCP connection — does not create or close them.
+//
+// Role in the post-workflow architecture: this is the agentic ReAct body,
+// used in exactly two places — (1) an `llm_agent` workflow step (the
+// executor spawns a sub-session with a bounded tool whitelist), and (2)
+// the supervisor fallback path (when the compiler can't produce a valid
+// workflow, or to phrase a failure via the `recovery` skill). The default
+// workflow path does NOT go through here — it runs tool / llm_compose
+// steps directly against the engine.
 
 export interface SessionOpts {
   id: string;
@@ -44,8 +52,8 @@ export interface SessionOpts {
   // available" (used when any loaded skill has `tools: *`).
   allowedTools?: Set<string> | null;
   // Caller-side narrowing of the effective tool set, intersected with
-  // the engine-resolved `allowedTools` from skills. Used by the planner
-  // runner to enforce a per-step `llm_agent` tool whitelist on top of
+  // the engine-resolved `allowedTools` from skills. Used by the workflow
+  // executor to enforce a per-step `llm_agent` tool whitelist on top of
   // what the skill already allows. Engine applies the intersection at
   // `startSession` time; callers don't touch `allowedTools` directly.
   toolWhitelist?: Set<string>;

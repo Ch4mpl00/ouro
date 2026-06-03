@@ -21,8 +21,10 @@ the other. Deployed as two containers (`docker-compose.yml`).
 2. When it sees something new, it calls `recordSignal({ source, content,
    envContext })` which inserts a row into the `signals` queue in
    `packages/mcp/data/tokens.db`.
-3. The supervisor (`packages/agent/src/supervisor.ts`) loops on
-   `get_next_signal`. When a signal pops, it loads three things:
+3. The supervisor (`packages/agent/src/supervisor/main.ts`) loops on
+   `get_next_signal`. When a signal pops, it runs the signal through the
+   `workflow/` module (compile → execute); the steps below describe the
+   agentic fallback path, which loads three things:
    - `skills/<signal.source>.md` (with `skills.default/` fallback) — the
      primary domain skill.
    - `skills/routing.md` — always loaded; tells the model to delegate to
@@ -64,11 +66,18 @@ mcp-tools/
     └── agent/
         ├── data/{schema.sql, agent.db}      agent-side state (memory KV)
         └── src/
-            ├── supervisor.ts                main loop
+            ├── supervisor/{main,fallback}.ts  poll loop + workflow failure handling
+            ├── workflow/                      dynamic-workflow module (compile + execute)
+            │   ├── index.ts                   createWorkflow facade (runForSignal)
+            │   ├── compile.ts                 signal → validated Workflow (LLM)
+            │   ├── execute.ts                 runtime that walks the steps
+            │   ├── dsl.ts                     Workflow step schema + parse
+            │   └── variables.ts               ${path} substitution + variable store
             ├── engine.ts, session.ts        DeepSeek runner + synthetic tools
             ├── mcp-client.ts                StreamableHTTP client
             ├── session-context.ts           markdown context block builder
             ├── skills.ts                    two-layer loader (live → default)
+            ├── tracing/{index,langfuse}.ts  Tracer interface + Langfuse adapter
             └── db/{client.ts, memory.ts}    KV helpers
 ```
 

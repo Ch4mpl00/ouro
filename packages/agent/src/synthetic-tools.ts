@@ -11,6 +11,11 @@ import type { TraceContext } from "./tracing";
 // `visibleTo` and dispatches incoming tool calls by name lookup in
 // SYNTHETIC_TOOLS_BY_NAME — adding a new tool is one new entry here,
 // no changes to session.ts beyond declaring the handler method.
+//
+// These live only because Session does — i.e. for the agentic fallback
+// path and `llm_agent` workflow steps. The default workflow path never
+// loads them: tool / llm_compose steps call MCP and the LLM directly,
+// and `set_memory` is expressed as an explicit `tool` step instead.
 
 // ─── set_memory ──────────────────────────────────────────────────────
 // Agent-side writes to the local memory KV (`agent.db memory`). Bypasses

@@ -4,7 +4,7 @@ import { DEFAULT_PRESETS, type ModelPreset, type PresetName } from "./models";
 import { Session, type SessionOpts } from "./session";
 import { readSkill, validateAllSkills } from "./skills";
 import { nullTracer, type Tracer } from "./tracing";
-import { langfuseTracerFromEnv } from "./tracing-langfuse";
+import { langfuseTracerFromEnv } from "./tracing/langfuse";
 
 // Process-level singleton. Owns shared, expensive resources:
 //   - two OpenAI-shaped clients, one per provider (DeepSeek for
@@ -41,7 +41,7 @@ export interface EngineOpts {
   // next session without an engine restart.
   skills?: string[];
   // Optional tracer for observability. Omit → auto-config from env (currently
-  // Langfuse, see `tracing-langfuse.ts`). Pass `nullTracer` to disable
+  // Langfuse, see `tracing/langfuse.ts`). Pass `nullTracer` to disable
   // explicitly, or any other `Tracer` to swap backends (testing, etc.).
   tracer?: Tracer;
 }
@@ -132,10 +132,10 @@ export class Engine {
     // expressed as a null allow-list (Session treats null as no filter).
     let allowedTools: Set<string> | null = wildcard ? null : accumulated;
 
-    // Caller-side narrowing on top of the skill-derived set. Planner
-    // runner passes a step's `tools: [...]` whitelist this way so the
-    // sub-agent sees an intersection of (skill says OK) ∩ (planner says
-    // OK). null skill-side means wildcard → fall back to the planner's
+    // Caller-side narrowing on top of the skill-derived set. The workflow
+    // executor passes a step's `tools: [...]` whitelist this way so the
+    // sub-agent sees an intersection of (skill says OK) ∩ (workflow says
+    // OK). null skill-side means wildcard → fall back to the workflow's
     // list verbatim.
     if (opts.toolWhitelist) {
       if (allowedTools === null) {

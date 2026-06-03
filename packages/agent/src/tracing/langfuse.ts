@@ -18,7 +18,7 @@ import type {
   TraceContextUpdate,
   TraceStartOpts,
   Tracer,
-} from "./tracing";
+} from "./index";
 
 // Langfuse v5 adapter. Built on OpenTelemetry — the LangfuseSpanProcessor
 // reads spans created via @langfuse/tracing's `startObservation` chain and

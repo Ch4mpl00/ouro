@@ -1,6 +1,6 @@
 # Refactor planner/runner → workflow module
 
-**Status:** in progress — Phase A + B done (rename + facade + supervisor split); Phase C pending
+**Status:** done — Phase A + B + C complete (rename + facade + supervisor split + tracing dir + docs)
 **Priority:** P1
 **Area:** packages/agent
 **Created:** 2026-06-03
@@ -130,7 +130,7 @@ src/
 - Шапка `main.ts`: 3-строчный поток (signal → workflow → fallback /
   recovery).
 
-### Phase C — мелочи (отдельный PR, опционально)
+### Phase C — мелочи (отдельный PR, опционально) ✅ DONE
 
 - `tracing.ts` + `tracing-langfuse.ts` → `tracing/{index,langfuse}.ts`.
   Все импорты `from "./tracing"` остаются (resolve на `index.ts`).
