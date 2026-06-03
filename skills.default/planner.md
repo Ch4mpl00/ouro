@@ -123,17 +123,55 @@ substitute through `${env.chatId}` — that's not in the store.
 
 ### `source = telegram`
 
-User wrote you a message. Decide what they want:
+User wrote you a message. Decide what they want.
 
-- **Conversational / unclear / multi-step** ("привет", "что в Одессе?",
-  "сделай X и Y") → ONE `llm_agent` step with `skill: "telegram"` and
-  `tools` set to a wide whitelist (all MCP tools the telegram skill
-  uses — easiest to include them all). This delegates to the existing
-  agent loop. It's the safe default when in doubt.
-- **Clear simple request** ("список квитанций", "напомни в 15:00 X") →
-  a structured plan: `start_typing` in parallel with the actual work
-  (e.g. `list_nashdom_mails` → `llm_compose` → `send_telegram_message`),
-  then `terminal`.
+**Default to a structured plan.** `llm_agent` is the escape hatch, NOT
+the safe default — when the runtime delegates a Telegram reply to a
+sub-session, that sub-session can (and does) finish with `content` and
+no `send_telegram_message` call, and the user sees nothing. The runtime
+sends messages only via an explicit `tool: send_telegram_message` step
+in YOUR plan. Make that step explicit.
+
+**Structured plan** — use when you can predict the tool calls. Most
+Telegram signals fit here, including "list X / show X / status" reads:
+
+- "покажи расписание / список задач / какие напоминания у меня" →
+  - parallel(`start_typing(chatId=<lit>)`, `list_scheduled_tasks()`)
+  - `llm_compose(preset="base",
+     prompt="Отформатируй расписание задач для ответа в Telegram.
+     Plain text (без Markdown), на русском, terse. Каждая задача:
+     cron-выражение по-человечески + краткое описание из prompt'а.
+     Время в Europe/Kiev. Не добавляй вступление/прощание.",
+     input: {tasks: ${tasks}, env_now: ${env.now}, env_tz: ${env.timezone}},
+     bind: "reply")`
+  - `tool: send_telegram_message(chatId=<lit>, text=${reply})`
+  - terminal
+- "есть квитанции? / список квитанций" → same shape with
+  `list_nashdom_mails` instead of `list_scheduled_tasks`.
+- "напомни в 15:00 купить X" →
+  - `tool: schedule_task(...)` → `tool: send_telegram_message(confirmation)`
+  - terminal
+- "сколько на карте / последние траты" → `list_monobank_transactions`
+  → `llm_compose` → `send_telegram_message`.
+
+**`llm_agent`** — ONLY when you genuinely cannot predict which tools
+the model will need to call (intent unclear, multi-step research,
+follow-up referring to ambiguous prior context). Examples:
+
+- "сделай вчерашнее / продолжи / а по другим?" (pronoun referring to
+  unknown prior turn — needs `get_telegram_chat_history` THEN decision)
+- "разберись с этим письмом и ответь" (open-ended)
+- one-word greetings ("привет", "ок") — the skill decides what to do
+
+When you do use `llm_agent`, include `send_telegram_message` in the
+`tools` whitelist. The skill's hard rule is "always reply", but it
+fires more reliably when the planner can't compose the reply itself.
+
+**News / topical queries** are a separate category — delegate to a
+news skill via `llm_compose`, do NOT use `llm_agent`:
+
+- "что нового / дайджест" → fetch via `list_news` + `llm_compose(skill="news-digest")`
+- "что говорил Маск / новости про Иран" → `search_news` + `llm_compose(skill="news-query")`
 
 ### `source = scheduler`
 
