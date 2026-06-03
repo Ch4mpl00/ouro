@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { createPlanSchema, formatPlanErrors, parsePlan, type Plan } from "./dsl";
+import { createWorkflowSchema, formatWorkflowErrors, parseWorkflow, type Workflow } from "./dsl";
 
 const FAKE_TOOLS = [
   "list_news",
@@ -18,28 +18,28 @@ const FAKE_SKILLS = [
 ] as const;
 
 function makeSchema() {
-  return createPlanSchema({
+  return createWorkflowSchema({
     knownTools: FAKE_TOOLS,
     knownSkills: FAKE_SKILLS,
   });
 }
 
-describe("createPlanSchema", () => {
+describe("createWorkflowSchema", () => {
   it("rejects empty knownTools / knownSkills at factory time", () => {
     expect(() =>
-      createPlanSchema({ knownTools: [], knownSkills: ["x"] }),
+      createWorkflowSchema({ knownTools: [], knownSkills: ["x"] }),
     ).toThrow(/knownTools/);
     expect(() =>
-      createPlanSchema({ knownTools: ["x"], knownSkills: [] }),
+      createWorkflowSchema({ knownTools: ["x"], knownSkills: [] }),
     ).toThrow(/knownSkills/);
   });
 });
 
 describe("plan validation — happy path per step kind", () => {
-  const { PlanSchema } = makeSchema();
+  const { WorkflowSchema } = makeSchema();
 
   it("accepts a tool step", () => {
-    const plan: Plan = {
+    const plan: Workflow = {
       version: 1,
       steps: [
         {
@@ -51,11 +51,11 @@ describe("plan validation — happy path per step kind", () => {
         { kind: "terminal" },
       ],
     };
-    expect(PlanSchema.safeParse(plan).success).toBe(true);
+    expect(WorkflowSchema.safeParse(plan).success).toBe(true);
   });
 
   it("accepts llm_compose with skill only", () => {
-    const plan: Plan = {
+    const plan: Workflow = {
       version: 1,
       steps: [
         {
@@ -68,11 +68,11 @@ describe("plan validation — happy path per step kind", () => {
         { kind: "terminal" },
       ],
     };
-    expect(PlanSchema.safeParse(plan).success).toBe(true);
+    expect(WorkflowSchema.safeParse(plan).success).toBe(true);
   });
 
   it("accepts llm_compose with prompt only", () => {
-    const plan: Plan = {
+    const plan: Workflow = {
       version: 1,
       steps: [
         {
@@ -85,14 +85,14 @@ describe("plan validation — happy path per step kind", () => {
         { kind: "terminal" },
       ],
     };
-    expect(PlanSchema.safeParse(plan).success).toBe(true);
+    expect(WorkflowSchema.safeParse(plan).success).toBe(true);
   });
 
   it("rejects llm_compose with neither skill nor prompt (post-check)", () => {
-    // This check runs in parsePlan() after the discriminated union
+    // This check runs in parseWorkflow() after the discriminated union
     // succeeds — Zod can't express "either A or B required" inside a
     // discriminated union member without breaking the union itself.
-    const r = parsePlan(
+    const r = parseWorkflow(
       {
         version: 1,
         steps: [
@@ -105,7 +105,7 @@ describe("plan validation — happy path per step kind", () => {
           { kind: "terminal" },
         ],
       },
-      PlanSchema,
+      WorkflowSchema,
     );
     expect(r.ok).toBe(false);
     if (!r.ok) {
@@ -116,7 +116,7 @@ describe("plan validation — happy path per step kind", () => {
 
   it("post-check walks into parallel steps", () => {
     // llm_compose inside parallel still gets the skill-or-prompt check.
-    const r = parsePlan(
+    const r = parseWorkflow(
       {
         version: 1,
         steps: [
@@ -135,7 +135,7 @@ describe("plan validation — happy path per step kind", () => {
           { kind: "terminal" },
         ],
       },
-      PlanSchema,
+      WorkflowSchema,
     );
     expect(r.ok).toBe(false);
     if (!r.ok) {
@@ -144,7 +144,7 @@ describe("plan validation — happy path per step kind", () => {
   });
 
   it("accepts llm_agent with bounded tools and iterations", () => {
-    const plan: Plan = {
+    const plan: Workflow = {
       version: 1,
       steps: [
         {
@@ -159,11 +159,11 @@ describe("plan validation — happy path per step kind", () => {
         { kind: "terminal" },
       ],
     };
-    expect(PlanSchema.safeParse(plan).success).toBe(true);
+    expect(WorkflowSchema.safeParse(plan).success).toBe(true);
   });
 
   it("accepts parallel with leaf steps inside", () => {
-    const plan: Plan = {
+    const plan: Workflow = {
       version: 1,
       steps: [
         {
@@ -186,12 +186,12 @@ describe("plan validation — happy path per step kind", () => {
         { kind: "terminal" },
       ],
     };
-    expect(PlanSchema.safeParse(plan).success).toBe(true);
+    expect(WorkflowSchema.safeParse(plan).success).toBe(true);
   });
 
   it("accepts a bare terminal step", () => {
     expect(
-      PlanSchema.safeParse({
+      WorkflowSchema.safeParse({
         version: 1,
         steps: [{ kind: "terminal" }],
       }).success,
@@ -200,10 +200,10 @@ describe("plan validation — happy path per step kind", () => {
 });
 
 describe("plan validation — rejections", () => {
-  const { PlanSchema } = makeSchema();
+  const { WorkflowSchema } = makeSchema();
 
   it("rejects an unknown tool name", () => {
-    const r = PlanSchema.safeParse({
+    const r = WorkflowSchema.safeParse({
       version: 1,
       steps: [
         { kind: "tool", tool: "list_things", args: {}, bind: "x" },
@@ -212,13 +212,13 @@ describe("plan validation — rejections", () => {
     });
     expect(r.success).toBe(false);
     if (!r.success) {
-      const msgs = formatPlanErrors(r.error).join(" | ");
+      const msgs = formatWorkflowErrors(r.error).join(" | ");
       expect(msgs).toMatch(/list_things|Invalid enum/i);
     }
   });
 
   it("rejects an unknown skill name on llm_agent", () => {
-    const r = PlanSchema.safeParse({
+    const r = WorkflowSchema.safeParse({
       version: 1,
       steps: [
         {
@@ -237,7 +237,7 @@ describe("plan validation — rejections", () => {
   });
 
   it("rejects an unknown preset", () => {
-    const r = PlanSchema.safeParse({
+    const r = WorkflowSchema.safeParse({
       version: 1,
       steps: [
         {
@@ -254,7 +254,7 @@ describe("plan validation — rejections", () => {
   });
 
   it("rejects nested parallel (flat-parallel constraint)", () => {
-    const r = PlanSchema.safeParse({
+    const r = WorkflowSchema.safeParse({
       version: 1,
       steps: [
         {
@@ -277,7 +277,7 @@ describe("plan validation — rejections", () => {
   });
 
   it("rejects parallel with a single step", () => {
-    const r = PlanSchema.safeParse({
+    const r = WorkflowSchema.safeParse({
       version: 1,
       steps: [
         {
@@ -291,7 +291,7 @@ describe("plan validation — rejections", () => {
   });
 
   it("rejects unknown step kind", () => {
-    const r = PlanSchema.safeParse({
+    const r = WorkflowSchema.safeParse({
       version: 1,
       steps: [{ kind: "branch", if: "x" }, { kind: "terminal" }],
     });
@@ -299,7 +299,7 @@ describe("plan validation — rejections", () => {
   });
 
   it("rejects unknown fields on a step (strict mode)", () => {
-    const r = PlanSchema.safeParse({
+    const r = WorkflowSchema.safeParse({
       version: 1,
       steps: [
         {
@@ -316,7 +316,7 @@ describe("plan validation — rejections", () => {
   });
 
   it("rejects version other than 1", () => {
-    const r = PlanSchema.safeParse({
+    const r = WorkflowSchema.safeParse({
       version: 2,
       steps: [{ kind: "terminal" }],
     });
@@ -324,12 +324,12 @@ describe("plan validation — rejections", () => {
   });
 
   it("rejects empty plan", () => {
-    const r = PlanSchema.safeParse({ version: 1, steps: [] });
+    const r = WorkflowSchema.safeParse({ version: 1, steps: [] });
     expect(r.success).toBe(false);
   });
 
   it("rejects llm_agent.maxIterations out of bounds", () => {
-    const r = PlanSchema.safeParse({
+    const r = WorkflowSchema.safeParse({
       version: 1,
       steps: [
         {
@@ -348,7 +348,7 @@ describe("plan validation — rejections", () => {
   });
 
   it("rejects llm_agent with empty tools whitelist", () => {
-    const r = PlanSchema.safeParse({
+    const r = WorkflowSchema.safeParse({
       version: 1,
       steps: [
         {
@@ -367,25 +367,25 @@ describe("plan validation — rejections", () => {
   });
 });
 
-describe("parsePlan", () => {
-  const { PlanSchema } = makeSchema();
+describe("parseWorkflow", () => {
+  const { WorkflowSchema } = makeSchema();
 
   it("returns ok=true with parsed plan on success", () => {
-    const r = parsePlan(
+    const r = parseWorkflow(
       {
         version: 1,
         steps: [{ kind: "terminal" }],
       },
-      PlanSchema,
+      WorkflowSchema,
     );
     expect(r.ok).toBe(true);
     if (r.ok) {
-      expect(r.plan.steps[0]?.kind).toBe("terminal");
+      expect(r.workflow.steps[0]?.kind).toBe("terminal");
     }
   });
 
   it("returns ok=false with human-readable errors on failure", () => {
-    const r = parsePlan(
+    const r = parseWorkflow(
       {
         version: 1,
         steps: [
@@ -393,7 +393,7 @@ describe("parsePlan", () => {
           { kind: "terminal" },
         ],
       },
-      PlanSchema,
+      WorkflowSchema,
     );
     expect(r.ok).toBe(false);
     if (!r.ok) {
@@ -404,11 +404,11 @@ describe("parsePlan", () => {
   });
 });
 
-describe("formatPlanErrors", () => {
-  const { PlanSchema } = makeSchema();
+describe("formatWorkflowErrors", () => {
+  const { WorkflowSchema } = makeSchema();
 
   it("renders path with brackets for array indices and dots for keys", () => {
-    const r = PlanSchema.safeParse({
+    const r = WorkflowSchema.safeParse({
       version: 1,
       steps: [
         {
@@ -425,22 +425,22 @@ describe("formatPlanErrors", () => {
     });
     expect(r.success).toBe(false);
     if (!r.success) {
-      const msgs = formatPlanErrors(r.error);
+      const msgs = formatWorkflowErrors(r.error);
       expect(msgs.some((m) => m.includes("steps[0].tools[0]"))).toBe(true);
     }
   });
 
-  it("uses 'at plan root' when path is empty", () => {
-    const r = PlanSchema.safeParse("not an object");
+  it("uses 'at workflow root' when path is empty", () => {
+    const r = WorkflowSchema.safeParse("not an object");
     expect(r.success).toBe(false);
     if (!r.success) {
-      const msgs = formatPlanErrors(r.error);
-      expect(msgs.some((m) => m.startsWith("at plan root"))).toBe(true);
+      const msgs = formatWorkflowErrors(r.error);
+      expect(msgs.some((m) => m.startsWith("at workflow root"))).toBe(true);
     }
   });
 
   it("formats invalid_enum_value (real tool-name error) with offending value", () => {
-    const r = PlanSchema.safeParse({
+    const r = WorkflowSchema.safeParse({
       version: 1,
       steps: [
         { kind: "tool", tool: "list_things", args: {}, bind: "a" },
@@ -449,7 +449,7 @@ describe("formatPlanErrors", () => {
     });
     expect(r.success).toBe(false);
     if (!r.success) {
-      const line = formatPlanErrors(r.error).find((m) =>
+      const line = formatWorkflowErrors(r.error).find((m) =>
         m.includes("steps[0].tool"),
       );
       expect(line).toBeDefined();
@@ -459,7 +459,7 @@ describe("formatPlanErrors", () => {
   });
 
   it("formats unrecognized_keys (strict mode) with the offending key name", () => {
-    const r = PlanSchema.safeParse({
+    const r = WorkflowSchema.safeParse({
       version: 1,
       steps: [
         {
@@ -474,13 +474,13 @@ describe("formatPlanErrors", () => {
     });
     expect(r.success).toBe(false);
     if (!r.success) {
-      const msgs = formatPlanErrors(r.error).join(" | ");
+      const msgs = formatWorkflowErrors(r.error).join(" | ");
       expect(msgs).toMatch(/extra_field/);
     }
   });
 
   it("formats invalid_type (real number-where-string error)", () => {
-    const r = PlanSchema.safeParse({
+    const r = WorkflowSchema.safeParse({
       version: 1,
       steps: [
         {
@@ -494,7 +494,7 @@ describe("formatPlanErrors", () => {
     });
     expect(r.success).toBe(false);
     if (!r.success) {
-      const line = formatPlanErrors(r.error).find((m) =>
+      const line = formatWorkflowErrors(r.error).find((m) =>
         m.includes("steps[0].bind"),
       );
       expect(line).toBeDefined();
@@ -503,19 +503,19 @@ describe("formatPlanErrors", () => {
   });
 
   it("formats invalid_literal (wrong version)", () => {
-    const r = PlanSchema.safeParse({
+    const r = WorkflowSchema.safeParse({
       version: 7,
       steps: [{ kind: "terminal" }],
     });
     expect(r.success).toBe(false);
     if (!r.success) {
-      const msgs = formatPlanErrors(r.error);
+      const msgs = formatWorkflowErrors(r.error);
       expect(msgs.some((m) => m.includes("version"))).toBe(true);
     }
   });
 
   it("formats too_small (maxIterations < 1)", () => {
-    const r = PlanSchema.safeParse({
+    const r = WorkflowSchema.safeParse({
       version: 1,
       steps: [
         {
@@ -532,7 +532,7 @@ describe("formatPlanErrors", () => {
     });
     expect(r.success).toBe(false);
     if (!r.success) {
-      const line = formatPlanErrors(r.error).find((m) =>
+      const line = formatWorkflowErrors(r.error).find((m) =>
         m.includes("steps[0].maxIterations"),
       );
       expect(line).toBeDefined();
@@ -542,7 +542,7 @@ describe("formatPlanErrors", () => {
   it("emits one line per issue when a parse produces multiple errors", () => {
     // Two independent violations in different paths — schema should
     // surface both, formatter should return one line each (not merge).
-    const r = PlanSchema.safeParse({
+    const r = WorkflowSchema.safeParse({
       version: 1,
       steps: [
         { kind: "tool", tool: "bogus_tool_one", args: {}, bind: "a" },
@@ -551,7 +551,7 @@ describe("formatPlanErrors", () => {
     });
     expect(r.success).toBe(false);
     if (!r.success) {
-      const msgs = formatPlanErrors(r.error);
+      const msgs = formatWorkflowErrors(r.error);
       expect(msgs.some((m) => m.includes("steps[0].tool"))).toBe(true);
       expect(msgs.some((m) => m.includes("steps[1].tool"))).toBe(true);
       // Both issues are surfaced independently.
@@ -560,13 +560,13 @@ describe("formatPlanErrors", () => {
   });
 
   it("formats discriminator mismatch (unknown step kind)", () => {
-    const r = PlanSchema.safeParse({
+    const r = WorkflowSchema.safeParse({
       version: 1,
       steps: [{ kind: "loop" }, { kind: "terminal" }],
     });
     expect(r.success).toBe(false);
     if (!r.success) {
-      const msgs = formatPlanErrors(r.error);
+      const msgs = formatWorkflowErrors(r.error);
       // Path points at the malformed step; Zod's discriminated-union
       // error mentions valid kinds.
       expect(msgs.some((m) => m.includes("steps[0]"))).toBe(true);
@@ -574,10 +574,10 @@ describe("formatPlanErrors", () => {
   });
 });
 
-describe("planToJsonSchema", () => {
-  it("produces a JSON schema object with $schema and a Plan definition", () => {
-    const { planToJsonSchema } = makeSchema();
-    const schema = planToJsonSchema() as Record<string, unknown>;
+describe("workflowToJsonSchema", () => {
+  it("produces a JSON schema object with $schema and a Workflow definition", () => {
+    const { workflowToJsonSchema } = makeSchema();
+    const schema = workflowToJsonSchema() as Record<string, unknown>;
     // Top-level shape sanity (zod-to-json-schema includes $schema by default).
     expect(typeof schema).toBe("object");
     expect(schema).not.toBeNull();
@@ -593,11 +593,11 @@ describe("example fixture matches schema", () => {
     const fs = await import("node:fs/promises");
     const raw = await fs.readFile(url, "utf8");
     const parsed = JSON.parse(raw);
-    const { PlanSchema } = makeSchema();
-    const r = PlanSchema.safeParse(parsed);
+    const { WorkflowSchema } = makeSchema();
+    const r = WorkflowSchema.safeParse(parsed);
     if (!r.success) {
       // Show why on failure so the test output explains itself.
-      console.error(formatPlanErrors(r.error));
+      console.error(formatWorkflowErrors(r.error));
     }
     expect(r.success).toBe(true);
   });

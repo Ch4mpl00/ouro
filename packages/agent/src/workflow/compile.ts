@@ -6,33 +6,35 @@ import type {
 import type { ModelPreset, PresetName } from "../models";
 import type { EnvData } from "../session-context";
 import type { Span, TraceContext } from "../tracing";
-import { createPlanSchema, parsePlan, type Plan } from "./dsl";
+import { createWorkflowSchema, parseWorkflow, type Workflow } from "./dsl";
 
-// Planner — turns a signal into a validated Plan via one LLM call (with
+// Compiler — turns a signal into a validated Workflow via one LLM call (with
 // up to N retries on schema/JSON failure). Always uses the `smartest`
 // preset (currently OpenAI gpt-5.4): strict structured-output guarantees
-// matter more here than per-call cost — we emit ONE plan per signal and
+// matter more here than per-call cost — we emit ONE workflow per signal and
 // the runtime takes over.
 
-const PLANNER_PRESET: PresetName = "smartest";
-const PLANNER_SKILL_NAME = "planner";
+const COMPILER_PRESET: PresetName = "smartest";
+// On-disk skill file keeps its historical name `planner.md` (see
+// skills.default/) — only the in-code terminology moved to "compiler".
+const COMPILER_SKILL_NAME = "planner";
 
-export type PlannerFailureReason =
+export type CompilerFailureReason =
   | "skill_not_found"
   | "llm_error"
   | "invalid_json"
   | "schema_invalid";
 
-export type PlannerResult =
-  | { ok: true; plan: Plan; attempts: number }
+export type CompilerResult =
+  | { ok: true; workflow: Workflow; attempts: number }
   | {
       ok: false;
-      reason: PlannerFailureReason;
+      reason: CompilerFailureReason;
       errors: string[];
       attempts: number;
     };
 
-export interface PlanRequest {
+export interface CompileRequest {
   signal: {
     source: string;
     content: string;
@@ -43,13 +45,13 @@ export interface PlanRequest {
   signalLabel: string;
 }
 
-export interface Planner {
-  plan(req: PlanRequest): Promise<PlannerResult>;
+export interface Compiler {
+  compile(req: CompileRequest): Promise<CompilerResult>;
 }
 
-// Surface that planner.ts depends on. Real Engine matches structurally;
-// mocks can be plain objects (mirrors the runner's EngineSurface).
-export interface PlannerEngineSurface {
+// Surface that compile.ts depends on. Real Engine matches structurally;
+// mocks can be plain objects (mirrors the executor's EngineSurface).
+export interface CompilerEngineSurface {
   readonly presets: Record<PresetName, ModelPreset>;
   resolveProvider(model: string): {
     client: OpenAI;
@@ -57,31 +59,31 @@ export interface PlannerEngineSurface {
   };
 }
 
-export interface PlannerDeps {
-  engine: PlannerEngineSurface;
+export interface CompilerDeps {
+  engine: CompilerEngineSurface;
   readSkill: (name: string) => Promise<string | null>;
   // Full MCP tool definitions — used to (a) build the schema enum of
   // legal tool names and (b) render compact `name(arg: type, ...)`
-  // signatures in the user prompt so the planner emits the right
-  // parameter names. Without this the planner would guess args from
+  // signatures in the user prompt so the compiler emits the right
+  // parameter names. Without this the compiler would guess args from
   // training-data conventions (e.g. `limit` instead of `k` on
   // search_news) and miss filter parameters like `sinceISO`.
   mcpTools: readonly ChatCompletionTool[];
-  // All skills that exist on disk. Planner emits only these.
+  // All skills that exist on disk. Compiler emits only these.
   knownSkills: readonly string[];
   // Initial attempt + retries. Default 3 (1 attempt + 2 retries).
   maxAttempts?: number;
 }
 
-export function createPlanner(deps: PlannerDeps): Planner {
+export function createCompiler(deps: CompilerDeps): Compiler {
   const maxAttempts = deps.maxAttempts ?? 3;
   const knownTools = deps.mcpTools.map((t) => t.function.name);
-  // PlanSchema is rebuilt once per planner instance — tool/skill enums
+  // WorkflowSchema is rebuilt once per compiler instance — tool/skill enums
   // are baked in. If MCP picks up a new tool at runtime, re-create the
-  // planner (or accept that the new tool can't appear in plans until
-  // restart). The supervisor builds the planner at engine startup, so
+  // compiler (or accept that the new tool can't appear in workflows until
+  // restart). The supervisor builds the compiler at engine startup, so
   // this matches process lifecycle.
-  const { PlanSchema } = createPlanSchema({
+  const { WorkflowSchema } = createWorkflowSchema({
     knownTools,
     knownSkills: deps.knownSkills,
   });
@@ -90,18 +92,18 @@ export function createPlanner(deps: PlannerDeps): Planner {
   const toolSignatures = deps.mcpTools.map(renderToolSignature);
 
   return {
-    async plan(req) {
-      const skill = await deps.readSkill(PLANNER_SKILL_NAME);
+    async compile(req) {
+      const skill = await deps.readSkill(COMPILER_SKILL_NAME);
       if (skill === null) {
         return {
           ok: false,
           reason: "skill_not_found",
-          errors: [`planner skill "${PLANNER_SKILL_NAME}" not found`],
+          errors: [`compiler skill "${COMPILER_SKILL_NAME}" not found`],
           attempts: 0,
         };
       }
 
-      const preset = deps.engine.presets[PLANNER_PRESET];
+      const preset = deps.engine.presets[COMPILER_PRESET];
       const provider = deps.engine.resolveProvider(preset.model);
 
       const initialUserPrompt = renderUserPrompt(req, deps, toolSignatures);
@@ -110,9 +112,11 @@ export function createPlanner(deps: PlannerDeps): Planner {
         { role: "user", content: initialUserPrompt },
       ];
 
-      const plannerSpan = req.parentTrace.span({
+      const compileSpan = req.parentTrace.span({
+        // Span name kept as "planner" for trace continuity with
+        // pre-rename Langfuse history — do not change to "compile".
         name: "planner",
-        input: { preset: PLANNER_PRESET, model: preset.model },
+        input: { preset: COMPILER_PRESET, model: preset.model },
         metadata: { signal_source: req.signal.source },
       });
 
@@ -121,13 +125,13 @@ export function createPlanner(deps: PlannerDeps): Planner {
           provider.client,
           preset,
           messages,
-          PlanSchema,
-          plannerSpan,
+          WorkflowSchema,
+          compileSpan,
           maxAttempts,
         );
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
-        plannerSpan.end({ level: "ERROR", statusMessage: message });
+        compileSpan.end({ level: "ERROR", statusMessage: message });
         throw err;
       }
     },
@@ -139,18 +143,18 @@ async function runRetryLoop(
   preset: ModelPreset,
   messages: ChatCompletionMessageParam[],
   // Avoid importing the schema type just for the parameter signature.
-  // `unknown` here is fine — parsePlan accepts any ZodTypeAny.
-  schema: Parameters<typeof parsePlan>[1],
-  plannerSpan: Span,
+  // `unknown` here is fine — parseWorkflow accepts any ZodTypeAny.
+  schema: Parameters<typeof parseWorkflow>[1],
+  compileSpan: Span,
   maxAttempts: number,
-): Promise<PlannerResult> {
+): Promise<CompilerResult> {
   let attempts = 0;
   let lastErrors: string[] = [];
 
   while (attempts < maxAttempts) {
     attempts++;
 
-    const gen = plannerSpan.generation({
+    const gen = compileSpan.generation({
       name: `attempt-${attempts}`,
       model: preset.model,
       input: messages,
@@ -183,7 +187,7 @@ async function runRetryLoop(
         level: "ERROR",
         statusMessage: message,
       });
-      plannerSpan.end({
+      compileSpan.end({
         level: "ERROR",
         statusMessage: message,
         output: { reason: "llm_error", attempts },
@@ -201,17 +205,17 @@ async function runRetryLoop(
       continue;
     }
 
-    const result = parsePlan(parsed, schema);
+    const result = parseWorkflow(parsed, schema);
     if (result.ok) {
-      plannerSpan.end({ output: { attempts, ok: true } });
-      return { ok: true, plan: result.plan, attempts };
+      compileSpan.end({ output: { attempts, ok: true } });
+      return { ok: true, workflow: result.workflow, attempts };
     }
 
     lastErrors = result.errors;
     pushRetryFeedback(messages, text, lastErrors);
   }
 
-  plannerSpan.end({
+  compileSpan.end({
     level: "ERROR",
     statusMessage: "exhausted retries",
     output: { reason: "max_retries", lastErrors, attempts },
@@ -235,17 +239,17 @@ function pushRetryFeedback(
   messages.push({
     role: "user",
     content: [
-      "Your previous plan failed validation. Errors:",
+      "Your previous workflow failed validation. Errors:",
       ...errors.map((e) => `  - ${e}`),
       "",
-      "Emit a corrected plan. Return ONLY the JSON, no markdown wrapper.",
+      "Emit a corrected workflow. Return ONLY the JSON, no markdown wrapper.",
     ].join("\n"),
   });
 }
 
 function renderUserPrompt(
-  req: PlanRequest,
-  deps: PlannerDeps,
+  req: CompileRequest,
+  deps: CompilerDeps,
   toolSignatures: string[],
 ): string {
   const lines: string[] = [];
@@ -295,14 +299,14 @@ function renderUserPrompt(
   lines.push("");
 
   lines.push(
-    "Emit a Plan as JSON matching the DSL. Return ONLY the JSON, no markdown wrapper.",
+    "Emit a Workflow as JSON matching the DSL. Return ONLY the JSON, no markdown wrapper.",
   );
 
   return lines.join("\n");
 }
 
 // Compact `name(arg: type, opt?: type) — description` line per tool.
-// Keeps the prompt small while giving the planner enough to use the
+// Keeps the prompt small while giving the compiler enough to use the
 // right parameter names — without this it falls back on training-data
 // conventions (e.g. `limit` instead of `k`) and silently produces
 // invalid args that MCP may or may not accept.
@@ -333,7 +337,7 @@ function truncate(s: string, max: number): string {
 }
 
 // Best-effort JSON-Schema → short type string. We don't aim for
-// completeness — the planner LLM just needs enough to pick the right
+// completeness — the compiler LLM just needs enough to pick the right
 // parameter name and shape. Unknown / weird shapes fall through to
 // "any" rather than blocking.
 function simplifyJsonSchemaType(schema: unknown): string {

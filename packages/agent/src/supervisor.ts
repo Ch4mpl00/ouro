@@ -2,12 +2,10 @@ import "dotenv/config";
 import type { ChatCompletionMessageParam } from "openai/resources/chat/completions";
 import { createEngine, type Engine } from "./engine";
 import { DEFAULT_PRESETS } from "./models";
-import { createPlanner, type Planner } from "./planner/planner";
-import { createRunner, type Runner } from "./planner/runner";
-import { createStore } from "./planner/substitute";
 import { buildSessionContext, gatherEnvData, type EnvData } from "./session-context";
 import { listSkills, readSkill } from "./skills";
 import type { Trace } from "./tracing";
+import { createWorkflow, type Workflow } from "./workflow";
 
 // Long-running process. The agent has no signal sources of its own — every
 // external event (Telegram, Gmail, cron, webhook) lives inside the MCP
@@ -16,14 +14,15 @@ import type { Trace } from "./tracing";
 //   loop forever:
 //     {signal, pendingAfter} = mcp.get_next_signal
 //     if signal is null: sleep
-//     else: run signal through planner → runner; fall back to a plain
-//           Session if the planner can't produce a valid plan.
+//     else: run signal through the workflow (compile → execute); fall
+//           back to a plain Session if compilation can't produce a
+//           valid workflow.
 //
-// The planner-then-runner path is the default for every signal. The
-// session fallback only fires when (a) the planner's LLM crashes /
-// retries are exhausted, or (b) the runner aborts mid-plan with an
-// error — in which case we either degrade to the existing agent loop
-// (planner failure) or report via `recovery` (runner failure).
+// The workflow path is the default for every signal. The session
+// fallback only fires when (a) the compiler's LLM crashes / retries are
+// exhausted, or (b) the executor aborts mid-workflow with an error — in
+// which case we either degrade to the existing agent loop (compile
+// failure) or report via `recovery` (execute failure).
 
 const POLL_INTERVAL_MS = 2_000;
 
@@ -48,9 +47,10 @@ function buildPromptPrefix(sessionContext: string, envContext: string | null): s
   return envContext ? `${sessionContext}\n\n---\n\n${envContext}` : sessionContext;
 }
 
-// Returns just the skill body (or null) — matches the surface both
-// the runner and the planner depend on. The full SkillFile shape (with
-// frontmatter tools list) stays internal to engine.startSession.
+// Returns just the skill body (or null) — matches the surface the
+// workflow facade (compiler + executor) depends on. The full SkillFile
+// shape (with frontmatter tools list) stays internal to
+// engine.startSession.
 async function readSkillBody(name: string): Promise<string | null> {
   const s = await readSkill(name);
   return s?.body ?? null;
@@ -59,14 +59,13 @@ async function readSkillBody(name: string): Promise<string | null> {
 async function runSignal(
   engine: Engine,
   signal: PendingSignal,
-  planner: Planner,
-  runner: Runner,
+  workflow: Workflow,
 ): Promise<void> {
   const signalLabel = `${signal.source}:${signal.id}`;
   const envData = await gatherEnvData(engine);
 
-  // One trace per signal — owns the planner, the runner, and (if we
-  // fall back) the session. Same sessionId so the Langfuse Sessions
+  // One trace per signal — owns the workflow (compile + execute) and (if
+  // we fall back) the session. Same sessionId so the Langfuse Sessions
   // view groups them.
   const trace = engine.tracer.trace({
     id: signalLabel,
@@ -81,62 +80,34 @@ async function runSignal(
   });
 
   try {
-    const planResult = await planner.plan({
-      signal: {
-        source: signal.source,
-        content: signal.content,
-        envContext: signal.envContext,
-      },
-      envData,
-      parentTrace: trace,
-      signalLabel,
-    });
+    const result = await workflow.runForSignal(signal, envData, trace, signalLabel);
 
-    if (!planResult.ok) {
+    if (!result.ok && result.stage === "compile") {
       console.warn(
-        `[supervisor] signal #${signal.id} planner ${planResult.reason} (attempts=${planResult.attempts}), falling back to agentic session`,
+        `[supervisor] signal #${signal.id} compile ${result.reason} (attempts=${result.attempts}), falling back to agentic session`,
       );
-      for (const err of planResult.errors.slice(0, 3)) {
+      for (const err of result.errors.slice(0, 3)) {
         console.warn(`[supervisor]   - ${err}`);
       }
       await runFallbackSession(engine, signal, envData, trace);
       return;
     }
 
-    console.log(
-      `[supervisor] signal #${signal.id} plan ready (attempts=${planResult.attempts}, steps=${planResult.plan.steps.length})`,
-    );
-
-    const store = createStore({
-      env: {
-        timezone: envData.timezone,
-        now: envData.now.toISOString(),
-        newsLastReadAt: envData.newsLastReadAt,
-        userEmail: envData.userEmail,
-      },
-      signal: {
-        source: signal.source,
-        content: signal.content,
-        id: signal.id,
-      },
-    });
-
-    const runResult = await runner.run(planResult.plan, {
-      store,
-      parentTrace: trace,
-      signalLabel,
-    });
-
-    if (!runResult.ok) {
+    if (!result.ok) {
       console.error(
-        `[supervisor] signal #${signal.id} runner ${runResult.reason} at step ${runResult.stepIndex}: ${runResult.error.message}`,
+        `[supervisor] signal #${signal.id} execute ${result.reason} at step ${result.stepIndex}: ${result.error.message}`,
       );
-      await reportRunnerFailureToUser(engine, signal, runResult.error, trace).catch(
+      await reportRunnerFailureToUser(engine, signal, result.error, trace).catch(
         (err) => {
           console.error(`[supervisor] recovery for ${signalLabel} also failed:`, err);
         },
       );
+      return;
     }
+
+    console.log(
+      `[supervisor] signal #${signal.id} workflow ok (attempts=${result.attempts}, steps=${result.stepCount})`,
+    );
   } catch (err) {
     console.error(`[supervisor] signal #${signal.id} unexpected error:`, err);
     await reportRunnerFailureToUser(engine, signal, err, trace).catch((err2) => {
@@ -307,33 +278,28 @@ async function main(): Promise<void> {
 
   console.log(`[supervisor] mcp tools: ${engine.mcp.tools.map((t) => t.function.name).join(", ")}`);
 
-  // Build planner once at startup: tool & skill names baked into the
-  // plan schema's enums. New tools / skills require an agent restart
-  // to be plan-emittable. The full MCP tool definitions go in so the
-  // planner can render compact `name(arg: type, ...)` signatures in
-  // its user prompt — without those the planner guesses parameter
-  // names from training-data conventions and produces invalid args.
+  // Build the workflow facade once at startup: tool & skill names baked
+  // into the compiler's schema enums. New tools / skills require an agent
+  // restart to be emittable. The full MCP tool definitions go in so the
+  // compiler can render compact `name(arg: type, ...)` signatures in its
+  // user prompt — without those it guesses parameter names from
+  // training-data conventions and produces invalid args.
   const skillEntries = await listSkills();
-  // Exclude `planner` itself (it's the system prompt) and `routing`
-  // (engine-level meta-skill, not directly invokable).
+  // Exclude `planner` itself (it's the compiler's system prompt) and
+  // `routing` (engine-level meta-skill, not directly invokable).
   const knownSkills = skillEntries
     .map((s) => s.name)
     .filter((n) => n !== "planner" && n !== "routing");
 
   console.log(
-    `[supervisor] planner: ${engine.mcp.tools.length} tools, ${knownSkills.length} skills`,
+    `[supervisor] workflow: ${engine.mcp.tools.length} tools, ${knownSkills.length} skills`,
   );
 
-  const planner = createPlanner({
+  const workflow = createWorkflow({
     engine,
     readSkill: readSkillBody,
     mcpTools: engine.mcp.tools,
     knownSkills,
-  });
-
-  const runner = createRunner({
-    engine,
-    readSkill: readSkillBody,
   });
 
   let stopping = false;
@@ -361,7 +327,7 @@ async function main(): Promise<void> {
       console.log(
         `[supervisor] signal #${result.signal.id} source=${result.signal.source} (${result.pendingAfter} pending after)`,
       );
-      await runSignal(engine, result.signal, planner, runner);
+      await runSignal(engine, result.signal, workflow);
     } catch (err) {
       console.error("[supervisor] loop error:", err);
       await sleep(POLL_INTERVAL_MS);

@@ -4,14 +4,14 @@ import type { ChatCompletionMessageParam } from "openai/resources/chat/completio
 import type { ModelPreset, PresetName } from "../models";
 import type { SessionOpts } from "../session";
 import type { Generation, Span, Trace, TraceContext } from "../tracing";
-import { createPlanSchema, type Plan } from "./dsl";
+import { createWorkflowSchema, type Workflow } from "./dsl";
 import {
-  createRunner,
+  createExecutor,
   type EngineSurface,
   type SubSessionHandle,
   __testing,
-} from "./runner";
-import { createStore } from "./substitute";
+} from "./execute";
+import { createStore } from "./variables";
 
 // ─── shared mocks ────────────────────────────────────────────────────
 
@@ -152,16 +152,16 @@ const baseCtx = () => ({
 
 // ─── tests ───────────────────────────────────────────────────────────
 
-describe("runner.run — tool step", () => {
+describe("executor.execute — tool step", () => {
   it("calls mcp.callTool with substituted args and binds parsed JSON result", async () => {
     const engine = makeMockEngine({
       toolResponses: {
         list_news: JSON.stringify({ count: 2, items: [{ id: 1 }, { id: 2 }] }),
       },
     });
-    const runner = createRunner({ engine, readSkill: nullReadSkill() });
+    const executor = createExecutor({ engine, readSkill: nullReadSkill() });
 
-    const plan: Plan = {
+    const plan: Workflow = {
       version: 1,
       steps: [
         {
@@ -175,7 +175,7 @@ describe("runner.run — tool step", () => {
     };
 
     const ctx = baseCtx();
-    const r = await runner.run(plan, ctx);
+    const r = await executor.execute(plan, ctx);
 
     expect(r.ok).toBe(true);
     expect(engine.toolCalls).toEqual([
@@ -191,8 +191,8 @@ describe("runner.run — tool step", () => {
     const engine = makeMockEngine({
       toolResponses: { set_memory: "ok" },
     });
-    const runner = createRunner({ engine, readSkill: nullReadSkill() });
-    const r = await runner.run(
+    const executor = createExecutor({ engine, readSkill: nullReadSkill() });
+    const r = await executor.execute(
       {
         version: 1,
         steps: [
@@ -209,9 +209,9 @@ describe("runner.run — tool step", () => {
     const engine = makeMockEngine({
       toolResponses: { ping: "pong" },
     });
-    const runner = createRunner({ engine, readSkill: nullReadSkill() });
+    const executor = createExecutor({ engine, readSkill: nullReadSkill() });
     const ctx = baseCtx();
-    await runner.run(
+    await executor.execute(
       {
         version: 1,
         steps: [
@@ -228,8 +228,8 @@ describe("runner.run — tool step", () => {
     const engine = makeMockEngine({
       toolResponses: { broken_tool: "[tool error] something broke" },
     });
-    const runner = createRunner({ engine, readSkill: nullReadSkill() });
-    const r = await runner.run(
+    const executor = createExecutor({ engine, readSkill: nullReadSkill() });
+    const r = await executor.execute(
       {
         version: 1,
         steps: [
@@ -249,8 +249,8 @@ describe("runner.run — tool step", () => {
 
   it("missing binding in args surfaces as missing_binding reason", async () => {
     const engine = makeMockEngine();
-    const runner = createRunner({ engine, readSkill: nullReadSkill() });
-    const r = await runner.run(
+    const executor = createExecutor({ engine, readSkill: nullReadSkill() });
+    const r = await executor.execute(
       {
         version: 1,
         steps: [
@@ -272,17 +272,17 @@ describe("runner.run — tool step", () => {
   });
 });
 
-describe("runner.run — llm_compose step", () => {
+describe("executor.execute — llm_compose step", () => {
   it("loads skill as system, builds user from prompt + XML input, calls LLM without tools", async () => {
     const engine = makeMockEngine({ llmResponses: ["composed digest"] });
-    const runner = createRunner({
+    const executor = createExecutor({
       engine,
       readSkill: fixedReadSkill({ "news-digest": "RULES go here" }),
     });
 
     const ctx = baseCtx();
     ctx.store.set("posts", [{ id: 1 }]);
-    const r = await runner.run(
+    const r = await executor.execute(
       {
         version: 1,
         steps: [
@@ -317,10 +317,10 @@ describe("runner.run — llm_compose step", () => {
 
   it("works with prompt-only (no skill)", async () => {
     const engine = makeMockEngine({ llmResponses: ["A: 5"] });
-    const runner = createRunner({ engine, readSkill: nullReadSkill() });
+    const executor = createExecutor({ engine, readSkill: nullReadSkill() });
     const ctx = baseCtx();
     ctx.store.set("question", "what is 2+3");
-    const r = await runner.run(
+    const r = await executor.execute(
       {
         version: 1,
         steps: [
@@ -347,10 +347,10 @@ describe("runner.run — llm_compose step", () => {
 
   it("appends XML blocks after prompt when both are present", async () => {
     const engine = makeMockEngine({ llmResponses: ["ok"] });
-    const runner = createRunner({ engine, readSkill: nullReadSkill() });
+    const executor = createExecutor({ engine, readSkill: nullReadSkill() });
     const ctx = baseCtx();
     ctx.store.set("items", ["a", "b"]);
-    await runner.run(
+    await executor.execute(
       {
         version: 1,
         steps: [
@@ -374,8 +374,8 @@ describe("runner.run — llm_compose step", () => {
 
   it("skill_not_found when skill is named but readSkill returns null", async () => {
     const engine = makeMockEngine();
-    const runner = createRunner({ engine, readSkill: nullReadSkill() });
-    const r = await runner.run(
+    const executor = createExecutor({ engine, readSkill: nullReadSkill() });
+    const r = await executor.execute(
       {
         version: 1,
         steps: [
@@ -396,13 +396,13 @@ describe("runner.run — llm_compose step", () => {
   });
 });
 
-describe("runner.run — llm_agent step", () => {
+describe("executor.execute — llm_agent step", () => {
   it("spawns child session with toolWhitelist and binds result", async () => {
     const engine = makeMockEngine({ sessionResults: ["agent answer"] });
-    const runner = createRunner({ engine, readSkill: nullReadSkill() });
+    const executor = createExecutor({ engine, readSkill: nullReadSkill() });
     const ctx = baseCtx();
     ctx.store.set("query", "что в Одессе");
-    const r = await runner.run(
+    const r = await executor.execute(
       {
         version: 1,
         steps: [
@@ -435,8 +435,8 @@ describe("runner.run — llm_agent step", () => {
 
   it("ends the spawned session on success", async () => {
     const engine = makeMockEngine({ sessionResults: ["x"] });
-    const runner = createRunner({ engine, readSkill: nullReadSkill() });
-    await runner.run(
+    const executor = createExecutor({ engine, readSkill: nullReadSkill() });
+    await executor.execute(
       {
         version: 1,
         steps: [
@@ -470,8 +470,8 @@ describe("runner.run — llm_agent step", () => {
         },
       };
     };
-    const runner = createRunner({ engine, readSkill: nullReadSkill() });
-    const r = await runner.run(
+    const executor = createExecutor({ engine, readSkill: nullReadSkill() });
+    const r = await executor.execute(
       {
         version: 1,
         steps: [
@@ -494,7 +494,7 @@ describe("runner.run — llm_agent step", () => {
   });
 });
 
-describe("runner.run — parallel step", () => {
+describe("executor.execute — parallel step", () => {
   it("runs children concurrently and binds each", async () => {
     const order: string[] = [];
     const engine = makeMockEngine({
@@ -509,9 +509,9 @@ describe("runner.run — parallel step", () => {
         },
       },
     });
-    const runner = createRunner({ engine, readSkill: nullReadSkill() });
+    const executor = createExecutor({ engine, readSkill: nullReadSkill() });
     const ctx = baseCtx();
-    const r = await runner.run(
+    const r = await executor.execute(
       {
         version: 1,
         steps: [
@@ -543,8 +543,8 @@ describe("runner.run — parallel step", () => {
         bad: "[tool error] nope",
       },
     });
-    const runner = createRunner({ engine, readSkill: nullReadSkill() });
-    const r = await runner.run(
+    const executor = createExecutor({ engine, readSkill: nullReadSkill() });
+    const r = await executor.execute(
       {
         version: 1,
         steps: [
@@ -568,14 +568,14 @@ describe("runner.run — parallel step", () => {
   });
 });
 
-describe("runner.run — terminal and end-of-list", () => {
+describe("executor.execute — terminal and end-of-list", () => {
   it("stops at explicit terminal mid-plan", async () => {
     const engine = makeMockEngine({
       toolResponses: { a: "A", b: "B" },
     });
-    const runner = createRunner({ engine, readSkill: nullReadSkill() });
+    const executor = createExecutor({ engine, readSkill: nullReadSkill() });
     const ctx = baseCtx();
-    const r = await runner.run(
+    const r = await executor.execute(
       {
         version: 1,
         steps: [
@@ -596,9 +596,9 @@ describe("runner.run — terminal and end-of-list", () => {
     const engine = makeMockEngine({
       toolResponses: { a: "A" },
     });
-    const runner = createRunner({ engine, readSkill: nullReadSkill() });
+    const executor = createExecutor({ engine, readSkill: nullReadSkill() });
     const ctx = baseCtx();
-    const r = await runner.run(
+    const r = await executor.execute(
       {
         version: 1,
         steps: [{ kind: "tool", tool: "a", args: {}, bind: "x" }],
@@ -610,13 +610,13 @@ describe("runner.run — terminal and end-of-list", () => {
   });
 });
 
-describe("runner.run — duplicate binding", () => {
+describe("executor.execute — duplicate binding", () => {
   it("surfaces duplicate_binding reason", async () => {
     const engine = makeMockEngine({
       toolResponses: { a: "A", b: "B" },
     });
-    const runner = createRunner({ engine, readSkill: nullReadSkill() });
-    const r = await runner.run(
+    const executor = createExecutor({ engine, readSkill: nullReadSkill() });
+    const r = await executor.execute(
       {
         version: 1,
         steps: [
@@ -635,7 +635,7 @@ describe("runner.run — duplicate binding", () => {
   });
 });
 
-describe("runner.run — end-to-end fixture", () => {
+describe("executor.execute — end-to-end fixture", () => {
   it("runs a news-digest-shaped plan to completion", async () => {
     const engine = makeMockEngine({
       toolResponses: {
@@ -646,7 +646,7 @@ describe("runner.run — end-to-end fixture", () => {
       },
       llmResponses: ["📰 Новости · 3 июня\n• fake digest"],
     });
-    const runner = createRunner({
+    const executor = createExecutor({
       engine,
       readSkill: fixedReadSkill({ "news-digest": "DIGEST RULES" }),
     });
@@ -655,7 +655,7 @@ describe("runner.run — end-to-end fixture", () => {
     ctx.store.set("watermark", "2026-06-02T18:00:00Z");
     ctx.store.set("now", "2026-06-03T05:05:00Z");
 
-    const plan: Plan = {
+    const plan: Workflow = {
       version: 1,
       steps: [
         {
@@ -701,8 +701,8 @@ describe("runner.run — end-to-end fixture", () => {
       ],
     };
 
-    // Validate plan against the schema first, like the real planner would.
-    const { PlanSchema } = createPlanSchema({
+    // Validate plan against the schema first, like the real compiler would.
+    const { WorkflowSchema } = createWorkflowSchema({
       knownTools: [
         "list_news",
         "get_telegram_chat_history",
@@ -711,9 +711,9 @@ describe("runner.run — end-to-end fixture", () => {
       ],
       knownSkills: ["news-digest"],
     });
-    expect(PlanSchema.safeParse(plan).success).toBe(true);
+    expect(WorkflowSchema.safeParse(plan).success).toBe(true);
 
-    const r = await runner.run(plan, ctx);
+    const r = await executor.execute(plan, ctx);
     expect(r.ok).toBe(true);
     expect(ctx.store.get("digest")).toContain("📰 Новости");
 

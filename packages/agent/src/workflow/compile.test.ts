@@ -6,7 +6,7 @@ import type {
 } from "openai/resources/chat/completions";
 import type { ModelPreset, PresetName } from "../models";
 import type { Generation, Span, Trace, TraceContext } from "../tracing";
-import { createPlanner, type PlanRequest } from "./planner";
+import { createCompiler, type CompileRequest } from "./compile";
 
 const PRESETS: Record<PresetName, ModelPreset> = {
   base: { model: "gpt-5.4-mini", reasoningEffort: "disabled" },
@@ -82,7 +82,7 @@ function makeEngineSurface(client: OpenAI) {
   };
 }
 
-function makeReq(): PlanRequest {
+function makeReq(): CompileRequest {
   return {
     signal: {
       source: "telegram",
@@ -151,34 +151,34 @@ const FAKE_TOOLS: ChatCompletionTool[] = [
 ];
 const FAKE_SKILLS = ["telegram", "news-digest"];
 
-describe("planner.plan — happy path", () => {
+describe("compiler.compile — happy path", () => {
   it("returns ok with parsed plan on first valid response", async () => {
     const { client, calls } = makeMockClient({ llmReplies: [VALID_PLAN_JSON] });
-    const planner = createPlanner({
+    const compiler = createCompiler({
       engine: makeEngineSurface(client),
       readSkill: async () => "PLANNER RULES",
       mcpTools: FAKE_TOOLS,
       knownSkills: FAKE_SKILLS,
     });
 
-    const r = await planner.plan(makeReq());
+    const r = await compiler.compile(makeReq());
     expect(r.ok).toBe(true);
     if (r.ok) {
       expect(r.attempts).toBe(1);
-      expect(r.plan.steps[0]?.kind).toBe("llm_agent");
+      expect(r.workflow.steps[0]?.kind).toBe("llm_agent");
     }
     expect(calls.length).toBe(1);
   });
 
   it("user prompt includes signal, env, envContext, tools, skills as XML blocks", async () => {
     const { client, calls } = makeMockClient({ llmReplies: [VALID_PLAN_JSON] });
-    const planner = createPlanner({
+    const compiler = createCompiler({
       engine: makeEngineSurface(client),
       readSkill: async () => "PLANNER RULES",
       mcpTools: FAKE_TOOLS,
       knownSkills: FAKE_SKILLS,
     });
-    await planner.plan(makeReq());
+    await compiler.compile(makeReq());
 
     const messages = calls[0]!.messages;
     expect(messages[0]?.role).toBe("system");
@@ -193,7 +193,7 @@ describe("planner.plan — happy path", () => {
     expect(userText).toContain("285083560");
     expect(userText).toContain("<tools>");
     // Compact signature format with required/optional param names and
-    // types — exactly what the planner needs to use the right keys
+    // types — exactly what the compiler needs to use the right keys
     // (e.g. `k` not `limit`, `sinceISO` for date filters).
     expect(userText).toMatch(
       /- search_news\(query: string, k\?: number, sinceISO\?: string\)/,
@@ -204,13 +204,13 @@ describe("planner.plan — happy path", () => {
 
   it("tool signatures expose required vs optional params correctly", async () => {
     const { client, calls } = makeMockClient({ llmReplies: [VALID_PLAN_JSON] });
-    const planner = createPlanner({
+    const compiler = createCompiler({
       engine: makeEngineSurface(client),
       readSkill: async () => "RULES",
       mcpTools: FAKE_TOOLS,
       knownSkills: FAKE_SKILLS,
     });
-    await planner.plan(makeReq());
+    await compiler.compile(makeReq());
     const userText = calls[0]!.messages[1]?.content as string;
     // chatId + text are required, so no `?`
     expect(userText).toMatch(
@@ -220,13 +220,13 @@ describe("planner.plan — happy path", () => {
 
   it("uses the smartest preset's model in the request", async () => {
     const { client, calls } = makeMockClient({ llmReplies: [VALID_PLAN_JSON] });
-    const planner = createPlanner({
+    const compiler = createCompiler({
       engine: makeEngineSurface(client),
       readSkill: async () => "RULES",
       mcpTools: FAKE_TOOLS,
       knownSkills: FAKE_SKILLS,
     });
-    await planner.plan(makeReq());
+    await compiler.compile(makeReq());
     // The OpenAI request body shape — verified indirectly via the
     // recordingClient capturing messages; model verification belongs in
     // an integration test, so we just sanity-check we got through.
@@ -234,16 +234,16 @@ describe("planner.plan — happy path", () => {
   });
 });
 
-describe("planner.plan — skill missing", () => {
+describe("compiler.compile — skill missing", () => {
   it("returns skill_not_found without calling the LLM", async () => {
     const { client, calls } = makeMockClient({ llmReplies: [] });
-    const planner = createPlanner({
+    const compiler = createCompiler({
       engine: makeEngineSurface(client),
       readSkill: async () => null,
       mcpTools: FAKE_TOOLS,
       knownSkills: FAKE_SKILLS,
     });
-    const r = await planner.plan(makeReq());
+    const r = await compiler.compile(makeReq());
     expect(r.ok).toBe(false);
     if (!r.ok) {
       expect(r.reason).toBe("skill_not_found");
@@ -253,17 +253,17 @@ describe("planner.plan — skill missing", () => {
   });
 });
 
-describe("planner.plan — LLM error", () => {
+describe("compiler.compile — LLM error", () => {
   it("returns llm_error and stops without retrying", async () => {
     const err = new Error("rate limit");
     const { client, calls } = makeMockClient({ llmReplies: [err] });
-    const planner = createPlanner({
+    const compiler = createCompiler({
       engine: makeEngineSurface(client),
       readSkill: async () => "RULES",
       mcpTools: FAKE_TOOLS,
       knownSkills: FAKE_SKILLS,
     });
-    const r = await planner.plan(makeReq());
+    const r = await compiler.compile(makeReq());
     expect(r.ok).toBe(false);
     if (!r.ok) {
       expect(r.reason).toBe("llm_error");
@@ -274,18 +274,18 @@ describe("planner.plan — LLM error", () => {
   });
 });
 
-describe("planner.plan — retry loop", () => {
+describe("compiler.compile — retry loop", () => {
   it("retries on invalid JSON with error feedback", async () => {
     const { client, calls } = makeMockClient({
       llmReplies: ["not json", VALID_PLAN_JSON],
     });
-    const planner = createPlanner({
+    const compiler = createCompiler({
       engine: makeEngineSurface(client),
       readSkill: async () => "RULES",
       mcpTools: FAKE_TOOLS,
       knownSkills: FAKE_SKILLS,
     });
-    const r = await planner.plan(makeReq());
+    const r = await compiler.compile(makeReq());
     expect(r.ok).toBe(true);
     if (r.ok) expect(r.attempts).toBe(2);
 
@@ -310,13 +310,13 @@ describe("planner.plan — retry loop", () => {
     const { client, calls } = makeMockClient({
       llmReplies: [invalidPlanJson, VALID_PLAN_JSON],
     });
-    const planner = createPlanner({
+    const compiler = createCompiler({
       engine: makeEngineSurface(client),
       readSkill: async () => "RULES",
       mcpTools: FAKE_TOOLS,
       knownSkills: FAKE_SKILLS,
     });
-    const r = await planner.plan(makeReq());
+    const r = await compiler.compile(makeReq());
     expect(r.ok).toBe(true);
     if (r.ok) expect(r.attempts).toBe(2);
 
@@ -337,14 +337,14 @@ describe("planner.plan — retry loop", () => {
     const { client } = makeMockClient({
       llmReplies: [invalidPlanJson, invalidPlanJson, invalidPlanJson],
     });
-    const planner = createPlanner({
+    const compiler = createCompiler({
       engine: makeEngineSurface(client),
       readSkill: async () => "RULES",
       mcpTools: FAKE_TOOLS,
       knownSkills: FAKE_SKILLS,
       maxAttempts: 3,
     });
-    const r = await planner.plan(makeReq());
+    const r = await compiler.compile(makeReq());
     expect(r.ok).toBe(false);
     if (!r.ok) {
       expect(r.reason).toBe("schema_invalid");
@@ -357,14 +357,14 @@ describe("planner.plan — retry loop", () => {
     const { client } = makeMockClient({
       llmReplies: ["not json", "still not json", "definitely not"],
     });
-    const planner = createPlanner({
+    const compiler = createCompiler({
       engine: makeEngineSurface(client),
       readSkill: async () => "RULES",
       mcpTools: FAKE_TOOLS,
       knownSkills: FAKE_SKILLS,
       maxAttempts: 3,
     });
-    const r = await planner.plan(makeReq());
+    const r = await compiler.compile(makeReq());
     expect(r.ok).toBe(false);
     if (!r.ok) {
       expect(r.reason).toBe("invalid_json");
@@ -374,14 +374,14 @@ describe("planner.plan — retry loop", () => {
 
   it("respects custom maxAttempts (1 = no retries)", async () => {
     const { client } = makeMockClient({ llmReplies: ["not json"] });
-    const planner = createPlanner({
+    const compiler = createCompiler({
       engine: makeEngineSurface(client),
       readSkill: async () => "RULES",
       mcpTools: FAKE_TOOLS,
       knownSkills: FAKE_SKILLS,
       maxAttempts: 1,
     });
-    const r = await planner.plan(makeReq());
+    const r = await compiler.compile(makeReq());
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.attempts).toBe(1);
   });
