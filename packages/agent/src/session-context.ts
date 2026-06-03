@@ -57,12 +57,36 @@ async function readTimezone(engine: Engine): Promise<string> {
   }
 }
 
-export async function buildSessionContext(engine: Engine): Promise<string> {
-  const [tz] = await Promise.all([readTimezone(engine)]);
-  return render({
+// Structured env data — single source of truth for both the supervisor
+// (markdown context block) and the planner runner (variable store
+// initial value under the `env` key). When this shape changes, both
+// consumers update at once.
+export interface EnvData {
+  now: Date;
+  timezone: string;
+  userEmail: string | null;
+  newsLastReadAt: string | null;
+}
+
+export async function gatherEnvData(engine: Engine): Promise<EnvData> {
+  const tz = await readTimezone(engine);
+  return {
     now: new Date(),
-    tz,
+    timezone: tz,
     userEmail: process.env.USER_EMAIL ?? null,
     newsLastReadAt: getMemory(MEMORY_KEYS.newsLastReadAt),
+  };
+}
+
+export async function buildSessionContext(
+  engine: Engine,
+  precomputed?: EnvData,
+): Promise<string> {
+  const env = precomputed ?? (await gatherEnvData(engine));
+  return render({
+    now: env.now,
+    tz: env.timezone,
+    userEmail: env.userEmail,
+    newsLastReadAt: env.newsLastReadAt,
   });
 }

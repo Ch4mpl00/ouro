@@ -43,6 +43,12 @@ export interface SessionOpts {
   // regardless of frontmatter. `null` means "no filter, all MCP tools
   // available" (used when any loaded skill has `tools: *`).
   allowedTools?: Set<string> | null;
+  // Caller-side narrowing of the effective tool set, intersected with
+  // the engine-resolved `allowedTools` from skills. Used by the planner
+  // runner to enforce a per-step `llm_agent` tool whitelist on top of
+  // what the skill already allows. Engine applies the intersection at
+  // `startSession` time; callers don't touch `allowedTools` directly.
+  toolWhitelist?: Set<string>;
   // Opt out of engine-level meta-skill (`routing`) for this session.
   // Default true. Sub-agents set this to false so they get only the
   // focused per-task skill set without the always-on parent extras.

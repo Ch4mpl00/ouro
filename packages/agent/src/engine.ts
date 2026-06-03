@@ -130,7 +130,22 @@ export class Engine {
 
     // Wildcard from ANY loaded skill collapses the union to "all MCP tools" —
     // expressed as a null allow-list (Session treats null as no filter).
-    const allowedTools = wildcard ? null : accumulated;
+    let allowedTools: Set<string> | null = wildcard ? null : accumulated;
+
+    // Caller-side narrowing on top of the skill-derived set. Planner
+    // runner passes a step's `tools: [...]` whitelist this way so the
+    // sub-agent sees an intersection of (skill says OK) ∩ (planner says
+    // OK). null skill-side means wildcard → fall back to the planner's
+    // list verbatim.
+    if (opts.toolWhitelist) {
+      if (allowedTools === null) {
+        allowedTools = new Set(opts.toolWhitelist);
+      } else {
+        allowedTools = new Set(
+          [...allowedTools].filter((t) => opts.toolWhitelist!.has(t)),
+        );
+      }
+    }
 
     const session = new Session(this, { ...opts, resolvedSkills, allowedTools });
     this.sessions.set(opts.id, session);
