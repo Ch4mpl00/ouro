@@ -1,10 +1,14 @@
 """MCP client.
 
 Connects to the MCP server and exposes its tools as native LangChain tools.
-``langchain-mcp-adapters`` does the schema mapping and response parsing:
-``get_tools()`` returns ready ``BaseTool`` objects that go straight into the
-agent. The thin ``McpHandle`` wrapper on top gives a single tools list plus a
-``call_tool(name, args)`` for direct calls from the workflow engine.
+
+We hold ONE persistent MCP session for the whole process. The MCP server's HTTP
+transport is built around a single long-lived session (see
+``packages/mcp/src/server.ts``: it connects one shared server instance per
+transport). ``MultiServerMCPClient.get_tools()`` would instead open a fresh
+session per tool call, which the server rejects with "Already connected to a
+transport" — so we bind the tools to one session via ``load_mcp_tools(session)``
+and keep it open.
 
 Two transports: ``http`` (Streamable HTTP to a remote server) and ``stdio``
 (spawns the TS server ``pnpm mcp:serve`` as a child process for local dev).
@@ -15,7 +19,6 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-from dataclasses import dataclass
 from typing import Any, Protocol
 
 from langchain_core.tools import BaseTool
@@ -32,10 +35,31 @@ class McpHandle(Protocol):
     async def close(self) -> None: ...
 
 
-@dataclass
+def _result_to_text(result: Any) -> str:
+    """Collapse a LangChain tool result to plain text.
+
+    langchain-mcp-adapters returns an MCP tool's content as a list of content
+    blocks (``[{"type": "text", "text": "<json>"}]``); some paths return a bare
+    string or a ToolMessage. Callers parse the text with ``json.loads``, so pull
+    the text payload out of whatever shape we get.
+    """
+    content = getattr(result, "content", result)  # unwrap ToolMessage
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        texts = [
+            b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text"
+        ]
+        if texts:
+            return "\n".join(texts)
+    return content if isinstance(content, str) else json.dumps(content, ensure_ascii=False)
+
+
 class _McpClient:
-    tools: list[BaseTool]
-    _by_name: dict[str, BaseTool]
+    def __init__(self, tools: list[BaseTool], session_cm: Any) -> None:
+        self.tools = tools
+        self._by_name = {t.name: t for t in tools}
+        self._session_cm = session_cm  # the persistent session context, held open
 
     @property
     def tool_names(self) -> list[str]:
@@ -45,20 +69,19 @@ class _McpClient:
         tool = self._by_name.get(name)
         if tool is None:
             return f"[tool error] unknown tool {name}"
-        result = await tool.ainvoke(args)
-        return result if isinstance(result, str) else json.dumps(result, ensure_ascii=False)
+        return _result_to_text(await tool.ainvoke(args))
 
-    async def close(self) -> None:  # MultiServerMCPClient manages sessions itself
-        pass
+    async def close(self) -> None:
+        try:
+            await self._session_cm.__aexit__(None, None, None)
+        except Exception:  # noqa: BLE001 — best-effort teardown
+            pass
 
 
-async def _connect(transport: str) -> McpHandle:
-    from langchain_mcp_adapters.client import MultiServerMCPClient
-
-    connections: dict[str, Any]
+def _connections(transport: str) -> dict[str, Any]:
     if transport == "stdio":
         project_root = os.environ.get("MCP_PROJECT_ROOT", os.getcwd())
-        connections = {
+        return {
             "integrations": {
                 "transport": "stdio",
                 "command": "pnpm",
@@ -66,12 +89,26 @@ async def _connect(transport: str) -> McpHandle:
                 "cwd": project_root,
             }
         }
-    else:
-        url = os.environ.get("MCP_URL", "http://localhost:3000/mcp")
-        connections = {"integrations": {"transport": "streamable_http", "url": url}}
-    client = MultiServerMCPClient(connections)
-    tools = await client.get_tools()
-    return _McpClient(tools=tools, _by_name={t.name: t for t in tools})
+    url = os.environ.get("MCP_URL", "http://localhost:3000/mcp")
+    return {"integrations": {"transport": "streamable_http", "url": url}}
+
+
+async def _connect(transport: str) -> McpHandle:
+    from langchain_mcp_adapters.client import MultiServerMCPClient
+    from langchain_mcp_adapters.tools import load_mcp_tools
+
+    client = MultiServerMCPClient(_connections(transport))
+    # One persistent, initialized session for the process lifetime. Entering the
+    # context manager manually (instead of `async with`) keeps it open across the
+    # supervisor's whole run; close() exits it on shutdown.
+    session_cm = client.session("integrations")
+    session = await session_cm.__aenter__()
+    try:
+        tools = await load_mcp_tools(session)
+    except BaseException:
+        await session_cm.__aexit__(None, None, None)
+        raise
+    return _McpClient(tools, session_cm)
 
 
 async def connect_mcp() -> McpHandle:
