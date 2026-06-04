@@ -3,7 +3,7 @@ import type { ChatCompletionMessageParam } from "openai/resources/chat/completio
 import type { ModelPreset, PresetName } from "../models";
 import type { SessionOpts } from "../session";
 import { SET_MEMORY_TOOL_NAME, SetMemoryArgsSchema } from "../synthetic-tools";
-import type { Span, TraceContext } from "../tracing";
+import type { Span, SpanKind, TraceContext } from "../tracing";
 import type {
   LlmAgentStep,
   LlmComposeStep,
@@ -112,6 +112,7 @@ export function createExecutor(deps: ExecutorDeps): Executor {
         // Span name kept as "runner" for trace continuity with
         // pre-rename Langfuse history — do not change to "execute".
         name: "runner",
+        kind: "chain",
         input: { stepCount: workflow.steps.length },
         metadata: { workflow_version: workflow.version },
       });
@@ -169,6 +170,7 @@ async function runOneStep(
 ): Promise<StepOutcome> {
   const span = parent.span({
     name: `step[${index}]:${step.kind}`,
+    kind: stepSpanKind(step.kind),
     metadata: stepMetadata(step),
   });
   try {
@@ -184,6 +186,23 @@ async function runOneStep(
       output: { reason },
     });
     return { ok: false, reason, error };
+  }
+}
+
+// Trace observation kind per step kind, so each renders with the right
+// badge in the UI: a tool step IS a tool call; an llm_agent step spawns a
+// sub-agent; llm_compose / parallel are multi-part links in the chain.
+function stepSpanKind(kind: Step["kind"]): SpanKind {
+  switch (kind) {
+    case "tool":
+      return "tool";
+    case "llm_agent":
+      return "agent";
+    case "llm_compose":
+    case "parallel":
+      return "chain";
+    case "terminal":
+      return "span";
   }
 }
 
@@ -507,6 +526,7 @@ async function execParallel(
     step.steps.map(async (child, i) => {
       const childSpan = span.span({
         name: `parallel[${i}]:${child.kind}`,
+        kind: stepSpanKind(child.kind),
         metadata: stepMetadata(child),
       });
       try {

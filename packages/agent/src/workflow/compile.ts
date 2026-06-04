@@ -116,6 +116,7 @@ export function createCompiler(deps: CompilerDeps): Compiler {
         // Span name kept as "planner" for trace continuity with
         // pre-rename Langfuse history — do not change to "compile".
         name: "planner",
+        kind: "chain",
         input: { preset: COMPILER_PRESET, model: preset.model },
         metadata: { signal_source: req.signal.source },
       });

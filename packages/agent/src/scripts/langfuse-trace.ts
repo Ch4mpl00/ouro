@@ -41,10 +41,26 @@ interface Trace {
   tags: string[];
 }
 
+// Langfuse observation types. Beyond the original GENERATION/SPAN/EVENT,
+// v5 adds typed spans (AGENT/TOOL/CHAIN/RETRIEVER/…) that the agent now
+// emits via `kind`. They render like spans; only GENERATION/EMBEDDING
+// carry model + token usage.
+type ObservationType =
+  | "GENERATION"
+  | "SPAN"
+  | "EVENT"
+  | "AGENT"
+  | "TOOL"
+  | "CHAIN"
+  | "RETRIEVER"
+  | "EVALUATOR"
+  | "GUARDRAIL"
+  | "EMBEDDING";
+
 interface Observation {
   id: string;
   name: string;
-  type: "GENERATION" | "SPAN" | "EVENT";
+  type: ObservationType;
   parentObservationId: string | null;
   startTime: string;
   endTime: string;
@@ -142,8 +158,12 @@ function renderTrace(t: Trace, observations: Observation[], opts: PrintOpts): vo
 
   console.log(`\nFLOW`);
   for (const o of children) {
-    if (o.name === t.name && o.type === "SPAN") continue; // root span placeholder
-    if (o.type === "GENERATION") {
+    // Root placeholder (the trace-level span) — skip regardless of its
+    // type (now AGENT, previously SPAN).
+    if (o.name === t.name && o.parentObservationId === null) continue;
+    // GENERATION / EMBEDDING are the only model calls (carry usage); all
+    // other types (SPAN/TOOL/AGENT/CHAIN/…) are span-like units of work.
+    if (o.type === "GENERATION" || o.type === "EMBEDDING") {
       const { content, tools } = summariseGenerationOutput(o.output);
       const usage = o.usage ? `${o.usage.input}→${o.usage.output}` : "—";
       const cost = o.calculatedTotalCost != null ? fmtCost(o.calculatedTotalCost) : "—";
@@ -154,9 +174,12 @@ function renderTrace(t: Trace, observations: Observation[], opts: PrintOpts): vo
       for (const t of tools) {
         console.log(`    → ${t.name}(${truncate(t.args, opts.raw ? 100_000 : 200)})`);
       }
-    } else if (o.type === "SPAN") {
+    } else {
       const lvl = o.level !== "DEFAULT" ? ` [${o.level}]` : "";
-      console.log(`\n  · ${o.name}  (${fmtSec(o.latency)})${lvl}`);
+      // Show the observation kind so the typed spans (tool/agent/chain)
+      // are visible at a glance in the terminal, mirroring the UI badge.
+      const kind = o.type === "SPAN" ? "" : ` {${o.type.toLowerCase()}}`;
+      console.log(`\n  · ${o.name}${kind}  (${fmtSec(o.latency)})${lvl}`);
       if (o.statusMessage) console.log(`    status: ${o.statusMessage}`);
       const inText = toText(o.input, opts.raw ? 100_000 : 200);
       const outText = toText(o.output, opts.raw ? 100_000 : 300);

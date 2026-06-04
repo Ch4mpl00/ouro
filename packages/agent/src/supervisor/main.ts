@@ -57,6 +57,7 @@ async function runSignal(
   const trace = engine.tracer.trace({
     id: signalLabel,
     name: `signal:${signal.source}`,
+    kind: "agent",
     sessionId: signalLabel,
     tags: [signal.source, "planner-mode"],
     metadata: {
@@ -84,6 +85,25 @@ async function runSignal(
               stepIndex: result.stepIndex,
               error: result.error,
             };
+      // Timeline marker for the workflow→agentic handoff. A compile miss is
+      // an expected degradation (WARNING); an execute failure means side
+      // effects may already have fired (ERROR).
+      trace.event({
+        name: "fallback",
+        level: failure.stage === "compile" ? "WARNING" : "ERROR",
+        metadata:
+          failure.stage === "compile"
+            ? { stage: "compile", reason: failure.reason, attempts: failure.attempts }
+            : {
+                stage: "execute",
+                reason: failure.reason,
+                step_index: failure.stepIndex,
+                error:
+                  failure.error instanceof Error
+                    ? failure.error.message
+                    : String(failure.error),
+              },
+      });
       await fallback.handle(signal, envData, failure, trace);
       return;
     }
@@ -93,6 +113,14 @@ async function runSignal(
     );
   } catch (err) {
     console.error(`[supervisor] signal #${signal.id} unexpected error:`, err);
+    trace.event({
+      name: "fallback",
+      level: "ERROR",
+      metadata: {
+        stage: "execute",
+        error: err instanceof Error ? err.message : String(err),
+      },
+    });
     await fallback.handle(signal, envData, { stage: "execute", error: err }, trace);
   } finally {
     trace.end();

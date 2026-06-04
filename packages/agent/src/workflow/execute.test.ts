@@ -44,6 +44,9 @@ function recordingSpan(): Span & { events: unknown[] } {
       events.push({ kind: "span:start", opts });
       return recordingSpan();
     },
+    event(opts) {
+      events.push({ kind: "event", opts });
+    },
   };
   return span;
 }
@@ -54,6 +57,7 @@ function recordingTrace(): Trace {
     update: root.update,
     generation: root.generation,
     span: root.span,
+    event: root.event,
     end: () => {},
   };
 }

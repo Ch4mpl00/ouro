@@ -25,6 +25,7 @@ function recordingSpan(): Span {
     span(opts) {
       return recordingSpan();
     },
+    event() {},
   };
   return span;
 }
@@ -37,6 +38,7 @@ function recordingTrace(): Trace {
       return { end() {} };
     },
     span: () => recordingSpan(),
+    event() {},
   };
 }
 

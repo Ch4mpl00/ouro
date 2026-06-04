@@ -5,6 +5,7 @@ import { isPresetName, type PresetName, type ReasoningEffort } from "./models";
 import { listSkills, readSkill, saveSkill } from "./skills";
 import type { Trace, TraceContext } from "./tracing";
 import {
+  INVOKE_SUB_AGENT_TOOL_NAME,
   InvokeSubAgentArgsSchema,
   SetMemoryArgsSchema,
   SkillNameArgSchema,
@@ -228,6 +229,7 @@ export class Session {
       this.trace = engine.tracer.trace({
         id: this.id,
         name: this.id,
+        kind: "agent",
         sessionId: opts.sessionId,
         tags: opts.tags,
         metadata: {
@@ -404,6 +406,11 @@ export class Session {
             // span in the trace.
             const span = this.scope.span({
               name: call.function.name,
+              // `invoke_sub_agent` spawns a whole sub-session inside this
+              // span (its iters/tool calls nest here), so badge it as an
+              // agent; every other call is a plain tool invocation.
+              kind:
+                call.function.name === INVOKE_SUB_AGENT_TOOL_NAME ? "agent" : "tool",
               input: { raw_arguments: call.function.arguments },
               metadata: this.observationMeta,
             });

@@ -49,10 +49,38 @@ export interface GenerationStartOpts {
   metadata?: Record<string, unknown>;
 }
 
+// Observation kind — how a span renders in the tracing UI. Purely
+// presentational: each kind gets a distinct icon/colour, no behavioural
+// difference. Maps to Langfuse's `asType`; backends that don't model
+// observation types (the null tracer) ignore it. We expose only the
+// kinds this codebase actually produces:
+//   - "tool"   a single tool / function call
+//   - "agent"  a spawned sub-agent (its own iters/tool calls nest inside)
+//   - "chain"  a multi-step unit of work (workflow runner, a workflow
+//              step, the compiler's retry loop)
+//   - "span"   generic fallback (the default when omitted)
+export type SpanKind = "tool" | "agent" | "chain" | "span";
+
 export interface SpanStartOpts {
   name: string;
   input?: unknown;
   metadata?: Record<string, unknown>;
+  // Defaults to "span" when omitted.
+  kind?: SpanKind;
+}
+
+// A point-in-time marker with no duration and no children — renders as a
+// timeline tick in the UI. Unlike a span there is no handle to close: the
+// backend auto-ends it. Use for discrete moments worth flagging on the
+// trace (e.g. the workflow→agentic fallback transition), NOT for units of
+// work that contain other observations — those are spans.
+export interface EventStartOpts {
+  name: string;
+  input?: unknown;
+  metadata?: Record<string, unknown>;
+  // Severity badge. Omit for a neutral marker; "WARNING" for a notable
+  // but non-fatal moment (degraded path), "ERROR" for a failure point.
+  level?: "WARNING" | "ERROR";
 }
 
 // Anything that can hold nested generations/spans and have its own
@@ -62,6 +90,8 @@ export interface TraceContext {
   update(data: TraceContextUpdate): void;
   generation(opts: GenerationStartOpts): Generation;
   span(opts: SpanStartOpts): Span;
+  // Point-in-time marker (auto-ended, no handle returned). See EventStartOpts.
+  event(opts: EventStartOpts): void;
 }
 
 // A Span is a TraceContext with a lifecycle terminator. Use `end` to set
@@ -85,6 +115,10 @@ export interface TraceStartOpts {
   sessionId?: string;
   tags?: string[];
   metadata?: Record<string, unknown>;
+  // Observation kind for the trace's root span. Defaults to "span"; pass
+  // "agent" for a top-level agent run so the UI badges the whole trace
+  // accordingly.
+  kind?: SpanKind;
 }
 
 export interface Tracer {
@@ -103,11 +137,13 @@ const NOOP_SPAN: Span = {
   end() {},
   generation: () => NOOP_GENERATION,
   span: () => NOOP_SPAN,
+  event() {},
 };
 const NOOP_TRACE: Trace = {
   update() {},
   generation: () => NOOP_GENERATION,
   span: () => NOOP_SPAN,
+  event() {},
   end() {},
 };
 

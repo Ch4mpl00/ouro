@@ -5,14 +5,17 @@ import {
   type LangfuseGeneration,
   type LangfuseGenerationAttributes,
   type LangfuseSpan,
+  type LangfuseSpanAttributes,
 } from "@langfuse/tracing";
 import { NodeTracerProvider } from "@opentelemetry/sdk-trace-node";
 import type {
+  EventStartOpts,
   Generation,
   GenerationEndOpts,
   GenerationStartOpts,
   Span,
   SpanEndOpts,
+  SpanKind,
   SpanStartOpts,
   Trace,
   TraceContextUpdate,
@@ -50,10 +53,9 @@ export function createLangfuseTracer(config: LangfuseTracerConfig): Tracer {
   return {
     trace(opts: TraceStartOpts): Trace {
       // No active OTel context here → the new observation becomes a root
-      // span, which Langfuse renders as a top-level trace.
-      const root = startObservation(opts.name, {
-        metadata: opts.metadata,
-      });
+      // span, which Langfuse renders as a top-level trace. `kind` badges
+      // the whole trace (e.g. "agent" for a signal-handling session).
+      const root = startRootObservation(opts.name, opts.metadata, opts.kind);
       // Trace-level attributes (sessionId, tags, traceName) live on
       // well-known OTel attribute keys that LangfuseSpanProcessor reads
       // off the root span. Children created via `root.startObservation`
@@ -98,6 +100,56 @@ function startGenerationChild(parent: LangfuseSpan, opts: GenerationStartOpts): 
   return parent.startObservation(opts.name, attrs, { asType: "generation" });
 }
 
+// Root-level counterpart of startSpanChild: opens a top-level observation
+// (which Langfuse renders as a trace) with the requested kind. No active
+// OTel parent context → it becomes a root span.
+function startRootObservation(
+  name: string,
+  metadata: Record<string, unknown> | undefined,
+  kind: SpanKind | undefined,
+): LangfuseSpan {
+  switch (kind) {
+    case "tool":
+      return startObservation(name, { metadata }, { asType: "tool" });
+    case "agent":
+      return startObservation(name, { metadata }, { asType: "agent" });
+    case "chain":
+      return startObservation(name, { metadata }, { asType: "chain" });
+    default:
+      return startObservation(name, { metadata });
+  }
+}
+
+// Map our backend-agnostic SpanKind to Langfuse's `asType`. The `tool` /
+// `agent` / `chain` observation classes are structurally identical to
+// LangfuseSpan (their attribute type IS LangfuseSpanAttributes), differing
+// only in the UI badge — so they wrap with the same LangfuseSpan logic.
+// The literal `asType` is required for overload resolution; a switch keeps
+// it literal without casting a dynamic string.
+function startSpanChild(parent: LangfuseSpan, opts: SpanStartOpts): LangfuseSpan {
+  const attrs: LangfuseSpanAttributes = { input: opts.input, metadata: opts.metadata };
+  switch (opts.kind) {
+    case "tool":
+      return parent.startObservation(opts.name, attrs, { asType: "tool" });
+    case "agent":
+      return parent.startObservation(opts.name, attrs, { asType: "agent" });
+    case "chain":
+      return parent.startObservation(opts.name, attrs, { asType: "chain" });
+    default:
+      return parent.startObservation(opts.name, attrs, { asType: "span" });
+  }
+}
+
+// Point-in-time marker. Langfuse auto-ends `event` observations, so there
+// is nothing to close and no handle to return.
+function startEventChild(parent: LangfuseSpan, opts: EventStartOpts): void {
+  parent.startObservation(
+    opts.name,
+    { input: opts.input, metadata: opts.metadata, level: opts.level },
+    { asType: "event" },
+  );
+}
+
 function wrapTrace(s: LangfuseSpan): Trace {
   return {
     update(data: TraceContextUpdate): void {
@@ -107,9 +159,10 @@ function wrapTrace(s: LangfuseSpan): Trace {
       return wrapGeneration(startGenerationChild(s, opts));
     },
     span(opts: SpanStartOpts): Span {
-      return wrapSpan(
-        s.startObservation(opts.name, { input: opts.input, metadata: opts.metadata }),
-      );
+      return wrapSpan(startSpanChild(s, opts));
+    },
+    event(opts: EventStartOpts): void {
+      startEventChild(s, opts);
     },
     end(): void {
       s.end();
@@ -134,9 +187,10 @@ function wrapSpan(s: LangfuseSpan): Span {
       return wrapGeneration(startGenerationChild(s, opts));
     },
     span(opts: SpanStartOpts): Span {
-      return wrapSpan(
-        s.startObservation(opts.name, { input: opts.input, metadata: opts.metadata }),
-      );
+      return wrapSpan(startSpanChild(s, opts));
+    },
+    event(opts: EventStartOpts): void {
+      startEventChild(s, opts);
     },
   };
 }
