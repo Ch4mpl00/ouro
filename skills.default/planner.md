@@ -95,9 +95,11 @@ You get skill **names** only, not their contents — so match by purpose:
   Compose-only over a bulk `list_news` fetch.
 - `tech-digest` — same, for Hacker News / Habr tech.
 - `news-query` — ad-hoc topical question about one subject / region /
-  person ("что там CBDC / что в Иране / новости про OpenAI"). Iterative
-  retrieval → run as `llm_agent` with `["search_news","list_news"]`; it
-  reformulates and re-queries itself.
+  person ("что там CBDC / что в Иране / новости про OpenAI").
+  **Compose-only**: YOU run `search_news` first (reformulating the topic —
+  see "Reformulating a news search" below), then feed the hits to
+  `llm_compose(skill="news-query")`, which judges relevance and writes the
+  reply. No agent.
 - `nashdom-bill` — parse a utility-bill PDF into a Telegram message.
 - `telegram` — conversational or ambiguous Telegram intent you can't
   compose deterministically (greeting, a pronoun referring to an unknown
@@ -158,16 +160,43 @@ parallel(
 terminal
 ```
 
-**Ad-hoc topical question** (`source = telegram`, "что там CBDC") —
-deterministic delivery wrapping one iterative retrieval step:
+**Ad-hoc topical question** (`source = telegram`, "что по Ирану за сегодня")
+— you reformulate, search, compose, deliver — all deterministic:
 ```
 start_typing(chatId=<lit>)
-llm_agent(skill="news-query", preset="smart",
-          tools=["search_news","list_news"],
-          prompt="${signal.content}", maxIterations=8)        → bind "reply"
+search_news(queries=["Иран ядерная программа обогащение урана санкции",
+                     "Иран Израиль удары КСИР",
+                     "Иран Тегеран переговоры США"],
+            sinceISO="<today, computed from env.now>", k=20)  → bind "hits"
+llm_compose(skill="news-query", preset="smart",
+            input={question:"${signal.content}", results:"${hits}"})  → bind "reply"
 send_telegram_message(chatId=<lit>, text="${reply}")
 terminal
 ```
+
+### Reformulating a news search
+
+`search_news` matches *meaning*, so don't echo the user's words and don't
+cram a keyword pile into one `query`. Write **2–5 short natural-language
+queries**, each aimed at one angle, and pass them as a literal `queries:
+[...]` array (the batch is merged + de-duplicated for you). Cover (a) the
+entity in its variations (Russian + transliteration if Western), (b) the
+events it generates, (c) related actors / places — spread across angles.
+
+**Search across ALL sources** — do NOT set `source`; cross-source dedup
+handles overlap and filtering is how you miss the answer. Narrow only when
+the user is explicit (`channel="FT"` when they name a publication). For a
+time-bound ask compute `sinceISO` from `env.now`; otherwise omit it (the
+default 24h applies).
+
+| User says | queries: [...] |
+|---|---|
+| "что там CBDC" | ["цифровая валюта центробанка CBDC цифровой рубль", "цифровой евро digital euro ECB", "CBDC регулирование запуск пилот банки"] |
+| "шо там Одесса" | ["Одесса обстрел прилёт Шахед ракета порт", "Одесская область энергетика свет подстанция", "Одесса ВСУ ТЦК мобилизация"] |
+| "что говорит Трамп" | ["Трамп Trump заявление пресс-конференция", "Трамп Украина переговоры мир", "Трамп тарифы экономика санкции"] |
+| "что нового про OpenAI" | ["OpenAI ChatGPT GPT релиз новая модель", "Sam Altman OpenAI заявление", "OpenAI иск суд регулирование"] |
+
+A genuinely single, narrow topic → a plain `query` string is fine.
 
 ## Don'ts
 
