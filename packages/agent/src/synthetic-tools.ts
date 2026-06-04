@@ -1,5 +1,6 @@
 import type { ChatCompletionTool } from "openai/resources/chat/completions";
-import { PRESET_NAMES, type PresetName } from "./models";
+import { z } from "zod";
+import { PRESET_NAMES } from "./models";
 import type { Session } from "./session";
 import type { TraceContext } from "./tracing";
 
@@ -54,10 +55,15 @@ export const SET_MEMORY_TOOL: ChatCompletionTool = {
   },
 };
 
-export interface SetMemoryArgs {
-  key?: string;
-  value?: string;
-}
+// Runtime arg contract (LLM-provided, untrusted). Validated with zod in
+// the handler; the TS type is derived so there's one source of truth.
+// Shared with the workflow executor's set_memory step (see
+// workflow/execute.ts) so both paths validate identically.
+export const SetMemoryArgsSchema = z.object({
+  key: z.string().min(1),
+  value: z.string(),
+});
+export type SetMemoryArgs = z.infer<typeof SetMemoryArgsSchema>;
 
 // ─── read_skill / write_skill / list_skills ──────────────────────────
 // Skills are agent reasoning config, not integration state — there's no
@@ -132,13 +138,16 @@ export const LIST_SKILLS_TOOL: ChatCompletionTool = {
   },
 };
 
-export interface SkillNameArg {
-  name?: string;
-}
-export interface WriteSkillArgs {
-  name?: string;
-  content?: string;
-}
+export const SkillNameArgSchema = z.object({
+  name: z.string().min(1),
+});
+export type SkillNameArg = z.infer<typeof SkillNameArgSchema>;
+
+export const WriteSkillArgsSchema = z.object({
+  name: z.string().min(1),
+  content: z.string().min(1),
+});
+export type WriteSkillArgs = z.infer<typeof WriteSkillArgsSchema>;
 
 // ─── invoke_sub_agent ────────────────────────────────────────────────
 // A fresh child Session spawned mid-loop with a focused skill set and no
@@ -216,13 +225,16 @@ export const INVOKE_SUB_AGENT_TOOL: ChatCompletionTool = {
   },
 };
 
-export interface InvokeSubAgentArgs {
-  skills?: string[];
-  system_prompt?: string;
-  prompt?: string;
-  max_iterations?: number;
-  preset?: PresetName;
-}
+export const InvokeSubAgentArgsSchema = z.object({
+  skills: z.array(z.string().min(1)).min(1),
+  prompt: z.string().min(1),
+  system_prompt: z.string().optional(),
+  max_iterations: z.number().int().positive().optional(),
+  // Inline literals (zod widens a readonly PRESET_NAMES to `string`); a
+  // typo here surfaces as a type error where preset feeds startSession.
+  preset: z.enum(["base", "smart", "smartest"]).optional(),
+});
+export type InvokeSubAgentArgs = z.infer<typeof InvokeSubAgentArgsSchema>;
 
 // ─── registry ────────────────────────────────────────────────────────
 export interface SyntheticTool {

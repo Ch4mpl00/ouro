@@ -1,17 +1,30 @@
 import type { ChatCompletionMessageParam } from "openai/resources/chat/completions";
 import type { Engine } from "./engine";
 import { setMemory } from "./db/memory";
-import type { PresetName, ReasoningEffort } from "./models";
+import { isPresetName, type PresetName, type ReasoningEffort } from "./models";
 import { listSkills, readSkill, saveSkill } from "./skills";
 import type { Trace, TraceContext } from "./tracing";
 import {
+  InvokeSubAgentArgsSchema,
+  SetMemoryArgsSchema,
+  SkillNameArgSchema,
   SYNTHETIC_TOOLS,
   SYNTHETIC_TOOLS_BY_NAME,
+  WriteSkillArgsSchema,
   type InvokeSubAgentArgs,
   type SetMemoryArgs,
   type SkillNameArg,
   type WriteSkillArgs,
 } from "./synthetic-tools";
+import type { z } from "zod";
+
+// Flatten zod issues into one `path: message; …` line for a synthetic
+// tool's `[<tool> error] …` result fed back to the model.
+function zodIssueText(error: z.ZodError): string {
+  return error.issues
+    .map((i) => `${i.path.join(".") || "args"}: ${i.message}`)
+    .join("; ");
+}
 
 // One isolated conversation thread. Owns its own message buffer, system
 // prompt, model and iteration budget. Shares the engine's OpenAI client
@@ -461,16 +474,18 @@ export class Session {
   }
 
   async applyReadSkill(args: SkillNameArg): Promise<string> {
-    if (typeof args.name !== "string" || args.name.length === 0) {
-      return `[read_skill error] name must be a non-empty string`;
+    const parsed = SkillNameArgSchema.safeParse(args);
+    if (!parsed.success) {
+      return `[read_skill error] ${zodIssueText(parsed.error)}`;
     }
+    const { name } = parsed.data;
     try {
-      const skill = await readSkill(args.name);
+      const skill = await readSkill(name);
       if (skill === null) {
-        return JSON.stringify({ name: args.name, found: false, content: null });
+        return JSON.stringify({ name, found: false, content: null });
       }
       return JSON.stringify({
-        name: args.name,
+        name,
         found: true,
         content: skill.body,
         tools: skill.tools,
@@ -483,16 +498,15 @@ export class Session {
   }
 
   async applyWriteSkill(args: WriteSkillArgs): Promise<string> {
-    if (typeof args.name !== "string" || args.name.length === 0) {
-      return `[write_skill error] name must be a non-empty string`;
+    const parsed = WriteSkillArgsSchema.safeParse(args);
+    if (!parsed.success) {
+      return `[write_skill error] ${zodIssueText(parsed.error)}`;
     }
-    if (typeof args.content !== "string" || args.content.length === 0) {
-      return `[write_skill error] content must be a non-empty string`;
-    }
+    const { name, content } = parsed.data;
     try {
-      const written = await saveSkill(args.name, args.content);
-      this.engine.log(this.id, `write_skill ${args.name} (${written.sizeBytes}b → ${written.path})`);
-      return JSON.stringify({ ok: true, name: args.name, ...written });
+      const written = await saveSkill(name, content);
+      this.engine.log(this.id, `write_skill ${name} (${written.sizeBytes}b → ${written.path})`);
+      return JSON.stringify({ ok: true, name, ...written });
     } catch (err) {
       return `[write_skill error] ${(err as Error).message}`;
     }
@@ -508,15 +522,11 @@ export class Session {
   }
 
   async applyInvokeSubAgent(args: InvokeSubAgentArgs, parentSpan: TraceContext): Promise<string> {
-    if (!Array.isArray(args.skills) || args.skills.length === 0) {
-      return `[invoke_sub_agent error] "skills" must be a non-empty string array`;
+    const parsed = InvokeSubAgentArgsSchema.safeParse(args);
+    if (!parsed.success) {
+      return `[invoke_sub_agent error] ${zodIssueText(parsed.error)}`;
     }
-    if (args.skills.some((s) => s.length === 0)) {
-      return `[invoke_sub_agent error] every entry in "skills" must be a non-empty string`;
-    }
-    if (typeof args.prompt !== "string" || args.prompt.length === 0) {
-      return `[invoke_sub_agent error] "prompt" must be a non-empty string`;
-    }
+    const { skills, prompt, system_prompt, max_iterations, preset } = parsed.data;
 
     this.subAgentCounter += 1;
     // `__sub` (double underscore) keeps the id ASCII-only and unique
@@ -532,11 +542,14 @@ export class Session {
         // + the named skills' content. NO session-context, NO envContext,
         // NO engine meta-skills. This is the entire point — a slim,
         // focused worker with exactly what the parent decided it needs.
-        systemPrompt: args.system_prompt,
-        skills: args.skills,
+        systemPrompt: system_prompt,
+        skills,
         includeEngineSkills: false,
-        preset: args.preset ?? "base",
-        maxIterations: args.max_iterations ?? 50,
+        // Narrow via the guard rather than leaning on zod's enum-literal
+        // inference (subtle enough that the IDE's TS server mis-typed it
+        // as `string`). Robust for any tooling; defaults on absent/invalid.
+        preset: isPresetName(preset) ? preset : "base",
+        maxIterations: max_iterations ?? 50,
         parentId: this.id,
         sessionId: this.sessionId,
         // Nest the sub-agent inside the parent's `invoke_sub_agent` span.
@@ -548,7 +561,7 @@ export class Session {
       return `[invoke_sub_agent error] failed to start: ${(err as Error).message}`;
     }
 
-    child.messages.push({ role: "user", content: args.prompt });
+    child.messages.push({ role: "user", content: prompt });
 
     try {
       return await child.run();
@@ -560,15 +573,14 @@ export class Session {
   }
 
   applySetMemory(args: SetMemoryArgs): string {
-    if (typeof args.key !== "string" || args.key.length === 0) {
-      return `[set_memory error] key must be a non-empty string`;
+    const parsed = SetMemoryArgsSchema.safeParse(args);
+    if (!parsed.success) {
+      return `[set_memory error] ${zodIssueText(parsed.error)}`;
     }
-    if (typeof args.value !== "string") {
-      return `[set_memory error] value must be a string (got ${typeof args.value})`;
-    }
-    setMemory(args.key, args.value);
-    this.engine.log(this.id, `set_memory ${args.key} = ${args.value.slice(0, 80)}`);
-    return `ok — stored ${args.key}`;
+    const { key, value } = parsed.data;
+    setMemory(key, value);
+    this.engine.log(this.id, `set_memory ${key} = ${value.slice(0, 80)}`);
+    return `ok — stored ${key}`;
   }
 
   close(): void {

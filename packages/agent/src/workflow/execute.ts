@@ -2,7 +2,7 @@ import type OpenAI from "openai";
 import type { ChatCompletionMessageParam } from "openai/resources/chat/completions";
 import type { ModelPreset, PresetName } from "../models";
 import type { SessionOpts } from "../session";
-import { SET_MEMORY_TOOL_NAME } from "../synthetic-tools";
+import { SET_MEMORY_TOOL_NAME, SetMemoryArgsSchema } from "../synthetic-tools";
 import type { Span, TraceContext } from "../tracing";
 import type {
   LlmAgentStep,
@@ -318,15 +318,15 @@ function execSetMemory(
   args: Record<string, unknown>,
   deps: ExecutorDeps,
 ): { ok: true; key: string } {
-  const { key, value } = args;
-  if (typeof key !== "string" || key.length === 0) {
-    throw new ToolCallError("set_memory", "key must be a non-empty string");
+  const parsed = SetMemoryArgsSchema.safeParse(args);
+  if (!parsed.success) {
+    const detail = parsed.error.issues
+      .map((i) => `${i.path.join(".") || "args"}: ${i.message}`)
+      .join("; ");
+    throw new ToolCallError("set_memory", detail);
   }
-  if (typeof value !== "string") {
-    throw new ToolCallError("set_memory", `value must be a string (got ${typeof value})`);
-  }
-  deps.setMemory(key, value);
-  return { ok: true, key };
+  deps.setMemory(parsed.data.key, parsed.data.value);
+  return { ok: true, key: parsed.data.key };
 }
 
 // ─── llm_compose ─────────────────────────────────────────────────────
