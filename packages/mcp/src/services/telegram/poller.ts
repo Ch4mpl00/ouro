@@ -68,14 +68,17 @@ export function startTelegramPoller(): void {
               role: "user",
               text: msg.text,
             });
-            const threadHint = threadId !== null
-              ? `, messageThreadId=${threadId}`
-              : "";
+            // Signal content is DATA, not agent instructions. It used to
+            // carry "Reply by calling send_telegram_message(...)" — useful
+            // for the old agentic loop, but poison for the workflow path:
+            // a non-tool `llm_compose` step fed this text would dutifully
+            // emit a send_telegram_message tool-call as plain text, which
+            // then got delivered verbatim. The planner already knows how to
+            // reply (send step + chatId from envContext); reply/thread
+            // conventions live in planner.md.
             const content = [
-              `New Telegram message in chat ${msg.chat.id}${threadId !== null ? ` (forum topic thread_id=${threadId})` : ""}.`,
+              `Telegram message in chat ${msg.chat.id}${threadId !== null ? ` (forum topic thread_id=${threadId})` : ""}.`,
               `Text: ${JSON.stringify(msg.text)}`,
-              `Reply by calling send_telegram_message(chatId="${msg.chat.id}"${threadHint}, text=...) — keep the same messageThreadId so the reply lands in the same topic.`,
-              `Use get_telegram_chat_history(chatId=${msg.chat.id}${threadId !== null ? `, threadId=${threadId}` : ""}, limit=20) if you need older context.`,
             ].join("\n");
             recordSignal({ source: "telegram", content });
             console.log(

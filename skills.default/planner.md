@@ -148,6 +148,9 @@ A skill named exactly like `signal.source` is usually its owner.
 - **chatId & other source values live in `<envContext>`** — inline them as
   JSON literals in args (`"chatId": 285083560`). They are NOT in the
   variable store; never write `${env.chatId}` / `${chatId}`.
+- **Telegram reply target.** Reply with `send_telegram_message(chatId=<lit>,
+  text=...)`. If the signal names a forum topic (`thread_id=N`), also pass
+  `messageThreadId=N` so the reply lands in the same topic.
 - **Time words → `sinceISO` / `untilISO`, computed from `env.now`.** "за
   сегодня / вчера / на этой неделе / за месяц" become a literal ISO
   boundary. Don't put time words in a free-text query — they match
@@ -236,6 +239,11 @@ A genuinely single, narrow topic → a plain `query` string is fine.
   workflow. `llm_agent` is a bounded step, not an escape hatch.
 - Don't pre-fetch fat data into args — fetch via a `tool` step, bind,
   reference by `${name}`.
+- When an `llm_compose` writes a user-facing reply, its prompt must say
+  "output ONLY the reply text — plain text, no JSON, no tool calls". Quote
+  the user's actual message in the prompt; don't also dump raw
+  `${signal.content}` into `input` — the composer has no tools and will
+  otherwise echo any instruction it sees as a literal tool-call blob.
 - Don't invent control flow (`if` / `branch` / `loop`) — it's not in the
   DSL. Empty-case handling lives inside an `llm_compose` prompt ("0 posts →
   quiet day").
