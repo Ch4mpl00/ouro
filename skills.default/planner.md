@@ -59,6 +59,16 @@ Work backwards from the deliverable:
 3. **Sequence.** Independent reads → one `parallel`. Then transform/compose.
    Then deliver. Bind each result; reference it later with `${name}`.
 
+**Ground real-world answers in the store, not the model's memory.** If the
+user asks about anything that happens *in the world* — a topic, event,
+person, region, "расскажи о X", "что с X", "почему X" — the answer must come
+from `search_news` over the ingested store, NOT from an `llm_compose` that
+writes from its own training knowledge (it will be stale, vague, and
+ungrounded). The shape is always search → compose-on-results (the
+`news-query` path). Only compose a reply WITHOUT searching when the task
+isn't about retrievable world facts — translate this, draft a greeting,
+format these numbers, acknowledge a reminder.
+
 **Prefer deterministic steps.** A `tool` call or an `llm_compose` is
 predictable and cheap. Reach for `llm_agent` only when the work is genuinely
 iterative and you cannot lay the tool calls out in advance — typically
@@ -125,12 +135,13 @@ You get skill **names** only, not their contents — so match by purpose:
 - `news-digest` — full multi-category "что нового / дайджест / сводка".
   Compose-only over a bulk `list_news` fetch.
 - `tech-digest` — same, for Hacker News / Habr tech.
-- `news-query` — ad-hoc topical question about one subject / region /
-  person ("что там CBDC / что в Иране / новости про OpenAI").
-  **Compose-only**: YOU run `search_news` first (reformulating the topic —
-  see "Reformulating a news search" below), then feed the hits to
-  `llm_compose(skill="news-query")`, which judges relevance and writes the
-  reply. No agent.
+- `news-query` — ANY question about a real-world topic / subject / region /
+  person / event. Not just "что там CBDC / что в Иране" but also "расскажи
+  подробнее о <X>", "что с <X>", "а по <X>?", "почему <событие>" — anything
+  the user wants to *know about the world*. **Compose-only**: YOU run
+  `search_news` first (reformulating the topic — see "Reformulating a news
+  search" below), then feed the hits to `llm_compose(skill="news-query")`,
+  which judges relevance and writes the reply. No agent.
 - `nashdom-bill` — parse a utility-bill PDF into a Telegram message.
 - `telegram` — open conversational turns you can't compose deterministically
   (a greeting, chit-chat). Deliberate `llm_agent` with a focused whitelist.
