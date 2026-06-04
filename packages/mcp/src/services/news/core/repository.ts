@@ -43,6 +43,17 @@ export interface SearchOpts {
   dedupThreshold?: number;
 }
 
+export interface SearchManyOpts {
+  // 1–N independent queries. Each is embedded and searched separately;
+  // the union is merged (min distance wins per item) and de-duplicated
+  // in embedding space across queries before the top-k cut. Filters and
+  // k apply to the whole batch.
+  queries: string[];
+  k?: number;
+  filter?: SearchFilter;
+  dedupThreshold?: number;
+}
+
 export interface SearchResult {
   id: number;
   source: string;
@@ -52,6 +63,9 @@ export interface SearchResult {
   postedAt: string | null;
   distance: number;
   metadata: Record<string, unknown>;
+  // Indices into the `queries` batch that surfaced this item. Present
+  // only on the batch path (searchMany); omitted for single-query search.
+  matchedQueries?: number[];
 }
 
 export interface NewsRepository {
@@ -60,6 +74,7 @@ export interface NewsRepository {
   findByExternalId(source: string, externalId: string): Promise<NewsItem | null>;
   list(opts: ListOpts): Promise<NewsItem[]>;
   search(opts: SearchOpts): Promise<SearchResult[]>;
+  searchMany(opts: SearchManyOpts): Promise<SearchResult[]>;
   embedMissingBatch(batchSize?: number): Promise<EmbedResult>;
 }
 
@@ -182,31 +197,76 @@ export function createNewsRepository(deps: NewsRepositoryDeps): NewsRepository {
       return deduped.slice(0, limit).map(toNewsItem);
     },
 
-    search: async (opts) => {
-      const k = opts.k ?? 10;
-      const threshold = opts.dedupThreshold ?? DEFAULT_DEDUP_THRESHOLD;
-      const dedupEnabled = threshold > 0;
-      // 2× headroom over k (min 30) leaves room for near-duplicates to be
-      // pruned while still leaving k survivors. Tuned on the RAG eval.
-      const poolSize = dedupEnabled ? Math.max(k * 2, 30) : k;
+    search: async (opts) =>
+      searchCore(deps, [opts.query], {
+        k: opts.k,
+        filter: opts.filter,
+        dedupThreshold: opts.dedupThreshold,
+        // Single-query callers expect the original shape; suppress the
+        // batch-only matchedQueries annotation.
+        annotateMatches: false,
+      }),
 
-      const filter = opts.filter ?? {};
-      const queryVector = await embeddings.embed(opts.query);
+    searchMany: async (opts) =>
+      searchCore(deps, opts.queries, {
+        k: opts.k,
+        filter: opts.filter,
+        dedupThreshold: opts.dedupThreshold,
+        annotateMatches: true,
+      }),
 
-      const filters = [isNotNull(newsItems.embedding)];
-      if (filter.source) filters.push(eq(newsItems.source, filter.source));
-      if (filter.sinceISO) filters.push(gt(newsItems.postedAt, new Date(filter.sinceISO)));
-      if (filter.untilISO) filters.push(lte(newsItems.postedAt, new Date(filter.untilISO)));
-      if (filter.channel) {
-        const f = or(
-          sql`${newsItems.metadata} ->> 'chat_username' = ${filter.channel}`,
-          sql`${newsItems.metadata} ->> 'chat_id' = ${filter.channel}`,
-        );
-        if (f) filters.push(f);
-      }
+    embedMissingBatch: embedder.embedMissingBatch,
+  };
+}
 
+interface SearchCoreOpts {
+  k?: number;
+  filter?: SearchFilter;
+  dedupThreshold?: number;
+  annotateMatches: boolean;
+}
+
+// Shared retrieval core for both single (`search`) and batch
+// (`searchMany`) paths. Embeds every query in one provider batch call,
+// runs a per-query vector search (each keeps its own 2× pool), merges
+// the union by news_items.id keeping the minimum distance, de-duplicates
+// the merged set in embedding space, and returns the top-k by min
+// distance. A single query is just the N=1 case — no cross merge, same
+// behaviour as before.
+async function searchCore(
+  deps: NewsRepositoryDeps,
+  queries: string[],
+  opts: SearchCoreOpts,
+): Promise<SearchResult[]> {
+  const { db, embeddings } = deps;
+  const k = opts.k ?? 10;
+  const threshold = opts.dedupThreshold ?? DEFAULT_DEDUP_THRESHOLD;
+  const dedupEnabled = threshold > 0;
+  // 2× headroom over k (min 30) leaves room for near-duplicates to be
+  // pruned while still leaving k survivors. Tuned on the RAG eval. Each
+  // query keeps its own pool — the DB-side limit caps per-query traffic.
+  const poolSize = dedupEnabled ? Math.max(k * 2, 30) : k;
+
+  const filter = opts.filter ?? {};
+  const filters = [isNotNull(newsItems.embedding)];
+  if (filter.source) filters.push(eq(newsItems.source, filter.source));
+  if (filter.sinceISO) filters.push(gt(newsItems.postedAt, new Date(filter.sinceISO)));
+  if (filter.untilISO) filters.push(lte(newsItems.postedAt, new Date(filter.untilISO)));
+  if (filter.channel) {
+    const f = or(
+      sql`${newsItems.metadata} ->> 'chat_username' = ${filter.channel}`,
+      sql`${newsItems.metadata} ->> 'chat_id' = ${filter.channel}`,
+    );
+    if (f) filters.push(f);
+  }
+
+  // One batch embed for the whole pack, then per-query searches in
+  // parallel — N round trips to PG, but a single embed provider call.
+  const vectors = await embeddings.embedBatch(queries);
+  const pools = await Promise.all(
+    vectors.map((queryVector) => {
       const distance = cosineDistance(newsItems.embedding, queryVector);
-      const rows = await db
+      return db
         .select({
           id: newsItems.id,
           source: newsItems.source,
@@ -222,25 +282,85 @@ export function createNewsRepository(deps: NewsRepositoryDeps): NewsRepository {
         .where(and(...filters))
         .orderBy(distance)
         .limit(poolSize);
+    }),
+  );
 
-      const deduped = dedupEnabled
-        ? dedupByPairwiseCosine(rows, (r) => r.embedding, threshold)
-        : rows;
+  return mergeRankedPools(pools, {
+    k,
+    threshold,
+    annotateMatches: opts.annotateMatches,
+  });
+}
 
-      return deduped.slice(0, k).map((r) => ({
-        id: Number(r.id),
-        source: r.source,
-        title: r.title,
-        url: r.url,
-        snippet: r.body.length > SNIPPET_CHARS ? r.body.slice(0, SNIPPET_CHARS) + "…" : r.body,
-        postedAt: r.postedAt?.toISOString() ?? null,
-        distance: Number(r.distance),
-        metadata: (r.metadata ?? {}) as Record<string, unknown>,
-      }));
-    },
+// Minimal row shape the merge step needs — a structural subset of the
+// drizzle search projection, so prod rows pass as-is and tests can hand
+// in plain objects.
+export interface RankablePoolRow {
+  id: number;
+  source: string;
+  title: string | null;
+  url: string | null;
+  body: string;
+  metadata: unknown;
+  postedAt: Date | null;
+  // The drizzle cosineDistance projection is typed `unknown` (pg returns
+  // numeric as a string); coerced with Number() at merge time.
+  distance: unknown;
+  embedding: number[] | null;
+}
 
-    embedMissingBatch: embedder.embedMissingBatch,
-  };
+// Pure merge + rank + dedup over per-query pools. Each pool is one
+// query's rows pre-sorted by ascending distance. An item retrieved by
+// several queries is kept once with its best (minimum) distance;
+// `matchedQueries` records which facet indices surfaced it. The merged
+// set is sorted by min distance, de-duplicated in embedding space across
+// queries, then cut to the top-k. Separated from I/O so the ranking
+// contract is unit-testable without a database.
+export function mergeRankedPools(
+  pools: RankablePoolRow[][],
+  opts: { k: number; threshold: number; annotateMatches: boolean },
+): SearchResult[] {
+  const dedupEnabled = opts.threshold > 0;
+  const byId = new Map<
+    number,
+    { row: RankablePoolRow; distance: number; matchedQueries: number[] }
+  >();
+  pools.forEach((rows, qi) => {
+    for (const row of rows) {
+      const id = Number(row.id);
+      const dist = Number(row.distance);
+      const existing = byId.get(id);
+      if (existing) {
+        existing.matchedQueries.push(qi);
+        if (dist < existing.distance) {
+          existing.distance = dist;
+          existing.row = row;
+        }
+      } else {
+        byId.set(id, { row, distance: dist, matchedQueries: [qi] });
+      }
+    }
+  });
+
+  const merged = [...byId.values()].sort((a, b) => a.distance - b.distance);
+  const deduped = dedupEnabled
+    ? dedupByPairwiseCosine(merged, (m) => m.row.embedding, opts.threshold)
+    : merged;
+
+  return deduped.slice(0, opts.k).map((m) => {
+    const r = m.row;
+    return {
+      id: Number(r.id),
+      source: r.source,
+      title: r.title,
+      url: r.url,
+      snippet: r.body.length > SNIPPET_CHARS ? r.body.slice(0, SNIPPET_CHARS) + "…" : r.body,
+      postedAt: r.postedAt?.toISOString() ?? null,
+      distance: m.distance,
+      metadata: (r.metadata ?? {}) as Record<string, unknown>,
+      ...(opts.annotateMatches ? { matchedQueries: m.matchedQueries } : {}),
+    };
+  });
 }
 
 function toNewsItem(r: typeof newsItems.$inferSelect): NewsItem {

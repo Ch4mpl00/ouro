@@ -46,6 +46,12 @@ apply here:
 - `search_news` takes `k` for result count (NOT `limit`).
 - `search_news` takes `sinceISO` / `untilISO` for date filters
   (not `dateFrom` / `since`).
+- `search_news` — for a multi-facet ask (one topic spanning several
+  distinct subjects, e.g. "что Маск говорил про Tesla, SpaceX и
+  политику"), use ONE step with `queries: ["${a}", "${b}", ...]` (1–8
+  facets) instead of N separate `search_news` steps. Results come back
+  merged and de-duplicated across the batch — don't add a separate
+  dedup step. Use plain `query` for a single-facet ask.
 - `get_telegram_chat_history` takes `chatId` and optional
   `messageThreadId` (NOT `chat_id`, NOT `thread`).
 - `send_telegram_message` takes `chatId`, `text`, optional

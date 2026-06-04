@@ -18,9 +18,30 @@ export function registerNewsTools(server: McpServer, news: NewsRepository): void
         "asks about a topic — the background pollers keep the store fresh, " +
         "so there is no need to fetch articles before searching. Returns " +
         "id, source, title, url, snippet (first ~400 chars of the body), " +
-        "posted_at, distance (lower = closer), and source-specific metadata.",
+        "posted_at, distance (lower = closer), and source-specific metadata.\n\n" +
+        "For a multi-facet ask (e.g. one topic spanning several distinct " +
+        "subjects), pass `queries: [...]` — one entry per facet — instead " +
+        "of calling this tool N times or blurring everything into one " +
+        "`query`. Each query is searched independently; results are merged " +
+        "and already de-duplicated across the batch (an item's `distance` " +
+        "is its best match across the facets, `matchedQueries` lists which " +
+        "facets surfaced it), so do NOT re-query per facet or re-dedup. " +
+        "Pass exactly one of `query` or `queries`.",
       inputSchema: {
-        query: z.string().min(1).describe("Natural-language search query."),
+        query: z
+          .string()
+          .min(1)
+          .optional()
+          .describe("Natural-language search query. Use for a single facet."),
+        queries: z
+          .array(z.string().min(1))
+          .min(1)
+          .max(8)
+          .optional()
+          .describe(
+            "Batch of 1–8 independent queries for a multi-facet ask. " +
+              "Mutually exclusive with `query`.",
+          ),
         k: z
           .number()
           .int()
@@ -49,12 +70,16 @@ export function registerNewsTools(server: McpServer, news: NewsRepository): void
           ),
       },
     },
-    async ({ query, k, source, sinceISO, untilISO, channel }) => {
-      const results = await news.search({
-        query,
-        k,
-        filter: { source, sinceISO, untilISO, channel },
-      });
+    async ({ query, queries, k, source, sinceISO, untilISO, channel }) => {
+      if ((query === undefined) === (queries === undefined)) {
+        return jsonResult({
+          error: "Pass exactly one of `query` or `queries`.",
+        });
+      }
+      const filter = { source, sinceISO, untilISO, channel };
+      const results = query
+        ? await news.search({ query, k, filter })
+        : await news.searchMany({ queries: queries ?? [], k, filter });
       return jsonResult({ count: results.length, results });
     },
   );

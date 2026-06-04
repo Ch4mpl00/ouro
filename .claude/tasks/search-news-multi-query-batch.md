@@ -1,6 +1,6 @@
 # search_news: batch multi-query with cross-query dedup
 
-**Status:** pending
+**Status:** done
 **Priority:** P2
 **Area:** packages/mcp (news / RAG)
 **Created:** 2026-06-04
