@@ -49,17 +49,10 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
-  # TS supervisor — the original hand-rolled engine. Parked behind the
-  # `legacy-ts` profile: a plain `docker compose up` does NOT start it, so
-  # only ONE supervisor consumes the signal queue (get_next_signal is a
-  # destructive pop — two live pollers would split the stream). The Python
-  # port `agent-py` below is the live supervisor now. To run the TS one
-  # instead, stop agent-py and `docker compose --profile legacy-ts up agent`.
   agent:
     build: .
     image: mcp-tools-image
     command: sh -c "pnpm setup:agent && pnpm agent:start"
-    profiles: ["legacy-ts"]
     env_file: .env.agent
     environment:
       MCP_TRANSPORT: http
@@ -71,30 +64,9 @@ services:
       - mcp
     restart: unless-stopped
 
-  # Python/LangGraph port of the supervisor — the LIVE one. Same contract as
-  # the TS agent: polls mcp:3000 for signals over HTTP, runs each to
-  # completion, talks to Postgres only through MCP tools. Reuses .env.agent
-  # (identical var names: OPENAI/DEEPSEEK keys + optional AGENT_*_MODEL).
-  # Built from agent-py/Dockerfile (uv, separate Python image).
-  agent-py:
-    build: ./agent-py
-    image: mcp-tools-agent-py
-    env_file: .env.agent
-    environment:
-      MCP_TRANSPORT: http
-      MCP_URL: http://mcp:3000/mcp
-    volumes:
-      - agent-py-data:/app/data            # agent.db (memory KV)
-      - agent-py-skills:/app/skills        # live skills overlay (dreaming writes here)
-    depends_on:
-      - mcp
-    restart: unless-stopped
-
 volumes:
   mcp-data:
   mcp-storage:
   agent-data:
   agent-skills:
-  agent-py-data:
-  agent-py-skills:
   pg-data:

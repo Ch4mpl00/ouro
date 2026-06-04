@@ -51,21 +51,11 @@ mcp-tools/
 ├── .env.mcp                MCP container env (integration creds)
 ├── .env.agent              agent container env (DeepSeek key, model)
 ├── .env.example, .env.mcp.example, .env.agent.example
-├── docker-compose.yml      postgres + mcp + agent-py (live); TS `agent` parked behind the legacy-ts profile
-├── Dockerfile              Node image for mcp + the (dormant) TS agent
+├── docker-compose.yml      two services: mcp + agent
+├── Dockerfile              one image for both
 ├── skills.default/         shipped skills (git-tracked, read-only fallback)
 ├── skills/                 live overlay, gitignored; dreaming writes here
 ├── storage/                downloaded Gmail attachments (gitignored)
-├── agent-py/               Python/LangGraph port of the agent (uv) — the LIVE supervisor
-│   ├── Dockerfile          uv image; built as the `agent-py` compose service
-│   ├── pyproject.toml + uv.lock   pinned langchain 1.x / langgraph 1.x
-│   ├── skills.default/     the SAME skill .md files (verbatim), read by a Python loader
-│   └── agent_py/
-│       ├── supervisor/{main,fallback}.py   poll loop + workflow failure handling
-│       ├── workflow/{dsl,compile,graph,variables}.py   DSL → langgraph StateGraph
-│       ├── engine.py, session.py           create_agent runner + synthetic tools
-│       ├── mcp_client.py                    langchain-mcp-adapters (http / stdio / mock)
-│       └── skills.py, session_context.py, models.py, tracing.py, db/memory.py
 └── packages/
     ├── mcp/
     │   ├── data/{schema.sql, tokens.db}     OAuth, watermarks, signals, scheduled_tasks
@@ -250,36 +240,6 @@ volume — written by the `dreaming` skill when it self-revises).
   `telegram` — primary domain skills, loaded per signal.source.
 - `routing`, `handoff` — always loaded on top.
 
-## Python agent (LangGraph port) — the live supervisor
-
-`agent-py/` is a port of `packages/agent` to Python + LangGraph/LangChain
-(`langchain.agents.create_agent` for the ReAct loop, a compiled `StateGraph`
-for the workflow executor). It speaks the SAME MCP contract and reuses the
-SAME `skills.default/*.md` files verbatim — skills are prompts/data, not
-code. Design write-up: `agent-py/COMPARISON.md`.
-
-It is the ONLY supervisor that runs on the droplet. The TS `agent` stays in
-the repo but is parked behind the compose `legacy-ts` profile, because
-`get_next_signal` is a destructive pop — two live pollers would split the
-signal stream. Exactly one consumer at a time.
-
-Packages are managed with **uv**; `uv.lock` pins the tree (langchain 1.x /
-langgraph 1.x). From `agent-py/`:
-
-- `uv sync` — create/refresh `.venv` from the lock.
-- `uvx ruff check agent_py` + `pyright` — lint + type-check (config in
-  `pyrightconfig.json`).
-- `uv run python -m agent_py.supervisor.main` — start the supervisor.
-  `MCP_TRANSPORT=http` (default, + `MCP_URL`) | `stdio` (+ `MCP_PROJECT_ROOT`).
-  There is no offline/mock transport — it talks to a real MCP.
-- `uv lock` after editing `pyproject.toml`; commit the lock.
-
-Env: reuses `.env.agent` (same `OPENAI_API_KEY` / `DEEPSEEK_API_KEY` /
-optional `AGENT_*_MODEL` var names as the TS agent). Compose injects
-`MCP_TRANSPORT=http` + `MCP_URL=http://mcp:3000/mcp`. Its sqlite memory KV
-lives in the `agent-py-data` volume; the live skills overlay in
-`agent-py-skills` (separate from the TS agent's volumes — no carry-over yet).
-
 ## Running
 
 - `pnpm db:init` — apply both schemas (mcp/tokens.db + agent/agent.db).
@@ -304,15 +264,7 @@ lives in the `agent-py-data` volume; the live skills overlay in
   outage during inline embed).
 
 Deploy: see `docker-compose.yml`. `docker compose up -d --build` on the
-droplet starts postgres + mcp + **agent-py** (the TS `agent` sits behind the
-`legacy-ts` profile and is NOT started). Named volumes (`mcp-data`,
-`mcp-storage`, `agent-data`, `agent-skills`, `agent-py-data`,
-`agent-py-skills`, `pg-data`) persist state across rebuilds. First boot
-needs `.env.postgres` (POSTGRES_USER / PASSWORD / DB) and `OPENAI_API_KEY`
-in `.env.mcp`.
-
-⚠️ Cutover gotcha: `docker compose up -d` does NOT stop a container whose
-service has moved behind a now-inactive profile. If a TS `agent` container
-is already running on the droplet, run `docker compose down` first (or
-`docker compose rm -sf agent`) before `up`, so the old supervisor stops —
-otherwise it and `agent-py` both poll `get_next_signal` and split the queue.
+droplet; named volumes (`mcp-data`, `mcp-storage`, `agent-data`,
+`agent-skills`, `pg-data`) persist state across rebuilds. First boot
+needs `.env.postgres` (POSTGRES_USER / PASSWORD / DB) and
+`OPENAI_API_KEY` in `.env.mcp`.
