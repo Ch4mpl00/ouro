@@ -15,7 +15,7 @@ from typing import Literal
 from langchain.chat_models import init_chat_model
 from langchain_core.language_models import BaseChatModel
 
-ReasoningEffort = Literal["disabled", "high", "max"]
+ReasoningEffort = Literal["disabled", "low", "medium", "high", "xhigh"]
 PresetName = Literal["base", "smart", "smartest"]
 
 
@@ -35,10 +35,10 @@ DEFAULT_PRESETS: dict[str, ModelPreset] = {
     "base": ModelPreset(model="openai:gpt-5.4-mini", reasoning_effort="disabled"),
     # smart    — DeepSeek with thinking enabled. Sub-agents doing real
     #            editorial / parsing work.
-    "smart": ModelPreset(model="deepseek:deepseek-v4-pro", reasoning_effort="max"),
+    "smart": ModelPreset(model="deepseek:deepseek-v4-pro", reasoning_effort="high"),
     # smartest — full GPT-5.4. Reserved for the compiler role, where strict
     #            structured output matters more than cost per call.
-    "smartest": ModelPreset(model="openai:gpt-5.4", reasoning_effort="max"),
+    "smartest": ModelPreset(model="openai:gpt-5.4", reasoning_effort="high"),
 }
 
 PRESET_NAMES: tuple[PresetName, ...] = ("base", "smart", "smartest")

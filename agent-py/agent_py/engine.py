@@ -20,6 +20,7 @@ from .models import DEFAULT_PRESETS, ModelPreset, build_model
 from .session import DEFAULT_MAX_ITERATIONS, Session
 from .skills import read_skill, validate_all_skills
 from .synthetic_tools import build_synthetic_tools
+from .tracing import langfuse_callbacks
 
 
 class Engine:
@@ -34,6 +35,8 @@ class Engine:
         self.presets = presets
         self.engine_skills = engine_skills
         self._model_cache: dict[str, BaseChatModel] = {}
+        # Tracing callbacks (Langfuse), built once; [] when not configured.
+        self.callbacks = langfuse_callbacks()
 
     # ─── models ───────────────────────────────────────────────────────
 

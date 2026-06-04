@@ -99,7 +99,7 @@ class Compiler:
         while attempts < self._max_attempts:
             attempts += 1
             try:
-                resp = await model.ainvoke(messages)
+                resp = await model.ainvoke(messages, config={"callbacks": self._engine.callbacks})
                 text = resp.content if isinstance(resp.content, str) else str(resp.content)
             except Exception as e:  # noqa: BLE001 — provider/network failure
                 return CompilerResult(

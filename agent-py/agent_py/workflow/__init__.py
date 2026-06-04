@@ -97,7 +97,9 @@ class Workflow:
         graph = compile_workflow_to_graph(compiled.workflow, deps, signal_label)
 
         try:
-            final = await graph.ainvoke({"vars": seed})
+            final = await graph.ainvoke(
+                {"vars": seed}, config={"callbacks": self._engine.callbacks}
+            )
         except StepExecutionError as e:
             return WorkflowRunResult(
                 ok=False, stage="execute", reason=e.reason, error=e, step_index=e.step_index

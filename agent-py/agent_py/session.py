@@ -58,7 +58,10 @@ class Session:
         """Run the agent and return the assistant's final text."""
         # recursion_limit: one ReAct turn ≈ 2 supersteps (model + tools), so the
         # iteration budget maps to 2*N+1.
-        config: RunnableConfig = {"recursion_limit": 2 * self.max_iterations + 1}
+        config: RunnableConfig = {
+            "recursion_limit": 2 * self.max_iterations + 1,
+            "callbacks": self.engine.callbacks,
+        }
         result = await self._agent.ainvoke({"messages": [("user", user_text)]}, config=config)
         messages = result["messages"]
         last = messages[-1]

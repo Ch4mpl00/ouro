@@ -27,7 +27,7 @@ WORKDIR /app
 # pass, after its source is copied.
 COPY pyproject.toml uv.lock ./
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --frozen --no-install-project --no-dev
+    uv sync --frozen --no-install-project --no-dev --extra tracing
 
 # Source. skills.default/ ships in the image as the read-only fallback; the
 # live skills/ overlay (dreaming writes there) arrives as a mounted volume at
@@ -36,7 +36,7 @@ COPY agent_py ./agent_py
 COPY skills.default ./skills.default
 
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --frozen --no-dev
+    uv sync --frozen --no-dev --extra tracing
 
 # Put the venv on PATH so `python` is the project interpreter.
 ENV PATH="/app/.venv/bin:$PATH"
