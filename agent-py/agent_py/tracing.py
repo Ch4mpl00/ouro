@@ -18,10 +18,13 @@ from typing import Any
 def langfuse_callbacks() -> list[Any]:
     """Build the Langfuse callback handlers, or ``[]`` if not configured.
 
-    Returns ``[]`` (a safe no-op) when ``LANGFUSE_PUBLIC_KEY`` is unset or the
-    langfuse package / its langchain integration is unavailable — tracing must
-    never break the agent.
+    Opt-in via ``AGENT_TRACING=langfuse`` — off by default so a tracing-backend
+    stall can never block signal processing. Also returns ``[]`` when
+    ``LANGFUSE_PUBLIC_KEY`` is unset or the langfuse package / its langchain
+    integration is unavailable. Tracing must never break the agent.
     """
+    if os.environ.get("AGENT_TRACING", "").lower() != "langfuse":
+        return []
     if not os.environ.get("LANGFUSE_PUBLIC_KEY"):
         return []
     # langfuse reads LANGFUSE_HOST; accept the TS-style LANGFUSE_BASE_URL too.
