@@ -173,11 +173,30 @@ When you do use `llm_agent`, include `send_telegram_message` in the
 `tools` whitelist. The skill's hard rule is "always reply", but it
 fires more reliably when the compiler can't compose the reply itself.
 
-**News / topical queries** are a separate category — delegate to a
-news skill via `llm_compose`, do NOT use `llm_agent`:
+**News / topical queries** — two different shapes:
 
-- "что нового / дайджест" → fetch via `list_news` + `llm_compose(skill="news-digest")`
-- "что говорил Маск / новости про Иран" → `search_news` + `llm_compose(skill="news-query")`
+- **Full digest** ("что нового / дайджест / сводка") → bulk-fetch via
+  `list_news` + `llm_compose(skill="news-digest")`. Compose-only: the
+  skill formats a fixed fetch, it does no searching.
+
+- **Ad-hoc topical** ("что говорил Маск / что там CBDC / новости про
+  Иран") → **`llm_agent(skill="news-query")`**, NOT `search_news` +
+  `llm_compose`. The news-query skill reformulates the topic into proper
+  search queries, batches them, searches across all sources, and
+  re-queries wider when the first pass is thin — it can only do that if
+  it drives `search_news` itself. If you pre-bake a `search_news` tool
+  step, none of that runs and you get a one-word literal query against a
+  single source. So:
+  - `tool: start_typing(chatId=<lit>)`
+  - `llm_agent(skill="news-query", preset="smart",
+     tools=["search_news","list_news"], prompt="${signal.content}",
+     maxIterations=8, bind="reply")`
+  - `tool: send_telegram_message(chatId=<lit>, text="${reply}")`
+  - terminal
+
+  Do **not** put `send_telegram_message` in the agent's tool whitelist —
+  the skill returns the answer as its final text; YOUR explicit step
+  delivers it. This keeps the "always reply" guarantee deterministic.
 
 ### `source = scheduler`
 
