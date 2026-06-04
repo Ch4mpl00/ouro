@@ -7,6 +7,7 @@ import {
   createCompiler,
   type CompilerEngineSurface,
   type CompilerFailureReason,
+  type PriorContext,
 } from "./compile";
 import type { Step } from "./dsl";
 import {
@@ -52,7 +53,12 @@ export type WorkflowRunResult =
       error: Error;
       stepIndex: number;
       step: Step;
-    };
+    }
+  // The planner emitted `replan` on every pass without ever committing to
+  // an acting workflow. Treated like a compile failure by the supervisor
+  // (degrade to an agentic session) — it means the planner couldn't
+  // converge on a plan.
+  | { ok: false; stage: "replan_exhausted"; passes: number; attempts: number };
 
 export interface Workflow {
   runForSignal(
@@ -75,6 +81,9 @@ export interface WorkflowDeps {
   readSkill: (name: string) => Promise<string | null>;
   // Compiler retry budget (initial attempt + retries). Default 3.
   maxAttempts?: number;
+  // Total planning passes per signal: the initial plan plus replans.
+  // Default 3 (initial + up to 2 replans). Exceeding it is a failure.
+  maxPasses?: number;
 }
 
 export function createWorkflow(deps: WorkflowDeps): Workflow {
@@ -94,67 +103,102 @@ export function createWorkflow(deps: WorkflowDeps): Workflow {
     setMemory,
   });
 
+  const maxPasses = deps.maxPasses ?? 3;
+
   return {
     async runForSignal(signal, envData, parentTrace, signalLabel) {
-      const compiled = await compiler.compile({
-        signal: {
-          source: signal.source,
-          content: signal.content,
-          envContext: signal.envContext,
-        },
-        envData,
-        parentTrace,
-        signalLabel,
-      });
+      // The plan→act→replan loop. Pass 0 is the initial plan; each `replan`
+      // step carries context into the next pass. Bounded by `maxPasses` so
+      // a planner that never commits can't loop forever.
+      let priorContext: PriorContext | undefined;
+      let lastAttempts = 0;
 
-      if (!compiled.ok) {
+      for (let pass = 0; pass < maxPasses; pass++) {
+        const compiled = await compiler.compile({
+          signal: {
+            source: signal.source,
+            content: signal.content,
+            envContext: signal.envContext,
+          },
+          envData,
+          parentTrace,
+          signalLabel,
+          priorContext,
+        });
+
+        if (!compiled.ok) {
+          return {
+            ok: false,
+            stage: "compile",
+            reason: compiled.reason,
+            errors: compiled.errors,
+            attempts: compiled.attempts,
+          };
+        }
+        lastAttempts = compiled.attempts;
+
+        // Seed the variable store with env + signal context, plus any
+        // context carried from a prior replan pass (referenceable as
+        // `${context.<name>}`). Steps see only the bindings they name.
+        const store = createStore({
+          env: {
+            timezone: envData.timezone,
+            now: envData.now.toISOString(),
+            newsLastReadAt: envData.newsLastReadAt,
+            userEmail: envData.userEmail,
+          },
+          signal: {
+            source: signal.source,
+            content: signal.content,
+            id: signal.id,
+          },
+          ...(priorContext ? { context: priorContext.data } : {}),
+        });
+
+        const executed = await executor.execute(compiled.workflow, {
+          store,
+          parentTrace,
+          signalLabel,
+        });
+
+        if (!executed.ok) {
+          return {
+            ok: false,
+            stage: "execute",
+            reason: executed.reason,
+            error: executed.error,
+            stepIndex: executed.stepIndex,
+            step: executed.step,
+          };
+        }
+
+        if (executed.replan) {
+          // Carry context into the next pass. `lastPass` is true when the
+          // pass that consumes this context is the final allowed one, so
+          // the compiler prompt forces a commit there.
+          priorContext = {
+            pass: pass + 1,
+            lastPass: pass + 1 === maxPasses - 1,
+            data: executed.replan.context,
+            note: executed.replan.note,
+          };
+          continue;
+        }
+
         return {
-          ok: false,
-          stage: "compile",
-          reason: compiled.reason,
-          errors: compiled.errors,
+          ok: true,
           attempts: compiled.attempts,
+          stepCount: compiled.workflow.steps.length,
+          store: executed.store,
         };
       }
 
-      // Seed the variable store with env + signal context. Steps see
-      // only the bindings they name via `${path}` placeholders.
-      const store = createStore({
-        env: {
-          timezone: envData.timezone,
-          now: envData.now.toISOString(),
-          newsLastReadAt: envData.newsLastReadAt,
-          userEmail: envData.userEmail,
-        },
-        signal: {
-          source: signal.source,
-          content: signal.content,
-          id: signal.id,
-        },
-      });
-
-      const executed = await executor.execute(compiled.workflow, {
-        store,
-        parentTrace,
-        signalLabel,
-      });
-
-      if (!executed.ok) {
-        return {
-          ok: false,
-          stage: "execute",
-          reason: executed.reason,
-          error: executed.error,
-          stepIndex: executed.stepIndex,
-          step: executed.step,
-        };
-      }
-
+      // Every pass asked to replan — the planner never committed.
       return {
-        ok: true,
-        attempts: compiled.attempts,
-        stepCount: compiled.workflow.steps.length,
-        store: executed.store,
+        ok: false,
+        stage: "replan_exhausted",
+        passes: maxPasses,
+        attempts: lastAttempts,
       };
     },
   };

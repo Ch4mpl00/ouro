@@ -32,6 +32,7 @@ Every workflow is `{ "version": 1, "steps": [...] }`. Step kinds:
   "prompt": "<text>", "tools": ["<name>", ...], "maxIterations": <1-20>,
   "bind": "<name>" }
 { "kind": "parallel", "steps": [ ...leaf steps, each with its own bind... ] }
+{ "kind": "replan", "context": ["<bind>", ...], "note"?: "<text>" }
 { "kind": "terminal" }
 ```
 
@@ -41,7 +42,8 @@ Every workflow is `{ "version": 1, "steps": [...] }`. Step kinds:
 - `tool` / `skill` / `tools[]` must be names from the lists you receive.
 - `preset` is `"base"` or `"smart"` ONLY. **Never `"smartest"`** — reserved
   for you.
-- Always end with `{"kind":"terminal"}`.
+- `replan` cannot be inside `parallel`; `context` lists ≥1 prior `bind`.
+- End with `{"kind":"terminal"}` (or `{"kind":"replan",...}` — see below).
 - Return ONE JSON object — no markdown fences, no commentary. The runtime
   parses your reply verbatim with `JSON.parse`.
 
@@ -80,6 +82,35 @@ end-to-end — then include `send_telegram_message` in its whitelist.)
   (see above). Sparingly.
 - **`parallel`** — independent reads at once. Never wrap dependent steps.
 
+### When the next step depends on data you don't have — `replan`
+
+Sometimes you can't plan the whole workflow up front because the right
+action depends on data you haven't seen. The classic case: a Telegram
+message like "продолжай", "сделай вчерашнее", "а по другим?" — a pronoun
+referring to a prior turn you can't see. You must NOT plan into the unknown
+(don't guess what "продолжай" means, don't dump it into an agent).
+
+Instead, **gather, then replan**: emit a short workflow that fetches what
+you need, bind it, and end with `replan` naming those bindings. The runtime
+recompiles you with that data in a `<context>` block — your next pass plans
+the real action with full information.
+
+```
+get_telegram_chat_history(chatId=<lit>, limit=10)            → bind "history"
+replan(context=["history"],
+       note="'продолжай' — fetched last 10 messages; decide what to continue and do it")
+```
+
+On the next pass you see `history` and emit the acting workflow (e.g. a
+fresh digest, or a reply). Carried bindings are also in the store as
+`${context.history}` if a step needs the data itself.
+
+Rules: `replan` is a deliberate gather→decide bridge, **not** a retry and
+**not** an escape hatch. Use it only when action genuinely depends on
+unseen data. Don't replan when you can already act. You get a small, bounded
+number of passes — on the final one you'll be told to commit, so don't
+stall. Prefer ONE gather pass: fetch everything the decision needs at once.
+
 ### Presets
 
 - `base` — short / mechanical output (replies, acknowledgements, one-line
@@ -101,9 +132,10 @@ You get skill **names** only, not their contents — so match by purpose:
   `llm_compose(skill="news-query")`, which judges relevance and writes the
   reply. No agent.
 - `nashdom-bill` — parse a utility-bill PDF into a Telegram message.
-- `telegram` — conversational or ambiguous Telegram intent you can't
-  compose deterministically (greeting, a pronoun referring to an unknown
-  prior turn). Deliberate `llm_agent` with a focused whitelist.
+- `telegram` — open conversational turns you can't compose deterministically
+  (a greeting, chit-chat). Deliberate `llm_agent` with a focused whitelist.
+  (Ambiguous-context messages — "продолжай", "а по другим?" — are NOT this:
+  gather history and `replan` instead of guessing.)
 - `scheduler` — a fired scheduled task whose action you can't compose
   directly.
 - `dreaming` — periodic self-revision; run as `llm_agent` per its own

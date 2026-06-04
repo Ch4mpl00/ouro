@@ -71,20 +71,33 @@ async function runSignal(
     const result = await workflow.runForSignal(signal, envData, trace, signalLabel);
 
     if (!result.ok) {
-      const failure: WorkflowFailure =
-        result.stage === "compile"
-          ? {
-              stage: "compile",
-              reason: result.reason,
-              errors: result.errors,
-              attempts: result.attempts,
-            }
-          : {
-              stage: "execute",
-              reason: result.reason,
-              stepIndex: result.stepIndex,
-              error: result.error,
-            };
+      let failure: WorkflowFailure;
+      if (result.stage === "compile") {
+        failure = {
+          stage: "compile",
+          reason: result.reason,
+          errors: result.errors,
+          attempts: result.attempts,
+        };
+      } else if (result.stage === "replan_exhausted") {
+        // The planner replanned on every pass without committing. Treat it
+        // like a compile miss — degrade to an agentic session.
+        failure = {
+          stage: "compile",
+          reason: "replan_exhausted",
+          errors: [
+            `planner replanned ${result.passes}× without committing to an acting workflow`,
+          ],
+          attempts: result.attempts,
+        };
+      } else {
+        failure = {
+          stage: "execute",
+          reason: result.reason,
+          stepIndex: result.stepIndex,
+          error: result.error,
+        };
+      }
       // Timeline marker for the workflow→agentic handoff. A compile miss is
       // an expected degradation (WARNING); an execute failure means side
       // effects may already have fired (ERROR).

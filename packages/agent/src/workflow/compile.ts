@@ -34,6 +34,21 @@ export type CompilerResult =
       attempts: number;
     };
 
+// Carried context for a replan pass. The previous pass emitted a `replan`
+// step; the runtime collected the named bindings and loops back here so
+// this pass can plan with data it didn't have before.
+export interface PriorContext {
+  // 1-based replan pass number (1 = first replan, after the initial plan).
+  pass: number;
+  // No more replans allowed after this pass — the prompt forces a commit.
+  lastPass: boolean;
+  // The carried bindings (name → value), also seeded into the store under
+  // `context.<name>` so this pass's workflow can reference them.
+  data: Record<string, unknown>;
+  // Optional note the previous pass left for this one.
+  note?: string;
+}
+
 export interface CompileRequest {
   signal: {
     source: string;
@@ -43,6 +58,8 @@ export interface CompileRequest {
   envData: EnvData;
   parentTrace: TraceContext;
   signalLabel: string;
+  // Present only on replan passes. Absent on the initial plan.
+  priorContext?: PriorContext;
 }
 
 export interface Compiler {
@@ -278,6 +295,31 @@ function renderUserPrompt(
     lines.push("<envContext>");
     lines.push(req.signal.envContext);
     lines.push("</envContext>");
+    lines.push("");
+  }
+
+  if (req.priorContext) {
+    const pc = req.priorContext;
+    lines.push("<context>");
+    lines.push(
+      `You already ran a gather pass for this signal (replan pass ${pc.pass}). ` +
+        "Use what you gathered to decide, and emit the ACTING workflow now.",
+    );
+    lines.push(
+      pc.lastPass
+        ? "This is your LAST pass — you MUST act now; do NOT emit another `replan`."
+        : "Emit another `replan` ONLY if you still genuinely lack data to proceed.",
+    );
+    if (pc.note) {
+      lines.push("");
+      lines.push(`Note from your previous pass: ${pc.note}`);
+    }
+    lines.push("");
+    lines.push(
+      "Gathered data (also in the store as ${context.<name>} for your steps to reference):",
+    );
+    lines.push(JSON.stringify(pc.data, null, 2));
+    lines.push("</context>");
     lines.push("");
   }
 

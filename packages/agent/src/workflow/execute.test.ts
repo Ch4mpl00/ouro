@@ -676,6 +676,57 @@ describe("executor.execute — terminal and end-of-list", () => {
   });
 });
 
+describe("executor.execute — replan step", () => {
+  it("stops the pass and returns the named bindings as replan context", async () => {
+    const engine = makeMockEngine({
+      toolResponses: {
+        get_history: JSON.stringify([{ id: 1 }, { id: 2 }]),
+        later: "L",
+      },
+    });
+    const executor = createExecutor({ engine, readSkill: nullReadSkill(), setMemory: () => {} });
+    const ctx = baseCtx();
+    const r = await executor.execute(
+      {
+        version: 1,
+        steps: [
+          { kind: "tool", tool: "get_history", args: {}, bind: "history" },
+          { kind: "replan", context: ["history"], note: "decide" },
+          { kind: "tool", tool: "later", args: {}, bind: "after" },
+        ],
+      },
+      ctx,
+    );
+    expect(r.ok).toBe(true);
+    if (!r.ok) throw new Error("expected ok");
+    expect(r.replan).toBeDefined();
+    expect(r.replan?.note).toBe("decide");
+    expect(r.replan?.context).toEqual({ history: [{ id: 1 }, { id: 2 }] });
+    // Steps after replan don't run — the pass terminates there.
+    expect(ctx.store.has("after")).toBe(false);
+    expect(engine.toolCalls.map((c) => c.tool)).toEqual(["get_history"]);
+  });
+
+  it("drops context names that were never bound, keeping the rest", async () => {
+    const engine = makeMockEngine({ toolResponses: { a: "A" } });
+    const executor = createExecutor({ engine, readSkill: nullReadSkill(), setMemory: () => {} });
+    const ctx = baseCtx();
+    const r = await executor.execute(
+      {
+        version: 1,
+        steps: [
+          { kind: "tool", tool: "a", args: {}, bind: "x" },
+          { kind: "replan", context: ["x", "missing"] },
+        ],
+      },
+      ctx,
+    );
+    expect(r.ok).toBe(true);
+    if (!r.ok) throw new Error("expected ok");
+    expect(r.replan?.context).toEqual({ x: "A" });
+  });
+});
+
 describe("executor.execute — duplicate binding", () => {
   it("surfaces duplicate_binding reason", async () => {
     const engine = makeMockEngine({

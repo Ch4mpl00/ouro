@@ -4,7 +4,7 @@ import { PRESET_NAMES } from "../models";
 
 // Workflow DSL — the language the compiler LLM emits and the executor runs.
 //
-// Five step kinds, no control flow primitives beyond `parallel`:
+// Six step kinds, no control flow primitives beyond `parallel`:
 //
 //   tool         — runtime → MCP tool with literal args, result bound
 //   llm_compose  — LLM with no tools, structured output, result bound
@@ -12,10 +12,15 @@ import { PRESET_NAMES } from "../models";
 //                  internal ReAct loop, final text bound
 //   parallel     — flat list of independent leaf steps, run concurrently
 //   terminal     — explicit end of workflow
+//   replan       — terminator that bounces back to the compiler with the
+//                  named bindings as context, for a fresh planning pass
 //
 // No `branch` / `if` / loops: empty-case handling lives inside
-// llm_compose prompts; truly structural decisions ("did this happen?")
-// fall back to the agentic mode at the supervisor level.
+// llm_compose prompts. The data-dependent case — "I can't plan the rest
+// until I see X" — is handled by `replan`: emit a gather workflow that
+// ends in `replan`, and the runtime recompiles with what you gathered so
+// the next pass can act. This is the structured, traced alternative to a
+// ReAct sub-session.
 //
 // Context flow is opt-in: each llm_* step declares its `input`
 // bindings explicitly. The runtime variable store persists across the
@@ -110,6 +115,23 @@ export function createWorkflowSchema(deps: WorkflowSchemaDeps): WorkflowSchemaBu
     })
     .strict();
 
+  // `replan` is a terminator like `terminal`, but instead of ending the
+  // signal it tells the runtime to recompile with `context` (the named
+  // bindings) carried into the next pass. NOT a leaf step — it cannot
+  // appear inside `parallel`.
+  const ReplanStepSchema = z
+    .object({
+      kind: z.literal("replan"),
+      // Bind names to carry into the next planning pass. The runtime seeds
+      // them under `context.<name>` and renders them into the compiler's
+      // prompt so the next pass can both read and reference them.
+      context: z.array(z.string().min(1)).min(1),
+      // Optional note from this pass to the next ("this is 'продолжай' — I
+      // fetched the last 10 messages; decide what to continue and act").
+      note: z.string().min(1).optional(),
+    })
+    .strict();
+
   // Leaf steps: anything except `parallel`. Used inside `parallel.steps`
   // to enforce flatness — nested `parallel` is intentionally forbidden,
   // both to keep traces readable and to keep the compiler from
@@ -134,6 +156,7 @@ export function createWorkflowSchema(deps: WorkflowSchemaDeps): WorkflowSchemaBu
     LlmAgentStepSchema,
     TerminalStepSchema,
     ParallelStepSchema,
+    ReplanStepSchema,
   ]);
 
   const WorkflowSchema = z
@@ -197,8 +220,14 @@ export interface TerminalStep {
   kind: "terminal";
 }
 
+export interface ReplanStep {
+  kind: "replan";
+  context: string[];
+  note?: string;
+}
+
 export type LeafStep = ToolStep | LlmComposeStep | LlmAgentStep | TerminalStep;
-export type Step = LeafStep | ParallelStep;
+export type Step = LeafStep | ParallelStep | ReplanStep;
 
 export interface Workflow {
   version: 1;

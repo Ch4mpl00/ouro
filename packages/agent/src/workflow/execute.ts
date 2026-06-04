@@ -8,6 +8,7 @@ import type {
   LlmAgentStep,
   LlmComposeStep,
   ParallelStep,
+  ReplanStep,
   Step,
   ToolStep,
   Workflow,
@@ -42,8 +43,16 @@ export type ExecFailureReason =
   | "tool_error"
   | "llm_error";
 
+// A `replan` step asks the runtime to recompile with `context` (the named
+// bindings' values) carried forward. The executor surfaces it; the
+// workflow facade loops back into the compiler.
+export interface ReplanRequest {
+  context: Record<string, unknown>;
+  note?: string;
+}
+
 export type ExecResult =
-  | { ok: true; store: VariableStore }
+  | { ok: true; store: VariableStore; replan?: ReplanRequest }
   | {
       ok: false;
       reason: ExecFailureReason;
@@ -136,6 +145,15 @@ export function createExecutor(deps: ExecutorDeps): Executor {
               store: ctx.store,
             };
           }
+          if (outcome.replan) {
+            rootSpan.end({
+              output: {
+                replanAtIndex: i,
+                carried: Object.keys(outcome.replan.context),
+              },
+            });
+            return { ok: true, replan: outcome.replan, store: ctx.store };
+          }
           if (outcome.stop) {
             rootSpan.end({ output: { stoppedAtIndex: i, stoppedBy: step.kind } });
             return { ok: true, store: ctx.store };
@@ -157,8 +175,15 @@ export function createExecutor(deps: ExecutorDeps): Executor {
 // ─── per-step execution ──────────────────────────────────────────────
 
 type StepOutcome =
-  | { ok: true; stop: boolean }
+  | { ok: true; stop: boolean; replan?: ReplanRequest }
   | { ok: false; reason: ExecFailureReason; error: Error };
+
+// A step either continues (stop:false), terminates the pass (stop:true),
+// or terminates the pass with a replan request.
+interface DispatchResult {
+  stop: boolean;
+  replan?: ReplanRequest;
+}
 
 async function runOneStep(
   step: Step,
@@ -174,9 +199,15 @@ async function runOneStep(
     metadata: stepMetadata(step),
   });
   try {
-    const stop = await dispatch(step, store, span, ctx, deps);
-    span.end({ output: stop ? { stop: true } : { ok: true } });
-    return { ok: true, stop };
+    const result = await dispatch(step, store, span, ctx, deps);
+    span.end({
+      output: result.replan
+        ? { replan: true }
+        : result.stop
+          ? { stop: true }
+          : { ok: true },
+    });
+    return { ok: true, stop: result.stop, replan: result.replan };
   } catch (err) {
     const error = err instanceof Error ? err : new Error(String(err));
     const reason = classifyError(error);
@@ -200,6 +231,7 @@ function stepSpanKind(kind: Step["kind"]): SpanKind {
       return "agent";
     case "llm_compose":
     case "parallel":
+    case "replan":
       return "chain";
     case "terminal":
       return "span";
@@ -228,6 +260,8 @@ function stepMetadata(step: Step): Record<string, unknown> {
       return { child_count: step.steps.length };
     case "terminal":
       return {};
+    case "replan":
+      return { context: step.context, has_note: step.note !== undefined };
   }
 }
 
@@ -246,23 +280,49 @@ async function dispatch(
   span: Span,
   ctx: ExecContext,
   deps: ExecutorDeps,
-): Promise<boolean> {
+): Promise<DispatchResult> {
   switch (step.kind) {
     case "tool":
       await execTool(step, store, span, deps);
-      return false;
+      return { stop: false };
     case "llm_compose":
       await execLlmCompose(step, store, span, deps);
-      return false;
+      return { stop: false };
     case "llm_agent":
       await execLlmAgent(step, store, span, ctx, deps);
-      return false;
+      return { stop: false };
     case "parallel":
       await execParallel(step, store, span, ctx, deps);
-      return false;
+      return { stop: false };
     case "terminal":
-      return true;
+      return { stop: true };
+    case "replan":
+      return { stop: true, replan: execReplan(step, store, span) };
   }
+}
+
+// ─── replan ──────────────────────────────────────────────────────────
+
+// Collect the named bindings into a context object for the next planning
+// pass. A binding the planner names but never bound is dropped (recorded
+// in the span) rather than throwing — the next pass simply won't see it,
+// same lenient stance as a missing `${}` would surface to the planner.
+function execReplan(
+  step: ReplanStep,
+  store: VariableStore,
+  span: Span,
+): ReplanRequest {
+  const context: Record<string, unknown> = {};
+  const missing: string[] = [];
+  for (const name of step.context) {
+    if (store.has(name)) context[name] = store.get(name);
+    else missing.push(name);
+  }
+  span.update({
+    input: { context: step.context, note: step.note ?? null },
+    output: { carried: Object.keys(context), missing },
+  });
+  return { context, note: step.note };
 }
 
 // ─── tool ────────────────────────────────────────────────────────────

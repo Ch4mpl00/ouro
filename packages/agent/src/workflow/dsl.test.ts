@@ -197,6 +197,34 @@ describe("plan validation — happy path per step kind", () => {
       }).success,
     ).toBe(true);
   });
+
+  it("accepts a replan step with context and note", () => {
+    const plan: Workflow = {
+      version: 1,
+      steps: [
+        {
+          kind: "tool",
+          tool: "get_telegram_chat_history",
+          args: { chatId: 1, limit: 10 },
+          bind: "history",
+        },
+        { kind: "replan", context: ["history"], note: "decide what to continue" },
+      ],
+    };
+    expect(WorkflowSchema.safeParse(plan).success).toBe(true);
+  });
+
+  it("accepts a replan step without a note", () => {
+    expect(
+      WorkflowSchema.safeParse({
+        version: 1,
+        steps: [
+          { kind: "tool", tool: "list_news", args: {}, bind: "n" },
+          { kind: "replan", context: ["n"] },
+        ],
+      }).success,
+    ).toBe(true);
+  });
 });
 
 describe("plan validation — rejections", () => {
@@ -285,6 +313,33 @@ describe("plan validation — rejections", () => {
           steps: [{ kind: "tool", tool: "list_news", args: {}, bind: "a" }],
         },
         { kind: "terminal" },
+      ],
+    });
+    expect(r.success).toBe(false);
+  });
+
+  it("rejects a replan step with an empty context", () => {
+    const r = WorkflowSchema.safeParse({
+      version: 1,
+      steps: [
+        { kind: "tool", tool: "list_news", args: {}, bind: "n" },
+        { kind: "replan", context: [] },
+      ],
+    });
+    expect(r.success).toBe(false);
+  });
+
+  it("rejects replan nested inside parallel (terminator, not a leaf)", () => {
+    const r = WorkflowSchema.safeParse({
+      version: 1,
+      steps: [
+        {
+          kind: "parallel",
+          steps: [
+            { kind: "tool", tool: "list_news", args: {}, bind: "a" },
+            { kind: "replan", context: ["a"] },
+          ],
+        },
       ],
     });
     expect(r.success).toBe(false);
