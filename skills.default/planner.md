@@ -87,7 +87,11 @@ end-to-end — then include `send_telegram_message` in its whitelist.)
 
 - **`tool`** — you know the exact action. Most steps.
 - **`llm_compose`** — produce/transform text by a skill's or prompt's rules
-  (format a digest, extract fields, summarise). No tools exposed.
+  (format a digest, extract fields, summarise). No tools exposed. **When it
+  has a `skill`, the skill IS the instructions** — pass data via `input` and
+  omit `prompt` (or keep it to one line). Don't hand-write a long prompt that
+  duplicates the skill: it bloats the workflow JSON and makes the model fumble
+  serialization (misplaced `bind`, broken quotes → a wasted retry).
 - **`llm_agent`** — bounded iterative tool-use you can't sequence upfront
   (see above). Sparingly.
 - **`parallel`** — independent reads at once. Never wrap dependent steps.
