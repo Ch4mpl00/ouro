@@ -207,6 +207,9 @@ function wrapGeneration(g: LangfuseGeneration): Generation {
           input: opts.usage.input,
           output: opts.usage.output,
           total: opts.usage.total,
+          // Langfuse renders extra usageDetails keys as-is — show the
+          // cached-input portion when the provider reported it.
+          ...(opts.usage.cached !== undefined ? { cached: opts.usage.cached } : {}),
         };
       }
       if (Object.keys(patch).length > 0) g.update(patch);

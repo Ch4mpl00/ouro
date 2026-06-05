@@ -172,7 +172,7 @@ describe("compiler.compile — happy path", () => {
     expect(calls.length).toBe(1);
   });
 
-  it("user prompt includes signal, env, envContext, tools, skills as XML blocks", async () => {
+  it("splits the prompt: static tools/skills in system (cache prefix), variable signal in user", async () => {
     const { client, calls } = makeMockClient({ llmReplies: [VALID_PLAN_JSON] });
     const compiler = createCompiler({
       engine: makeEngineSurface(client),
@@ -183,8 +183,24 @@ describe("compiler.compile — happy path", () => {
     await compiler.compile(makeReq());
 
     const messages = calls[0]!.messages;
+    // System = planner skill + the static reference (tools + skills). It
+    // leads with the skill verbatim so the whole static block is a stable
+    // cache prefix across signals.
     expect(messages[0]?.role).toBe("system");
-    expect(messages[0]?.content).toBe("PLANNER RULES");
+    const systemText = messages[0]?.content as string;
+    expect(systemText.startsWith("PLANNER RULES")).toBe(true);
+    expect(systemText).toContain("<tools>");
+    // Compact signature format with required/optional param names and
+    // types — exactly what the compiler needs to use the right keys
+    // (e.g. `k` not `limit`, `sinceISO` for date filters).
+    expect(systemText).toMatch(
+      /- search_news\(query: string, k\?: number, sinceISO\?: string\)/,
+    );
+    expect(systemText).toContain("<skills>");
+    expect(systemText).toContain("- telegram");
+
+    // User = only the per-signal variable content; NO tools/skills (those
+    // must stay in the cached prefix, not after the variable signal text).
     const userText = messages[1]?.content as string;
     expect(userText).toContain("<signal>");
     expect(userText).toContain("Source: telegram");
@@ -193,15 +209,8 @@ describe("compiler.compile — happy path", () => {
     expect(userText).toContain("Europe/Kiev");
     expect(userText).toContain("<envContext>");
     expect(userText).toContain("285083560");
-    expect(userText).toContain("<tools>");
-    // Compact signature format with required/optional param names and
-    // types — exactly what the compiler needs to use the right keys
-    // (e.g. `k` not `limit`, `sinceISO` for date filters).
-    expect(userText).toMatch(
-      /- search_news\(query: string, k\?: number, sinceISO\?: string\)/,
-    );
-    expect(userText).toContain("<skills>");
-    expect(userText).toContain("- telegram");
+    expect(userText).not.toContain("<tools>");
+    expect(userText).not.toContain("<skills>");
   });
 
   it("tool signatures expose required vs optional params correctly", async () => {
@@ -213,9 +222,9 @@ describe("compiler.compile — happy path", () => {
       knownSkills: FAKE_SKILLS,
     });
     await compiler.compile(makeReq());
-    const userText = calls[0]!.messages[1]?.content as string;
+    const systemText = calls[0]!.messages[0]?.content as string;
     // chatId + text are required, so no `?`
-    expect(userText).toMatch(
+    expect(systemText).toMatch(
       /- send_telegram_message\(chatId: number, text: string\)/,
     );
   });

@@ -12,6 +12,10 @@ export interface TokenUsage {
   input: number;
   output: number;
   total: number;
+  // Portion of `input` served from the provider's prompt cache, when the
+  // provider reports it (OpenAI: prompt_tokens_details.cached_tokens).
+  // Purely informational — surfaced in the trace so cache hits are visible.
+  cached?: number;
 }
 
 export interface SpanEndOpts {

@@ -72,6 +72,9 @@ interface Observation {
   model: string | null;
   modelParameters: Record<string, unknown> | null;
   usage: { input: number; output: number; total: number } | null;
+  // Per-key usage breakdown — carries the `cached` key we attach for the
+  // prompt-cache hit portion (see tracing/langfuse.ts).
+  usageDetails: Record<string, number> | null;
   calculatedTotalCost: number | null;
   latency: number;
 }
@@ -168,7 +171,10 @@ function renderTrace(t: Trace, observations: Observation[], opts: PrintOpts): vo
     // other types (SPAN/TOOL/AGENT/CHAIN/…) are span-like units of work.
     if (o.type === "GENERATION" || o.type === "EMBEDDING") {
       const { content, tools } = summariseGenerationOutput(o.output);
-      const usage = o.usage ? `${o.usage.input}→${o.usage.output}` : "—";
+      const cached = o.usageDetails?.cached;
+      const usage = o.usage
+        ? `${o.usage.input}→${o.usage.output}${cached ? ` (${cached} cached)` : ""}`
+        : "—";
       const cost = o.calculatedTotalCost != null ? fmtCost(o.calculatedTotalCost) : "—";
       const lvl = o.level !== "DEFAULT" ? ` [${o.level}]` : "";
       console.log(`\n  • ${o.name}  (${o.model ?? "—"}, ${usage} tok, ${cost}, ${fmtSec(o.latency)})${lvl}`);

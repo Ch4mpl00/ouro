@@ -107,6 +107,15 @@ export function createCompiler(deps: CompilerDeps): Compiler {
   // Pre-render tool signatures once — the same prompt content per
   // signal, no point doing this in the hot path.
   const toolSignatures = deps.mcpTools.map(renderToolSignature);
+  // The static reference block (tool signatures + skill list) is identical
+  // for every signal, so build it once and APPEND IT TO THE SYSTEM MESSAGE
+  // (after the planner skill). Keeping all the static content at the front
+  // of the request, before any per-signal text, maximises OpenAI's
+  // automatic prompt-cache prefix: the model caches the longest common
+  // leading token run across calls, so planner.md + tools + skills all land
+  // in the cached region. Only the variable signal/env/context stays in the
+  // user message. (Caching is purely a prefix optimisation — no API flag.)
+  const staticReference = renderStaticReference(deps, toolSignatures);
 
   return {
     async compile(req) {
@@ -123,9 +132,12 @@ export function createCompiler(deps: CompilerDeps): Compiler {
       const preset = deps.engine.presets[COMPILER_PRESET];
       const provider = deps.engine.resolveProvider(preset.model);
 
-      const initialUserPrompt = renderUserPrompt(req, deps, toolSignatures);
+      // System = static prefix (planner rules + tools + skills), cached
+      // across signals. User = only the per-signal variable content.
+      const systemContent = `${skill}\n\n${staticReference}`;
+      const initialUserPrompt = renderSignalPrompt(req);
       const messages: ChatCompletionMessageParam[] = [
-        { role: "system", content: skill },
+        { role: "system", content: systemContent },
         { role: "user", content: initialUserPrompt },
       ];
 
@@ -195,6 +207,10 @@ async function runRetryLoop(
               input: u.prompt_tokens,
               output: u.completion_tokens,
               total: u.total_tokens,
+              // How much of the input was served from OpenAI's automatic
+              // prompt cache — lets the trace show the cache actually
+              // hitting the static planner.md + tools + skills prefix.
+              cached: u.prompt_tokens_details?.cached_tokens,
             }
           : undefined,
       });
@@ -265,11 +281,41 @@ function pushRetryFeedback(
   });
 }
 
-function renderUserPrompt(
-  req: CompileRequest,
+// Static half of the prompt — identical for every signal, so it's built
+// once and appended to the system message to sit in the cache prefix (see
+// createCompiler). Holds the available tools and skills, the reference
+// material the compiler needs but that never varies per call.
+function renderStaticReference(
   deps: CompilerDeps,
   toolSignatures: string[],
 ): string {
+  const lines: string[] = [];
+
+  lines.push("<tools>");
+  lines.push(
+    "Signature format: name(arg: type, opt?: type) — description. " +
+      "Use the EXACT parameter names listed; do not invent aliases.",
+  );
+  for (const sig of toolSignatures) {
+    lines.push(sig);
+  }
+  lines.push("</tools>");
+  lines.push("");
+
+  lines.push("<skills>");
+  for (const name of deps.knownSkills) {
+    lines.push(`- ${name}`);
+  }
+  lines.push("</skills>");
+
+  return lines.join("\n");
+}
+
+// Variable half of the prompt — the per-signal content (signal, env,
+// envContext, replan context) plus the final emit instruction. Everything
+// here changes call-to-call, so it stays in the user message AFTER the
+// cached static prefix.
+function renderSignalPrompt(req: CompileRequest): string {
   const lines: string[] = [];
 
   lines.push("<signal>");
@@ -322,24 +368,6 @@ function renderUserPrompt(
     lines.push("</context>");
     lines.push("");
   }
-
-  lines.push("<tools>");
-  lines.push(
-    "Signature format: name(arg: type, opt?: type) — description. " +
-      "Use the EXACT parameter names listed; do not invent aliases.",
-  );
-  for (const sig of toolSignatures) {
-    lines.push(sig);
-  }
-  lines.push("</tools>");
-  lines.push("");
-
-  lines.push("<skills>");
-  for (const name of deps.knownSkills) {
-    lines.push(`- ${name}`);
-  }
-  lines.push("</skills>");
-  lines.push("");
 
   lines.push(
     "Emit a Workflow as JSON matching the DSL. Return ONLY the JSON, no markdown wrapper.",
