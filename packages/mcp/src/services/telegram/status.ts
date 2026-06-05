@@ -16,11 +16,11 @@ import {
 //
 // On top of that, MCP animates the bubble on its own — like the typing
 // keep-alive in `typing.ts`. A background timer ticks ~1/s and edits the
-// active bubble, cycling a clock emoji in front of the text, WITHOUT the
-// workflow doing anything. The caller just sets a base text; "aliveness"
-// is MCP's job. Animation restarts on a text update, stops when the bubble
-// is cleared, and freezes after a safety TTL (so a forgotten bubble doesn't
-// edit forever).
+// active bubble, cycling trailing dots after the text (0 → . → .. → ... →
+// 0 → …), WITHOUT the workflow doing anything. The caller just sets a base
+// text; "aliveness" is MCP's job. Animation restarts on a text update,
+// stops when the bubble is cleared, and freezes after a safety TTL (so a
+// forgotten bubble doesn't edit forever).
 //
 // The map lives in MCP process memory; it spans the tool calls of one
 // workflow but nothing more. Status messages are intentionally NOT written
@@ -49,18 +49,16 @@ const ANIM_INTERVAL_MS = 1_000;
 const ANIM_TTL_MS = 3 * 60_000;
 const BACKOFF_MS = 5_000;
 
-// Cycled in front of the text, one frame per tick. Adjacent frames always
-// differ, so Telegram never rejects an edit as "not modified".
-const CLOCK_FRAMES = [
-  "🕐", "🕑", "🕒", "🕓", "🕔", "🕕",
-  "🕖", "🕗", "🕘", "🕙", "🕚", "🕛",
-] as const;
+// Trailing dots appended after the text, one more per tick, wrapping at 3
+// back to none: 0 → . → .. → ... → 0 → … Adjacent frames always differ, so
+// Telegram never rejects an edit as "not modified".
+const DOT_CYCLE = 4;
 
 const statuses = new Map<string, StatusEntry>();
 let timer: NodeJS.Timeout | null = null;
 
 function render(baseText: string, frame: number): string {
-  return `${CLOCK_FRAMES[frame % CLOCK_FRAMES.length]} ${baseText}`;
+  return baseText + ".".repeat(frame % DOT_CYCLE);
 }
 
 function ensureTimer(): void {

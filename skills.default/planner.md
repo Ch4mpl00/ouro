@@ -89,17 +89,15 @@ workflow has a slow step — a `search_news` + `llm_compose`, a digest,
 anything that takes real seconds — narrate progress through ONE live status
 message, not a pile of separate sends. Use `telegram_send_status` with a
 stable id `status:${signal.id}`:
-- `telegram_send_status(id="status:${signal.id}", text="собираю новости")`
+- `telegram_send_status(id="status:${signal.id}", text="🔎 собираю новости")`
   BEFORE each slow step — the first call sends the bubble, each next call
-  EDITS the same bubble in place (e.g. `"готовлю выборку"`, `"пишу ответ"`).
-  No bind needed.
+  EDITS the same bubble in place (e.g. `"🧠 готовлю выборку"`, `"✍️ пишу
+  ответ"`). No bind needed.
 - After the real answer ships via `send_telegram_message`, clear the bubble:
   `telegram_send_status(id="status:${signal.id}", text="")` (empty text
   deletes it) — so the chat is left with just the answer, no progress litter.
 
-Keep status text to a few words, and DON'T prefix it with an emoji — MCP
-animates the bubble itself by cycling a clock emoji in front of your text,
-so a leading emoji of your own just doubles up. The final `send_telegram_message` is the
+Keep status text to a few words. The final `send_telegram_message` is the
 real answer (status messages are ephemeral and never the answer). Skip the
 play-by-play for a quick single-step reply (a confirmation, a one-liner) —
 only narrate when there's a real wait. (Scheduler/cron signals have no live
@@ -215,8 +213,8 @@ easy-to-forget bits.
 - **News digest** (scheduler/news-digest):
   `[list_news: channel] ‖ [chat history] → [compose:news-digest] → [send] ‖ [stamp news_digest.last_read_at]`
 - **Topical question** (telegram, about the world):
-  `[start_typing] → [status "собираю новости"] → [search_news: reformulated topic, NO source] → [status "готовлю выборку"] → [compose:news-query] → [send: answer] → [status ""]`
-  (`status` = `telegram_send_status(id="status:${signal.id}", …)`; same id edits the one bubble, MCP animates a clock in front, empty text clears it after the answer.)
+  `[start_typing] → [status "🔎 собираю новости"] → [search_news: reformulated topic, NO source] → [status "🧠 готовлю выборку"] → [compose:news-query] → [send: answer] → [status ""]`
+  (`status` = `telegram_send_status(id="status:${signal.id}", …)`; same id edits the one bubble, empty text clears it after the answer.)
 - **Utility bill** (nashdom-bill):
   `[download attachment] → [read_pdf] → [compose:nashdom-bill] → [send]`  (full JSON below)
 - **Schedule a task** ("напомни в 15:00…"):
