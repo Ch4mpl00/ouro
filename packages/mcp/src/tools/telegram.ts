@@ -118,9 +118,11 @@ export function registerTelegramTools(server: McpServer): void {
         "repeatedly to update the same bubble: the first call sends it, later " +
         "calls edit it. Call with an EMPTY `text` to delete the bubble when " +
         "the work is done. Use a stable per-workflow id like `status:<signalId>`. " +
-        "chatId falls back to TELEGRAM_DEFAULT_CHAT_ID. Status messages are " +
-        "ephemeral — they are NOT written to the chat log; ship the real answer " +
-        "with send_telegram_message.",
+        "chatId falls back to TELEGRAM_DEFAULT_CHAT_ID. MCP animates the bubble " +
+        "on its own (cycles a clock emoji in front of your text ~1/s) so it " +
+        "looks alive between updates — pass plain text WITHOUT a leading emoji. " +
+        "Status messages are ephemeral — they are NOT written to the chat log; " +
+        "ship the real answer with send_telegram_message.",
       inputSchema: {
         id: z
           .string()
