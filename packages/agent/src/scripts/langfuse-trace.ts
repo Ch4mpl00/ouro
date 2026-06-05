@@ -119,7 +119,10 @@ function fmtCost(n: number): string {
   return n < 0.01 ? `$${n.toFixed(5)}` : `$${n.toFixed(4)}`;
 }
 
-function fmtSec(s: number): string {
+function fmtSec(s: number | null | undefined): string {
+  // Some observations (e.g. a still-open span, or one the API returns
+  // without timing) have no latency — don't crash the whole render.
+  if (s == null) return "—";
   return `${s.toFixed(2)}s`;
 }
 

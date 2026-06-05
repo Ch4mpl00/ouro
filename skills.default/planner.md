@@ -233,6 +233,12 @@ queries**, each aimed at one angle, and pass them as a literal `queries:
 entity in its variations (Russian + transliteration if Western), (b) the
 events it generates, (c) related actors / places — spread across angles.
 
+**Hard cap: at most 8 queries in one call** — `search_news` rejects a
+bigger batch and the step fails. Aim for 2–5; if a topic feels like it
+needs more, consolidate angles, don't spray every keyword into its own
+query. One `search_news` step per ask — never split into several to dodge
+the cap.
+
 **Search across ALL sources** — do NOT set `source`; cross-source dedup
 handles overlap and filtering is how you miss the answer. Narrow only when
 the user is explicit (`channel="FT"` when they name a publication). For a
