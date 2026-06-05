@@ -141,7 +141,7 @@ You get skill **names** only, not their contents — so match by purpose:
 - `tech-digest` — IT/tech digest. NOT a bulk fetch: YOU `search_news` the
   curated IT topics **across ALL sources** (HN, Habr AND Telegram channels —
   do NOT set `source`), then `llm_compose(skill="tech-digest")` filters +
-  formats. See the tech-digest example below.
+  formats. See the IT-digest shape below.
 - `news-query` — ANY question about a real-world topic / subject / region /
   person / event. Not just "что там CBDC / что в Иране" but also "расскажи
   подробнее о <X>", "что с <X>", "а по <X>?", "почему <событие>" — anything
@@ -179,99 +179,70 @@ A skill named exactly like `signal.source` is usually its owner.
   value as-is (array stays array, object stays object); mixed `"Reply:
   ${x}"` JSON-stringifies non-strings. The store starts with `env.*`,
   `signal.source`, `signal.content`, plus every prior step's `bind`.
-- **Watermarks.** A digest sweep stamps its watermark in the same workflow
-  (`set_memory` key `news_digest.last_read_at` / `tech_digest.last_read_at`,
-  value `${env.now}`). An ad-hoc `news-query` peek does NOT stamp.
 
-## Worked examples (illustrate the conventions — not a fixed catalogue)
+## Pipeline shapes
 
-**Utility bill** (`source = nashdom-bill`) — each step feeds the next, order
-matters:
+The STRUCTURE of common workflows — steps and order, not recipes to copy.
+Fill args by reasoning + tool signatures, and apply the invariants below.
+Notation: `→` sequence, `‖` independent (one `parallel`), `[compose:skill]`
+= `llm_compose` with that skill. Inline caps (NO source, stamp) are the
+easy-to-forget bits.
+
+- **IT digest** (scheduler/tech-digest):
+  `[chat history] ‖ [search_news: IT topics, NO source, k≤50] → [compose:tech-digest] → [send] ‖ [stamp tech_digest.last_read_at]`
+- **News digest** (scheduler/news-digest):
+  `[list_news: channel] ‖ [chat history] → [compose:news-digest] → [send] ‖ [stamp news_digest.last_read_at]`
+- **Topical question** (telegram, about the world):
+  `[start_typing] → [search_news: reformulated topic, NO source] → [compose:news-query] → [send]`
+- **Utility bill** (nashdom-bill):
+  `[download attachment] → [read_pdf] → [compose:nashdom-bill] → [send]`  (full JSON below)
+- **Schedule a task** ("напомни в 15:00…"):
+  `[schedule_task] → [send confirmation]`
+- **Reminder fired** (scheduler, the body is the message):
+  `[send the reminder text]`
+- **Open conversation / greeting** (telegram, no world-facts):
+  `[start_typing] → [llm_agent:telegram, whitelist incl. send_telegram_message]`
+- **Ambiguous context** ("продолжай", "а по другим?"):
+  `[fetch what's needed] → [replan: carry it]`  → next pass plans the action
+
+### Format anchor — the bill, fully written
+
+So the exact JSON shape is unambiguous (`${}` refs, literal chatId, `input`):
 ```
-download_gmail_attachment(messageId=<from envContext>)        → bind "file"
-read_pdf(path="${file}")                                      → bind "pdf"
+download_gmail_attachment(messageId=<from envContext>)   → bind "file"
+read_pdf(path="${file}")                                 → bind "pdf"
 llm_compose(skill="nashdom-bill", preset="smart",
-            input={pdf_text:"${pdf}"})                        → bind "reply"
+            input={pdf_text:"${pdf}"})                    → bind "reply"
 send_telegram_message(chatId=<lit>, text="${reply}")
 terminal
 ```
 
-**Daily digest** (`source = scheduler / news-digest`) — parallel reads,
-compose, then deliver + stamp the watermark in parallel:
-```
-parallel(
-  list_news(source="channel", sinceISO="${env.newsLastReadAt}")  → bind "posts",
-  get_telegram_chat_history(chatId=<lit>, limit=5)               → bind "history"
-)
-llm_compose(skill="news-digest", preset="smart",
-            input={posts:"${posts}", history:"${history}",
-                   env_now:"${env.now}"})                     → bind "digest"
-parallel(
-  send_telegram_message(chatId=<lit>, text="${digest}"),
-  set_memory(key="news_digest.last_read_at", value="${env.now}")
-)
-terminal
-```
+### Invariants (hold across every shape)
 
-**IT/tech digest** (`source = scheduler / tech-digest`) — search the curated
-IT topics ACROSS ALL SOURCES (not a bulk `list_news` — that misses channels
-and dumps hundreds of raw items), compose, deliver + stamp:
-```
-parallel(
-  search_news(queries=[
-      "AI LLM frontier labs Anthropic OpenAI Claude GPT DeepSeek Gemini model release benchmark",
-      "agentic tools planning RAG vector embeddings inference evals training fine-tuning",
-      "TypeScript Node.js React Vue PHP framework library release"],
-    sinceISO="<today, computed from env.now>", k=50)           → bind "candidates",
-  get_telegram_chat_history(chatId=<lit>, limit=10)            → bind "history"
-)
-llm_compose(skill="tech-digest", preset="smart",
-            input={candidates:"${candidates}", history:"${history}",
-                   env_now:"${env.now}"})                      → bind "digest"
-parallel(
-  send_telegram_message(chatId=<lit>, text="${digest}"),
-  set_memory(key="tech_digest.last_read_at", value="${env.now}")
-)
-terminal
-```
-No `source` filter — Telegram IT channels carry tech news too. The 3 topic
-queries are a coarse net (≤8 in one call); `tech-digest.md` does the strict
-filter over the candidates.
-
-**Ad-hoc topical question** (`source = telegram`, "что по Ирану за сегодня")
-— you reformulate, search, compose, deliver — all deterministic:
-```
-start_typing(chatId=<lit>)
-search_news(queries=["Иран ядерная программа обогащение урана санкции",
-                     "Иран Израиль удары КСИР",
-                     "Иран Тегеран переговоры США"],
-            sinceISO="<today, computed from env.now>", k=20)  → bind "hits"
-llm_compose(skill="news-query", preset="smart",
-            input={question:"${signal.content}", results:"${hits}"})  → bind "reply"
-send_telegram_message(chatId=<lit>, text="${reply}")
-terminal
-```
+- **Delivery is your explicit `send` step** — never let an agent deliver
+  (except an `llm_agent` that owns a whole conversational turn).
+- **Digests stamp their watermark** in the same workflow: `set_memory`
+  (`…_digest.last_read_at`, value `${env.now}`), in `parallel` with the send.
+  An ad-hoc `news-query` does NOT stamp.
+- **News searches never set `source`** — all sources, channels included.
+  ≤8 `queries` per call, `k` ≤ 50. (Details below.)
+- **Independent reads → one `parallel`**; dependent steps stay sequential.
+- **`compose` with a `skill`**: pass data via `input`, omit `prompt`.
 
 ### Reformulating a news search
 
 `search_news` matches *meaning*, so don't echo the user's words and don't
 cram a keyword pile into one `query`. Write **2–5 short natural-language
-queries**, each aimed at one angle, and pass them as a literal `queries:
-[...]` array (the batch is merged + de-duplicated for you). Cover (a) the
-entity in its variations (Russian + transliteration if Western), (b) the
-events it generates, (c) related actors / places — spread across angles.
+queries**, each aimed at one angle, as a literal `queries: [...]` array
+(merged + de-duplicated for you). Cover (a) the entity in its variations
+(Russian + transliteration if Western), (b) the events it generates, (c)
+related actors / places — spread across angles; don't spray every keyword
+into its own query, and consolidate rather than exceed the 8-query cap (one
+`search_news` step per ask, never split to dodge it).
 
-**Hard cap: at most 8 queries in one call** — `search_news` rejects a
-bigger batch and the step fails. Aim for 2–5; if a topic feels like it
-needs more, consolidate angles, don't spray every keyword into its own
-query. One `search_news` step per ask — never split into several to dodge
-the cap.
-
-**Search across ALL sources** — do NOT set `source`; cross-source dedup
-handles overlap and filtering is how you miss the answer. Narrow only when
-the user is explicit (`channel="FT"` when they name a publication). For a
-time-bound ask compute `sinceISO` from `env.now`; otherwise omit it (the
-default 24h applies).
+Narrow the source only when the user is explicit (`channel="FT"` when they
+name a publication) — otherwise all sources. For a time-bound ask compute
+`sinceISO` from `env.now`; otherwise omit it (default 24h).
 
 | User says | queries: [...] |
 |---|---|
