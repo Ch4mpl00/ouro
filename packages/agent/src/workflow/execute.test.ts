@@ -62,6 +62,67 @@ function recordingTrace(): Trace {
   };
 }
 
+// Like recordingSpan, but every span created under it (recursively) is
+// pushed into a shared `all` list so a test can inspect the output a
+// nested step span was closed with. recordingTrace/recordingSpan discard
+// child spans, which is fine for store/tool-call assertions but hides the
+// per-step `end({ output })` we want to verify.
+function collectingTrace(): { trace: Trace; all: Array<{ name: string; events: unknown[] }> } {
+  const all: Array<{ name: string; events: unknown[] }> = [];
+  function make(name: string): Span & { events: unknown[] } {
+    const events: unknown[] = [];
+    const self: Span & { events: unknown[] } = {
+      events,
+      update(data) {
+        events.push({ kind: "update", data });
+      },
+      end(opts) {
+        events.push({ kind: "end", opts });
+      },
+      generation(opts) {
+        events.push({ kind: "generation:start", opts });
+        return {
+          end(eo) {
+            events.push({ kind: "generation:end", opts: eo });
+          },
+        };
+      },
+      span(opts) {
+        return make(opts.name);
+      },
+      event(opts) {
+        events.push({ kind: "event", opts });
+      },
+    };
+    all.push({ name, events });
+    return self;
+  }
+  const root = make("__root__");
+  const trace: Trace = {
+    update: root.update,
+    generation: root.generation,
+    span: root.span,
+    event: root.event,
+    end: () => {},
+  };
+  return { trace, all };
+}
+
+// Pull the `output` a span was closed with, by name prefix (step spans are
+// named `step[<i>]:<kind>`).
+function endOutput(
+  all: Array<{ name: string; events: unknown[] }>,
+  namePrefix: string,
+): unknown {
+  const span = all.find((s) => s.name.startsWith(namePrefix));
+  if (!span) throw new Error(`no span named ${namePrefix}; have ${all.map((s) => s.name).join(", ")}`);
+  const end = span.events.find(
+    (e): e is { kind: "end"; opts?: { output?: unknown } } =>
+      typeof e === "object" && e !== null && (e as { kind?: string }).kind === "end",
+  );
+  return end?.opts?.output;
+}
+
 interface MockCall {
   tool: string;
   args: Record<string, unknown>;
@@ -189,6 +250,31 @@ describe("executor.execute — tool step", () => {
       count: 2,
       items: [{ id: 1 }, { id: 2 }],
     });
+  });
+
+  it("records the real tool output on the step span (not a generic {ok:true})", async () => {
+    const engine = makeMockEngine({
+      toolResponses: {
+        search_news: JSON.stringify({ hits: [{ id: 7, title: "x" }] }),
+      },
+    });
+    const executor = createExecutor({ engine, readSkill: nullReadSkill(), setMemory: () => {} });
+    const { trace, all } = collectingTrace();
+
+    const r = await executor.execute(
+      {
+        version: 1,
+        steps: [
+          { kind: "tool", tool: "search_news", args: { queries: ["ai"] }, bind: "res" },
+          { kind: "terminal" },
+        ],
+      },
+      { store: createStore({ env: {} }), parentTrace: trace, signalLabel: "test:1" },
+    );
+
+    expect(r.ok).toBe(true);
+    // The step span must carry the parsed tool result, not `{ ok: true }`.
+    expect(endOutput(all, "step[0]:tool")).toEqual({ hits: [{ id: 7, title: "x" }] });
   });
 
   it("works without bind (fire-and-forget)", async () => {

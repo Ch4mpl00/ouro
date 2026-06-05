@@ -179,10 +179,16 @@ type StepOutcome =
   | { ok: false; reason: ExecFailureReason; error: Error };
 
 // A step either continues (stop:false), terminates the pass (stop:true),
-// or terminates the pass with a replan request.
+// or terminates the pass with a replan request. `output` is the real
+// result to record on the step span (the tool's parsed output, the
+// composed text, the sub-agent's answer, the replan's carried context).
+// runOneStep / execParallel record it on `end`; only when a step has no
+// meaningful output do they fall back to a generic control marker. This
+// keeps the span's output from being clobbered by a bare `{ ok: true }`.
 interface DispatchResult {
   stop: boolean;
   replan?: ReplanRequest;
+  output?: unknown;
 }
 
 async function runOneStep(
@@ -200,13 +206,7 @@ async function runOneStep(
   });
   try {
     const result = await dispatch(step, store, span, ctx, deps);
-    span.end({
-      output: result.replan
-        ? { replan: true }
-        : result.stop
-          ? { stop: true }
-          : { ok: true },
-    });
+    span.end({ output: spanOutput(result) });
     return { ok: true, stop: result.stop, replan: result.replan };
   } catch (err) {
     const error = err instanceof Error ? err : new Error(String(err));
@@ -218,6 +218,16 @@ async function runOneStep(
     });
     return { ok: false, reason, error };
   }
+}
+
+// What to record as a step span's output: the step's real result if it
+// produced one, otherwise a generic control marker so the span still
+// closes with *something* legible (terminal/parallel have no single value).
+function spanOutput(result: DispatchResult): unknown {
+  if (result.output !== undefined) return result.output;
+  if (result.replan) return { replan: true };
+  if (result.stop) return { stop: true };
+  return { ok: true };
 }
 
 // Trace observation kind per step kind, so each renders with the right
@@ -283,21 +293,20 @@ async function dispatch(
 ): Promise<DispatchResult> {
   switch (step.kind) {
     case "tool":
-      await execTool(step, store, span, deps);
-      return { stop: false };
+      return { stop: false, output: await execTool(step, store, span, deps) };
     case "llm_compose":
-      await execLlmCompose(step, store, span, deps);
-      return { stop: false };
+      return { stop: false, output: await execLlmCompose(step, store, span, deps) };
     case "llm_agent":
-      await execLlmAgent(step, store, span, ctx, deps);
-      return { stop: false };
+      return { stop: false, output: await execLlmAgent(step, store, span, ctx, deps) };
     case "parallel":
       await execParallel(step, store, span, ctx, deps);
       return { stop: false };
     case "terminal":
       return { stop: true };
-    case "replan":
-      return { stop: true, replan: execReplan(step, store, span) };
+    case "replan": {
+      const { request, output } = execReplan(step, store, span);
+      return { stop: true, replan: request, output };
+    }
   }
 }
 
@@ -311,18 +320,18 @@ function execReplan(
   step: ReplanStep,
   store: VariableStore,
   span: Span,
-): ReplanRequest {
+): { request: ReplanRequest; output: { carried: string[]; missing: string[] } } {
   const context: Record<string, unknown> = {};
   const missing: string[] = [];
   for (const name of step.context) {
     if (store.has(name)) context[name] = store.get(name);
     else missing.push(name);
   }
-  span.update({
-    input: { context: step.context, note: step.note ?? null },
+  span.update({ input: { context: step.context, note: step.note ?? null } });
+  return {
+    request: { context, note: step.note },
     output: { carried: Object.keys(context), missing },
-  });
-  return { context, note: step.note };
+  };
 }
 
 // ─── tool ────────────────────────────────────────────────────────────
@@ -334,12 +343,16 @@ class ToolCallError extends Error {
   }
 }
 
+// Returns the tool's result (parsed JSON when the payload is an object/array,
+// otherwise the raw string) so the caller can record it as the span output.
+// set_memory returns its `{ ok, key }` ack. The result is also bound into the
+// store under `step.bind` for later `${}` references.
 async function execTool(
   step: ToolStep,
   store: VariableStore,
   span: Span,
   deps: ExecutorDeps,
-): Promise<void> {
+): Promise<unknown> {
   const resolvedArgs = substitute(step.args, store) as Record<string, unknown>;
   span.update({ input: { tool: step.tool, args: resolvedArgs } });
 
@@ -351,8 +364,7 @@ async function execTool(
   if (step.tool === SET_MEMORY_TOOL_NAME) {
     const out = execSetMemory(resolvedArgs, deps);
     if (step.bind) store.set(step.bind, out);
-    span.update({ output: out });
-    return;
+    return out;
   }
 
   let raw: string;
@@ -372,7 +384,7 @@ async function execTool(
   if (step.bind) {
     store.set(step.bind, parsed);
   }
-  span.update({ output: parsed });
+  return parsed;
 }
 
 function tryParseJson(raw: string): unknown {
@@ -429,7 +441,7 @@ async function execLlmCompose(
   store: VariableStore,
   span: Span,
   deps: ExecutorDeps,
-): Promise<void> {
+): Promise<string> {
   const preset = deps.engine.presets[step.preset];
   const provider = deps.engine.resolveProvider(preset.model);
 
@@ -491,6 +503,7 @@ async function execLlmCompose(
 
   gen.end({ output: content, usage });
   store.set(step.bind, content);
+  return content;
 }
 
 function buildLlmComposeBody(
@@ -542,7 +555,7 @@ async function execLlmAgent(
   span: Span,
   ctx: ExecContext,
   deps: ExecutorDeps,
-): Promise<void> {
+): Promise<string> {
   const prompt = substitute(step.prompt, store) as string;
   const allowedTools = new Set(step.tools);
   const childId = `${ctx.signalLabel}__agent:${step.bind}`;
@@ -570,7 +583,7 @@ async function execLlmAgent(
   }
 
   store.set(step.bind, result);
-  span.update({ output: result });
+  return result;
 }
 
 // ─── parallel ────────────────────────────────────────────────────────
@@ -590,8 +603,8 @@ async function execParallel(
         metadata: stepMetadata(child),
       });
       try {
-        await dispatch(child, store, childSpan, ctx, deps);
-        childSpan.end({ output: { ok: true } });
+        const res = await dispatch(child, store, childSpan, ctx, deps);
+        childSpan.end({ output: spanOutput(res) });
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         childSpan.end({ level: "ERROR", statusMessage: message });
