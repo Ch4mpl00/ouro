@@ -137,8 +137,11 @@ stall. Prefer ONE gather pass: fetch everything the decision needs at once.
 You get skill **names** only, not their contents — so match by purpose:
 
 - `news-digest` — full multi-category "что нового / дайджест / сводка".
-  Compose-only over a bulk `list_news` fetch.
-- `tech-digest` — same, for Hacker News / Habr tech.
+  Compose-only over a bulk `list_news(source="channel")` fetch.
+- `tech-digest` — IT/tech digest. NOT a bulk fetch: YOU `search_news` the
+  curated IT topics **across ALL sources** (HN, Habr AND Telegram channels —
+  do NOT set `source`), then `llm_compose(skill="tech-digest")` filters +
+  formats. See the tech-digest example below.
 - `news-query` — ANY question about a real-world topic / subject / region /
   person / event. Not just "что там CBDC / что в Иране" but also "расскажи
   подробнее о <X>", "что с <X>", "а по <X>?", "почему <событие>" — anything
@@ -209,6 +212,31 @@ parallel(
 )
 terminal
 ```
+
+**IT/tech digest** (`source = scheduler / tech-digest`) — search the curated
+IT topics ACROSS ALL SOURCES (not a bulk `list_news` — that misses channels
+and dumps hundreds of raw items), compose, deliver + stamp:
+```
+parallel(
+  search_news(queries=[
+      "AI LLM frontier labs Anthropic OpenAI Claude GPT DeepSeek Gemini model release benchmark",
+      "agentic tools planning RAG vector embeddings inference evals training fine-tuning",
+      "TypeScript Node.js React Vue PHP framework library release"],
+    sinceISO="<today, computed from env.now>", k=50)           → bind "candidates",
+  get_telegram_chat_history(chatId=<lit>, limit=10)            → bind "history"
+)
+llm_compose(skill="tech-digest", preset="smart",
+            input={candidates:"${candidates}", history:"${history}",
+                   env_now:"${env.now}"})                      → bind "digest"
+parallel(
+  send_telegram_message(chatId=<lit>, text="${digest}"),
+  set_memory(key="tech_digest.last_read_at", value="${env.now}")
+)
+terminal
+```
+No `source` filter — Telegram IT channels carry tech news too. The 3 topic
+queries are a coarse net (≤8 in one call); `tech-digest.md` does the strict
+filter over the candidates.
 
 **Ad-hoc topical question** (`source = telegram`, "что по Ирану за сегодня")
 — you reformulate, search, compose, deliver — all deterministic:
