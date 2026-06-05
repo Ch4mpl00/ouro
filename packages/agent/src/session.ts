@@ -105,24 +105,6 @@ export interface SessionOpts {
 
 const DEFAULT_MAX_ITERATIONS = 100;
 
-
-// DeepSeek extends OpenAI's assistant message shape with `reasoning_content`
-// (the thinking text). Required in the request history whenever the next
-// call uses thinking-mode — even if it's empty.
-type DeepSeekAssistantHistory = ChatCompletionMessageParam & {
-  reasoning_content?: string;
-};
-
-function ensureReasoningContentOnHistory(messages: ChatCompletionMessageParam[]): void {
-  for (const m of messages) {
-    if (m.role !== "assistant") continue;
-    const extended = m as DeepSeekAssistantHistory;
-    if (extended.reasoning_content === undefined) {
-      extended.reasoning_content = "";
-    }
-  }
-}
-
 export class Session {
   readonly id: string;
   readonly parentId?: string;
@@ -276,7 +258,7 @@ export class Session {
     // Resolve provider once per run. Model is fixed for the session's
     // lifetime (set in constructor), so the provider does not change
     // across iterations either.
-    const { client: llm, kind: providerKind } = this.engine.resolveProvider(this.model);
+    const provider = this.engine.resolveProvider(this.model);
 
     // Surface the user's prompt on the trace so the Session-replay UI
     // renders a real `user → assistant` exchange. Done here (not in the
@@ -293,18 +275,6 @@ export class Session {
 
     try {
       for (let i = 0; i < this.maxIterations; i++) {
-        // DeepSeek's thinking mode requires every prior assistant turn in
-        // the history to carry a `reasoning_content` field. Turns produced
-        // under `thinking=disabled` lack it — sub-agents launched with
-        // `reasoning_effort: max` would otherwise 400 on their first call
-        // if they inherit any thinking-disabled history. Stamp an empty
-        // string on every assistant message missing the field whenever
-        // we're about to send in thinking-enabled mode. OpenAI ignores the
-        // field, but we only hit this branch on the DeepSeek path anyway.
-        if (providerKind === "deepseek" && this.reasoningEffort !== "disabled") {
-          ensureReasoningContentOnHistory(this.messages);
-        }
-
         // MCP tools filtered by the per-session allow-list (union of
         // loaded skills' frontmatter). Synthetic agent-side tools are
         // not gated by skill frontmatter — they're cheap and universal
@@ -314,28 +284,12 @@ export class Session {
         const mcpTools = this.allowedTools === null
           ? mcp.tools
           : mcp.tools.filter((t) => this.allowedTools!.has(t.function.name));
-        const baseBody = {
-          model: this.model,
-          messages: this.messages,
-          tools: [
-            ...mcpTools,
-            ...SYNTHETIC_TOOLS.filter((t) => t.visibleTo?.(this) ?? true).map(
-              (t) => t.def,
-            ),
-          ],
-        };
-        // Provider-specific extras. DeepSeek understands `thinking` +
-        // `reasoning_effort`; OpenAI rejects both (we use OpenAI only for
-        // non-thinking chat sessions — gpt-5.4-mini and friends — so
-        // there's nothing to pass).
-        const body = providerKind === "deepseek"
-          ? {
-              ...baseBody,
-              ...(this.reasoningEffort === "disabled"
-                ? { thinking: { type: "disabled" as const } }
-                : { thinking: { type: "enabled" as const }, reasoning_effort: this.reasoningEffort }),
-            }
-          : baseBody;
+        const tools = [
+          ...mcpTools,
+          ...SYNTHETIC_TOOLS.filter((t) => t.visibleTo?.(this) ?? true).map(
+            (t) => t.def,
+          ),
+        ];
 
         // Generation span = one LLM call. The tracer computes latency
         // from start/end timestamps and stores prompt/completion tokens
@@ -354,13 +308,17 @@ export class Session {
           metadata: this.observationMeta,
         });
 
-        let response;
+        // The provider wrapper owns request shaping (thinking /
+        // reasoning_effort, history repair) and usage normalization
+        // (cached-input portion) — Session stays provider-agnostic.
+        let result;
         try {
-          // DeepSeek adds `thinking` + `reasoning_effort` on top of the
-          // OpenAI request shape; since `body` is a variable (not an
-          // inline object), TS skips excess-property checks and we don't
-          // need a directive here.
-          response = await llm.chat.completions.create(body);
+          result = await provider.complete({
+            model: this.model,
+            messages: this.messages,
+            reasoningEffort: this.reasoningEffort,
+            tools,
+          });
         } catch (err) {
           generation.end({
             output: { error: (err as Error).message },
@@ -370,22 +328,12 @@ export class Session {
           throw err;
         }
 
-        const choice = response.choices[0]!;
-        const { message } = choice;
+        const { message } = result;
         this.messages.push(message);
 
-        generation.end({
-          output: message,
-          usage: response.usage
-            ? {
-                input: response.usage.prompt_tokens,
-                output: response.usage.completion_tokens,
-                total: response.usage.total_tokens,
-              }
-            : undefined,
-        });
+        generation.end({ output: message, usage: result.usage });
 
-        this.engine.log(this.id, `iter ${i} finish=${choice.finish_reason} tool_calls=${message.tool_calls?.length ?? 0}`);
+        this.engine.log(this.id, `iter ${i} finish=${result.finishReason} tool_calls=${message.tool_calls?.length ?? 0}`);
 
         if (!message.tool_calls?.length) {
           if (this.trace) {

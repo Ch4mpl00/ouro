@@ -1,10 +1,10 @@
 import { describe, expect, it } from "vitest";
-import type OpenAI from "openai";
 import type {
   ChatCompletionMessageParam,
   ChatCompletionTool,
 } from "openai/resources/chat/completions";
 import type { ModelPreset, PresetName } from "../models";
+import type { ChatProvider } from "../providers";
 import type { Generation, Span, Trace, TraceContext } from "../tracing";
 import { createCompiler, type CompileRequest } from "./compile";
 
@@ -42,44 +42,37 @@ function recordingTrace(): Trace {
   };
 }
 
-interface MockClientOpts {
+interface MockProviderOpts {
   llmReplies: Array<string | Error>;
 }
 
-function makeMockClient(opts: MockClientOpts): {
-  client: OpenAI;
+function makeMockProvider(opts: MockProviderOpts): {
+  provider: ChatProvider;
   calls: Array<{ messages: ChatCompletionMessageParam[] }>;
 } {
   const calls: Array<{ messages: ChatCompletionMessageParam[] }> = [];
   const queue = [...opts.llmReplies];
-  const client = {
-    chat: {
-      completions: {
-        create: async (body: {
-          messages: ChatCompletionMessageParam[];
-        }) => {
-          calls.push({ messages: structuredClone(body.messages) });
-          const next = queue.shift();
-          if (next instanceof Error) throw next;
-          return {
-            choices: [{ message: { content: next ?? "" } }],
-            usage: { prompt_tokens: 100, completion_tokens: 50, total_tokens: 150 },
-          };
-        },
-      },
+  const provider: ChatProvider = {
+    kind: "openai",
+    complete: async (params) => {
+      calls.push({ messages: structuredClone(params.messages) });
+      const next = queue.shift();
+      if (next instanceof Error) throw next;
+      return {
+        message: { role: "assistant", content: next ?? "", refusal: null },
+        finishReason: "stop",
+        usage: { input: 100, output: 50, total: 150 },
+      };
     },
-  } as unknown as OpenAI;
-  return { client, calls };
+  };
+  return { provider, calls };
 }
 
-function makeEngineSurface(client: OpenAI) {
+function makeEngineSurface(provider: ChatProvider) {
   return {
     presets: PRESETS,
-    resolveProvider(model: string) {
-      return {
-        client,
-        kind: model.startsWith("deepseek") ? ("deepseek" as const) : ("openai" as const),
-      };
+    resolveProvider(_model: string) {
+      return provider;
     },
   };
 }
@@ -155,9 +148,9 @@ const FAKE_SKILLS = ["telegram", "news-digest"];
 
 describe("compiler.compile — happy path", () => {
   it("returns ok with parsed plan on first valid response", async () => {
-    const { client, calls } = makeMockClient({ llmReplies: [VALID_PLAN_JSON] });
+    const { provider, calls } = makeMockProvider({ llmReplies: [VALID_PLAN_JSON] });
     const compiler = createCompiler({
-      engine: makeEngineSurface(client),
+      engine: makeEngineSurface(provider),
       readSkill: async () => "PLANNER RULES",
       mcpTools: FAKE_TOOLS,
       knownSkills: FAKE_SKILLS,
@@ -173,9 +166,9 @@ describe("compiler.compile — happy path", () => {
   });
 
   it("splits the prompt: static tools/skills in system (cache prefix), variable signal in user", async () => {
-    const { client, calls } = makeMockClient({ llmReplies: [VALID_PLAN_JSON] });
+    const { provider, calls } = makeMockProvider({ llmReplies: [VALID_PLAN_JSON] });
     const compiler = createCompiler({
-      engine: makeEngineSurface(client),
+      engine: makeEngineSurface(provider),
       readSkill: async () => "PLANNER RULES",
       mcpTools: FAKE_TOOLS,
       knownSkills: FAKE_SKILLS,
@@ -214,9 +207,9 @@ describe("compiler.compile — happy path", () => {
   });
 
   it("tool signatures expose required vs optional params correctly", async () => {
-    const { client, calls } = makeMockClient({ llmReplies: [VALID_PLAN_JSON] });
+    const { provider, calls } = makeMockProvider({ llmReplies: [VALID_PLAN_JSON] });
     const compiler = createCompiler({
-      engine: makeEngineSurface(client),
+      engine: makeEngineSurface(provider),
       readSkill: async () => "RULES",
       mcpTools: FAKE_TOOLS,
       knownSkills: FAKE_SKILLS,
@@ -230,9 +223,9 @@ describe("compiler.compile — happy path", () => {
   });
 
   it("uses the smartest preset's model in the request", async () => {
-    const { client, calls } = makeMockClient({ llmReplies: [VALID_PLAN_JSON] });
+    const { provider, calls } = makeMockProvider({ llmReplies: [VALID_PLAN_JSON] });
     const compiler = createCompiler({
-      engine: makeEngineSurface(client),
+      engine: makeEngineSurface(provider),
       readSkill: async () => "RULES",
       mcpTools: FAKE_TOOLS,
       knownSkills: FAKE_SKILLS,
@@ -247,9 +240,9 @@ describe("compiler.compile — happy path", () => {
 
 describe("compiler.compile — skill missing", () => {
   it("returns skill_not_found without calling the LLM", async () => {
-    const { client, calls } = makeMockClient({ llmReplies: [] });
+    const { provider, calls } = makeMockProvider({ llmReplies: [] });
     const compiler = createCompiler({
-      engine: makeEngineSurface(client),
+      engine: makeEngineSurface(provider),
       readSkill: async () => null,
       mcpTools: FAKE_TOOLS,
       knownSkills: FAKE_SKILLS,
@@ -267,9 +260,9 @@ describe("compiler.compile — skill missing", () => {
 describe("compiler.compile — LLM error", () => {
   it("returns llm_error and stops without retrying", async () => {
     const err = new Error("rate limit");
-    const { client, calls } = makeMockClient({ llmReplies: [err] });
+    const { provider, calls } = makeMockProvider({ llmReplies: [err] });
     const compiler = createCompiler({
-      engine: makeEngineSurface(client),
+      engine: makeEngineSurface(provider),
       readSkill: async () => "RULES",
       mcpTools: FAKE_TOOLS,
       knownSkills: FAKE_SKILLS,
@@ -287,11 +280,11 @@ describe("compiler.compile — LLM error", () => {
 
 describe("compiler.compile — retry loop", () => {
   it("retries on invalid JSON with error feedback", async () => {
-    const { client, calls } = makeMockClient({
+    const { provider, calls } = makeMockProvider({
       llmReplies: ["not json", VALID_PLAN_JSON],
     });
     const compiler = createCompiler({
-      engine: makeEngineSurface(client),
+      engine: makeEngineSurface(provider),
       readSkill: async () => "RULES",
       mcpTools: FAKE_TOOLS,
       knownSkills: FAKE_SKILLS,
@@ -318,11 +311,11 @@ describe("compiler.compile — retry loop", () => {
         { kind: "terminal" },
       ],
     });
-    const { client, calls } = makeMockClient({
+    const { provider, calls } = makeMockProvider({
       llmReplies: [invalidPlanJson, VALID_PLAN_JSON],
     });
     const compiler = createCompiler({
-      engine: makeEngineSurface(client),
+      engine: makeEngineSurface(provider),
       readSkill: async () => "RULES",
       mcpTools: FAKE_TOOLS,
       knownSkills: FAKE_SKILLS,
@@ -345,11 +338,11 @@ describe("compiler.compile — retry loop", () => {
         { kind: "terminal" },
       ],
     });
-    const { client } = makeMockClient({
+    const { provider } = makeMockProvider({
       llmReplies: [invalidPlanJson, invalidPlanJson, invalidPlanJson],
     });
     const compiler = createCompiler({
-      engine: makeEngineSurface(client),
+      engine: makeEngineSurface(provider),
       readSkill: async () => "RULES",
       mcpTools: FAKE_TOOLS,
       knownSkills: FAKE_SKILLS,
@@ -365,11 +358,11 @@ describe("compiler.compile — retry loop", () => {
   });
 
   it("returns invalid_json after exhausting all attempts on JSON errors", async () => {
-    const { client } = makeMockClient({
+    const { provider } = makeMockProvider({
       llmReplies: ["not json", "still not json", "definitely not"],
     });
     const compiler = createCompiler({
-      engine: makeEngineSurface(client),
+      engine: makeEngineSurface(provider),
       readSkill: async () => "RULES",
       mcpTools: FAKE_TOOLS,
       knownSkills: FAKE_SKILLS,
@@ -384,9 +377,9 @@ describe("compiler.compile — retry loop", () => {
   });
 
   it("respects custom maxAttempts (1 = no retries)", async () => {
-    const { client } = makeMockClient({ llmReplies: ["not json"] });
+    const { provider } = makeMockProvider({ llmReplies: ["not json"] });
     const compiler = createCompiler({
-      engine: makeEngineSurface(client),
+      engine: makeEngineSurface(provider),
       readSkill: async () => "RULES",
       mcpTools: FAKE_TOOLS,
       knownSkills: FAKE_SKILLS,

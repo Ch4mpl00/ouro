@@ -1,6 +1,11 @@
 import OpenAI from "openai";
 import { connectMcp, type McpHandle } from "./mcp-client";
 import { DEFAULT_PRESETS, type ModelPreset, type PresetName } from "./models";
+import {
+  createDeepseekProvider,
+  createOpenAiProvider,
+  type ChatProvider,
+} from "./providers";
 import { Session, type SessionOpts } from "./session";
 import { readSkill, validateAllSkills } from "./skills";
 import { nullTracer, type Tracer } from "./tracing";
@@ -15,12 +20,9 @@ import { langfuseTracerFromEnv } from "./tracing/langfuse";
 // Hands out Sessions on demand. Each Session has its own context buffer,
 // system prompt and iteration budget but reuses these shared resources.
 
-export type ProviderKind = "deepseek" | "openai";
-
-export interface Provider {
-  client: OpenAI;
-  kind: ProviderKind;
-}
+// Provider kind + the ChatProvider wrapper live in ./providers now. Re-export
+// the kind for callers that only need the discriminator.
+export type { ProviderKind } from "./providers";
 
 export interface EngineOpts {
   deepseekApiKey: string;
@@ -51,11 +53,11 @@ export class Engine {
   readonly presets: Record<PresetName, ModelPreset>;
   readonly skills: readonly string[];
   readonly tracer: Tracer;
-  private readonly providers: { deepseek: OpenAI; openai: OpenAI };
+  private readonly providers: { deepseek: ChatProvider; openai: ChatProvider };
   private sessions = new Map<string, Session>();
 
   constructor(
-    providers: { deepseek: OpenAI; openai: OpenAI },
+    providers: { deepseek: ChatProvider; openai: ChatProvider },
     mcp: McpHandle,
     presets: Record<PresetName, ModelPreset>,
     skills: readonly string[],
@@ -68,15 +70,13 @@ export class Engine {
     this.tracer = tracer;
   }
 
-  // Pick the LLM client + provider semantics based on the model name. The
-  // model name is the source of truth — Session resolves a preset name
-  // to a concrete model at construction time; this method only routes
-  // that model to its endpoint.
-  resolveProvider(model: string): Provider {
-    if (model.startsWith("deepseek")) {
-      return { client: this.providers.deepseek, kind: "deepseek" };
-    }
-    return { client: this.providers.openai, kind: "openai" };
+  // Pick the provider wrapper based on the model name. The model name is the
+  // source of truth — Session resolves a preset name to a concrete model at
+  // construction time; this method only routes that model to its endpoint.
+  resolveProvider(model: string): ChatProvider {
+    return model.startsWith("deepseek")
+      ? this.providers.deepseek
+      : this.providers.openai;
   }
 
   async startSession(opts: SessionOpts): Promise<Session> {
@@ -183,13 +183,13 @@ export async function createEngine(opts: EngineOpts): Promise<Engine> {
   if (!opts.deepseekApiKey) throw new Error("createEngine: deepseekApiKey is required");
   if (!opts.openaiApiKey) throw new Error("createEngine: openaiApiKey is required");
 
-  const deepseek = new OpenAI({
-    apiKey: opts.deepseekApiKey,
-    baseURL: "https://api.deepseek.com",
-  });
-  const openai = new OpenAI({
-    apiKey: opts.openaiApiKey,
-  });
+  const deepseek = createDeepseekProvider(
+    new OpenAI({
+      apiKey: opts.deepseekApiKey,
+      baseURL: "https://api.deepseek.com",
+    }),
+  );
+  const openai = createOpenAiProvider(new OpenAI({ apiKey: opts.openaiApiKey }));
 
   const mcp = await connectMcp();
 

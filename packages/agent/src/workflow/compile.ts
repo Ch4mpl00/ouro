@@ -1,9 +1,9 @@
-import type OpenAI from "openai";
 import type {
   ChatCompletionMessageParam,
   ChatCompletionTool,
 } from "openai/resources/chat/completions";
 import type { ModelPreset, PresetName } from "../models";
+import type { ChatProvider } from "../providers";
 import type { EnvData } from "../session-context";
 import type { Span, TraceContext } from "../tracing";
 import { createWorkflowSchema, parseWorkflow, type Workflow } from "./dsl";
@@ -70,10 +70,7 @@ export interface Compiler {
 // mocks can be plain objects (mirrors the executor's EngineSurface).
 export interface CompilerEngineSurface {
   readonly presets: Record<PresetName, ModelPreset>;
-  resolveProvider(model: string): {
-    client: OpenAI;
-    kind: "deepseek" | "openai";
-  };
+  resolveProvider(model: string): ChatProvider;
 }
 
 export interface CompilerDeps {
@@ -152,7 +149,7 @@ export function createCompiler(deps: CompilerDeps): Compiler {
 
       try {
         return await runRetryLoop(
-          provider.client,
+          provider,
           preset,
           messages,
           WorkflowSchema,
@@ -169,7 +166,7 @@ export function createCompiler(deps: CompilerDeps): Compiler {
 }
 
 async function runRetryLoop(
-  client: OpenAI,
+  provider: ChatProvider,
   preset: ModelPreset,
   messages: ChatCompletionMessageParam[],
   // Avoid importing the schema type just for the parameter signature.
@@ -193,27 +190,16 @@ async function runRetryLoop(
 
     let text: string;
     try {
-      const response = await client.chat.completions.create({
+      // The provider normalizes usage (incl. the cached-prompt portion that
+      // shows the static planner.md + tools + skills prefix hitting cache).
+      const result = await provider.complete({
         model: preset.model,
         messages,
-        response_format: { type: "json_object" },
+        reasoningEffort: preset.reasoningEffort,
+        responseFormat: { type: "json_object" },
       });
-      text = response.choices[0]?.message.content ?? "";
-      const u = response.usage;
-      gen.end({
-        output: text,
-        usage: u
-          ? {
-              input: u.prompt_tokens,
-              output: u.completion_tokens,
-              total: u.total_tokens,
-              // How much of the input was served from OpenAI's automatic
-              // prompt cache — lets the trace show the cache actually
-              // hitting the static planner.md + tools + skills prefix.
-              cached: u.prompt_tokens_details?.cached_tokens,
-            }
-          : undefined,
-      });
+      text = result.message.content ?? "";
+      gen.end({ output: text, usage: result.usage });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       gen.end({

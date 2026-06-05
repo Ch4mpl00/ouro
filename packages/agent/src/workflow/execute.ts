@@ -1,6 +1,6 @@
-import type OpenAI from "openai";
 import type { ChatCompletionMessageParam } from "openai/resources/chat/completions";
 import type { ModelPreset, PresetName } from "../models";
+import type { ChatProvider } from "../providers";
 import type { SessionOpts } from "../session";
 import { SET_MEMORY_TOOL_NAME, SetMemoryArgsSchema } from "../synthetic-tools";
 import type { Span, SpanKind, TraceContext } from "../tracing";
@@ -83,10 +83,7 @@ export interface Executor {
 // avoids `as unknown as Engine` casts in tests.
 export interface EngineSurface {
   readonly presets: Record<PresetName, ModelPreset>;
-  resolveProvider(model: string): {
-    client: OpenAI;
-    kind: "deepseek" | "openai";
-  };
+  resolveProvider(model: string): ChatProvider;
   mcp: {
     callTool(name: string, args: Record<string, unknown>): Promise<string>;
   };
@@ -470,8 +467,6 @@ async function execLlmCompose(
   if (system) messages.push({ role: "system", content: system });
   messages.push({ role: "user", content: userText });
 
-  const body = buildLlmComposeBody(preset, provider.kind, messages);
-
   const gen = span.generation({
     name: `llm_compose:${step.bind}`,
     model: preset.model,
@@ -483,53 +478,24 @@ async function execLlmCompose(
   });
 
   let content: string;
-  let usage: { input: number; output: number; total: number } | undefined;
   try {
-    const response = await provider.client.chat.completions.create(body);
-    content = response.choices[0]?.message.content ?? "";
-    const u = response.usage;
-    if (u) {
-      usage = {
-        input: u.prompt_tokens,
-        output: u.completion_tokens,
-        total: u.total_tokens,
-      };
-    }
+    // No tools passed → the provider omits the field (the SDK rejects an
+    // empty array); a compose step is one shot, no tool_calls possible.
+    const result = await provider.complete({
+      model: preset.model,
+      messages,
+      reasoningEffort: preset.reasoningEffort,
+    });
+    content = result.message.content ?? "";
+    gen.end({ output: content, usage: result.usage });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     gen.end({ output: { error: message }, level: "ERROR", statusMessage: message });
     throw new LlmCallError(message);
   }
 
-  gen.end({ output: content, usage });
   store.set(step.bind, content);
   return content;
-}
-
-function buildLlmComposeBody(
-  preset: ModelPreset,
-  providerKind: "deepseek" | "openai",
-  messages: ChatCompletionMessageParam[],
-) {
-  const base = {
-    model: preset.model,
-    messages,
-    // tools=[] would be ideal, but the OpenAI SDK rejects an empty
-    // array on chat.completions.create. Omitting the field has the
-    // same effect: no tools declared = no tool_calls possible.
-  };
-  if (providerKind === "deepseek") {
-    return {
-      ...base,
-      ...(preset.reasoningEffort === "disabled"
-        ? { thinking: { type: "disabled" as const } }
-        : {
-            thinking: { type: "enabled" as const },
-            reasoning_effort: preset.reasoningEffort,
-          }),
-    };
-  }
-  return base;
 }
 
 // XML-style input blocks render reliably for both OpenAI and DeepSeek
@@ -618,7 +584,6 @@ async function execParallel(
 
 export const __testing = {
   renderInputAsXml,
-  buildLlmComposeBody,
   classifyError,
   ToolCallError,
   SkillNotFoundError,

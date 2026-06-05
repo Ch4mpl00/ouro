@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it } from "vitest";
-import type OpenAI from "openai";
 import type { ChatCompletionMessageParam } from "openai/resources/chat/completions";
 import type { ModelPreset, PresetName } from "../models";
+import type { ChatProvider } from "../providers";
 import type { SessionOpts } from "../session";
 import type { Generation, Span, Trace, TraceContext } from "../tracing";
 import { createWorkflowSchema, type Workflow } from "./dsl";
@@ -148,28 +148,25 @@ function makeMockEngine(opts: MockEngineOpts = {}): EngineSurface & {
   const llmQueue = [...(opts.llmResponses ?? [])];
   const sessionQueue = [...(opts.sessionResults ?? [])];
 
-  const openaiClient = {
-    chat: {
-      completions: {
-        create: async (body: unknown) => {
-          llmCalls.push(body);
-          const text = llmQueue.shift() ?? "";
-          return {
-            choices: [{ message: { content: text } }],
-            usage: { prompt_tokens: 100, completion_tokens: 50, total_tokens: 150 },
-          };
-        },
-      },
+  // ChatProvider mock: captures the normalized completion params (which
+  // carry `.messages`, the assertion target) and returns a canned answer.
+  const provider: ChatProvider = {
+    kind: "openai",
+    complete: async (params) => {
+      llmCalls.push(params);
+      const text = llmQueue.shift() ?? "";
+      return {
+        message: { role: "assistant", content: text, refusal: null },
+        finishReason: "stop",
+        usage: { input: 100, output: 50, total: 150 },
+      };
     },
-  } as unknown as OpenAI;
+  };
 
   return {
     presets: PRESETS,
-    resolveProvider(model: string) {
-      return {
-        client: openaiClient,
-        kind: model.startsWith("deepseek") ? "deepseek" : "openai",
-      };
+    resolveProvider(_model: string) {
+      return provider;
     },
     mcp: {
       callTool: async (name, args) => {
@@ -957,44 +954,6 @@ describe("renderInputAsXml (internal)", () => {
   it("JSON-stringifies non-string values", () => {
     const out = __testing.renderInputAsXml({ x: { v: 1 } });
     expect(out).toContain('"v": 1');
-  });
-});
-
-describe("buildLlmComposeBody (internal)", () => {
-  it("OpenAI: no thinking / no reasoning_effort", () => {
-    const body = __testing.buildLlmComposeBody(
-      PRESETS.base,
-      "openai",
-      [{ role: "user", content: "x" }],
-    );
-    expect(body).toEqual({
-      model: "gpt-5.4-mini",
-      messages: [{ role: "user", content: "x" }],
-    });
-  });
-
-  it("DeepSeek + disabled effort: adds thinking:disabled, no reasoning_effort", () => {
-    const body = __testing.buildLlmComposeBody(
-      { model: "deepseek-chat", reasoningEffort: "disabled" },
-      "deepseek",
-      [],
-    );
-    expect(body).toMatchObject({
-      thinking: { type: "disabled" },
-    });
-    expect((body as { reasoning_effort?: string }).reasoning_effort).toBeUndefined();
-  });
-
-  it("DeepSeek + max effort: adds thinking:enabled + reasoning_effort:max", () => {
-    const body = __testing.buildLlmComposeBody(
-      PRESETS.smart,
-      "deepseek",
-      [],
-    );
-    expect(body).toMatchObject({
-      thinking: { type: "enabled" },
-      reasoning_effort: "max",
-    });
   });
 });
 
