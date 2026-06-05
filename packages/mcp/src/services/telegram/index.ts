@@ -1,6 +1,7 @@
 export {
   sendMessage,
   editMessageText,
+  deleteMessage,
   sendChatAction,
   getUpdates,
   getBotToken,
@@ -26,5 +27,11 @@ export {
 } from "./storage";
 
 export { startTyping, stopTyping } from "./typing";
+
+export {
+  sendStatus,
+  type SendStatusInput,
+  type SendStatusResult,
+} from "./status";
 
 export { startTelegramPoller } from "./poller";

@@ -86,13 +86,22 @@ end-to-end — then include `send_telegram_message` in its whitelist.)
 **Telegram → keep the user posted.** When `signal.source = telegram` the
 user is watching live. ALWAYS open with `start_typing(chatId=<lit>)`. If the
 workflow has a slow step — a `search_news` + `llm_compose`, a digest,
-anything that takes real seconds — send a short `send_telegram_message`
-status note (no bind) BEFORE each slow step so they're not staring at
-silence: e.g. `"🔎 собираю новости"`, `"🧠 обрабатываю, готовлю выборку"`,
-`"✍️ пишу ответ"`. The final `send_telegram_message` is the real answer.
-Keep notes to a few words. Skip the play-by-play for a quick single-step
-reply (a confirmation, a one-liner) — only narrate when there's a real wait.
-(Scheduler/cron signals have no live watcher — no typing, no status notes.)
+anything that takes real seconds — narrate progress through ONE live status
+message, not a pile of separate sends. Use `telegram_send_status` with a
+stable id `status:${signal.id}`:
+- `telegram_send_status(id="status:${signal.id}", text="🔎 собираю новости")`
+  BEFORE each slow step — the first call sends the bubble, each next call
+  EDITS the same bubble in place (e.g. `"🧠 готовлю выборку"`, `"✍️ пишу
+  ответ"`). No bind needed.
+- After the real answer ships via `send_telegram_message`, clear the bubble:
+  `telegram_send_status(id="status:${signal.id}", text="")` (empty text
+  deletes it) — so the chat is left with just the answer, no progress litter.
+
+Keep status text to a few words. The final `send_telegram_message` is the
+real answer (status messages are ephemeral and never the answer). Skip the
+play-by-play for a quick single-step reply (a confirmation, a one-liner) —
+only narrate when there's a real wait. (Scheduler/cron signals have no live
+watcher — no typing, no status.)
 
 ### Step kinds
 
@@ -204,7 +213,8 @@ easy-to-forget bits.
 - **News digest** (scheduler/news-digest):
   `[list_news: channel] ‖ [chat history] → [compose:news-digest] → [send] ‖ [stamp news_digest.last_read_at]`
 - **Topical question** (telegram, about the world):
-  `[start_typing] → [send "🔎 собираю новости"] → [search_news: reformulated topic, NO source] → [send "🧠 готовлю выборку"] → [compose:news-query] → [send: answer]`
+  `[start_typing] → [status "🔎 собираю новости"] → [search_news: reformulated topic, NO source] → [status "🧠 готовлю выборку"] → [compose:news-query] → [send: answer] → [status ""]`
+  (`status` = `telegram_send_status(id="status:${signal.id}", …)`; same id edits the one bubble, empty text clears it after the answer.)
 - **Utility bill** (nashdom-bill):
   `[download attachment] → [read_pdf] → [compose:nashdom-bill] → [send]`  (full JSON below)
 - **Schedule a task** ("напомни в 15:00…"):

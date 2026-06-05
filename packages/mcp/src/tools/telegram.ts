@@ -9,6 +9,7 @@ import {
   getChatHistory,
   startTyping,
   stopTyping,
+  sendStatus,
 } from "../services/telegram";
 import { jsonResult } from "../result";
 
@@ -104,6 +105,50 @@ export function registerTelegramTools(server: McpServer): void {
         messageId: edited.message_id,
         date: new Date(edited.date * 1000).toISOString(),
       });
+    },
+  );
+
+  server.registerTool(
+    "telegram_send_status",
+    {
+      title: "Send / update / clear a live status message",
+      description:
+        "Show live progress in a SINGLE Telegram message edited in place, " +
+        "instead of posting a new message per step. Call with the same `id` " +
+        "repeatedly to update the same bubble: the first call sends it, later " +
+        "calls edit it. Call with an EMPTY `text` to delete the bubble when " +
+        "the work is done. Use a stable per-workflow id like `status:<signalId>`. " +
+        "chatId falls back to TELEGRAM_DEFAULT_CHAT_ID. Status messages are " +
+        "ephemeral — they are NOT written to the chat log; ship the real answer " +
+        "with send_telegram_message.",
+      inputSchema: {
+        id: z
+          .string()
+          .min(1)
+          .describe("Stable per-workflow status id, e.g. `status:<signalId>`. Same id edits the same message."),
+        text: z
+          .string()
+          .max(4096)
+          .describe("Status text. Empty string deletes the status message."),
+        chatId: chatIdAsString
+          .optional()
+          .describe("Telegram chat id. Falls back to TELEGRAM_DEFAULT_CHAT_ID if omitted."),
+        messageThreadId: z
+          .number()
+          .int()
+          .optional()
+          .describe("Forum topic thread_id (used when first creating the bubble)."),
+      },
+    },
+    async ({ id, text, chatId, messageThreadId }) => {
+      const target = chatId ?? getDefaultChatId();
+      if (!target) {
+        throw new Error(
+          "No chat target. Pass chatId, or set TELEGRAM_DEFAULT_CHAT_ID in .env (find your id with `pnpm telegram:get-chat-id`).",
+        );
+      }
+      const result = await sendStatus({ id, text, chatId: target, messageThreadId });
+      return jsonResult(result);
     },
   );
 

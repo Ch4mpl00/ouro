@@ -105,6 +105,18 @@ export async function editMessageText(input: EditMessageInput): Promise<SentMess
   });
 }
 
+// Delete a message the bot sent. Telegram only lets a bot delete its own
+// messages (and only within 48h). Used to clear ephemeral status bubbles.
+export async function deleteMessage(
+  chatId: string | number,
+  messageId: number,
+): Promise<void> {
+  await call<true>("deleteMessage", {
+    chat_id: chatId,
+    message_id: messageId,
+  });
+}
+
 export type ChatAction =
   | "typing"
   | "upload_photo"
