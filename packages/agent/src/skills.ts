@@ -105,6 +105,17 @@ export async function readSkill(name: string): Promise<SkillFile | null> {
   return null;
 }
 
+// Raw skill text (live → default), frontmatter included, WITHOUT parsing or
+// validating it. The eval/judge path wants the contract as prose and must not
+// trip over a live overlay that `dreaming` wrote without a `tools:` block —
+// `readSkill` throws there; this doesn't.
+export async function readSkillRaw(name: string): Promise<string | null> {
+  validateName(name);
+  const live = await readIfExists(path.join(LIVE_DIR, `${name}.md`));
+  if (live !== null) return live;
+  return readIfExists(path.join(DEFAULTS_DIR, `${name}.md`));
+}
+
 // Walk every skill file on disk (defaults ∪ live) and parse it. Throws on
 // the first broken frontmatter / unknown tool. Called once at engine
 // startup so misconfiguration crashes the agent up front, not mid-signal.

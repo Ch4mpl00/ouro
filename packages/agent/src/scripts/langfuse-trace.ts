@@ -1,83 +1,13 @@
 import "dotenv/config";
+import { api, type Observation, type Trace } from "./langfuse-api";
 
 // Inspect a Langfuse trace from the terminal. Usage:
 //   pnpm trace <sessionId>            — all traces in a session, summarised
 //   pnpm trace <sessionId> --raw      — also dump full input/output JSON
 //   pnpm trace <traceId> --by-id      — fetch a single trace by its trace id
 //
-// Auth comes from LANGFUSE_PUBLIC_KEY / LANGFUSE_SECRET_KEY / LANGFUSE_BASE_URL
-// in .env (same vars the agent uses).
-
-const baseUrl = process.env.LANGFUSE_BASE_URL ?? "https://cloud.langfuse.com";
-const publicKey = process.env.LANGFUSE_PUBLIC_KEY;
-const secretKey = process.env.LANGFUSE_SECRET_KEY;
-if (!publicKey || !secretKey) {
-  console.error("LANGFUSE_PUBLIC_KEY / LANGFUSE_SECRET_KEY missing in env");
-  process.exit(1);
-}
-const authHeader = `Basic ${Buffer.from(`${publicKey}:${secretKey}`).toString("base64")}`;
-
-async function api<T>(path: string): Promise<T> {
-  const res = await fetch(`${baseUrl}/api/public${path}`, {
-    headers: { Authorization: authHeader },
-  });
-  if (!res.ok) throw new Error(`langfuse ${res.status} ${res.statusText} on ${path}`);
-  return (await res.json()) as T;
-}
-
-interface Trace {
-  id: string;
-  name: string;
-  sessionId: string | null;
-  timestamp: string;
-  input: unknown;
-  output: unknown;
-  metadata: Record<string, unknown> | null;
-  // /traces?sessionId=... returns IDs; /traces/<id> returns full
-  // Observation objects inline. Handle both.
-  observations: Array<string | Observation>;
-  latency: number;
-  totalCost: number;
-  tags: string[];
-}
-
-// Langfuse observation types. Beyond the original GENERATION/SPAN/EVENT,
-// v5 adds typed spans (AGENT/TOOL/CHAIN/RETRIEVER/…) that the agent now
-// emits via `kind`. They render like spans; only GENERATION/EMBEDDING
-// carry model + token usage.
-type ObservationType =
-  | "GENERATION"
-  | "SPAN"
-  | "EVENT"
-  | "AGENT"
-  | "TOOL"
-  | "CHAIN"
-  | "RETRIEVER"
-  | "EVALUATOR"
-  | "GUARDRAIL"
-  | "EMBEDDING";
-
-interface Observation {
-  id: string;
-  name: string;
-  type: ObservationType;
-  parentObservationId: string | null;
-  startTime: string;
-  endTime: string;
-  level: string;
-  statusMessage: string | null;
-  input: unknown;
-  output: unknown;
-  metadata: Record<string, unknown> | null;
-  model: string | null;
-  modelParameters: Record<string, unknown> | null;
-  usage: { input: number; output: number; total: number } | null;
-  // Per-key usage breakdown — carries the `cached` key we attach for the
-  // prompt-cache hit portion (see tracing/langfuse.ts).
-  usageDetails: Record<string, number> | null;
-  calculatedTotalCost: number | null;
-  latency: number;
-}
+// Auth + the api()/Trace/Observation types live in ./langfuse-api (shared with
+// the eval judge). This file owns only the terminal rendering.
 
 function truncate(s: string, n: number): string {
   if (s.length <= n) return s;
