@@ -6,7 +6,7 @@ import {
   createOpenAiProvider,
   type ChatProvider,
 } from "./providers";
-import { Session, type SessionOpts } from "./session";
+import { AgentLoop, type AgentLoopOpts } from "./agent-loop";
 import { readSkill, validateAllSkills } from "./skills";
 import { nullTracer, type Tracer } from "./tracing";
 import { langfuseTracerFromEnv } from "./tracing/langfuse";
@@ -17,8 +17,9 @@ import { langfuseTracerFromEnv } from "./tracing/langfuse";
 //     API key + rate-limit bucket)
 //   - one MCP connection (one stdio child process for the integrations server)
 //   - one Tracer (observability backend; defaults to no-op)
-// Hands out Sessions on demand. Each Session has its own context buffer,
-// system prompt and iteration budget but reuses these shared resources.
+// Hands out AgentLoops on demand. Each AgentLoop has its own context
+// buffer, system prompt and iteration budget but reuses these shared
+// resources.
 
 // Provider kind + the ChatProvider wrapper live in ./providers now. Re-export
 // the kind for callers that only need the discriminator.
@@ -36,9 +37,9 @@ export interface EngineOpts {
   // (unless a session opts out via `includeEngineSkills: false`). Use for
   // meta-skills that apply across every domain — e.g. `routing` (when to
   // delegate to another skill). Per-session domain skills are passed via
-  // `SessionOpts.skills` instead.
+  // `AgentLoopOpts.skills` instead.
   //
-  // Resolved at `startSession` time, not engine-create time, so live
+  // Resolved at `startAgentLoop` time, not engine-create time, so live
   // overlay edits (e.g. by the `dreaming` skill) take effect on the very
   // next session without an engine restart.
   skills?: string[];
@@ -54,7 +55,7 @@ export class Engine {
   readonly skills: readonly string[];
   readonly tracer: Tracer;
   private readonly providers: { deepseek: ChatProvider; openai: ChatProvider };
-  private sessions = new Map<string, Session>();
+  private agentLoops = new Map<string, AgentLoop>();
 
   constructor(
     providers: { deepseek: ChatProvider; openai: ChatProvider },
@@ -79,9 +80,9 @@ export class Engine {
       : this.providers.openai;
   }
 
-  async startSession(opts: SessionOpts): Promise<Session> {
-    if (this.sessions.has(opts.id)) {
-      throw new Error(`session id ${opts.id} already exists`);
+  async startAgentLoop(opts: AgentLoopOpts): Promise<AgentLoop> {
+    if (this.agentLoops.has(opts.id)) {
+      throw new Error(`agent-loop id ${opts.id} already exists`);
     }
 
     const sessionSkillNames = opts.skills ?? [];
@@ -147,23 +148,23 @@ export class Engine {
       }
     }
 
-    const session = new Session(this, { ...opts, resolvedSkills, allowedTools });
-    this.sessions.set(opts.id, session);
+    const loop = new AgentLoop(this, { ...opts, resolvedSkills, allowedTools });
+    this.agentLoops.set(opts.id, loop);
     const skillsList = Object.keys(resolvedSkills).join(",");
     const toolsLabel = allowedTools === null ? "*" : String(allowedTools.size);
     this.log(
       opts.id,
-      `session opened (preset=${session.preset} → model=${session.model}, effort=${session.reasoningEffort}, skills=[${skillsList}], tools=${toolsLabel}${opts.parentId ? `, parent=${opts.parentId}` : ""})`,
+      `agent-loop opened (preset=${loop.preset} → model=${loop.model}, effort=${loop.reasoningEffort}, skills=[${skillsList}], tools=${toolsLabel}${opts.parentId ? `, parent=${opts.parentId}` : ""})`,
     );
-    return session;
+    return loop;
   }
 
-  endSession(id: string): void {
-    const s = this.sessions.get(id);
-    if (!s) return;
-    s.close();
-    this.sessions.delete(id);
-    this.log(id, "session closed");
+  endAgentLoop(id: string): void {
+    const loop = this.agentLoops.get(id);
+    if (!loop) return;
+    loop.close();
+    this.agentLoops.delete(id);
+    this.log(id, "agent-loop closed");
   }
 
   log(sessionId: string, ...parts: unknown[]): void {
@@ -171,7 +172,7 @@ export class Engine {
   }
 
   async shutdown(): Promise<void> {
-    for (const id of [...this.sessions.keys()]) this.endSession(id);
+    for (const id of [...this.agentLoops.keys()]) this.endAgentLoop(id);
     // Flush buffered tracer events. Without this, traces from the final
     // session(s) before SIGTERM are silently dropped.
     await this.tracer.shutdown();

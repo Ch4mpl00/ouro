@@ -16,7 +16,7 @@ import {
 // MCP server, which queues signals into its own DB. Each signal flows:
 //
 //   signal → workflow (compile → execute)
-//          ↳ compile failed → fallback: agentic Session
+//          ↳ compile failed → fallback: agentic AgentLoop
 //          ↳ execute failed → fallback: recovery report
 //
 // The poll loop and trace setup live here; everything past a workflow
@@ -36,7 +36,7 @@ function sleep(ms: number): Promise<void> {
 // Returns just the skill body (or null) — matches the surface the
 // workflow facade (compiler + executor) depends on. The full SkillFile
 // shape (with frontmatter tools list) stays internal to
-// engine.startSession.
+// engine.startAgentLoop.
 async function readSkillBody(name: string): Promise<string | null> {
   const s = await readSkill(name);
   return s?.body ?? null;

@@ -1,25 +1,26 @@
 import type { ChatCompletionTool } from "openai/resources/chat/completions";
 import { z } from "zod";
 import { PRESET_NAMES } from "./models";
-import type { Session } from "./session";
+import type { AgentLoop } from "./agent-loop";
 import type { TraceContext } from "./tracing";
 
-// Agent-side synthetic tools — intercepted inside the Session loop and
+// Agent-side synthetic tools — intercepted inside the AgentLoop and
 // never forwarded to the MCP server. Each tool is declared as the
-// (OpenAI tool definition + Session-method handler) pair below, then
-// listed in SYNTHETIC_TOOLS at the bottom of the file. The Session
-// loop builds its per-call `tools` array by filtering through
+// (OpenAI tool definition + AgentLoop-method handler) pair below, then
+// listed in SYNTHETIC_TOOLS at the bottom of the file. The AgentLoop
+// builds its per-call `tools` array by filtering through
 // `visibleTo` and dispatches incoming tool calls by name lookup in
 // SYNTHETIC_TOOLS_BY_NAME — adding a new tool is one new entry here,
-// no changes to session.ts beyond declaring the handler method.
+// no changes to agent-loop.ts beyond declaring the handler method.
 //
-// These live for Session — i.e. the agentic fallback path and `llm_agent`
-// workflow steps (a sub-session sees the full set here). The default
-// workflow path does NOT load this registry: its tool / llm_compose steps
-// call MCP and the LLM directly. The one exception is `set_memory`, which
-// a workflow `tool` step also needs (watermark writes) — the executor
-// dispatches it to the same agent.db writer without going through Session
-// (see workflow/execute.ts execSetMemory).
+// These live for the AgentLoop — i.e. the agentic fallback path and
+// `llm_agent` workflow steps (a sub-loop sees the full set here). The
+// default workflow path does NOT load this registry: its tool /
+// llm_compose steps call MCP and the LLM directly. The one exception is
+// `set_memory`, which a workflow `tool` step also needs (watermark
+// writes) — the executor dispatches it to the same agent.db writer
+// without going through an AgentLoop (see workflow/execute.ts
+// execSetMemory).
 
 // ─── set_memory ──────────────────────────────────────────────────────
 // Agent-side writes to the local memory KV (`agent.db memory`). Bypasses
@@ -231,7 +232,7 @@ export const InvokeSubAgentArgsSchema = z.object({
   system_prompt: z.string().optional(),
   max_iterations: z.number().int().positive().optional(),
   // Inline literals (zod widens a readonly PRESET_NAMES to `string`); a
-  // typo here surfaces as a type error where preset feeds startSession.
+  // typo here surfaces as a type error where preset feeds startAgentLoop.
   preset: z.enum(["base", "smart", "smartest"]).optional(),
 });
 export type InvokeSubAgentArgs = z.infer<typeof InvokeSubAgentArgsSchema>;
@@ -239,14 +240,14 @@ export type InvokeSubAgentArgs = z.infer<typeof InvokeSubAgentArgsSchema>;
 // ─── registry ────────────────────────────────────────────────────────
 export interface SyntheticTool {
   def: ChatCompletionTool;
-  visibleTo?: (session: Session) => boolean;
+  visibleTo?: (loop: AgentLoop) => boolean;
   // `span` is the trace span the dispatch loop opened for this tool call.
   // Most handlers ignore it; `invoke_sub_agent` reuses it as the child
-  // session's trace scope so the sub-agent's iter/tool spans nest inside
-  // the parent's `invoke_sub_agent` span (one trace per top-level session
-  // instead of one per session).
+  // loop's trace scope so the sub-agent's iter/tool spans nest inside
+  // the parent's `invoke_sub_agent` span (one trace per top-level loop
+  // instead of one per loop).
   handle: (
-    session: Session,
+    loop: AgentLoop,
     args: Record<string, unknown>,
     span: TraceContext,
   ) => Promise<string> | string;

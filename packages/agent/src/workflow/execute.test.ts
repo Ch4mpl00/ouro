@@ -2,13 +2,13 @@ import { beforeEach, describe, expect, it } from "vitest";
 import type { ChatCompletionMessageParam } from "openai/resources/chat/completions";
 import type { ModelPreset, PresetName } from "../models";
 import type { ChatProvider } from "../providers";
-import type { SessionOpts } from "../session";
+import type { AgentLoopOpts } from "../agent-loop";
 import type { Generation, Span, Trace, TraceContext } from "../tracing";
 import { createWorkflowSchema, type Workflow } from "./dsl";
 import {
   createExecutor,
   type EngineSurface,
-  type SubSessionHandle,
+  type AgentLoopHandle,
   __testing,
 } from "./execute";
 import { createStore } from "./variables";
@@ -131,22 +131,22 @@ interface MockCall {
 interface MockEngineOpts {
   toolResponses?: Record<string, string | ((args: Record<string, unknown>) => string)>;
   llmResponses?: string[];
-  sessionResults?: string[];
-  startSessionThrows?: Error;
+  agentLoopResults?: string[];
+  startAgentLoopThrows?: Error;
 }
 
 function makeMockEngine(opts: MockEngineOpts = {}): EngineSurface & {
   toolCalls: MockCall[];
   llmCalls: unknown[];
-  sessionStarts: SessionOpts[];
-  endedSessionIds: string[];
+  agentLoopStarts: AgentLoopOpts[];
+  endedAgentLoopIds: string[];
 } {
   const toolCalls: MockCall[] = [];
   const llmCalls: unknown[] = [];
-  const sessionStarts: SessionOpts[] = [];
-  const endedSessionIds: string[] = [];
+  const agentLoopStarts: AgentLoopOpts[] = [];
+  const endedAgentLoopIds: string[] = [];
   const llmQueue = [...(opts.llmResponses ?? [])];
-  const sessionQueue = [...(opts.sessionResults ?? [])];
+  const agentLoopQueue = [...(opts.agentLoopResults ?? [])];
 
   // ChatProvider mock: captures the normalized completion params (which
   // carry `.messages`, the assertion target) and returns a canned answer.
@@ -176,23 +176,23 @@ function makeMockEngine(opts: MockEngineOpts = {}): EngineSurface & {
         return typeof r === "function" ? r(args) : r;
       },
     },
-    startSession: async (sessionOpts: SessionOpts): Promise<SubSessionHandle> => {
-      if (opts.startSessionThrows) throw opts.startSessionThrows;
-      sessionStarts.push(sessionOpts);
-      const result = sessionQueue.shift() ?? "";
+    startAgentLoop: async (loopOpts: AgentLoopOpts): Promise<AgentLoopHandle> => {
+      if (opts.startAgentLoopThrows) throw opts.startAgentLoopThrows;
+      agentLoopStarts.push(loopOpts);
+      const result = agentLoopQueue.shift() ?? "";
       const messages: ChatCompletionMessageParam[] = [];
       return {
         messages,
         run: async () => result,
       };
     },
-    endSession: (id: string) => {
-      endedSessionIds.push(id);
+    endAgentLoop: (id: string) => {
+      endedAgentLoopIds.push(id);
     },
     toolCalls,
     llmCalls,
-    sessionStarts,
-    endedSessionIds,
+    agentLoopStarts,
+    endedAgentLoopIds,
   };
 }
 
@@ -547,7 +547,7 @@ describe("executor.execute — llm_compose step", () => {
 
 describe("executor.execute — llm_agent step", () => {
   it("spawns child session with toolWhitelist and binds result", async () => {
-    const engine = makeMockEngine({ sessionResults: ["agent answer"] });
+    const engine = makeMockEngine({ agentLoopResults: ["agent answer"] });
     const executor = createExecutor({ engine, readSkill: nullReadSkill(), setMemory: () => {} });
     const ctx = baseCtx();
     ctx.store.set("query", "что в Одессе");
@@ -572,8 +572,8 @@ describe("executor.execute — llm_agent step", () => {
     expect(r.ok).toBe(true);
     expect(ctx.store.get("answer")).toBe("agent answer");
 
-    expect(engine.sessionStarts.length).toBe(1);
-    const opts = engine.sessionStarts[0]!;
+    expect(engine.agentLoopStarts.length).toBe(1);
+    const opts = engine.agentLoopStarts[0]!;
     expect(opts.skills).toEqual(["news-query"]);
     expect(opts.includeEngineSkills).toBe(false);
     expect(opts.preset).toBe("smart");
@@ -583,7 +583,7 @@ describe("executor.execute — llm_agent step", () => {
   });
 
   it("ends the spawned session on success", async () => {
-    const engine = makeMockEngine({ sessionResults: ["x"] });
+    const engine = makeMockEngine({ agentLoopResults: ["x"] });
     const executor = createExecutor({ engine, readSkill: nullReadSkill(), setMemory: () => {} });
     await executor.execute(
       {
@@ -603,15 +603,15 @@ describe("executor.execute — llm_agent step", () => {
       },
       baseCtx(),
     );
-    expect(engine.endedSessionIds.length).toBe(1);
-    expect(engine.endedSessionIds[0]).toMatch(/__agent:a$/);
+    expect(engine.endedAgentLoopIds.length).toBe(1);
+    expect(engine.endedAgentLoopIds[0]).toMatch(/__agent:a$/);
   });
 
   it("ends the spawned session even when child.run() throws", async () => {
     const engine = makeMockEngine();
-    // Override startSession to return a handle whose run throws.
-    engine.startSession = async (sessionOpts: SessionOpts) => {
-      engine.sessionStarts.push(sessionOpts);
+    // Override startAgentLoop to return a handle whose run throws.
+    engine.startAgentLoop = async (loopOpts: AgentLoopOpts) => {
+      engine.agentLoopStarts.push(loopOpts);
       return {
         messages: [],
         run: async () => {
@@ -639,7 +639,7 @@ describe("executor.execute — llm_agent step", () => {
       baseCtx(),
     );
     expect(r.ok).toBe(false);
-    expect(engine.endedSessionIds.length).toBe(1);
+    expect(engine.endedAgentLoopIds.length).toBe(1);
   });
 });
 

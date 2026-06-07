@@ -8,7 +8,7 @@ import type { Trace } from "../tracing";
 // here. Two recovery shapes, keyed by the stage that failed:
 //
 //   compile  — the compiler couldn't produce a valid workflow. Degrade to
-//              a plain agentic Session (the pre-workflow behaviour): same
+//              a plain agentic AgentLoop (the pre-workflow behaviour): same
 //              source-matched skill + the engine's usual meta-skills.
 //   execute  — the executor aborted mid-workflow. Side effects may have
 //              already fired (e.g. a parallel branch sent a message before
@@ -54,7 +54,7 @@ export function createFallback(deps: FallbackDeps): Fallback {
         for (const err of failure.errors.slice(0, 3)) {
           console.warn(`[supervisor]   - ${err}`);
         }
-        await runFallbackSession(engine, signal, envData, trace);
+        await runFallbackAgentLoop(engine, signal, envData, trace);
         return;
       }
 
@@ -78,10 +78,10 @@ function buildPromptPrefix(sessionContext: string, envContext: string | null): s
 }
 
 // Compiler couldn't produce a valid workflow — degrade to the pre-workflow
-// path: spawn a Session with the source-matched skill and the engine's
+// path: spawn an AgentLoop with the source-matched skill and the engine's
 // usual meta-skills. Preserves the user-facing behaviour we had before
 // the workflow-mode switch.
-async function runFallbackSession(
+async function runFallbackAgentLoop(
   engine: Engine,
   signal: PendingSignal,
   envData: EnvData,
@@ -89,9 +89,9 @@ async function runFallbackSession(
 ): Promise<void> {
   const sessionContext = await buildSessionContext(engine, envData);
 
-  let session;
+  let loop;
   try {
-    session = await engine.startSession({
+    loop = await engine.startAgentLoop({
       id: `${signal.source}:${signal.id}`,
       systemPrompt: buildPromptPrefix(sessionContext, signal.envContext),
       skills: [signal.source],
@@ -108,23 +108,23 @@ async function runFallbackSession(
     });
   } catch (err) {
     console.error(
-      `[supervisor] signal #${signal.id} fallback session start failed: ${(err as Error).message}`,
+      `[supervisor] signal #${signal.id} fallback agent-loop start failed: ${(err as Error).message}`,
     );
     return;
   }
-  session.messages.push({ role: "user", content: signal.content });
+  loop.messages.push({ role: "user", content: signal.content });
 
   try {
-    await session.run();
+    await loop.run();
   } catch (err) {
-    console.error(`[supervisor] fallback session ${session.id} crashed:`, err);
-    await reportFailureToUser(engine, signal, session.messages, err, trace).catch(
+    console.error(`[supervisor] fallback agent-loop ${loop.id} crashed:`, err);
+    await reportFailureToUser(engine, signal, loop.messages, err, trace).catch(
       (err2) => {
         console.error(`[supervisor] recovery also failed:`, err2);
       },
     );
   } finally {
-    engine.endSession(session.id);
+    engine.endAgentLoop(loop.id);
   }
 }
 
@@ -174,7 +174,7 @@ async function spawnRecovery(
   briefing: string,
   trace: Trace,
 ): Promise<void> {
-  const session = await engine.startSession({
+  const loop = await engine.startAgentLoop({
     id: `recovery:${signal.source}:${signal.id}`,
     skills: ["recovery"],
     includeEngineSkills: false,
@@ -189,11 +189,11 @@ async function spawnRecovery(
       signal_source: signal.source,
     },
   });
-  session.messages.push({ role: "user", content: briefing });
+  loop.messages.push({ role: "user", content: briefing });
 
   try {
-    await session.run();
+    await loop.run();
   } finally {
-    engine.endSession(session.id);
+    engine.endAgentLoop(loop.id);
   }
 }

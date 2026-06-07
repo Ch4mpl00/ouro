@@ -1,7 +1,7 @@
 import type { ChatCompletionMessageParam } from "openai/resources/chat/completions";
 import type { ModelPreset, PresetName } from "../models";
 import type { ChatProvider } from "../providers";
-import type { SessionOpts } from "../session";
+import type { AgentLoopOpts } from "../agent-loop";
 import { SET_MEMORY_TOOL_NAME, SetMemoryArgsSchema } from "../synthetic-tools";
 import type { Span, SpanKind, TraceContext } from "../tracing";
 import type {
@@ -33,7 +33,7 @@ import {
 //   - emit prompts itself (the compiler produced the workflow; the
 //     executor just runs it)
 //   - touch conversation history of any previous session (each
-//     llm_compose is a fresh API call; llm_agent spawns a fresh Session)
+//     llm_compose is a fresh API call; llm_agent spawns a fresh AgentLoop)
 
 export type ExecFailureReason =
   | "step_failed"
@@ -87,14 +87,14 @@ export interface EngineSurface {
   mcp: {
     callTool(name: string, args: Record<string, unknown>): Promise<string>;
   };
-  startSession(opts: SessionOpts): Promise<SubSessionHandle>;
-  endSession(id: string): void;
+  startAgentLoop(opts: AgentLoopOpts): Promise<AgentLoopHandle>;
+  endAgentLoop(id: string): void;
 }
 
-// Surface of Session that the executor touches when running an
-// `llm_agent` step. The real Session has many more methods/fields — we
+// Surface of AgentLoop that the executor touches when running an
+// `llm_agent` step. The real AgentLoop has many more methods/fields — we
 // only need these two.
-export interface SubSessionHandle {
+export interface AgentLoopHandle {
   messages: ChatCompletionMessageParam[];
   run(): Promise<string>;
 }
@@ -397,7 +397,7 @@ function tryParseJson(raw: string): unknown {
 
 // set_memory — the one synthetic agent-side tool reachable as a direct
 // workflow step (watermark writes, e.g. news_digest.last_read_at). Same
-// validation as Session.applySetMemory; on bad args we throw ToolCallError
+// validation as AgentLoop.applySetMemory; on bad args we throw ToolCallError
 // so the executor classifies it as a tool failure like any other step.
 // The other synthetic tools stay agentic-only: invoke_sub_agent is
 // superseded by the `llm_agent` step kind, and skill read/write is the
@@ -526,7 +526,7 @@ async function execLlmAgent(
   const allowedTools = new Set(step.tools);
   const childId = `${ctx.signalLabel}__agent:${step.bind}`;
 
-  const child = await deps.engine.startSession({
+  const child = await deps.engine.startAgentLoop({
     id: childId,
     skills: [step.skill],
     includeEngineSkills: false,
@@ -545,7 +545,7 @@ async function execLlmAgent(
   try {
     result = await child.run();
   } finally {
-    deps.engine.endSession(childId);
+    deps.engine.endAgentLoop(childId);
   }
 
   store.set(step.bind, result);

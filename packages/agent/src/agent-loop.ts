@@ -27,19 +27,23 @@ function zodIssueText(error: z.ZodError): string {
     .join("; ");
 }
 
-// One isolated conversation thread. Owns its own message buffer, system
-// prompt, model and iteration budget. Shares the engine's OpenAI client
-// and MCP connection — does not create or close them.
+// One agentic ReAct loop: an isolated conversation thread that owns its
+// own message buffer, system prompt, model and iteration budget. Shares
+// the engine's OpenAI client and MCP connection — does not create or
+// close them.
 //
-// Role in the post-workflow architecture: this is the agentic ReAct body,
-// used in exactly two places — (1) an `llm_agent` workflow step (the
-// executor spawns a sub-session with a bounded tool whitelist), and (2)
-// the supervisor fallback path (when the compiler can't produce a valid
+// `AgentLoop` is one of the two sibling strategies for handling a signal
+// (the other being a compiled Workflow). The unit of work — handling one
+// signal — is the "session" (see `sessionId`, the trace-grouping id); an
+// AgentLoop is the LLM-driven loop that may run inside it. It's used in
+// exactly two places: (1) an `llm_agent` workflow step (the executor
+// spawns a sub-loop with a bounded tool whitelist), and (2) the
+// supervisor fallback path (when the compiler can't produce a valid
 // workflow, or to phrase a failure via the `recovery` skill). The default
 // workflow path does NOT go through here — it runs tool / llm_compose
 // steps directly against the engine.
 
-export interface SessionOpts {
+export interface AgentLoopOpts {
   id: string;
   // Pre-assembled context that goes at the top of the system prompt (e.g.
   // the session-context block + the signal's envContext). Skills are
@@ -47,7 +51,7 @@ export interface SessionOpts {
   systemPrompt?: string;
   // Per-session skills — typically the primary domain skill matching the
   // signal source (e.g. `nashdom-bill`). The engine resolves these via
-  // `readSkill` at `startSession` time. Missing here is a hard error —
+  // `readSkill` at `startAgentLoop` time. Missing here is a hard error —
   // the caller decides whether to skip the signal. Engine-level
   // meta-skill (`routing`) comes from `EngineOpts.skills` and is added
   // on top unless `includeEngineSkills: false`.
@@ -69,7 +73,7 @@ export interface SessionOpts {
   // the engine-resolved `allowedTools` from skills. Used by the workflow
   // executor to enforce a per-step `llm_agent` tool whitelist on top of
   // what the skill already allows. Engine applies the intersection at
-  // `startSession` time; callers don't touch `allowedTools` directly.
+  // `startAgentLoop` time; callers don't touch `allowedTools` directly.
   toolWhitelist?: Set<string>;
   // Opt out of engine-level meta-skill (`routing`) for this session.
   // Default true. Sub-agents set this to false so they get only the
@@ -105,7 +109,7 @@ export interface SessionOpts {
 
 const DEFAULT_MAX_ITERATIONS = 100;
 
-export class Session {
+export class AgentLoop {
   readonly id: string;
   readonly parentId?: string;
   // Trace-grouping session id. Stored so spawned sub-agents can inherit it
@@ -138,7 +142,7 @@ export class Session {
   private subAgentCounter = 0;
   private closed = false;
 
-  constructor(engine: Engine, opts: SessionOpts) {
+  constructor(engine: Engine, opts: AgentLoopOpts) {
     this.engine = engine;
     this.id = opts.id;
     this.parentId = opts.parentId;
@@ -263,7 +267,7 @@ export class Session {
     // Surface the user's prompt on the trace so the Session-replay UI
     // renders a real `user → assistant` exchange. Done here (not in the
     // constructor) because the caller pushes the user message AFTER
-    // startSession returns. Skip for sub-agents — their scope is the
+    // startAgentLoop returns. Skip for sub-agents — their scope is the
     // parent's tool span and the input there is the tool args, not the
     // user message; overwriting would erase the parent's view.
     if (this.trace) {
@@ -489,9 +493,9 @@ export class Session {
     // sub-agent renders inside the parent's `invoke_sub_agent` span).
     const childId = `${this.id}__sub${this.subAgentCounter}`;
 
-    let child: Session;
+    let child: AgentLoop;
     try {
-      child = await this.engine.startSession({
+      child = await this.engine.startAgentLoop({
         id: childId,
         // Sub-agent's system message = optional parent-provided framing
         // + the named skills' content. NO session-context, NO envContext,
@@ -523,7 +527,7 @@ export class Session {
     } catch (err) {
       return `[invoke_sub_agent error] sub-agent crashed: ${(err as Error).message}`;
     } finally {
-      this.engine.endSession(childId);
+      this.engine.endAgentLoop(childId);
     }
   }
 
