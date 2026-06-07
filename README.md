@@ -43,22 +43,33 @@ round-trips), and every step pays the full context cost.
 Here the supervisor inverts that: **one planning call compiles the signal into
 a typed workflow, then a deterministic runtime executes it.**
 
-```jsonc
-// What the compiler LLM emits for "what did that Telegram thread decide?"
-{
-  "version": 1,
-  "steps": [
-    { "kind": "tool", "tool": "get_telegram_chat_history",
-      "args": { "limit": 20 }, "bind": "history" },
-    { "kind": "llm_compose", "preset": "base",
-      "prompt": "Summarize the decision made in this thread",
-      "input": { "history": "${history}" }, "bind": "summary" },
-    { "kind": "tool", "tool": "send_telegram_message",
-      "args": { "text": "${summary}" } },
-    { "kind": "terminal" }
-  ]
-}
+What the compiler emits for *"what did that Telegram thread decide?"* — and
+how the runtime walks it:
+
+```mermaid
+flowchart LR
+    SIG(["signal<br/>'what did that<br/>thread decide?'"]) --> C
+
+    C{{"compiler LLM<br/>one planning call<br/>→ validated workflow"}}
+
+    C --> S1
+
+    subgraph runtime ["deterministic runtime — walks the steps, no LLM driving"]
+        direction LR
+        S1["kind: tool<br/>get_telegram_chat_history<br/>bind: history"]
+        S2["kind: llm_compose<br/>'summarize the decision'<br/>input: $history → bind: summary"]
+        S3["kind: tool<br/>send_telegram_message<br/>text: $summary"]
+        S4([terminal])
+        S1 -->|history| S2 -->|summary| S3 --> S4
+    end
+
+    style C fill:#4b6bfb,color:#fff
+    style S2 fill:#4b6bfb,color:#fff
 ```
+
+LLM calls are the two blue nodes — everything else is plain code: the
+runtime dispatches tools, resolves `${bindings}`, and never re-asks the
+model what to do next.
 
 The DSL (`packages/agent/src/workflow/dsl.ts`) has six step kinds — `tool`,
 `llm_compose`, `llm_agent` (a *bounded* ReAct sub-loop with a tool whitelist
