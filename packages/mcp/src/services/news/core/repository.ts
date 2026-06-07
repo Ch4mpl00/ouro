@@ -30,6 +30,15 @@ export interface SearchFilter {
   source?: string;
   sinceISO?: string;
   untilISO?: string;
+  // Point-in-time cutoff for eval/judge replay: restrict to rows that were
+  // already SEARCHABLE at this instant (embedded_at <= asOfISO). search
+  // requires isNotNull(embedding), so embedded_at — not fetched_at — is the
+  // field that decides historical visibility here (a NULL embedded_at, i.e.
+  // never embedded, is excluded by lte, matching that embedding filter).
+  // Excludes rows embedded after the agent's run (poller / backfill lag).
+  // NOT the same as untilISO (posted_at): a row posted earlier but embedded
+  // later is excluded.
+  asOfISO?: string;
   // Channel-specific: matches metadata.chat_username OR chat_id.
   channel?: string;
 }
@@ -174,6 +183,10 @@ export function createNewsRepository(deps: NewsRepositoryDeps): NewsRepository {
       if (opts.source) filters.push(eq(newsItems.source, opts.source));
       if (opts.sinceISO) filters.push(gt(newsItems.postedAt, new Date(opts.sinceISO)));
       if (opts.untilISO) filters.push(lte(newsItems.postedAt, new Date(opts.untilISO)));
+      // asOfISO → fetched_at: "what the store held at this instant". list
+      // returns rows even without an embedding, so store membership
+      // (fetched_at) is the right visibility field, not embedded_at.
+      if (opts.asOfISO) filters.push(lte(newsItems.fetchedAt, new Date(opts.asOfISO)));
       if (opts.channel) {
         const f = or(
           sql`${newsItems.metadata} ->> 'chat_username' = ${opts.channel}`,
@@ -252,6 +265,11 @@ async function searchCore(
   if (filter.source) filters.push(eq(newsItems.source, filter.source));
   if (filter.sinceISO) filters.push(gt(newsItems.postedAt, new Date(filter.sinceISO)));
   if (filter.untilISO) filters.push(lte(newsItems.postedAt, new Date(filter.untilISO)));
+  // asOfISO → embedded_at: "what was searchable at this instant". A row
+  // embedded after asOfISO wasn't retrievable then, even if posted/fetched
+  // earlier. NULL embedded_at (never embedded) is excluded by lte, which
+  // lines up with the isNotNull(embedding) filter above.
+  if (filter.asOfISO) filters.push(lte(newsItems.embeddedAt, new Date(filter.asOfISO)));
   if (filter.channel) {
     const f = or(
       sql`${newsItems.metadata} ->> 'chat_username' = ${filter.channel}`,

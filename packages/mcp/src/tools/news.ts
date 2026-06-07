@@ -61,6 +61,15 @@ export function registerNewsTools(server: McpServer, news: NewsRepository): void
           .string()
           .optional()
           .describe("Only items with posted_at <= this ISO timestamp."),
+        asOfISO: z
+          .string()
+          .optional()
+          .describe(
+            "Eval/judge point-in-time replay: only items already searchable " +
+              "at this ISO instant (embedded_at <= asOfISO). Reconstructs " +
+              "what search could have returned at a past moment, excluding " +
+              "rows embedded later (poller/backfill lag). Normal runs omit this.",
+          ),
         channel: z
           .string()
           .optional()
@@ -70,13 +79,13 @@ export function registerNewsTools(server: McpServer, news: NewsRepository): void
           ),
       },
     },
-    async ({ query, queries, k, source, sinceISO, untilISO, channel }) => {
+    async ({ query, queries, k, source, sinceISO, untilISO, asOfISO, channel }) => {
       if ((query === undefined) === (queries === undefined)) {
         return jsonResult({
           error: "Pass exactly one of `query` or `queries`.",
         });
       }
-      const filter = { source, sinceISO, untilISO, channel };
+      const filter = { source, sinceISO, untilISO, asOfISO, channel };
       const results = query
         ? await news.search({ query, k, filter })
         : await news.searchMany({ queries: queries ?? [], k, filter });
@@ -109,6 +118,15 @@ export function registerNewsTools(server: McpServer, news: NewsRepository): void
           .string()
           .optional()
           .describe("Only items with posted_at <= this ISO timestamp."),
+        asOfISO: z
+          .string()
+          .optional()
+          .describe(
+            "Eval/judge point-in-time replay: only items already in the " +
+              "store at this ISO instant (fetched_at <= asOfISO). Reconstructs " +
+              "what the store held at a past moment, excluding rows fetched " +
+              "later (poller lag). Normal runs omit this.",
+          ),
         channel: z
           .string()
           .optional()
@@ -125,8 +143,8 @@ export function registerNewsTools(server: McpServer, news: NewsRepository): void
           .describe("Max rows. Default 500."),
       },
     },
-    async ({ source, sinceISO, untilISO, channel, limit }) => {
-      const items = await news.list({ source, sinceISO, untilISO, channel, limit });
+    async ({ source, sinceISO, untilISO, asOfISO, channel, limit }) => {
+      const items = await news.list({ source, sinceISO, untilISO, asOfISO, channel, limit });
       return jsonResult({
         count: items.length,
         items: items.map(serializeItem),

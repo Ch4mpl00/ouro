@@ -23,6 +23,14 @@ export interface ListOpts {
   source?: string;
   sinceISO?: string;
   untilISO?: string;
+  // Point-in-time cutoff for eval/judge replay: restrict to rows already
+  // in the store at this instant (fetched_at <= asOfISO). list needs no
+  // embedding, so fetched_at — not embedded_at — decides "was it in the
+  // store". Excludes rows fetched after the agent's run (poller lag), so a
+  // judge replaying the run can't see items the agent couldn't have. NOT
+  // the same as untilISO (posted_at): a row posted earlier but fetched
+  // later is still excluded.
+  asOfISO?: string;
   limit?: number;
   // Channel-only convenience: matches metadata.chat_username OR chat_id.
   channel?: string;
