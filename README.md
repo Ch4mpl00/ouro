@@ -1,16 +1,20 @@
-# Ouro helper
+<p align="center">
+  <img src="https://github.com/user-attachments/assets/e9695e32-8317-44c5-9f2a-b8f72da6ed94" width="140" alt="Ouro helper logo" />
+</p>
 
-<img width="640" height="640" alt="photo_2026-06-07 21 15 59" src="https://github.com/user-attachments/assets/e9695e32-8317-44c5-9f2a-b8f72da6ed94" />
+<h1 align="center">Ouro helper</h1>
 
 > A personal agent that reads your mail, watches your Telegram channels, tracks
 > your bank feed — and acts on it. Built as two small processes talking strictly
 > over the [Model Context Protocol](https://modelcontextprotocol.io).
 
-[![Status](https://img.shields.io/badge/status-work%20in%20progress-orange)](#what-it-is)
-[![TypeScript](https://img.shields.io/badge/TypeScript-ESM-3178c6)](#stack)
-[![MCP](https://img.shields.io/badge/protocol-MCP-blueviolet)](https://modelcontextprotocol.io)
-[![LLM](https://img.shields.io/badge/LLM-DeepSeek-4b6bfb)](#stack)
-[![pgvector](https://img.shields.io/badge/RAG-pgvector-336791)](#stack)
+<p align="center">
+  <a href="#what-it-is"><img src="https://img.shields.io/badge/status-work%20in%20progress-orange" alt="Status" /></a>
+  <a href="#stack"><img src="https://img.shields.io/badge/TypeScript-ESM-3178c6" alt="TypeScript" /></a>
+  <a href="https://modelcontextprotocol.io"><img src="https://img.shields.io/badge/protocol-MCP-blueviolet" alt="MCP" /></a>
+  <a href="#stack"><img src="https://img.shields.io/badge/LLM-DeepSeek-4b6bfb" alt="LLM" /></a>
+  <a href="#stack"><img src="https://img.shields.io/badge/RAG-pgvector-336791" alt="pgvector" /></a>
+</p>
 
 > 🚧 **Work in progress** — a personal project under active development;
 > interfaces and internals change frequently.
@@ -248,4 +252,3 @@ docker compose up -d --build
 
 Named volumes (`mcp-data`, `mcp-storage`, `agent-data`, `agent-skills`,
 `pg-data`) persist state across rebuilds.
-ко
