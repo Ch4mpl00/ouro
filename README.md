@@ -1,4 +1,6 @@
-# Helper agent
+# Ouro helper
+
+<img width="640" height="640" alt="photo_2026-06-07 21 15 59" src="https://github.com/user-attachments/assets/e9695e32-8317-44c5-9f2a-b8f72da6ed94" />
 
 > A personal agent that reads your mail, watches your Telegram channels, tracks
 > your bank feed — and acts on it. Built as two small processes talking strictly
