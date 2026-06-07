@@ -206,6 +206,102 @@ async function judge(
   return ScorecardSchema.parse(JSON.parse(content));
 }
 
+// ─── faithfulness sub-judge ──────────────────────────────────────────
+// Separate call, claim-decomposition style (RAGAS-ish): extract atomic
+// factual claims from F, verify each against R's snippets. A "rate
+// faithfulness 0..1" vibe score is unreliable for catching fabricated
+// specifics (numbers / dates); per-claim verdicts are not. The composer
+// contract calls hallucinated specifics "the most damaging error", so this
+// gets its own focused pass rather than folding into the holistic call.
+
+const FaithClaimSchema = z.object({
+  claim: z.string(),
+  verdict: z.enum(["supported", "partial", "unsupported"]),
+  evidence: z.string(),
+});
+const FaithfulnessSchema = z.object({
+  applicable: z.boolean(),
+  claims: z.array(FaithClaimSchema),
+  // (supported + 0.5*partial) / total; null when no factual claims (quiet day).
+  score: z.number().nullable(),
+  note: z.string(),
+});
+type Faithfulness = z.infer<typeof FaithfulnessSchema>;
+
+const FAITH_RESPONSE_SCHEMA = {
+  type: "object",
+  properties: {
+    applicable: { type: "boolean" },
+    claims: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: {
+          claim: { type: "string" },
+          verdict: { type: "string", enum: ["supported", "partial", "unsupported"] },
+          evidence: { type: "string" },
+        },
+        required: ["claim", "verdict", "evidence"],
+        additionalProperties: false,
+      },
+    },
+    score: { type: ["number", "null"] },
+    note: { type: "string" },
+  },
+  required: ["applicable", "claims", "score", "note"],
+  additionalProperties: false,
+};
+
+const FAITH_SYSTEM_PROMPT = `You are a faithfulness checker for an AI-composed news digest or answer. You verify that every factual claim in the FINAL OUTPUT (F) is grounded in the retrieved snippets (R) or the chat history shown in the transcript. Per the composer contract, quoting specifics — numbers, counts, dates, version numbers — not present in a snippet is the single most damaging error class.
+
+Method:
+1. Extract ATOMIC factual claims from F. Focus on verifiable specifics: numbers/counts, dates, named entities, concrete events, and comparisons ("up from 63 the day before").
+2. For each claim, look for support in R's snippets (and the chat history). Verdict:
+   - supported — the claim and its specifics appear in some snippet/item.
+   - partial — the gist is backed but a specific (number/date/name) is missing, altered, or aggregated beyond what any single snippet states.
+   - unsupported — no item backs it; likely fabricated or editorialized.
+3. Cite the supporting (or contradicting) item id as evidence, or "none".
+
+Rules:
+- Judge only F's factual content. The digest's own header/date line, category labels, and emojis are not claims.
+- A hard number synthesized by aggregating several monitoring/channel posts is at best PARTIAL unless a snippet states that number.
+- If F is an empty / "тихий день" message with no factual claims, set applicable=false, score=null, claims=[].
+- score = (count(supported) + 0.5 * count(partial)) / total_claims, rounded to 2 decimals.
+- Ground every verdict in the transcript; never invent snippet content.`;
+
+function buildFaithUserPrompt(composerContract: string | null, transcript: string): string {
+  return `<composer_contract>
+${composerContract ?? "(no contract)"}
+</composer_contract>
+
+<transcript>
+${transcript}
+</transcript>
+
+Extract F's atomic factual claims and verify each against R. Return JSON per the schema.`;
+}
+
+async function judgeFaithfulness(
+  openai: OpenAI,
+  composerContract: string | null,
+  transcript: string,
+): Promise<Faithfulness> {
+  const res = await openai.chat.completions.create({
+    model: JUDGE_MODEL,
+    messages: [
+      { role: "system", content: FAITH_SYSTEM_PROMPT },
+      { role: "user", content: buildFaithUserPrompt(composerContract, transcript) },
+    ],
+    response_format: {
+      type: "json_schema",
+      json_schema: { name: "faithfulness", strict: true, schema: FAITH_RESPONSE_SCHEMA },
+    },
+  });
+  const content = res.choices[0]?.message.content;
+  if (!content) throw new Error("faithfulness judge returned empty content");
+  return FaithfulnessSchema.parse(JSON.parse(content));
+}
+
 // ─── output ──────────────────────────────────────────────────────────
 
 function printScorecard(traceId: string, skillName: string | null, card: Scorecard): void {
@@ -220,6 +316,23 @@ function printScorecard(traceId: string, skillName: string | null, card: Scoreca
     console.log();
   }
   console.log(`overall: ${card.overall_note}\n`);
+}
+
+function printFaithfulness(f: Faithfulness): void {
+  if (!f.applicable) {
+    console.log(`● faithfulness: n/a — ${f.note}\n`);
+    return;
+  }
+  const score = f.score !== null ? f.score.toFixed(2) : "—";
+  const bad = f.claims.filter((c) => c.verdict !== "supported").length;
+  console.log(`● faithfulness: ${score}  (${f.claims.length} claims, ${bad} not fully supported)`);
+  for (const c of f.claims) {
+    const mark = c.verdict === "supported" ? "✓" : c.verdict === "partial" ? "~" : "✗";
+    console.log(`  ${mark} ${c.claim}`);
+    if (c.verdict !== "supported") console.log(`      ↳ ${c.evidence}`);
+  }
+  if (f.note) console.log(`  ${f.note}`);
+  console.log();
 }
 
 async function main(): Promise<void> {
@@ -249,8 +362,14 @@ async function main(): Promise<void> {
       `transcript ${transcript.length} chars`,
   );
 
-  const card = await judge(openai, skillName, composerContract, orchestratorContract, transcript);
+  // Holistic axes and the faithfulness sub-judge are independent calls — run
+  // them concurrently.
+  const [card, faith] = await Promise.all([
+    judge(openai, skillName, composerContract, orchestratorContract, transcript),
+    judgeFaithfulness(openai, composerContract, transcript),
+  ]);
   printScorecard(traceId, skillName, card);
+  printFaithfulness(faith);
 }
 
 main().catch((err: unknown) => {
