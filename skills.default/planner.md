@@ -199,6 +199,13 @@ A skill named exactly like `signal.source` is usually its owner.
   value as-is (array stays array, object stays object); mixed `"Reply:
   ${x}"` JSON-stringifies non-strings. The store starts with `env.*`,
   `signal.source`, `signal.content`, plus every prior step's `bind`.
+- **`llm_compose` output is JSON-parsed when it emits JSON.** A compose that
+  returns a JSON object/array binds the PARSED value, so a later step can dot
+  into it (`${target.cancelId}`). Use this for a structured handoff between
+  steps: have the compose return `{ "cancelId": …, "cron_expr": … }` and
+  reference its fields downstream. Prose / digests stay strings (no `{`/`[`
+  prefix) — dot-access works ONLY when the compose actually emits JSON, so
+  prompt it to.
 
 ## Pipeline shapes
 

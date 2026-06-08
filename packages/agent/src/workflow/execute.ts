@@ -438,7 +438,7 @@ async function execLlmCompose(
   store: VariableStore,
   span: Span,
   deps: ExecutorDeps,
-): Promise<string> {
+): Promise<unknown> {
   const preset = deps.engine.presets[step.preset];
   const provider = deps.engine.resolveProvider(preset.model);
 
@@ -494,8 +494,15 @@ async function execLlmCompose(
     throw new LlmCallError(message);
   }
 
-  store.set(step.bind, content);
-  return content;
+  // Honor the DSL's "structured output" contract: when the compose emits a
+  // JSON object/array, bind the PARSED value so later steps can dot into it
+  // (`${target.cancelId}`). Plain prose / markdown digests don't start with
+  // `{`/`[`, so they stay strings — same lenient rule as execTool's tool
+  // results. Without this, a compose that returns JSON binds a raw string and
+  // any `${bind.field}` reference fails with MissingBindingError.
+  const parsed = tryParseJson(content);
+  store.set(step.bind, parsed);
+  return parsed;
 }
 
 // XML-style input blocks render reliably for both OpenAI and DeepSeek

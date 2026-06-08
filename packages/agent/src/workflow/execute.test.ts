@@ -464,6 +464,240 @@ describe("executor.execute — llm_compose step", () => {
     expect(body.messages[1]!.content).toContain('"id": 1');
   });
 
+  it("parses JSON output and binds the object, so later steps can dot into it", async () => {
+    const engine = makeMockEngine({
+      llmResponses: [JSON.stringify({ cancelId: 10, cron_expr: "0 9 L * *" })],
+      toolResponses: { cancel_scheduled_task: JSON.stringify({ cancelled: true }) },
+    });
+    const executor = createExecutor({ engine, readSkill: nullReadSkill(), setMemory: () => {} });
+    const ctx = baseCtx();
+    const r = await executor.execute(
+      {
+        version: 1,
+        steps: [
+          {
+            kind: "llm_compose",
+            preset: "base",
+            prompt: "Emit the reschedule plan as JSON",
+            input: {},
+            bind: "target",
+          },
+          {
+            kind: "tool",
+            tool: "cancel_scheduled_task",
+            args: { id: "${target.cancelId}" },
+          },
+          { kind: "terminal" },
+        ],
+      },
+      ctx,
+    );
+    expect(r.ok).toBe(true);
+    // Bound as a parsed object, not a raw JSON string.
+    expect(ctx.store.get("target")).toEqual({ cancelId: 10, cron_expr: "0 9 L * *" });
+    // The dot-access ${target.cancelId} resolved to the literal 10.
+    const toolCall = engine.toolCalls.find((c) => c.tool === "cancel_scheduled_task");
+    expect(toolCall?.args).toEqual({ id: 10 });
+  });
+
+  it("resolves deep dot-access into a nested parsed object", async () => {
+    const engine = makeMockEngine({
+      llmResponses: [JSON.stringify({ schedule: { cron: "0 9 L * *", recurring: true } })],
+      toolResponses: { schedule_task: JSON.stringify({ id: 11 }) },
+    });
+    const executor = createExecutor({ engine, readSkill: nullReadSkill(), setMemory: () => {} });
+    const ctx = baseCtx();
+    const r = await executor.execute(
+      {
+        version: 1,
+        steps: [
+          { kind: "llm_compose", preset: "base", prompt: "plan", input: {}, bind: "plan" },
+          {
+            kind: "tool",
+            tool: "schedule_task",
+            args: { cron_expr: "${plan.schedule.cron}", recurring: "${plan.schedule.recurring}" },
+          },
+          { kind: "terminal" },
+        ],
+      },
+      ctx,
+    );
+    expect(r.ok).toBe(true);
+    const call = engine.toolCalls.find((c) => c.tool === "schedule_task");
+    // Whole-string placeholders preserve type: cron stays a string, recurring stays a boolean.
+    expect(call?.args).toEqual({ cron_expr: "0 9 L * *", recurring: true });
+  });
+
+  it("parses a JSON array output and binds it as an array (whole-string preserves type)", async () => {
+    const engine = makeMockEngine({
+      llmResponses: [JSON.stringify([{ id: 1 }, { id: 2 }])],
+      toolResponses: { send_batch: JSON.stringify({ ok: true }) },
+    });
+    const executor = createExecutor({ engine, readSkill: nullReadSkill(), setMemory: () => {} });
+    const ctx = baseCtx();
+    const r = await executor.execute(
+      {
+        version: 1,
+        steps: [
+          { kind: "llm_compose", preset: "base", prompt: "list", input: {}, bind: "rows" },
+          { kind: "tool", tool: "send_batch", args: { rows: "${rows}" } },
+          { kind: "terminal" },
+        ],
+      },
+      ctx,
+    );
+    expect(r.ok).toBe(true);
+    expect(ctx.store.get("rows")).toEqual([{ id: 1 }, { id: 2 }]);
+    const call = engine.toolCalls.find((c) => c.tool === "send_batch");
+    expect(Array.isArray(call?.args.rows)).toBe(true);
+    expect(call?.args.rows).toEqual([{ id: 1 }, { id: 2 }]);
+  });
+
+  it("interpolates a parsed object's field into a mixed string (JSON-stringifies the number)", async () => {
+    const engine = makeMockEngine({
+      llmResponses: [JSON.stringify({ cancelId: 10 })],
+      toolResponses: { send_telegram_message: JSON.stringify({ delivered: true }) },
+    });
+    const executor = createExecutor({ engine, readSkill: nullReadSkill(), setMemory: () => {} });
+    const ctx = baseCtx();
+    const r = await executor.execute(
+      {
+        version: 1,
+        steps: [
+          { kind: "llm_compose", preset: "base", prompt: "plan", input: {}, bind: "target" },
+          {
+            kind: "tool",
+            tool: "send_telegram_message",
+            args: { chatId: 1, text: "Cancelled task ${target.cancelId}" },
+          },
+          { kind: "terminal" },
+        ],
+      },
+      ctx,
+    );
+    expect(r.ok).toBe(true);
+    const call = engine.toolCalls.find((c) => c.tool === "send_telegram_message");
+    expect(call?.args.text).toBe("Cancelled task 10");
+  });
+
+  it("keeps plain prose as a string (no JSON prefix → not parsed)", async () => {
+    const engine = makeMockEngine({ llmResponses: ["Привет! Вот твой дайджест за сегодня."] });
+    const executor = createExecutor({ engine, readSkill: nullReadSkill(), setMemory: () => {} });
+    const ctx = baseCtx();
+    const r = await executor.execute(
+      {
+        version: 1,
+        steps: [
+          { kind: "llm_compose", preset: "base", prompt: "greet", input: {}, bind: "reply" },
+          { kind: "terminal" },
+        ],
+      },
+      ctx,
+    );
+    expect(r.ok).toBe(true);
+    const reply = ctx.store.get("reply");
+    expect(typeof reply).toBe("string");
+    expect(reply).toBe("Привет! Вот твой дайджест за сегодня.");
+  });
+
+  it("keeps a bare primitive output as a string (only {/[ prefixes are parsed)", async () => {
+    const engine = makeMockEngine({ llmResponses: ["42"] });
+    const executor = createExecutor({ engine, readSkill: nullReadSkill(), setMemory: () => {} });
+    const ctx = baseCtx();
+    const r = await executor.execute(
+      {
+        version: 1,
+        steps: [
+          { kind: "llm_compose", preset: "base", prompt: "count", input: {}, bind: "n" },
+          { kind: "terminal" },
+        ],
+      },
+      ctx,
+    );
+    expect(r.ok).toBe(true);
+    // "42" doesn't start with { or [, so it stays the raw string, not the number 42.
+    expect(ctx.store.get("n")).toBe("42");
+  });
+
+  it("keeps JSON-looking-but-invalid output as the raw string", async () => {
+    const engine = makeMockEngine({ llmResponses: ['{ "cancelId": 10  // oops, not JSON'] });
+    const executor = createExecutor({ engine, readSkill: nullReadSkill(), setMemory: () => {} });
+    const ctx = baseCtx();
+    const r = await executor.execute(
+      {
+        version: 1,
+        steps: [
+          { kind: "llm_compose", preset: "base", prompt: "plan", input: {}, bind: "target" },
+          { kind: "terminal" },
+        ],
+      },
+      ctx,
+    );
+    expect(r.ok).toBe(true);
+    // JSON.parse throws → tryParseJson falls back to the raw string.
+    expect(ctx.store.get("target")).toBe('{ "cancelId": 10  // oops, not JSON');
+  });
+
+  it("fails with missing_binding when dotting into a field the parsed object lacks", async () => {
+    const engine = makeMockEngine({
+      llmResponses: [JSON.stringify({ cancelId: 10 })],
+      toolResponses: { cancel_scheduled_task: JSON.stringify({ cancelled: true }) },
+    });
+    const executor = createExecutor({ engine, readSkill: nullReadSkill(), setMemory: () => {} });
+    const ctx = baseCtx();
+    const r = await executor.execute(
+      {
+        version: 1,
+        steps: [
+          { kind: "llm_compose", preset: "base", prompt: "plan", input: {}, bind: "target" },
+          {
+            kind: "tool",
+            tool: "cancel_scheduled_task",
+            args: { id: "${target.missingField}" },
+          },
+          { kind: "terminal" },
+        ],
+      },
+      ctx,
+    );
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.reason).toBe("missing_binding");
+      expect(r.stepIndex).toBe(1);
+    }
+    // The tool never ran — substitution failed before dispatch.
+    expect(engine.toolCalls.find((c) => c.tool === "cancel_scheduled_task")).toBeUndefined();
+  });
+
+  it("fails with missing_binding when dotting into a string-valued compose result", async () => {
+    // Regression guard for the original bug: a prose compose bound as a
+    // string, then a step that dots into it — must surface MissingBindingError,
+    // not silently expand to "undefined".
+    const engine = makeMockEngine({
+      llmResponses: ["just some prose, no fields here"],
+      toolResponses: { cancel_scheduled_task: JSON.stringify({ cancelled: true }) },
+    });
+    const executor = createExecutor({ engine, readSkill: nullReadSkill(), setMemory: () => {} });
+    const ctx = baseCtx();
+    const r = await executor.execute(
+      {
+        version: 1,
+        steps: [
+          { kind: "llm_compose", preset: "base", prompt: "plan", input: {}, bind: "target" },
+          {
+            kind: "tool",
+            tool: "cancel_scheduled_task",
+            args: { id: "${target.cancelId}" },
+          },
+          { kind: "terminal" },
+        ],
+      },
+      ctx,
+    );
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.reason).toBe("missing_binding");
+  });
+
   it("works with prompt-only (no skill)", async () => {
     const engine = makeMockEngine({ llmResponses: ["A: 5"] });
     const executor = createExecutor({ engine, readSkill: nullReadSkill(), setMemory: () => {} });
