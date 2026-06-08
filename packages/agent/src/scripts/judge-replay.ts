@@ -33,8 +33,15 @@ const deepseek = new OpenAI({
   apiKey: process.env.DEEPSEEK_API_KEY,
   baseURL: "https://api.deepseek.com",
 });
+// Gemini exposes an OpenAI-compatible endpoint — same SDK, different baseURL/key.
+const gemini = new OpenAI({
+  apiKey: process.env.GEMINI_API_KEY,
+  baseURL: "https://generativelanguage.googleapis.com/v1beta/openai/",
+});
 function clientFor(model: string): OpenAI {
-  return model.startsWith("deepseek") ? deepseek : openai;
+  if (model.startsWith("deepseek")) return deepseek;
+  if (model.startsWith("gemini")) return gemini;
+  return openai;
 }
 
 // ─── helpers ─────────────────────────────────────────────────────────
@@ -89,19 +96,33 @@ function outputText(gen: Observation): string {
   return typeof gen.output === "string" ? gen.output : JSON.stringify(gen.output);
 }
 
+// Retry 429 (rate limit) and 5xx with exponential backoff. Free-tier Gemini
+// rate-limits hard — 5 parallel thinking calls trip its per-minute quota — and
+// the OpenAI/DeepSeek endpoints 5xx transiently; the backoff outlives a minute
+// window. 4xx other than 429 are permanent and rethrown immediately.
 async function replayGeneration(
   messages: ChatCompletionMessageParam[],
   model: string,
   jsonMode: boolean,
   reasoningEffort?: ReasoningEffort,
 ): Promise<string> {
-  const res = await clientFor(model).chat.completions.create({
-    model,
-    messages,
-    ...(jsonMode ? { response_format: { type: "json_object" } } : {}),
-    ...(reasoningEffort ? { reasoning_effort: reasoningEffort } : {}),
-  });
-  return res.choices[0]?.message.content ?? "";
+  const client = clientFor(model);
+  for (let attempt = 0; ; attempt++) {
+    try {
+      const res = await client.chat.completions.create({
+        model,
+        messages,
+        ...(jsonMode ? { response_format: { type: "json_object" } } : {}),
+        ...(reasoningEffort ? { reasoning_effort: reasoningEffort } : {}),
+      });
+      return res.choices[0]?.message.content ?? "";
+    } catch (err) {
+      const status = err instanceof OpenAI.APIError ? err.status : undefined;
+      const retryable = status === 429 || (status !== undefined && status >= 500);
+      if (!retryable || attempt >= 5) throw err;
+      await new Promise((r) => setTimeout(r, 3000 * 2 ** attempt)); // 3s,6s,12s,24s,48s
+    }
+  }
 }
 
 function printWorkflow(label: string, model: string | null, json: string): void {
