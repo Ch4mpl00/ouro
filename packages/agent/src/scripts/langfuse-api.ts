@@ -99,15 +99,54 @@ export interface Trace {
 export async function fetchTraceById(
   id: string,
 ): Promise<{ trace: Trace; observations: Observation[] }> {
-  const trace = await api<Trace>(`/traces/${encodeURIComponent(id)}`);
-  const observations = await Promise.all(
-    trace.observations.map((entry) =>
-      typeof entry === "string"
-        ? api<Observation>(`/observations/${entry}`)
-        : Promise.resolve(entry),
-    ),
-  );
-  return { trace, observations };
+  try {
+    const trace = await api<Trace>(`/traces/${encodeURIComponent(id)}`);
+    const observations = await Promise.all(
+      trace.observations.map((entry) =>
+        typeof entry === "string"
+          ? api<Observation>(`/observations/${entry}`)
+          : Promise.resolve(entry),
+      ),
+    );
+    return { trace, observations };
+  } catch {
+    // `/traces/<id>` inlines every observation and gateway-times-out (502) on
+    // large traces (big digests with 50+ snippets). Fall back to fetching the
+    // observations on their own lighter endpoint and synthesize a trace stub
+    // from the root observation — judge/replay need observations + the root's
+    // input/output/metadata, not the trace-list fields (tags, cost).
+    const observations = await fetchObservationsByTrace(id);
+    const root =
+      observations.find((o) => o.parentObservationId === null) ?? observations[0];
+    const trace: Trace = {
+      id,
+      name: root?.name ?? id,
+      sessionId: null,
+      timestamp: root?.startTime ?? "",
+      input: root?.input ?? null,
+      output: root?.output ?? null,
+      metadata: root?.metadata ?? null,
+      observations,
+      latency: 0,
+      totalCost: 0,
+      tags: [],
+    };
+    return { trace, observations };
+  }
+}
+
+// All observations for a trace via the dedicated endpoint, paged. Lighter than
+// inlining them in `/traces/<id>` — each page is a bounded response.
+async function fetchObservationsByTrace(traceId: string): Promise<Observation[]> {
+  const all: Observation[] = [];
+  for (let page = 1; ; page++) {
+    const res = await api<{ data: Observation[]; meta: { totalPages: number } }>(
+      `/observations?traceId=${encodeURIComponent(traceId)}&limit=100&page=${page}`,
+    );
+    all.push(...res.data);
+    if (res.data.length === 0 || page >= (res.meta?.totalPages ?? 1)) break;
+  }
+  return all;
 }
 
 export interface TraceSummary {
