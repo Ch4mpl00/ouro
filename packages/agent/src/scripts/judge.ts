@@ -2,7 +2,7 @@ import "dotenv/config";
 import OpenAI from "openai";
 import { z } from "zod";
 import { config as loadEnv } from "dotenv";
-import { fetchTraceById, type Observation, type Trace } from "./langfuse-api";
+import { fetchRecentTraces, fetchTraceById, type Observation, type Trace } from "./langfuse-api";
 import { readSkillRaw } from "../skills";
 
 // LANGFUSE_* live in .env; OPENAI_API_KEY (the judge model's key) lives in
@@ -335,19 +335,7 @@ function printFaithfulness(f: Faithfulness): void {
   console.log();
 }
 
-async function main(): Promise<void> {
-  const traceId = process.argv[2];
-  if (!traceId || traceId.startsWith("--")) {
-    console.error("usage: pnpm judge <traceId>");
-    process.exit(1);
-  }
-  const apiKey = process.env.OPENAI_API_KEY;
-  if (!apiKey) {
-    console.error("OPENAI_API_KEY missing in env");
-    process.exit(1);
-  }
-  const openai = new OpenAI({ apiKey });
-
+async function judgeOne(openai: OpenAI, traceId: string): Promise<void> {
   const { trace, observations } = await fetchTraceById(traceId);
   const skillName = findSkill(trace, observations);
   const composerContract = skillName ? await readSkillRaw(skillName) : null;
@@ -370,6 +358,42 @@ async function main(): Promise<void> {
   ]);
   printScorecard(traceId, skillName, card);
   printFaithfulness(faith);
+}
+
+async function main(): Promise<void> {
+  const args = process.argv.slice(2);
+  const apiKey = process.env.OPENAI_API_KEY;
+  if (!apiKey) {
+    console.error("OPENAI_API_KEY missing in env");
+    process.exit(1);
+  }
+  const openai = new OpenAI({ apiKey });
+
+  // Batch mode: judge the N most recent traces. A stepping stone toward the
+  // polling worker (filtering successful runs + score ingestion come later).
+  if (args[0] === "--recent") {
+    const parsed = Number(args[1] ?? "5");
+    const n = Number.isFinite(parsed) && parsed > 0 ? parsed : 5;
+    const recent = await fetchRecentTraces(n);
+    console.error(`[judge] fetched ${recent.length} recent traces`);
+    for (const t of recent) {
+      console.log(`\n${"—".repeat(72)}`);
+      console.log(`trace ${t.id} · ${t.name} · [${t.tags.join(",")}] · ${t.timestamp}`);
+      try {
+        await judgeOne(openai, t.id);
+      } catch (err) {
+        console.error(`[judge] ${t.id} failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+    return;
+  }
+
+  const traceId = args[0];
+  if (!traceId || traceId.startsWith("--")) {
+    console.error("usage: pnpm judge <traceId>  |  pnpm judge --recent [N]");
+    process.exit(1);
+  }
+  await judgeOne(openai, traceId);
 }
 
 main().catch((err: unknown) => {

@@ -109,3 +109,17 @@ export async function fetchTraceById(
   );
   return { trace, observations };
 }
+
+export interface TraceSummary {
+  id: string;
+  name: string;
+  timestamp: string;
+  tags: string[];
+}
+
+// Most recent traces first (Langfuse lists newest-first by default). Summary
+// only — observations are NOT inlined; fetch them per-id with fetchTraceById.
+export async function fetchRecentTraces(limit: number): Promise<TraceSummary[]> {
+  const res = await api<{ data: TraceSummary[] }>(`/traces?limit=${limit}`);
+  return res.data;
+}
