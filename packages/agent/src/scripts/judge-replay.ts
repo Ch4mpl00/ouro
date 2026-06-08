@@ -96,26 +96,16 @@ function outputText(gen: Observation): string {
   return typeof gen.output === "string" ? gen.output : JSON.stringify(gen.output);
 }
 
-// Retry 429 (rate limit) and 5xx with exponential backoff. Free-tier Gemini
-// rate-limits hard — 5 parallel thinking calls trip its per-minute quota — and
-// the OpenAI/DeepSeek endpoints 5xx transiently; the backoff outlives a minute
-// window. 4xx other than 429 are permanent and rethrown immediately.
-async function replayGeneration(
-  messages: ChatCompletionMessageParam[],
-  model: string,
-  jsonMode: boolean,
-  reasoningEffort?: ReasoningEffort,
-): Promise<string> {
-  const client = clientFor(model);
+// Retry 429 (rate limit) and 5xx with exponential backoff. Both generation and
+// judging hit limits here: free-tier Gemini rate-limits hard (5 parallel
+// thinking calls trip its per-minute quota), and the gpt-5.4 judge blows the
+// OpenAI per-minute token budget when several swap-pairs send ~160k-char
+// candidate sets at once. The backoff (3s..48s) outlives a one-minute window;
+// 4xx other than 429 are permanent and rethrown immediately.
+async function withRetry<T>(fn: () => Promise<T>): Promise<T> {
   for (let attempt = 0; ; attempt++) {
     try {
-      const res = await client.chat.completions.create({
-        model,
-        messages,
-        ...(jsonMode ? { response_format: { type: "json_object" } } : {}),
-        ...(reasoningEffort ? { reasoning_effort: reasoningEffort } : {}),
-      });
-      return res.choices[0]?.message.content ?? "";
+      return await fn();
     } catch (err) {
       const status = err instanceof OpenAI.APIError ? err.status : undefined;
       const retryable = status === 429 || (status !== undefined && status >= 500);
@@ -123,6 +113,24 @@ async function replayGeneration(
       await new Promise((r) => setTimeout(r, 3000 * 2 ** attempt)); // 3s,6s,12s,24s,48s
     }
   }
+}
+
+async function replayGeneration(
+  messages: ChatCompletionMessageParam[],
+  model: string,
+  jsonMode: boolean,
+  reasoningEffort?: ReasoningEffort,
+): Promise<string> {
+  const client = clientFor(model);
+  const res = await withRetry(() =>
+    client.chat.completions.create({
+      model,
+      messages,
+      ...(jsonMode ? { response_format: { type: "json_object" } } : {}),
+      ...(reasoningEffort ? { reasoning_effort: reasoningEffort } : {}),
+    }),
+  );
+  return res.choices[0]?.message.content ?? "";
 }
 
 function printWorkflow(label: string, model: string | null, json: string): void {
@@ -385,17 +393,19 @@ async function judgePair(
   digest1: string,
   digest2: string,
 ): Promise<Pairwise> {
-  const res = await openai.chat.completions.create({
-    model: JUDGE_MODEL,
-    messages: [
-      { role: "system", content: PAIRWISE_SYSTEM },
-      { role: "user", content: buildPairwisePrompt(contract, candidates, digest1, digest2) },
-    ],
-    response_format: {
-      type: "json_schema",
-      json_schema: { name: "pairwise", strict: true, schema: PAIRWISE_RESPONSE_SCHEMA },
-    },
-  });
+  const res = await withRetry(() =>
+    openai.chat.completions.create({
+      model: JUDGE_MODEL,
+      messages: [
+        { role: "system", content: PAIRWISE_SYSTEM },
+        { role: "user", content: buildPairwisePrompt(contract, candidates, digest1, digest2) },
+      ],
+      response_format: {
+        type: "json_schema",
+        json_schema: { name: "pairwise", strict: true, schema: PAIRWISE_RESPONSE_SCHEMA },
+      },
+    }),
+  );
   const content = res.choices[0]?.message.content;
   if (!content) throw new Error("pairwise judge returned empty content");
   return PairwiseSchema.parse(JSON.parse(content));
