@@ -10,11 +10,12 @@ import { createWorkflowSchema, parseWorkflow, type Workflow } from "./dsl";
 
 // Compiler — turns a signal into a validated Workflow via one LLM call (with
 // up to N retries on schema/JSON failure). Always uses the `compiler` preset
-// (currently Gemini 3 Flash): in Test A the Gemini-3 generation rebuilt the
-// non-obvious dedup step 5/5 with reliable structured output, at a fraction of
-// gpt-5.4's cost — and we emit ONE workflow per signal, so reliability + cost
-// win here. (Override the model with AGENT_COMPILER_MODEL; routing follows the
-// name.)
+// (currently Gemini 3 Flash, reasoning_effort=low): in Test A the Gemini-3
+// generation rebuilt the non-obvious dedup step 5/5 with reliable structured
+// output, at a fraction of gpt-5.4's cost, and at "low" effort ~2.8s/plan
+// (gpt-5.4-class latency, vs ~12s on Gemini's default budget). We emit ONE
+// workflow per signal, so reliability + cost + latency all win here. (Override
+// the model with AGENT_COMPILER_MODEL; routing follows the name.)
 
 const COMPILER_PRESET: PresetName = "compiler";
 // On-disk skill file keeps its historical name `planner.md` (see

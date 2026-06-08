@@ -163,6 +163,13 @@ describe("gemini provider", () => {
     expect(bodies[0]!.reasoning_effort).toBe("high");
   });
 
+  it("low effort: maps to reasoning_effort 'low' (the compiler's latency knob)", async () => {
+    const { client, bodies } = fakeClient(OPENAI_USAGE);
+    const provider = createGeminiProvider(client);
+    await provider.complete({ model: "gemini-3-flash-preview", messages: [], reasoningEffort: "low" });
+    expect(bodies[0]!.reasoning_effort).toBe("low");
+  });
+
   it("passes tools and response_format through, normalizes usage like OpenAI", async () => {
     const { client, bodies } = fakeClient(OPENAI_USAGE);
     const provider = createGeminiProvider(client);

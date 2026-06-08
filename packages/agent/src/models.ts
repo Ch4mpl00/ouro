@@ -11,7 +11,11 @@
 // through DeepSeek, a "gemini-*" name through Gemini's OpenAI-compatible
 // endpoint, any other prefix through OpenAI.
 
-export type ReasoningEffort = "disabled" | "high" | "max";
+// "low" exists for the Gemini compiler: on Gemini-3 the default (omitted)
+// reasoning budget is dynamic and heavy (~12s/plan); "low" cuts that to ~2.8s
+// with no quality loss (dedup step still 5/5). DeepSeek/OpenAI don't use it
+// (smart=max, base=disabled) — it's a Gemini-latency knob.
+export type ReasoningEffort = "disabled" | "low" | "high" | "max";
 
 export interface ModelPreset {
   model: string;
@@ -43,7 +47,7 @@ export const DEFAULT_PRESETS: Record<PresetName, ModelPreset> = {
   base: { model: "gpt-5.4-mini", reasoningEffort: "disabled" },
   smart: { model: "deepseek-v4-pro", reasoningEffort: "max" },
   smartest: { model: "gpt-5.4", reasoningEffort: "max" },
-  compiler: { model: "gemini-3-flash-preview", reasoningEffort: "disabled" },
+  compiler: { model: "gemini-3-flash-preview", reasoningEffort: "low" },
 };
 
 // Presets selectable inside a workflow (llm_compose/llm_agent `preset`) or by

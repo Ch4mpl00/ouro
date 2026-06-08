@@ -7,11 +7,12 @@ import { toResult } from "./result";
 // Gemini provider. Google exposes an OpenAI-compatible Chat Completions
 // endpoint, so the request/response shape — tools, response_format, usage —
 // matches OpenAI's (normalizeOpenAiUsage reads prompt_tokens_details just the
-// same). The one divergence we model is reasoning_effort: Gemini's enum is
-// low|medium|high (no "max"), and OMITTING it lets Gemini pick a dynamic
-// thinking budget — the exact mode Test A validated, where the Gemini-3
-// generation rebuilt the compiler's dedup step 5/5 with no explicit effort. So
-// we map "disabled" → omit (dynamic budget), anything else → "high".
+// same). The one divergence we model is reasoning_effort. Gemini's enum is
+// none|low|medium|high (no "max"). A latency sweep on Gemini-3 (Test A trace):
+//   omit / medium / high → ~12s per plan (dynamic budget is heavy)
+//   "low"                → ~2.8s, dedup step still 5/5  ← the compiler uses this
+//   "none"               → ~2.7s but drops the dedup step (2/3) — too lossy
+// So we map: "disabled" → omit, "low" → "low" (the latency knob), else → "high".
 //
 // The client is constructed with baseURL
 // https://generativelanguage.googleapis.com/v1beta/openai/ in the engine.
@@ -34,7 +35,9 @@ export function createGeminiProvider(client: OpenAI): ChatProvider {
       };
       // reasoning_effort is outside the statically-typed body — attach at
       // runtime, mirroring the deepseek provider's extension pattern.
-      if (params.reasoningEffort !== "disabled") {
+      if (params.reasoningEffort === "low") {
+        Object.assign(body, { reasoning_effort: "low" });
+      } else if (params.reasoningEffort !== "disabled") {
         Object.assign(body, { reasoning_effort: "high" });
       }
       for (let attempt = 0; ; attempt++) {
