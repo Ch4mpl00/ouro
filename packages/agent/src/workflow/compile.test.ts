@@ -12,6 +12,7 @@ const PRESETS: Record<PresetName, ModelPreset> = {
   base: { model: "gpt-5.4-mini", reasoningEffort: "disabled" },
   smart: { model: "deepseek-v4-pro", reasoningEffort: "max" },
   smartest: { model: "gpt-5.4", reasoningEffort: "max" },
+  compiler: { model: "gemini-3.5-flash", reasoningEffort: "disabled" },
 };
 
 function recordingSpan(): Span {
@@ -222,7 +223,7 @@ describe("compiler.compile — happy path", () => {
     );
   });
 
-  it("uses the smartest preset's model in the request", async () => {
+  it("uses the compiler preset's model in the request", async () => {
     const { provider, calls } = makeMockProvider({ llmReplies: [VALID_PLAN_JSON] });
     const compiler = createCompiler({
       engine: makeEngineSurface(provider),

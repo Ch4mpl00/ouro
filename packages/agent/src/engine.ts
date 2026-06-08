@@ -3,6 +3,7 @@ import { connectMcp, type McpHandle } from "./mcp-client";
 import { DEFAULT_PRESETS, type ModelPreset, type PresetName } from "./models";
 import {
   createDeepseekProvider,
+  createGeminiProvider,
   createOpenAiProvider,
   type ChatProvider,
 } from "./providers";
@@ -12,9 +13,9 @@ import { nullTracer, type Tracer } from "./tracing";
 import { langfuseTracerFromEnv } from "./tracing/langfuse";
 
 // Process-level singleton. Owns shared, expensive resources:
-//   - two OpenAI-shaped clients, one per provider (DeepSeek for
-//     thinking-mode sessions, OpenAI for non-thinking — each on its own
-//     API key + rate-limit bucket)
+//   - three OpenAI-shaped clients, one per provider (DeepSeek for
+//     thinking-mode sessions, OpenAI for non-thinking, Gemini for the
+//     workflow compiler — each on its own API key + rate-limit bucket)
 //   - one MCP connection (one stdio child process for the integrations server)
 //   - one Tracer (observability backend; defaults to no-op)
 // Hands out AgentLoops on demand. Each AgentLoop has its own context
@@ -28,6 +29,9 @@ export type { ProviderKind } from "./providers";
 export interface EngineOpts {
   deepseekApiKey: string;
   openaiApiKey: string;
+  // The workflow compiler runs on Gemini (the `compiler` preset), via its
+  // OpenAI-compatible endpoint. Required — the compiler is on the hot path.
+  geminiApiKey: string;
   // Optional override for the model-preset registry. Omit to use
   // DEFAULT_PRESETS from `./models`. Per-preset env overrides
   // (AGENT_BASE_MODEL / AGENT_SMART_MODEL) are applied by the supervisor
@@ -54,11 +58,15 @@ export class Engine {
   readonly presets: Record<PresetName, ModelPreset>;
   readonly skills: readonly string[];
   readonly tracer: Tracer;
-  private readonly providers: { deepseek: ChatProvider; openai: ChatProvider };
+  private readonly providers: {
+    deepseek: ChatProvider;
+    openai: ChatProvider;
+    gemini: ChatProvider;
+  };
   private agentLoops = new Map<string, AgentLoop>();
 
   constructor(
-    providers: { deepseek: ChatProvider; openai: ChatProvider },
+    providers: { deepseek: ChatProvider; openai: ChatProvider; gemini: ChatProvider },
     mcp: McpHandle,
     presets: Record<PresetName, ModelPreset>,
     skills: readonly string[],
@@ -75,9 +83,9 @@ export class Engine {
   // source of truth — Session resolves a preset name to a concrete model at
   // construction time; this method only routes that model to its endpoint.
   resolveProvider(model: string): ChatProvider {
-    return model.startsWith("deepseek")
-      ? this.providers.deepseek
-      : this.providers.openai;
+    if (model.startsWith("deepseek")) return this.providers.deepseek;
+    if (model.startsWith("gemini")) return this.providers.gemini;
+    return this.providers.openai;
   }
 
   async startAgentLoop(opts: AgentLoopOpts): Promise<AgentLoop> {
@@ -183,6 +191,7 @@ export class Engine {
 export async function createEngine(opts: EngineOpts): Promise<Engine> {
   if (!opts.deepseekApiKey) throw new Error("createEngine: deepseekApiKey is required");
   if (!opts.openaiApiKey) throw new Error("createEngine: openaiApiKey is required");
+  if (!opts.geminiApiKey) throw new Error("createEngine: geminiApiKey is required");
 
   const deepseek = createDeepseekProvider(
     new OpenAI({
@@ -191,6 +200,12 @@ export async function createEngine(opts: EngineOpts): Promise<Engine> {
     }),
   );
   const openai = createOpenAiProvider(new OpenAI({ apiKey: opts.openaiApiKey }));
+  const gemini = createGeminiProvider(
+    new OpenAI({
+      apiKey: opts.geminiApiKey,
+      baseURL: "https://generativelanguage.googleapis.com/v1beta/openai/",
+    }),
+  );
 
   const mcp = await connectMcp();
 
@@ -218,7 +233,7 @@ export async function createEngine(opts: EngineOpts): Promise<Engine> {
   }
 
   return new Engine(
-    { deepseek, openai },
+    { deepseek, openai, gemini },
     mcp,
     opts.presets ?? DEFAULT_PRESETS,
     opts.skills ?? [],

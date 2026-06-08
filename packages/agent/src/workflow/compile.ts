@@ -9,12 +9,13 @@ import type { Span, TraceContext } from "../tracing";
 import { createWorkflowSchema, parseWorkflow, type Workflow } from "./dsl";
 
 // Compiler — turns a signal into a validated Workflow via one LLM call (with
-// up to N retries on schema/JSON failure). Always uses the `smartest`
-// preset (currently OpenAI gpt-5.4): strict structured-output guarantees
-// matter more here than per-call cost — we emit ONE workflow per signal and
-// the runtime takes over.
+// up to N retries on schema/JSON failure). Always uses the `compiler` preset
+// (currently Gemini 3.5 Flash): in Test A it rebuilt the non-obvious dedup
+// step 10/10 with reliable structured output, at a fraction of gpt-5.4's
+// cost — and we emit ONE workflow per signal, so reliability + cost win here.
+// (Override the model with AGENT_COMPILER_MODEL; routing follows the name.)
 
-const COMPILER_PRESET: PresetName = "smartest";
+const COMPILER_PRESET: PresetName = "compiler";
 // On-disk skill file keeps its historical name `planner.md` (see
 // skills.default/) — only the in-code terminology moved to "compiler".
 const COMPILER_SKILL_NAME = "planner";

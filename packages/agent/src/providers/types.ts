@@ -21,8 +21,11 @@ import type { TokenUsage } from "../tracing";
 // `ChatProvider.complete` hides both behind one normalized call/return, so
 // session.ts / compile.ts / execute.ts stop carrying `if (kind ===
 // "deepseek")` branches. New provider → new factory, no call-site edits.
+//
+// Gemini joins via its OpenAI-compatible endpoint: same wire shape as OpenAI,
+// with its own reasoning_effort handling (see providers/gemini.ts).
 
-export type ProviderKind = "deepseek" | "openai";
+export type ProviderKind = "deepseek" | "openai" | "gemini";
 
 export interface CompletionParams {
   model: string;

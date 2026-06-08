@@ -145,13 +145,15 @@ async function main(): Promise<void> {
   if (!deepseekApiKey) throw new Error("DEEPSEEK_API_KEY is not set in .env");
   const openaiApiKey = process.env.OPENAI_API_KEY;
   if (!openaiApiKey) throw new Error("OPENAI_API_KEY is not set in .env");
+  const geminiApiKey = process.env.GEMINI_API_KEY;
+  if (!geminiApiKey) throw new Error("GEMINI_API_KEY is not set in .env (workflow compiler)");
 
   // Build the preset registry from defaults + per-preset env overrides.
   // `base` runs on OpenAI (non-thinking — primary replies, recovery,
   // scheduler dispatch). `smart` runs on DeepSeek with thinking on —
   // sub-agents that do real editorial / parsing work (news-digest,
-  // tech-digest, nashdom-bill, …). `smartest` is reserved for the
-  // compiler role; current agentic sessions never select it.
+  // tech-digest, nashdom-bill, …). `compiler` runs on Gemini and powers
+  // the workflow compiler. `smartest` is a reserve high-end preset.
   const presets = {
     base: {
       ...DEFAULT_PRESETS.base,
@@ -165,11 +167,16 @@ async function main(): Promise<void> {
       ...DEFAULT_PRESETS.smartest,
       model: process.env.AGENT_SMARTEST_MODEL ?? DEFAULT_PRESETS.smartest.model,
     },
+    compiler: {
+      ...DEFAULT_PRESETS.compiler,
+      model: process.env.AGENT_COMPILER_MODEL ?? DEFAULT_PRESETS.compiler.model,
+    },
   };
 
   const engine = await createEngine({
     deepseekApiKey,
     openaiApiKey,
+    geminiApiKey,
     presets,
     // Meta-skills loaded into every session: routing (cross-skill
     // delegation when intent ≠ source). Only used on the fallback

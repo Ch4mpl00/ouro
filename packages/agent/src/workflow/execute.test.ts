@@ -19,6 +19,7 @@ const PRESETS: Record<PresetName, ModelPreset> = {
   base: { model: "gpt-5.4-mini", reasoningEffort: "disabled" },
   smart: { model: "deepseek-v4-pro", reasoningEffort: "max" },
   smartest: { model: "gpt-5.4", reasoningEffort: "max" },
+  compiler: { model: "gemini-3.5-flash", reasoningEffort: "disabled" },
 };
 
 function recordingSpan(): Span & { events: unknown[] } {

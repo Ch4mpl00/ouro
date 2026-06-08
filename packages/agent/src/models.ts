@@ -6,10 +6,10 @@
 // read as intent ("base reply", "smart digest") rather than
 // implementation knobs.
 //
-// Provider routing (DeepSeek vs OpenAI endpoint) is derived from the
-// model name in `engine.resolveProvider` — adding a preset that uses a
-// "deepseek-*" name will route through DeepSeek automatically; any
-// other prefix routes through OpenAI.
+// Provider routing (DeepSeek vs Gemini vs OpenAI endpoint) is derived from
+// the model name in `engine.resolveProvider` — a "deepseek-*" name routes
+// through DeepSeek, a "gemini-*" name through Gemini's OpenAI-compatible
+// endpoint, any other prefix through OpenAI.
 
 export type ReasoningEffort = "disabled" | "high" | "max";
 
@@ -18,7 +18,7 @@ export interface ModelPreset {
   reasoningEffort: ReasoningEffort;
 }
 
-export type PresetName = "base" | "smart" | "smartest";
+export type PresetName = "base" | "smart" | "smartest" | "compiler";
 
 // Defaults applied at engine startup when env overrides are absent.
 // `base`     — non-thinking chat, OpenAI provider. Default for primary
@@ -27,17 +27,26 @@ export type PresetName = "base" | "smart" | "smartest";
 // `smart`    — DeepSeek with thinking on. Used for sub-agents that do
 //              real editorial / parsing work (digests, semantic dedup,
 //              PDF amount extraction).
-// `smartest` — OpenAI full GPT-5.4. Reserved for the planner role
-//              where strict structured-output guarantees and a single
-//              high-quality decision matter more than per-call cost
-//              (the planner emits one compact plan per signal, then
-//              the runtime takes over deterministically).
+// `smartest` — OpenAI full GPT-5.4. A reserve high-end preset, still
+//              selectable by sub-agents/handoff; no longer the compiler's
+//              default (see `compiler`).
+// `compiler` — Gemini 3.5 Flash. The model the WORKFLOW COMPILER runs on:
+//              Test A showed it rebuilds the non-obvious dedup step 10/10
+//              (vs gpt-5.4-mini 3/5, gemini-2.5-flash 0/10) while being far
+//              cheaper than gpt-5.4 — and the compiler emits ONE structured
+//              plan per signal, so structured-output reliability + cost win
+//              here. Not in PRESET_NAMES: it's the compiler's own model, not
+//              a preset a workflow step or sub-agent picks.
 export const DEFAULT_PRESETS: Record<PresetName, ModelPreset> = {
   base: { model: "gpt-5.4-mini", reasoningEffort: "disabled" },
   smart: { model: "deepseek-v4-pro", reasoningEffort: "max" },
   smartest: { model: "gpt-5.4", reasoningEffort: "max" },
+  compiler: { model: "gemini-3.5-flash", reasoningEffort: "disabled" },
 };
 
+// Presets selectable inside a workflow (llm_compose/llm_agent `preset`) or by
+// a sub-agent. `compiler` is intentionally excluded — it's the compiler's own
+// model, resolved directly by COMPILER_PRESET, never chosen by a workflow step.
 export const PRESET_NAMES: readonly PresetName[] = ["base", "smart", "smartest"];
 
 export function isPresetName(value: unknown): value is PresetName {

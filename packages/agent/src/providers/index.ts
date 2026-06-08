@@ -6,3 +6,4 @@ export type {
 } from "./types";
 export { createOpenAiProvider } from "./openai";
 export { createDeepseekProvider } from "./deepseek";
+export { createGeminiProvider } from "./gemini";
