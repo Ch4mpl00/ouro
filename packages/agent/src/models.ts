@@ -30,18 +30,20 @@ export type PresetName = "base" | "smart" | "smartest" | "compiler";
 // `smartest` — OpenAI full GPT-5.4. A reserve high-end preset, still
 //              selectable by sub-agents/handoff; no longer the compiler's
 //              default (see `compiler`).
-// `compiler` — Gemini 3.5 Flash. The model the WORKFLOW COMPILER runs on:
-//              Test A showed it rebuilds the non-obvious dedup step 10/10
-//              (vs gpt-5.4-mini 3/5, gemini-2.5-flash 0/10) while being far
-//              cheaper than gpt-5.4 — and the compiler emits ONE structured
-//              plan per signal, so structured-output reliability + cost win
-//              here. Not in PRESET_NAMES: it's the compiler's own model, not
-//              a preset a workflow step or sub-agent picks.
+// `compiler` — Gemini 3 Flash (preview). The model the WORKFLOW COMPILER runs
+//              on: Test A showed the Gemini-3 generation rebuilds the
+//              non-obvious dedup step 5/5 (vs gpt-5.4-mini 3/5, gemini-2.5-flash
+//              0/10), on par with gemini-3.5-flash but ~3x cheaper. The compiler
+//              emits ONE structured plan per signal, so structured-output
+//              reliability + cost win here. Not in PRESET_NAMES: it's the
+//              compiler's own model, not a preset a workflow step or sub-agent
+//              picks. (Preview availability wobbles — the Gemini provider
+//              retries 429/5xx so a transient blip doesn't fail compilation.)
 export const DEFAULT_PRESETS: Record<PresetName, ModelPreset> = {
   base: { model: "gpt-5.4-mini", reasoningEffort: "disabled" },
   smart: { model: "deepseek-v4-pro", reasoningEffort: "max" },
   smartest: { model: "gpt-5.4", reasoningEffort: "max" },
-  compiler: { model: "gemini-3.5-flash", reasoningEffort: "disabled" },
+  compiler: { model: "gemini-3-flash-preview", reasoningEffort: "disabled" },
 };
 
 // Presets selectable inside a workflow (llm_compose/llm_agent `preset`) or by
