@@ -139,6 +139,11 @@ Common cases (skill name → typical triggers):
 - `dreaming` only fires from `source=dreaming` cron — never on demand.
 - `routing` is meta — it's this file.
 
+The **knowledge base** is not a skill at all — `add_note` / `find_notes`
+are plain MCP tools. Call them inline when the user asks you to remember
+or recall a personal fact ("запомни, что …" / "что ты помнишь про …");
+never spin up a sub-agent for them.
+
 ## Discovery
 
 If you're unsure which skill applies, call `list_skills()`. Names are

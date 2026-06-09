@@ -12,6 +12,7 @@ import { registerPdfTools } from "./tools/pdf";
 import { registerFsTools } from "./tools/fs";
 import { registerSignalsTools } from "./tools/signals";
 import { registerNewsTools } from "./tools/news";
+import { registerKnowledgeTools } from "./tools/knowledge";
 import { registerDreamingTools } from "./tools/dreaming";
 import { registerUserbotTools } from "./tools/userbot";
 import { registerSchedulerTools } from "./tools/scheduler";
@@ -20,9 +21,11 @@ import { startGmailPoller } from "./services/gmail";
 import { startSchedulerPoller } from "./services/scheduler";
 import { createPgClient } from "./db/pg/client";
 import { createNewsModule, startNewsModule, type NewsRepository } from "./services/news";
+import { createKnowledgeModule, type KnowledgeRepository } from "./services/knowledge";
 
 export interface ServerDeps {
   news: NewsRepository;
+  knowledge: KnowledgeRepository;
 }
 
 export function createServer(deps: ServerDeps): McpServer {
@@ -38,6 +41,7 @@ export function createServer(deps: ServerDeps): McpServer {
   registerFsTools(server);
   registerSignalsTools(server);
   registerNewsTools(server, deps.news);
+  registerKnowledgeTools(server, deps.knowledge);
   registerDreamingTools(server);
   registerUserbotTools(server);
   registerSchedulerTools(server);
@@ -121,8 +125,12 @@ async function main(): Promise<void> {
   await pg.ensureReady();
 
   const newsModule = createNewsModule({ db: pg.db });
+  const knowledgeModule = createKnowledgeModule({ db: pg.db });
 
-  const server = createServer({ news: newsModule.repository });
+  const server = createServer({
+    news: newsModule.repository,
+    knowledge: knowledgeModule.repository,
+  });
   const transport = (process.env.MCP_TRANSPORT ?? "stdio").toLowerCase();
 
   if (transport === "http") {

@@ -69,6 +69,15 @@ ungrounded). The shape is always search → compose-on-results (the
 isn't about retrievable world facts — translate this, draft a greeting,
 format these numbers, acknowledge a reminder.
 
+**Personal facts are a separate store — `find_notes`, not `search_news`.**
+Things the user told you to remember live in the knowledge base, not the
+news store. "запомни, что … / запиши …" → an `add_note` step (you invent
+3–6 short lowercase tags for its `tags` arg). "что ты помнишь про … /
+напомни … / когда Лёша платит за интернет" → `find_notes` (`search_news`
+is world/news only). Shapes: remember `[add_note] → [send confirmation]`;
+recall `[start_typing] → [find_notes] → [compose: reply from the hits] →
+[send]`.
+
 **Prefer deterministic steps.** A `tool` call or an `llm_compose` is
 predictable and cheap. Reach for `llm_agent` only when the work is genuinely
 iterative and you cannot lay the tool calls out in advance — typically

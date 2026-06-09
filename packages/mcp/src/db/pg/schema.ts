@@ -46,3 +46,45 @@ export const newsItems = pgTable(
 
 export type NewsItemRow = typeof newsItems.$inferSelect;
 export type NewsItemInsert = typeof newsItems.$inferInsert;
+
+// Personal knowledge base: freeform notes the user asks the agent to
+// remember ("запомни, что …"), recalled later by semantic search over
+// `body` ("что ты помнишь про …"). Distinct from news_items (external
+// harvested content) and agent.db memory (opaque internal KV).
+//
+// `tags` are LLM-generated at add time (the agent picks a handful "на
+// свой вкус") and used only as structured metadata for now — stored,
+// returned, and filterable via array-overlap (&&). They do NOT
+// participate in the embedding: only `body` is vectorised. Folding tags
+// into the embedded text later is a one-line change in the embed step
+// (no schema migration) — revisit if recall over body alone underperforms.
+export const knowledgeBaseNotes = pgTable(
+  "knowledge_base_notes",
+  {
+    id: bigserial("id", { mode: "number" }).primaryKey(),
+    body: text("body").notNull(),
+    tags: text("tags")
+      .array()
+      .notNull()
+      .default(sql`'{}'::text[]`),
+    source: text("source"),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+    embeddedAt: timestamp("embedded_at", { withTimezone: true }),
+    embedding: vector("embedding", { dimensions: 1536 }),
+  },
+  // No ANN index on `embedding` — same rationale as news_items: a seq
+  // scan over a small corpus is sub-ms; add ivfflat/hnsw past ~50–100k
+  // rows. GIN on `tags` keeps the optional array-overlap filter cheap.
+  (t) => [
+    index("kb_notes_created_at").on(t.createdAt.desc()),
+    index("kb_notes_tags").using("gin", t.tags),
+  ],
+);
+
+export type KnowledgeBaseNoteRow = typeof knowledgeBaseNotes.$inferSelect;
+export type KnowledgeBaseNoteInsert = typeof knowledgeBaseNotes.$inferInsert;
