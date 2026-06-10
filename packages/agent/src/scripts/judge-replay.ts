@@ -1,4 +1,5 @@
 import "dotenv/config";
+import { readFileSync } from "node:fs";
 import OpenAI from "openai";
 import type { ChatCompletionMessageParam } from "openai/resources/chat/completions";
 import type { ReasoningEffort } from "openai/resources/shared";
@@ -6,6 +7,7 @@ import { config as loadEnv } from "dotenv";
 import { z } from "zod";
 import { fetchTraceById, type Observation } from "./langfuse-api";
 import { DEEPSEEK_BASE_URL, GEMINI_BASE_URL, retryOnTransient } from "../providers";
+import { createWorkflowSchema, parseWorkflow } from "../workflow/dsl";
 
 // A/B replay over a captured trace. Both tests reduce to ONE pattern: take a
 // generation's recorded input (which already pins everything but the model —
@@ -16,8 +18,14 @@ import { DEEPSEEK_BASE_URL, GEMINI_BASE_URL, retryOnTransient } from "../provide
 //   Test B (compose): replay the `llm_compose` generation -> a digest text
 //
 //   tsx judge-replay.ts <traceId>                            # extract + inspect
-//   tsx judge-replay.ts <traceId> --plan <model> [--thinking]
-//   tsx judge-replay.ts <traceId> --compose <model> [--thinking] [--judge]
+//   tsx judge-replay.ts <traceId> --plan <model> [--thinking [level]] [--planner-file <path>]
+//   tsx judge-replay.ts <traceId> --compose <model> [--thinking [level]] [--judge]
+//
+// --planner-file swaps the planner-skill body inside the recorded system
+// message for the given on-disk file (the <tools>/<skills> reference block
+// stays as recorded) — an A/B of a planner.md edit over a frozen signal.
+// --thinking takes an optional level (low/medium/high; bare flag = high) —
+// pass `low` to mirror the production compiler preset.
 //
 // With --judge, the original (A) and each B sample go to a pairwise judge
 // (gpt-5.4) over the SAME frozen candidates — both in one call (one salience
@@ -202,36 +210,119 @@ function validateWorkflowLite(json: string): { ok: boolean; error?: string; step
   return { ok: true, steps: steps.length };
 }
 
+// ─── full-schema validation from the recorded prompt ─────────────────
+// The recorded system message carries the exact <tools>/<skills> reference
+// the compiler saw, so we can rebuild the SAME production Zod schema
+// (tool/skill enums included) and validate samples for real — not just
+// "parses and has kinds".
+
+function extractBlock(text: string, tag: string): string | null {
+  const m = new RegExp(`<${tag}>\\n([\\s\\S]*?)\\n</${tag}>`).exec(text);
+  return m?.[1] ?? null;
+}
+
+function schemaFromRecordedPrompt(
+  messages: ChatCompletionMessageParam[],
+): z.ZodTypeAny | null {
+  const sys = messages.find((m) => m.role === "system");
+  if (!sys || typeof sys.content !== "string") return null;
+  const toolsBlock = extractBlock(sys.content, "tools");
+  const skillsBlock = extractBlock(sys.content, "skills");
+  if (!toolsBlock || !skillsBlock) return null;
+  const knownTools = [...toolsBlock.matchAll(/^- ([a-zA-Z0-9_]+)\(/gm)].map((m) => m[1]!);
+  const knownSkills = [...skillsBlock.matchAll(/^- (\S+)$/gm)].map((m) => m[1]!);
+  if (knownTools.length === 0 || knownSkills.length === 0) return null;
+  return createWorkflowSchema({ knownTools, knownSkills }).WorkflowSchema;
+}
+
+interface SampleVerdict {
+  ok: boolean;
+  steps?: number;
+  errors: string[];
+}
+
+function validateSample(json: string, schema: z.ZodTypeAny | null): SampleVerdict {
+  const lite = validateWorkflowLite(json);
+  if (!lite.ok) return { ok: false, errors: [lite.error ?? "invalid"] };
+  if (!schema) return { ok: true, steps: lite.steps, errors: [] };
+  const parsed = parseWorkflow(JSON.parse(json), schema);
+  return parsed.ok
+    ? { ok: true, steps: lite.steps, errors: [] }
+    : { ok: false, steps: lite.steps, errors: parsed.errors };
+}
+
+// Swap the planner-skill body in the recorded system message for the given
+// on-disk file, keeping the recorded <tools>/<skills> reference intact.
+// skills.ts strips frontmatter before the body reaches the compiler —
+// mirrored here so the swapped prompt matches what production would send.
+function swapPlannerBody(
+  messages: ChatCompletionMessageParam[],
+  plannerPath: string,
+): void {
+  const sys = messages.find((m) => m.role === "system");
+  if (!sys || typeof sys.content !== "string") {
+    throw new Error("no system message in recorded input to swap");
+  }
+  const idx = sys.content.indexOf("<tools>");
+  if (idx < 0) throw new Error("recorded system message has no <tools> block");
+  let body = readFileSync(plannerPath, "utf8");
+  if (body.startsWith("---\n")) {
+    const end = body.indexOf("\n---\n");
+    if (end >= 0) body = body.slice(end + 5);
+  }
+  sys.content = `${body.trim()}\n\n${sys.content.slice(idx)}`;
+}
+
 // Test A: replay the planner's input under model B, SAMPLES times. A is the
 // original output (one reference); B is the distribution of fresh samples.
+// With plannerFile, B runs on the swapped-in prompt (A stays the recorded
+// run for reference).
 async function testPlan(
   observations: Observation[],
   modelB: string,
   reasoningEffort?: ReasoningEffort,
+  plannerFile?: string,
 ): Promise<void> {
   const planner = findGeneration(observations, "attempt-");
   if (!planner) throw new Error("no planner generation in trace");
   const messages = toChatMessages(planner.input);
+  // Schema enums come from the RECORDED reference block — identical before
+  // and after the swap, since swapPlannerBody preserves it.
+  const schema = schemaFromRecordedPrompt(messages);
+  if (!schema) console.log("(no <tools>/<skills> block found — falling back to lite validation)");
 
-  printWorkflow("PLAN A — original", planner.model, outputText(planner));
+  if (plannerFile) {
+    const before = messages.find((m) => m.role === "system");
+    const beforeLen = typeof before?.content === "string" ? before.content.length : 0;
+    swapPlannerBody(messages, plannerFile);
+    const afterLen = typeof before?.content === "string" ? before.content.length : 0;
+    console.log(`planner body swapped in from ${plannerFile} (system ${beforeLen} → ${afterLen} chars)`);
+  }
+
+  printWorkflow("PLAN A — original (recorded prompt)", planner.model, outputText(planner));
 
   const thinkLabel = reasoningEffort ? ` (thinking=${reasoningEffort})` : "";
-  console.log(`\n=== PLAN B — ${modelB}${thinkLabel}, ${SAMPLES} independent samples ===`);
+  const promptLabel = plannerFile ? `, prompt=${plannerFile}` : ", prompt=recorded";
+  console.log(`\n=== PLAN B — ${modelB}${thinkLabel}${promptLabel}, ${SAMPLES} independent samples ===`);
   const samples = await Promise.all(
     Array.from({ length: SAMPLES }, () => replayGeneration(messages, modelB, true, reasoningEffort)),
   );
   let valid = 0;
   samples.forEach((out, i) => {
-    const v = validateWorkflowLite(out);
+    const v = validateSample(out, schema);
     if (v.ok) valid += 1;
-    console.log(`\n[sample ${i + 1}] ${v.ok ? `✓ valid (${v.steps} steps)` : `✗ ${v.error}`}`);
-    if (v.ok) {
+    console.log(
+      `\n[sample ${i + 1}] ${v.ok ? `✓ valid (${v.steps} steps)` : `✗ invalid${v.steps !== undefined ? ` (${v.steps} steps)` : ""}`}`,
+    );
+    for (const e of v.errors.slice(0, 4)) console.log(`    ! ${e}`);
+    const lite = validateWorkflowLite(out);
+    if (lite.ok) {
       printSteps((JSON.parse(out) as { steps: unknown[] }).steps, "  ");
     } else {
       console.log(`  ${truncate(out, 220).replace(/\n/g, " ")}`);
     }
   });
-  console.log(`\nB valid: ${valid}/${SAMPLES}`);
+  console.log(`\nB valid: ${valid}/${SAMPLES}${schema ? " (full production schema)" : " (lite)"}`);
 }
 
 // Test B: replay the composer's input under model B, SAMPLES times. The input
@@ -493,24 +584,35 @@ async function judgeCompose(
   }
 }
 
+// `--thinking` with an optional level. Bare flag keeps the historical
+// meaning (high); `--thinking low` mirrors the production compiler preset.
+function parseThinking(): ReasoningEffort | undefined {
+  const i = process.argv.indexOf("--thinking");
+  if (i < 0) return undefined;
+  const next = process.argv[i + 1];
+  if (next === "low" || next === "medium" || next === "high") {
+    return next;
+  }
+  return "high";
+}
+
 async function main(): Promise<void> {
   const traceId = process.argv[2];
   if (!traceId || traceId.startsWith("--")) {
     console.error(
-      "usage: tsx judge-replay.ts <traceId> [--plan <model> | --compose <model>] [--thinking] [--judge]",
+      "usage: tsx judge-replay.ts <traceId> [--plan <model> | --compose <model>] " +
+        "[--thinking [low|medium|high]] [--planner-file <path>] [--judge]",
     );
     process.exit(1);
   }
   const { trace, observations } = await fetchTraceById(traceId);
   console.log(`trace ${traceId} · ${trace.name} · tags=[${trace.tags.join(",")}]`);
 
-  const thinking: ReasoningEffort | undefined = process.argv.includes("--thinking")
-    ? "high"
-    : undefined;
+  const thinking = parseThinking();
   const planModel = argFlag("--plan");
   const composeModel = argFlag("--compose");
   if (planModel !== undefined) {
-    await testPlan(observations, planModel || "gpt-5.4-mini", thinking);
+    await testPlan(observations, planModel || "gpt-5.4-mini", thinking, argFlag("--planner-file"));
   } else if (composeModel !== undefined) {
     const withJudge = process.argv.includes("--judge");
     await testCompose(observations, composeModel || "gpt-5.4-mini", thinking, withJudge);
