@@ -1,4 +1,5 @@
 import "dotenv/config";
+import { writeFileSync } from "node:fs";
 import OpenAI from "openai";
 import { z } from "zod";
 import { config as loadEnv } from "dotenv";
@@ -19,12 +20,20 @@ loadEnv({ path: ".env.agent" });
 // normalization yet — we feed the raw flow and see whether the judge copes.
 //
 // Usage: pnpm judge <traceId>
+//        pnpm judge --recent [N]
+//        pnpm judge --dump <traceId> | pnpm judge --dump --recent [N]
 //
 //   - Judge model is a different family from the generators (GPT-5.4 vs the
 //     DeepSeek composer), so there's no self-preference on the output.
 //   - Contract comes from the skill, not from judge code: a new scenario =
 //     a new skill, judge unchanged.
 //   - Scores print to stdout for now; Langfuse score ingestion is a later step.
+//   - --dump skips the GPT judge entirely: it assembles the SAME materials
+//     (contracts + transcript) and writes them to /tmp/judge-dump-<id>.md,
+//     for an external judge — the /judge-trace Claude Code skill reads that
+//     file and scores the run in-session (free for experiments). Keep the
+//     dump format in sync with buildUserPrompt so the two judges see
+//     identical evidence.
 
 const JUDGE_MODEL = "gpt-5.4";
 const JUDGE_PROMPT_VERSION = "v2";
@@ -338,7 +347,17 @@ function printFaithfulness(f: Faithfulness): void {
   console.log();
 }
 
-async function judgeOne(openai: OpenAI, traceId: string): Promise<void> {
+interface JudgeMaterials {
+  skillName: string | null;
+  composerContract: string | null;
+  orchestratorContract: string | null;
+  transcript: string;
+  obsCount: number;
+}
+
+// One assembly path for both judges (GPT call and --dump for the
+// /judge-trace skill) — they must see identical evidence.
+async function assembleMaterials(traceId: string): Promise<JudgeMaterials> {
   const { trace, observations } = await fetchTraceById(traceId);
   const skillName = findSkill(trace, observations);
   const composerContract = skillName ? await skillStore.readSkillRaw(skillName) : null;
@@ -347,30 +366,71 @@ async function judgeOne(openai: OpenAI, traceId: string): Promise<void> {
   // the composer skill (which never calls tools).
   const orchestratorContract = await skillStore.readSkillRaw("planner");
   const transcript = buildTranscript(trace, observations);
+  return {
+    skillName,
+    composerContract,
+    orchestratorContract,
+    transcript,
+    obsCount: observations.length,
+  };
+}
+
+async function judgeOne(openai: OpenAI, traceId: string): Promise<void> {
+  const m = await assembleMaterials(traceId);
 
   console.error(
-    `[judge] trace ${traceId} · skill=${skillName ?? "—"} · ${observations.length} obs · ` +
-    `transcript ${transcript.length} chars`,
+    `[judge] trace ${traceId} · skill=${m.skillName ?? "—"} · ${m.obsCount} obs · ` +
+    `transcript ${m.transcript.length} chars`,
   );
 
   // Holistic axes and the faithfulness sub-judge are independent calls — run
   // them concurrently.
   const [card, faith] = await Promise.all([
-    judge(openai, skillName, composerContract, orchestratorContract, transcript),
-    judgeFaithfulness(openai, composerContract, transcript),
+    judge(openai, m.skillName, m.composerContract, m.orchestratorContract, m.transcript),
+    judgeFaithfulness(openai, m.composerContract, m.transcript),
   ]);
-  printScorecard(traceId, skillName, card);
+  printScorecard(traceId, m.skillName, card);
   printFaithfulness(faith);
 }
 
+// Assemble the judge materials and write them to a file (stdout would be
+// truncated by most tool runners — transcripts run to 150k+ chars). The body
+// is exactly what buildUserPrompt feeds the GPT judge, minus the scoring
+// instruction — the /judge-trace skill carries the rubric instead.
+async function dumpOne(traceId: string): Promise<void> {
+  const m = await assembleMaterials(traceId);
+  const body = [
+    `# JUDGE MATERIALS · trace ${traceId} · composer skill ${m.skillName ?? "—"}`,
+    "",
+    buildUserPrompt(m.skillName, m.composerContract, m.orchestratorContract, m.transcript)
+      .replace(/\n\nScore this run\.[\s\S]*$/, ""),
+    "",
+  ].join("\n");
+  const path = `/tmp/judge-dump-${traceId}.md`;
+  writeFileSync(path, body);
+  console.log(
+    `[judge] dumped ${traceId} · skill=${m.skillName ?? "—"} · ${m.obsCount} obs · ` +
+      `${body.length} chars → ${path}`,
+  );
+}
+
 async function main(): Promise<void> {
-  const args = process.argv.slice(2);
-  const apiKey = process.env.OPENAI_API_KEY;
-  if (!apiKey) {
-    console.error("OPENAI_API_KEY missing in env");
-    process.exit(1);
+  const args = process.argv.slice(2).filter((a) => a !== "--dump");
+  const dump = process.argv.includes("--dump");
+
+  // Dump mode needs no judge model — only Langfuse access.
+  let openai: OpenAI | null = null;
+  if (!dump) {
+    const apiKey = process.env.OPENAI_API_KEY;
+    if (!apiKey) {
+      console.error("OPENAI_API_KEY missing in env");
+      process.exit(1);
+    }
+    openai = new OpenAI({ apiKey });
   }
-  const openai = new OpenAI({ apiKey });
+
+  const runOne = (traceId: string): Promise<void> =>
+    dump ? dumpOne(traceId) : judgeOne(openai!, traceId);
 
   // Batch mode: judge the N most recent traces. A stepping stone toward the
   // polling worker (filtering successful runs + score ingestion come later).
@@ -383,7 +443,7 @@ async function main(): Promise<void> {
       console.log(`\n${"—".repeat(72)}`);
       console.log(`trace ${t.id} · ${t.name} · [${t.tags.join(",")}] · ${t.timestamp}`);
       try {
-        await judgeOne(openai, t.id);
+        await runOne(t.id);
       } catch (err) {
         console.error(`[judge] ${t.id} failed: ${err instanceof Error ? err.message : String(err)}`);
       }
@@ -393,10 +453,12 @@ async function main(): Promise<void> {
 
   const traceId = args[0];
   if (!traceId || traceId.startsWith("--")) {
-    console.error("usage: pnpm judge <traceId>  |  pnpm judge --recent [N]");
+    console.error(
+      "usage: pnpm judge [--dump] <traceId>  |  pnpm judge [--dump] --recent [N]",
+    );
     process.exit(1);
   }
-  await judgeOne(openai, traceId);
+  await runOne(traceId);
 }
 
 main().catch((err: unknown) => {
