@@ -292,18 +292,22 @@ parallel — three identical map steps, one per chunk:
       digest. Keep candidate events per the skill's categories; when
       unsure KEEP (the reduce step filters strictly); drop obvious noise
       (ads, alerts/drone play-by-play without damage, weather, filler,
-      memes, sport). Skip events already covered in input.history. Merge
-      same-event posts into one entry. Output ONLY a JSON array:
-      [{summary: 1–2 фразы на русском с конкретикой (числа, имена,
-      места), category, source_ids, postedAt}]; empty chunk → []",
+      memes, sport). Merge same-event posts into one entry. Do NOT drop
+      events because input.history already mentions them — dedup is the
+      reduce step's job. Output ONLY a JSON array: [{summary: 1–2 фразы
+      на русском с конкретикой (числа, имена, места), category,
+      source_ids, postedAt}]; empty chunk → []",
     input={posts:"${posts.chunks.0}", history:"${history}"})  → bind "sel0"
   …same step with ${posts.chunks.1} → "sel1", ${posts.chunks.2} → "sel2"
 llm_compose(skill="news-digest", preset="smart",
   prompt="Reduce pass: input.selections hold pre-selected candidates from
     parallel map passes (raw posts are not available — the summaries carry
     the facts). Apply the skill's normal bar, categories, consolidation
-    and format; merge duplicates across chunks; dedup against
-    input.history; compose the digest message.",
+    and format; merge duplicates across chunks. Dedup against
+    input.history ONLY on a watermark-driven run; when the user explicitly
+    asked for a period («за сегодня / за день»), keep the period's
+    salient events even if an earlier digest already covered them.
+    Compose the digest message.",
   input={selections:["${sel0}","${sel1}","${sel2}"],
          history:"${history}", now:"${env.now}"})             → bind "digest"
 parallel:
