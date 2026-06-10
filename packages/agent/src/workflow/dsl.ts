@@ -132,15 +132,16 @@ export function createWorkflowSchema(deps: WorkflowSchemaDeps): WorkflowSchemaBu
     })
     .strict();
 
-  // Leaf steps: anything except `parallel`. Used inside `parallel.steps`
-  // to enforce flatness — nested `parallel` is intentionally forbidden,
-  // both to keep traces readable and to keep the compiler from
-  // over-engineering workflows.
+  // Leaf steps: the work-performing kinds allowed inside `parallel.steps`.
+  // Nested `parallel` is intentionally forbidden (keeps traces readable,
+  // keeps the compiler from over-engineering workflows). Terminators
+  // (`terminal`, `replan`) are excluded too — the runtime ignores a stop
+  // signal coming from a parallel branch, so allowing them in the schema
+  // would let the compiler emit a step that silently does nothing.
   const LeafStepSchema = z.discriminatedUnion("kind", [
     ToolStepSchema,
     LlmComposeStepSchema,
     LlmAgentStepSchema,
-    TerminalStepSchema,
   ]);
 
   const ParallelStepSchema = z
@@ -226,8 +227,8 @@ export interface ReplanStep {
   note?: string;
 }
 
-export type LeafStep = ToolStep | LlmComposeStep | LlmAgentStep | TerminalStep;
-export type Step = LeafStep | ParallelStep | ReplanStep;
+export type LeafStep = ToolStep | LlmComposeStep | LlmAgentStep;
+export type Step = LeafStep | TerminalStep | ParallelStep | ReplanStep;
 
 export interface Workflow {
   version: 1;

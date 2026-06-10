@@ -1,5 +1,4 @@
-import type { Engine } from "./engine";
-import { getMemory, MEMORY_KEYS } from "./db/memory";
+import { MEMORY_KEYS, type MemoryStore } from "./db/memory";
 
 // `Current context` block prepended to every session's system prompt.
 // Saves the agent a few tool calls per session (no `get_timezone`,
@@ -10,9 +9,20 @@ import { getMemory, MEMORY_KEYS } from "./db/memory";
 // most sessions, and stable enough that a ~minute of staleness is fine.
 // Bigger / per-source state still goes through tool calls.
 
-interface ContextInputs {
+// Narrow dependency surface: gathering env data needs one MCP call and one
+// memory read — not the whole Engine.
+export interface EnvDataDeps {
+  mcp: { callTool(name: string, args: Record<string, unknown>): Promise<string> };
+  memory: Pick<MemoryStore, "get">;
+}
+
+// Structured env data — single source of truth for both the supervisor
+// (markdown context block) and the workflow runner (variable store
+// initial value under the `env` key). When this shape changes, both
+// consumers update at once.
+export interface EnvData {
   now: Date;
-  tz: string;
+  timezone: string;
   userEmail: string | null;
   newsLastReadAt: string | null;
 }
@@ -31,24 +41,12 @@ function formatLocalTime(now: Date, tz: string): string {
   return `${get("year")}-${get("month")}-${get("day")} ${get("hour")}:${get("minute")}`;
 }
 
-function render(inputs: ContextInputs): string {
-  const lines = [
-    "## Current context",
-    `- Local time: ${formatLocalTime(inputs.now, inputs.tz)} (${inputs.tz})`,
-  ];
-  if (inputs.userEmail) lines.push(`- User email: ${inputs.userEmail}`);
-  lines.push(
-    `- News last read at: ${inputs.newsLastReadAt ?? "never (bootstrap with now - 24h)"}`,
-  );
-  return lines.join("\n");
-}
-
 // Reads the integration-owned timezone from MCP exactly once per call.
 // Returns "UTC" if the MCP call fails — the block is best-effort, we'd
 // rather inject a slightly-wrong tz than crash the session.
-async function readTimezone(engine: Engine): Promise<string> {
+async function readTimezone(deps: EnvDataDeps): Promise<string> {
   try {
-    const raw = await engine.mcp.callTool("get_timezone", {});
+    const raw = await deps.mcp.callTool("get_timezone", {});
     if (raw.startsWith("[tool error]")) return "UTC";
     const parsed = JSON.parse(raw) as { timezone?: string };
     return parsed.timezone ?? "UTC";
@@ -57,36 +55,25 @@ async function readTimezone(engine: Engine): Promise<string> {
   }
 }
 
-// Structured env data — single source of truth for both the supervisor
-// (markdown context block) and the planner runner (variable store
-// initial value under the `env` key). When this shape changes, both
-// consumers update at once.
-export interface EnvData {
-  now: Date;
-  timezone: string;
-  userEmail: string | null;
-  newsLastReadAt: string | null;
-}
-
-export async function gatherEnvData(engine: Engine): Promise<EnvData> {
-  const tz = await readTimezone(engine);
+export async function gatherEnvData(deps: EnvDataDeps): Promise<EnvData> {
+  const tz = await readTimezone(deps);
   return {
     now: new Date(),
     timezone: tz,
     userEmail: process.env.USER_EMAIL ?? null,
-    newsLastReadAt: getMemory(MEMORY_KEYS.newsLastReadAt),
+    newsLastReadAt: deps.memory.get(MEMORY_KEYS.newsLastReadAt),
   };
 }
 
-export async function buildSessionContext(
-  engine: Engine,
-  precomputed?: EnvData,
-): Promise<string> {
-  const env = precomputed ?? (await gatherEnvData(engine));
-  return render({
-    now: env.now,
-    tz: env.timezone,
-    userEmail: env.userEmail,
-    newsLastReadAt: env.newsLastReadAt,
-  });
+// Pure render of the already-gathered EnvData into the markdown block.
+export function buildSessionContext(env: EnvData): string {
+  const lines = [
+    "## Current context",
+    `- Local time: ${formatLocalTime(env.now, env.timezone)} (${env.timezone})`,
+  ];
+  if (env.userEmail) lines.push(`- User email: ${env.userEmail}`);
+  lines.push(
+    `- News last read at: ${env.newsLastReadAt ?? "never (bootstrap with now - 24h)"}`,
+  );
+  return lines.join("\n");
 }

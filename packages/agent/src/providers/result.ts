@@ -9,7 +9,10 @@ export function toResult(
   raw: ChatCompletion,
   usage: TokenUsage | undefined,
 ): CompletionResult {
-  const choice = raw.choices[0]!;
+  const choice = raw.choices[0];
+  if (!choice) {
+    throw new Error(`provider returned no choices (model=${raw.model})`);
+  }
   return {
     message: choice.message,
     finishReason: choice.finish_reason ?? null,

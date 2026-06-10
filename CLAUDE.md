@@ -24,13 +24,11 @@ the other. Deployed as two containers (`docker-compose.yml`).
 3. The supervisor (`packages/agent/src/supervisor/main.ts`) loops on
    `get_next_signal`. When a signal pops, it runs the signal through the
    `workflow/` module (compile → execute); the steps below describe the
-   agentic fallback path, which loads three things:
+   agentic fallback path, which loads two things:
    - `skills/<signal.source>.md` (with `skills.default/` fallback) — the
      primary domain skill.
    - `skills/routing.md` — always loaded; tells the model to delegate to
      another skill if the prompt matches a different domain.
-   - `skills/handoff.md` — always loaded; rules for escalating reasoning
-     effort mid-session.
 4. Plus a session-context block (local time, tz, watermarks) and the signal's
    `envContext` (per-source env addendum, e.g. default Telegram chat id).
 5. The signal's `content` is pushed as the first user message. DeepSeek
@@ -68,12 +66,13 @@ mcp-tools/
         └── src/
             ├── supervisor/{main,fallback}.ts  poll loop + workflow failure handling
             ├── workflow/                      dynamic-workflow module (compile + execute)
-            │   ├── index.ts                   createWorkflow facade (runForSignal)
+            │   ├── index.ts                   createWorkflowRunner facade (runForSignal)
             │   ├── compile.ts                 signal → validated Workflow (LLM)
             │   ├── execute.ts                 runtime that walks the steps
             │   ├── dsl.ts                     Workflow step schema + parse
             │   └── variables.ts               ${path} substitution + variable store
-            ├── engine.ts, session.ts        DeepSeek runner + synthetic tools
+            ├── engine.ts, agent-loop.ts     LLM runner (ReAct loop)
+            ├── synthetic-tools.ts           agent-side tools (set_memory, …)
             ├── mcp-client.ts                StreamableHTTP client
             ├── session-context.ts           markdown context block builder
             ├── skills.ts                    two-layer loader (live → default)
@@ -238,7 +237,9 @@ volume — written by the `dreaming` skill when it self-revises).
 
 - `nashdom-bill`, `news-digest`, `tech-digest`, `dreaming`, `scheduler`,
   `telegram` — primary domain skills, loaded per signal.source.
-- `routing`, `handoff` — always loaded on top.
+- `routing` — always loaded on top (fallback agentic path only).
+- `planner` — the workflow compiler's system prompt.
+- `recovery` — spawned by the fallback path to phrase failures to the user.
 
 ## Running
 

@@ -56,6 +56,28 @@ async function openClient(): Promise<Client> {
 
 export async function connectMcp(): Promise<McpHandle> {
   let client = await openClient();
+  // Single in-flight reconnect, shared by concurrent callers. The AgentLoop
+  // dispatches tool calls in parallel — when the MCP session dies, several
+  // calls fail at once, and without this each would open its own client
+  // (last write wins, the rest leak unclosed).
+  let reconnecting: Promise<Client> | null = null;
+
+  function reconnect(failed: Client): Promise<Client> {
+    // Someone already swapped the client out — just use the fresh one.
+    if (failed !== client) return Promise.resolve(client);
+    reconnecting ??= (async () => {
+      try {
+        await failed.close();
+      } catch {
+        /* dead session, close may itself fail — ignore */
+      }
+      client = await openClient();
+      return client;
+    })().finally(() => {
+      reconnecting = null;
+    });
+    return reconnecting;
+  }
 
   // Tool schemas are stable across MCP restarts (we deploy mcp+agent in
   // lockstep), so we list once at boot and reuse. If we ever change that,
@@ -75,19 +97,15 @@ export async function connectMcp(): Promise<McpHandle> {
     name: string,
     args: Record<string, unknown>,
   ): Promise<string> {
+    const used = client;
     let result;
     try {
-      result = await client.callTool({ name, arguments: args });
+      result = await used.callTool({ name, arguments: args });
     } catch (err) {
       if (!isSessionLostError(err)) throw err;
       console.warn("[mcp-client] session lost, reconnecting…");
-      try {
-        await client.close();
-      } catch {
-        /* dead session, close may itself fail — ignore */
-      }
-      client = await openClient();
-      result = await client.callTool({ name, arguments: args });
+      const fresh = await reconnect(used);
+      result = await fresh.callTool({ name, arguments: args });
     }
 
     const parts = Array.isArray(result.content) ? result.content : [];

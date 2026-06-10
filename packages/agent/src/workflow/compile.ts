@@ -200,6 +200,9 @@ async function runRetryLoop(
         messages,
         reasoningEffort: preset.reasoningEffort,
         responseFormat: { type: "json_object" },
+        // Transient-failure retries (withRetry decorator) show up as
+        // WARNING events on the compile span, next to attempt-N.
+        trace: compileSpan,
       });
       text = result.message.content ?? "";
       gen.end({ output: text, usage: result.usage });

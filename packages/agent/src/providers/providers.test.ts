@@ -1,9 +1,12 @@
 import { describe, expect, it } from "vitest";
-import type OpenAI from "openai";
+import OpenAI from "openai";
 import type { ChatCompletionMessageParam } from "openai/resources/chat/completions";
+import type { EventStartOpts, Span } from "../tracing";
 import { createOpenAiProvider } from "./openai";
 import { createDeepseekProvider } from "./deepseek";
 import { createGeminiProvider } from "./gemini";
+import { withRetry } from "./retry";
+import type { ChatProvider } from "./types";
 
 // Fake OpenAI-shaped client: captures the request body and returns a canned
 // completion. Casting an incomplete stand-in to the full SDK type is the
@@ -184,5 +187,101 @@ describe("gemini provider", () => {
     expect(bodies[0]!.tools).toEqual(tools);
     expect(bodies[0]!.response_format).toEqual({ type: "json_object" });
     expect(r.usage).toEqual({ input: 100, output: 20, total: 120, cached: 64 });
+  });
+});
+
+// ─── withRetry decorator ─────────────────────────────────────────────
+
+// Provider that throws the queued errors first, then succeeds.
+function flakyProvider(errors: unknown[]): { provider: ChatProvider; calls: () => number } {
+  let n = 0;
+  const provider: ChatProvider = {
+    kind: "openai",
+    async complete() {
+      n++;
+      const next = errors.shift();
+      if (next) throw next;
+      return {
+        message: { role: "assistant", content: "ok", refusal: null },
+        finishReason: "stop",
+      };
+    },
+  };
+  return { provider, calls: () => n };
+}
+
+// Minimal TraceContext stub that records emitted events.
+function captureTrace(): { ctx: Span; events: EventStartOpts[] } {
+  const events: EventStartOpts[] = [];
+  const ctx: Span = {
+    update() {},
+    end() {},
+    event(o) {
+      events.push(o);
+    },
+    generation: () => ({ end() {} }),
+    span: () => ctx,
+  };
+  return { ctx, events };
+}
+
+function apiError(status: number) {
+  return new OpenAI.APIError(status, undefined, `status ${status}`, undefined);
+}
+
+describe("withRetry decorator", () => {
+  it("retries 429/5xx and emits a WARNING llm_retry event per attempt on the trace", async () => {
+    const { provider, calls } = flakyProvider([apiError(429), apiError(503)]);
+    const { ctx, events } = captureTrace();
+    const r = await withRetry(provider, { baseDelayMs: 1 }).complete({
+      model: "gpt-5.4-mini",
+      messages: [],
+      reasoningEffort: "disabled",
+      trace: ctx,
+    });
+    expect(r.message.content).toBe("ok");
+    expect(calls()).toBe(3);
+    expect(events.map((e) => e.name)).toEqual(["llm_retry", "llm_retry"]);
+    expect(events.every((e) => e.level === "WARNING")).toBe(true);
+    expect(events[0]!.metadata).toMatchObject({ attempt: 1, status: 429, model: "gpt-5.4-mini" });
+    expect(events[1]!.metadata).toMatchObject({ attempt: 2, status: 503 });
+  });
+
+  it("rethrows non-retryable 4xx immediately, no events", async () => {
+    const { provider, calls } = flakyProvider([apiError(400)]);
+    const { ctx, events } = captureTrace();
+    await expect(
+      withRetry(provider, { baseDelayMs: 1 }).complete({
+        model: "gpt-5.4-mini",
+        messages: [],
+        reasoningEffort: "disabled",
+        trace: ctx,
+      }),
+    ).rejects.toThrow("status 400");
+    expect(calls()).toBe(1);
+    expect(events).toEqual([]);
+  });
+
+  it("gives up after maxRetries and rethrows the last error", async () => {
+    const { provider, calls } = flakyProvider([apiError(429), apiError(429), apiError(429)]);
+    await expect(
+      withRetry(provider, { maxRetries: 2, baseDelayMs: 1 }).complete({
+        model: "gpt-5.4-mini",
+        messages: [],
+        reasoningEffort: "disabled",
+      }),
+    ).rejects.toThrow("status 429");
+    expect(calls()).toBe(3); // initial + 2 retries
+  });
+
+  it("works without a trace (scripts) — retry path doesn't require one", async () => {
+    const { provider, calls } = flakyProvider([apiError(500)]);
+    const r = await withRetry(provider, { baseDelayMs: 1 }).complete({
+      model: "gpt-5.4-mini",
+      messages: [],
+      reasoningEffort: "disabled",
+    });
+    expect(r.message.content).toBe("ok");
+    expect(calls()).toBe(2);
   });
 });

@@ -1,21 +1,35 @@
 import "dotenv/config";
+import OpenAI from "openai";
+import { createAgentDb } from "../db/client";
+import { createMemoryStore } from "../db/memory";
 import { createEngine, type Engine } from "../engine";
+import { connectMcp } from "../mcp-client";
 import { DEFAULT_PRESETS } from "../models";
-import { gatherEnvData } from "../session-context";
-import { listSkills, readSkill } from "../skills";
-import { createWorkflow, type Workflow } from "../workflow";
 import {
-  createFallback,
-  type Fallback,
-  type PendingSignal,
-  type WorkflowFailure,
-} from "./fallback";
+  createDeepseekProvider,
+  createGeminiProvider,
+  createOpenAiProvider,
+  withRetry,
+  DEEPSEEK_BASE_URL,
+  GEMINI_BASE_URL,
+} from "../providers";
+import { gatherEnvData } from "../session-context";
+import { createSkillStore } from "../skills";
+import { nullTracer, type Tracer } from "../tracing";
+import { langfuseTracerFromEnv } from "../tracing/langfuse";
+import { createWorkflowRunner, type WorkflowRunner } from "../workflow";
+import { createFallback, type Fallback, type PendingSignal } from "./fallback";
 
-// Long-running supervisor. The agent has no signal sources of its own —
-// every external event (Telegram, Gmail, cron, webhook) lives inside the
-// MCP server, which queues signals into its own DB. Each signal flows:
+// Long-running supervisor — and the composition root: every long-lived
+// resource (sqlite handle, providers, MCP connection, tracer, skill store)
+// is built HERE and threaded down through factories. No module reaches for
+// a global or reads env outside this file's wiring.
 //
-//   signal → workflow (compile → execute)
+// The agent has no signal sources of its own — every external event
+// (Telegram, Gmail, cron, webhook) lives inside the MCP server, which
+// queues signals into its own DB. Each signal flows:
+//
+//   signal → workflow runner (compile → execute)
 //          ↳ compile failed → fallback: agentic AgentLoop
 //          ↳ execute failed → fallback: recovery report
 //
@@ -33,19 +47,10 @@ function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-// Returns just the skill body (or null) — matches the surface the
-// workflow facade (compiler + executor) depends on. The full SkillFile
-// shape (with frontmatter tools list) stays internal to
-// engine.startAgentLoop.
-async function readSkillBody(name: string): Promise<string | null> {
-  const s = await readSkill(name);
-  return s?.body ?? null;
-}
-
 async function runSignal(
   engine: Engine,
   signal: PendingSignal,
-  workflow: Workflow,
+  runner: WorkflowRunner,
   fallback: Fallback,
 ): Promise<void> {
   const signalLabel = `${signal.source}:${signal.id}`;
@@ -68,56 +73,10 @@ async function runSignal(
   });
 
   try {
-    const result = await workflow.runForSignal(signal, envData, trace, signalLabel);
+    const result = await runner.runForSignal(signal, envData, trace);
 
     if (!result.ok) {
-      let failure: WorkflowFailure;
-      if (result.stage === "compile") {
-        failure = {
-          stage: "compile",
-          reason: result.reason,
-          errors: result.errors,
-          attempts: result.attempts,
-        };
-      } else if (result.stage === "replan_exhausted") {
-        // The planner replanned on every pass without committing. Treat it
-        // like a compile miss — degrade to an agentic session.
-        failure = {
-          stage: "compile",
-          reason: "replan_exhausted",
-          errors: [
-            `planner replanned ${result.passes}× without committing to an acting workflow`,
-          ],
-          attempts: result.attempts,
-        };
-      } else {
-        failure = {
-          stage: "execute",
-          reason: result.reason,
-          stepIndex: result.stepIndex,
-          error: result.error,
-        };
-      }
-      // Timeline marker for the workflow→agentic handoff. A compile miss is
-      // an expected degradation (WARNING); an execute failure means side
-      // effects may already have fired (ERROR).
-      trace.event({
-        name: "fallback",
-        level: failure.stage === "compile" ? "WARNING" : "ERROR",
-        metadata:
-          failure.stage === "compile"
-            ? { stage: "compile", reason: failure.reason, attempts: failure.attempts }
-            : {
-                stage: "execute",
-                reason: failure.reason,
-                step_index: failure.stepIndex,
-                error:
-                  failure.error instanceof Error
-                    ? failure.error.message
-                    : String(failure.error),
-              },
-      });
-      await fallback.handle(signal, envData, failure, trace);
+      await fallback.handle(signal, envData, result, trace);
       return;
     }
 
@@ -126,15 +85,7 @@ async function runSignal(
     );
   } catch (err) {
     console.error(`[supervisor] signal #${signal.id} unexpected error:`, err);
-    trace.event({
-      name: "fallback",
-      level: "ERROR",
-      metadata: {
-        stage: "execute",
-        error: err instanceof Error ? err.message : String(err),
-      },
-    });
-    await fallback.handle(signal, envData, { stage: "execute", error: err }, trace);
+    await fallback.handleCrash(signal, err, trace);
   } finally {
     trace.end();
   }
@@ -152,62 +103,108 @@ async function main(): Promise<void> {
   // `base` runs on OpenAI (non-thinking — primary replies, recovery,
   // scheduler dispatch). `smart` runs on DeepSeek with thinking on —
   // sub-agents that do real editorial / parsing work (news-digest,
-  // tech-digest, nashdom-bill, …). `compiler` runs on Gemini and powers
-  // the workflow compiler. `smartest` is a reserve high-end preset.
+  // tech-digest, nashdom-bill, …). `compiler` powers the workflow
+  // compiler. `smartest` is a reserve high-end preset.
+  const withEnvModel = (name: keyof typeof DEFAULT_PRESETS, envVar: string) => ({
+    ...DEFAULT_PRESETS[name],
+    model: process.env[envVar] ?? DEFAULT_PRESETS[name].model,
+  });
   const presets = {
-    base: {
-      ...DEFAULT_PRESETS.base,
-      model: process.env.AGENT_BASE_MODEL ?? DEFAULT_PRESETS.base.model,
-    },
-    smart: {
-      ...DEFAULT_PRESETS.smart,
-      model: process.env.AGENT_SMART_MODEL ?? DEFAULT_PRESETS.smart.model,
-    },
-    smartest: {
-      ...DEFAULT_PRESETS.smartest,
-      model: process.env.AGENT_SMARTEST_MODEL ?? DEFAULT_PRESETS.smartest.model,
-    },
-    compiler: {
-      ...DEFAULT_PRESETS.compiler,
-      model: process.env.AGENT_COMPILER_MODEL ?? DEFAULT_PRESETS.compiler.model,
-    },
+    base: withEnvModel("base", "AGENT_BASE_MODEL"),
+    smart: withEnvModel("smart", "AGENT_SMART_MODEL"),
+    smartest: withEnvModel("smartest", "AGENT_SMARTEST_MODEL"),
+    compiler: withEnvModel("compiler", "AGENT_COMPILER_MODEL"),
   };
 
-  const engine = await createEngine({
-    deepseekApiKey,
-    openaiApiKey,
-    geminiApiKey,
+  // Every provider is wrapped in withRetry (429/5xx, exponential backoff):
+  // the workflow compiler is on the hot path regardless of which provider
+  // AGENT_COMPILER_MODEL routes to, and agentic sessions only benefit from
+  // riding out a transient blip too. Each retry attempt is surfaced as a
+  // WARNING `llm_retry` event on the caller's trace scope.
+  const providers = {
+    deepseek: withRetry(
+      createDeepseekProvider(
+        new OpenAI({ apiKey: deepseekApiKey, baseURL: DEEPSEEK_BASE_URL }),
+      ),
+    ),
+    openai: withRetry(createOpenAiProvider(new OpenAI({ apiKey: openaiApiKey }))),
+    gemini: withRetry(
+      createGeminiProvider(
+        new OpenAI({ apiKey: geminiApiKey, baseURL: GEMINI_BASE_URL }),
+      ),
+    ),
+  };
+
+  const db = createAgentDb();
+  const memory = createMemoryStore(db);
+  const skillStore = createSkillStore();
+  const mcp = await connectMcp();
+
+  // Validate every skill on disk against the live MCP registry. Crashes
+  // early with a precise error if any skill is missing frontmatter, has
+  // a malformed `tools:` line, or names a tool that doesn't exist —
+  // instead of failing mid-signal handling.
+  const mcpToolNames = mcp.tools.map((t) => t.function.name);
+  await skillStore.validateAll(mcpToolNames);
+  console.log(`[supervisor] skill validation passed (mcp tools: ${mcpToolNames.length})`);
+
+  // Tracer: env auto-config > null. Logged once at startup.
+  let tracer: Tracer;
+  const auto = langfuseTracerFromEnv();
+  if (auto) {
+    tracer = auto;
+    console.log(
+      `[supervisor] tracing enabled (langfuse v5, ${process.env.LANGFUSE_BASE_URL ?? "default host"})`,
+    );
+  } else {
+    tracer = nullTracer;
+    console.log("[supervisor] tracing disabled (LANGFUSE_*_KEY not set)");
+  }
+
+  const engine = createEngine({
+    providers,
+    mcp,
     presets,
     // Meta-skills loaded into every session: routing (cross-skill
     // delegation when intent ≠ source). Only used on the fallback
     // session path now; workflow-mode signals never load these.
     skills: ["routing"],
+    skillStore,
+    memory,
+    tracer,
   });
 
-  console.log(`[supervisor] mcp tools: ${engine.mcp.tools.map((t) => t.function.name).join(", ")}`);
+  console.log(`[supervisor] mcp tools: ${mcp.tools.map((t) => t.function.name).join(", ")}`);
 
-  // Build the workflow facade once at startup: tool & skill names baked
+  // Build the workflow runner once at startup: tool & skill names baked
   // into the compiler's schema enums. New tools / skills require an agent
   // restart to be emittable. The full MCP tool definitions go in so the
   // compiler can render compact `name(arg: type, ...)` signatures in its
   // user prompt — without those it guesses parameter names from
   // training-data conventions and produces invalid args.
-  const skillEntries = await listSkills();
-  // Exclude `planner` itself (it's the compiler's system prompt) and
-  // `routing` (engine-level meta-skill, not directly invokable).
+  const skillEntries = await skillStore.listSkills();
+  // Exclude `planner` itself (it's the compiler's system prompt), `routing`
+  // (engine-level meta-skill, not directly invokable) and `recovery` (the
+  // failure-reporting skill — only the fallback path spawns it; a workflow
+  // step has no business invoking it).
+  const NON_WORKFLOW_SKILLS = new Set(["planner", "routing", "recovery"]);
   const knownSkills = skillEntries
     .map((s) => s.name)
-    .filter((n) => n !== "planner" && n !== "routing");
+    .filter((n) => !NON_WORKFLOW_SKILLS.has(n));
 
   console.log(
-    `[supervisor] workflow: ${engine.mcp.tools.length} tools, ${knownSkills.length} skills`,
+    `[supervisor] workflow: ${mcp.tools.length} tools, ${knownSkills.length} skills`,
   );
 
-  const workflow = createWorkflow({
+  const runner = createWorkflowRunner({
     engine,
-    readSkill: readSkillBody,
-    mcpTools: engine.mcp.tools,
+    // The runner (compiler + executor) needs only the skill BODY — the
+    // full SkillFile shape (frontmatter tools list) stays internal to
+    // engine.startAgentLoop.
+    readSkill: async (name) => (await skillStore.readSkill(name))?.body ?? null,
+    mcpTools: mcp.tools,
     knownSkills,
+    setMemory: (key, value) => memory.set(key, value),
   });
 
   const fallback = createFallback({ engine });
@@ -218,6 +215,7 @@ async function main(): Promise<void> {
     stopping = true;
     console.log(`[supervisor] ${sig} — shutting down`);
     await engine.shutdown();
+    db.close();
     process.exit(0);
   };
   process.on("SIGINT", () => void stop("SIGINT"));
@@ -226,7 +224,7 @@ async function main(): Promise<void> {
   console.log("[supervisor] entering main loop (workflow-mode)");
   while (!stopping) {
     try {
-      const raw = await engine.mcp.callTool("get_next_signal", {});
+      const raw = await mcp.callTool("get_next_signal", {});
       const result = JSON.parse(raw) as NextSignalResult;
 
       if (!result.signal) {
@@ -237,7 +235,7 @@ async function main(): Promise<void> {
       console.log(
         `[supervisor] signal #${result.signal.id} source=${result.signal.source} (${result.pendingAfter} pending after)`,
       );
-      await runSignal(engine, result.signal, workflow, fallback);
+      await runSignal(engine, result.signal, runner, fallback);
     } catch (err) {
       console.error("[supervisor] loop error:", err);
       await sleep(POLL_INTERVAL_MS);

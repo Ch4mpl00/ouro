@@ -1,34 +1,17 @@
 import path from "node:path";
 import Database from "better-sqlite3";
 
-// Singleton sqlite handle for the agent's domain state (bills, memory).
-// Default path is resolved relative to this source file so the lookup works
-// regardless of cwd.
-
-declare global {
-  // eslint-disable-next-line no-var
-  var __agent_db: Database.Database | undefined;
-}
+// Sqlite handle for the agent's domain state (memory KV). Built once in the
+// composition root (supervisor main / a script's main) and passed down —
+// no module-level singleton, per the workspace DI rules. Default path is
+// resolved relative to this source file so the lookup works regardless of
+// cwd.
 
 const DEFAULT_PATH = path.resolve(import.meta.dirname, "../../data/agent.db");
 
-function dbPath(): string {
-  return process.env.AGENT_DB_PATH ?? DEFAULT_PATH;
-}
-
-export function getDb(): Database.Database {
-  if (!global.__agent_db) {
-    const db = new Database(dbPath());
-    db.pragma("journal_mode = WAL");
-    db.pragma("foreign_keys = ON");
-    global.__agent_db = db;
-  }
-  return global.__agent_db;
-}
-
-export function closeDb(): void {
-  if (global.__agent_db) {
-    global.__agent_db.close();
-    global.__agent_db = undefined;
-  }
+export function createAgentDb(dbPath?: string): Database.Database {
+  const db = new Database(dbPath ?? process.env.AGENT_DB_PATH ?? DEFAULT_PATH);
+  db.pragma("journal_mode = WAL");
+  db.pragma("foreign_keys = ON");
+  return db;
 }

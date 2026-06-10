@@ -345,6 +345,24 @@ describe("plan validation — rejections", () => {
     expect(r.success).toBe(false);
   });
 
+  it("rejects terminal nested inside parallel (terminator, not a leaf)", () => {
+    // The runtime ignores a stop signal coming from a parallel branch, so
+    // the schema must not let the compiler emit a silently-dead step.
+    const r = WorkflowSchema.safeParse({
+      version: 1,
+      steps: [
+        {
+          kind: "parallel",
+          steps: [
+            { kind: "tool", tool: "list_news", args: {}, bind: "a" },
+            { kind: "terminal" },
+          ],
+        },
+      ],
+    });
+    expect(r.success).toBe(false);
+  });
+
   it("rejects unknown step kind", () => {
     const r = WorkflowSchema.safeParse({
       version: 1,

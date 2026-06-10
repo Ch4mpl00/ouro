@@ -5,6 +5,7 @@ import type { ReasoningEffort } from "openai/resources/shared";
 import { config as loadEnv } from "dotenv";
 import { z } from "zod";
 import { fetchTraceById, type Observation } from "./langfuse-api";
+import { DEEPSEEK_BASE_URL, GEMINI_BASE_URL, retryOnTransient } from "../providers";
 
 // A/B replay over a captured trace. Both tests reduce to ONE pattern: take a
 // generation's recorded input (which already pins everything but the model —
@@ -31,12 +32,12 @@ loadEnv({ path: ".env.agent" });
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const deepseek = new OpenAI({
   apiKey: process.env.DEEPSEEK_API_KEY,
-  baseURL: "https://api.deepseek.com",
+  baseURL: DEEPSEEK_BASE_URL,
 });
 // Gemini exposes an OpenAI-compatible endpoint — same SDK, different baseURL/key.
 const gemini = new OpenAI({
   apiKey: process.env.GEMINI_API_KEY,
-  baseURL: "https://generativelanguage.googleapis.com/v1beta/openai/",
+  baseURL: GEMINI_BASE_URL,
 });
 function clientFor(model: string): OpenAI {
   if (model.startsWith("deepseek")) return deepseek;
@@ -96,23 +97,14 @@ function outputText(gen: Observation): string {
   return typeof gen.output === "string" ? gen.output : JSON.stringify(gen.output);
 }
 
-// Retry 429 (rate limit) and 5xx with exponential backoff. Both generation and
-// judging hit limits here: free-tier Gemini rate-limits hard (5 parallel
-// thinking calls trip its per-minute quota), and the gpt-5.4 judge blows the
-// OpenAI per-minute token budget when several swap-pairs send ~160k-char
-// candidate sets at once. The backoff (3s..48s) outlives a one-minute window;
-// 4xx other than 429 are permanent and rethrown immediately.
-async function withRetry<T>(fn: () => Promise<T>): Promise<T> {
-  for (let attempt = 0; ; attempt++) {
-    try {
-      return await fn();
-    } catch (err) {
-      const status = err instanceof OpenAI.APIError ? err.status : undefined;
-      const retryable = status === 429 || (status !== undefined && status >= 500);
-      if (!retryable || attempt >= 5) throw err;
-      await new Promise((r) => setTimeout(r, 3000 * 2 ** attempt)); // 3s,6s,12s,24s,48s
-    }
-  }
+// Retry 429 (rate limit) and 5xx with exponential backoff — the shared
+// providers/retry helper, tuned wider here: free-tier Gemini rate-limits
+// hard (5 parallel thinking calls trip its per-minute quota), and the
+// gpt-5.4 judge blows the OpenAI per-minute token budget when several
+// swap-pairs send ~160k-char candidate sets at once. The backoff
+// (3s..48s) outlives a one-minute window.
+function withRetry<T>(fn: () => Promise<T>): Promise<T> {
+  return retryOnTransient(fn, { maxRetries: 5, baseDelayMs: 3000 });
 }
 
 async function replayGeneration(

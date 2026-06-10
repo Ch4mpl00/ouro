@@ -4,10 +4,12 @@ import type { ChatProvider, CompletionParams, CompletionResult } from "./types";
 import { normalizeOpenAiUsage } from "./usage";
 import { toResult } from "./result";
 
-// OpenAI provider. The models we route here (gpt-5.4 for the compiler,
-// gpt-5.4-mini for cheap chat) run WITHOUT an explicit reasoning_effort in
-// the request — so we drop it, preserving the pre-abstraction behavior.
-// tools / response_format pass through unchanged.
+// OpenAI provider. `reasoningEffort` is INTENTIONALLY not forwarded: for the
+// OpenAI models we route here (gpt-5.4 / gpt-5.4-mini — including when the
+// workflow compiler runs on one via AGENT_COMPILER_MODEL) the default,
+// effort-less request measured as the best speed/quality/price point, so a
+// preset's `reasoningEffort` is a no-op on this route (it only drives the
+// DeepSeek/Gemini providers). tools / response_format pass through unchanged.
 export function createOpenAiProvider(client: OpenAI): ChatProvider {
   return {
     kind: "openai",

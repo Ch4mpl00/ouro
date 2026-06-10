@@ -275,9 +275,9 @@ function stepMetadata(step: Step): Record<string, unknown> {
 function classifyError(err: Error): ExecFailureReason {
   if (err instanceof MissingBindingError) return "missing_binding";
   if (err instanceof DuplicateBindingError) return "duplicate_binding";
-  if (err.name === "SkillNotFoundError") return "skill_not_found";
-  if (err.name === "ToolCallError") return "tool_error";
-  if (err.name === "LlmCallError") return "llm_error";
+  if (err instanceof SkillNotFoundError) return "skill_not_found";
+  if (err instanceof ToolCallError) return "tool_error";
+  if (err instanceof LlmCallError) return "llm_error";
   return "step_failed";
 }
 
@@ -397,8 +397,9 @@ function tryParseJson(raw: string): unknown {
 
 // set_memory — the one synthetic agent-side tool reachable as a direct
 // workflow step (watermark writes, e.g. news_digest.last_read_at). Same
-// validation as AgentLoop.applySetMemory; on bad args we throw ToolCallError
-// so the executor classifies it as a tool failure like any other step.
+// SetMemoryArgsSchema validation as the synthetic-tools registry; on bad
+// args we throw ToolCallError so the executor classifies it as a tool
+// failure like any other step.
 // The other synthetic tools stay agentic-only: invoke_sub_agent is
 // superseded by the `llm_agent` step kind, and skill read/write is the
 // agentic `dreaming` flow's job.
@@ -453,9 +454,7 @@ async function execLlmCompose(
   for (const [k, v] of Object.entries(step.input)) {
     resolvedInput[k] = substitute(v, store);
   }
-  const userPrompt = step.prompt
-    ? (substitute(step.prompt, store) as string)
-    : "";
+  const userPrompt = step.prompt ? substituteText(step.prompt, store) : "";
   const inputBlocks = renderInputAsXml(resolvedInput);
   const userText = userPrompt
     ? inputBlocks
@@ -485,6 +484,9 @@ async function execLlmCompose(
       model: preset.model,
       messages,
       reasoningEffort: preset.reasoningEffort,
+      // Retry attempts (withRetry decorator) land as WARNING events on
+      // this step's span, next to the llm_compose generation.
+      trace: span,
     });
     content = result.message.content ?? "";
     gen.end({ output: content, usage: result.usage });
@@ -503,6 +505,17 @@ async function execLlmCompose(
   const parsed = tryParseJson(content);
   store.set(step.bind, parsed);
   return parsed;
+}
+
+// Substitution for fields that must end up as TEXT (llm_compose / llm_agent
+// prompts). `substitute` preserves the bound value's type when the string is
+// one whole placeholder (`"${posts}"` → the actual array) — right for tool
+// args, wrong for a prompt: a non-string would end up as a raw object in
+// `message.content` (API error) or get default-coerced by a template
+// literal. Stringify it explicitly instead.
+function substituteText(value: string, store: VariableStore): string {
+  const resolved = substitute(value, store);
+  return typeof resolved === "string" ? resolved : JSON.stringify(resolved, null, 2);
 }
 
 // XML-style input blocks render reliably for both OpenAI and DeepSeek
@@ -529,7 +542,7 @@ async function execLlmAgent(
   ctx: ExecContext,
   deps: ExecutorDeps,
 ): Promise<string> {
-  const prompt = substitute(step.prompt, store) as string;
+  const prompt = substituteText(step.prompt, store);
   const allowedTools = new Set(step.tools);
   const childId = `${ctx.signalLabel}__agent:${step.bind}`;
 

@@ -12,14 +12,17 @@ import fs from "node:fs/promises";
 // defaults are never touched at runtime, which preserves a clean reset
 // point (delete the live file → fall back to default).
 //
+// Exposed as a `SkillStore` factory so consumers (engine, workflow,
+// scripts) take the store as a dependency instead of importing file-system
+// functions directly — tests stub the interface, and alternate roots are a
+// constructor argument away.
+//
 // Both dirs are anchored at the repo root; the supervisor runs from the
 // agent package but the docker / dev layouts both place the repo root one
 // level up from `packages/`. We resolve relative to this source file so
 // the lookup works regardless of cwd.
 
 const REPO_ROOT = path.resolve(import.meta.dirname, "../../..");
-const LIVE_DIR = path.resolve(REPO_ROOT, "skills");
-const DEFAULTS_DIR = path.resolve(REPO_ROOT, "skills.default");
 const NAME_PATTERN = /^[a-z0-9][a-z0-9_-]*$/i;
 
 function validateName(name: string): void {
@@ -51,6 +54,32 @@ export interface SkillFile {
   body: string;
   tools: string[] | "*";
   source: "live" | "default";
+}
+
+export interface SkillEntry {
+  name: string;
+  source: "live" | "default";
+  sizeBytes: number;
+  modifiedAt: string;
+}
+
+export interface SkillStore {
+  // Parsed skill, live → default. Throws on broken frontmatter.
+  readSkill(name: string): Promise<SkillFile | null>;
+  // Raw skill text (live → default), frontmatter included, WITHOUT parsing
+  // or validating it. The eval/judge path wants the contract as prose and
+  // must not trip over a live overlay that `dreaming` wrote without a
+  // `tools:` block — `readSkill` throws there; this doesn't.
+  readSkillRaw(name: string): Promise<string | null>;
+  // Always writes to the live overlay; defaults stay intact.
+  saveSkill(name: string, content: string): Promise<{ path: string; sizeBytes: number }>;
+  // Union of live + defaults, with `source` showing which layer is active.
+  listSkills(): Promise<SkillEntry[]>;
+  // Walk every skill on disk and parse it; throws a combined error listing
+  // every broken frontmatter / unknown tool. Called once at startup so
+  // misconfiguration crashes the agent up front, not mid-signal.
+  // `knownMcpTools` empty → skip the MCP cross-check.
+  validateAll(knownMcpTools: string[]): Promise<void>;
 }
 
 const FRONTMATTER_RE = /^---\s*\r?\n([\s\S]*?)\r?\n---\s*\r?\n/;
@@ -96,116 +125,107 @@ function parseSkillFile(name: string, raw: string, source: "live" | "default"): 
   return { body, tools, source };
 }
 
-export async function readSkill(name: string): Promise<SkillFile | null> {
-  validateName(name);
-  const live = await readIfExists(path.join(LIVE_DIR, `${name}.md`));
-  if (live !== null) return parseSkillFile(name, live, "live");
-  const def = await readIfExists(path.join(DEFAULTS_DIR, `${name}.md`));
-  if (def !== null) return parseSkillFile(name, def, "default");
-  return null;
+export interface SkillStoreOpts {
+  liveDir?: string;
+  defaultsDir?: string;
 }
 
-// Raw skill text (live → default), frontmatter included, WITHOUT parsing or
-// validating it. The eval/judge path wants the contract as prose and must not
-// trip over a live overlay that `dreaming` wrote without a `tools:` block —
-// `readSkill` throws there; this doesn't.
-export async function readSkillRaw(name: string): Promise<string | null> {
-  validateName(name);
-  const live = await readIfExists(path.join(LIVE_DIR, `${name}.md`));
-  if (live !== null) return live;
-  return readIfExists(path.join(DEFAULTS_DIR, `${name}.md`));
-}
+export function createSkillStore(opts: SkillStoreOpts = {}): SkillStore {
+  const liveDir = opts.liveDir ?? path.resolve(REPO_ROOT, "skills");
+  const defaultsDir = opts.defaultsDir ?? path.resolve(REPO_ROOT, "skills.default");
 
-// Walk every skill file on disk (defaults ∪ live) and parse it. Throws on
-// the first broken frontmatter / unknown tool. Called once at engine
-// startup so misconfiguration crashes the agent up front, not mid-signal.
-//
-// `knownMcpTools` is the list of MCP tool names the engine sees right
-// now. Any declared tool that's not in this set is rejected (catches
-// typos like `set_memrory`). Pass an empty array to skip MCP cross-check.
-export async function validateAllSkills(knownMcpTools: string[]): Promise<void> {
-  const known = new Set(knownMcpTools);
-  const entries = await listSkills();
-  const errors: string[] = [];
-  for (const e of entries) {
-    let parsed: SkillFile | null;
+  async function readDir(dir: string, source: "live" | "default"): Promise<SkillEntry[]> {
+    let files: string[];
     try {
-      parsed = await readSkill(e.name);
-    } catch (err) {
-      errors.push((err as Error).message);
-      continue;
+      files = await fs.readdir(dir);
+    } catch {
+      return [];
     }
-    if (!parsed) continue;
-    if (known.size === 0) continue;
-    if (parsed.tools === "*") continue; // wildcard — nothing to cross-check
-    for (const tool of parsed.tools) {
-      if (!known.has(tool)) {
-        errors.push(
-          `skill "${e.name}" (${parsed.source}): declares tool "${tool}" which is not in the MCP registry. ` +
-            `Known tools: ${[...known].sort().join(", ")}`,
+    const out = await Promise.all(
+      files
+        .filter((f) => f.endsWith(".md"))
+        .map(async (f) => {
+          const stat = await fs.stat(path.join(dir, f));
+          if (!stat.isFile()) return null;
+          return {
+            name: f.replace(/\.md$/, ""),
+            source,
+            sizeBytes: stat.size,
+            modifiedAt: stat.mtime.toISOString(),
+          } satisfies SkillEntry;
+        }),
+    );
+    return out.filter((x): x is SkillEntry => x !== null);
+  }
+
+  const store: SkillStore = {
+    async readSkill(name) {
+      validateName(name);
+      const live = await readIfExists(path.join(liveDir, `${name}.md`));
+      if (live !== null) return parseSkillFile(name, live, "live");
+      const def = await readIfExists(path.join(defaultsDir, `${name}.md`));
+      if (def !== null) return parseSkillFile(name, def, "default");
+      return null;
+    },
+
+    async readSkillRaw(name) {
+      validateName(name);
+      const live = await readIfExists(path.join(liveDir, `${name}.md`));
+      if (live !== null) return live;
+      return readIfExists(path.join(defaultsDir, `${name}.md`));
+    },
+
+    async saveSkill(name, content) {
+      validateName(name);
+      await fs.mkdir(liveDir, { recursive: true });
+      const target = path.join(liveDir, `${name}.md`);
+      await fs.writeFile(target, content, "utf-8");
+      return { path: target, sizeBytes: Buffer.byteLength(content, "utf-8") };
+    },
+
+    async listSkills() {
+      const [liveEntries, defaultEntries] = await Promise.all([
+        readDir(liveDir, "live"),
+        readDir(defaultsDir, "default"),
+      ]);
+      const byName = new Map<string, SkillEntry>();
+      for (const e of defaultEntries) byName.set(e.name, e);
+      for (const e of liveEntries) byName.set(e.name, e); // overwrites default
+      return [...byName.values()].sort((a, b) => a.name.localeCompare(b.name));
+    },
+
+    async validateAll(knownMcpTools) {
+      const known = new Set(knownMcpTools);
+      const entries = await store.listSkills();
+      const errors: string[] = [];
+      for (const e of entries) {
+        let parsed: SkillFile | null;
+        try {
+          parsed = await store.readSkill(e.name);
+        } catch (err) {
+          errors.push((err as Error).message);
+          continue;
+        }
+        if (!parsed) continue;
+        if (known.size === 0) continue;
+        if (parsed.tools === "*") continue; // wildcard — nothing to cross-check
+        for (const tool of parsed.tools) {
+          if (!known.has(tool)) {
+            errors.push(
+              `skill "${e.name}" (${parsed.source}): declares tool "${tool}" which is not in the MCP registry. ` +
+                `Known tools: ${[...known].sort().join(", ")}`,
+            );
+          }
+        }
+      }
+      if (errors.length > 0) {
+        throw new Error(
+          `Skill validation failed (${errors.length} issue(s)):\n` +
+            errors.map((e) => `  - ${e}`).join("\n"),
         );
       }
-    }
-  }
-  if (errors.length > 0) {
-    throw new Error(
-      `Skill validation failed (${errors.length} issue(s)):\n` +
-        errors.map((e) => `  - ${e}`).join("\n"),
-    );
-  }
-}
+    },
+  };
 
-export async function saveSkill(
-  name: string,
-  content: string,
-): Promise<{ path: string; sizeBytes: number }> {
-  validateName(name);
-  await fs.mkdir(LIVE_DIR, { recursive: true });
-  const target = path.join(LIVE_DIR, `${name}.md`);
-  await fs.writeFile(target, content, "utf-8");
-  return { path: target, sizeBytes: Buffer.byteLength(content, "utf-8") };
-}
-
-export interface SkillEntry {
-  name: string;
-  source: "live" | "default";
-  sizeBytes: number;
-  modifiedAt: string;
-}
-
-// Union of live + defaults, with `source` showing which layer is active
-// for each name. If both exist, the live one wins (matches readSkill).
-export async function listSkills(): Promise<SkillEntry[]> {
-  const [liveEntries, defaultEntries] = await Promise.all([
-    readDir(LIVE_DIR, "live"),
-    readDir(DEFAULTS_DIR, "default"),
-  ]);
-  const byName = new Map<string, SkillEntry>();
-  for (const e of defaultEntries) byName.set(e.name, e);
-  for (const e of liveEntries) byName.set(e.name, e); // overwrites default
-  return [...byName.values()].sort((a, b) => a.name.localeCompare(b.name));
-}
-
-async function readDir(dir: string, source: "live" | "default"): Promise<SkillEntry[]> {
-  let files: string[];
-  try {
-    files = await fs.readdir(dir);
-  } catch {
-    return [];
-  }
-  const out = await Promise.all(
-    files
-      .filter((f) => f.endsWith(".md"))
-      .map(async (f) => {
-        const stat = await fs.stat(path.join(dir, f));
-        if (!stat.isFile()) return null;
-        return {
-          name: f.replace(/\.md$/, ""),
-          source,
-          sizeBytes: stat.size,
-          modifiedAt: stat.mtime.toISOString(),
-        } satisfies SkillEntry;
-      }),
-  );
-  return out.filter((x): x is SkillEntry => x !== null);
+  return store;
 }

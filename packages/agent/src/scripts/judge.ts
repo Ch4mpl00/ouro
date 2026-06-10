@@ -3,7 +3,10 @@ import OpenAI from "openai";
 import { z } from "zod";
 import { config as loadEnv } from "dotenv";
 import { fetchRecentTraces, fetchTraceById, type Observation, type Trace } from "./langfuse-api";
-import { readSkillRaw } from "../skills";
+import { createSkillStore } from "../skills";
+
+// Script-scope composition: one skill store for both contract reads.
+const skillStore = createSkillStore();
 
 // LANGFUSE_* live in .env; OPENAI_API_KEY (the judge model's key) lives in
 // .env.agent. Layer .env.agent on top — dotenv doesn't override what .env
@@ -338,16 +341,16 @@ function printFaithfulness(f: Faithfulness): void {
 async function judgeOne(openai: OpenAI, traceId: string): Promise<void> {
   const { trace, observations } = await fetchTraceById(traceId);
   const skillName = findSkill(trace, observations);
-  const composerContract = skillName ? await readSkillRaw(skillName) : null;
+  const composerContract = skillName ? await skillStore.readSkillRaw(skillName) : null;
   // The planner/orchestrator owns tool choice + query phrasing; load its
   // contract separately so query_formulation is judged against it, not against
   // the composer skill (which never calls tools).
-  const orchestratorContract = await readSkillRaw("planner");
+  const orchestratorContract = await skillStore.readSkillRaw("planner");
   const transcript = buildTranscript(trace, observations);
 
   console.error(
     `[judge] trace ${traceId} · skill=${skillName ?? "—"} · ${observations.length} obs · ` +
-      `transcript ${transcript.length} chars`,
+    `transcript ${transcript.length} chars`,
   );
 
   // Holistic axes and the faithfulness sub-judge are independent calls — run

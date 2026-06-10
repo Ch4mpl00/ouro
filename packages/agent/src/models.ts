@@ -15,6 +15,11 @@
 // reasoning budget is dynamic and heavy (~12s/plan); "low" cuts that to ~2.8s
 // with no quality loss (dedup step still 5/5). DeepSeek/OpenAI don't use it
 // (smart=max, base=disabled) — it's a Gemini-latency knob.
+//
+// NOTE: the value only drives the DeepSeek and Gemini providers. The OpenAI
+// provider intentionally never sends reasoning_effort (the effort-less
+// default is the best speed/quality/price point there) — so for a preset
+// whose model routes to OpenAI this field is documentation, not behaviour.
 export type ReasoningEffort = "disabled" | "low" | "high" | "max";
 
 export interface ModelPreset {
@@ -41,8 +46,9 @@ export type PresetName = "base" | "smart" | "smartest" | "compiler";
 //              emits ONE structured plan per signal, so structured-output
 //              reliability + cost win here. Not in PRESET_NAMES: it's the
 //              compiler's own model, not a preset a workflow step or sub-agent
-//              picks. (Preview availability wobbles — the Gemini provider
-//              retries 429/5xx so a transient blip doesn't fail compilation.)
+//              picks. (Availability wobbles are absorbed by the engine-level
+//              withRetry wrapper — every provider retries 429/5xx, so a
+//              transient blip doesn't fail compilation on any route.)
 export const DEFAULT_PRESETS: Record<PresetName, ModelPreset> = {
   base: { model: "gpt-5.4-mini", reasoningEffort: "disabled" },
   smart: { model: "deepseek-v4-pro", reasoningEffort: "max" },

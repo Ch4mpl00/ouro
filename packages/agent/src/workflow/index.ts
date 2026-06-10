@@ -1,5 +1,4 @@
 import type { ChatCompletionTool } from "openai/resources/chat/completions";
-import { setMemory } from "../db/memory";
 import type { EnvData } from "../session-context";
 import { SET_MEMORY_TOOL } from "../synthetic-tools";
 import type { TraceContext } from "../tracing";
@@ -17,11 +16,12 @@ import {
 } from "./execute";
 import { createStore, type VariableStore } from "./variables";
 
-// Dynamic-workflow facade. The two halves of the mechanism — the
+// Dynamic-workflow runner. The two halves of the mechanism — the
 // compiler (LLM turns a signal into a validated Workflow) and the
 // executor (runtime walks the steps) — are composed here so the
 // supervisor depends on ONE surface, not on `compile` / `execute`
-// directly.
+// directly. ("Workflow" the data type — the compiled plan — lives in
+// ./dsl; this module is the RUNNER that produces and executes plans.)
 //
 //   runForSignal:  signal → compile → execute → result
 //
@@ -60,16 +60,18 @@ export type WorkflowRunResult =
   // converge on a plan.
   | { ok: false; stage: "replan_exhausted"; passes: number; attempts: number };
 
-export interface Workflow {
+// The failure half of the union — what the fallback module consumes.
+export type WorkflowRunFailure = Exclude<WorkflowRunResult, { ok: true }>;
+
+export interface WorkflowRunner {
   runForSignal(
     signal: WorkflowSignal,
     envData: EnvData,
     parentTrace: TraceContext,
-    signalLabel: string,
   ): Promise<WorkflowRunResult>;
 }
 
-export interface WorkflowDeps {
+export interface WorkflowRunnerDeps {
   engine: CompilerEngineSurface & EngineSurface;
   // Full MCP tool definitions — feed the compiler's schema enums and
   // rendered tool signatures (see compile.ts).
@@ -79,6 +81,10 @@ export interface WorkflowDeps {
   // frontmatter), or null when not found.
   knownSkills: readonly string[];
   readSkill: (name: string) => Promise<string | null>;
+  // Agent-side memory KV writer — dispatched by the executor for
+  // `set_memory` tool steps (watermark writes). Injected by the
+  // composition root, same instance the AgentLoop path uses.
+  setMemory: (key: string, value: string) => void;
   // Compiler retry budget (initial attempt + retries). Default 3.
   maxAttempts?: number;
   // Total planning passes per signal: the initial plan plus replans.
@@ -86,7 +92,7 @@ export interface WorkflowDeps {
   maxPasses?: number;
 }
 
-export function createWorkflow(deps: WorkflowDeps): Workflow {
+export function createWorkflowRunner(deps: WorkflowRunnerDeps): WorkflowRunner {
   const compiler = createCompiler({
     engine: deps.engine,
     readSkill: deps.readSkill,
@@ -100,13 +106,14 @@ export function createWorkflow(deps: WorkflowDeps): Workflow {
   const executor = createExecutor({
     engine: deps.engine,
     readSkill: deps.readSkill,
-    setMemory,
+    setMemory: deps.setMemory,
   });
 
   const maxPasses = deps.maxPasses ?? 3;
 
   return {
-    async runForSignal(signal, envData, parentTrace, signalLabel) {
+    async runForSignal(signal, envData, parentTrace) {
+      const signalLabel = `${signal.source}:${signal.id}`;
       // The plan→act→replan loop. Pass 0 is the initial plan; each `replan`
       // step carries context into the next pass. Bounded by `maxPasses` so
       // a planner that never commits can't loop forever.

@@ -5,7 +5,7 @@ import type {
   ChatCompletionCreateParamsNonStreaming,
 } from "openai/resources/chat/completions";
 import type { ReasoningEffort } from "../models";
-import type { TokenUsage } from "../tracing";
+import type { TokenUsage, TraceContext } from "../tracing";
 
 // Provider abstraction. Both DeepSeek and OpenAI speak the OpenAI Chat
 // Completions wire format, but they diverge on two things we kept
@@ -36,6 +36,11 @@ export interface CompletionParams {
   // Omitted / empty → no tools sent (the SDK rejects an empty array).
   tools?: ChatCompletionTool[];
   responseFormat?: ChatCompletionCreateParamsNonStreaming["response_format"];
+  // Trace scope of the call site, for cross-cutting wrappers — the engine's
+  // `withRetry` decorator emits a WARNING `llm_retry` event here per retry
+  // attempt, so retries are visible in the trace instead of reading as one
+  // slow call. Concrete providers never touch it.
+  trace?: TraceContext;
 }
 
 export interface CompletionResult {

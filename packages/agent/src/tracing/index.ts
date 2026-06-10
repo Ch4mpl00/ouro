@@ -1,7 +1,8 @@
-// Provider-agnostic tracing interfaces. The Session and Engine speak ONLY
+// Provider-agnostic tracing interfaces. The AgentLoop and Engine speak ONLY
 // these types — concrete backends (Langfuse, etc.) live behind an adapter
 // that returns objects matching these shapes. Replacing the backend means
-// adding a new adapter and swapping it in `createEngine`; no Session edits.
+// adding a new adapter and swapping it in the composition root (supervisor
+// main); no AgentLoop edits.
 //
 // Hierarchy: a `TraceContext` is anything that can host nested children
 // (generations and spans). The root of a session is a Trace; spans can

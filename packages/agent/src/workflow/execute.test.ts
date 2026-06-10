@@ -465,6 +465,37 @@ describe("executor.execute — llm_compose step", () => {
     expect(body.messages[1]!.content).toContain('"id": 1');
   });
 
+  it("stringifies a whole-placeholder prompt bound to a non-string value", async () => {
+    // `substitute` preserves type for whole-string placeholders — right for
+    // tool args, but a prompt must stay TEXT: a raw array in message.content
+    // would be an API error.
+    const engine = makeMockEngine({ llmResponses: ["ok"] });
+    const executor = createExecutor({ engine, readSkill: nullReadSkill(), setMemory: () => {} });
+    const ctx = baseCtx();
+    ctx.store.set("posts", [{ id: 1 }]);
+    const r = await executor.execute(
+      {
+        version: 1,
+        steps: [
+          {
+            kind: "llm_compose",
+            preset: "base",
+            prompt: "${posts}",
+            input: {},
+            bind: "out",
+          },
+          { kind: "terminal" },
+        ],
+      },
+      ctx,
+    );
+    expect(r.ok).toBe(true);
+    const body = engine.llmCalls[0] as { messages: ChatCompletionMessageParam[] };
+    const content = body.messages[0]!.content;
+    expect(typeof content).toBe("string");
+    expect(content).toContain('"id": 1');
+  });
+
   it("parses JSON output and binds the object, so later steps can dot into it", async () => {
     const engine = makeMockEngine({
       llmResponses: [JSON.stringify({ cancelId: 10, cron_expr: "0 9 L * *" })],

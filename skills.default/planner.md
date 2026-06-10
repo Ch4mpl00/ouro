@@ -36,7 +36,8 @@ Every workflow is `{ "version": 1, "steps": [...] }`. Step kinds:
 { "kind": "terminal" }
 ```
 
-- `parallel` holds only leaf steps — it cannot nest another `parallel`.
+- `parallel` holds only work steps (`tool` / `llm_compose` / `llm_agent`) —
+  it cannot nest another `parallel`, `terminal`, or `replan`.
 - `llm_compose` needs `skill` OR `prompt` (or both).
 - `bind` names are unique across the whole workflow.
 - `tool` / `skill` / `tools[]` must be names from the lists you receive.
