@@ -2,7 +2,7 @@
 // with its reasoning_effort. Sessions pick a preset by name instead of
 // configuring model + effort separately — the two are coupled in
 // practice (we run the cheap chat model with thinking off, the expensive
-// thinking model with effort=max) and naming the pair makes call sites
+// thinking model with a tuned effort) and naming the pair makes call sites
 // read as intent ("base reply", "smart digest") rather than
 // implementation knobs.
 //
@@ -13,14 +13,15 @@
 
 // "low" exists for the Gemini compiler: on Gemini-3 the default (omitted)
 // reasoning budget is dynamic and heavy (~12s/plan); "low" cuts that to ~2.8s
-// with no quality loss (dedup step still 5/5). DeepSeek/OpenAI don't use it
-// (smart=max, base=disabled) — it's a Gemini-latency knob.
+// with no quality loss (dedup step still 5/5). "medium" is the DeepSeek
+// latency knob: at "max" the smart digest-reduce pass thought for ~3min,
+// which is unacceptable for an interactive Telegram ask.
 //
 // NOTE: the value only drives the DeepSeek and Gemini providers. The OpenAI
 // provider intentionally never sends reasoning_effort (the effort-less
 // default is the best speed/quality/price point there) — so for a preset
 // whose model routes to OpenAI this field is documentation, not behaviour.
-export type ReasoningEffort = "disabled" | "low" | "high" | "max";
+export type ReasoningEffort = "disabled" | "low" | "medium" | "high" | "max";
 
 export interface ModelPreset {
   model: string;
@@ -51,7 +52,7 @@ export type PresetName = "base" | "smart" | "smartest" | "compiler";
 //              transient blip doesn't fail compilation on any route.)
 export const DEFAULT_PRESETS: Record<PresetName, ModelPreset> = {
   base: { model: "gpt-5.4-mini", reasoningEffort: "disabled" },
-  smart: { model: "deepseek-v4-pro", reasoningEffort: "max" },
+  smart: { model: "deepseek-v4-pro", reasoningEffort: "medium" },
   smartest: { model: "gpt-5.4", reasoningEffort: "max" },
   compiler: { model: "gemini-3-flash-preview", reasoningEffort: "low" },
 };
