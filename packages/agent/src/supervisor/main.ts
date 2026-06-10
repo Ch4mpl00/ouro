@@ -13,7 +13,7 @@ import {
   DEEPSEEK_BASE_URL,
   GEMINI_BASE_URL,
 } from "../providers";
-import { gatherEnvData } from "../session-context";
+import { gatherEnvData, type EnvDataDeps } from "../session-context";
 import { createSkillStore } from "../skills";
 import { nullTracer, type Tracer } from "../tracing";
 import { langfuseTracerFromEnv } from "../tracing/langfuse";
@@ -49,12 +49,13 @@ function sleep(ms: number): Promise<void> {
 
 async function runSignal(
   engine: Engine,
+  envDeps: EnvDataDeps,
   signal: PendingSignal,
   runner: WorkflowRunner,
   fallback: Fallback,
 ): Promise<void> {
   const signalLabel = `${signal.source}:${signal.id}`;
-  const envData = await gatherEnvData(engine);
+  const envData = await gatherEnvData(envDeps);
 
   // One trace per signal — owns the workflow (compile + execute) and (if
   // we fall back) the session. Same sessionId so the Langfuse Sessions
@@ -209,6 +210,14 @@ async function main(): Promise<void> {
 
   const fallback = createFallback({ engine });
 
+  // Per-signal env gathering deps. USER_EMAIL is read here, once — the
+  // business path (runSignal → gatherEnvData) never touches process.env.
+  const envDeps: EnvDataDeps = {
+    mcp,
+    memory,
+    userEmail: process.env.USER_EMAIL ?? null,
+  };
+
   let stopping = false;
   const stop = async (sig: string): Promise<void> => {
     if (stopping) return;
@@ -235,7 +244,7 @@ async function main(): Promise<void> {
       console.log(
         `[supervisor] signal #${result.signal.id} source=${result.signal.source} (${result.pendingAfter} pending after)`,
       );
-      await runSignal(engine, result.signal, runner, fallback);
+      await runSignal(engine, envDeps, result.signal, runner, fallback);
     } catch (err) {
       console.error("[supervisor] loop error:", err);
       await sleep(POLL_INTERVAL_MS);

@@ -9,11 +9,14 @@ import { MEMORY_KEYS, type MemoryStore } from "./db/memory";
 // most sessions, and stable enough that a ~minute of staleness is fine.
 // Bigger / per-source state still goes through tool calls.
 
-// Narrow dependency surface: gathering env data needs one MCP call and one
-// memory read — not the whole Engine.
+// Narrow dependency surface: gathering env data needs one MCP call, one
+// memory read and the user's email — not the whole Engine. `userEmail` is
+// read from env ONCE in the composition root and injected here, so this
+// per-signal business path touches no process.env.
 export interface EnvDataDeps {
   mcp: { callTool(name: string, args: Record<string, unknown>): Promise<string> };
   memory: Pick<MemoryStore, "get">;
+  userEmail: string | null;
 }
 
 // Structured env data — single source of truth for both the supervisor
@@ -60,7 +63,7 @@ export async function gatherEnvData(deps: EnvDataDeps): Promise<EnvData> {
   return {
     now: new Date(),
     timezone: tz,
-    userEmail: process.env.USER_EMAIL ?? null,
+    userEmail: deps.userEmail,
     newsLastReadAt: deps.memory.get(MEMORY_KEYS.newsLastReadAt),
   };
 }
