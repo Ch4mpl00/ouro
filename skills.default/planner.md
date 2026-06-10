@@ -91,7 +91,9 @@ recall `[start_typing] → [find_notes] → [compose: reply from the hits] →
   has a `skill`, the skill IS the instructions — pass data via `input` and
   omit `prompt` (or keep it to one line); a long prompt duplicating the
   skill bloats the workflow JSON and makes serialization fumble (misplaced
-  `bind`, broken quotes → a wasted retry). When it writes a user-facing
+  `bind`, broken quotes → a wasted retry). Exception: a shape anchor may
+  pin a longer step prompt (the digest map/reduce roles) — copy that
+  wording; it assigns a step ROLE, it doesn't duplicate the skill. When it writes a user-facing
   reply from a bare `prompt`, that prompt must say "output ONLY the reply
   text — plain text, no JSON, no tool calls"; quote the user's actual
   message in the prompt, and don't also dump raw `${signal.content}` into
@@ -199,6 +201,11 @@ pipeline is wired lives in the SHAPES below; this is just the routing:
   ${x}"` JSON-stringifies non-strings. The store starts with `env.*`,
   `signal.source`, `signal.content`, `signal.id`, plus every prior step's
   `bind`.
+- **`chunks=N` on `list_news` / `search_news`** returns `{count, chunks:
+  [N arrays]}` instead of a flat list — N contiguous parts, fixed at plan
+  time, so steps can reference `${bind.chunks.0}` … `${bind.chunks.N-1}`
+  statically (trailing parts may be empty). This is the fan-out for
+  map-reduce shapes; the DSL has no dynamic loops.
 - **`llm_compose` output is JSON-parsed when it emits JSON.** A compose that
   returns a JSON object/array binds the PARSED value, so a later step can dot
   into it (`${target.cancelId}`). Use this for a structured handoff between
@@ -220,11 +227,14 @@ skill. Inline caps (NO source, stamp) are the easy-to-forget bits.
   per-source `list_news`/`search_news` fetches. `[chat history]` =
   `get_telegram_chat_history(chatId=<lit>)`, required — the composer
   dedups against the previous digests in it.)
-- **News digest** (scheduler/news-digest):
-  `[list_news(source="channel")] ‖ [chat history] → [compose:news-digest] → [send] ‖ [stamp news_digest.last_read_at]`
-  (`list_news(source="channel")` — exactly this arg. `[chat history]` =
-  `get_telegram_chat_history(chatId=<lit>)`, required — dedup against
-  previous digests.)
+- **News digest** (scheduler/news-digest) — map-reduce, exactly this shape
+  (full anchor below):
+  `[list_news(source="channel", chunks=3)] ‖ [chat history] → parallel[3× compose:news-digest map-pass, one per ${posts.chunks.N}] → [compose:news-digest reduce ← selections + history] → [send] ‖ [stamp news_digest.last_read_at]`
+  (ONE skill — `news-digest` — runs all four composes; YOUR per-step
+  `prompt` switches map vs reduce — copy the anchor wording. Maps on
+  `base`, reduce on `smart`. `[chat history]` =
+  `get_telegram_chat_history(chatId=<lit>)`, required — maps and reduce
+  dedup against previous digests in it.)
 - **Topical question** (telegram, about the world):
   `[start_typing] → [status "🔎 собираю новости"] → [search_news: reformulated topic, NO source] → [status "🧠 готовлю выборку"] → [compose:news-query] → [send: answer] → [status ""]`
   (`status` = `telegram_send_status(id="status:${signal.id}", …)`; same id
@@ -253,6 +263,40 @@ read_pdf(path="${file}")                                 → bind "pdf"
 llm_compose(skill="nashdom-bill", preset="smart",
             input={pdf_text:"${pdf}"})                    → bind "reply"
 send_telegram_message(chatId=<lit>, text="${reply}")
+terminal
+```
+
+### Format anchor — news digest, map-reduce
+
+Use these step prompts as written — they carry the map/reduce roles the
+skill itself doesn't know about:
+```
+parallel:
+  list_news(source="channel", sinceISO=<watermark>, chunks=3) → bind "posts"
+  get_telegram_chat_history(chatId=<lit>, limit=30)           → bind "history"
+parallel — three identical map steps, one per chunk:
+  llm_compose(skill="news-digest", preset="base",
+    prompt="Map pass over one chunk of a split fetch — do NOT compose a
+      digest. Keep candidate events per the skill's categories; when
+      unsure KEEP (the reduce step filters strictly); drop obvious noise
+      (ads, alerts/drone play-by-play without damage, weather, filler,
+      memes, sport). Skip events already covered in input.history. Merge
+      same-event posts into one entry. Output ONLY a JSON array:
+      [{summary: 1–2 фразы на русском с конкретикой (числа, имена,
+      места), category, source_ids, postedAt}]; empty chunk → []",
+    input={posts:"${posts.chunks.0}", history:"${history}"})  → bind "sel0"
+  …same step with ${posts.chunks.1} → "sel1", ${posts.chunks.2} → "sel2"
+llm_compose(skill="news-digest", preset="smart",
+  prompt="Reduce pass: input.selections hold pre-selected candidates from
+    parallel map passes (raw posts are not available — the summaries carry
+    the facts). Apply the skill's normal bar, categories, consolidation
+    and format; merge duplicates across chunks; dedup against
+    input.history; compose the digest message.",
+  input={selections:["${sel0}","${sel1}","${sel2}"],
+         history:"${history}", now:"${env.now}"})             → bind "digest"
+parallel:
+  send_telegram_message(chatId=<lit>, text="${digest}")
+  set_memory(key="news_digest.last_read_at", value="${env.now}")
 terminal
 ```
 
@@ -289,6 +333,8 @@ A genuinely single, narrow topic → a plain `query` string is fine.
 - Delivery is your explicit `send` step (an agent sends only when it owns
   the whole conversational turn).
 - Digest workflows stamp their watermark; ad-hoc queries don't.
+- News digest is map-reduce: `chunks=3`, the `news-digest` skill in ALL
+  four composes, step prompts copied from its anchor.
 - `search_news`: no `source`, ≤8 queries, `k` ≤ 50, one step per ask.
 - `llm_compose` with a `skill`: data via `input`, no duplicated prompt.
 - Don't pre-fetch fat data into args — fetch via a `tool` step, bind,

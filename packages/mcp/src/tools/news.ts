@@ -6,6 +6,32 @@ import { jsonResult } from "../result";
 
 const KNOWN_SOURCES = ["hackernews", "habr", "channel"] as const;
 
+// Contiguous even split into EXACTLY n parts (last parts may be shorter or
+// empty — the caller promised the planner a fixed chunk count, so we always
+// deliver n arrays). Contiguous, not round-robin: list_news is time-ordered
+// and search results are relevance-ordered, so neighbouring items are the
+// ones most likely to describe the same event — keeping them in one chunk
+// lets a map-phase composer consolidate locally.
+export function splitChunks<T>(items: readonly T[], n: number): T[][] {
+  const out: T[][] = [];
+  const base = Math.floor(items.length / n);
+  const extra = items.length % n;
+  let offset = 0;
+  for (let i = 0; i < n; i++) {
+    const size = base + (i < extra ? 1 : 0);
+    out.push(items.slice(offset, offset + size));
+    offset += size;
+  }
+  return out;
+}
+
+const CHUNKS_DESCRIPTION =
+  "Map-reduce mode: split the result into EXACTLY this many contiguous " +
+  "chunks and return { count, chunks: [...] } instead of a flat list — one " +
+  "chunk per parallel map step. The chunk count is fixed so a workflow can " +
+  "reference ${bind.chunks.0}, ${bind.chunks.1}, … statically; trailing " +
+  "chunks may be empty when there are few items.";
+
 export function registerNewsTools(server: McpServer, news: NewsRepository): void {
   server.registerTool(
     "search_news",
@@ -77,9 +103,10 @@ export function registerNewsTools(server: McpServer, news: NewsRepository): void
             "For source='channel' only: restrict to one Telegram channel " +
               "by chat_username or chat_id.",
           ),
+        chunks: z.number().int().min(2).max(8).optional().describe(CHUNKS_DESCRIPTION),
       },
     },
-    async ({ query, queries, k, source, sinceISO, untilISO, asOfISO, channel }) => {
+    async ({ query, queries, k, source, sinceISO, untilISO, asOfISO, channel, chunks }) => {
       if ((query === undefined) === (queries === undefined)) {
         return jsonResult({
           error: "Pass exactly one of `query` or `queries`.",
@@ -89,6 +116,9 @@ export function registerNewsTools(server: McpServer, news: NewsRepository): void
       const results = query
         ? await news.search({ query, k, filter })
         : await news.searchMany({ queries: queries ?? [], k, filter });
+      if (chunks !== undefined) {
+        return jsonResult({ count: results.length, chunks: splitChunks(results, chunks) });
+      }
       return jsonResult({ count: results.length, results });
     },
   );
@@ -141,13 +171,18 @@ export function registerNewsTools(server: McpServer, news: NewsRepository): void
           .max(2000)
           .optional()
           .describe("Max rows. Default 500."),
+        chunks: z.number().int().min(2).max(8).optional().describe(CHUNKS_DESCRIPTION),
       },
     },
-    async ({ source, sinceISO, untilISO, asOfISO, channel, limit }) => {
+    async ({ source, sinceISO, untilISO, asOfISO, channel, limit, chunks }) => {
       const items = await news.list({ source, sinceISO, untilISO, asOfISO, channel, limit });
+      const serialized = items.map(serializeItem);
+      if (chunks !== undefined) {
+        return jsonResult({ count: items.length, chunks: splitChunks(serialized, chunks) });
+      }
       return jsonResult({
         count: items.length,
-        items: items.map(serializeItem),
+        items: serialized,
       });
     },
   );

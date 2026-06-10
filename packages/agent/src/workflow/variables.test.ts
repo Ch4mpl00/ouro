@@ -166,3 +166,19 @@ describe("substitute — recursive walks", () => {
     });
   });
 });
+
+describe("array index paths (map-reduce chunks)", () => {
+  it("resolves ${bind.chunks.N} to the N-th array element as-is", () => {
+    const chunk0 = [{ body: "a" }, { body: "b" }];
+    const chunk1 = [{ body: "c" }];
+    const s = createStore({ posts: { count: 3, chunks: [chunk0, chunk1, []] } });
+    expect(substitute("${posts.chunks.0}", s)).toBe(chunk0);
+    expect(substitute("${posts.chunks.1}", s)).toBe(chunk1);
+    expect(substitute("${posts.chunks.2}", s)).toEqual([]);
+  });
+
+  it("throws MissingBindingError for an out-of-range index", () => {
+    const s = createStore({ posts: { chunks: [[]] } });
+    expect(() => substitute("${posts.chunks.5}", s)).toThrow("posts.chunks.5");
+  });
+});

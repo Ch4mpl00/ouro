@@ -304,12 +304,25 @@ async function testPlan(
   reasoningEffort?: ReasoningEffort,
   plannerFile?: string,
   dumpDir?: string,
+  systemFile?: string,
 ): Promise<void> {
   const planner = findGeneration(observations, "attempt-");
   if (!planner) throw new Error("no planner generation in trace");
   const messages = toChatMessages(planner.input);
-  // Schema enums come from the RECORDED reference block — identical before
-  // and after the swap, since swapPlannerBody preserves it.
+
+  // Full system-message override — for testing prompt + tool-signature
+  // changes that the recorded trace predates (e.g. a new tool parameter).
+  // The schema below is rebuilt AFTER the swap, so the file's
+  // <tools>/<skills> blocks drive validation too.
+  if (systemFile) {
+    const sys = messages.find((m) => m.role === "system");
+    if (!sys) throw new Error("no system message in recorded input");
+    sys.content = readFileSync(systemFile, "utf8");
+    console.log(`system message replaced from ${systemFile}`);
+  }
+
+  // Schema enums come from the (possibly swapped) reference block —
+  // swapPlannerBody preserves the recorded one.
   const schema = schemaFromRecordedPrompt(messages);
   if (!schema) console.log("(no <tools>/<skills> block found — falling back to lite validation)");
 
@@ -695,6 +708,7 @@ async function main(): Promise<void> {
       thinking,
       argFlag("--planner-file"),
       argFlag("--dump-dir"),
+      argFlag("--system-file"),
     );
   } else if (composeModel !== undefined) {
     const withJudge = process.argv.includes("--judge");
