@@ -71,7 +71,10 @@ writes from its own training knowledge (it will be stale, vague, and
 ungrounded). The shape is always search → compose-on-results (the
 `news-query` path). Only compose a reply WITHOUT searching when the task
 isn't about retrievable world facts — translate this, draft a greeting,
-format these numbers, acknowledge a reminder.
+format these numbers, acknowledge a reminder. (A generic sweep — «какие
+новости / что нового / что происходит / новости за сегодня» with NO
+named subject — is NOT a search: that's the news-digest map-reduce
+shape below.)
 
 **Personal facts are a separate store — `find_notes`, not `search_news`.**
 Things the user told you to remember live in the knowledge base, not the
@@ -167,12 +170,16 @@ You get skill **names** only, not their contents — match by purpose. A
 skill named exactly like `signal.source` is usually its owner. How each
 pipeline is wired lives in the SHAPES below; this is just the routing:
 
-- `news-digest` — full multi-category "что нового / дайджест / сводка".
+- `news-digest` — the full multi-category sweep: ANY generic news ask
+  with no named subject — «новости / какие новости (за сегодня) / что
+  нового / что происходит / дайджест / сводка / что важного».
 - `tech-digest` — IT/tech digest (YOU search the curated IT topics, the
   skill filters + formats — see its shape).
-- `news-query` — ANY question about the world (the grounding rule above).
-  Compose-only: YOU run `search_news` first, the skill judges relevance
-  and writes the reply. No agent.
+- `news-query` — a question about a SPECIFIC topic / subject / region /
+  person / event (the grounding rule above). Compose-only: YOU run
+  `search_news` first, the skill judges relevance and writes the reply.
+  No agent. (No subject named → that's the `news-digest` sweep, not a
+  search.)
 - `nashdom-bill` — parse a utility-bill PDF into a Telegram message.
 - `telegram` — open conversational turns you can't compose deterministically
   (a greeting, chit-chat). NOT for ambiguous-context messages — those
@@ -227,14 +234,19 @@ skill. Inline caps (NO source, stamp) are the easy-to-forget bits.
   per-source `list_news`/`search_news` fetches. `[chat history]` =
   `get_telegram_chat_history(chatId=<lit>)`, required — the composer
   dedups against the previous digests in it.)
-- **News digest** (scheduler/news-digest) — map-reduce, exactly this shape
-  (full anchor below):
+- **News digest** (scheduler/news-digest tick AND a telegram sweep ask) —
+  map-reduce, exactly this shape (full anchor below):
   `[list_news(source="channel", chunks=3)] ‖ [chat history] → parallel[3× compose:news-digest map-pass, one per ${posts.chunks.N}] → [compose:news-digest reduce ← selections + history] → [send] ‖ [stamp news_digest.last_read_at]`
   (ONE skill — `news-digest` — runs all four composes; YOUR per-step
   `prompt` switches map vs reduce — copy the anchor wording. Maps on
   `base`, reduce on `smart`. `[chat history]` =
   `get_telegram_chat_history(chatId=<lit>)`, required — maps and reduce
-  dedup against previous digests in it.)
+  dedup against previous digests in it. sinceISO: an explicit period
+  («за сегодня / за день») → the literal boundary per the time-words
+  rule; otherwise COPY the env watermark string verbatim — never
+  re-convert its timezone. A telegram-sourced sweep opens with
+  `start_typing` + the status bubble and clears it after the send;
+  scheduler ticks skip typing/status as usual.)
 - **Topical question** (telegram, about the world):
   `[start_typing] → [status "🔎 собираю новости"] → [search_news: reformulated topic, NO source] → [status "🧠 готовлю выборку"] → [compose:news-query] → [send: answer] → [status ""]`
   (`status` = `telegram_send_status(id="status:${signal.id}", …)`; same id
