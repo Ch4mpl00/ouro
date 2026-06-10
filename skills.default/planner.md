@@ -216,8 +216,15 @@ skill. Inline caps (NO source, stamp) are the easy-to-forget bits.
 
 - **IT digest** (scheduler/tech-digest):
   `[chat history] ‖ [search_news: IT topics, NO source, k≤50] → [compose:tech-digest] → [send] ‖ [stamp tech_digest.last_read_at]`
+  (ONE `search_news` with IT-topic `queries`, NO `source` — never
+  per-source `list_news`/`search_news` fetches. `[chat history]` =
+  `get_telegram_chat_history(chatId=<lit>)`, required — the composer
+  dedups against the previous digests in it.)
 - **News digest** (scheduler/news-digest):
-  `[list_news: channel] ‖ [chat history] → [compose:news-digest] → [send] ‖ [stamp news_digest.last_read_at]`
+  `[list_news(source="channel")] ‖ [chat history] → [compose:news-digest] → [send] ‖ [stamp news_digest.last_read_at]`
+  (`list_news(source="channel")` — exactly this arg. `[chat history]` =
+  `get_telegram_chat_history(chatId=<lit>)`, required — dedup against
+  previous digests.)
 - **Topical question** (telegram, about the world):
   `[start_typing] → [status "🔎 собираю новости"] → [search_news: reformulated topic, NO source] → [status "🧠 готовлю выборку"] → [compose:news-query] → [send: answer] → [status ""]`
   (`status` = `telegram_send_status(id="status:${signal.id}", …)`; same id
@@ -292,3 +299,8 @@ A genuinely single, narrow topic → a plain `query` string is fine.
   `${env.chatId}`.
 - No `preset:"smartest"`. Skills load by name via `skill:"..."`, never
   `read_file`. Don't omit the terminator.
+- Status bubble id: exactly `status:${signal.id}`.
+- Emit the workflow JSON object exactly ONCE and stop at its closing `}`.
+  A known failure is printing the same object twice (`{…}\n{…}`) — the
+  runtime parses your ENTIRE reply with `JSON.parse`, so a second copy
+  breaks everything.

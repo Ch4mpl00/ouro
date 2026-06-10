@@ -1,5 +1,5 @@
 import "dotenv/config";
-import { readFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import OpenAI from "openai";
 import type { ChatCompletionMessageParam } from "openai/resources/chat/completions";
 import type { ReasoningEffort } from "openai/resources/shared";
@@ -251,6 +251,27 @@ function validateSample(json: string, schema: z.ZodTypeAny | null): SampleVerdic
     : { ok: false, steps: lite.steps, errors: parsed.errors };
 }
 
+// First balanced JSON object from a reply with trailing garbage (the
+// gpt-5.4-mini duplicate-object pathology emits `{…}\n{…}`). Mirrors what a
+// production-side salvage would do: JSON.parse pinpoints the offset where
+// extra content starts; everything before it is the complete first object.
+function salvageFirstJson(text: string): string | null {
+  try {
+    JSON.parse(text);
+    return null; // parsed whole — nothing to salvage
+  } catch (e) {
+    const m = (e as Error).message.match(/position (\d+)/);
+    if (!m) return null;
+    const head = text.slice(0, Number(m[1]));
+    try {
+      JSON.parse(head);
+      return head;
+    } catch {
+      return null;
+    }
+  }
+}
+
 // Swap the planner-skill body in the recorded system message for the given
 // on-disk file, keeping the recorded <tools>/<skills> reference intact.
 // skills.ts strips frontmatter before the body reaches the compiler —
@@ -282,6 +303,7 @@ async function testPlan(
   modelB: string,
   reasoningEffort?: ReasoningEffort,
   plannerFile?: string,
+  dumpDir?: string,
 ): Promise<void> {
   const planner = findGeneration(observations, "attempt-");
   if (!planner) throw new Error("no planner generation in trace");
@@ -307,12 +329,63 @@ async function testPlan(
   const samples = await Promise.all(
     Array.from({ length: SAMPLES }, () => replayGeneration(messages, modelB, true, reasoningEffort)),
   );
+  const withSalvage = process.argv.includes("--salvage");
+  // Simulate the production compile retry loop: on an invalid reply, append
+  // it + the validation errors as feedback (same wording as compile.ts
+  // pushRetryFeedback) and re-ask, up to N extra attempts per sample.
+  const retries = Number(argFlag("--retries") ?? "0") || 0;
   let valid = 0;
-  samples.forEach((out, i) => {
-    const v = validateSample(out, schema);
+  let salvaged = 0;
+  let attemptsTotal = 0;
+
+  for (let i = 0; i < samples.length; i++) {
+    let out = samples[i]!;
+    if (dumpDir) writeFileSync(`${dumpDir}/sample-${i + 1}.json`, out);
+    const convo = [...messages];
+    let v: SampleVerdict = { ok: false, errors: [] };
+    let wasSalvaged = false;
+    let attempt = 0;
+    for (attempt = 1; attempt <= 1 + retries; attempt++) {
+      let candidate = out;
+      let salvagedNow = false;
+      if (withSalvage) {
+        const head = salvageFirstJson(candidate);
+        if (head !== null) {
+          candidate = head;
+          salvagedNow = true;
+        }
+      }
+      v = validateSample(candidate, schema);
+      if (v.ok) {
+        out = candidate;
+        wasSalvaged = salvagedNow;
+        break;
+      }
+      if (attempt > retries) break;
+      convo.push({ role: "assistant", content: out });
+      convo.push({
+        role: "user",
+        content: [
+          "Your previous workflow failed validation. Errors:",
+          ...v.errors.map((e) => `  - ${e}`),
+          "",
+          "Emit a corrected workflow. Return ONLY the JSON, no markdown wrapper.",
+        ].join("\n"),
+      });
+      // Sequential by design — a retry depends on the previous reply.
+      out = await replayGeneration(convo, modelB, true, reasoningEffort);
+    }
+    if (wasSalvaged) salvaged += 1;
     if (v.ok) valid += 1;
+    attemptsTotal += Math.min(attempt, 1 + retries);
+    const tags = [
+      wasSalvaged ? "salvaged" : "",
+      attempt > 1 ? `attempts=${Math.min(attempt, 1 + retries)}` : "",
+    ]
+      .filter(Boolean)
+      .join(", ");
     console.log(
-      `\n[sample ${i + 1}] ${v.ok ? `✓ valid (${v.steps} steps)` : `✗ invalid${v.steps !== undefined ? ` (${v.steps} steps)` : ""}`}`,
+      `\n[sample ${i + 1}] ${v.ok ? `✓ valid (${v.steps} steps)` : `✗ invalid${v.steps !== undefined ? ` (${v.steps} steps)` : ""}`}${tags ? ` [${tags}]` : ""}`,
     );
     for (const e of v.errors.slice(0, 4)) console.log(`    ! ${e}`);
     const lite = validateWorkflowLite(out);
@@ -321,8 +394,12 @@ async function testPlan(
     } else {
       console.log(`  ${truncate(out, 220).replace(/\n/g, " ")}`);
     }
-  });
-  console.log(`\nB valid: ${valid}/${SAMPLES}${schema ? " (full production schema)" : " (lite)"}`);
+  }
+  const salvageNote = withSalvage ? `, ${salvaged} salvaged` : "";
+  const retryNote = retries > 0 ? `, ${(attemptsTotal / samples.length).toFixed(1)} avg attempts` : "";
+  console.log(
+    `\nB valid: ${valid}/${SAMPLES}${schema ? " (full production schema)" : " (lite)"}${salvageNote}${retryNote}`,
+  );
 }
 
 // Test B: replay the composer's input under model B, SAMPLES times. The input
@@ -612,7 +689,13 @@ async function main(): Promise<void> {
   const planModel = argFlag("--plan");
   const composeModel = argFlag("--compose");
   if (planModel !== undefined) {
-    await testPlan(observations, planModel || "gpt-5.4-mini", thinking, argFlag("--planner-file"));
+    await testPlan(
+      observations,
+      planModel || "gpt-5.4-mini",
+      thinking,
+      argFlag("--planner-file"),
+      argFlag("--dump-dir"),
+    );
   } else if (composeModel !== undefined) {
     const withJudge = process.argv.includes("--judge");
     await testCompose(observations, composeModel || "gpt-5.4-mini", thinking, withJudge);
