@@ -51,7 +51,14 @@ export function buildTranscript(trace: Trace, observations: Observation[]): stri
       if (o.output !== null && o.output !== undefined) lines.push(`output: ${stringify(o.output)}`);
     }
   }
-  lines.push(`\n# FINAL OUTPUT (trace.output)\n${stringify(trace.output)}`);
+  const finalOutput = stringify(trace.output);
+  lines.push(
+    `\n# FINAL OUTPUT (trace.output)\n${
+      finalOutput === "null"
+        ? "(empty — workflow path; F is the text delivered by send/edit tool calls and the last compose output in the FLOW above)"
+        : finalOutput
+    }`,
+  );
   return lines.join("\n");
 }
 

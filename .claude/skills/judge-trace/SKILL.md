@@ -7,9 +7,9 @@ description: Judge an agent run from a Langfuse trace in-session (free replaceme
 
 You replace the GPT-5.4 judge from `packages/agent/src/scripts/judge.ts` for
 cheap experimentation. The materials assembly and the rubric below are kept
-in sync with that script (`SYSTEM_PROMPT`, `FAITH_SYSTEM_PROMPT`, prompt v2)
-— do not improvise your own criteria, or scores stop being comparable
-between the two judges.
+in sync with that script (`SYSTEM_PROMPT`, `FAITH_SYSTEM_PROMPT` in
+`packages/agent/src/judging/schema.ts`, prompt v3) — do not improvise your
+own criteria, or scores stop being comparable between the two judges.
 
 ## Steps
 
@@ -32,7 +32,7 @@ between the two judges.
    When judging several traces, finish with a one-line-per-trace summary
    table.
 
-## Rubric (prompt v2 — keep verbatim-equivalent to judge.ts)
+## Rubric (prompt v3 — keep verbatim-equivalent to judging/schema.ts)
 
 You are a rigorous evaluation judge for an AI agent that handles each signal
 in TWO stages. Understanding the split is essential to scoring correctly:
@@ -46,6 +46,11 @@ in TWO stages. Understanding the split is essential to scoring correctly:
    candidates and chat history as INPUT, filters them, and writes the final
    text (F). The composer does NOT call tools; it legitimately receives chat
    history as input rather than fetching it.
+
+F is the final user-visible text of the run: the last compose step's output
+and the text actually delivered via send/edit tool calls in the FLOW. The
+trace-level FINAL OUTPUT field may be empty on the workflow path — find F in
+the FLOW; an empty field is NOT "no output".
 
 You score ONE completed run. You did not generate it and have no stake in it.
 
@@ -62,6 +67,13 @@ name or item id). CRITICAL — judge each axis against the RIGHT contract:
   noise?
 - composition -> the COMPOSER_CONTRACT. Does F follow the composer's format,
   tone, length, threshold and no-fabrication rules?
+- process -> the ORCHESTRATOR_CONTRACT. Walk the FLOW step by step and judge
+  the whole chain of actions: was every tool call the right tool with sane
+  arguments, in a sensible order; was each step's result actually used
+  downstream (not fetched and dropped); were watermarks/memory updated when
+  the contract requires it; did the chain deliver the result the way the
+  contract requires? Redundant, missing, or contradictory steps lower the
+  score.
 
 DECISIVE RULE — never penalize the COMPOSER for ORCHESTRATION. Which tools
 were called, that the result was sent via `send_telegram_message`, that
@@ -86,9 +98,12 @@ Other rules:
 
 ## Faithfulness sub-judge (separate pass, claim decomposition)
 
-After the three axes, verify that every factual claim in the FINAL OUTPUT
-(F) is grounded in the retrieved snippets (R) or the chat history shown in
-the transcript. Quoting specifics — numbers, counts, dates, version
+After the four axes, verify that every factual claim in the final text (F)
+is grounded in the retrieved snippets (R) or the chat history shown in the
+transcript. F is ALL user-visible text the run delivered: the text arguments
+of send/edit Telegram tool calls in the FLOW plus the last compose step's
+output — an empty trace-level FINAL OUTPUT field NEVER means there are no
+claims to check. Quoting specifics — numbers, counts, dates, version
 numbers — not present in a snippet is the single most damaging error class.
 
 Method:
@@ -117,7 +132,7 @@ Rules:
 ## Output format (mirrors judge.ts printScorecard / printFaithfulness)
 
 ```
-=== JUDGE claude-code (prompt v2) · trace <id> · skill <name> ===
+=== JUDGE claude-code (prompt v3) · trace <id> · skill <name> ===
 
 ● coverage: <fail|weak|ok|strong|n/a> (<0.00-1.00|n/a>)
   <one-sentence rationale>
@@ -125,6 +140,7 @@ Rules:
 
 ● query_formulation: …
 ● composition: …
+● process: …
 
 overall: <one-sentence holistic note>
 

@@ -56,11 +56,18 @@ function tomlValue(value: unknown): string {
   return JSON.stringify(String(value));
 }
 
-function parseJsonl(stdout: string): { events: unknown[]; content: string; usage?: unknown; threadId?: string } {
+function parseJsonl(stdout: string): {
+  events: unknown[];
+  content: string;
+  usage?: unknown;
+  threadId?: string;
+  errorMessage?: string;
+} {
   const events: unknown[] = [];
   let content = "";
   let usage: unknown;
   let threadId: string | undefined;
+  let errorMessage: string | undefined;
   for (const line of stdout.split(/\r?\n/)) {
     if (!line.trim()) continue;
     try {
@@ -76,12 +83,17 @@ function parseJsonl(stdout: string): { events: unknown[]; content: string; usage
         }
       }
       if (event.type === "turn.completed") usage = event.usage;
+      // The actual failure reason (usage limit, auth, model error) arrives as
+      // a JSONL error event on STDOUT — stderr carries only progress notices.
+      if (event.type === "error" && typeof event.message === "string") {
+        errorMessage = event.message;
+      }
     } catch {
       // Codex --json should be JSONL. Keep non-JSON lines out of events and
       // fall back to stdout as content below if no agent_message arrives.
     }
   }
-  return { events, content: content || stdout.trim(), usage, threadId };
+  return { events, content: content || stdout.trim(), usage, threadId, errorMessage };
 }
 
 function parseStructuredContent(content: string): unknown | undefined {
@@ -105,6 +117,10 @@ export async function runCodex(req: CodexRunRequest): Promise<CodexRunResult | C
       "--ephemeral",
       "--json",
       "--skip-git-repo-check",
+      // Host-independent behavior: the host's personal config.toml (model,
+      // reasoning effort, MCP servers) must not leak into service runs.
+      // Auth still comes from CODEX_HOME; per-run knobs arrive via req.
+      "--ignore-user-config",
       "--sandbox",
       req.sandbox ?? "read-only",
       // `codex exec` has no --ask-for-approval flag (it's interactive-only);
@@ -144,7 +160,11 @@ export async function runCodex(req: CodexRunRequest): Promise<CodexRunResult | C
       stderr += chunk;
     });
 
-    const timeout = setTimeout(() => child.kill("SIGTERM"), timeoutMs);
+    let timedOut = false;
+    const timeout = setTimeout(() => {
+      timedOut = true;
+      child.kill("SIGTERM");
+    }, timeoutMs);
     const exit = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve, reject) => {
       child.on("error", reject);
       child.on("close", (code, signal) => resolve({ code, signal }));
@@ -153,9 +173,15 @@ export async function runCodex(req: CodexRunRequest): Promise<CodexRunResult | C
 
     const parsed = parseJsonl(stdout);
     if (exit.code !== 0) {
+      const reason = timedOut
+        ? `codex timed out after ${timeoutMs}ms (killed with ${exit.signal ?? "SIGTERM"})`
+        : exit.signal
+          ? `codex killed by ${exit.signal}`
+          : `codex exited with code ${exit.code ?? "?"}`;
+      const detail = parsed.errorMessage ?? (stderr.trim() || null);
       return {
         ok: false,
-        error: stderr.trim() || `codex exited with code ${exit.code ?? "?"}`,
+        error: detail ? `${reason}: ${detail}` : reason,
         code: exit.code,
         signal: exit.signal,
         stdout,
