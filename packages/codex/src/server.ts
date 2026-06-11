@@ -1,4 +1,5 @@
-import "dotenv/config";
+// No dotenv here: the codex package has zero deps and the service reads its
+// few knobs (CODEX_SERVICE_PORT, CODEX_HOME) from real env — compose sets them.
 import http from "node:http";
 import { runCodex, type CodexRunRequest } from "./runner";
 
