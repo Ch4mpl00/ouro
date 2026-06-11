@@ -32,7 +32,10 @@ export async function api<T>(path: string, retries = 3): Promise<T> {
       lastErr = err instanceof Error ? err : new Error(String(err));
       continue; // network error — retry
     }
-    if (res.ok) return (await res.json()) as T;
+    if (res.ok) {
+      const text = await res.text();
+      return (text ? JSON.parse(text) : undefined) as T;
+    }
     if (res.status >= 500) {
       lastErr = new Error(`langfuse ${res.status} ${res.statusText} on ${path}`);
       continue; // transient server error — retry
@@ -40,6 +43,39 @@ export async function api<T>(path: string, retries = 3): Promise<T> {
     throw new Error(`langfuse ${res.status} ${res.statusText} on ${path}`);
   }
   throw lastErr ?? new Error(`langfuse request failed on ${path}`);
+}
+
+export async function apiPost<T>(
+  path: string,
+  body: unknown,
+  retries = 3,
+): Promise<T> {
+  let lastErr: Error | null = null;
+  for (let attempt = 0; attempt < retries; attempt++) {
+    if (attempt > 0) await new Promise((r) => setTimeout(r, 600 * attempt));
+    let res: Response;
+    try {
+      res = await fetch(`${baseUrl}/api/public${path}`, {
+        method: "POST",
+        headers: {
+          Authorization: authHeader,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify(body),
+      });
+    } catch (err) {
+      lastErr = err instanceof Error ? err : new Error(String(err));
+      continue;
+    }
+    if (res.ok) return (await res.json()) as T;
+    if (res.status >= 500) {
+      lastErr = new Error(`langfuse ${res.status} ${res.statusText} on POST ${path}`);
+      continue;
+    }
+    const text = await res.text().catch(() => "");
+    throw new Error(`langfuse ${res.status} ${res.statusText} on POST ${path}: ${text}`);
+  }
+  throw lastErr ?? new Error(`langfuse POST failed on ${path}`);
 }
 
 // Langfuse observation types. Beyond the original GENERATION/SPAN/EVENT, v5

@@ -18,7 +18,10 @@
 services:
   postgres:
     image: pgvector/pgvector:pg16
-    env_file: .env.postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-mcp}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-mcp}
+      POSTGRES_DB: ${POSTGRES_DB:-mcp}
     volumes:
       - pg-data:/var/lib/postgresql/data
     healthcheck:
@@ -34,7 +37,6 @@ services:
     command: sh -c "pnpm setup:mcp && pnpm mcp:serve"
     env_file:
       - .env.mcp
-      - .env.postgres
     environment:
       MCP_TRANSPORT: http
       MCP_PORT: "3000"
@@ -64,9 +66,38 @@ services:
       - mcp
     restart: unless-stopped
 
+  codex:
+    build: .
+    image: mcp-tools-image
+    command: pnpm codex:serve
+    environment:
+      CODEX_HOME: /codex-home
+      CODEX_SERVICE_PORT: "3010"
+    volumes:
+      - codex-home:/codex-home              # Codex auth/session cache
+    expose:
+      - "3010"
+    restart: unless-stopped
+
+  judge-worker:
+    build: .
+    image: mcp-tools-image
+    command: sh -c "pnpm setup:agent && pnpm judge:worker"
+    env_file: .env.agent
+    environment:
+      CODEX_URL: http://codex:3010
+      JUDGE_PROVIDER: codex
+    volumes:
+      - agent-data:/app/packages/agent/data
+      - agent-skills:/app/skills
+    depends_on:
+      - codex
+    restart: unless-stopped
+
 volumes:
   mcp-data:
   mcp-storage:
   agent-data:
   agent-skills:
   pg-data:
+  codex-home:

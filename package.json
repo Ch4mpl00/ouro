@@ -7,9 +7,11 @@
   "scripts": {
     "typecheck": "tsc --noEmit",
     "mcp:serve": "tsx packages/mcp/src/server.ts",
+    "codex:serve": "tsx packages/codex/src/server.ts",
     "agent:start": "tsx packages/agent/src/supervisor/main.ts",
     "trace": "tsx packages/agent/src/scripts/langfuse-trace.ts",
     "judge": "tsx packages/agent/src/scripts/judge.ts",
+    "judge:worker": "tsx packages/agent/src/scripts/judge-worker.ts",
     "db:init": "pnpm db:init:mcp && pnpm db:init:agent",
     "db:init:mcp": "mkdir -p packages/mcp/data && sqlite3 packages/mcp/data/tokens.db < packages/mcp/data/schema.sql",
     "db:init:agent": "mkdir -p packages/agent/data && sqlite3 packages/agent/data/agent.db < packages/agent/data/schema.sql",
