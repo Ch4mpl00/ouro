@@ -3,12 +3,15 @@ import { writeFileSync } from "node:fs";
 import OpenAI from "openai";
 import { config as loadEnv } from "dotenv";
 import { fetchRecentTraces } from "./langfuse-api";
+import { createAgentDb } from "../db/client";
+import { createTraceStore } from "../db/trace-store";
 import { assembleMaterials } from "../judging/materials";
 import { judgeWithOpenAi } from "../judging/openai-judge";
 import { createCodexClient } from "../judging/codex-client";
 import { judgeWithCodex } from "../judging/codex-judge";
 import { printFaithfulness, printScorecard } from "../judging/print";
 import { buildUserPrompt } from "../judging/schema";
+import { createLangfuseTraceSource, createLocalTraceSource, type TraceSource } from "../judging/trace-source";
 
 loadEnv({ path: ".env.agent" });
 
@@ -51,8 +54,13 @@ function parseArgs(argv: string[]): CliOpts {
   return { dump, provider, args };
 }
 
-async function judgeOne(provider: JudgeProvider, openai: OpenAI | null, traceId: string): Promise<void> {
-  const m = await assembleMaterials(traceId);
+async function judgeOne(
+  source: TraceSource,
+  provider: JudgeProvider,
+  openai: OpenAI | null,
+  traceId: string,
+): Promise<void> {
+  const m = await assembleMaterials(source, traceId);
 
   console.error(
     `[judge] trace ${traceId} · provider=${provider} · skill=${m.skillName ?? "—"} · ${m.obsCount} obs · ` +
@@ -72,8 +80,8 @@ async function judgeOne(provider: JudgeProvider, openai: OpenAI | null, traceId:
   printFaithfulness(result.faithfulness);
 }
 
-async function dumpOne(traceId: string): Promise<void> {
-  const m = await assembleMaterials(traceId);
+async function dumpOne(source: TraceSource, traceId: string): Promise<void> {
+  const m = await assembleMaterials(source, traceId);
   const body = [
     `# JUDGE MATERIALS · trace ${traceId} · composer skill ${m.skillName ?? "—"}`,
     "",
@@ -102,8 +110,14 @@ async function main(): Promise<void> {
     openai = new OpenAI({ apiKey });
   }
 
+  // Local mirror first (fast, and present when run on the droplet), Langfuse
+  // as fallback for ids not mirrored locally. --recent still lists from
+  // Langfuse (recent prod traces), below.
+  const db = createAgentDb();
+  const source = createLocalTraceSource(createTraceStore(db), createLangfuseTraceSource());
+
   const runOne = (traceId: string): Promise<void> =>
-    dump ? dumpOne(traceId) : judgeOne(provider, openai, traceId);
+    dump ? dumpOne(source, traceId) : judgeOne(source, provider, openai, traceId);
 
   if (args[0] === "--recent") {
     const parsed = Number(args[1] ?? "5");

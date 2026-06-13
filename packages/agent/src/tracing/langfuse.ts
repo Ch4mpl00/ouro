@@ -151,7 +151,12 @@ function startEventChild(parent: LangfuseSpan, opts: EventStartOpts): void {
 }
 
 function wrapTrace(s: LangfuseSpan): Trace {
+  // The OTel trace id is assigned when the span is created (part of its
+  // SpanContext), not at export time — so it's valid immediately, even if
+  // Langfuse ingestion later 502s. This IS the Langfuse trace id.
+  const id = s.otelSpan.spanContext().traceId;
   return {
+    id,
     update(data: TraceContextUpdate): void {
       applyContextUpdate(s, data);
     },

@@ -33,6 +33,7 @@ function recordingSpan(): Span {
 
 function recordingTrace(): Trace {
   return {
+    id: "test-trace",
     update() {},
     end() {},
     generation() {

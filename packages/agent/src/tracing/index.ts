@@ -111,6 +111,11 @@ export interface Span extends TraceContext {
 // In-process backends with implicit lifecycles (or the null tracer) can
 // treat `end` as a no-op.
 export interface Trace extends TraceContext {
+  // The backend's trace id, known at creation time. For Langfuse this is the
+  // OTel trace id (the same hex the scores API and UI use) — the tee reads it
+  // off the primary tracer and keys the local mirror on it, so scores link
+  // back to Langfuse with no mapping table.
+  readonly id: string;
   end(): void;
 }
 
@@ -145,6 +150,7 @@ const NOOP_SPAN: Span = {
   event() {},
 };
 const NOOP_TRACE: Trace = {
+  id: "",
   update() {},
   generation: () => NOOP_GENERATION,
   span: () => NOOP_SPAN,

@@ -1,26 +1,23 @@
 import OpenAI from "openai";
-import type { MemoryStore } from "../db/memory";
-import { fetchRecentTraces } from "../scripts/langfuse-api";
 import { assembleMaterials } from "./materials";
 import { judgeWithOpenAi } from "./openai-judge";
 import { createCodexClient } from "./codex-client";
 import { judgeWithCodex } from "./codex-judge";
-import { writeLangfuseScores } from "./langfuse-scores";
+import type { ScoreWriter } from "./langfuse-scores";
+import type { TraceSource } from "./trace-source";
 import { JUDGE_PROMPT_VERSION, type JudgeResultBundle } from "./schema";
 
 type JudgeProvider = "openai" | "codex";
 
 export interface JudgeWorkerDeps {
-  memory: MemoryStore;
+  source: TraceSource;
+  writeScores: ScoreWriter;
 }
 
 export interface JudgeWorkerOpts {
   provider: JudgeProvider;
   pollIntervalMs: number;
   recentLimit: number;
-  // Skip traces younger than this — a trace listed by /traces may still be
-  // mid-run, and judging a partial transcript would mark it "ok" permanently.
-  minTraceAgeMs: number;
   dryRun: boolean;
   once: boolean;
 }
@@ -41,42 +38,27 @@ export function judgeWorkerOptsFromEnv(): JudgeWorkerOpts {
     provider,
     pollIntervalMs: Number(process.env.JUDGE_POLL_INTERVAL_MS ?? 60_000),
     recentLimit: Number(process.env.JUDGE_RECENT_LIMIT ?? 20),
-    minTraceAgeMs: Number(process.env.JUDGE_MIN_TRACE_AGE_MS ?? 10 * 60_000),
     dryRun: !boolEnv("JUDGE_WRITE_SCORES", false),
     once: boolEnv("JUDGE_ONCE", false),
   };
-}
-
-function judgedKey(provider: JudgeProvider, traceId: string): string {
-  return `judge.${provider}.${JUDGE_PROMPT_VERSION}.${traceId}`;
-}
-
-function isEligibleTrace(trace: { id: string; name: string; tags: string[] }): boolean {
-  if (trace.tags.includes("judge")) return false;
-  if (trace.name.startsWith("judge")) return false;
-  return true;
 }
 
 async function runJudge(
   provider: JudgeProvider,
   materials: Awaited<ReturnType<typeof assembleMaterials>>,
 ): Promise<JudgeResultBundle> {
-  if (provider === "openai") {
-    const apiKey = process.env.OPENAI_API_KEY;
-    if (!apiKey) throw new Error("OPENAI_API_KEY missing in env");
-    return judgeWithOpenAi(new OpenAI({ apiKey }), {
-      skillName: materials.skillName,
-      composerContract: materials.composerContract,
-      orchestratorContract: materials.orchestratorContract,
-      transcript: materials.transcript,
-    });
-  }
-  return judgeWithCodex(createCodexClient(), {
+  const params = {
     skillName: materials.skillName,
     composerContract: materials.composerContract,
     orchestratorContract: materials.orchestratorContract,
     transcript: materials.transcript,
-  });
+  };
+  if (provider === "openai") {
+    const apiKey = process.env.OPENAI_API_KEY;
+    if (!apiKey) throw new Error("OPENAI_API_KEY missing in env");
+    return judgeWithOpenAi(new OpenAI({ apiKey }), params);
+  }
+  return judgeWithCodex(createCodexClient(), params);
 }
 
 async function processTrace(
@@ -84,38 +66,34 @@ async function processTrace(
   deps: JudgeWorkerDeps,
   opts: JudgeWorkerOpts,
 ): Promise<void> {
-  const key = judgedKey(opts.provider, traceId);
-  const current = deps.memory.get(key);
-  if (current === "ok") return;
-  if (current === "in_progress") {
-    console.log(`[judge-worker] retrying stale in_progress trace ${traceId}`);
-  }
-
-  deps.memory.set(key, "in_progress");
-  const materials = await assembleMaterials(traceId);
+  const materials = await assembleMaterials(deps.source, traceId);
   console.log(
     `[judge-worker] judging ${traceId} provider=${opts.provider} skill=${materials.skillName ?? "—"} ` +
       `obs=${materials.obsCount} transcript=${materials.transcript.length}`,
   );
   const result = await runJudge(opts.provider, materials);
-  await writeLangfuseScores(result.scorecard, result.faithfulness, {
+  await deps.writeScores.write(result.scorecard, result.faithfulness, {
     traceId,
     provider: opts.provider,
+    promptVersion: JUDGE_PROMPT_VERSION,
     dryRun: opts.dryRun,
   });
-  deps.memory.set(key, "ok");
 }
 
 async function tick(deps: JudgeWorkerDeps, opts: JudgeWorkerOpts): Promise<void> {
-  const traces = await fetchRecentTraces(opts.recentLimit);
+  // The local source returns only COMPLETE runs (written on trace.end()) that
+  // lack a judgement for this (provider, version) — so no age filter and no
+  // separate dedup are needed. A trace that throws (e.g. Codex usage limit)
+  // simply writes no judgement and reappears next tick: auto-retry.
+  const traces = await deps.source.recentTraces(opts.recentLimit, {
+    provider: opts.provider,
+    promptVersion: JUDGE_PROMPT_VERSION,
+  });
   for (const trace of traces) {
-    if (!isEligibleTrace(trace)) continue;
-    if (Date.now() - new Date(trace.timestamp).getTime() < opts.minTraceAgeMs) continue;
     try {
       await processTrace(trace.id, deps, opts);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      deps.memory.set(judgedKey(opts.provider, trace.id), `error: ${msg}`);
       console.error(`[judge-worker] ${trace.id} failed: ${msg}`);
     }
   }

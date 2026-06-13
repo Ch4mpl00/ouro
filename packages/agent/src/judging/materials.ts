@@ -1,5 +1,7 @@
-import { fetchTraceById, type Observation, type Trace } from "../scripts/langfuse-api";
+import type { Observation, Trace } from "../trace-model";
+import { resolveSkill } from "../trace-model";
 import { createSkillStore } from "../skills";
+import type { TraceSource } from "./trace-source";
 
 const skillStore = createSkillStore();
 
@@ -11,16 +13,6 @@ function stringify(x: unknown): string {
   } catch {
     return String(x);
   }
-}
-
-function findSkill(trace: Trace, observations: Observation[]): string | null {
-  for (const o of observations) {
-    const skill = o.metadata?.skill;
-    if (typeof skill === "string" && skill.length > 0) return skill;
-  }
-  const skills = trace.metadata?.skills;
-  if (Array.isArray(skills) && typeof skills[0] === "string") return skills[0];
-  return null;
 }
 
 export function buildTranscript(trace: Trace, observations: Observation[]): string {
@@ -71,9 +63,12 @@ export interface JudgeMaterials {
   obsCount: number;
 }
 
-export async function assembleMaterials(traceId: string): Promise<JudgeMaterials> {
-  const { trace, observations } = await fetchTraceById(traceId);
-  const skillName = findSkill(trace, observations);
+export async function assembleMaterials(
+  source: TraceSource,
+  traceId: string,
+): Promise<JudgeMaterials> {
+  const { trace, observations } = await source.getTrace(traceId);
+  const skillName = resolveSkill(observations, trace.metadata);
   const composerContract = skillName ? await skillStore.readSkillRaw(skillName) : null;
   const orchestratorContract = await skillStore.readSkillRaw("planner");
   const transcript = buildTranscript(trace, observations);

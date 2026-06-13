@@ -2,6 +2,7 @@ import "dotenv/config";
 import OpenAI from "openai";
 import { createAgentDb } from "../db/client";
 import { createMemoryStore } from "../db/memory";
+import { createTraceStore } from "../db/trace-store";
 import { createEngine, type Engine } from "../engine";
 import { connectMcp } from "../mcp-client";
 import { DEFAULT_PRESETS } from "../models";
@@ -15,8 +16,10 @@ import {
 } from "../providers";
 import { gatherEnvData, type EnvDataDeps } from "../session-context";
 import { createSkillStore } from "../skills";
-import { nullTracer, type Tracer } from "../tracing";
+import { type Tracer } from "../tracing";
 import { langfuseTracerFromEnv } from "../tracing/langfuse";
+import { createLocalRecorderTracer } from "../tracing/local-recorder";
+import { teeTracer } from "../tracing/tee";
 import { createWorkflowRunner, type WorkflowRunner } from "../workflow";
 import { createFallback, type Fallback, type PendingSignal } from "./fallback";
 
@@ -138,6 +141,7 @@ async function main(): Promise<void> {
 
   const db = createAgentDb();
   const memory = createMemoryStore(db);
+  const traceStore = createTraceStore(db);
   const skillStore = createSkillStore();
   const mcp = await connectMcp();
 
@@ -149,17 +153,22 @@ async function main(): Promise<void> {
   await skillStore.validateAll(mcpToolNames);
   console.log(`[supervisor] skill validation passed (mcp tools: ${mcpToolNames.length})`);
 
-  // Tracer: env auto-config > null. Logged once at startup.
+  // Tracer: every run is mirrored into the local store (agent.db) so the
+  // judge + self-improvement loop read runs fast and independently of
+  // Langfuse uptime. When Langfuse creds are present we tee — Langfuse stays
+  // primary (it owns the trace id; the local mirror keys on it), local is the
+  // secondary leg. Without creds we record locally only.
   let tracer: Tracer;
-  const auto = langfuseTracerFromEnv();
-  if (auto) {
-    tracer = auto;
+  const local = createLocalRecorderTracer(traceStore);
+  const langfuse = langfuseTracerFromEnv();
+  if (langfuse) {
+    tracer = teeTracer(langfuse, local);
     console.log(
-      `[supervisor] tracing enabled (langfuse v5, ${process.env.LANGFUSE_BASE_URL ?? "default host"})`,
+      `[supervisor] tracing: langfuse v5 (${process.env.LANGFUSE_BASE_URL ?? "default host"}) + local mirror`,
     );
   } else {
-    tracer = nullTracer;
-    console.log("[supervisor] tracing disabled (LANGFUSE_*_KEY not set)");
+    tracer = local;
+    console.log("[supervisor] tracing: local mirror only (LANGFUSE_*_KEY not set)");
   }
 
   const engine = createEngine({
