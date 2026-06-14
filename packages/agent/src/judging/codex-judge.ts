@@ -1,14 +1,13 @@
 import {
   buildFaithUserPrompt,
-  buildUserPrompt,
   FAITH_RESPONSE_SCHEMA,
   FAITH_SYSTEM_PROMPT,
   FaithfulnessSchema,
-  RESPONSE_SCHEMA,
+  rubricFor,
   ScorecardSchema,
-  SYSTEM_PROMPT,
   type Faithfulness,
-  type JudgeResultBundle,
+  type JudgeNodeInput,
+  type NodeJudgement,
   type Scorecard,
 } from "./schema";
 import type { CodexClient } from "./codex-client";
@@ -26,60 +25,43 @@ function extractParsedJson(content: string, parsed: unknown): unknown {
   return JSON.parse(content);
 }
 
-export async function judgeScorecardWithCodex(
-  codex: CodexClient,
-  composerSkill: string | null,
-  composerContract: string | null,
-  orchestratorContract: string | null,
-  transcript: string,
-): Promise<Scorecard> {
+function timeoutMs(): number {
+  return Number(process.env.CODEX_JUDGE_TIMEOUT_MS ?? 10 * 60_000);
+}
+
+async function scorecardFor(codex: CodexClient, node: JudgeNodeInput): Promise<Scorecard> {
+  const rubric = rubricFor(node.kind);
   const result = await codex.run({
-    prompt: `${SYSTEM_PROMPT}\n\nReturn only the final JSON object matching the provided schema.`,
-    input: buildUserPrompt(composerSkill, composerContract, orchestratorContract, transcript),
-    schema: RESPONSE_SCHEMA,
+    prompt: `${rubric.system}\n\nReturn only the final JSON object matching the provided schema.`,
+    input: rubric.buildUserPrompt(node.skill, node.contract, node.inputText, node.outputText),
+    schema: rubric.responseSchema,
     sandbox: "read-only",
     approvalPolicy: "never",
-    timeoutMs: Number(process.env.CODEX_JUDGE_TIMEOUT_MS ?? 10 * 60_000),
+    timeoutMs: timeoutMs(),
     config: codexConfig(),
   });
   return ScorecardSchema.parse(extractParsedJson(result.content, result.parsed));
 }
 
-export async function judgeFaithfulnessWithCodex(
-  codex: CodexClient,
-  composerContract: string | null,
-  transcript: string,
-): Promise<Faithfulness> {
+async function faithfulnessFor(codex: CodexClient, node: JudgeNodeInput): Promise<Faithfulness> {
   const result = await codex.run({
     prompt: `${FAITH_SYSTEM_PROMPT}\n\nReturn only the final JSON object matching the provided schema.`,
-    input: buildFaithUserPrompt(composerContract, transcript),
+    input: buildFaithUserPrompt(node.contract, node.inputText, node.outputText),
     schema: FAITH_RESPONSE_SCHEMA,
     sandbox: "read-only",
     approvalPolicy: "never",
-    timeoutMs: Number(process.env.CODEX_JUDGE_TIMEOUT_MS ?? 10 * 60_000),
+    timeoutMs: timeoutMs(),
     config: codexConfig(),
   });
   return FaithfulnessSchema.parse(extractParsedJson(result.content, result.parsed));
 }
 
-export async function judgeWithCodex(
-  codex: CodexClient,
-  params: {
-    skillName: string | null;
-    composerContract: string | null;
-    orchestratorContract: string | null;
-    transcript: string;
-  },
-): Promise<JudgeResultBundle> {
+// Judge ONE node with codex — same contract as judgeNodeWithOpenAi.
+export async function judgeNodeWithCodex(codex: CodexClient, node: JudgeNodeInput): Promise<NodeJudgement> {
+  const wantsFaith = rubricFor(node.kind).faithfulness;
   const [scorecard, faithfulness] = await Promise.all([
-    judgeScorecardWithCodex(
-      codex,
-      params.skillName,
-      params.composerContract,
-      params.orchestratorContract,
-      params.transcript,
-    ),
-    judgeFaithfulnessWithCodex(codex, params.composerContract, params.transcript),
+    scorecardFor(codex, node),
+    wantsFaith ? faithfulnessFor(codex, node) : Promise.resolve(null),
   ]);
   return { scorecard, faithfulness };
 }

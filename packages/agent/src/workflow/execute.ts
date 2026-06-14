@@ -3,6 +3,7 @@ import type { ModelPreset, PresetName } from "../models";
 import type { ChatProvider } from "../providers";
 import type { AgentLoopOpts } from "../agent-loop";
 import { SET_MEMORY_TOOL_NAME, SetMemoryArgsSchema } from "../synthetic-tools";
+import { JUDGE_NODE_META } from "../trace-model";
 import type { Span, SpanKind, TraceContext } from "../tracing";
 import type {
   LlmAgentStep,
@@ -474,6 +475,10 @@ async function execLlmCompose(
       tools_mode: "none",
     },
     input: messages,
+    // Mark this as a compose node for the per-node judge, self-contained: the
+    // owner skill rides along (null = prompt-only → the planner owns it). The
+    // judge classifies by this tag, never the `llm_compose:*` name.
+    metadata: { [JUDGE_NODE_META]: "compose", skill: step.skill ?? null },
   });
 
   let content: string;
@@ -545,6 +550,11 @@ async function execLlmAgent(
   const prompt = substituteText(step.prompt, store);
   const allowedTools = new Set(step.tools);
   const childId = `${ctx.signalLabel}__agent:${step.bind}`;
+
+  // Record the resolved prompt as the agent step's input so the per-node judge
+  // can score this AGENT span black-box (input→output) without descending into
+  // the sub-agent's own iterations.
+  span.update({ input: { skill: step.skill, prompt } });
 
   const child = await deps.engine.startAgentLoop({
     id: childId,

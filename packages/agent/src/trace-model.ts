@@ -63,6 +63,17 @@ export interface TraceSummary {
   tags: string[];
 }
 
+// A judgeable generation tags itself with its node role under
+// metadata[JUDGE_NODE_META], so the per-node judge classifies by an explicit
+// producer→judge contract rather than by observation NAMES ("attempt-1",
+// "llm_compose:digest") — those stay display-only and can be renamed freely.
+// Kept separate from metadata.skill on purpose: `skill` means "which skill
+// composed the output" (drives resolveSkill / the traces.skill column), and a
+// planner generation must NOT claim that role. Agent nodes need no tag — an
+// llm_agent step is already an AGENT-type span.
+export const JUDGE_NODE_META = "judge_node";
+export type JudgeNodeRole = "planner" | "compose";
+
 // Which skill composed the output. Workflow path stamps it on the
 // llm_compose / llm_agent step observation's metadata.skill; agent-loop path
 // lists it on trace.metadata.skills. First non-empty wins. Used both at

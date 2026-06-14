@@ -1,11 +1,11 @@
 import OpenAI from "openai";
-import { assembleMaterials } from "./materials";
-import { judgeWithOpenAi } from "./openai-judge";
+import { assembleNodeMaterials, type NodeMaterial } from "./materials";
+import { judgeNodeWithOpenAi } from "./openai-judge";
 import { createCodexClient } from "./codex-client";
-import { judgeWithCodex } from "./codex-judge";
+import { judgeNodeWithCodex } from "./codex-judge";
 import type { ScoreWriter } from "./langfuse-scores";
 import type { TraceSource } from "./trace-source";
-import { JUDGE_PROMPT_VERSION, type JudgeResultBundle } from "./schema";
+import { JUDGE_PROMPT_VERSION, type NodeJudgement } from "./schema";
 
 type JudgeProvider = "openai" | "codex";
 
@@ -43,22 +43,17 @@ export function judgeWorkerOptsFromEnv(): JudgeWorkerOpts {
   };
 }
 
-async function runJudge(
-  provider: JudgeProvider,
-  materials: Awaited<ReturnType<typeof assembleMaterials>>,
-): Promise<JudgeResultBundle> {
-  const params = {
-    skillName: materials.skillName,
-    composerContract: materials.composerContract,
-    orchestratorContract: materials.orchestratorContract,
-    transcript: materials.transcript,
-  };
+// One judge function bound to its provider/client, reused across a trace's
+// nodes. Throws up front if the openai key is missing (same as before).
+function makeNodeJudge(provider: JudgeProvider): (node: NodeMaterial) => Promise<NodeJudgement> {
   if (provider === "openai") {
     const apiKey = process.env.OPENAI_API_KEY;
     if (!apiKey) throw new Error("OPENAI_API_KEY missing in env");
-    return judgeWithOpenAi(new OpenAI({ apiKey }), params);
+    const openai = new OpenAI({ apiKey });
+    return (node) => judgeNodeWithOpenAi(openai, node);
   }
-  return judgeWithCodex(createCodexClient(), params);
+  const codex = createCodexClient();
+  return (node) => judgeNodeWithCodex(codex, node);
 }
 
 async function processTrace(
@@ -66,25 +61,46 @@ async function processTrace(
   deps: JudgeWorkerDeps,
   opts: JudgeWorkerOpts,
 ): Promise<void> {
-  const materials = await assembleMaterials(deps.source, traceId);
-  console.log(
-    `[judge-worker] judging ${traceId} provider=${opts.provider} skill=${materials.skillName ?? "—"} ` +
-      `obs=${materials.obsCount} transcript=${materials.transcript.length}`,
-  );
-  const result = await runJudge(opts.provider, materials);
-  await deps.writeScores.write(result.scorecard, result.faithfulness, {
-    traceId,
-    provider: opts.provider,
-    promptVersion: JUDGE_PROMPT_VERSION,
-    dryRun: opts.dryRun,
-  });
+  const { nodes } = await assembleNodeMaterials(deps.source, traceId);
+  if (nodes.length === 0) {
+    // No generative node to score (e.g. a pure-agentic fallback run whose only
+    // generations live inside an AGENT black box). Nothing to persist; the
+    // trace stays unjudged but is cheap to re-skip (no LLM call).
+    console.log(`[judge-worker] ${traceId} has no judgeable nodes — skipping`);
+    return;
+  }
+
+  const judge = makeNodeJudge(opts.provider);
+  console.log(`[judge-worker] judging ${traceId} provider=${opts.provider} nodes=${nodes.length}`);
+
+  // Judge ALL nodes first. If any throws (e.g. codex usage limit), we persist
+  // NOTHING and the trace reappears next tick — the whole-trace auto-retry the
+  // single-judgement worker had, preserved per-node. Sequential keeps codex
+  // within the shared ChatGPT quota.
+  const judged: Array<{ node: NodeMaterial; verdict: NodeJudgement }> = [];
+  for (const node of nodes) {
+    const verdict = await judge(node);
+    judged.push({ node, verdict });
+  }
+
+  for (const { node, verdict } of judged) {
+    await deps.writeScores.write(verdict.scorecard, verdict.faithfulness, {
+      traceId,
+      observationId: node.observationId,
+      nodeKind: node.kind,
+      skill: node.skill,
+      provider: opts.provider,
+      promptVersion: JUDGE_PROMPT_VERSION,
+      dryRun: opts.dryRun,
+    });
+  }
 }
 
 async function tick(deps: JudgeWorkerDeps, opts: JudgeWorkerOpts): Promise<void> {
   // The local source returns only COMPLETE runs (written on trace.end()) that
-  // lack a judgement for this (provider, version) — so no age filter and no
+  // lack ANY judgement for this (provider, version) — so no age filter and no
   // separate dedup are needed. A trace that throws (e.g. Codex usage limit)
-  // simply writes no judgement and reappears next tick: auto-retry.
+  // writes no rows and reappears next tick: auto-retry.
   const traces = await deps.source.recentTraces(opts.recentLimit, {
     provider: opts.provider,
     promptVersion: JUDGE_PROMPT_VERSION,

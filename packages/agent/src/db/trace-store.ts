@@ -23,16 +23,21 @@ export interface StoredTraceInput {
   startedAt: string;
 }
 
-// Numeric axis scores (null = judge marked n/a) + the rich payload.
+// One judged node: its identity (trace + observation), owner attribution
+// (node kind + skill), the numeric axis scores (null = not emitted by this
+// node's rubric, or marked n/a), and the rich payload.
 export interface JudgementInput {
   traceId: string;
+  observationId: string;
+  nodeKind: string;
+  skill: string;
   provider: string;
   promptVersion: string;
   scores: {
-    coverage: number | null;
     query_formulation: number | null;
-    composition: number | null;
     process: number | null;
+    coverage: number | null;
+    composition: number | null;
     faithfulness: number | null;
   };
   detail: unknown;
@@ -48,6 +53,10 @@ export interface TraceStore {
   // memory-KV dedup + age window.
   listRecent(limit: number, unjudgedFor?: { provider: string; promptVersion: string }): TraceSummary[];
   writeJudgement(j: JudgementInput): void;
+  // True once ANY node of the trace has a row for (provider, version): the
+  // worker judges all of a trace's nodes in one pass, so the presence of any
+  // row means the trace is done. Mirrors the LEFT JOIN in listRecent's unjudged
+  // filter.
   hasJudgement(traceId: string, provider: string, promptVersion: string): boolean;
 }
 
@@ -107,20 +116,24 @@ export function createTraceStore(db: Database.Database): TraceStore {
   );
   const upsertJudgement = db.prepare(
     `INSERT INTO judgements
-       (trace_id, provider, prompt_version, coverage, query_formulation, composition, process, faithfulness, detail)
+       (trace_id, observation_id, provider, prompt_version, node_kind, skill,
+        query_formulation, process, coverage, composition, faithfulness, detail)
      VALUES
-       (@trace_id, @provider, @prompt_version, @coverage, @query_formulation, @composition, @process, @faithfulness, @detail)
-     ON CONFLICT(trace_id, provider, prompt_version) DO UPDATE SET
-       coverage = excluded.coverage,
+       (@trace_id, @observation_id, @provider, @prompt_version, @node_kind, @skill,
+        @query_formulation, @process, @coverage, @composition, @faithfulness, @detail)
+     ON CONFLICT(trace_id, observation_id, provider, prompt_version) DO UPDATE SET
+       node_kind = excluded.node_kind,
+       skill = excluded.skill,
        query_formulation = excluded.query_formulation,
-       composition = excluded.composition,
        process = excluded.process,
+       coverage = excluded.coverage,
+       composition = excluded.composition,
        faithfulness = excluded.faithfulness,
        detail = excluded.detail,
        created_at = datetime('now')`,
   );
   const selectJudgement = db.prepare(
-    `SELECT 1 FROM judgements WHERE trace_id = ? AND provider = ? AND prompt_version = ?`,
+    `SELECT 1 FROM judgements WHERE trace_id = ? AND provider = ? AND prompt_version = ? LIMIT 1`,
   );
 
   function rowToSummary(row: Pick<TraceRow, "id" | "name" | "tags" | "started_at">): TraceSummary {
@@ -179,12 +192,15 @@ export function createTraceStore(db: Database.Database): TraceStore {
     writeJudgement(j) {
       upsertJudgement.run({
         trace_id: j.traceId,
+        observation_id: j.observationId,
         provider: j.provider,
         prompt_version: j.promptVersion,
-        coverage: j.scores.coverage,
+        node_kind: j.nodeKind,
+        skill: j.skill,
         query_formulation: j.scores.query_formulation,
-        composition: j.scores.composition,
         process: j.scores.process,
+        coverage: j.scores.coverage,
+        composition: j.scores.composition,
         faithfulness: j.scores.faithfulness,
         detail: JSON.stringify(j.detail),
       });

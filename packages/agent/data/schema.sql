@@ -62,24 +62,34 @@ CREATE TABLE IF NOT EXISTS traces (
 CREATE INDEX IF NOT EXISTS traces_started ON traces(started_at);
 CREATE INDEX IF NOT EXISTS traces_skill ON traces(skill);
 
--- One row per (trace, judge provider, prompt version). Axis scores live in
+-- One row per JUDGED NODE: (trace, observation, judge provider, prompt
+-- version). A node is one generative LLM observation — the planner generation,
+-- an llm_compose, or an llm_agent step — owned by exactly one skill (or the
+-- planner). Per-node scores localize the signal to the unit the improver
+-- patches (a skill), so the PK is the node, not the run. Axis scores live in
 -- numeric columns so the improver can filter/aggregate cheaply
 -- (WHERE composition < 0.7, GROUP BY skill); the rich payload (labels,
--- rationale, evidence, faithfulness claims) is the `detail` JSON. A null
--- axis column means the judge marked that axis n/a for the run.
+-- rationale, evidence, faithfulness claims) is the `detail` JSON. Axes are
+-- owner-type specific: a planner node fills query_formulation/process, a
+-- composer/agent node fills coverage/composition/faithfulness — the others
+-- stay null. A null axis the rubric DID emit means the judge marked it n/a.
 CREATE TABLE IF NOT EXISTS judgements (
   trace_id           TEXT NOT NULL,
+  observation_id     TEXT NOT NULL,                -- the judged node's observation id
   provider           TEXT NOT NULL,                -- codex|openai
-  prompt_version     TEXT NOT NULL,                -- e.g. v3
-  coverage           REAL,
+  prompt_version     TEXT NOT NULL,                -- e.g. n1
+  node_kind          TEXT NOT NULL,                -- planner|compose|agent
+  skill              TEXT NOT NULL,                -- owner skill (planner for prompt-only)
   query_formulation  REAL,
-  composition        REAL,
   process            REAL,
+  coverage           REAL,
+  composition        REAL,
   faithfulness       REAL,
-  detail             TEXT NOT NULL,                -- json: full scorecard + faithfulness
+  detail             TEXT NOT NULL,                -- json: scorecard (+ faithfulness)
   created_at         TEXT NOT NULL DEFAULT (datetime('now')),
-  PRIMARY KEY (trace_id, provider, prompt_version),
+  PRIMARY KEY (trace_id, observation_id, provider, prompt_version),
   FOREIGN KEY (trace_id) REFERENCES traces(id)
 );
-CREATE INDEX IF NOT EXISTS judgements_scores
-  ON judgements(prompt_version, composition, coverage);
+-- The improver aggregates low-score clusters per (skill, version) → patch.
+CREATE INDEX IF NOT EXISTS judgements_skill
+  ON judgements(skill, prompt_version);

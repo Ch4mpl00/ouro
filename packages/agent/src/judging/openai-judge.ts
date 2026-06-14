@@ -1,38 +1,32 @@
 import OpenAI from "openai";
 import {
   buildFaithUserPrompt,
-  buildUserPrompt,
   FAITH_RESPONSE_SCHEMA,
   FAITH_SYSTEM_PROMPT,
   FaithfulnessSchema,
   JUDGE_MODEL,
-  RESPONSE_SCHEMA,
+  rubricFor,
   ScorecardSchema,
-  SYSTEM_PROMPT,
   type Faithfulness,
-  type JudgeResultBundle,
+  type JudgeNodeInput,
+  type NodeJudgement,
   type Scorecard,
 } from "./schema";
 
-export async function judgeScorecardWithOpenAi(
-  openai: OpenAI,
-  composerSkill: string | null,
-  composerContract: string | null,
-  orchestratorContract: string | null,
-  transcript: string,
-): Promise<Scorecard> {
+async function scorecardFor(openai: OpenAI, node: JudgeNodeInput): Promise<Scorecard> {
+  const rubric = rubricFor(node.kind);
   const res = await openai.chat.completions.create({
     model: JUDGE_MODEL,
     messages: [
-      { role: "system", content: SYSTEM_PROMPT },
+      { role: "system", content: rubric.system },
       {
         role: "user",
-        content: buildUserPrompt(composerSkill, composerContract, orchestratorContract, transcript),
+        content: rubric.buildUserPrompt(node.skill, node.contract, node.inputText, node.outputText),
       },
     ],
     response_format: {
       type: "json_schema",
-      json_schema: { name: "scorecard", strict: true, schema: RESPONSE_SCHEMA },
+      json_schema: { name: "scorecard", strict: true, schema: rubric.responseSchema },
     },
   });
   const content = res.choices[0]?.message.content;
@@ -40,16 +34,12 @@ export async function judgeScorecardWithOpenAi(
   return ScorecardSchema.parse(JSON.parse(content));
 }
 
-export async function judgeFaithfulnessWithOpenAi(
-  openai: OpenAI,
-  composerContract: string | null,
-  transcript: string,
-): Promise<Faithfulness> {
+async function faithfulnessFor(openai: OpenAI, node: JudgeNodeInput): Promise<Faithfulness> {
   const res = await openai.chat.completions.create({
     model: JUDGE_MODEL,
     messages: [
       { role: "system", content: FAITH_SYSTEM_PROMPT },
-      { role: "user", content: buildFaithUserPrompt(composerContract, transcript) },
+      { role: "user", content: buildFaithUserPrompt(node.contract, node.inputText, node.outputText) },
     ],
     response_format: {
       type: "json_schema",
@@ -61,24 +51,14 @@ export async function judgeFaithfulnessWithOpenAi(
   return FaithfulnessSchema.parse(JSON.parse(content));
 }
 
-export async function judgeWithOpenAi(
-  openai: OpenAI,
-  params: {
-    skillName: string | null;
-    composerContract: string | null;
-    orchestratorContract: string | null;
-    transcript: string;
-  },
-): Promise<JudgeResultBundle> {
+// Judge ONE node: its axis scorecard, plus the faithfulness pass for
+// compose/agent nodes (planner nodes have no faithfulness axis). The two LLM
+// calls run concurrently.
+export async function judgeNodeWithOpenAi(openai: OpenAI, node: JudgeNodeInput): Promise<NodeJudgement> {
+  const wantsFaith = rubricFor(node.kind).faithfulness;
   const [scorecard, faithfulness] = await Promise.all([
-    judgeScorecardWithOpenAi(
-      openai,
-      params.skillName,
-      params.composerContract,
-      params.orchestratorContract,
-      params.transcript,
-    ),
-    judgeFaithfulnessWithOpenAi(openai, params.composerContract, params.transcript),
+    scorecardFor(openai, node),
+    wantsFaith ? faithfulnessFor(openai, node) : Promise.resolve(null),
   ]);
   return { scorecard, faithfulness };
 }

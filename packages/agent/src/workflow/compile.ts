@@ -6,6 +6,7 @@ import type { ModelPreset, PresetName } from "../models";
 import type { ChatProvider } from "../providers";
 import type { EnvData } from "../session-context";
 import type { Span, TraceContext } from "../tracing";
+import { JUDGE_NODE_META } from "../trace-model";
 import { createWorkflowSchema, parseWorkflow, type Workflow } from "./dsl";
 
 // Compiler — turns a signal into a validated Workflow via one LLM call (with
@@ -189,6 +190,9 @@ async function runRetryLoop(
       model: preset.model,
       input: messages,
       modelParameters: { response_format: "json_object" },
+      // Mark this as the planner node for the per-node judge. Identity comes
+      // from this tag, never the name — `attempt-N` is display-only.
+      metadata: { [JUDGE_NODE_META]: "planner" },
     });
 
     let text: string;

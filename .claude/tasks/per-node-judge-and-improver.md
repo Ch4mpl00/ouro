@@ -1,6 +1,6 @@
 # Per-node judge + closed-loop self-improvement
 
-**Status:** in-progress (Phase 1)
+**Status:** Phase 1 DONE (in PR, not merged); Phase 2 next
 **Priority:** P1
 **Area:** evals / agent / self-improvement
 **Created:** 2026-06-14
@@ -98,7 +98,36 @@ prompt-cache prefix `compile.ts` deliberately builds.
 - `judge-replay.ts`: `--planner-file` (full body swap), `--compose`, swap-debiased
   `--judge`. Reused/generalized in Phase 2.
 
-## Phase 1 — per-node judge (THIS slice, execute first)
+## Phase 1 — per-node judge (THIS slice, execute first) — DONE
+
+Built, typecheck + `pnpm test` green (190), verified end-to-end on a fixtured
+news-digest trace via `pnpm judge --dump` (planner node → planner.md; compose
+node → news-digest.md; agent node black-box). Not yet judged live (needs an
+OpenAI/codex key + a real trace) but the path is exercised.
+
+### Deviations from the plan below (locked, with rationale)
+- **Node role is `metadata.judge_node`, NOT `metadata.skill`** (Step 1). Putting
+  `skill="planner"` on the planner generation would poison `resolveSkill` (it
+  takes the first `metadata.skill` in the tree for the `traces.skill` column =
+  "which skill COMPOSED the output"), turning every workflow trace's skill into
+  "planner". So node role got its own key (`JUDGE_NODE_META` in `trace-model.ts`),
+  orthogonal to `skill`. Compose generations are tagged the same way
+  (`judge_node="compose"`, with the owner `skill` riding along, null=prompt-only).
+- **Classification is metadata-only, never by observation NAME.** `attempt-N` /
+  `llm_compose:*` are display-only labels — renaming them must not break judging
+  (caught in review). `classify()` reads `judge_node` + AGENT type; a unit test
+  pins the rename-independence. Agent nodes are still identified structurally
+  (AGENT-type span), inner `iter-*` generations skipped via `hasAgentAncestor`.
+- **Two strict response schemas** (planner: query_formulation/process; composer:
+  coverage/composition) instead of one — strict-mode forces each rubric to emit
+  exactly its own axes.
+- **llm_agent step now records `span.input`** (the resolved prompt) so the agent
+  node is judgeable black-box; it was null before.
+- **Local DROP needed once on machines that ran bb8c292** (the old per-run
+  `judgements` table); fresh installs (the droplet — bb8c292 undeployed) create
+  the new per-node table directly, no manual step.
+
+### Original plan
 
 1. **Stamp the planner generation with `metadata.skill = "planner"`**
    (`workflow/compile.ts`, the `attempt-N` generation). Today it's identified
