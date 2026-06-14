@@ -1,9 +1,15 @@
 # Reference-free trajectory judge over Langfuse traces
 
-**Status:** in-progress
+**Status:** superseded → [[per-node-judge-and-improver]]
 **Priority:** P2
 **Area:** evals / agent
 **Created:** 2026-06-07
+
+> SUPERSEDED 2026-06-14. The whole-run trajectory judge described here is being
+> replaced by a **per-node** judge (one score per generative LLM node) to drive
+> the closed-loop improver. See `per-node-judge-and-improver.md`. The infra
+> built since (local trace mirror, codex judge stack, judge-replay A/B) is
+> reused there. Kept for the calibration / judge-method findings in Notes.
 
 ## Context
 
