@@ -1,13 +1,9 @@
-import OpenAI from "openai";
 import { assembleNodeMaterials, type NodeMaterial } from "./materials";
-import { judgeNodeWithOpenAi } from "./openai-judge";
-import { createCodexClient } from "./codex-client";
-import { judgeNodeWithCodex } from "./codex-judge";
+import { createJudgeBackend, type JudgeProvider } from "./judge-backend";
+import { judgeNode } from "./node-judge";
 import type { ScoreWriter } from "./langfuse-scores";
 import type { TraceSource } from "./trace-source";
 import { JUDGE_PROMPT_VERSION, type NodeJudgement } from "./schema";
-
-type JudgeProvider = "openai" | "codex";
 
 export interface JudgeWorkerDeps {
   source: TraceSource;
@@ -43,19 +39,6 @@ export function judgeWorkerOptsFromEnv(): JudgeWorkerOpts {
   };
 }
 
-// One judge function bound to its provider/client, reused across a trace's
-// nodes. Throws up front if the openai key is missing (same as before).
-function makeNodeJudge(provider: JudgeProvider): (node: NodeMaterial) => Promise<NodeJudgement> {
-  if (provider === "openai") {
-    const apiKey = process.env.OPENAI_API_KEY;
-    if (!apiKey) throw new Error("OPENAI_API_KEY missing in env");
-    const openai = new OpenAI({ apiKey });
-    return (node) => judgeNodeWithOpenAi(openai, node);
-  }
-  const codex = createCodexClient();
-  return (node) => judgeNodeWithCodex(codex, node);
-}
-
 async function processTrace(
   traceId: string,
   deps: JudgeWorkerDeps,
@@ -70,7 +53,7 @@ async function processTrace(
     return;
   }
 
-  const judge = makeNodeJudge(opts.provider);
+  const backend = createJudgeBackend(opts.provider);
   console.log(`[judge-worker] judging ${traceId} provider=${opts.provider} nodes=${nodes.length}`);
 
   // Judge ALL nodes first. If any throws (e.g. codex usage limit), we persist
@@ -79,7 +62,7 @@ async function processTrace(
   // within the shared ChatGPT quota.
   const judged: Array<{ node: NodeMaterial; verdict: NodeJudgement }> = [];
   for (const node of nodes) {
-    const verdict = await judge(node);
+    const verdict = await judgeNode(backend, node);
     judged.push({ node, verdict });
   }
 

@@ -6,16 +6,13 @@ import { fetchRecentTraces } from "./langfuse-api";
 import { createAgentDb } from "../db/client";
 import { createTraceStore } from "../db/trace-store";
 import { assembleNodeMaterials, type NodeMaterial } from "../judging/materials";
-import { judgeNodeWithOpenAi } from "../judging/openai-judge";
-import { createCodexClient } from "../judging/codex-client";
-import { judgeNodeWithCodex } from "../judging/codex-judge";
+import { createJudgeBackend, type JudgeProvider } from "../judging/judge-backend";
+import { judgeNode } from "../judging/node-judge";
 import { nodeSummaryLine, printNodeJudgement, printTraceHeader } from "../judging/print";
-import { rubricFor, type NodeJudgement } from "../judging/schema";
+import { rubricFor } from "../judging/schema";
 import { createLangfuseTraceSource, createLocalTraceSource, type TraceSource } from "../judging/trace-source";
 
 loadEnv({ path: ".env.agent" });
-
-type JudgeProvider = "openai" | "codex";
 
 interface CliOpts {
   dump: boolean;
@@ -54,18 +51,6 @@ function parseArgs(argv: string[]): CliOpts {
   return { dump, provider, args };
 }
 
-// One judge bound to its provider/client, reused across a trace's nodes.
-function makeNodeJudge(
-  provider: JudgeProvider,
-  openai: OpenAI | null,
-): (node: NodeMaterial) => Promise<NodeJudgement> {
-  if (provider === "codex") {
-    const codex = createCodexClient();
-    return (node) => judgeNodeWithCodex(codex, node);
-  }
-  return (node) => judgeNodeWithOpenAi(openai!, node);
-}
-
 async function judgeOne(
   source: TraceSource,
   provider: JudgeProvider,
@@ -76,11 +61,11 @@ async function judgeOne(
   console.error(`[judge] trace ${traceId} · provider=${provider} · ${nodes.length} judgeable nodes`);
   printTraceHeader(traceId);
 
-  const judge = makeNodeJudge(provider, openai);
+  const backend = createJudgeBackend(provider, openai);
   const summary: string[] = [];
   for (const node of nodes) {
     const header = { label: node.label, kind: node.kind, skill: node.skill };
-    const verdict = await judge(node);
+    const verdict = await judgeNode(backend, node);
     printNodeJudgement(header, verdict);
     summary.push(nodeSummaryLine(header, verdict));
   }
