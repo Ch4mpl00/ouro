@@ -10,7 +10,7 @@ cheap experimentation. The judge is PER NODE: one score per generative LLM node
 (the planner generation, each `llm_compose`, each `llm_agent` step), each scored
 against THAT node's owner contract. The rubrics below are kept verbatim-synced
 with `packages/agent/src/judging/schema.ts` (`PLANNER_NODE_PROMPT`,
-`COMPOSER_NODE_PROMPT`, `FAITH_SYSTEM_PROMPT`, prompt version `n1`) — do not
+`COMPOSER_NODE_PROMPT`, `FAITH_SYSTEM_PROMPT`, prompt version `n2`) — do not
 improvise your own criteria, or scores stop being comparable between the two
 judges.
 
@@ -39,7 +39,7 @@ judges.
    When several nodes (or several traces) are judged, finish with the one-line
    summary table.
 
-## Planner node rubric (prompt n1 — keep verbatim-equivalent to schema.ts)
+## Planner node rubric (prompt n2 — keep verbatim-equivalent to schema.ts)
 
 You are a rigorous evaluation judge for the PLANNER (orchestrator) of an AI agent. The planner reads one signal plus environment context and emits a workflow: a JSON plan of steps — tool calls (search_news, get_telegram_chat_history, send_telegram_message, set_memory, …), llm_compose / llm_agent steps that delegate to a skill, parallel groups, replan, and a terminal. You are scoring the PLAN ITSELF (the orchestration decision), NOT its execution: execution is deterministic code that walks the steps, so a sound plan is a sound run. You did not author the plan and have no stake in it.
 
@@ -49,15 +49,16 @@ Inputs:
 - PLAN — the planner's output: the Workflow JSON (the steps to run).
 
 Score EXACTLY these two axes from 0 to 1 (fail < 0.3, weak < 0.5, ok < 0.75, strong >= 0.75), each with a one-sentence rationale and concrete evidence (a step kind/bind or a query string):
-- query_formulation -> the PLANNER_CONTRACT's retrieval rules AND the target topics implied by the signal. Look at the search/RAG steps' arguments (the queries Q, the source routing, sinceISO/limit filters): do they cover the intent's target topics with good retrieval terms, the right sources, and a correct time window? Reward precise, well-routed queries; penalize vague, missing, or mis-routed ones.
-- process -> the PLANNER_CONTRACT. Walk the plan step by step: is every step the right tool/skill with sane arguments, in a sensible order; does each binding get consumed downstream (not bound and dropped); are watermarks/memory updated when the contract requires it; is the result delivered the way the contract requires (e.g. send to the right chat); is the terminal/replan structure correct? Redundant, missing, contradictory, or dangling steps lower the score.
+- query_formulation -> the PLANNER_CONTRACT's retrieval rules AND the target topics implied by the signal. Look at the search/RAG steps' arguments (the queries Q, the source routing, sinceISO/limit filters): do they cover the intent's target topics with good retrieval terms, the right sources, and a correct time window? Reward precise, well-routed queries; penalize vague, missing, or mis-routed ones. This axis covers ONLY semantic search/RAG (search_news / list_news / find_notes); when the plan legitimately needs none, set it n/a (applicable=false) — and then process carries the FULL evaluation. (Gathering decisions that are NOT semantic search — e.g. fetching chat history — belong to process, not here.)
+- process -> the PLANNER_CONTRACT. Walk the plan step by step: is every step the right tool/skill with sane arguments, in a sensible order; does each binding get consumed downstream (not bound and dropped); are watermarks/memory updated when the contract requires it; is the result delivered the way the contract requires (e.g. send to the right chat); is the terminal/replan structure correct? CRITICAL — does the plan RESOLVE referential ambiguity BEFORE acting: when the signal carries a pronoun or back-reference to unseen prior context (e.g. «ему»/«его»/«там»/«продолжай»/«то же самое»/"the other one"), the plan MUST gather that context (e.g. get_telegram_chat_history) and replan per the contract's ambiguous-context shape — a plan that bakes an unresolved referent into its deliverable (a reminder, reply, or task prompt) has FAILED the intent and scores weak at best, however tidy its mechanics. Score what the deliverable actually accomplishes for the signal, not just whether the steps are well-formed. Redundant, missing, contradictory, or dangling steps lower the score.
 
 Rules:
 - Judge the plan against the contract, not against your own idea of a nicer plan. A different-but-valid plan is not a defect.
-- If the signal legitimately calls for a tiny plan (e.g. a one-shot reply), a short correct plan scores high — reward correctness, not elaborateness.
+- If the signal legitimately calls for a tiny plan (e.g. a one-shot reply), a short correct plan scores high — reward correctness, not elaborateness. But "tidy mechanics" is NOT correctness if the plan ignored ambiguity or fails the signal's actual intent.
+- The planner is ALWAYS substantively judged. n/a on query_formulation (no retrieval) is fine, but never sign the planner off with a lenient process just because the steps look clean — always weigh whether the plan satisfies the signal.
 - Ground every claim in the PLAN / SIGNAL_AND_ENV. Never invent steps or queries that aren't there.
 
-## Composer / agent node rubric (prompt n1 — keep verbatim-equivalent to schema.ts)
+## Composer / agent node rubric (prompt n2 — keep verbatim-equivalent to schema.ts)
 
 You are a rigorous evaluation judge for ONE composer node of an AI agent — a single skill that receives gathered candidates (and any chat history) as INPUT and writes a final text (F). The composer does NOT call tools and does NOT fetch anything; it legitimately receives its material as input. You are scoring THIS node in isolation: its input is everything it had to work with, its output is the text it produced. You did not author it and have no stake in it.
 
@@ -102,7 +103,7 @@ One block per node. Planner nodes show `query_formulation` + `process`;
 compose/agent nodes show `coverage` + `composition` + a faithfulness line.
 
 ```
-=== JUDGE claude-code (prompt n1) · trace <id> ===
+=== JUDGE claude-code (prompt n2) · trace <id> ===
 
 ── node <label> · <kind> · skill <skill> ──
 ● <axis>: <fail|weak|ok|strong|n/a> (<0.00-1.00|n/a>)
