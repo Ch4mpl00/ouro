@@ -62,8 +62,9 @@ mcp-tools/
     │       ├── tools/                       MCP-exposed actions
     │       └── services/{gmail,telegram,monobank,scheduler,news,pdf,signals,settings}
     └── agent/
-        ├── data/{schema.sql, agent.db}      agent-side state (memory KV)
+        ├── data/agent.db                    agent-side state (memory KV + trace mirror)
         └── src/
+            ├── db/{client,memory,trace-store,schema}.ts + migrations/  Drizzle (sqlite)
             ├── supervisor/{main,fallback}.ts  poll loop + workflow failure handling
             ├── workflow/                      dynamic-workflow module (compile + execute)
             │   ├── index.ts                   createWorkflowRunner facade (runForSignal)
@@ -96,10 +97,12 @@ mcp-tools/
   tokens, Gmail watermarks, Telegram poll cursors, the `signals` queue,
   the `scheduled_tasks` table, userbot channel watermarks. Don't read or
   write this from agent code — go through MCP tools.
-- **`packages/agent/data/agent.db`** (sqlite) — agent's domain state.
-  Currently only `memory` (freeform KV, e.g. `news_digest.last_read_at`).
-  A `bills` table exists in schema as a leftover but is no longer
-  populated.
+- **`packages/agent/data/agent.db`** (sqlite) — agent's domain state:
+  `memory` (freeform KV, e.g. `news_digest.last_read_at`) plus the local
+  trace mirror (`traces` + per-node `judgements`). Schema lives in code at
+  `packages/agent/src/db/schema.ts` (Drizzle ORM, sqlite); migrations are
+  generated with `pnpm db:generate:agent` and applied on boot
+  (`db/client.ts`, also `pnpm setup:agent`).
 - **Postgres + pgvector** (containerized, `postgres` service in
   docker-compose) — the news / RAG store. One table `news_items` unifies
   HN/Habr articles and harvested Telegram channel posts; rows have a
@@ -109,9 +112,10 @@ mcp-tools/
   `packages/mcp/src/db/pg/schema.ts` (Drizzle ORM); migrations are
   generated with `pnpm db:generate:pg` and applied on server boot.
 
-Schemas: `packages/mcp/data/schema.sql`, `packages/agent/data/schema.sql`,
-`packages/mcp/src/db/pg/schema.ts`. Re-apply sqlite with `pnpm db:init`
-(idempotent); PG migrations apply automatically when mcp starts.
+Schemas: `packages/mcp/data/schema.sql` (mcp sqlite, raw),
+`packages/agent/src/db/schema.ts` (agent sqlite, Drizzle),
+`packages/mcp/src/db/pg/schema.ts` (PG, Drizzle). Re-apply with `pnpm db:init`
+(idempotent); agent + PG migrations apply automatically on boot.
 
 For ad-hoc queries during development:
 
@@ -258,6 +262,9 @@ volume — written by the `dreaming` skill when it self-revises).
 - `pnpm db:generate:pg` — regenerate Drizzle migrations after editing
   `packages/mcp/src/db/pg/schema.ts`. The new `*.sql` file lands in
   `packages/mcp/src/db/pg/migrations/` and is applied on next mcp boot.
+- `pnpm db:generate:agent` — same for the agent sqlite schema
+  (`packages/agent/src/db/schema.ts` → `packages/agent/src/db/migrations/`,
+  applied on agent/judge-worker boot via `db/client.ts`).
 - `pnpm db:migrate:channel-posts` — one-shot copy of the legacy sqlite
   `channel_posts` table into PG `news_items` + inline-embed. Idempotent.
 - `pnpm embed:backfill` — re-attempt embeddings for any `news_items`

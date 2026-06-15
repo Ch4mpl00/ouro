@@ -25,7 +25,7 @@ async function main(): Promise<void> {
 
     await runJudgeWorker({ source, writeScores }, judgeWorkerOptsFromEnv());
   } finally {
-    db.close();
+    db.$client.close();
   }
 }
 
