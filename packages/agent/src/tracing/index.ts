@@ -34,6 +34,10 @@ export interface GenerationEndOpts extends SpanEndOpts {
 }
 
 export interface Generation {
+  // The backend's observation id. For Langfuse this is the OTel span id — the
+  // same id the scores API targets — so the tee can force it onto the local
+  // mirror and per-observation judge scores link back to the right step.
+  readonly id: string;
   end(opts: GenerationEndOpts): void;
 }
 
@@ -46,6 +50,10 @@ export interface TraceContextUpdate {
 export interface GenerationStartOpts {
   name: string;
   model: string;
+  // Force a specific observation id (the tee passes the primary backend's id so
+  // the secondary mirror shares it). Backends that own their id (Langfuse/OTel)
+  // ignore it; the local recorder uses it instead of a random one.
+  id?: string;
   // Scalar-only by design: most observability backends index these for
   // filtering, so structured objects don't belong here. Stick to the LLM
   // request parameters (temperature, top_p, reasoning_effort, ...).
@@ -76,6 +84,8 @@ export interface SpanStartOpts {
   metadata?: Record<string, unknown>;
   // Defaults to "span" when omitted.
   kind?: SpanKind;
+  // Force a specific observation id (see GenerationStartOpts.id).
+  id?: string;
 }
 
 // A point-in-time marker with no duration and no children — renders as a
@@ -106,6 +116,8 @@ export interface TraceContext {
 // A Span is a TraceContext with a lifecycle terminator. Use `end` to set
 // the final output + status; `update` for intermediate refinements.
 export interface Span extends TraceContext {
+  // The backend's observation id (see Generation.id).
+  readonly id: string;
   end(opts: SpanEndOpts): void;
 }
 
@@ -145,8 +157,9 @@ export interface Tracer {
 // no-op objects (instead of forcing every call site to null-check) keeps
 // Session free of `?.` chains. The NOOP_SPAN self-reference works because
 // the property is a function — by the time it runs, the const exists.
-const NOOP_GENERATION: Generation = { end() {} };
+const NOOP_GENERATION: Generation = { id: "", end() {} };
 const NOOP_SPAN: Span = {
+  id: "",
   update() {},
   end() {},
   generation: () => NOOP_GENERATION,

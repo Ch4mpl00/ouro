@@ -5,8 +5,11 @@ export const JUDGE_MODEL = "gpt-5.4";
 // node is scored against its OWNER contract, so the signal pins to one skill.
 // n2: planner `process` axis hardened to penalize unresolved referential
 // ambiguity (pronouns to unseen context → must gather+replan) and to always
-// judge the planner substantively. Bump re-judges the corpus at the new version.
-export const JUDGE_PROMPT_VERSION = "n2";
+// judge the planner substantively.
+// n3: calibration — an unresolved referent DEGRADES (weak/ok), it is not a
+// fail when the core task still executes; reserve fail for not-accomplished.
+// Bump re-judges the corpus at the new version.
+export const JUDGE_PROMPT_VERSION = "n3";
 
 // A judgeable node's owner type. Selects the rubric (planner axes vs composer
 // axes) and whether faithfulness applies. `compose` and `agent` share a rubric
@@ -114,7 +117,7 @@ Inputs:
 
 Score EXACTLY these two axes from 0 to 1 (fail < 0.3, weak < 0.5, ok < 0.75, strong >= 0.75), each with a one-sentence rationale and concrete evidence (a step kind/bind or a query string):
 - query_formulation -> the PLANNER_CONTRACT's retrieval rules AND the target topics implied by the signal. Look at the search/RAG steps' arguments (the queries Q, the source routing, sinceISO/limit filters): do they cover the intent's target topics with good retrieval terms, the right sources, and a correct time window? Reward precise, well-routed queries; penalize vague, missing, or mis-routed ones. This axis covers ONLY semantic search/RAG (search_news / list_news / find_notes); when the plan legitimately needs none, set it n/a (applicable=false) — and then process carries the FULL evaluation. (Gathering decisions that are NOT semantic search — e.g. fetching chat history — belong to process, not here.)
-- process -> the PLANNER_CONTRACT. Walk the plan step by step: is every step the right tool/skill with sane arguments, in a sensible order; does each binding get consumed downstream (not bound and dropped); are watermarks/memory updated when the contract requires it; is the result delivered the way the contract requires (e.g. send to the right chat); is the terminal/replan structure correct? CRITICAL — does the plan RESOLVE referential ambiguity BEFORE acting: when the signal carries a pronoun or back-reference to unseen prior context (e.g. «ему»/«его»/«там»/«продолжай»/«то же самое»/"the other one"), the plan MUST gather that context (e.g. get_telegram_chat_history) and replan per the contract's ambiguous-context shape — a plan that bakes an unresolved referent into its deliverable (a reminder, reply, or task prompt) has FAILED the intent and scores weak at best, however tidy its mechanics. Score what the deliverable actually accomplishes for the signal, not just whether the steps are well-formed. Redundant, missing, contradictory, or dangling steps lower the score.
+- process -> the PLANNER_CONTRACT. Walk the plan step by step: is every step the right tool/skill with sane arguments, in a sensible order; does each binding get consumed downstream (not bound and dropped); are watermarks/memory updated when the contract requires it; is the result delivered the way the contract requires (e.g. send to the right chat); is the terminal/replan structure correct? CRITICAL — does the plan RESOLVE referential ambiguity BEFORE acting: when the signal carries a pronoun or back-reference to unseen prior context (e.g. «ему»/«его»/«там»/«продолжай»/«то же самое»/"the other one"), the plan MUST gather that context (e.g. get_telegram_chat_history) and replan per the contract's ambiguous-context shape — a plan that bakes an unresolved referent into its deliverable (a reminder, reply, or task prompt) has a real defect that DEGRADES the deliverable: dock it (typically to weak/ok, not strong). Calibrate by what the plan ACCOMPLISHES: reserve fail (<0.3) for plans that don't accomplish the task at all; when the core task still executes correctly (e.g. the reminder still fires at the right time, just with an unresolved referent) it is "done but imperfect" → weak/ok, not fail. Score what the deliverable accomplishes for the signal, not just whether the steps are well-formed. Redundant, missing, contradictory, or dangling steps lower the score.
 
 Rules:
 - Judge the plan against the contract, not against your own idea of a nicer plan. A different-but-valid plan is not a defect.

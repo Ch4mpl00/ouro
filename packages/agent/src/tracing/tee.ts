@@ -7,6 +7,7 @@ import type {
   SpanEndOpts,
   SpanStartOpts,
   Trace,
+  TraceContext,
   TraceContextUpdate,
   TraceStartOpts,
   Tracer,
@@ -24,8 +25,24 @@ import type {
 // judge never cross-references child ids across systems, so no override is
 // needed below the root.
 
+// Create a child on the primary, then the secondary WITH the primary's id
+// forced — so the local mirror's observation id == the Langfuse observation id,
+// and per-observation judge scores link back to the right step.
+function forkGeneration(a: TraceContext, b: TraceContext, opts: GenerationStartOpts): Generation {
+  const ga = a.generation(opts);
+  const gb = b.generation({ ...opts, id: ga.id });
+  return teeGeneration(ga, gb);
+}
+
+function forkSpan(a: TraceContext, b: TraceContext, opts: SpanStartOpts): Span {
+  const sa = a.span(opts);
+  const sb = b.span({ ...opts, id: sa.id });
+  return teeSpan(sa, sb);
+}
+
 function teeGeneration(a: Generation, b: Generation): Generation {
   return {
+    id: a.id,
     end(opts: GenerationEndOpts): void {
       a.end(opts);
       b.end(opts);
@@ -35,6 +52,7 @@ function teeGeneration(a: Generation, b: Generation): Generation {
 
 function teeSpan(a: Span, b: Span): Span {
   return {
+    id: a.id,
     update(data: TraceContextUpdate): void {
       a.update(data);
       b.update(data);
@@ -44,10 +62,10 @@ function teeSpan(a: Span, b: Span): Span {
       b.end(opts);
     },
     generation(opts: GenerationStartOpts): Generation {
-      return teeGeneration(a.generation(opts), b.generation(opts));
+      return forkGeneration(a, b, opts);
     },
     span(opts: SpanStartOpts): Span {
-      return teeSpan(a.span(opts), b.span(opts));
+      return forkSpan(a, b, opts);
     },
     event(opts: EventStartOpts): void {
       a.event(opts);
@@ -64,10 +82,10 @@ function teeTrace(a: Trace, b: Trace): Trace {
       b.update(data);
     },
     generation(opts: GenerationStartOpts): Generation {
-      return teeGeneration(a.generation(opts), b.generation(opts));
+      return forkGeneration(a, b, opts);
     },
     span(opts: SpanStartOpts): Span {
-      return teeSpan(a.span(opts), b.span(opts));
+      return forkSpan(a, b, opts);
     },
     event(opts: EventStartOpts): void {
       a.event(opts);

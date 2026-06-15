@@ -214,12 +214,13 @@ function flakyProvider(errors: unknown[]): { provider: ChatProvider; calls: () =
 function captureTrace(): { ctx: Span; events: EventStartOpts[] } {
   const events: EventStartOpts[] = [];
   const ctx: Span = {
+    id: "test-span",
     update() {},
     end() {},
     event(o) {
       events.push(o);
     },
-    generation: () => ({ end() {} }),
+    generation: () => ({ id: "test-gen", end() {} }),
     span: () => ctx,
   };
   return { ctx, events };
