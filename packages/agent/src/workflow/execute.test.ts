@@ -26,6 +26,7 @@ function recordingSpan(): Span & { events: unknown[] } {
   const events: unknown[] = [];
   const span: Span & { events: unknown[] } = {
     events,
+    id: "test-span",
     update(data) {
       events.push({ kind: "update", data });
     },
@@ -35,6 +36,7 @@ function recordingSpan(): Span & { events: unknown[] } {
     generation(opts) {
       events.push({ kind: "generation:start", opts });
       const gen: Generation = {
+        id: "test-gen",
         end(eo) {
           events.push({ kind: "generation:end", opts: eo });
         },
@@ -75,6 +77,7 @@ function collectingTrace(): { trace: Trace; all: Array<{ name: string; events: u
     const events: unknown[] = [];
     const self: Span & { events: unknown[] } = {
       events,
+      id: "test-span",
       update(data) {
         events.push({ kind: "update", data });
       },
@@ -84,6 +87,7 @@ function collectingTrace(): { trace: Trace; all: Array<{ name: string; events: u
       generation(opts) {
         events.push({ kind: "generation:start", opts });
         return {
+          id: "test-gen",
           end(eo) {
             events.push({ kind: "generation:end", opts: eo });
           },

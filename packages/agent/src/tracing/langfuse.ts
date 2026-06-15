@@ -177,6 +177,8 @@ function wrapTrace(s: LangfuseSpan): Trace {
 
 function wrapSpan(s: LangfuseSpan): Span {
   return {
+    // OTel span id = the Langfuse observation id (see wrapGeneration).
+    id: s.otelSpan.spanContext().spanId,
     update(data: TraceContextUpdate): void {
       applyContextUpdate(s, data);
     },
@@ -202,6 +204,8 @@ function wrapSpan(s: LangfuseSpan): Span {
 
 function wrapGeneration(g: LangfuseGeneration): Generation {
   return {
+    // OTel span id = the Langfuse observation id the scores API targets.
+    id: g.otelSpan.spanContext().spanId,
     end(opts: GenerationEndOpts): void {
       const patch: Record<string, unknown> = {};
       if (opts.output !== undefined) patch.output = opts.output;

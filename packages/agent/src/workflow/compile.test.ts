@@ -18,10 +18,11 @@ const PRESETS: Record<PresetName, ModelPreset> = {
 
 function recordingSpan(): Span {
   const span: Span = {
+    id: "test-span",
     update() {},
     end() {},
     generation(_) {
-      const gen: Generation = { end() {} };
+      const gen: Generation = { id: "test-gen", end() {} };
       return gen;
     },
     span(opts) {
@@ -38,7 +39,7 @@ function recordingTrace(): Trace {
     update() {},
     end() {},
     generation() {
-      return { end() {} };
+      return { id: "test-gen", end() {} };
     },
     span: () => recordingSpan(),
     event() {},
@@ -58,6 +59,7 @@ function collectingTrace(): { trace: Trace; gens: GenRecord[] } {
     const rec: GenRecord = { name: opts.name, startMeta: opts.metadata, endMeta: undefined };
     gens.push(rec);
     return {
+      id: "test-gen",
       end(o) {
         rec.endMeta = o?.metadata;
       },
@@ -65,6 +67,7 @@ function collectingTrace(): { trace: Trace; gens: GenRecord[] } {
   }
   function span(): Span {
     return {
+      id: "test-span",
       update() {},
       end() {},
       generation: record,

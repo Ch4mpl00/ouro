@@ -95,6 +95,9 @@ function newObservation(
 
 function makeGeneration(state: RunState, parentId: string, opts: GenerationStartOpts): Generation {
   const obs = newObservation(parentId, opts.name, "GENERATION", {
+    // Use the forced id (the tee passes the Langfuse observation id) so judge
+    // scores written against this node link back to the right Langfuse step.
+    ...(opts.id ? { id: opts.id } : {}),
     input: opts.input ?? null,
     model: opts.model,
     modelParameters: opts.modelParameters ?? null,
@@ -102,6 +105,7 @@ function makeGeneration(state: RunState, parentId: string, opts: GenerationStart
   });
   state.observations.push(obs);
   return {
+    id: obs.id,
     end(o: GenerationEndOpts): void {
       obs.endTime = nowIso();
       if (o.output !== undefined) obs.output = o.output;
@@ -123,11 +127,14 @@ function makeGeneration(state: RunState, parentId: string, opts: GenerationStart
 
 function makeSpan(state: RunState, parentId: string, opts: SpanStartOpts): Span {
   const obs = newObservation(parentId, opts.name, kindToType(opts.kind), {
+    // Forced id (Langfuse observation id) so per-node scores link — see makeGeneration.
+    ...(opts.id ? { id: opts.id } : {}),
     input: opts.input ?? null,
     metadata: opts.metadata ?? null,
   });
   state.observations.push(obs);
   return {
+    id: obs.id,
     update(data: TraceContextUpdate): void {
       if (data.input !== undefined) obs.input = data.input;
       if (data.output !== undefined) obs.output = data.output;
