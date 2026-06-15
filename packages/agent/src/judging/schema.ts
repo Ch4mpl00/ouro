@@ -1,9 +1,12 @@
 import { z } from "zod";
 
 export const JUDGE_MODEL = "gpt-5.4";
-// Per-node rubrics (n1). Supersedes the whole-run v3 prompt: each generative
+// Per-node rubrics (n2). Supersedes the whole-run v3 prompt: each generative
 // node is scored against its OWNER contract, so the signal pins to one skill.
-export const JUDGE_PROMPT_VERSION = "n1";
+// n2: planner `process` axis hardened to penalize unresolved referential
+// ambiguity (pronouns to unseen context → must gather+replan) and to always
+// judge the planner substantively. Bump re-judges the corpus at the new version.
+export const JUDGE_PROMPT_VERSION = "n2";
 
 // A judgeable node's owner type. Selects the rubric (planner axes vs composer
 // axes) and whether faithfulness applies. `compose` and `agent` share a rubric
@@ -110,12 +113,13 @@ Inputs:
 - PLAN — the planner's output: the Workflow JSON (the steps to run).
 
 Score EXACTLY these two axes from 0 to 1 (fail < 0.3, weak < 0.5, ok < 0.75, strong >= 0.75), each with a one-sentence rationale and concrete evidence (a step kind/bind or a query string):
-- query_formulation -> the PLANNER_CONTRACT's retrieval rules AND the target topics implied by the signal. Look at the search/RAG steps' arguments (the queries Q, the source routing, sinceISO/limit filters): do they cover the intent's target topics with good retrieval terms, the right sources, and a correct time window? Reward precise, well-routed queries; penalize vague, missing, or mis-routed ones.
-- process -> the PLANNER_CONTRACT. Walk the plan step by step: is every step the right tool/skill with sane arguments, in a sensible order; does each binding get consumed downstream (not bound and dropped); are watermarks/memory updated when the contract requires it; is the result delivered the way the contract requires (e.g. send to the right chat); is the terminal/replan structure correct? Redundant, missing, contradictory, or dangling steps lower the score.
+- query_formulation -> the PLANNER_CONTRACT's retrieval rules AND the target topics implied by the signal. Look at the search/RAG steps' arguments (the queries Q, the source routing, sinceISO/limit filters): do they cover the intent's target topics with good retrieval terms, the right sources, and a correct time window? Reward precise, well-routed queries; penalize vague, missing, or mis-routed ones. This axis covers ONLY semantic search/RAG (search_news / list_news / find_notes); when the plan legitimately needs none, set it n/a (applicable=false) — and then process carries the FULL evaluation. (Gathering decisions that are NOT semantic search — e.g. fetching chat history — belong to process, not here.)
+- process -> the PLANNER_CONTRACT. Walk the plan step by step: is every step the right tool/skill with sane arguments, in a sensible order; does each binding get consumed downstream (not bound and dropped); are watermarks/memory updated when the contract requires it; is the result delivered the way the contract requires (e.g. send to the right chat); is the terminal/replan structure correct? CRITICAL — does the plan RESOLVE referential ambiguity BEFORE acting: when the signal carries a pronoun or back-reference to unseen prior context (e.g. «ему»/«его»/«там»/«продолжай»/«то же самое»/"the other one"), the plan MUST gather that context (e.g. get_telegram_chat_history) and replan per the contract's ambiguous-context shape — a plan that bakes an unresolved referent into its deliverable (a reminder, reply, or task prompt) has FAILED the intent and scores weak at best, however tidy its mechanics. Score what the deliverable actually accomplishes for the signal, not just whether the steps are well-formed. Redundant, missing, contradictory, or dangling steps lower the score.
 
 Rules:
 - Judge the plan against the contract, not against your own idea of a nicer plan. A different-but-valid plan is not a defect.
-- If the signal legitimately calls for a tiny plan (e.g. a one-shot reply), a short correct plan scores high — reward correctness, not elaborateness.
+- If the signal legitimately calls for a tiny plan (e.g. a one-shot reply), a short correct plan scores high — reward correctness, not elaborateness. But "tidy mechanics" is NOT correctness if the plan ignored ambiguity or fails the signal's actual intent.
+- The planner is ALWAYS substantively judged. n/a on query_formulation (no retrieval) is fine, but never sign the planner off with a lenient process just because the steps look clean — always weigh whether the plan satisfies the signal.
 - Ground every claim in the PLAN / SIGNAL_AND_ENV. Never invent steps or queries that aren't there.`;
 
 // ─── composer / agent node rubric ────────────────────────────────────
