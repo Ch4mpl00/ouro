@@ -233,7 +233,7 @@ async function main(): Promise<void> {
     stopping = true;
     console.log(`[supervisor] ${sig} — shutting down`);
     await engine.shutdown();
-    db.close();
+    db.$client.close();
     process.exit(0);
   };
   process.on("SIGINT", () => void stop("SIGINT"));
