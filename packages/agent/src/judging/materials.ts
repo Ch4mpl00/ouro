@@ -52,13 +52,17 @@ export interface NodeMaterial {
 
 const ROOT_SKIP = Symbol("root");
 
-// True when any ancestor of `obs` is an AGENT span — i.e. `obs` is a
-// generation/span INSIDE a spawned sub-agent (its `iter-*` calls), which we
-// judge only black-box at the agent-step boundary, never node by node.
+// True when any ancestor of `obs` is a SPAWNED sub-agent AGENT span — i.e.
+// `obs` is a generation/span INSIDE an llm_agent step (its `iter-*` calls),
+// which we judge only black-box at the agent-step boundary, never node by node.
+// The trace ROOT is itself an AGENT span (the supervisor / agent-loop start the
+// trace with kind:"agent"), but it is NOT a spawned sub-agent — every node
+// lives under it. So a root AGENT (parentObservationId === null) does NOT count;
+// only a NESTED AGENT (an actual llm_agent step) black-boxes its descendants.
 function hasAgentAncestor(obs: Observation, byId: Map<string, Observation>): boolean {
   let parent = obs.parentObservationId ? byId.get(obs.parentObservationId) : undefined;
   while (parent) {
-    if (parent.type === "AGENT") return true;
+    if (parent.type === "AGENT" && parent.parentObservationId !== null) return true;
     parent = parent.parentObservationId ? byId.get(parent.parentObservationId) : undefined;
   }
   return false;
