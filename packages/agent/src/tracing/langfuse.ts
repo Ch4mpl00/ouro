@@ -207,6 +207,7 @@ function wrapGeneration(g: LangfuseGeneration): Generation {
       if (opts.output !== undefined) patch.output = opts.output;
       if (opts.level !== undefined) patch.level = opts.level;
       if (opts.statusMessage !== undefined) patch.statusMessage = opts.statusMessage;
+      if (opts.metadata !== undefined) patch.metadata = opts.metadata;
       if (opts.usage) {
         patch.usageDetails = {
           input: opts.usage.input,

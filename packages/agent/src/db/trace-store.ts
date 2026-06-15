@@ -53,16 +53,13 @@ export interface TraceStore {
   // memory-KV dedup + age window.
   listRecent(limit: number, unjudgedFor?: { provider: string; promptVersion: string }): TraceSummary[];
   writeJudgement(j: JudgementInput): void;
-  // True once ANY node of the trace has a row for (provider, version): the
-  // worker judges all of a trace's nodes in one pass, so the presence of any
-  // row means the trace is done. Mirrors the LEFT JOIN in listRecent's unjudged
-  // filter.
-  hasJudgement(traceId: string, provider: string, promptVersion: string): boolean;
 }
 
 interface TraceRow {
   id: string;
   name: string;
+  source: string | null;
+  skill: string | null;
   session_id: string | null;
   tags: string;
   input: string | null;
@@ -132,10 +129,6 @@ export function createTraceStore(db: Database.Database): TraceStore {
        detail = excluded.detail,
        created_at = datetime('now')`,
   );
-  const selectJudgement = db.prepare(
-    `SELECT 1 FROM judgements WHERE trace_id = ? AND provider = ? AND prompt_version = ? LIMIT 1`,
-  );
-
   function rowToSummary(row: Pick<TraceRow, "id" | "name" | "tags" | "started_at">): TraceSummary {
     return {
       id: row.id,
@@ -204,10 +197,6 @@ export function createTraceStore(db: Database.Database): TraceStore {
         faithfulness: j.scores.faithfulness,
         detail: JSON.stringify(j.detail),
       });
-    },
-
-    hasJudgement(traceId, provider, promptVersion) {
-      return selectJudgement.get(traceId, provider, promptVersion) !== undefined;
     },
   };
 }

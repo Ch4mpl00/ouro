@@ -6,6 +6,7 @@ import type {
 import type { ModelPreset, PresetName } from "../models";
 import type { ChatProvider } from "../providers";
 import type { Generation, Span, Trace, TraceContext } from "../tracing";
+import { JUDGE_NODE_META } from "../trace-model";
 import { createCompiler, type CompileRequest } from "./compile";
 
 const PRESETS: Record<PresetName, ModelPreset> = {
@@ -42,6 +43,44 @@ function recordingTrace(): Trace {
     span: () => recordingSpan(),
     event() {},
   };
+}
+
+// A trace that records every generation's name + the metadata seen at start
+// and at end, so a test can assert which attempt carries the planner judge tag.
+interface GenRecord {
+  name: string;
+  startMeta: Record<string, unknown> | undefined;
+  endMeta: Record<string, unknown> | undefined;
+}
+function collectingTrace(): { trace: Trace; gens: GenRecord[] } {
+  const gens: GenRecord[] = [];
+  function record(opts: { name: string; metadata?: Record<string, unknown> }): Generation {
+    const rec: GenRecord = { name: opts.name, startMeta: opts.metadata, endMeta: undefined };
+    gens.push(rec);
+    return {
+      end(o) {
+        rec.endMeta = o?.metadata;
+      },
+    };
+  }
+  function span(): Span {
+    return {
+      update() {},
+      end() {},
+      generation: record,
+      span: () => span(),
+      event() {},
+    };
+  }
+  const trace: Trace = {
+    id: "test-trace",
+    update() {},
+    end() {},
+    generation: record,
+    span: () => span(),
+    event() {},
+  };
+  return { trace, gens };
 }
 
 interface MockProviderOpts {
@@ -376,6 +415,28 @@ describe("compiler.compile — retry loop", () => {
       expect(r.reason).toBe("invalid_json");
       expect(r.attempts).toBe(3);
     }
+  });
+
+  it("tags only the ACCEPTED attempt as the planner judge node, never failed retries", async () => {
+    const { provider } = makeMockProvider({ llmReplies: ["not json", VALID_PLAN_JSON] });
+    const { trace, gens } = collectingTrace();
+    const compiler = createCompiler({
+      engine: makeEngineSurface(provider),
+      readSkill: async () => "RULES",
+      mcpTools: FAKE_TOOLS,
+      knownSkills: FAKE_SKILLS,
+    });
+    const r = await compiler.compile({ ...makeReq(), parentTrace: trace as TraceContext });
+    expect(r.ok).toBe(true);
+
+    const attempts = gens.filter((g) => g.name.startsWith("attempt-"));
+    expect(attempts.length).toBe(2);
+    // Identity is never set at start — `attempt-N` is display-only.
+    expect(attempts.every((g) => g.startMeta === undefined)).toBe(true);
+    // The failed attempt stays untagged → the per-node judge skips it.
+    expect(attempts[0]!.endMeta).toBeUndefined();
+    // Only the winning attempt is the judgeable planner node.
+    expect(attempts[1]!.endMeta).toEqual({ [JUDGE_NODE_META]: "planner" });
   });
 
   it("respects custom maxAttempts (1 = no retries)", async () => {

@@ -107,6 +107,7 @@ function makeGeneration(state: RunState, parentId: string, opts: GenerationStart
       if (o.output !== undefined) obs.output = o.output;
       if (o.level !== undefined) obs.level = o.level;
       if (o.statusMessage !== undefined) obs.statusMessage = o.statusMessage;
+      if (o.metadata !== undefined) obs.metadata = mergeMeta(obs.metadata, o.metadata);
       if (o.usage) {
         obs.usage = { input: o.usage.input, output: o.usage.output, total: o.usage.total };
         obs.usageDetails = {

@@ -27,6 +27,10 @@ export interface SpanEndOpts {
 
 export interface GenerationEndOpts extends SpanEndOpts {
   usage?: TokenUsage;
+  // Metadata known only at end time, merged over what `generation()` set at
+  // start. Lets a producer tag a generation conditionally on its outcome
+  // (e.g. mark only the ACCEPTED planner attempt as the judgeable node).
+  metadata?: Record<string, unknown>;
 }
 
 export interface Generation {
