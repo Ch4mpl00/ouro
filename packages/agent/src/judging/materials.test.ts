@@ -30,7 +30,11 @@ function obs(p: Partial<Observation> & Pick<Observation, "id" | "name" | "type">
 // iteration), plus tool/embedding spans that must be ignored.
 function newsDigestTree(plannerGenName = "attempt-1"): { trace: Trace; observations: Observation[] } {
   const observations: Observation[] = [
-    obs({ id: "root", name: "news-digest", type: "CHAIN", startTime: "2026-06-14T00:00:00.000Z" }),
+    // Trace root is an AGENT span — the supervisor / agent-loop start every
+    // trace with kind:"agent" (so the root is type AGENT, not CHAIN). The judge
+    // must NOT treat this root AGENT as a spawned sub-agent black box, or it
+    // skips every node under it.
+    obs({ id: "root", name: "news-digest", type: "AGENT", startTime: "2026-06-14T00:00:00.000Z" }),
     obs({ id: "planner", name: "planner", type: "CHAIN", parentObservationId: "root", metadata: { signal_source: "news-digest" }, startTime: "2026-06-14T00:00:00.100Z" }),
     obs({
       id: "gen-planner",
@@ -126,6 +130,16 @@ describe("classify — node identity is by metadata, not name", () => {
 
   it("classifies an llm_agent step as an agent node, black-box", () => {
     expect(classify(find("step-agent"), trace, byId)).toEqual({ kind: "agent", skill: "researcher" });
+  });
+
+  it("does NOT treat the trace-root AGENT as a sub-agent — nodes under it stay judgeable", () => {
+    // Regression: the root is an AGENT span (kind:"agent"); a buggy ancestor
+    // walk that counts it would skip every node, yielding 0 judgeable nodes on
+    // every real trace. The planner sits under root→planner→gen, all under the
+    // root AGENT, and must still classify.
+    expect(byId.get("root")!.type).toBe("AGENT");
+    expect(classify(find("gen-planner"), trace, byId)).toEqual({ kind: "planner", skill: "planner" });
+    expect(classify(find("gen-compose"), trace, byId)).toEqual({ kind: "compose", skill: "news-digest" });
   });
 
   it("skips generations INSIDE an agent span even if tagged", () => {
