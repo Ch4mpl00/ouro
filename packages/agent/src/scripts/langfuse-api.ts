@@ -78,56 +78,10 @@ export async function apiPost<T>(
   throw lastErr ?? new Error(`langfuse POST failed on ${path}`);
 }
 
-// Langfuse observation types. Beyond the original GENERATION/SPAN/EVENT, v5
-// adds typed spans (AGENT/TOOL/CHAIN/RETRIEVER/…) the agent emits via `kind`.
-// Only GENERATION/EMBEDDING carry model + token usage.
-export type ObservationType =
-  | "GENERATION"
-  | "SPAN"
-  | "EVENT"
-  | "AGENT"
-  | "TOOL"
-  | "CHAIN"
-  | "RETRIEVER"
-  | "EVALUATOR"
-  | "GUARDRAIL"
-  | "EMBEDDING";
-
-export interface Observation {
-  id: string;
-  name: string;
-  type: ObservationType;
-  parentObservationId: string | null;
-  startTime: string;
-  endTime: string;
-  level: string;
-  statusMessage: string | null;
-  input: unknown;
-  output: unknown;
-  metadata: Record<string, unknown> | null;
-  model: string | null;
-  modelParameters: Record<string, unknown> | null;
-  usage: { input: number; output: number; total: number } | null;
-  usageDetails: Record<string, number> | null;
-  calculatedTotalCost: number | null;
-  latency: number;
-}
-
-export interface Trace {
-  id: string;
-  name: string;
-  sessionId: string | null;
-  timestamp: string;
-  input: unknown;
-  output: unknown;
-  metadata: Record<string, unknown> | null;
-  // /traces?sessionId=... returns observation IDs; /traces/<id> inlines full
-  // Observation objects. Both shapes are handled by fetchTraceById.
-  observations: Array<string | Observation>;
-  latency: number;
-  totalCost: number;
-  tags: string[];
-}
+// Read-shape types now live in ../trace-model (shared with the local mirror).
+// Re-export so existing `from "../scripts/langfuse-api"` imports keep working.
+export type { ObservationType, Observation, Trace, TraceSummary } from "../trace-model";
+import type { Observation, Trace, TraceSummary } from "../trace-model";
 
 // Fetch one trace by id with every observation resolved to a full object.
 // `/traces/<id>` inlines Observation objects; the string-id form (returned by
@@ -183,13 +137,6 @@ async function fetchObservationsByTrace(traceId: string): Promise<Observation[]>
     if (res.data.length === 0 || page >= (res.meta?.totalPages ?? 1)) break;
   }
   return all;
-}
-
-export interface TraceSummary {
-  id: string;
-  name: string;
-  timestamp: string;
-  tags: string[];
 }
 
 // Most recent traces first (Langfuse lists newest-first by default). Summary

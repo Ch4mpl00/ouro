@@ -3,16 +3,16 @@ import { writeFileSync } from "node:fs";
 import OpenAI from "openai";
 import { config as loadEnv } from "dotenv";
 import { fetchRecentTraces } from "./langfuse-api";
-import { assembleMaterials } from "../judging/materials";
-import { judgeWithOpenAi } from "../judging/openai-judge";
-import { createCodexClient } from "../judging/codex-client";
-import { judgeWithCodex } from "../judging/codex-judge";
-import { printFaithfulness, printScorecard } from "../judging/print";
-import { buildUserPrompt } from "../judging/schema";
+import { createAgentDb } from "../db/client";
+import { createTraceStore } from "../db/trace-store";
+import { assembleNodeMaterials, type NodeMaterial } from "../judging/materials";
+import { createJudgeBackend, type JudgeProvider } from "../judging/judge-backend";
+import { judgeNode } from "../judging/node-judge";
+import { nodeSummaryLine, printNodeJudgement, printTraceHeader } from "../judging/print";
+import { rubricFor } from "../judging/schema";
+import { createLangfuseTraceSource, createLocalTraceSource, type TraceSource } from "../judging/trace-source";
 
 loadEnv({ path: ".env.agent" });
-
-type JudgeProvider = "openai" | "codex";
 
 interface CliOpts {
   dump: boolean;
@@ -51,42 +51,59 @@ function parseArgs(argv: string[]): CliOpts {
   return { dump, provider, args };
 }
 
-async function judgeOne(provider: JudgeProvider, openai: OpenAI | null, traceId: string): Promise<void> {
-  const m = await assembleMaterials(traceId);
+async function judgeOne(
+  source: TraceSource,
+  provider: JudgeProvider,
+  openai: OpenAI | null,
+  traceId: string,
+): Promise<void> {
+  const { nodes } = await assembleNodeMaterials(source, traceId);
+  console.error(`[judge] trace ${traceId} · provider=${provider} · ${nodes.length} judgeable nodes`);
+  printTraceHeader(traceId);
 
-  console.error(
-    `[judge] trace ${traceId} · provider=${provider} · skill=${m.skillName ?? "—"} · ${m.obsCount} obs · ` +
-      `transcript ${m.transcript.length} chars`,
-  );
-
-  const params = {
-    skillName: m.skillName,
-    composerContract: m.composerContract,
-    orchestratorContract: m.orchestratorContract,
-    transcript: m.transcript,
-  };
-  const result = provider === "codex"
-    ? await judgeWithCodex(createCodexClient(), params)
-    : await judgeWithOpenAi(openai!, params);
-  printScorecard(traceId, m.skillName, result.scorecard);
-  printFaithfulness(result.faithfulness);
+  const backend = createJudgeBackend(provider, openai);
+  const summary: string[] = [];
+  for (const node of nodes) {
+    const header = { label: node.label, kind: node.kind, skill: node.skill };
+    const verdict = await judgeNode(backend, node);
+    printNodeJudgement(header, verdict);
+    summary.push(nodeSummaryLine(header, verdict));
+  }
+  if (nodes.length > 1) {
+    console.log(`\n── summary ──`);
+    for (const line of summary) console.log(line);
+  }
 }
 
-async function dumpOne(traceId: string): Promise<void> {
-  const m = await assembleMaterials(traceId);
-  const body = [
-    `# JUDGE MATERIALS · trace ${traceId} · composer skill ${m.skillName ?? "—"}`,
+// Write per-node judge materials (no LLM call) for the in-session judge-trace
+// skill: one block per node, each the exact user prompt that node's rubric
+// would receive (contract + node IO), minus the trailing scoring instruction.
+function renderNodeDump(node: NodeMaterial, index: number): string {
+  const userPrompt = rubricFor(node.kind).buildUserPrompt(
+    node.skill,
+    node.contract,
+    node.inputText,
+    node.outputText,
+  );
+  const materials = userPrompt.replace(/\n\n(?:Score this|Extract F's)[\s\S]*$/, "");
+  return [
+    `## NODE ${index + 1} · ${node.label} · ${node.kind} · skill ${node.skill}`,
     "",
-    buildUserPrompt(m.skillName, m.composerContract, m.orchestratorContract, m.transcript)
-      .replace(/\n\nScore this run\.[\s\S]*$/, ""),
-    "",
+    materials,
   ].join("\n");
+}
+
+async function dumpOne(source: TraceSource, traceId: string): Promise<void> {
+  const { nodes } = await assembleNodeMaterials(source, traceId);
+  const body = [
+    `# JUDGE MATERIALS · trace ${traceId} · ${nodes.length} nodes`,
+    "",
+    ...nodes.map((n, i) => renderNodeDump(n, i)),
+    "",
+  ].join("\n\n");
   const path = `/tmp/judge-dump-${traceId}.md`;
   writeFileSync(path, body);
-  console.log(
-    `[judge] dumped ${traceId} · skill=${m.skillName ?? "—"} · ${m.obsCount} obs · ` +
-      `${body.length} chars → ${path}`,
-  );
+  console.log(`[judge] dumped ${traceId} · ${nodes.length} nodes · ${body.length} chars → ${path}`);
 }
 
 async function main(): Promise<void> {
@@ -102,8 +119,14 @@ async function main(): Promise<void> {
     openai = new OpenAI({ apiKey });
   }
 
+  // Local mirror first (fast, and present when run on the droplet), Langfuse
+  // as fallback for ids not mirrored locally. --recent still lists from
+  // Langfuse (recent prod traces), below.
+  const db = createAgentDb();
+  const source = createLocalTraceSource(createTraceStore(db), createLangfuseTraceSource());
+
   const runOne = (traceId: string): Promise<void> =>
-    dump ? dumpOne(traceId) : judgeOne(provider, openai, traceId);
+    dump ? dumpOne(source, traceId) : judgeOne(source, provider, openai, traceId);
 
   if (args[0] === "--recent") {
     const parsed = Number(args[1] ?? "5");

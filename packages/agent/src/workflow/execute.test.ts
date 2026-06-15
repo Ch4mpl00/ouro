@@ -55,6 +55,7 @@ function recordingSpan(): Span & { events: unknown[] } {
 function recordingTrace(): Trace {
   const root = recordingSpan();
   return {
+    id: "test-trace",
     update: root.update,
     generation: root.generation,
     span: root.span,
@@ -100,6 +101,7 @@ function collectingTrace(): { trace: Trace; all: Array<{ name: string; events: u
   }
   const root = make("__root__");
   const trace: Trace = {
+    id: "test-trace",
     update: root.update,
     generation: root.generation,
     span: root.span,

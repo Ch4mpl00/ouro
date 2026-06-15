@@ -5,7 +5,8 @@ import type {
 import type { ModelPreset, PresetName } from "../models";
 import type { ChatProvider } from "../providers";
 import type { EnvData } from "../session-context";
-import type { Span, TraceContext } from "../tracing";
+import type { Span, TokenUsage, TraceContext } from "../tracing";
+import { JUDGE_NODE_META } from "../trace-model";
 import { createWorkflowSchema, parseWorkflow, type Workflow } from "./dsl";
 
 // Compiler — turns a signal into a validated Workflow via one LLM call (with
@@ -192,6 +193,7 @@ async function runRetryLoop(
     });
 
     let text: string;
+    let usage: TokenUsage | undefined;
     try {
       // The provider normalizes usage (incl. the cached-prompt portion that
       // shows the static planner.md + tools + skills prefix hitting cache).
@@ -205,7 +207,7 @@ async function runRetryLoop(
         trace: compileSpan,
       });
       text = result.message.content ?? "";
-      gen.end({ output: text, usage: result.usage });
+      usage = result.usage;
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       gen.end({
@@ -225,6 +227,9 @@ async function runRetryLoop(
     try {
       parsed = JSON.parse(text);
     } catch (err) {
+      // Failed attempt — end UNtagged so the per-node judge skips it; only the
+      // accepted plan below is a judgeable planner node.
+      gen.end({ output: text, usage });
       const errMsg = `invalid JSON: ${(err as Error).message}`;
       lastErrors = [errMsg];
       pushRetryFeedback(messages, text, lastErrors);
@@ -233,10 +238,17 @@ async function runRetryLoop(
 
     const result = parseWorkflow(parsed, schema);
     if (result.ok) {
+      // Tag the ACCEPTED generation as the planner node for the per-node judge.
+      // Identity comes from this tag, never the name — `attempt-N` is
+      // display-only — and only the winning attempt carries it, so failed
+      // retries above never pollute the planner's per-skill scores.
+      gen.end({ output: text, usage, metadata: { [JUDGE_NODE_META]: "planner" } });
       compileSpan.end({ output: { attempts, ok: true } });
       return { ok: true, workflow: result.workflow, attempts };
     }
 
+    // Schema-invalid attempt — also UNtagged (not judged), then retry.
+    gen.end({ output: text, usage });
     lastErrors = result.errors;
     pushRetryFeedback(messages, text, lastErrors);
   }

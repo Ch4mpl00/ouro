@@ -1,26 +1,19 @@
-import OpenAI from "openai";
-import type { MemoryStore } from "../db/memory";
-import { fetchRecentTraces } from "../scripts/langfuse-api";
-import { assembleMaterials } from "./materials";
-import { judgeWithOpenAi } from "./openai-judge";
-import { createCodexClient } from "./codex-client";
-import { judgeWithCodex } from "./codex-judge";
-import { writeLangfuseScores } from "./langfuse-scores";
-import { JUDGE_PROMPT_VERSION, type JudgeResultBundle } from "./schema";
-
-type JudgeProvider = "openai" | "codex";
+import { assembleNodeMaterials, type NodeMaterial } from "./materials";
+import { createJudgeBackend, type JudgeProvider } from "./judge-backend";
+import { judgeNode } from "./node-judge";
+import type { ScoreWriter } from "./langfuse-scores";
+import type { TraceSource } from "./trace-source";
+import { JUDGE_PROMPT_VERSION, type NodeJudgement } from "./schema";
 
 export interface JudgeWorkerDeps {
-  memory: MemoryStore;
+  source: TraceSource;
+  writeScores: ScoreWriter;
 }
 
 export interface JudgeWorkerOpts {
   provider: JudgeProvider;
   pollIntervalMs: number;
   recentLimit: number;
-  // Skip traces younger than this — a trace listed by /traces may still be
-  // mid-run, and judging a partial transcript would mark it "ok" permanently.
-  minTraceAgeMs: number;
   dryRun: boolean;
   once: boolean;
 }
@@ -41,42 +34,9 @@ export function judgeWorkerOptsFromEnv(): JudgeWorkerOpts {
     provider,
     pollIntervalMs: Number(process.env.JUDGE_POLL_INTERVAL_MS ?? 60_000),
     recentLimit: Number(process.env.JUDGE_RECENT_LIMIT ?? 20),
-    minTraceAgeMs: Number(process.env.JUDGE_MIN_TRACE_AGE_MS ?? 10 * 60_000),
     dryRun: !boolEnv("JUDGE_WRITE_SCORES", false),
     once: boolEnv("JUDGE_ONCE", false),
   };
-}
-
-function judgedKey(provider: JudgeProvider, traceId: string): string {
-  return `judge.${provider}.${JUDGE_PROMPT_VERSION}.${traceId}`;
-}
-
-function isEligibleTrace(trace: { id: string; name: string; tags: string[] }): boolean {
-  if (trace.tags.includes("judge")) return false;
-  if (trace.name.startsWith("judge")) return false;
-  return true;
-}
-
-async function runJudge(
-  provider: JudgeProvider,
-  materials: Awaited<ReturnType<typeof assembleMaterials>>,
-): Promise<JudgeResultBundle> {
-  if (provider === "openai") {
-    const apiKey = process.env.OPENAI_API_KEY;
-    if (!apiKey) throw new Error("OPENAI_API_KEY missing in env");
-    return judgeWithOpenAi(new OpenAI({ apiKey }), {
-      skillName: materials.skillName,
-      composerContract: materials.composerContract,
-      orchestratorContract: materials.orchestratorContract,
-      transcript: materials.transcript,
-    });
-  }
-  return judgeWithCodex(createCodexClient(), {
-    skillName: materials.skillName,
-    composerContract: materials.composerContract,
-    orchestratorContract: materials.orchestratorContract,
-    transcript: materials.transcript,
-  });
 }
 
 async function processTrace(
@@ -84,38 +44,55 @@ async function processTrace(
   deps: JudgeWorkerDeps,
   opts: JudgeWorkerOpts,
 ): Promise<void> {
-  const key = judgedKey(opts.provider, traceId);
-  const current = deps.memory.get(key);
-  if (current === "ok") return;
-  if (current === "in_progress") {
-    console.log(`[judge-worker] retrying stale in_progress trace ${traceId}`);
+  const { nodes } = await assembleNodeMaterials(deps.source, traceId);
+  if (nodes.length === 0) {
+    // No generative node to score (e.g. a pure-agentic fallback run whose only
+    // generations live inside an AGENT black box). Nothing to persist; the
+    // trace stays unjudged but is cheap to re-skip (no LLM call).
+    console.log(`[judge-worker] ${traceId} has no judgeable nodes — skipping`);
+    return;
   }
 
-  deps.memory.set(key, "in_progress");
-  const materials = await assembleMaterials(traceId);
-  console.log(
-    `[judge-worker] judging ${traceId} provider=${opts.provider} skill=${materials.skillName ?? "—"} ` +
-      `obs=${materials.obsCount} transcript=${materials.transcript.length}`,
-  );
-  const result = await runJudge(opts.provider, materials);
-  await writeLangfuseScores(result.scorecard, result.faithfulness, {
-    traceId,
-    provider: opts.provider,
-    dryRun: opts.dryRun,
-  });
-  deps.memory.set(key, "ok");
+  const backend = createJudgeBackend(opts.provider);
+  console.log(`[judge-worker] judging ${traceId} provider=${opts.provider} nodes=${nodes.length}`);
+
+  // Judge ALL nodes first. If any throws (e.g. codex usage limit), we persist
+  // NOTHING and the trace reappears next tick — the whole-trace auto-retry the
+  // single-judgement worker had, preserved per-node. Sequential keeps codex
+  // within the shared ChatGPT quota.
+  const judged: Array<{ node: NodeMaterial; verdict: NodeJudgement }> = [];
+  for (const node of nodes) {
+    const verdict = await judgeNode(backend, node);
+    judged.push({ node, verdict });
+  }
+
+  for (const { node, verdict } of judged) {
+    await deps.writeScores.write(verdict.scorecard, verdict.faithfulness, {
+      traceId,
+      observationId: node.observationId,
+      nodeKind: node.kind,
+      skill: node.skill,
+      provider: opts.provider,
+      promptVersion: JUDGE_PROMPT_VERSION,
+      dryRun: opts.dryRun,
+    });
+  }
 }
 
 async function tick(deps: JudgeWorkerDeps, opts: JudgeWorkerOpts): Promise<void> {
-  const traces = await fetchRecentTraces(opts.recentLimit);
+  // The local source returns only COMPLETE runs (written on trace.end()) that
+  // lack ANY judgement for this (provider, version) — so no age filter and no
+  // separate dedup are needed. A trace that throws (e.g. Codex usage limit)
+  // writes no rows and reappears next tick: auto-retry.
+  const traces = await deps.source.recentTraces(opts.recentLimit, {
+    provider: opts.provider,
+    promptVersion: JUDGE_PROMPT_VERSION,
+  });
   for (const trace of traces) {
-    if (!isEligibleTrace(trace)) continue;
-    if (Date.now() - new Date(trace.timestamp).getTime() < opts.minTraceAgeMs) continue;
     try {
       await processTrace(trace.id, deps, opts);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      deps.memory.set(judgedKey(opts.provider, trace.id), `error: ${msg}`);
       console.error(`[judge-worker] ${trace.id} failed: ${msg}`);
     }
   }

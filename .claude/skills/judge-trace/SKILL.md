@@ -1,15 +1,18 @@
 ---
 name: judge-trace
-description: Judge an agent run from a Langfuse trace in-session (free replacement for the gpt-5.4 judge in scripts/judge.ts). Use when the user asks to judge/score/evaluate a trace or recent runs. Args - a traceId, or "--recent N" for the N latest traces.
+description: Judge an agent run PER NODE from a Langfuse/local trace in-session (free replacement for the gpt-5.4 per-node judge in scripts/judge.ts). Use when the user asks to judge/score/evaluate a trace or recent runs. Args - a traceId, or "--recent N" for the N latest traces.
 ---
 
-# judge-trace — score an agent run from its Langfuse trace
+# judge-trace — score an agent run, one generative node at a time
 
 You replace the GPT-5.4 judge from `packages/agent/src/scripts/judge.ts` for
-cheap experimentation. The materials assembly and the rubric below are kept
-in sync with that script (`SYSTEM_PROMPT`, `FAITH_SYSTEM_PROMPT` in
-`packages/agent/src/judging/schema.ts`, prompt v3) — do not improvise your
-own criteria, or scores stop being comparable between the two judges.
+cheap experimentation. The judge is PER NODE: one score per generative LLM node
+(the planner generation, each `llm_compose`, each `llm_agent` step), each scored
+against THAT node's owner contract. The rubrics below are kept verbatim-synced
+with `packages/agent/src/judging/schema.ts` (`PLANNER_NODE_PROMPT`,
+`COMPOSER_NODE_PROMPT`, `FAITH_SYSTEM_PROMPT`, prompt version `n1`) — do not
+improvise your own criteria, or scores stop being comparable between the two
+judges.
 
 ## Steps
 
@@ -22,134 +25,104 @@ own criteria, or scores stop being comparable between the two judges.
 
    Each trace is written to `/tmp/judge-dump-<traceId>.md` (path is printed).
 
-2. Read the dump file fully (use offset/limit Reads if it is long). It
-   contains `<orchestrator_contract>`, `<composer_contract>` and
-   `<transcript>` blocks — the same evidence the GPT judge receives.
+2. Read the dump file fully (use offset/limit Reads if it is long). It is split
+   into `## NODE <i> · <label> · <kind> · skill <skill>` blocks. Each block
+   carries the materials for ONE node:
+   - a planner node → `<planner_contract>`, `<signal_and_env>`, `<plan>`
+   - a compose / agent node → `<composer_contract>`, `<node_input>`, `<node_output>`
 
-3. Score the run per the rubric below. Judge ONLY from the dump file.
+3. Score EACH node from its own block, using the rubric that matches its kind
+   (planner rubric for planner nodes; composer rubric for compose/agent nodes).
+   Judge ONLY from that node's block — never pull evidence from another node.
 
-4. Print one scorecard per trace in the exact output format at the bottom.
-   When judging several traces, finish with a one-line-per-trace summary
-   table.
+4. Print one scorecard block per node in the exact output format at the bottom.
+   When several nodes (or several traces) are judged, finish with the one-line
+   summary table.
 
-## Rubric (prompt v3 — keep verbatim-equivalent to judging/schema.ts)
+## Planner node rubric (prompt n1 — keep verbatim-equivalent to schema.ts)
 
-You are a rigorous evaluation judge for an AI agent that handles each signal
-in TWO stages. Understanding the split is essential to scoring correctly:
+You are a rigorous evaluation judge for the PLANNER (orchestrator) of an AI agent. The planner reads one signal plus environment context and emits a workflow: a JSON plan of steps — tool calls (search_news, get_telegram_chat_history, send_telegram_message, set_memory, …), llm_compose / llm_agent steps that delegate to a skill, parallel groups, replan, and a terminal. You are scoring the PLAN ITSELF (the orchestration decision), NOT its execution: execution is deterministic code that walks the steps, so a sound plan is a sound run. You did not author the plan and have no stake in it.
 
-1. ORCHESTRATOR (the "planner") builds a workflow: it decides which tools to
-   call, how to phrase and reformulate the RAG queries, which sources to hit,
-   and how to deliver the result. Tool calls in the transcript —
-   `search_news`, `get_telegram_chat_history`, `send_telegram_message`,
-   `set_memory` — are ALL the orchestrator's machinery.
-2. COMPOSER (the skill, e.g. news-digest / tech-digest) receives the gathered
-   candidates and chat history as INPUT, filters them, and writes the final
-   text (F). The composer does NOT call tools; it legitimately receives chat
-   history as input rather than fetching it.
+Inputs:
+- PLANNER_CONTRACT — how the planner should phrase / reformulate / route retrieval and how it should structure the workflow.
+- SIGNAL_AND_ENV — the frozen input the planner saw (the signal content + env: timezone, now, watermarks, envContext).
+- PLAN — the planner's output: the Workflow JSON (the steps to run).
 
-F is the final user-visible text of the run: the last compose step's output
-and the text actually delivered via send/edit tool calls in the FLOW. The
-trace-level FINAL OUTPUT field may be empty on the workflow path — find F in
-the FLOW; an empty field is NOT "no output".
+Score EXACTLY these two axes from 0 to 1 (fail < 0.3, weak < 0.5, ok < 0.75, strong >= 0.75), each with a one-sentence rationale and concrete evidence (a step kind/bind or a query string):
+- query_formulation -> the PLANNER_CONTRACT's retrieval rules AND the target topics implied by the signal. Look at the search/RAG steps' arguments (the queries Q, the source routing, sinceISO/limit filters): do they cover the intent's target topics with good retrieval terms, the right sources, and a correct time window? Reward precise, well-routed queries; penalize vague, missing, or mis-routed ones.
+- process -> the PLANNER_CONTRACT. Walk the plan step by step: is every step the right tool/skill with sane arguments, in a sensible order; does each binding get consumed downstream (not bound and dropped); are watermarks/memory updated when the contract requires it; is the result delivered the way the contract requires (e.g. send to the right chat); is the terminal/replan structure correct? Redundant, missing, contradictory, or dangling steps lower the score.
 
-You score ONE completed run. You did not generate it and have no stake in it.
+Rules:
+- Judge the plan against the contract, not against your own idea of a nicer plan. A different-but-valid plan is not a defect.
+- If the signal legitimately calls for a tiny plan (e.g. a one-shot reply), a short correct plan scores high — reward correctness, not elaborateness.
+- Ground every claim in the PLAN / SIGNAL_AND_ENV. Never invent steps or queries that aren't there.
 
-Score each axis from 0 to 1 (fail < 0.3, weak < 0.5, ok < 0.75,
-strong >= 0.75) with a one-sentence rationale and concrete evidence (step
-name or item id). CRITICAL — judge each axis against the RIGHT contract:
+## Composer / agent node rubric (prompt n1 — keep verbatim-equivalent to schema.ts)
 
-- query_formulation -> the ORCHESTRATOR_CONTRACT (phrasing / reformulation /
-  source routing) AND the COMPOSER_CONTRACT's stated interests/topics (what
-  the queries should target). Did the planner's queries (Q, in the search
-  args) cover the intent's target topics with good retrieval terms?
-- coverage -> the COMPOSER_CONTRACT. Of what retrieval returned (R), did the
-  final text (F) include the salient contract-fitting items and drop the
-  noise?
-- composition -> the COMPOSER_CONTRACT. Does F follow the composer's format,
-  tone, length, threshold and no-fabrication rules?
-- process -> the ORCHESTRATOR_CONTRACT. Walk the FLOW step by step and judge
-  the whole chain of actions: was every tool call the right tool with sane
-  arguments, in a sensible order; was each step's result actually used
-  downstream (not fetched and dropped); were watermarks/memory updated when
-  the contract requires it; did the chain deliver the result the way the
-  contract requires? Redundant, missing, or contradictory steps lower the
-  score.
+You are a rigorous evaluation judge for ONE composer node of an AI agent — a single skill that receives gathered candidates (and any chat history) as INPUT and writes a final text (F). The composer does NOT call tools and does NOT fetch anything; it legitimately receives its material as input. You are scoring THIS node in isolation: its input is everything it had to work with, its output is the text it produced. You did not author it and have no stake in it.
 
-DECISIVE RULE — never penalize the COMPOSER for ORCHESTRATION. Which tools
-were called, that the result was sent via `send_telegram_message`, that
-history arrived via `get_telegram_chat_history`, or which search tool was
-used are the orchestrator's job and normal workflow machinery. They are
-NEVER a coverage or composition violation. A composer-contract line like
-"do not call any Telegram tool" describes the COMPOSER's role (it composes,
-it doesn't fetch) — it is satisfied as long as the composer's own text
-doesn't try to call tools; it is NOT violated by orchestrator tool calls in
-the trace.
+Inputs:
+- COMPOSER_CONTRACT — the skill: how candidates should be filtered and the output composed (format, thresholds, tone, length, no-fabrication). For a prompt-only node the owner is the planner and the binding instruction is the inline prompt shown in NODE_INPUT — judge against that instruction.
+- NODE_INPUT — exactly what the node received: the retrieved candidates / posts / chat history (this is R). The system message is the contract above; the user message carries R.
+- NODE_OUTPUT — the text the node produced (this is F).
 
-Other rules:
-- Obey the contracts. If the composer contract says "< 3 matches -> short
-  message and stop", an empty digest is CORRECT — judge whether the count
-  was right (were there really < 3 contract-fitting, non-duplicate items in
-  R?), not whether it produced a digest.
-- If an axis does not apply to this run (nothing to deduplicate, or an empty
-  output has no facts to verify), set label "n/a" and no score.
-- Reward neither length nor fluency. A correct short output beats a verbose
-  wrong one.
-- Ground every claim in the TRANSCRIPT. Never invent items that aren't in R.
+Score EXACTLY these two axes from 0 to 1 (fail < 0.3, weak < 0.5, ok < 0.75, strong >= 0.75), each with a one-sentence rationale and concrete evidence (an item id or a quoted phrase):
+- coverage -> the COMPOSER_CONTRACT. Of what the node received in NODE_INPUT (R), did F include the salient contract-fitting items and drop the noise? Missing a clearly contract-fitting item lowers it; padding with off-contract noise lowers it.
+- composition -> the COMPOSER_CONTRACT. Does F follow the contract's format, tone, length, threshold, and no-fabrication rules?
 
-## Faithfulness sub-judge (separate pass, claim decomposition)
+Rules:
+- Obey the contract. If it says "< 3 matches -> short message and stop", a short / empty output is CORRECT when R really held < 3 contract-fitting, non-duplicate items — judge whether the count was right, not whether it produced a long digest.
+- NEVER penalize the composer for orchestration. That a result is later sent via a Telegram tool, or that history arrived via a fetch tool, is the planner's job and is not even visible in this node's input. A contract line like "do not call any Telegram tool" describes the composer's role (it composes, it doesn't fetch); it is satisfied as long as F itself doesn't try to call tools.
+- If an axis does not apply (an empty output has nothing to compose, nothing in R to cover), set applicable=false, score=null, label="n/a".
+- Reward neither length nor fluency. A correct short output beats a verbose wrong one.
+- Ground every claim in NODE_INPUT / NODE_OUTPUT. Never invent items that aren't in R.
 
-After the four axes, verify that every factual claim in the final text (F)
-is grounded in the retrieved snippets (R) or the chat history shown in the
-transcript. F is ALL user-visible text the run delivered: the text arguments
-of send/edit Telegram tool calls in the FLOW plus the last compose step's
-output — an empty trace-level FINAL OUTPUT field NEVER means there are no
-claims to check. Quoting specifics — numbers, counts, dates, version
-numbers — not present in a snippet is the single most damaging error class.
+## Faithfulness sub-judge (compose / agent nodes only — keep verbatim-equivalent to schema.ts)
+
+After the two composer axes, verify that every factual claim in the node's final text (F = NODE_OUTPUT) is grounded in the material the node received (R = NODE_INPUT: the retrieved snippets and any chat history). Quoting specifics — numbers, counts, dates, version numbers — not present in R is the single most damaging error class. (Planner nodes have no faithfulness pass.)
 
 Method:
-1. Extract ATOMIC factual claims from F. Focus on verifiable specifics:
-   numbers/counts, dates, named entities, concrete events, and comparisons
-   ("up from 63 the day before").
-2. For each claim, look for support in R's snippets (and the chat history).
-   Verdict:
-   - supported — the claim and its specifics appear in some snippet/item.
-   - partial — the gist is backed but a specific (number/date/name) is
-     missing, altered, or aggregated beyond what any single snippet states.
-   - unsupported — no item backs it; likely fabricated or editorialized.
+1. Extract ATOMIC factual claims from F. Focus on verifiable specifics: numbers/counts, dates, named entities, concrete events, and comparisons ("up from 63 the day before").
+2. For each claim, look for support in R. Verdict:
+   - supported — the claim and its specifics appear in some item in R.
+   - partial — the gist is backed but a specific (number/date/name) is missing, altered, or aggregated beyond what any single item states.
+   - unsupported — no item in R backs it; likely fabricated or editorialized.
 3. Cite the supporting (or contradicting) item id as evidence, or "none".
 
 Rules:
-- Judge only F's factual content. The digest's own header/date line,
-  category labels, and emojis are not claims.
-- A hard number synthesized by aggregating several monitoring/channel posts
-  is at best PARTIAL unless a snippet states that number.
-- If F is an empty / "тихий день" message with no factual claims, mark
-  faithfulness n/a with no claims.
-- score = (count(supported) + 0.5 * count(partial)) / total_claims, rounded
-  to 2 decimals.
-- Ground every verdict in the transcript; never invent snippet content.
+- Judge only F's factual content. The text's own header/date line, category labels, and emojis are not claims.
+- A hard number synthesized by aggregating several items is at best PARTIAL unless an item states that number.
+- If F is empty / a "тихий день" style message with no factual claims, set applicable=false, score=null, claims=[].
+- score = (count(supported) + 0.5 * count(partial)) / total_claims, rounded to 2 decimals.
+- Ground every verdict in R; never invent item content.
 
-## Output format (mirrors judge.ts printScorecard / printFaithfulness)
+## Output format (mirrors judge.ts printNodeJudgement / nodeSummaryLine)
+
+One block per node. Planner nodes show `query_formulation` + `process`;
+compose/agent nodes show `coverage` + `composition` + a faithfulness line.
 
 ```
-=== JUDGE claude-code (prompt v3) · trace <id> · skill <name> ===
+=== JUDGE claude-code (prompt n1) · trace <id> ===
 
-● coverage: <fail|weak|ok|strong|n/a> (<0.00-1.00|n/a>)
+── node <label> · <kind> · skill <skill> ──
+● <axis>: <fail|weak|ok|strong|n/a> (<0.00-1.00|n/a>)
   <one-sentence rationale>
-  ↳ <evidence: step name / item id>
-
-● query_formulation: …
-● composition: …
-● process: …
-
-overall: <one-sentence holistic note>
-
-● faithfulness: <score>  (<N> claims, <M> not fully supported)
+  ↳ <evidence: step kind/bind / item id>
+● <axis>: …
+  overall: <one-sentence holistic note>
+● faithfulness: <score>  (<N> claims, <M> not fully supported)    # compose/agent only
   ✓ <supported claim>
   ~ <partial claim>
       ↳ <evidence>
   ✗ <unsupported claim>
       ↳ <evidence>
+
+── node <next label> · … ──
+…
+
+── summary ──
+node <label> · <kind> · skill <skill> · <axis> <score> <axis> <score> …
+node …
 ```
 
 Label the header `JUDGE claude-code` (not the GPT model) so saved scorecards
