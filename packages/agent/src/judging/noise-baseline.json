@@ -3,51 +3,102 @@
     "model": "gpt-5.4",
     "provider": "openai",
     "promptVersion": "n3",
-    "runs": 2,
+    "runs": 3,
     "sampleNodes": 5,
-    "totalJudgeCalls": 10,
+    "totalJudgeCalls": 15,
     "axes": [
       {
         "axis": "process",
         "nodes": 1,
-        "pooledSigma": 0.0071,
-        "meanSigma": 0.0071,
-        "p90Sigma": 0.0071,
-        "maxSigma": 0.0071,
-        "meanScore": 0.975,
+        "pooledSigma": 0.0058,
+        "meanSigma": 0.0058,
+        "p90Sigma": 0.0058,
+        "maxSigma": 0.0058,
+        "meanScore": 0.973,
         "applicabilityFlips": 0
       },
       {
         "axis": "coverage",
         "nodes": 4,
-        "pooledSigma": 0.0615,
-        "meanSigma": 0.0513,
-        "p90Sigma": 0.0877,
-        "maxSigma": 0.0919,
-        "meanScore": 0.429,
+        "pooledSigma": 0.0573,
+        "meanSigma": 0.0454,
+        "p90Sigma": 0.0835,
+        "maxSigma": 0.0954,
+        "meanScore": 0.439,
         "applicabilityFlips": 0
       },
       {
         "axis": "composition",
         "nodes": 4,
-        "pooledSigma": 0.0956,
-        "meanSigma": 0.0689,
-        "p90Sigma": 0.14,
-        "maxSigma": 0.1485,
-        "meanScore": 0.569,
+        "pooledSigma": 0.1865,
+        "meanSigma": 0.1278,
+        "p90Sigma": 0.2755,
+        "maxSigma": 0.3612,
+        "meanScore": 0.665,
         "applicabilityFlips": 0
       },
       {
         "axis": "faithfulness",
         "nodes": 4,
-        "pooledSigma": 0.0094,
-        "meanSigma": 0.0088,
-        "p90Sigma": 0.012,
-        "maxSigma": 0.0141,
-        "meanScore": 0.946,
+        "pooledSigma": 0.0173,
+        "meanSigma": 0.0134,
+        "p90Sigma": 0.0248,
+        "maxSigma": 0.0306,
+        "meanScore": 0.947,
         "applicabilityFlips": 0
       }
     ],
-    "measuredAt": "2026-06-16T08:59:22.160Z"
+    "measuredAt": "2026-06-16T09:11:39.524Z"
+  },
+  "gpt-5.4|n4": {
+    "model": "gpt-5.4",
+    "provider": "openai",
+    "promptVersion": "n4",
+    "runs": 3,
+    "sampleNodes": 5,
+    "totalJudgeCalls": 15,
+    "axes": [
+      {
+        "axis": "process",
+        "nodes": 1,
+        "pooledSigma": 0.0058,
+        "meanSigma": 0.0058,
+        "p90Sigma": 0.0058,
+        "maxSigma": 0.0058,
+        "meanScore": 0.977,
+        "applicabilityFlips": 0
+      },
+      {
+        "axis": "coverage",
+        "nodes": 4,
+        "pooledSigma": 0.0466,
+        "meanSigma": 0.0417,
+        "p90Sigma": 0.0649,
+        "maxSigma": 0.07,
+        "meanScore": 0.41,
+        "applicabilityFlips": 0
+      },
+      {
+        "axis": "composition",
+        "nodes": 4,
+        "pooledSigma": 0.022,
+        "meanSigma": 0.0162,
+        "p90Sigma": 0.0326,
+        "maxSigma": 0.0416,
+        "meanScore": 0.945,
+        "applicabilityFlips": 0
+      },
+      {
+        "axis": "faithfulness",
+        "nodes": 4,
+        "pooledSigma": 0.0252,
+        "meanSigma": 0.0231,
+        "p90Sigma": 0.0289,
+        "maxSigma": 0.0289,
+        "meanScore": 0.934,
+        "applicabilityFlips": 0
+      }
+    ],
+    "measuredAt": "2026-06-16T09:17:32.377Z"
   }
 }

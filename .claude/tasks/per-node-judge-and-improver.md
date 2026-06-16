@@ -204,11 +204,24 @@ by (model | prompt version). Pure stats in `judging/noise.ts` (unit-tested,
 `pooledSigma` (sqrt of mean per-node within-node variance); also p90/max σ,
 meanScore (range sanity), applicabilityFlips (n/a↔numeric instability).
 
-First read (gpt-5.4, n3, runs=2 SMOKE, 5 nodes): process σ≈0.007, faithfulness
-σ≈0.009 (near-deterministic) · coverage σ≈0.06 · composition σ≈0.10 (max 0.15,
-the noisiest axis). TODO: re-run authoritative baseline with `--runs 5` over
-more traces AND `--provider codex` (codex is the PROD judge — its σ is what the
-live gate must clear).
+First read (gpt-5.4, n3, runs=3, trace e5cec8e5): composition was the noisiest
+axis by far — pooledσ 0.19, maxσ 0.36 (process/faithfulness near-deterministic
+σ<0.02, coverage σ≈0.06).
+
+**Composition axis de-tasted (prompt n3→n4).** The σ tool exposed composition
+as too subjective ("does F follow format/tone/length"). Rewrote it OBJECTIVE:
+dock ONLY for a clear citable CONTRADICTION with a rule the contract actually
+states (wrong format / blown length cap / violated "stop if < N"); dropped
+`tone` entirely; silence ≠ violation; factual fabrication belongs to
+faithfulness, not here. Result on the SAME trace/nodes (runs=3): composition
+pooledσ 0.19→0.022 (8.5× more repeatable), maxσ 0.36→0.04, meanScore 0.67→0.95
+(taste-deductions gone). Other axes unchanged. Tradeoff: composition is now a
+low-noise "is there a real violation?" gate, not a quality grade — exactly what
+the improver can reliably patch toward. schema.ts ↔ judge-trace/SKILL.md kept
+verbatim-synced; version bump re-judges the corpus.
+
+TODO: authoritative baseline `--runs 5` over more traces AND `--provider codex`
+(codex is the PROD judge — its σ is what the live gate must clear).
 
 Gate guidance baked into output: accept Δ only when `Δ > k·pooledSigma` (k≈2)
 on the target axis AND no holdout regression.
