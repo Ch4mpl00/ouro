@@ -92,6 +92,9 @@ export interface SkillStore {
   readPatch(name: string): Promise<string | null>;
   // Always writes to the live overlay; defaults stay intact.
   saveSkill(name: string, content: string): Promise<{ path: string; sizeBytes: number }>;
+  // Write the improver's patch overlay (skills/<name>.patch.md). Deleting the
+  // file is the clean revert (the body falls back to its unpatched form).
+  savePatch(name: string, content: string): Promise<{ path: string; sizeBytes: number }>;
   // Union of live + defaults, with `source` showing which layer is active.
   listSkills(): Promise<SkillEntry[]>;
   // Walk every skill on disk and parse it; throws a combined error listing
@@ -203,6 +206,14 @@ export function createSkillStore(opts: SkillStoreOpts = {}): SkillStore {
       validateName(name);
       await fs.mkdir(liveDir, { recursive: true });
       const target = path.join(liveDir, `${name}.md`);
+      await fs.writeFile(target, content, "utf-8");
+      return { path: target, sizeBytes: Buffer.byteLength(content, "utf-8") };
+    },
+
+    async savePatch(name, content) {
+      validateName(name);
+      await fs.mkdir(liveDir, { recursive: true });
+      const target = path.join(liveDir, `${name}.patch.md`);
       await fs.writeFile(target, content, "utf-8");
       return { path: target, sizeBytes: Buffer.byteLength(content, "utf-8") };
     },

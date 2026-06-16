@@ -250,14 +250,42 @@ baseline now exists for `codex|n4` (composition σ 0.030, coverage 0.050, proces
 uses. Known simplification: replay sends model+messages(+json for planner) but
 not the recorded temperature/reasoning preset; revisit if it skews Δ.
 
-## Phase 3 — improver (cron, closed-loop) (deferred)
+## Phase 3 — improver (closed-loop)
 
-Per the locked closed-loop decisions above: aggregate per-skill low-score
-clusters → codex patch-author (rules: concrete-but-general lessons, few-shot
-good/bad) → gate (Phase 2) on cluster + holdout → ship to
-`skills/<skill>.patch.md` → live-trend monitor → auto-revert. Watermark per
-`(skill, axis)`: last attempt + outcome + live patch ref. Self-consistency
-caveat: patch-author should differ from judge model where possible.
+### п1 — runtime patch injection — DONE (2026-06-16)
+Shipped `skills/<skill>.patch.md` now actually take effect. `appendPatch` (in
+skills.ts, the shared primitive; judging/patch.ts re-exports it) glues the patch
+onto the END of the node's final system message — planner: after <tools>/<skills>
+(keeps cache prefix); compose: after the body. `SkillStore.readPatch`/`savePatch`
+own the file. `readPatch` threaded composition-root → runner → compiler/executor
+as an OPTIONAL dep. llm_agent is NOT patched (judge-only). Test pins the compose
+injection. The gate (п2) replays through the SAME `appendPatch`, so prod runs
+exactly what was scored.
+
+### п2 — author → gate → ship — DONE (2026-06-16, code; live-validate on prod)
+`pnpm improve --skill S --axis A [--cluster N] [--holdout M] [--samples K]
+[--lowMax 0.6] [--k 2] [--provider codex] [--apply]`.
+- `judging/improver.ts` (pure, tested): `selectClusters` (low scorers ≤lowMax +
+  high-score holdout, null axes ignored), `authorPatch` (codex/backend writes ONE
+  append-only lesson — concrete-but-general, no body rewrite, empty when no
+  generalizable fix), `decideShip` (accept iff target axis NET-improves on the
+  cluster AND zero regressions anywhere — conservative, since shipping is auto).
+- `scripts/improve.ts`: corpus (`listJudgements`) → cluster → author → gate
+  (`runNodeGate` over cluster + holdout, σ from noise-baseline) → decide →
+  `--apply` appends to `skills/S.patch.md`. `scripts/gate-runtime.ts` shared with
+  judge:gate (lazy per-provider clients, `buildGateTarget`, `runModel`).
+- Defaults codex. Self-consistency caveat still open: author==judge==codex for
+  now; move author off codex (e.g. gpt-5.4 one call) if patches overfit the judge.
+- **TODO: live-validate `improve` on prod** — the judged corpus lives in the
+  droplet's agent.db, not locally (`improve` on an empty local store just says
+  "run the judge worker first"). Run it there (codex up) to see a real author+gate
+  cycle, first WITHOUT `--apply`.
+
+### п3 — cron + live-trend monitor + auto-revert (NEXT)
+Schedule `improve --apply` per (skill, axis); watermark last attempt + outcome +
+live patch ref; monitor the live axis trend on NEW traces after a ship and
+AUTO-REVERT (delete the .patch.md) if the gain doesn't hold. ≤1 informed retry
+(feed the failed gate rationale back), max 2 attempts/cluster/run.
 
 ## Open knobs (decide with data, not now)
 - Per-node judging cost on map-stage nodes (large chunk inputs) — sample or

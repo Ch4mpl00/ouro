@@ -1,23 +1,20 @@
 import "dotenv/config";
 import { readFileSync } from "node:fs";
 import { config as loadEnv } from "dotenv";
-import OpenAI from "openai";
-import type { ChatCompletionMessageParam } from "openai/resources/chat/completions";
-import { DEEPSEEK_BASE_URL, GEMINI_BASE_URL, retryOnTransient } from "../providers";
 import { createAgentDb } from "../db/client";
 import { createTraceStore } from "../db/trace-store";
 import { assembleNodeMaterials } from "../judging/materials";
 import { createJudgeBackend, type JudgeProvider } from "../judging/judge-backend";
-import { runNodeGate, type GateNodeTarget } from "../judging/gate";
+import { runNodeGate } from "../judging/gate";
 import { type NoiseAxis } from "../judging/noise";
 import { JUDGE_MODEL, JUDGE_PROMPT_VERSION } from "../judging/schema";
-import type { ChatMessage } from "../judging/patch";
 import {
   createLangfuseTraceSource,
   createLocalTraceSource,
   type TraceSource,
 } from "../judging/trace-source";
 import type { Observation } from "../trace-model";
+import { buildGateTarget, runModel } from "./gate-runtime";
 
 loadEnv({ path: ".env.agent" });
 
@@ -76,38 +73,6 @@ function parseArgs(argv: string[]): CliOpts {
   return opts as CliOpts;
 }
 
-// ─── generator (re-run the patched prompt under the recorded model) ───
-
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-const deepseek = new OpenAI({ apiKey: process.env.DEEPSEEK_API_KEY, baseURL: DEEPSEEK_BASE_URL });
-const gemini = new OpenAI({ apiKey: process.env.GEMINI_API_KEY, baseURL: GEMINI_BASE_URL });
-
-function clientFor(model: string): OpenAI {
-  if (model.startsWith("deepseek")) return deepseek;
-  if (model.startsWith("gemini")) return gemini;
-  return openai;
-}
-
-function toParam(m: ChatMessage): ChatCompletionMessageParam {
-  const content = typeof m.content === "string" ? m.content : JSON.stringify(m.content);
-  if (m.role === "system") return { role: "system", content };
-  if (m.role === "assistant") return { role: "assistant", content };
-  return { role: "user", content };
-}
-
-async function runModel(messages: ChatMessage[], model: string, jsonMode: boolean): Promise<string> {
-  const res = await retryOnTransient(
-    () =>
-      clientFor(model).chat.completions.create({
-        model,
-        messages: messages.map(toParam),
-        ...(jsonMode ? { response_format: { type: "json_object" } } : {}),
-      }),
-    { maxRetries: 5, baseDelayMs: 3000 },
-  );
-  return res.choices[0]?.message.content ?? "";
-}
-
 // ─── σ baseline lookup ───────────────────────────────────────────────
 
 interface BaselineAxis {
@@ -131,15 +96,6 @@ function loadSigma(judgeModel: string): { sigma: Partial<Record<NoiseAxis, numbe
   const sigma: Partial<Record<NoiseAxis, number>> = {};
   for (const a of entry.axes) sigma[a.axis] = a.pooledSigma;
   return { sigma, found: true };
-}
-
-// ─── messages from a recorded observation ────────────────────────────
-
-function recordedMessages(input: unknown): ChatMessage[] {
-  if (!Array.isArray(input)) return [];
-  return input.filter(
-    (m): m is ChatMessage => typeof m === "object" && m !== null && "role" in m,
-  );
 }
 
 const VERDICT_GLYPH: Record<string, string> = {
@@ -188,29 +144,15 @@ async function main(): Promise<void> {
   }
   console.log(`${targets.length} target node(s)\n`);
 
-  const backend = createJudgeBackend(opts.provider, opts.provider === "openai" ? openai : null);
+  const backend = createJudgeBackend(opts.provider);
 
   for (const node of targets) {
-    const obs = byId.get(node.observationId);
-    const model = obs?.model ?? process.env.AGENT_MODEL;
-    if (!model) {
+    const target = buildGateTarget(node, byId.get(node.observationId));
+    if (!target) {
       console.log(`── ${node.label} · SKIP (no recorded model and AGENT_MODEL unset) ──\n`);
       continue;
     }
-    const target: GateNodeTarget = {
-      observationId: node.observationId,
-      kind: node.kind,
-      skill: node.skill,
-      label: node.label,
-      contract: node.contract,
-      inputText: node.inputText,
-      originalOutput: node.outputText,
-      model,
-      recordedInput: recordedMessages(obs?.input),
-      jsonMode: node.kind === "planner",
-    };
-
-    console.log(`── node ${node.label} · ${node.kind} · model ${model} ──`);
+    console.log(`── node ${node.label} · ${node.kind} · model ${target.model} ──`);
     const result = await runNodeGate({ backend, runModel }, target, patch, opts.samples, sigma, opts.k);
 
     const shown = opts.axis ? result.grades.filter((g) => g.axis === opts.axis) : result.grades;

@@ -46,6 +46,23 @@ export interface JudgementInput {
   detail: unknown;
 }
 
+// One judged node read back for the improver: identity + numeric axis scores +
+// the rich payload. Same shape as JudgementInput minus the filter keys.
+export interface JudgementRecord {
+  traceId: string;
+  observationId: string;
+  nodeKind: string;
+  skill: string;
+  scores: {
+    query_formulation: number | null;
+    process: number | null;
+    coverage: number | null;
+    composition: number | null;
+    faithfulness: number | null;
+  };
+  detail: unknown;
+}
+
 export interface TraceStore {
   writeTrace(t: StoredTraceInput): void;
   // Read-back in the canonical {trace, observations} shape (same as a Langfuse
@@ -56,6 +73,9 @@ export interface TraceStore {
   // memory-KV dedup + age window.
   listRecent(limit: number, unjudgedFor?: { provider: string; promptVersion: string }): TraceSummary[];
   writeJudgement(j: JudgementInput): void;
+  // Every judged node for a (skill, provider, promptVersion) — the improver's
+  // corpus. It clusters the low scorers and holds out the high ones in code.
+  listJudgements(filter: { skill: string; provider: string; promptVersion: string }): JudgementRecord[];
 }
 
 export function createTraceStore(db: AgentDatabase): TraceStore {
@@ -179,6 +199,34 @@ export function createTraceStore(db: AgentDatabase): TraceStore {
           set: { nodeKind: j.nodeKind, skill: j.skill, ...scores, detail: j.detail },
         })
         .run();
+    },
+
+    listJudgements(filter) {
+      const rows = db
+        .select()
+        .from(judgements)
+        .where(
+          and(
+            eq(judgements.skill, filter.skill),
+            eq(judgements.provider, filter.provider),
+            eq(judgements.promptVersion, filter.promptVersion),
+          ),
+        )
+        .all();
+      return rows.map((r) => ({
+        traceId: r.traceId,
+        observationId: r.observationId,
+        nodeKind: r.nodeKind,
+        skill: r.skill,
+        scores: {
+          query_formulation: r.queryFormulation,
+          process: r.process,
+          coverage: r.coverage,
+          composition: r.composition,
+          faithfulness: r.faithfulness,
+        },
+        detail: r.detail,
+      }));
     },
   };
 }
