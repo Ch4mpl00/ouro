@@ -7,6 +7,7 @@ import type { ChatProvider } from "../providers";
 import type { EnvData } from "../session-context";
 import type { Span, TokenUsage, TraceContext } from "../tracing";
 import { JUDGE_NODE_META } from "../trace-model";
+import { appendPatch } from "../skills";
 import { createWorkflowSchema, parseWorkflow, type Workflow } from "./dsl";
 
 // Compiler — turns a signal into a validated Workflow via one LLM call (with
@@ -80,6 +81,11 @@ export interface CompilerEngineSurface {
 export interface CompilerDeps {
   engine: CompilerEngineSurface;
   readSkill: (name: string) => Promise<string | null>;
+  // Optional improver patch loader for the planner skill. When present and a
+  // `skills/planner.patch.md` exists, it's appended to the END of the system
+  // message (after the <tools>/<skills> block) — the SAME placement the gate
+  // replay measures. Absent → no patch (default; tests omit it).
+  readPatch?: (name: string) => Promise<string | null>;
   // Full MCP tool definitions — used to (a) build the schema enum of
   // legal tool names and (b) render compact `name(arg: type, ...)`
   // signatures in the user prompt so the compiler emits the right
@@ -134,8 +140,11 @@ export function createCompiler(deps: CompilerDeps): Compiler {
       const provider = deps.engine.resolveProvider(preset.model);
 
       // System = static prefix (planner rules + tools + skills), cached
-      // across signals. User = only the per-signal variable content.
-      const systemContent = `${skill}\n\n${staticReference}`;
+      // across signals. User = only the per-signal variable content. A live
+      // improver patch (if any) is appended at the very end so the cache prefix
+      // stays intact and the placement matches the gate replay.
+      const patch = deps.readPatch ? await deps.readPatch(COMPILER_SKILL_NAME) : null;
+      const systemContent = appendPatch(`${skill}\n\n${staticReference}`, patch ?? "");
       const initialUserPrompt = renderSignalPrompt(req);
       const messages: ChatCompletionMessageParam[] = [
         { role: "system", content: systemContent },

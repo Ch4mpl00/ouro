@@ -1,26 +1,10 @@
-// Append-only skill patches: the improver's unit of change. A patch is extra
-// instruction text appended AFTER a skill's body (never an edit of the body —
-// don't break what works, and keep the change token-cheap and trivially
-// revertible: delete the .patch.md).
-//
-// `appendPatch` is the ONE injection point that MUST be identical in both places
-// or the gate is measuring fiction:
-//   - prod runtime: append the live patch after the freshly-loaded skill body
-//     (compose) / after the <tools>/<skills> block (planner) — Phase 3 wiring.
-//   - gate replay: append the CANDIDATE patch to the node's RECORDED system
-//     message before re-running the generator.
-// Appending at the END preserves the planner's prompt-cache prefix (the stable
-// <tools>/<skills> block compile.ts builds up front).
+// Gate-side patch injection. The core primitive `appendPatch` lives in
+// ../skills (the skill-overlay home) and is the SAME function prod runtime uses
+// (compile.ts/execute.ts) — re-exported here so the gate and prod can't drift.
+// This module adds the chat-message variant the replay needs.
+import { appendPatch } from "../skills";
 
-export const PATCH_MARKER = "<!-- improver-patch -->";
-
-// Append a patch to a skill's effective system text. Empty/whitespace patch is a
-// no-op (so an absent .patch.md changes nothing).
-export function appendPatch(system: string, patch: string): string {
-  const trimmed = patch.trim();
-  if (trimmed.length === 0) return system;
-  return `${system.replace(/\s+$/, "")}\n\n${PATCH_MARKER}\n${trimmed}\n`;
-}
+export { appendPatch, PATCH_MARKER } from "../skills";
 
 export interface ChatMessage {
   role: string;

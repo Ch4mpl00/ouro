@@ -81,6 +81,10 @@ export interface WorkflowRunnerDeps {
   // frontmatter), or null when not found.
   knownSkills: readonly string[];
   readSkill: (name: string) => Promise<string | null>;
+  // Optional improver patch loader (skills/<name>.patch.md), threaded to both
+  // the compiler (planner patch) and the executor (compose patch). Absent → no
+  // patching; agent (llm_agent) skills are judge-only and never patched here.
+  readPatch?: (name: string) => Promise<string | null>;
   // Agent-side memory KV writer — dispatched by the executor for
   // `set_memory` tool steps (watermark writes). Injected by the
   // composition root, same instance the AgentLoop path uses.
@@ -96,6 +100,7 @@ export function createWorkflowRunner(deps: WorkflowRunnerDeps): WorkflowRunner {
   const compiler = createCompiler({
     engine: deps.engine,
     readSkill: deps.readSkill,
+    readPatch: deps.readPatch,
     // set_memory is a synthetic agent-side tool with no MCP counterpart;
     // surface it to the compiler too so it appears in the schema enum and
     // the prompt's tool signatures (the executor dispatches it directly).
@@ -106,6 +111,7 @@ export function createWorkflowRunner(deps: WorkflowRunnerDeps): WorkflowRunner {
   const executor = createExecutor({
     engine: deps.engine,
     readSkill: deps.readSkill,
+    readPatch: deps.readPatch,
     setMemory: deps.setMemory,
   });
 

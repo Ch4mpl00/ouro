@@ -25,6 +25,20 @@ import fs from "node:fs/promises";
 const REPO_ROOT = path.resolve(import.meta.dirname, "../../..");
 const NAME_PATTERN = /^[a-z0-9][a-z0-9_-]*$/i;
 
+// Append-only improver patch marker. The improver writes lessons to
+// `skills/<name>.patch.md`; appendPatch glues them onto the END of a skill's
+// effective system text. This is the ONE injection used by BOTH prod runtime
+// (compile.ts/execute.ts, below) and the gate replay (judging/patch.ts) — they
+// MUST agree or the gate measures fiction. Appending at the very end keeps the
+// planner's prompt-cache prefix (body + <tools>/<skills>) intact.
+export const PATCH_MARKER = "<!-- improver-patch -->";
+
+export function appendPatch(system: string, patch: string): string {
+  const trimmed = patch.trim();
+  if (trimmed.length === 0) return system;
+  return `${system.replace(/\s+$/, "")}\n\n${PATCH_MARKER}\n${trimmed}\n`;
+}
+
 function validateName(name: string): void {
   if (!NAME_PATTERN.test(name)) {
     throw new Error(`Invalid skill name "${name}". Use [a-z0-9][a-z0-9_-]* only.`);
@@ -71,6 +85,11 @@ export interface SkillStore {
   // must not trip over a live overlay that `dreaming` wrote without a
   // `tools:` block — `readSkill` throws there; this doesn't.
   readSkillRaw(name: string): Promise<string | null>;
+  // The improver's append-only patch for a skill, if any. Patches live ONLY in
+  // the live overlay (`skills/<name>.patch.md`) — the improver writes them and
+  // defaults never ship one — so this does NOT fall back to defaults. null when
+  // absent. Callers glue it on with `appendPatch`.
+  readPatch(name: string): Promise<string | null>;
   // Always writes to the live overlay; defaults stay intact.
   saveSkill(name: string, content: string): Promise<{ path: string; sizeBytes: number }>;
   // Union of live + defaults, with `source` showing which layer is active.
@@ -173,6 +192,11 @@ export function createSkillStore(opts: SkillStoreOpts = {}): SkillStore {
       const live = await readIfExists(path.join(liveDir, `${name}.md`));
       if (live !== null) return live;
       return readIfExists(path.join(defaultsDir, `${name}.md`));
+    },
+
+    async readPatch(name) {
+      validateName(name);
+      return readIfExists(path.join(liveDir, `${name}.patch.md`));
     },
 
     async saveSkill(name, content) {
