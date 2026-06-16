@@ -48,7 +48,9 @@ interface CliOpts {
 
 function parseArgs(argv: string[]): CliOpts {
   const opts: CliOpts = {
-    provider: "openai",
+    // codex is the PROD judge and the cheap one (shared ChatGPT quota, not the
+    // expensive gpt-5.4 API) — default to it; --provider openai to override.
+    provider: "codex",
     runs: 5,
     concurrency: 1,
     model: null,

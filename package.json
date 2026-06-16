@@ -13,6 +13,7 @@
     "judge": "tsx packages/agent/src/scripts/judge.ts",
     "judge:worker": "tsx packages/agent/src/scripts/judge-worker.ts",
     "judge:noise": "tsx packages/agent/src/scripts/judge-noise.ts",
+    "judge:gate": "tsx packages/agent/src/scripts/judge-gate.ts",
     "db:init": "pnpm db:init:mcp && pnpm db:init:agent",
     "db:init:mcp": "mkdir -p packages/mcp/data && sqlite3 packages/mcp/data/tokens.db < packages/mcp/data/schema.sql",
     "db:init:agent": "pnpm setup:agent",

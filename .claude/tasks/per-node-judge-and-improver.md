@@ -226,10 +226,29 @@ TODO: authoritative baseline `--runs 5` over more traces AND `--provider codex`
 Gate guidance baked into output: accept Δ only when `Δ > k·pooledSigma` (k≈2)
 on the target axis AND no holdout regression.
 
-### Slice 1 — replay harness (NEXT)
-Generalize `judge-replay` to `replayNodeWithPatch(node, patchText)`: append patch
-to the node's recorded system message, re-run same model, return new output.
-Re-judge the target axis. Compare Δ against the σ baseline from Slice 0.
+### Slice 1 — replay/gate harness — DONE (2026-06-16)
+`pnpm judge:gate <traceId> --skill <skill> --patch <file.md> [--node <substr>]
+[--axis <axis>] [--samples N] [--provider codex|openai] [--k 2]`.
+
+- `judging/patch.ts` — `appendPatch(system, patch)` + `patchMessages(msgs, patch)`:
+  the ONE shared injection (append-only, marker `<!-- improver-patch -->`, after
+  the body / planner tools-skills block to keep the cache prefix). Phase 3 reuses
+  it in `execute.ts`/`compile.ts` so prod runs exactly what the gate measured.
+- `judging/gate.ts` — `gradeAxis` (pure: Δ vs k·σ → improve/regress/noise/
+  no-baseline/n-a) + `runNodeGate` (before = recorded output judged N×; after =
+  N fresh generations from the patched prompt, judged each; judge yardstick stays
+  the ORIGINAL contract — the patch nudges the GENERATOR, not the goalposts).
+  Unit-tested (`gate.test.ts`).
+- `scripts/judge-gate.ts` — wiring: re-runs the generator under the RECORDED
+  model (deepseek), judges via codex (default), reads σ from noise-baseline.json
+  keyed (judge model | prompt version).
+
+**Defaults flipped to codex** (`judge:noise` + `judge:gate`) — codex is the prod
+judge and cheap (shared ChatGPT quota), gpt-5.4 is expensive. Authoritative σ
+baseline now exists for `codex|n4` (composition σ 0.030, coverage 0.050, process
+0.020, faithfulness 0.018, query_formulation 0.029) — the floor the live gate
+uses. Known simplification: replay sends model+messages(+json for planner) but
+not the recorded temperature/reasoning preset; revisit if it skews Δ.
 
 ## Phase 3 — improver (cron, closed-loop) (deferred)
 
