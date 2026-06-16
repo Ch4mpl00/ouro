@@ -1,9 +1,28 @@
 # Per-node judge + closed-loop self-improvement
 
-**Status:** Phase 1 DONE (in PR, not merged); Phase 2 next
+**Status:** Phase 1 DONE + deployed; Phase 2 IN PROGRESS (σ_judge tool done)
 **Priority:** P1
 **Area:** evals / agent / self-improvement
 **Created:** 2026-06-14
+
+## Decisions update (2026-06-16, locked with user)
+
+- **Closed-loop directly, no propose-only intermediate.** Cost is low (single
+  user = the owner). Build Phase 2 gate + Phase 3 cron; ship to live with
+  auto-revert. Still gate every patch (σ-aware Δ + holdout) — "closed-loop"
+  ≠ "unverified".
+- **`dreaming` is DEPRECATED — do NOT integrate.** It will be removed later.
+  The improver does not call it, does not share its file. (`dreaming.md`'s
+  "only path to self-revision" claim is now stale.)
+- **Patch = separate `skills/<skill>.patch.md`, append-only.** Improver owns
+  ONLY the `.patch.md`; the skill body stays human-owned. Injection (append
+  patch after the skill body) is ONE shared function used by BOTH prod runtime
+  (`execute.ts` readSkill path + `compile.ts` planner load) AND the gate replay
+  — otherwise the gate measures something prod won't run. Revert = delete the
+  `.patch.md` (clean reset to the body).
+- **σ_judge is measured PER MODEL.** Different judge models have different
+  repeatability noise; the gate's accept threshold per axis derives from the
+  judge model's own σ. Committed baseline keyed by (model | prompt version).
 
 Supersedes the whole-run trajectory judge in [[eval-trajectory-judge]]: that
 judge scored the WHOLE run against two contracts. We are replacing it with a
@@ -174,12 +193,30 @@ OpenAI/codex key + a real trace) but the path is exercised.
   query_formulation/process; each compose node on composition/coverage/faithfulness;
   agent node (if any) judged black-box.
 
-## Phase 2 — generic patch-replay harness (deferred)
+## Phase 2 — generic patch-replay harness (IN PROGRESS)
 
+### Slice 0 — σ_judge calibration tool — DONE (2026-06-16)
+`pnpm judge:noise [--provider openai|codex] [--runs K] [--model label] (<traceId...> | --recent N)`
+re-judges the SAME nodes K times unchanged and reports per-axis spread, merged
+into a committed baseline `packages/agent/src/judging/noise-baseline.json` keyed
+by (model | prompt version). Pure stats in `judging/noise.ts` (unit-tested,
+`noise.test.ts`); CLI glue in `scripts/judge-noise.ts`. Headline stat =
+`pooledSigma` (sqrt of mean per-node within-node variance); also p90/max σ,
+meanScore (range sanity), applicabilityFlips (n/a↔numeric instability).
+
+First read (gpt-5.4, n3, runs=2 SMOKE, 5 nodes): process σ≈0.007, faithfulness
+σ≈0.009 (near-deterministic) · coverage σ≈0.06 · composition σ≈0.10 (max 0.15,
+the noisiest axis). TODO: re-run authoritative baseline with `--runs 5` over
+more traces AND `--provider codex` (codex is the PROD judge — its σ is what the
+live gate must clear).
+
+Gate guidance baked into output: accept Δ only when `Δ > k·pooledSigma` (k≈2)
+on the target axis AND no holdout regression.
+
+### Slice 1 — replay harness (NEXT)
 Generalize `judge-replay` to `replayNodeWithPatch(node, patchText)`: append patch
 to the node's recorded system message, re-run same model, return new output.
-Re-judge the target axis. Validate Δ measurement + a noise calibration
-(re-judge same cluster 2–3× without a patch to set the accept threshold).
+Re-judge the target axis. Compare Δ against the σ baseline from Slice 0.
 
 ## Phase 3 — improver (cron, closed-loop) (deferred)
 

@@ -1,0 +1,53 @@
+{
+  "gpt-5.4|n3": {
+    "model": "gpt-5.4",
+    "provider": "openai",
+    "promptVersion": "n3",
+    "runs": 2,
+    "sampleNodes": 5,
+    "totalJudgeCalls": 10,
+    "axes": [
+      {
+        "axis": "process",
+        "nodes": 1,
+        "pooledSigma": 0.0071,
+        "meanSigma": 0.0071,
+        "p90Sigma": 0.0071,
+        "maxSigma": 0.0071,
+        "meanScore": 0.975,
+        "applicabilityFlips": 0
+      },
+      {
+        "axis": "coverage",
+        "nodes": 4,
+        "pooledSigma": 0.0615,
+        "meanSigma": 0.0513,
+        "p90Sigma": 0.0877,
+        "maxSigma": 0.0919,
+        "meanScore": 0.429,
+        "applicabilityFlips": 0
+      },
+      {
+        "axis": "composition",
+        "nodes": 4,
+        "pooledSigma": 0.0956,
+        "meanSigma": 0.0689,
+        "p90Sigma": 0.14,
+        "maxSigma": 0.1485,
+        "meanScore": 0.569,
+        "applicabilityFlips": 0
+      },
+      {
+        "axis": "faithfulness",
+        "nodes": 4,
+        "pooledSigma": 0.0094,
+        "meanSigma": 0.0088,
+        "p90Sigma": 0.012,
+        "maxSigma": 0.0141,
+        "meanScore": 0.946,
+        "applicabilityFlips": 0
+      }
+    ],
+    "measuredAt": "2026-06-16T08:59:22.160Z"
+  }
+}
