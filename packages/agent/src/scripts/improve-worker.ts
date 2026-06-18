@@ -1,4 +1,5 @@
 import "dotenv/config";
+import { appendFileSync } from "node:fs";
 import { config as loadEnv } from "dotenv";
 import { createAgentDb } from "../db/client";
 import { createTraceStore } from "../db/trace-store";
@@ -37,8 +38,20 @@ async function main(): Promise<void> {
       );
     }
 
+    // Durable audit trail on the agent-data volume — survives container
+    // recreates (unlike `docker compose logs`), so a week of cycles (incl.
+    // rejected, with the proposed lesson + gate reasons) stays reviewable.
+    const auditPath = process.env.IMPROVE_AUDIT_PATH ?? "packages/agent/data/improver-audit.jsonl";
+    const audit = (entry: Record<string, unknown>): void => {
+      try {
+        appendFileSync(auditPath, `${JSON.stringify(entry)}\n`);
+      } catch (err) {
+        console.warn(`[improve-worker] audit write failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    };
+
     await runImproveWorker(
-      { store, improverStore, skillStore, source, backend, sigma, log: (m) => console.log(m) },
+      { store, improverStore, skillStore, source, backend, sigma, log: (m) => console.log(m), audit },
       opts,
     );
   } finally {

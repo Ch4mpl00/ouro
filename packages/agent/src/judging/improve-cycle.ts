@@ -237,6 +237,7 @@ export async function runImproveCycle(deps: ImproveCycleDeps, opts: ImproveCycle
   // Author → gate, with ≤(maxAttempts−1) informed retries on a failed gate.
   let priorFeedback: string | null = null;
   let lastReasons: string[] = [];
+  let lastLesson: string | null = null;
   for (let attempt = 1; attempt <= Math.max(1, opts.maxAttempts); attempt++) {
     const authored = await authorPatch(deps.backend, {
       skill,
@@ -249,6 +250,7 @@ export async function runImproveCycle(deps: ImproveCycleDeps, opts: ImproveCycle
     });
     log(`[attempt ${attempt}] candidate: ${authored.lesson.trim() ? authored.lesson.trim() : "(empty)"}`);
     if (authored.lesson.trim().length === 0) return { outcome: "no-fix", mode: mode.description };
+    lastLesson = authored.lesson.trim();
 
     const clusterResults = await gateNodes(cluster, opts.samples, authored.lesson);
     const holdoutResults = await gateNodes(holdout, 1, authored.lesson);
@@ -279,5 +281,5 @@ export async function runImproveCycle(deps: ImproveCycleDeps, opts: ImproveCycle
     };
   }
 
-  return { outcome: "rejected", mode: mode.description, reasons: lastReasons };
+  return { outcome: "rejected", mode: mode.description, lesson: lastLesson ?? undefined, reasons: lastReasons };
 }

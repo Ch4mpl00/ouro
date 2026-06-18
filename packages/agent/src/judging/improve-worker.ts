@@ -27,6 +27,12 @@ export interface ImproveWorkerDeps {
   backend: JudgeBackend;
   sigma: Partial<Record<NoiseAxis, number>>;
   log?: (msg: string) => void;
+  // Durable, structured audit sink (one record per cycle + monitor event),
+  // distinct from `log` (ephemeral stdout lost on container recreate). The
+  // script appends these as JSONL on the agent-data volume so a week of runs —
+  // INCLUDING rejected proposals (with the lesson + gate reasons) — is reviewable
+  // later. No-op when unset.
+  audit?: (entry: Record<string, unknown>) => void;
 }
 
 export interface ImproveWorkerOpts {
@@ -136,6 +142,17 @@ async function monitorPending(
       monitorStatus: null,
     });
     log(`[${skill}/${axis}] AUTO-REVERTED — live trend fell below baseline; removed the lesson.`);
+    deps.audit?.({
+      at: nowISO,
+      kind: "monitor",
+      action: "reverted",
+      skill,
+      axis,
+      baselineMean: state.baselineMean,
+      postMean: verdict.postMean,
+      postN: verdict.postN,
+      lesson: state.shippedLesson ?? null,
+    });
     return "reverted";
   }
 
@@ -150,6 +167,17 @@ async function monitorPending(
     monitorStatus: "kept",
   });
   log(`[${skill}/${axis}] ship held in prod — kept.`);
+  deps.audit?.({
+    at: nowISO,
+    kind: "monitor",
+    action: "kept",
+    skill,
+    axis,
+    baselineMean: state.baselineMean,
+    postMean: verdict.postMean,
+    postN: verdict.postN,
+    lesson: state.shippedLesson ?? null,
+  });
   return "kept";
 }
 
@@ -240,6 +268,16 @@ async function tick(deps: ImproveWorkerDeps, opts: ImproveWorkerOpts): Promise<v
     });
     log(`[${p.skill}/${p.axis}] cycle → ${result.outcome}${result.mode ? ` (mode: ${result.mode})` : ""}`);
     recordCycle(deps, p.skill, p.axis, result, nowISO);
+    deps.audit?.({
+      at: nowISO,
+      kind: "cycle",
+      skill: p.skill,
+      axis: p.axis,
+      outcome: result.outcome,
+      mode: result.mode ?? null,
+      lesson: result.lesson ?? null,
+      reasons: result.reasons ?? null,
+    });
   }
 }
 
