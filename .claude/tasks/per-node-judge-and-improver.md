@@ -1,6 +1,8 @@
 # Per-node judge + closed-loop self-improvement
 
-**Status:** Phase 1 DONE + deployed; Phase 2 IN PROGRESS (σ_judge tool done)
+**Status:** Phase 1 DONE + deployed; Phase 2 DONE; Phase 3 п1/п2 DONE; refined
+improver (A/B/C/D) IMPLEMENTED 2026-06-18 (typecheck + 226 tests green) — NEXT:
+prod-validate `improve` WITHOUT --apply, then п3 (E: cron/monitor/revert)
 **Priority:** P1
 **Area:** evals / agent / self-improvement
 **Created:** 2026-06-14
@@ -170,6 +172,29 @@ with low scores + a per-skill patch budget).
   cluster; embeddings noted as the scale-up path.
 - author gets the current `.patch.md` for dedup.
 - п3 still owns: cron, live-trend monitor, auto-revert, retire/budget.
+
+#### IMPLEMENTED 2026-06-18 (A/B/C/D — on branch `improver-gate`)
+
+- **band = 0.75 (the "ok" anchor)**, locked with user: candidate iff
+  `score < absMax(0.6) AND score < bar(0.75) − k·σ`.
+- `db/trace-store.ts`: `JudgementRecord` now carries `startedAt` (joined from
+  `traces`); `listJudgements` does the inner-join — the recency signal the
+  cluster window needs.
+- `improver.ts`: `selectClusters` → **`selectCandidates`** (absolute+σ,
+  recent-window cluster vs all-time `≥holdoutMin` holdout, returns ALL recent
+  candidates — not capped). NEW `induceTaxonomy` (open-coding, one LLM call →
+  named modes + member ids) + `dominantMode` (Pareto pick, drops hallucinated
+  ids). `authorPatch` now takes `failureMode` + `existingPatch` (dedup-on-input).
+- `gate.ts`: `gradeAxis` before is a single stored score (not S re-judges);
+  threshold `k·σ·√(1+1/S)`. `runNodeGate` takes `storedScores`, no before-judge.
+- `scripts/improve.ts`: new pipeline select→taxonomy→dominant cluster→author
+  (with dedup)→cheap gate (cluster S=2 / holdout S=1, stored before)→decide→ship.
+  New flags `--absMax --bar --holdoutMin --recentDays`; dropped `--lowMax`.
+- `scripts/judge-gate.ts` (standalone A/B): judges the recorded output ONCE for
+  its before (no corpus there), then the same `runNodeGate`.
+- STILL OPEN (E / п3): cron, live-trend monitor, auto-revert, retire/budget — and
+  the п2 TODO to live-validate `improve` on prod (corpus lives in droplet
+  agent.db) BEFORE building п3.
 
 Supersedes the whole-run trajectory judge in [[eval-trajectory-judge]]: that
 judge scored the WHOLE run against two contracts. We are replacing it with a

@@ -6,7 +6,8 @@ import { createTraceStore } from "../db/trace-store";
 import { assembleNodeMaterials } from "../judging/materials";
 import { createJudgeBackend, type JudgeProvider } from "../judging/judge-backend";
 import { runNodeGate } from "../judging/gate";
-import { type NoiseAxis } from "../judging/noise";
+import { judgeNode } from "../judging/node-judge";
+import { extractAxisScores, type NoiseAxis } from "../judging/noise";
 import { JUDGE_MODEL, JUDGE_PROMPT_VERSION } from "../judging/schema";
 import {
   createLangfuseTraceSource,
@@ -153,7 +154,17 @@ async function main(): Promise<void> {
       continue;
     }
     console.log(`── node ${node.label} · ${node.kind} · model ${target.model} ──`);
-    const result = await runNodeGate({ backend, runModel }, target, patch, opts.samples, sigma, opts.k);
+    // Standalone A/B tool: no stored corpus score here, so derive the "before"
+    // by judging the recorded output ONCE (the improver path reads it for free).
+    const beforeVerdict = await judgeNode(backend, {
+      kind: target.kind,
+      skill: target.skill,
+      contract: target.contract,
+      inputText: target.inputText,
+      outputText: target.originalOutput,
+    });
+    const storedScores = extractAxisScores(beforeVerdict);
+    const result = await runNodeGate({ backend, runModel }, target, patch, opts.samples, sigma, opts.k, storedScores);
 
     const shown = opts.axis ? result.grades.filter((g) => g.axis === opts.axis) : result.grades;
     for (const g of shown) {

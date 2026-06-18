@@ -1,10 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { decideShip, selectClusters } from "./improver";
+import { decideShip, dominantMode, selectCandidates, type Taxonomy } from "./improver";
 import type { AxisGrade, NodeGateResult } from "./gate";
 import type { NoiseAxis } from "./noise";
 import type { JudgementRecord } from "../db/trace-store";
 
-function rec(id: string, coverage: number | null): JudgementRecord {
+function rec(id: string, coverage: number | null, startedAt = "2026-06-18T00:00:00.000Z"): JudgementRecord {
   return {
     traceId: `t-${id}`,
     observationId: `o-${id}`,
@@ -18,31 +18,85 @@ function rec(id: string, coverage: number | null): JudgementRecord {
       faithfulness: null,
     },
     detail: {},
+    startedAt,
   };
 }
 
-describe("selectClusters", () => {
-  it("clusters the lowest scorers ≤ lowMax and holds out the highest, no overlap", () => {
+// Defaults mirroring the locked design: candidate iff score < 0.6 AND
+// score < 0.75 − k·σ; holdout = all-time score ≥ 0.85.
+const OPTS = { holdoutSize: 5, absMax: 0.6, bar: 0.75, k: 2, holdoutMin: 0.85, recentSince: null as string | null };
+
+describe("selectCandidates", () => {
+  it("selects absolute+σ failures (asc) and an all-time high holdout (desc), no overlap", () => {
     const records = [rec("a", 0.2), rec("b", 0.5), rec("c", 0.9), rec("d", 0.95), rec("e", 0.4)];
-    const { cluster, holdout } = selectClusters(records, "coverage", {
-      clusterSize: 2,
-      holdoutSize: 2,
-      lowMax: 0.6,
-    });
-    expect(cluster.map((r) => r.observationId)).toEqual(["o-a", "o-e"]); // 0.2, 0.4
+    const { candidates, holdout } = selectCandidates(records, "coverage", { ...OPTS, sigma: 0.05 });
+    // sigmaFloor = 0.75 − 0.1 = 0.65; absMax 0.6 dominates → s < 0.6
+    expect(candidates.map((r) => r.observationId)).toEqual(["o-a", "o-e", "o-b"]); // 0.2,0.4,0.5
     expect(holdout.map((r) => r.observationId)).toEqual(["o-d", "o-c"]); // 0.95, 0.9
+  });
+
+  it("the σ term excludes near-bar lows on a noisy axis (not just judge wobble)", () => {
+    const records = [rec("a", 0.4), rec("b", 0.5)];
+    // sigma 0.15 → sigmaFloor = 0.75 − 0.3 = 0.45; 0.5 fails absMax but not the σ floor.
+    const { candidates } = selectCandidates(records, "coverage", { ...OPTS, sigma: 0.15 });
+    expect(candidates.map((r) => r.observationId)).toEqual(["o-a"]);
+  });
+
+  it("draws the cluster from the recent window but the holdout from all time", () => {
+    const records = [
+      rec("old-low", 0.3, "2026-01-01T00:00:00.000Z"),
+      rec("new-low", 0.3, "2026-06-17T00:00:00.000Z"),
+      rec("old-high", 0.9, "2026-01-01T00:00:00.000Z"),
+    ];
+    const { candidates, holdout } = selectCandidates(records, "coverage", {
+      ...OPTS,
+      sigma: 0.05,
+      recentSince: "2026-06-01T00:00:00.000Z",
+    });
+    expect(candidates.map((r) => r.observationId)).toEqual(["o-new-low"]); // old low dropped
+    expect(holdout.map((r) => r.observationId)).toEqual(["o-old-high"]); // height, not recency
   });
 
   it("ignores nodes where the axis is null (rubric didn't emit it / n/a)", () => {
     const records = [rec("a", null), rec("b", 0.3), rec("c", null)];
-    const { cluster } = selectClusters(records, "coverage", { clusterSize: 5, holdoutSize: 5, lowMax: 0.6 });
-    expect(cluster.map((r) => r.observationId)).toEqual(["o-b"]);
+    const { candidates } = selectCandidates(records, "coverage", { ...OPTS, sigma: 0.05 });
+    expect(candidates.map((r) => r.observationId)).toEqual(["o-b"]);
   });
 
-  it("returns an empty cluster when nothing is at or below lowMax", () => {
+  it("returns no candidates when the floor has reached the ceiling (all good)", () => {
     const records = [rec("a", 0.8), rec("b", 0.9)];
-    const { cluster } = selectClusters(records, "coverage", { clusterSize: 3, holdoutSize: 3, lowMax: 0.6 });
-    expect(cluster).toEqual([]);
+    const { candidates } = selectCandidates(records, "coverage", { ...OPTS, sigma: 0.05 });
+    expect(candidates).toEqual([]);
+  });
+});
+
+describe("dominantMode", () => {
+  const taxonomy: Taxonomy = {
+    modes: [
+      { name: "omits-item", description: "omits a concrete item", nodeIds: ["t-a:o-a", "t-b:o-b"] },
+      { name: "off-contract", description: "includes off-contract opinion", nodeIds: ["t-c:o-c"] },
+    ],
+  };
+
+  it("picks the Pareto-dominant mode (most valid members)", () => {
+    const valid = new Set(["t-a:o-a", "t-b:o-b", "t-c:o-c"]);
+    expect(dominantMode(taxonomy, valid)?.name).toBe("omits-item");
+  });
+
+  it("drops hallucinated ids and re-ranks on the cleaned counts", () => {
+    // only one of omits-item's ids is real → off-contract now wins
+    const valid = new Set(["t-a:o-a", "t-c:o-c", "t-x:o-x"]);
+    const tax: Taxonomy = {
+      modes: [
+        { name: "omits-item", description: "x", nodeIds: ["t-a:o-a", "t-ghost:o-ghost"] },
+        { name: "off-contract", description: "y", nodeIds: ["t-c:o-c", "t-x:o-x"] },
+      ],
+    };
+    expect(dominantMode(tax, valid)?.name).toBe("off-contract");
+  });
+
+  it("returns null when no candidate mapped", () => {
+    expect(dominantMode({ modes: [{ name: "m", description: "d", nodeIds: ["ghost"] }] }, new Set())).toBeNull();
   });
 });
 

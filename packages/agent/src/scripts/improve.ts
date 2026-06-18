@@ -13,7 +13,9 @@ import { JUDGE_PROMPT_VERSION } from "../judging/schema";
 import {
   authorPatch,
   decideShip,
-  selectClusters,
+  dominantMode,
+  induceTaxonomy,
+  selectCandidates,
   type PatchExample,
 } from "../judging/improver";
 import {
@@ -33,15 +35,19 @@ loadEnv({ path: ".env.agent" });
 // the candidate + the gate verdict). The cron (п3) just calls this on a schedule.
 //
 //   pnpm improve --skill news-digest --axis coverage [--cluster 3] [--holdout 3]
-//                [--samples 3] [--lowMax 0.6] [--k 2] [--provider codex] [--apply]
+//                [--samples 2] [--absMax 0.6] [--bar 0.75] [--holdoutMin 0.85]
+//                [--recentDays 14] [--k 2] [--provider codex] [--apply]
 
 interface CliOpts {
   skill: string;
   axis: NoiseAxis;
-  cluster: number;
+  cluster: number; // cap on the cluster (dominant-mode nodes the gate replays)
   holdout: number;
-  samples: number;
-  lowMax: number;
+  samples: number; // cluster samples (S); holdout is always S=1 (regression guard)
+  absMax: number; // candidate iff score < absMax …
+  bar: number; // … AND score < bar − k·σ (bar = "ok" anchor by default)
+  holdoutMin: number; // all-time gold-standard threshold
+  recentDays: number; // cluster drawn from this trailing window
   k: number;
   provider: JudgeProvider;
   apply: boolean;
@@ -51,8 +57,11 @@ function parseArgs(argv: string[]): CliOpts {
   const o: Partial<CliOpts> = {
     cluster: 3,
     holdout: 3,
-    samples: 3,
-    lowMax: 0.6,
+    samples: 2,
+    absMax: 0.6,
+    bar: 0.75,
+    holdoutMin: 0.85,
+    recentDays: 14,
     k: 2,
     provider: "codex",
     apply: false,
@@ -64,8 +73,11 @@ function parseArgs(argv: string[]): CliOpts {
     else if (arg === "--axis" || arg.startsWith("--axis=")) o.axis = val("--axis") as NoiseAxis;
     else if (arg === "--cluster" || arg.startsWith("--cluster=")) o.cluster = Math.max(1, Number(val("--cluster")) || 3);
     else if (arg === "--holdout" || arg.startsWith("--holdout=")) o.holdout = Math.max(0, Number(val("--holdout")) || 3);
-    else if (arg === "--samples" || arg.startsWith("--samples=")) o.samples = Math.max(1, Number(val("--samples")) || 3);
-    else if (arg === "--lowMax" || arg.startsWith("--lowMax=")) o.lowMax = Number(val("--lowMax")) || 0.6;
+    else if (arg === "--samples" || arg.startsWith("--samples=")) o.samples = Math.max(1, Number(val("--samples")) || 2);
+    else if (arg === "--absMax" || arg.startsWith("--absMax=")) o.absMax = Number(val("--absMax")) || 0.6;
+    else if (arg === "--bar" || arg.startsWith("--bar=")) o.bar = Number(val("--bar")) || 0.75;
+    else if (arg === "--holdoutMin" || arg.startsWith("--holdoutMin=")) o.holdoutMin = Number(val("--holdoutMin")) || 0.85;
+    else if (arg === "--recentDays" || arg.startsWith("--recentDays=")) o.recentDays = Math.max(0, Number(val("--recentDays")) || 14);
     else if (arg === "--k" || arg.startsWith("--k=")) o.k = Math.max(0, Number(val("--k")) || 2);
     else if (arg === "--provider" || arg.startsWith("--provider=")) {
       const v = val("--provider");
@@ -77,7 +89,8 @@ function parseArgs(argv: string[]): CliOpts {
   if (!o.skill || !o.axis) {
     console.error(
       "usage: pnpm improve --skill <skill> --axis <axis> [--cluster N] [--holdout M] " +
-        "[--samples K] [--lowMax 0.6] [--k 2] [--provider codex|openai] [--apply]",
+        "[--samples K] [--absMax 0.6] [--bar 0.75] [--holdoutMin 0.85] [--recentDays 14] " +
+        "[--k 2] [--provider codex|openai] [--apply]",
     );
     process.exit(1);
   }
@@ -115,10 +128,13 @@ async function main(): Promise<void> {
   const source: TraceSource = createLocalTraceSource(store, createLangfuseTraceSource());
 
   const judgeModel = opts.provider === "openai" ? "openai" : (process.env.CODEX_JUDGE_MODEL ?? "codex");
+  const sigma = loadSigma(judgeModel);
+  const axisSigma = sigma[opts.axis] ?? null;
   console.log(`\n=== IMPROVER · skill=${opts.skill} · axis=${opts.axis} ===`);
   console.log(
-    `judge=${opts.provider} prompt=${JUDGE_PROMPT_VERSION} · cluster≤${opts.lowMax} ×${opts.cluster} · ` +
-      `holdout ×${opts.holdout} · samples=${opts.samples} · k=${opts.k} · apply=${opts.apply}`,
+    `judge=${opts.provider} prompt=${JUDGE_PROMPT_VERSION} · σ=${axisSigma === null ? "—" : axisSigma.toFixed(3)} · ` +
+      `candidate<${opts.absMax} & <${opts.bar}−${opts.k}σ · recent=${opts.recentDays}d · cluster≤${opts.cluster} · ` +
+      `holdout≥${opts.holdoutMin} ×${opts.holdout} · samples=${opts.samples}/1 · apply=${opts.apply}`,
   );
 
   const records = store.listJudgements({
@@ -134,16 +150,55 @@ async function main(): Promise<void> {
     return;
   }
 
-  const { cluster, holdout } = selectClusters(records, opts.axis, {
-    clusterSize: opts.cluster,
+  const recentSince =
+    opts.recentDays > 0 ? new Date(Date.now() - opts.recentDays * 86_400_000).toISOString() : null;
+  const { candidates, holdout } = selectCandidates(records, opts.axis, {
     holdoutSize: opts.holdout,
-    lowMax: opts.lowMax,
+    absMax: opts.absMax,
+    bar: opts.bar,
+    k: opts.k,
+    sigma: axisSigma,
+    holdoutMin: opts.holdoutMin,
+    recentSince,
   });
-  console.log(`corpus=${records.length} · cluster=${cluster.length} (≤${opts.lowMax}) · holdout=${holdout.length}`);
-  if (cluster.length === 0) {
-    console.log(`Nothing below ${opts.lowMax} on ${opts.axis} — nothing to improve.`);
+  console.log(
+    `corpus=${records.length} · recent candidates=${candidates.length} · holdout=${holdout.length}`,
+  );
+  if (candidates.length === 0) {
+    console.log(
+      `No confident failures on ${opts.axis} in the recent window — the floor has reached the ceiling here, nothing to improve.`,
+    );
     return;
   }
+
+  // Taxonomy (open-coding): group the candidates by failure MODE and patch the
+  // Pareto-dominant one — the lowest-N may fail for unrelated reasons that one
+  // patch can't fix. A fresh taxonomy each run → self-adapts to what fails NOW.
+  const nid = (r: JudgementRecord): string => `${r.traceId}:${r.observationId}`;
+  const rationaleById = new Map(
+    candidates.map((r) => [nid(r), judgeRationale(r.detail, opts.axis)]),
+  );
+  const backend = createJudgeBackend(opts.provider);
+  console.log(`\nInducing failure-mode taxonomy over ${candidates.length} candidate(s)…`);
+  const taxonomy = await induceTaxonomy(backend, {
+    skill: opts.skill,
+    axis: opts.axis,
+    items: candidates.map((r) => ({ id: nid(r), rationale: rationaleById.get(nid(r)) ?? "" })),
+  });
+  for (const m of taxonomy.modes) {
+    console.log(`  · ${m.name} (${m.nodeIds.filter((id) => rationaleById.has(id)).length}): ${m.description}`);
+  }
+  const mode = dominantMode(taxonomy, new Set(rationaleById.keys()));
+  if (!mode) {
+    console.log("\nTaxonomy produced no usable mode (no candidate mapped) — aborting.");
+    return;
+  }
+  const modeIds = new Set(mode.nodeIds);
+  const cluster = candidates.filter((r) => modeIds.has(nid(r))).slice(0, opts.cluster);
+  console.log(
+    `\nDominant mode: "${mode.name}" — ${mode.description}\n` +
+      `cluster=${cluster.length} node(s) (capped at ${opts.cluster}); holdout=${holdout.length}`,
+  );
 
   // Resolve each judged record to its node material (+ recorded observation),
   // caching per trace so a multi-node trace is fetched once.
@@ -178,34 +233,46 @@ async function main(): Promise<void> {
     return;
   }
 
-  const backend = createJudgeBackend(opts.provider);
-  console.log(`\nAuthoring patch from ${examples.length} failing example(s)…`);
-  const authored = await authorPatch(backend, { skill: opts.skill, axis: opts.axis, contract, examples });
+  // Show the author the current patch so it does NOT repeat an existing lesson
+  // (dedup-on-input — pairs with retire-on-output, п3, to bound prompt growth).
+  const existingPatch = (await skillStore.readPatch(opts.skill)) ?? "";
+  console.log(`\nAuthoring patch from ${examples.length} failing example(s) of "${mode.name}"…`);
+  const authored = await authorPatch(backend, {
+    skill: opts.skill,
+    axis: opts.axis,
+    contract,
+    examples,
+    failureMode: mode.description,
+    existingPatch,
+  });
   console.log(`\n── candidate patch ──\n${authored.lesson || "(empty)"}`);
   console.log(`\nauthor rationale: ${authored.rationale}`);
   if (authored.lesson.trim().length === 0) {
-    console.log("\nAuthor found no generalizable fix — nothing to gate.");
+    console.log("\nAuthor found no generalizable fix (or it's already patched) — nothing to gate.");
     return;
   }
 
   // Gate: replay the candidate over cluster (must improve target axis) and
-  // holdout (must not regress). σ baseline drives the per-axis verdicts.
-  const sigma = loadSigma(judgeModel);
-  async function gateNodes(recs: JudgementRecord[]): Promise<NodeGateResult[]> {
+  // holdout (must not regress). "before" = each node's STORED score (free); only
+  // regeneration costs codex. σ baseline drives the per-axis verdicts. Cluster is
+  // sampled S× (measurement), holdout S=1 (regression guard, not a measurement).
+  async function gateNodes(recs: JudgementRecord[], samples: number): Promise<NodeGateResult[]> {
     const out: NodeGateResult[] = [];
     for (const rec of recs) {
       const r = await resolve(rec);
       if (!r) continue;
       const target = buildGateTarget(r.node, r.obs);
       if (!target) continue;
-      out.push(await runNodeGate({ backend, runModel }, target, authored.lesson, opts.samples, sigma, opts.k));
+      out.push(
+        await runNodeGate({ backend, runModel }, target, authored.lesson, samples, sigma, opts.k, rec.scores),
+      );
     }
     return out;
   }
 
-  console.log(`\nGating candidate over cluster (${cluster.length}) + holdout (${holdout.length})…`);
-  const clusterResults = await gateNodes(cluster);
-  const holdoutResults = await gateNodes(holdout);
+  console.log(`\nGating candidate over cluster (${cluster.length}, S=${opts.samples}) + holdout (${holdout.length}, S=1)…`);
+  const clusterResults = await gateNodes(cluster, opts.samples);
+  const holdoutResults = await gateNodes(holdout, 1);
 
   printGate("cluster", clusterResults, opts.axis);
   printGate("holdout", holdoutResults, opts.axis);
@@ -223,8 +290,10 @@ async function main(): Promise<void> {
     return;
   }
 
-  const existing = (await skillStore.readPatch(opts.skill)) ?? "";
-  const merged = existing.trim().length > 0 ? `${existing.trimEnd()}\n\n${authored.lesson.trim()}\n` : `${authored.lesson.trim()}\n`;
+  const merged =
+    existingPatch.trim().length > 0
+      ? `${existingPatch.trimEnd()}\n\n${authored.lesson.trim()}\n`
+      : `${authored.lesson.trim()}\n`;
   const saved = await skillStore.savePatch(opts.skill, merged);
   console.log(`\nSHIPPED → ${saved.path} (${saved.sizeBytes} bytes). Monitor the live ${opts.axis} trend; revert = delete the file.`);
 }

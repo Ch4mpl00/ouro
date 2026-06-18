@@ -8,12 +8,18 @@ import type { NodeKind } from "./schema";
 // recorded input, re-judge the result, and decide whether the patch moved the
 // target axis BEYOND the judge's own noise (σ_judge, measured by judge:noise).
 //
-// before = the recorded output judged `samples` times (the judge-noise envelope
-//          around the node's existing score).
+// before = the STORED judgement score (free — we already judged every node once
+//          when building the corpus). A single point, so the accept threshold is
+//          widened to k·σ·√(1+1/S) to cover its own judge-noise.
 // after  = `samples` FRESH generations from the patched prompt, each judged once
 //          (generation + judge variance under the patch).
 // The judge yardstick stays fixed: it scores against the ORIGINAL contract, not
 // the patched one — a patch nudges the GENERATOR, it must not move the goalposts.
+//
+// REGENERATION is the irreducible cost: re-judging the OLD output under a patched
+// contract is meaningless (the yardstick is the ORIGINAL contract, fixed), so the
+// only way to see a patch's effect is to re-run the generator. Everything else —
+// re-judging "before" S× — is cut: the corpus already gives us the before.
 
 export type GateVerdict = "improve" | "regress" | "noise" | "no-baseline" | "n/a";
 
@@ -38,21 +44,22 @@ function round(x: number, places = 4): number {
   return Math.round(x * f) / f;
 }
 
-// Pure verdict for one axis. A patch's Δ counts only when it clears k·σ_judge:
-// without a σ baseline we can't tell signal from noise, so we abstain.
+// Pure verdict for one axis. before is the node's single STORED score; after is
+// the S fresh patched judgements. A patch's Δ counts only when it clears
+// k·σ·√(1+1/S) — the σ envelope around a (single before) vs (S-sample after)
+// comparison. Without a σ baseline we can't tell signal from noise, so we abstain.
 export function gradeAxis(
   axis: NoiseAxis,
-  before: number[],
+  before: number | null,
   after: number[],
   sigma: number | null,
   k: number,
 ): AxisGrade {
-  const beforeMean = mean(before);
   const afterMean = mean(after);
   const base: AxisGrade = {
     axis,
-    beforeN: before.length,
-    beforeMean: beforeMean === null ? null : round(beforeMean),
+    beforeN: before === null ? 0 : 1,
+    beforeMean: before === null ? null : round(before),
     afterN: after.length,
     afterMean: afterMean === null ? null : round(afterMean),
     delta: null,
@@ -60,11 +67,11 @@ export function gradeAxis(
     threshold: null,
     verdict: "n/a",
   };
-  if (beforeMean === null || afterMean === null) return base;
-  const delta = round(afterMean - beforeMean);
+  if (before === null || afterMean === null) return base;
+  const delta = round(afterMean - before);
   base.delta = delta;
   if (sigma === null) return { ...base, verdict: "no-baseline" };
-  const threshold = round(k * sigma);
+  const threshold = round(k * sigma * Math.sqrt(1 + 1 / after.length));
   base.threshold = threshold;
   if (delta > threshold) return { ...base, verdict: "improve" };
   if (delta < -threshold) return { ...base, verdict: "regress" };
@@ -80,7 +87,8 @@ export interface GateNodeTarget {
   // R — what the node received; the judge scores F against this. Unchanged by
   // the patch (the patch only touches the generator's system message).
   inputText: string;
-  // F — the recorded output (the "before" candidate).
+  // F — the recorded output. Kept for display/debug; the "before" score now
+  // comes from the stored corpus judgement, not from re-judging this.
   originalOutput: string;
   // Replay material: the recorded chat messages + the model that produced them.
   model: string;
@@ -135,7 +143,8 @@ async function judgeOutputs(
 }
 
 // Run the gate for ONE node. Sequential by design — codex is the bottleneck and
-// shares the user's ChatGPT quota.
+// shares the user's ChatGPT quota. `storedScores` are the node's existing corpus
+// scores (the free "before"); only REGENERATION + after-judging cost codex calls.
 export async function runNodeGate(
   deps: GateDeps,
   target: GateNodeTarget,
@@ -143,10 +152,8 @@ export async function runNodeGate(
   samples: number,
   sigmaByAxis: Partial<Record<NoiseAxis, number>>,
   k: number,
+  storedScores: Partial<Record<NoiseAxis, number | null>>,
 ): Promise<NodeGateResult> {
-  // before: judge the recorded output `samples` times (judge-noise envelope).
-  const before = await judgeOutputs(deps, target, Array.from({ length: samples }, () => target.originalOutput));
-
   // after: generate `samples` fresh outputs from the patched prompt, judge each.
   const patchedMessages = patchMessages(target.recordedInput, patch);
   const patchedOutputs: string[] = [];
@@ -156,7 +163,7 @@ export async function runNodeGate(
   const after = await judgeOutputs(deps, target, patchedOutputs);
 
   const grades = NOISE_AXES.map((axis) =>
-    gradeAxis(axis, before[axis], after[axis], sigmaByAxis[axis] ?? null, k),
+    gradeAxis(axis, storedScores[axis] ?? null, after[axis], sigmaByAxis[axis] ?? null, k),
   ).filter((g) => g.beforeN > 0 || g.afterN > 0);
 
   return {

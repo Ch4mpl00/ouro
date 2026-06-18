@@ -45,33 +45,43 @@ describe("patchMessages", () => {
 describe("gradeAxis", () => {
   const K = 2;
 
-  it("calls a clear lift above k·σ an improvement", () => {
-    const g = gradeAxis("composition", [0.6, 0.6], [0.9, 0.9], 0.02, K);
+  it("calls a clear lift above k·σ·√(1+1/S) an improvement", () => {
+    // before = single stored score; after = S=2 fresh judgements.
+    const g = gradeAxis("composition", 0.6, [0.9, 0.9], 0.02, K);
     expect(g.delta).toBeCloseTo(0.3, 4);
-    expect(g.threshold).toBeCloseTo(0.04, 4);
+    // 2·0.02·√(1.5) ≈ 0.049
+    expect(g.threshold).toBeCloseTo(0.049, 3);
+    expect(g.beforeN).toBe(1);
     expect(g.verdict).toBe("improve");
   });
 
-  it("calls a drop below -k·σ a regression", () => {
-    const g = gradeAxis("composition", [0.9, 0.9], [0.6, 0.6], 0.02, K);
+  it("calls a drop below -threshold a regression", () => {
+    const g = gradeAxis("composition", 0.9, [0.6, 0.6], 0.02, K);
     expect(g.verdict).toBe("regress");
   });
 
-  it("treats a Δ within k·σ as noise", () => {
-    const g = gradeAxis("process", [0.70, 0.72], [0.73, 0.71], 0.05, K);
-    // |Δ| = 0.01 < 0.10 threshold
+  it("treats a Δ within the threshold as noise", () => {
+    const g = gradeAxis("process", 0.71, [0.73, 0.71], 0.05, K);
+    // |Δ| = 0.01 < 0.12 threshold
     expect(g.verdict).toBe("noise");
   });
 
   it("abstains when no σ baseline is available", () => {
-    const g = gradeAxis("composition", [0.6], [0.9], null, K);
+    const g = gradeAxis("composition", 0.6, [0.9], null, K);
     expect(g.verdict).toBe("no-baseline");
     expect(g.delta).toBeCloseTo(0.3, 4);
     expect(g.threshold).toBeNull();
   });
 
-  it("is n/a when either side has no numeric samples", () => {
-    expect(gradeAxis("coverage", [], [0.5], 0.05, K).verdict).toBe("n/a");
-    expect(gradeAxis("coverage", [0.5], [], 0.05, K).verdict).toBe("n/a");
+  it("is n/a when the before score or the after samples are missing", () => {
+    expect(gradeAxis("coverage", null, [0.5], 0.05, K).verdict).toBe("n/a");
+    expect(gradeAxis("coverage", 0.5, [], 0.05, K).verdict).toBe("n/a");
+  });
+
+  it("widens the threshold as S shrinks (single-sample holdout)", () => {
+    const s1 = gradeAxis("coverage", 0.5, [0.6], 0.05, K).threshold!; // S=1 → √2
+    const s2 = gradeAxis("coverage", 0.5, [0.6, 0.6], 0.05, K).threshold!; // S=2 → √1.5
+    expect(s1).toBeGreaterThan(s2);
+    expect(s1).toBeCloseTo(2 * 0.05 * Math.sqrt(2), 3);
   });
 });

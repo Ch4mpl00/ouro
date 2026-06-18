@@ -47,7 +47,10 @@ export interface JudgementInput {
 }
 
 // One judged node read back for the improver: identity + numeric axis scores +
-// the rich payload. Same shape as JudgementInput minus the filter keys.
+// the rich payload. Same shape as JudgementInput minus the filter keys, plus the
+// owning trace's startedAt — the run's wall-clock time, which the improver uses
+// to draw the cluster from a RECENT window (fix current failures, not old ones)
+// while the holdout is all-time.
 export interface JudgementRecord {
   traceId: string;
   observationId: string;
@@ -61,6 +64,7 @@ export interface JudgementRecord {
     faithfulness: number | null;
   };
   detail: unknown;
+  startedAt: string;
 }
 
 export interface TraceStore {
@@ -203,8 +207,9 @@ export function createTraceStore(db: AgentDatabase): TraceStore {
 
     listJudgements(filter) {
       const rows = db
-        .select()
+        .select({ j: judgements, startedAt: traces.startedAt })
         .from(judgements)
+        .innerJoin(traces, eq(judgements.traceId, traces.id))
         .where(
           and(
             eq(judgements.skill, filter.skill),
@@ -213,19 +218,20 @@ export function createTraceStore(db: AgentDatabase): TraceStore {
           ),
         )
         .all();
-      return rows.map((r) => ({
-        traceId: r.traceId,
-        observationId: r.observationId,
-        nodeKind: r.nodeKind,
-        skill: r.skill,
+      return rows.map(({ j, startedAt }) => ({
+        traceId: j.traceId,
+        observationId: j.observationId,
+        nodeKind: j.nodeKind,
+        skill: j.skill,
         scores: {
-          query_formulation: r.queryFormulation,
-          process: r.process,
-          coverage: r.coverage,
-          composition: r.composition,
-          faithfulness: r.faithfulness,
+          query_formulation: j.queryFormulation,
+          process: j.process,
+          coverage: j.coverage,
+          composition: j.composition,
+          faithfulness: j.faithfulness,
         },
-        detail: r.detail,
+        detail: j.detail,
+        startedAt,
       }));
     },
   };
