@@ -1,10 +1,19 @@
 # Per-node judge + closed-loop self-improvement
 
-**Status:** Phase 1 DONE + deployed; Phase 2 DONE; Phase 3 п1/п2 DONE; refined
-improver (A/B/C/D) + п3 (E: cron/monitor/revert/budget/retry) IMPLEMENTED
-2026-06-18 (typecheck + 236 tests green, on branch `improver-gate`). NEXT (gate
-before enabling on prod): prod-validate `improve` WITHOUT --apply on the droplet
-corpus, THEN flip IMPROVE_APPLY=true on the improve-worker service.
+**Status:** Phase 1/2/3 DONE and DEPLOYED to prod 2026-06-18 (merged to main,
+`docker compose up -d --build` on the droplet; 236 tests green). All 6 services
+running incl. new `improve-worker` in SHADOW mode (`IMPROVE_APPLY=false`). NEXT:
+watch the shadow loop on real data, then flip `IMPROVE_APPLY=true` when proposals
+look sane. Two deploy notes below.
+
+### Deploy notes (2026-06-18)
+- **judge prompt n1→n4 on prod.** Prod corpus was judged at n1; the deploy moved
+  the judge to n4 (de-tasted composition). judge-worker is RE-JUDGING the corpus
+  at n4 (codex, ~5 nodes/trace, slow). Until codex|n4 rows exist the improver
+  finds 0 skills — expected. The first improve-worker tick logged "0 skill(s)".
+- **Migration race** surfaced (3 services run setup:agent on the shared volume):
+  the loser crashes on `improver_state already exists`, restarts, heals. Tracked
+  in [[agent-migration-race]].
 **Priority:** P1
 **Area:** evals / agent / self-improvement
 **Created:** 2026-06-14
