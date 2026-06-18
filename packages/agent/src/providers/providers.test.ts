@@ -248,6 +248,22 @@ describe("withRetry decorator", () => {
     expect(events[1]!.metadata).toMatchObject({ attempt: 2, status: 503 });
   });
 
+  it("retries a connection-level failure (no HTTP status, e.g. Premature close)", async () => {
+    const connErr = new OpenAI.APIConnectionError({ message: "Premature close" });
+    const { provider, calls } = flakyProvider([connErr]);
+    const { ctx, events } = captureTrace();
+    const r = await withRetry(provider, { baseDelayMs: 1 }).complete({
+      model: "gpt-5.4-mini",
+      messages: [],
+      reasoningEffort: "disabled",
+      trace: ctx,
+    });
+    expect(r.message.content).toBe("ok");
+    expect(calls()).toBe(2);
+    expect(events.map((e) => e.name)).toEqual(["llm_retry"]);
+    expect(events[0]!.metadata).toMatchObject({ attempt: 1, status: null });
+  });
+
   it("rethrows non-retryable 4xx immediately, no events", async () => {
     const { provider, calls } = flakyProvider([apiError(400)]);
     const { ctx, events } = captureTrace();

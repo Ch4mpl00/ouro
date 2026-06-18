@@ -42,7 +42,14 @@ export async function retryOnTransient<T>(
       return await fn();
     } catch (err) {
       const status = err instanceof OpenAI.APIError ? err.status : undefined;
-      const retryable = status === 429 || (status !== undefined && status >= 500);
+      // 429 + 5xx back off and retry. A connection-level failure (no HTTP
+      // status — ECONNRESET, timeout, "Premature close" mid-stream on a large
+      // completion) is equally transient, so retry it too; any other 4xx is
+      // permanent and rethrows.
+      const retryable =
+        status === 429 ||
+        (status !== undefined && status >= 500) ||
+        err instanceof OpenAI.APIConnectionError;
       if (!retryable || attempt >= maxRetries) throw err;
       const delayMs = baseDelayMs * 2 ** attempt;
       opts.onRetry?.({ attempt: attempt + 1, status, delayMs });
