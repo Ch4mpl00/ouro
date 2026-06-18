@@ -185,7 +185,9 @@ function recordCycle(
   deps: ImproveWorkerDeps,
   skill: string,
   axis: NoiseAxis,
-  result: CycleResult,
+  // Accepts a CycleResult, plus the worker-level "error" outcome for a cycle
+  // that threw — lastOutcome is free text, so this just records the attempt.
+  result: Pick<CycleResult, "lesson" | "baseline"> & { outcome: CycleResult["outcome"] | "error" },
   nowISO: string,
 ): void {
   if (result.outcome === "shipped") {
@@ -248,36 +250,47 @@ async function tick(deps: ImproveWorkerDeps, opts: ImproveWorkerOpts): Promise<v
 
   for (const p of toRun) {
     const nowISO = new Date().toISOString();
-    const result = await runImproveCycle(deps, {
-      skill: p.skill,
-      axis: p.axis,
-      provider: opts.provider,
-      cluster: opts.cluster,
-      holdout: opts.holdout,
-      samples: opts.samples,
-      absMax: opts.absMax,
-      bar: opts.bar,
-      holdoutMin: opts.holdoutMin,
-      recentDays: opts.recentDays,
-      k: opts.k,
-      apply: opts.apply,
-      maxAttempts: opts.maxAttempts,
-      budget: opts.budget,
-      guardFaithfulness: opts.guardFaithfulness,
-      now: Date.now(),
-    });
-    log(`[${p.skill}/${p.axis}] cycle → ${result.outcome}${result.mode ? ` (mode: ${result.mode})` : ""}`);
-    recordCycle(deps, p.skill, p.axis, result, nowISO);
-    deps.audit?.({
-      at: nowISO,
-      kind: "cycle",
-      skill: p.skill,
-      axis: p.axis,
-      outcome: result.outcome,
-      mode: result.mode ?? null,
-      lesson: result.lesson ?? null,
-      reasons: result.reasons ?? null,
-    });
+    try {
+      const result = await runImproveCycle(deps, {
+        skill: p.skill,
+        axis: p.axis,
+        provider: opts.provider,
+        cluster: opts.cluster,
+        holdout: opts.holdout,
+        samples: opts.samples,
+        absMax: opts.absMax,
+        bar: opts.bar,
+        holdoutMin: opts.holdoutMin,
+        recentDays: opts.recentDays,
+        k: opts.k,
+        apply: opts.apply,
+        maxAttempts: opts.maxAttempts,
+        budget: opts.budget,
+        guardFaithfulness: opts.guardFaithfulness,
+        now: Date.now(),
+      });
+      log(`[${p.skill}/${p.axis}] cycle → ${result.outcome}${result.mode ? ` (mode: ${result.mode})` : ""}`);
+      recordCycle(deps, p.skill, p.axis, result, nowISO);
+      deps.audit?.({
+        at: nowISO,
+        kind: "cycle",
+        skill: p.skill,
+        axis: p.axis,
+        outcome: result.outcome,
+        mode: result.mode ?? null,
+        lesson: result.lesson ?? null,
+        reasons: result.reasons ?? null,
+      });
+    } catch (err) {
+      // A cycle that throws (a flaky generator/judge call, a bad trace) must NOT
+      // abort the tick or starve the round-robin: record the attempt (so the
+      // pair moves to the back of the queue) and audit the failure so a week of
+      // logs shows it too.
+      const msg = err instanceof Error ? err.message : String(err);
+      log(`[${p.skill}/${p.axis}] cycle FAILED: ${msg}`);
+      recordCycle(deps, p.skill, p.axis, { outcome: "error" }, nowISO);
+      deps.audit?.({ at: nowISO, kind: "cycle", skill: p.skill, axis: p.axis, outcome: "error", error: msg });
+    }
   }
 }
 
