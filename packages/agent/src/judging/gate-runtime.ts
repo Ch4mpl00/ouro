@@ -1,14 +1,15 @@
 import OpenAI from "openai";
 import type { ChatCompletionMessageParam } from "openai/resources/chat/completions";
 import { DEEPSEEK_BASE_URL, GEMINI_BASE_URL, retryOnTransient } from "../providers";
-import type { GateNodeTarget } from "../judging/gate";
-import type { NodeMaterial } from "../judging/materials";
-import type { ChatMessage } from "../judging/patch";
+import type { GateNodeTarget } from "./gate";
+import type { NodeMaterial } from "./materials";
+import type { ChatMessage } from "./patch";
 import type { Observation } from "../trace-model";
 
-// Script-side runtime for the gate / improver: re-running the generator under the
-// recorded model, and lifting a NodeMaterial + its observation into a replayable
-// GateNodeTarget. Shared by judge-gate.ts and improve.ts so the two can't drift.
+// Generator-replay runtime for the gate / improver: re-running the generator
+// under the recorded model, and lifting a NodeMaterial + its observation into a
+// replayable GateNodeTarget. Shared by the improve cycle, the improve worker,
+// and judge-gate.ts so they can't drift.
 
 // Lazy, per-provider — built on first use (after the caller has loaded env) and
 // only for the provider actually needed, so a deepseek-only run never requires a

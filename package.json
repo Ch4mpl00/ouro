@@ -15,6 +15,7 @@
     "judge:noise": "tsx packages/agent/src/scripts/judge-noise.ts",
     "judge:gate": "tsx packages/agent/src/scripts/judge-gate.ts",
     "improve": "tsx packages/agent/src/scripts/improve.ts",
+    "improve:worker": "tsx packages/agent/src/scripts/improve-worker.ts",
     "db:init": "pnpm db:init:mcp && pnpm db:init:agent",
     "db:init:mcp": "mkdir -p packages/mcp/data && sqlite3 packages/mcp/data/tokens.db < packages/mcp/data/schema.sql",
     "db:init:agent": "pnpm setup:agent",

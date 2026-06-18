@@ -219,6 +219,7 @@ export function buildAuthorUserPrompt(
   examples: PatchExample[],
   failureMode: string | null,
   existingPatch: string | null,
+  priorFeedback: string | null,
 ): string {
   const blocks = examples
     .map((e, i) =>
@@ -238,6 +239,9 @@ export function buildAuthorUserPrompt(
     `EXISTING PATCH (already appended — do NOT repeat or overlap these lessons):\n${
       existingPatch && existingPatch.trim().length > 0 ? existingPatch.trim() : "(none yet)"
     }`,
+    priorFeedback
+      ? `PREVIOUS ATTEMPT FAILED THE GATE — do NOT repeat that angle; try a different, sharper fix:\n${priorFeedback}`
+      : "",
     `\n${examples.length} failing example(s) of this mode:\n\n${blocks}`,
     `\nWrite the append-only patch per your instructions. Return JSON.`,
   ]
@@ -254,6 +258,7 @@ export async function authorPatch(
     examples: PatchExample[];
     failureMode?: string | null;
     existingPatch?: string | null;
+    priorFeedback?: string | null;
   },
 ): Promise<AuthoredPatch> {
   const json = await backend.complete({
@@ -266,6 +271,7 @@ export async function authorPatch(
       args.examples,
       args.failureMode ?? null,
       args.existingPatch ?? null,
+      args.priorFeedback ?? null,
     ),
     schema: PATCH_RESPONSE_SCHEMA,
   });

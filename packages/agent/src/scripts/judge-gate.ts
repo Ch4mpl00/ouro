@@ -8,6 +8,7 @@ import { createJudgeBackend, type JudgeProvider } from "../judging/judge-backend
 import { runNodeGate } from "../judging/gate";
 import { judgeNode } from "../judging/node-judge";
 import { extractAxisScores, type NoiseAxis } from "../judging/noise";
+import { loadSigmaBaseline } from "../judging/sigma-baseline";
 import { JUDGE_MODEL, JUDGE_PROMPT_VERSION } from "../judging/schema";
 import {
   createLangfuseTraceSource,
@@ -15,7 +16,7 @@ import {
   type TraceSource,
 } from "../judging/trace-source";
 import type { Observation } from "../trace-model";
-import { buildGateTarget, runModel } from "./gate-runtime";
+import { buildGateTarget, runModel } from "../judging/gate-runtime";
 
 loadEnv({ path: ".env.agent" });
 
@@ -29,8 +30,6 @@ loadEnv({ path: ".env.agent" });
 // The generator is re-run under the RECORDED model (what prod uses); the judge
 // defaults to codex (prod judge, cheap). Δ is graded against the committed
 // noise baseline for (judge model | prompt version).
-
-const BASELINE_PATH = "packages/agent/src/judging/noise-baseline.json";
 
 interface CliOpts {
   traceId: string;
@@ -74,31 +73,6 @@ function parseArgs(argv: string[]): CliOpts {
   return opts as CliOpts;
 }
 
-// ─── σ baseline lookup ───────────────────────────────────────────────
-
-interface BaselineAxis {
-  axis: NoiseAxis;
-  pooledSigma: number;
-}
-interface BaselineEntry {
-  model: string;
-  axes: BaselineAxis[];
-}
-
-function loadSigma(judgeModel: string): { sigma: Partial<Record<NoiseAxis, number>>; found: boolean } {
-  let entries: Record<string, BaselineEntry> = {};
-  try {
-    entries = JSON.parse(readFileSync(BASELINE_PATH, "utf-8")) as Record<string, BaselineEntry>;
-  } catch {
-    return { sigma: {}, found: false };
-  }
-  const entry = entries[`${judgeModel}|${JUDGE_PROMPT_VERSION}`];
-  if (!entry) return { sigma: {}, found: false };
-  const sigma: Partial<Record<NoiseAxis, number>> = {};
-  for (const a of entry.axes) sigma[a.axis] = a.pooledSigma;
-  return { sigma, found: true };
-}
-
 const VERDICT_GLYPH: Record<string, string> = {
   improve: "✅ improve",
   regress: "🔻 regress",
@@ -130,7 +104,7 @@ async function main(): Promise<void> {
   }
 
   const judgeModel = opts.provider === "openai" ? JUDGE_MODEL : (process.env.CODEX_JUDGE_MODEL ?? "codex");
-  const { sigma, found } = loadSigma(judgeModel);
+  const { sigma, found } = loadSigmaBaseline(judgeModel);
 
   console.log(`\n=== IMPROVER GATE · trace ${opts.traceId} · ${trace.name} ===`);
   console.log(

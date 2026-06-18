@@ -1,8 +1,10 @@
 # Per-node judge + closed-loop self-improvement
 
 **Status:** Phase 1 DONE + deployed; Phase 2 DONE; Phase 3 п1/п2 DONE; refined
-improver (A/B/C/D) IMPLEMENTED 2026-06-18 (typecheck + 226 tests green) — NEXT:
-prod-validate `improve` WITHOUT --apply, then п3 (E: cron/monitor/revert)
+improver (A/B/C/D) + п3 (E: cron/monitor/revert/budget/retry) IMPLEMENTED
+2026-06-18 (typecheck + 236 tests green, on branch `improver-gate`). NEXT (gate
+before enabling on prod): prod-validate `improve` WITHOUT --apply on the droplet
+corpus, THEN flip IMPROVE_APPLY=true on the improve-worker service.
 **Priority:** P1
 **Area:** evals / agent / self-improvement
 **Created:** 2026-06-14
@@ -453,11 +455,45 @@ exactly what was scored.
   "run the judge worker first"). Run it there (codex up) to see a real author+gate
   cycle, first WITHOUT `--apply`.
 
-### п3 — cron + live-trend monitor + auto-revert (NEXT)
+### п3 — cron + live-trend monitor + auto-revert — DONE 2026-06-18 (code; enable on prod after validation)
 Schedule `improve --apply` per (skill, axis); watermark last attempt + outcome +
 live patch ref; monitor the live axis trend on NEW traces after a ship and
 AUTO-REVERT (delete the .patch.md) if the gain doesn't hold. ≤1 informed retry
 (feed the failed gate rationale back), max 2 attempts/cluster/run.
+
+Implemented (branch `improver-gate`):
+- **Cycle extracted** → `judging/improve-cycle.ts runImproveCycle` (one (skill,
+  axis): select→taxonomy→author→gate→decide→[ship]). BOTH the CLI
+  (`scripts/improve.ts`, now a thin wrapper) and the worker drive it.
+- **Informed retry**: `authorPatch` gains `priorFeedback`; the cycle re-authors
+  once after a failed gate, feeding back the decision reasons + per-node before→
+  after (`maxAttempts`, default 2 = one retry).
+- **Cron loop** → `judging/improve-worker.ts` + `scripts/improve-worker.ts`
+  (`pnpm improve:worker`), mirroring judge-worker as a compose service
+  (`improve-worker`). Walks every (skill, axis) in the corpus
+  (`TraceStore.listJudgedSkills` + present axes), `IMPROVE_*` env knobs.
+- **Live-trend monitor + auto-revert** → `judging/monitor.ts decideRevert`
+  (pure, two-sample noise band `k·σ·√(1/postN+1/baseN)`, conservative: reverts
+  ONLY on a confident drop, keeps a flat trend). State in a new `improver_state`
+  table (`db/improver-store.ts`, one row per (skill, axis): last outcome +
+  pre-ship baseline + shipped lesson + monitor status). While a ship is
+  "pending" (post-ship N < `minMonitorN`) the worker does NOT author — one change
+  at a time, attributable. Revert is SURGICAL (`removeLesson` keeps other
+  lessons; `SkillStore.deletePatch` when none remain).
+- **Patch budget** → `monitor.budgetExceeded` (per-skill lesson cap, default 8);
+  ships are blocked when full (logged, not auto-pruned — conservative; retire-by-
+  correlation is the scale-up, noted below).
+- **Shadow-by-default**: `IMPROVE_APPLY=false` in compose → the worker proposes +
+  gates but never writes a `.patch.md` until the user flips it post-validation.
+- Shared σ baseline loader extracted → `judging/sigma-baseline.ts` (gate,
+  improver, worker read the same floor). `judging/gate-runtime.ts` moved out of
+  `scripts/` so the cycle module doesn't import scripts.
+
+NOT done (deliberate, "decide with data"):
+- **Retire-by-correlation** (drop lessons that stop correlating with low scores):
+  needs per-lesson attribution infra we don't have; budget cap blocks growth for
+  now, manual prune. Scale-up later.
+- **Prod-validation of the whole loop** still pending (corpus is on the droplet).
 
 ## Open knobs (decide with data, not now)
 - Per-node judging cost on map-stage nodes (large chunk inputs) — sample or

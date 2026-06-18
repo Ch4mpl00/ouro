@@ -80,6 +80,9 @@ export interface TraceStore {
   // Every judged node for a (skill, provider, promptVersion) — the improver's
   // corpus. It clusters the low scorers and holds out the high ones in code.
   listJudgements(filter: { skill: string; provider: string; promptVersion: string }): JudgementRecord[];
+  // Distinct skills that have any judgement for (provider, promptVersion) — the
+  // cron improver iterates these (× each axis) instead of a hardcoded list.
+  listJudgedSkills(filter: { provider: string; promptVersion: string }): string[];
 }
 
 export function createTraceStore(db: AgentDatabase): TraceStore {
@@ -233,6 +236,20 @@ export function createTraceStore(db: AgentDatabase): TraceStore {
         detail: j.detail,
         startedAt,
       }));
+    },
+
+    listJudgedSkills(filter) {
+      return db
+        .selectDistinct({ skill: judgements.skill })
+        .from(judgements)
+        .where(
+          and(
+            eq(judgements.provider, filter.provider),
+            eq(judgements.promptVersion, filter.promptVersion),
+          ),
+        )
+        .all()
+        .map((r) => r.skill);
     },
   };
 }

@@ -95,6 +95,9 @@ export interface SkillStore {
   // Write the improver's patch overlay (skills/<name>.patch.md). Deleting the
   // file is the clean revert (the body falls back to its unpatched form).
   savePatch(name: string, content: string): Promise<{ path: string; sizeBytes: number }>;
+  // Delete the patch overlay entirely — the auto-revert's clean reset to the
+  // body. Returns true if a file was removed, false if there was none.
+  deletePatch(name: string): Promise<boolean>;
   // Union of live + defaults, with `source` showing which layer is active.
   listSkills(): Promise<SkillEntry[]>;
   // Walk every skill on disk and parse it; throws a combined error listing
@@ -216,6 +219,17 @@ export function createSkillStore(opts: SkillStoreOpts = {}): SkillStore {
       const target = path.join(liveDir, `${name}.patch.md`);
       await fs.writeFile(target, content, "utf-8");
       return { path: target, sizeBytes: Buffer.byteLength(content, "utf-8") };
+    },
+
+    async deletePatch(name) {
+      validateName(name);
+      try {
+        await fs.unlink(path.join(liveDir, `${name}.patch.md`));
+        return true;
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code === "ENOENT") return false;
+        throw err;
+      }
     },
 
     async listSkills() {
