@@ -4,6 +4,7 @@ import type { ChatProvider } from "../providers";
 import type { AgentLoopOpts } from "../agent-loop";
 import { SET_MEMORY_TOOL_NAME, SetMemoryArgsSchema } from "../synthetic-tools";
 import { JUDGE_NODE_META } from "../trace-model";
+import { appendPatch } from "../skills";
 import type { Span, SpanKind, TraceContext } from "../tracing";
 import type {
   LlmAgentStep,
@@ -105,6 +106,11 @@ export interface ExecutorDeps {
   // Decoupled from skills.ts so tests can pass a stub. Returns the
   // skill body (no frontmatter); null when not found.
   readSkill: (name: string) => Promise<string | null>;
+  // Optional improver patch loader. When present and a `skills/<skill>.patch.md`
+  // exists, it's appended to the END of the compose node's system message — the
+  // SAME placement the gate replay measures. Absent → no patch (default; tests
+  // omit it). Agent (llm_agent) skills are NOT patched yet (judge-only).
+  readPatch?: (name: string) => Promise<string | null>;
   // Agent-side memory KV writer (agent.db). A `set_memory` tool step is
   // dispatched here, NOT to MCP — set_memory is a synthetic agent-side
   // tool with no MCP counterpart. Injected (rather than imported) so the
@@ -448,7 +454,10 @@ async function execLlmCompose(
   if (step.skill) {
     const body = await deps.readSkill(step.skill);
     if (body === null) throw new SkillNotFoundError(step.skill);
-    system = body;
+    // Append the live improver patch (if any) at the end — same placement the
+    // gate replay measures, so prod runs exactly what the gate scored.
+    const patch = deps.readPatch ? await deps.readPatch(step.skill) : null;
+    system = appendPatch(body, patch ?? "");
   }
 
   const resolvedInput: Record<string, unknown> = {};

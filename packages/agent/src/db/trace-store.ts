@@ -46,6 +46,27 @@ export interface JudgementInput {
   detail: unknown;
 }
 
+// One judged node read back for the improver: identity + numeric axis scores +
+// the rich payload. Same shape as JudgementInput minus the filter keys, plus the
+// owning trace's startedAt — the run's wall-clock time, which the improver uses
+// to draw the cluster from a RECENT window (fix current failures, not old ones)
+// while the holdout is all-time.
+export interface JudgementRecord {
+  traceId: string;
+  observationId: string;
+  nodeKind: string;
+  skill: string;
+  scores: {
+    query_formulation: number | null;
+    process: number | null;
+    coverage: number | null;
+    composition: number | null;
+    faithfulness: number | null;
+  };
+  detail: unknown;
+  startedAt: string;
+}
+
 export interface TraceStore {
   writeTrace(t: StoredTraceInput): void;
   // Read-back in the canonical {trace, observations} shape (same as a Langfuse
@@ -56,6 +77,12 @@ export interface TraceStore {
   // memory-KV dedup + age window.
   listRecent(limit: number, unjudgedFor?: { provider: string; promptVersion: string }): TraceSummary[];
   writeJudgement(j: JudgementInput): void;
+  // Every judged node for a (skill, provider, promptVersion) — the improver's
+  // corpus. It clusters the low scorers and holds out the high ones in code.
+  listJudgements(filter: { skill: string; provider: string; promptVersion: string }): JudgementRecord[];
+  // Distinct skills that have any judgement for (provider, promptVersion) — the
+  // cron improver iterates these (× each axis) instead of a hardcoded list.
+  listJudgedSkills(filter: { provider: string; promptVersion: string }): string[];
 }
 
 export function createTraceStore(db: AgentDatabase): TraceStore {
@@ -179,6 +206,50 @@ export function createTraceStore(db: AgentDatabase): TraceStore {
           set: { nodeKind: j.nodeKind, skill: j.skill, ...scores, detail: j.detail },
         })
         .run();
+    },
+
+    listJudgements(filter) {
+      const rows = db
+        .select({ j: judgements, startedAt: traces.startedAt })
+        .from(judgements)
+        .innerJoin(traces, eq(judgements.traceId, traces.id))
+        .where(
+          and(
+            eq(judgements.skill, filter.skill),
+            eq(judgements.provider, filter.provider),
+            eq(judgements.promptVersion, filter.promptVersion),
+          ),
+        )
+        .all();
+      return rows.map(({ j, startedAt }) => ({
+        traceId: j.traceId,
+        observationId: j.observationId,
+        nodeKind: j.nodeKind,
+        skill: j.skill,
+        scores: {
+          query_formulation: j.queryFormulation,
+          process: j.process,
+          coverage: j.coverage,
+          composition: j.composition,
+          faithfulness: j.faithfulness,
+        },
+        detail: j.detail,
+        startedAt,
+      }));
+    },
+
+    listJudgedSkills(filter) {
+      return db
+        .selectDistinct({ skill: judgements.skill })
+        .from(judgements)
+        .where(
+          and(
+            eq(judgements.provider, filter.provider),
+            eq(judgements.promptVersion, filter.promptVersion),
+          ),
+        )
+        .all()
+        .map((r) => r.skill);
     },
   };
 }

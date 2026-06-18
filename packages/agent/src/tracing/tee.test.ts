@@ -48,6 +48,8 @@ function captureStore(): { store: TraceStore; written: StoredTraceInput[] } {
     getTrace: () => null,
     listRecent: () => [],
     writeJudgement: () => {},
+    listJudgements: () => [],
+    listJudgedSkills: () => [],
   };
   return { store, written };
 }

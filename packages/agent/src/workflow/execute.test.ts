@@ -12,6 +12,7 @@ import {
   __testing,
 } from "./execute";
 import { createStore } from "./variables";
+import { PATCH_MARKER } from "../skills";
 
 // ─── shared mocks ────────────────────────────────────────────────────
 
@@ -469,6 +470,37 @@ describe("executor.execute — llm_compose step", () => {
     expect(typeof body.messages[1]!.content).toBe("string");
     expect(body.messages[1]!.content).toContain("<posts>");
     expect(body.messages[1]!.content).toContain('"id": 1');
+  });
+
+  it("appends the improver patch to the compose system message when readPatch returns one", async () => {
+    const engine = makeMockEngine({ llmResponses: ["composed"] });
+    const executor = createExecutor({
+      engine,
+      readSkill: fixedReadSkill({ "news-digest": "RULES go here" }),
+      readPatch: async (name) => (name === "news-digest" ? "PATCH LESSON" : null),
+      setMemory: () => {},
+    });
+
+    const ctx = baseCtx();
+    ctx.store.set("posts", [{ id: 1 }]);
+    const r = await executor.execute(
+      {
+        version: 1,
+        steps: [
+          { kind: "llm_compose", preset: "smartest", skill: "news-digest", input: {}, bind: "d" },
+          { kind: "terminal" },
+        ],
+      },
+      ctx,
+    );
+    expect(r.ok).toBe(true);
+    const body = engine.llmCalls[0] as { messages: ChatCompletionMessageParam[] };
+    const system = body.messages[0]!.content as string;
+    // Body first, patch glued onto the END with the marker — the same shape the
+    // gate replay measures.
+    expect(system.startsWith("RULES go here")).toBe(true);
+    expect(system).toContain(PATCH_MARKER);
+    expect(system).toContain("PATCH LESSON");
   });
 
   it("stringifies a whole-placeholder prompt bound to a non-string value", async () => {

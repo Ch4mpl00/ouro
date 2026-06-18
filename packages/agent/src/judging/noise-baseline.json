@@ -1,0 +1,165 @@
+{
+  "codex|n4": {
+    "model": "codex",
+    "provider": "codex",
+    "promptVersion": "n4",
+    "runs": 3,
+    "sampleNodes": 5,
+    "totalJudgeCalls": 15,
+    "axes": [
+      {
+        "axis": "query_formulation",
+        "nodes": 1,
+        "pooledSigma": 0.0289,
+        "meanSigma": 0.0289,
+        "p90Sigma": 0.0289,
+        "maxSigma": 0.0289,
+        "meanScore": 0.933,
+        "applicabilityFlips": 0
+      },
+      {
+        "axis": "process",
+        "nodes": 1,
+        "pooledSigma": 0.02,
+        "meanSigma": 0.02,
+        "p90Sigma": 0.02,
+        "maxSigma": 0.02,
+        "meanScore": 0.96,
+        "applicabilityFlips": 0
+      },
+      {
+        "axis": "coverage",
+        "nodes": 4,
+        "pooledSigma": 0.0504,
+        "meanSigma": 0.0467,
+        "p90Sigma": 0.065,
+        "maxSigma": 0.0681,
+        "meanScore": 0.564,
+        "applicabilityFlips": 0
+      },
+      {
+        "axis": "composition",
+        "nodes": 4,
+        "pooledSigma": 0.0297,
+        "meanSigma": 0.0297,
+        "p90Sigma": 0.0312,
+        "maxSigma": 0.0321,
+        "meanScore": 0.93,
+        "applicabilityFlips": 0
+      },
+      {
+        "axis": "faithfulness",
+        "nodes": 4,
+        "pooledSigma": 0.0183,
+        "meanSigma": 0.017,
+        "p90Sigma": 0.0245,
+        "maxSigma": 0.0265,
+        "meanScore": 0.942,
+        "applicabilityFlips": 0
+      }
+    ],
+    "measuredAt": "2026-06-16T09:44:34.560Z"
+  },
+  "gpt-5.4|n3": {
+    "model": "gpt-5.4",
+    "provider": "openai",
+    "promptVersion": "n3",
+    "runs": 3,
+    "sampleNodes": 5,
+    "totalJudgeCalls": 15,
+    "axes": [
+      {
+        "axis": "process",
+        "nodes": 1,
+        "pooledSigma": 0.0058,
+        "meanSigma": 0.0058,
+        "p90Sigma": 0.0058,
+        "maxSigma": 0.0058,
+        "meanScore": 0.973,
+        "applicabilityFlips": 0
+      },
+      {
+        "axis": "coverage",
+        "nodes": 4,
+        "pooledSigma": 0.0573,
+        "meanSigma": 0.0454,
+        "p90Sigma": 0.0835,
+        "maxSigma": 0.0954,
+        "meanScore": 0.439,
+        "applicabilityFlips": 0
+      },
+      {
+        "axis": "composition",
+        "nodes": 4,
+        "pooledSigma": 0.1865,
+        "meanSigma": 0.1278,
+        "p90Sigma": 0.2755,
+        "maxSigma": 0.3612,
+        "meanScore": 0.665,
+        "applicabilityFlips": 0
+      },
+      {
+        "axis": "faithfulness",
+        "nodes": 4,
+        "pooledSigma": 0.0173,
+        "meanSigma": 0.0134,
+        "p90Sigma": 0.0248,
+        "maxSigma": 0.0306,
+        "meanScore": 0.947,
+        "applicabilityFlips": 0
+      }
+    ],
+    "measuredAt": "2026-06-16T09:11:39.524Z"
+  },
+  "gpt-5.4|n4": {
+    "model": "gpt-5.4",
+    "provider": "openai",
+    "promptVersion": "n4",
+    "runs": 3,
+    "sampleNodes": 5,
+    "totalJudgeCalls": 15,
+    "axes": [
+      {
+        "axis": "process",
+        "nodes": 1,
+        "pooledSigma": 0.0058,
+        "meanSigma": 0.0058,
+        "p90Sigma": 0.0058,
+        "maxSigma": 0.0058,
+        "meanScore": 0.977,
+        "applicabilityFlips": 0
+      },
+      {
+        "axis": "coverage",
+        "nodes": 4,
+        "pooledSigma": 0.0466,
+        "meanSigma": 0.0417,
+        "p90Sigma": 0.0649,
+        "maxSigma": 0.07,
+        "meanScore": 0.41,
+        "applicabilityFlips": 0
+      },
+      {
+        "axis": "composition",
+        "nodes": 4,
+        "pooledSigma": 0.022,
+        "meanSigma": 0.0162,
+        "p90Sigma": 0.0326,
+        "maxSigma": 0.0416,
+        "meanScore": 0.945,
+        "applicabilityFlips": 0
+      },
+      {
+        "axis": "faithfulness",
+        "nodes": 4,
+        "pooledSigma": 0.0252,
+        "meanSigma": 0.0231,
+        "p90Sigma": 0.0289,
+        "maxSigma": 0.0289,
+        "meanScore": 0.934,
+        "applicabilityFlips": 0
+      }
+    ],
+    "measuredAt": "2026-06-16T09:17:32.377Z"
+  }
+}

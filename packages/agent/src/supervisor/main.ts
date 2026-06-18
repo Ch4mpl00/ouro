@@ -212,6 +212,9 @@ async function main(): Promise<void> {
     // full SkillFile shape (frontmatter tools list) stays internal to
     // engine.startAgentLoop.
     readSkill: async (name) => (await skillStore.readSkill(name))?.body ?? null,
+    // Live improver patches (skills/<name>.patch.md) — appended to the planner
+    // and compose system messages so shipped patches actually take effect.
+    readPatch: (name) => skillStore.readPatch(name),
     mcpTools: mcp.tools,
     knownSkills,
     setMemory: (key, value) => memory.set(key, value),

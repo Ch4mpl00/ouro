@@ -9,7 +9,7 @@ export const JUDGE_MODEL = "gpt-5.4";
 // n3: calibration — an unresolved referent DEGRADES (weak/ok), it is not a
 // fail when the core task still executes; reserve fail for not-accomplished.
 // Bump re-judges the corpus at the new version.
-export const JUDGE_PROMPT_VERSION = "n3";
+export const JUDGE_PROMPT_VERSION = "n4";
 
 // A judgeable node's owner type. Selects the rubric (planner axes vs composer
 // axes) and whether faithfulness applies. `compose` and `agent` share a rubric
@@ -133,13 +133,13 @@ Rules:
 export const COMPOSER_NODE_PROMPT = `You are a rigorous evaluation judge for ONE composer node of an AI agent — a single skill that receives gathered candidates (and any chat history) as INPUT and writes a final text (F). The composer does NOT call tools and does NOT fetch anything; it legitimately receives its material as input. You are scoring THIS node in isolation: its input is everything it had to work with, its output is the text it produced. You did not author it and have no stake in it.
 
 Inputs:
-- COMPOSER_CONTRACT — the skill: how candidates should be filtered and the output composed (format, thresholds, tone, length, no-fabrication). For a prompt-only node the owner is the planner and the binding instruction is the inline prompt shown in NODE_INPUT — judge against that instruction.
+- COMPOSER_CONTRACT — the skill: how candidates should be filtered and the output composed (format, thresholds, length). For a prompt-only node the owner is the planner and the binding instruction is the inline prompt shown in NODE_INPUT — judge against that instruction.
 - NODE_INPUT — exactly what the node received: the retrieved candidates / posts / chat history (this is R). The system message is the contract above; the user message carries R.
 - NODE_OUTPUT — the text the node produced (this is F).
 
 Score EXACTLY these two axes from 0 to 1 (fail < 0.3, weak < 0.5, ok < 0.75, strong >= 0.75), each with a one-sentence rationale and concrete evidence (an item id or a quoted phrase):
 - coverage -> the COMPOSER_CONTRACT. Of what the node received in NODE_INPUT (R), did F include the salient contract-fitting items and drop the noise? Missing a clearly contract-fitting item lowers it; padding with off-contract noise lowers it.
-- composition -> the COMPOSER_CONTRACT. Does F follow the contract's format, tone, length, threshold, and no-fabrication rules?
+- composition -> the COMPOSER_CONTRACT. Does F respect the contract's EXPLICIT structural rules — the format/shape it prescribes and any stated length or threshold limit? Judge OBJECTIVELY against rules the contract actually states: dock ONLY for a clear, citable CONTRADICTION with such a rule (wrong format, a blown length cap, a violated "stop if < N matches"). Do NOT judge tone, voice, style, polish, or elegance; do NOT penalize anything the contract is silent about — silence is not a violation; factual fabrication is the faithfulness axis's job, not this one. Absent a concrete contract violation, score composition strong.
 
 Rules:
 - Obey the contract. If it says "< 3 matches -> short message and stop", a short / empty output is CORRECT when R really held < 3 contract-fitting, non-duplicate items — judge whether the count was right, not whether it produced a long digest.

@@ -94,6 +94,25 @@ services:
       - codex
     restart: unless-stopped
 
+  # Closed-loop improver (Phase 3, п3). Shares agent-data (the judged corpus +
+  # improver_state) and agent-skills (writes skills/<skill>.patch.md). Ships only
+  # when IMPROVE_APPLY=true — leave it OFF until `improve` is prod-validated.
+  improve-worker:
+    build: .
+    image: mcp-tools-image
+    command: sh -c "pnpm setup:agent && pnpm improve:worker"
+    env_file: .env.agent
+    environment:
+      CODEX_URL: http://codex:3010
+      JUDGE_PROVIDER: codex
+      IMPROVE_APPLY: "false"     # shadow mode until prod-validated; flip to true to ship
+    volumes:
+      - agent-data:/app/packages/agent/data
+      - agent-skills:/app/skills
+    depends_on:
+      - codex
+    restart: unless-stopped
+
 volumes:
   mcp-data:
   mcp-storage:

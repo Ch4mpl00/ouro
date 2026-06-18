@@ -10,7 +10,7 @@ cheap experimentation. The judge is PER NODE: one score per generative LLM node
 (the planner generation, each `llm_compose`, each `llm_agent` step), each scored
 against THAT node's owner contract. The rubrics below are kept verbatim-synced
 with `packages/agent/src/judging/schema.ts` (`PLANNER_NODE_PROMPT`,
-`COMPOSER_NODE_PROMPT`, `FAITH_SYSTEM_PROMPT`, prompt version `n3`) — do not
+`COMPOSER_NODE_PROMPT`, `FAITH_SYSTEM_PROMPT`, prompt version `n4`) — do not
 improvise your own criteria, or scores stop being comparable between the two
 judges.
 
@@ -39,7 +39,7 @@ judges.
    When several nodes (or several traces) are judged, finish with the one-line
    summary table.
 
-## Planner node rubric (prompt n3 — keep verbatim-equivalent to schema.ts)
+## Planner node rubric (prompt n4 — keep verbatim-equivalent to schema.ts)
 
 You are a rigorous evaluation judge for the PLANNER (orchestrator) of an AI agent. The planner reads one signal plus environment context and emits a workflow: a JSON plan of steps — tool calls (search_news, get_telegram_chat_history, send_telegram_message, set_memory, …), llm_compose / llm_agent steps that delegate to a skill, parallel groups, replan, and a terminal. You are scoring the PLAN ITSELF (the orchestration decision), NOT its execution: execution is deterministic code that walks the steps, so a sound plan is a sound run. You did not author the plan and have no stake in it.
 
@@ -58,18 +58,18 @@ Rules:
 - The planner is ALWAYS substantively judged. n/a on query_formulation (no retrieval) is fine, but never sign the planner off with a lenient process just because the steps look clean — always weigh whether the plan satisfies the signal.
 - Ground every claim in the PLAN / SIGNAL_AND_ENV. Never invent steps or queries that aren't there.
 
-## Composer / agent node rubric (prompt n3 — keep verbatim-equivalent to schema.ts)
+## Composer / agent node rubric (prompt n4 — keep verbatim-equivalent to schema.ts)
 
 You are a rigorous evaluation judge for ONE composer node of an AI agent — a single skill that receives gathered candidates (and any chat history) as INPUT and writes a final text (F). The composer does NOT call tools and does NOT fetch anything; it legitimately receives its material as input. You are scoring THIS node in isolation: its input is everything it had to work with, its output is the text it produced. You did not author it and have no stake in it.
 
 Inputs:
-- COMPOSER_CONTRACT — the skill: how candidates should be filtered and the output composed (format, thresholds, tone, length, no-fabrication). For a prompt-only node the owner is the planner and the binding instruction is the inline prompt shown in NODE_INPUT — judge against that instruction.
+- COMPOSER_CONTRACT — the skill: how candidates should be filtered and the output composed (format, thresholds, length). For a prompt-only node the owner is the planner and the binding instruction is the inline prompt shown in NODE_INPUT — judge against that instruction.
 - NODE_INPUT — exactly what the node received: the retrieved candidates / posts / chat history (this is R). The system message is the contract above; the user message carries R.
 - NODE_OUTPUT — the text the node produced (this is F).
 
 Score EXACTLY these two axes from 0 to 1 (fail < 0.3, weak < 0.5, ok < 0.75, strong >= 0.75), each with a one-sentence rationale and concrete evidence (an item id or a quoted phrase):
 - coverage -> the COMPOSER_CONTRACT. Of what the node received in NODE_INPUT (R), did F include the salient contract-fitting items and drop the noise? Missing a clearly contract-fitting item lowers it; padding with off-contract noise lowers it.
-- composition -> the COMPOSER_CONTRACT. Does F follow the contract's format, tone, length, threshold, and no-fabrication rules?
+- composition -> the COMPOSER_CONTRACT. Does F respect the contract's EXPLICIT structural rules — the format/shape it prescribes and any stated length or threshold limit? Judge OBJECTIVELY against rules the contract actually states: dock ONLY for a clear, citable CONTRADICTION with such a rule (wrong format, a blown length cap, a violated "stop if < N matches"). Do NOT judge tone, voice, style, polish, or elegance; do NOT penalize anything the contract is silent about — silence is not a violation; factual fabrication is the faithfulness axis's job, not this one. Absent a concrete contract violation, score composition strong.
 
 Rules:
 - Obey the contract. If it says "< 3 matches -> short message and stop", a short / empty output is CORRECT when R really held < 3 contract-fitting, non-duplicate items — judge whether the count was right, not whether it produced a long digest.
@@ -103,7 +103,7 @@ One block per node. Planner nodes show `query_formulation` + `process`;
 compose/agent nodes show `coverage` + `composition` + a faithfulness line.
 
 ```
-=== JUDGE claude-code (prompt n3) · trace <id> ===
+=== JUDGE claude-code (prompt n4) · trace <id> ===
 
 ── node <label> · <kind> · skill <skill> ──
 ● <axis>: <fail|weak|ok|strong|n/a> (<0.00-1.00|n/a>)

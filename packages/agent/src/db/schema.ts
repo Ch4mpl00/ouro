@@ -91,3 +91,32 @@ export const judgements = sqliteTable(
 );
 
 export type JudgementRow = typeof judgements.$inferSelect;
+
+// Closed-loop improver state (Phase 3, п3), one row per (skill, axis). The cron
+// worker watermarks each cycle's outcome here, and — crucially — when it SHIPS a
+// patch it records the pre-ship baseline (the axis's recent mean) + the shipped
+// lesson + a "pending" monitor status. On later runs it gathers the axis scores
+// of traces that ran AFTER the ship and AUTO-REVERTS (removes the lesson) if the
+// live trend fell below the baseline: the gate can be fooled, prod is ground
+// truth. While a ship is "pending" (too few post-ship traces yet) the worker
+// does NOT author a new lesson — one change at a time, so each ship's effect is
+// isolated and attributable.
+export const improverState = sqliteTable(
+  "improver_state",
+  {
+    skill: text("skill").notNull(),
+    axis: text("axis").notNull(),
+    lastAttemptAt: text("last_attempt_at").notNull().default(nowDefault),
+    lastOutcome: text("last_outcome").notNull(), // no-candidates|no-fix|rejected|shipped|reverted|kept
+    // Set when the last attempt SHIPPED; null once the ship is reverted/settled
+    // into the body's history (we only actively monitor the most recent ship).
+    shippedAt: text("shipped_at"),
+    shippedLesson: text("shipped_lesson"), // the exact appended block, for surgical revert
+    baselineMean: real("baseline_mean"), // pre-ship recent axis mean
+    baselineN: real("baseline_n"), // how many nodes that mean averaged
+    monitorStatus: text("monitor_status"), // pending|kept|null (no live ship)
+  },
+  (t) => [primaryKey({ columns: [t.skill, t.axis] })],
+);
+
+export type ImproverStateRow = typeof improverState.$inferSelect;
