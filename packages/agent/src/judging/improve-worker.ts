@@ -45,6 +45,12 @@ export interface ImproveWorkerOpts {
   bar: number;
   holdoutMin: number;
   maxAttempts: number;
+  guardFaithfulness: boolean;
+  // Cost ceiling: at most this many improve cycles (the codex-heavy step) per
+  // tick. Monitoring/auto-revert is free and runs for ALL pairs every tick; only
+  // AUTHORING is capped. Pairs are picked least-recently-attempted first
+  // (round-robin), so an unattended tick can't blow the shared codex quota.
+  maxCyclesPerTick: number;
 }
 
 function sleep(ms: number): Promise<void> {
@@ -62,7 +68,7 @@ export function improveWorkerOptsFromEnv(): ImproveWorkerOpts {
   return {
     provider,
     apply: boolEnv("IMPROVE_APPLY", false),
-    pollIntervalMs: Number(process.env.IMPROVE_POLL_INTERVAL_MS ?? 86_400_000), // daily
+    pollIntervalMs: Number(process.env.IMPROVE_POLL_INTERVAL_MS ?? 86_400_000), // daily; cap below bounds per-tick cost
     once: boolEnv("IMPROVE_ONCE", false),
     recentDays: Number(process.env.IMPROVE_RECENT_DAYS ?? 14),
     minMonitorN: Number(process.env.IMPROVE_MIN_MONITOR_N ?? 5),
@@ -74,7 +80,9 @@ export function improveWorkerOptsFromEnv(): ImproveWorkerOpts {
     absMax: Number(process.env.IMPROVE_ABS_MAX ?? 0.6),
     bar: Number(process.env.IMPROVE_BAR ?? 0.75),
     holdoutMin: Number(process.env.IMPROVE_HOLDOUT_MIN ?? 0.85),
-    maxAttempts: Number(process.env.IMPROVE_MAX_ATTEMPTS ?? 2),
+    maxAttempts: Number(process.env.IMPROVE_MAX_ATTEMPTS ?? 1), // 1 = no informed retry (retry doubles codex)
+    guardFaithfulness: boolEnv("IMPROVE_GUARD_FAITHFULNESS", false),
+    maxCyclesPerTick: Number(process.env.IMPROVE_MAX_CYCLES_PER_TICK ?? 1),
   };
 }
 
@@ -173,39 +181,65 @@ function recordCycle(
   });
 }
 
+interface Pair {
+  skill: string;
+  axis: NoiseAxis;
+  records: JudgementRecord[];
+  lastAttemptAt: string; // "" = never attempted → sorts first (round-robin)
+}
+
 async function tick(deps: ImproveWorkerDeps, opts: ImproveWorkerOpts): Promise<void> {
   const log = deps.log ?? (() => {});
   const skills = deps.store.listJudgedSkills({ provider: opts.provider, promptVersion: JUDGE_PROMPT_VERSION });
   log(`[improve-worker] ${skills.length} skill(s) with a corpus: ${skills.join(", ") || "(none)"}`);
 
+  // Enumerate every (skill, axis) pair the corpus actually scores, loading each
+  // skill's judgements once.
+  const pairs: Pair[] = [];
   for (const skill of skills) {
     const records = deps.store.listJudgements({ skill, provider: opts.provider, promptVersion: JUDGE_PROMPT_VERSION });
-    const presentAxes = NOISE_AXES.filter((a) => records.some((r) => r.scores[a] !== null));
-    for (const axis of presentAxes) {
-      const nowISO = new Date().toISOString();
-      const action = await monitorPending(deps, opts, skill, axis, records, nowISO);
-      if (action === "watching" || action === "reverted") continue; // skip authoring this round
-
-      const result = await runImproveCycle(deps, {
-        skill,
-        axis,
-        provider: opts.provider,
-        cluster: opts.cluster,
-        holdout: opts.holdout,
-        samples: opts.samples,
-        absMax: opts.absMax,
-        bar: opts.bar,
-        holdoutMin: opts.holdoutMin,
-        recentDays: opts.recentDays,
-        k: opts.k,
-        apply: opts.apply,
-        maxAttempts: opts.maxAttempts,
-        budget: opts.budget,
-        now: Date.now(),
-      });
-      log(`[${skill}/${axis}] cycle → ${result.outcome}${result.mode ? ` (mode: ${result.mode})` : ""}`);
-      recordCycle(deps, skill, axis, result, nowISO);
+    for (const axis of NOISE_AXES.filter((a) => records.some((r) => r.scores[a] !== null))) {
+      pairs.push({ skill, axis, records, lastAttemptAt: deps.improverStore.get(skill, axis)?.lastAttemptAt ?? "" });
     }
+  }
+
+  // Monitor every pair first — free (no codex): auto-revert a ship whose live
+  // trend fell, settle a held one. "watching"/"reverted" pairs skip authoring.
+  const eligible: Pair[] = [];
+  for (const p of pairs) {
+    const action = await monitorPending(deps, opts, p.skill, p.axis, p.records, new Date().toISOString());
+    if (action === "author" || action === "kept") eligible.push(p);
+  }
+
+  // Author for at most maxCyclesPerTick pairs — the codex-heavy step — picking
+  // the least-recently-attempted first so coverage rotates and no single tick
+  // can spike the shared quota.
+  eligible.sort((a, b) => a.lastAttemptAt.localeCompare(b.lastAttemptAt));
+  const toRun = eligible.slice(0, Math.max(0, opts.maxCyclesPerTick));
+  log(`[improve-worker] ${eligible.length} pair(s) eligible to author; running ${toRun.length} this tick (cap ${opts.maxCyclesPerTick})`);
+
+  for (const p of toRun) {
+    const nowISO = new Date().toISOString();
+    const result = await runImproveCycle(deps, {
+      skill: p.skill,
+      axis: p.axis,
+      provider: opts.provider,
+      cluster: opts.cluster,
+      holdout: opts.holdout,
+      samples: opts.samples,
+      absMax: opts.absMax,
+      bar: opts.bar,
+      holdoutMin: opts.holdoutMin,
+      recentDays: opts.recentDays,
+      k: opts.k,
+      apply: opts.apply,
+      maxAttempts: opts.maxAttempts,
+      budget: opts.budget,
+      guardFaithfulness: opts.guardFaithfulness,
+      now: Date.now(),
+    });
+    log(`[${p.skill}/${p.axis}] cycle → ${result.outcome}${result.mode ? ` (mode: ${result.mode})` : ""}`);
+    recordCycle(deps, p.skill, p.axis, result, nowISO);
   }
 }
 
@@ -213,6 +247,7 @@ export async function runImproveWorker(deps: ImproveWorkerDeps, opts: ImproveWor
   const log = deps.log ?? (() => {});
   log(
     `[improve-worker] provider=${opts.provider} apply=${opts.apply} interval=${opts.pollIntervalMs}ms ` +
+      `cap=${opts.maxCyclesPerTick}/tick maxAttempts=${opts.maxAttempts} guardFaith=${opts.guardFaithfulness} ` +
       `recent=${opts.recentDays}d minMonitorN=${opts.minMonitorN} budget=${opts.budget} once=${opts.once}`,
   );
   if (!opts.apply) log("[improve-worker] SHADOW MODE (IMPROVE_APPLY not set) — proposes + gates but never ships.");

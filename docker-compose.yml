@@ -105,7 +105,11 @@ services:
     environment:
       CODEX_URL: http://codex:3010
       JUDGE_PROVIDER: codex
-      IMPROVE_APPLY: "false"     # shadow mode until prod-validated; flip to true to ship
+      IMPROVE_APPLY: "false"          # shadow mode until prod-validated; flip to true to ship
+      # Cost ceiling for the shared codex/ChatGPT quota (see task п3 cost notes):
+      IMPROVE_MAX_CYCLES_PER_TICK: "1" # ≤1 codex-heavy improve cycle per tick (round-robin)
+      IMPROVE_MAX_ATTEMPTS: "1"        # no informed retry by default (retry doubles gate codex)
+      IMPROVE_GUARD_FAITHFULNESS: "false" # target-axis-only judging: skip the input-heavy faithfulness pass
     volumes:
       - agent-data:/app/packages/agent/data
       - agent-skills:/app/skills

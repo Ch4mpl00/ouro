@@ -123,16 +123,21 @@ async function judgeOutputs(
   deps: GateDeps,
   target: GateNodeTarget,
   outputs: string[],
+  skipFaithfulness: boolean,
 ): Promise<Record<NoiseAxis, number[]>> {
   const acc = emptyAxisArrays();
   for (const outputText of outputs) {
-    const verdict = await judgeNode(deps.backend, {
-      kind: target.kind,
-      skill: target.skill,
-      contract: target.contract,
-      inputText: target.inputText,
-      outputText,
-    });
+    const verdict = await judgeNode(
+      deps.backend,
+      {
+        kind: target.kind,
+        skill: target.skill,
+        contract: target.contract,
+        inputText: target.inputText,
+        outputText,
+      },
+      { skipFaithfulness },
+    );
     const scores = extractAxisScores(verdict);
     for (const a of NOISE_AXES) {
       const v = scores[a];
@@ -153,6 +158,7 @@ export async function runNodeGate(
   sigmaByAxis: Partial<Record<NoiseAxis, number>>,
   k: number,
   storedScores: Partial<Record<NoiseAxis, number | null>>,
+  skipFaithfulness = false,
 ): Promise<NodeGateResult> {
   // after: generate `samples` fresh outputs from the patched prompt, judge each.
   const patchedMessages = patchMessages(target.recordedInput, patch);
@@ -160,7 +166,7 @@ export async function runNodeGate(
   for (let i = 0; i < samples; i++) {
     patchedOutputs.push(await deps.runModel(patchedMessages, target.model, target.jsonMode));
   }
-  const after = await judgeOutputs(deps, target, patchedOutputs);
+  const after = await judgeOutputs(deps, target, patchedOutputs, skipFaithfulness);
 
   const grades = NOISE_AXES.map((axis) =>
     gradeAxis(axis, storedScores[axis] ?? null, after[axis], sigmaByAxis[axis] ?? null, k),

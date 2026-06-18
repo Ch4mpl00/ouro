@@ -38,6 +38,7 @@ interface CliOpts {
   k: number;
   budget: number;
   maxAttempts: number;
+  guardFaithfulness: boolean;
   provider: JudgeProvider;
   apply: boolean;
 }
@@ -53,7 +54,8 @@ function parseArgs(argv: string[]): CliOpts {
     recentDays: 14,
     k: 2,
     budget: 8,
-    maxAttempts: 2,
+    maxAttempts: 1,
+    guardFaithfulness: false,
     provider: "codex",
     apply: false,
   };
@@ -71,7 +73,8 @@ function parseArgs(argv: string[]): CliOpts {
     else if (arg === "--recentDays" || arg.startsWith("--recentDays=")) o.recentDays = Math.max(0, Number(val("--recentDays")) || 14);
     else if (arg === "--k" || arg.startsWith("--k=")) o.k = Math.max(0, Number(val("--k")) || 2);
     else if (arg === "--budget" || arg.startsWith("--budget=")) o.budget = Math.max(1, Number(val("--budget")) || 8);
-    else if (arg === "--maxAttempts" || arg.startsWith("--maxAttempts=")) o.maxAttempts = Math.max(1, Number(val("--maxAttempts")) || 2);
+    else if (arg === "--maxAttempts" || arg.startsWith("--maxAttempts=")) o.maxAttempts = Math.max(1, Number(val("--maxAttempts")) || 1);
+    else if (arg === "--guard-faithfulness") o.guardFaithfulness = true;
     else if (arg === "--provider" || arg.startsWith("--provider=")) {
       const v = val("--provider");
       if (v !== "openai" && v !== "codex") throw new Error("--provider must be openai or codex");
@@ -83,7 +86,7 @@ function parseArgs(argv: string[]): CliOpts {
     console.error(
       "usage: pnpm improve --skill <skill> --axis <axis> [--cluster N] [--holdout M] " +
         "[--samples K] [--absMax 0.6] [--bar 0.75] [--holdoutMin 0.85] [--recentDays 14] " +
-        "[--k 2] [--budget 8] [--maxAttempts 2] [--provider codex|openai] [--apply]",
+        "[--k 2] [--budget 8] [--maxAttempts 1] [--guard-faithfulness] [--provider codex|openai] [--apply]",
     );
     process.exit(1);
   }

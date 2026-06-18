@@ -83,8 +83,12 @@ export interface ImproveCycleOpts {
   recentDays: number;
   k: number;
   apply: boolean;
-  maxAttempts: number; // ≤2 → one informed retry after a failed gate
+  maxAttempts: number; // 1 → no retry; 2 → one informed retry after a failed gate
   budget: number; // per-skill patch lesson budget (block new ships when full)
+  // Re-judge the faithfulness axis in the gate too (collateral-regression guard).
+  // Default OFF: faithfulness is a separate, input-heavy codex call — skipping it
+  // when it isn't the target halves the gate's codex cost (target-axis-only).
+  guardFaithfulness: boolean;
   now: number; // Date.now(), injected for the recent window + testability
 }
 
@@ -204,6 +208,9 @@ export async function runImproveCycle(deps: ImproveCycleDeps, opts: ImproveCycle
     return { outcome: "budget", mode: mode.description };
   }
 
+  // Target-axis-only judging: only re-judge faithfulness when it IS the target
+  // or the caller explicitly guards it — otherwise skip its costly extra pass.
+  const skipFaithfulness = axis !== "faithfulness" && !opts.guardFaithfulness;
   async function gateNodes(recs: JudgementRecord[], samples: number, lesson: string): Promise<NodeGateResult[]> {
     const out: NodeGateResult[] = [];
     for (const rec of recs) {
@@ -211,7 +218,18 @@ export async function runImproveCycle(deps: ImproveCycleDeps, opts: ImproveCycle
       if (!r) continue;
       const target = buildGateTarget(r.node, r.obs);
       if (!target) continue;
-      out.push(await runNodeGate({ backend: deps.backend, runModel }, target, lesson, samples, deps.sigma, opts.k, rec.scores));
+      out.push(
+        await runNodeGate(
+          { backend: deps.backend, runModel },
+          target,
+          lesson,
+          samples,
+          deps.sigma,
+          opts.k,
+          rec.scores,
+          skipFaithfulness,
+        ),
+      );
     }
     return out;
   }

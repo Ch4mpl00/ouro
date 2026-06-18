@@ -6,6 +6,29 @@ running incl. new `improve-worker` in SHADOW mode (`IMPROVE_APPLY=false`). NEXT:
 watch the shadow loop on real data, then flip `IMPROVE_APPLY=true` when proposals
 look sane. Two deploy notes below.
 
+### First prod run + cost reduction (2026-06-18)
+- **End-to-end run on prod (shadow)** on news-digest/coverage worked: select
+  (corpus=12 → 11 candidates) → taxonomy (4 named modes; Noise-Retention ×6
+  dominant) → author a concrete-but-general lesson → gate → informed retry
+  (re-authored a sharper lesson) → **rejected** (Δ within σ; one collateral
+  regress). Mechanism validated; rejection partly an artifact of `--samples 1`
+  (threshold k·σ·√2 ≈ 0.14, single-sample variance).
+- **Cost blew the 5h codex quota.** Root cause: the gate re-judged the
+  faithfulness axis (a SEPARATE input-heavy codex call) on every sample, AND the
+  informed retry re-gated (×2) — over large news-digest payloads. (Amplified by
+  an ssh-timeout that left a runaway `docker compose run` + a second full run.)
+- **Cost cuts shipped** (code only, validated by 238 tests; the design's own
+  knobs): (1) **target-axis-only judging** — `judgeNode(skipFaithfulness)`; the
+  gate skips faithfulness unless it's the target or `--guard-faithfulness`
+  (2 codex calls → 1 per compose sample). (2) **retry off by default** —
+  `maxAttempts=1` (retry opt-in). (3) **worker round-robin + per-tick cap** —
+  `IMPROVE_MAX_CYCLES_PER_TICK=1`, least-recently-attempted first; monitoring is
+  free and runs for all pairs, only authoring is capped → an unattended tick
+  can't spike the shared quota. ~4× cheaper in the common reject path.
+- **improve-worker STOPPED on prod** (`docker compose stop improve-worker`) until
+  quota recovers + the cheaper code is redeployed. Restart: `docker compose up -d
+  --build improve-worker` (shadow), watch, then flip `IMPROVE_APPLY=true`.
+
 ### Deploy notes (2026-06-18)
 - **judge prompt n1→n4 on prod.** Prod corpus was judged at n1; the deploy moved
   the judge to n4 (de-tasted composition). judge-worker is RE-JUDGING the corpus
