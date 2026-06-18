@@ -24,6 +24,153 @@
   repeatability noise; the gate's accept threshold per axis derives from the
   judge model's own σ. Committed baseline keyed by (model | prompt version).
 
+## Refined improver design (locked 2026-06-18, with user)
+
+This section supersedes the cruder selection/cost details in Phase 3 below
+(median split, absolute-only `lowMax`, re-judging "before"). Notation: σ = the
+judge's measured repeatability noise on an axis; k ≈ 2 = noise multiplier;
+"band" = the rubric's score anchors (fail<0.3, weak<0.5, ok<0.75, strong≥0.75).
+
+### Two costs that are NOT the same (and why the gate is affordable)
+
+| cost | when | scales with |
+| --- | --- | --- |
+| judging the corpus (`judge-worker`) | once per node as traces arrive | corpus size (happens anyway) |
+| σ baseline (`judge:noise`) | one-off per judge model | fixed (a few nodes × K) |
+| the gate (`improve`) | per improvement attempt | **cluster + holdout × samples — NOT corpus size** |
+
+The gate touches only the cluster (~3) + holdout (~3) nodes, never the whole
+corpus. Corpus size affects only (a) the ongoing per-node judging that already
+happens, and (b) cluster-selection QUALITY (more data → better failure picture).
+
+Corpus estimate (verify on prod): ~17 signals/day → ~500 traces/month; per
+(skill, axis) ~40–60 nodes/week. The gate still only judges ~6 of them.
+
+### Cheap gate (REPLACE the current re-judge-before implementation)
+
+The irreducible cost is REGENERATION: to see a patch's effect we MUST re-run the
+generator on the frozen input — re-judging the OLD output under a patched
+contract is meaningless (we deliberately keep the judge yardstick = the ORIGINAL
+contract, fixed). Everything else is cuttable:
+
+1. **"before" = the stored judgement score (free), not S re-judges.** We already
+   judged every node once (the corpus). Use that single score as the before;
+   bump the threshold to `k·σ·√(1+1/S)` to cover its single-point noise. Saves
+   ~half the codex calls. (Current `runNodeGate` wastefully re-judges before S×.)
+2. **holdout sampled at S=1** (it's a regression guard, not a measurement).
+3. **samples = 2** on the cluster (σ already known from the baseline).
+4. optional: target-axis-only judging (skip the faithfulness sub-pass unless it
+   is the target / a needed guard).
+
+Per-run codex calls: current S3/C3/H3 ≈ 72 → cheap variant ≈ 9–18 (deepseek
+regenerations are separate and cheap, ~S·C ≈ 6). Run `improve` on a schedule
+(daily/weekly per skill), not per trace → ~tens of codex calls/day, trivial vs
+the shared ChatGPT quota.
+
+### Cluster selection — ABSOLUTE + σ, never a percentile
+
+A percentile (median, p75, …) is the WRONG selector: it's relative so it never
+converges (there's always a bottom X% → endless churn / "median chasing"), it
+ignores σ (on a tight distribution the "bottom" is just judge noise), it ignores
+absolute quality (on a uniformly-bad skill the "top" is still bad), and it's
+noisy at our small N (~50). The paired Δ-vs-σ ACCEPT test is the real
+noise-aware statistic and is SEPARATE from selection — don't conflate them.
+
+Selection rule (per skill, per axis):
+- **candidate failure** = `score < 0.6` AND `score < band − k·σ` (confidently
+  below a meaningful bar, not just nominally low). Absolute → the loop CONVERGES
+  and shuts off when the skill is uniformly good. (Optional secondary guard:
+  also require below the skill's own median — but absolute is primary.)
+- **holdout** = nodes with `score ≥ 0.85` over ALL time (gold standards; recency
+  irrelevant — height is). Cluster is drawn from a RECENT window (fix current
+  problems, not already-fixed old ones).
+
+### Failure-mode taxonomy — the cluster is a PATTERN, not the lowest-N
+
+A patch fixes a recurring failure MODE, not a number. The 3 numerically-lowest
+nodes may fail for 3 unrelated reasons (one patch can't fix them); 3 nodes with
+the SAME judge complaint are patchable. So between selection and authoring,
+induce a taxonomy of failure modes and patch the most frequent one (Pareto).
+
+- **Do NOT embed raw verdicts.** A verdict is a blob mixing several complaints +
+  instance specifics (item ids, names, quotes). Embedding it gives a blurry
+  average: the specifics (different per verdict) dominate the vector, multiple
+  issues in one paragraph average to a meaningless midpoint, and the judge's
+  prose style falsely clusters unrelated failures.
+- **First DISTILL, then group.** Turn each verdict into ATOMIC, instance-free
+  failure phrases (strip ids/names → keep them as evidence metadata). Example
+  coverage verdict → two atoms: "includes off-contract opinion/business items the
+  contract says to skip" + "omits a concrete infra/data-architecture item". These
+  short normalized phrases are also exactly the form a general patch should take.
+- **At our N, use LLM open-coding, not embeddings.** ~40–60 short rationales fit
+  in one context: one LLM call → "3–7 named failure modes + frequency + which
+  nodes". Human-readable, gives Pareto frequencies for free, no embedding call /
+  cluster-threshold tuning. Embedding-then-cluster (distilled phrases, e.g.
+  HDBSCAN) is the SCALE-UP path for when verdicts number in the thousands.
+- **Taxonomy runs in the IMPROVER at improve-time, NOT at judge-time.** The judge
+  stays simple/stable (verbatim-synced, calibrated — don't bloat it). A taxonomy
+  is inherently over a SAMPLE (you can't find "recurring" in one node), so it
+  belongs to the batch step. Each run builds a FRESH taxonomy over the current
+  window → it self-adapts to what's failing NOW (already-fixed modes drop out),
+  with no cross-run category persistence to maintain.
+- We are half-way already: `judgements.detail` stores rationale PER AXIS, and
+  faithfulness per-claim with supported/partial/unsupported — cross-axis mixing
+  is already separated; distillation only needs to split WITHIN an axis.
+
+### Refined per-run pipeline
+
+```
+1. Take traces since the last improve run → group by SKILL (outer; the .patch.md
+   is per-skill, and contracts differ — never mix telegram "привет" with news).
+2. For each (skill, AXIS):  (axis inner — gate measures one axis; rationale is per-axis)
+   a. select low nodes: score < 0.6 AND score < band − k·σ   (absolute + noise)
+   b. taxonomy: 1 LLM call over those low nodes' rationales → named failure modes
+      + frequency + member nodes
+   c. dominant mode (Pareto) → its nodes = the cluster for the gate
+   d. holdout = all-time high nodes (score ≥ 0.85)
+   e. author writes ONE append-only lesson for THAT mode — AND is shown the
+      current skills/<skill>.patch.md so it does NOT repeat an existing lesson
+      (dedup-on-input; pairs with retire-on-output to bound prompt growth)
+   f. cheap gate (before=stored, S=2 cluster / S=1 holdout) → decideShip → ship
+```
+
+### Why this raises the median (and where it stops) — the theory
+
+Lifting the low tail DOES raise the median (you move the lower mass up). But be
+clear what kind of engine this is:
+- **Floor-lifting (what the loop does):** fix systematic failure modes → weak
+  runs rise, variance shrinks, median climbs, worst-case reliability improves.
+- **Ceiling-raising (the loop barely does):** making already-good runs better
+  only happens if a general lesson also helps them; selection pressure is on
+  failures, so the loop's energy goes to the floor.
+- **There is a hard ceiling** = generator model + axis/contract definition +
+  judge. With the ABSOLUTE selection floor, when the floor reaches the ceiling
+  the candidate set empties and the improver SHUTS OFF — convergence, not endless
+  churn. (A pure percentile selector would never stop = "everything dragged to a
+  barely-moving median".)
+- **To move the CEILING** (separate mechanisms, not this loop): a stronger
+  generator model; a rewritten axis/contract (like the composition de-taste —
+  bump prompt_version, scores not comparable across); or an EXPLORATION mode
+  (occasionally try a bold patch on already-good nodes to find higher peaks).
+
+Two standing risks: **Goodhart** (we optimize the JUDGE's score, not truth → the
+loop's ceiling is "what the judge can't distinguish"; mitigated by objective
+de-tasted axes, σ-aware gating, and prod as ground truth via the п3 live-trend
+monitor + auto-revert) and **patch bloat** (lessons accumulate → giant-prompt
+regression; mitigated by dedup-on-input + retire lessons that stop correlating
+with low scores + a per-skill patch budget).
+
+### What this changes in the code (vs what's already built)
+
+- `judging/improver.ts selectClusters`: replace `lowMax`-only with `score < 0.6
+  AND score < band − k·σ`; holdout = all-time `score ≥ 0.85`.
+- `judging/gate.ts runNodeGate`: stop re-judging "before" — read the stored
+  score; threshold `k·σ·√(1+1/S)`; default S=2 cluster / S=1 holdout.
+- NEW taxonomy step (improve-time, LLM open-coding per (skill, axis)) feeding the
+  cluster; embeddings noted as the scale-up path.
+- author gets the current `.patch.md` for dedup.
+- п3 still owns: cron, live-trend monitor, auto-revert, retire/budget.
+
 Supersedes the whole-run trajectory judge in [[eval-trajectory-judge]]: that
 judge scored the WHOLE run against two contracts. We are replacing it with a
 **per-node judge** (one score per generative LLM node), which localizes the
