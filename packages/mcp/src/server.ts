@@ -4,6 +4,7 @@ import { randomUUID } from "node:crypto";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import { registerGmailTools } from "./tools/gmail";
 import { registerTelegramTools } from "./tools/telegram";
@@ -22,6 +23,7 @@ import { startSchedulerPoller } from "./services/scheduler";
 import { createPgClient } from "./db/pg/client";
 import { createNewsModule, startNewsModule, type NewsRepository } from "./services/news";
 import { createKnowledgeModule, type KnowledgeRepository } from "./services/knowledge";
+import { createGatewayModule, loadGatewayConfig } from "./services/gateway";
 
 export interface ServerDeps {
   news: NewsRepository;
@@ -62,11 +64,18 @@ async function readBody(req: IncomingMessage): Promise<unknown> {
   }
 }
 
+// The agent-facing endpoint is either the own McpServer directly (no upstreams)
+// or the gateway's low-level Server (own-MCP + third-party MCPs merged). Both
+// expose connect(transport); that's all the transport plumbing needs.
+interface ConnectableServer {
+  connect(transport: Transport): Promise<void>;
+}
+
 // HTTP mode: single MCP server instance, one session per connecting client.
 // Sessions are created lazily on the initialize request and tracked by
 // the mcp-session-id header for subsequent calls (per the Streamable HTTP
 // spec). For our deployment (one agent), there'll be exactly one session.
-async function runHttpTransport(server: McpServer, port: number): Promise<void> {
+async function runHttpTransport(server: ConnectableServer, port: number): Promise<void> {
   const transports = new Map<string, StreamableHTTPServerTransport>();
 
   const http = createHttpServer(async (req: IncomingMessage, res: ServerResponse) => {
@@ -127,19 +136,27 @@ async function main(): Promise<void> {
   const newsModule = createNewsModule({ db: pg.db });
   const knowledgeModule = createKnowledgeModule({ db: pg.db });
 
-  const server = createServer({
+  const ownServer = createServer({
     news: newsModule.repository,
     knowledge: knowledgeModule.repository,
   });
+
+  // Gateway: if any third-party MCP upstreams are configured + resolvable, front
+  // own-MCP with the aggregating gateway so the agent sees one merged, namespaced
+  // tool list. With no upstreams, serve own-MCP directly — zero behaviour change.
+  const upstreams = loadGatewayConfig();
+  const endpoint: ConnectableServer =
+    upstreams.length > 0 ? (await createGatewayModule({ ownServer, upstreams })).server : ownServer;
+
   const transport = (process.env.MCP_TRANSPORT ?? "stdio").toLowerCase();
 
   if (transport === "http") {
     const port = Number(process.env.MCP_PORT ?? 3000);
     if (!Number.isFinite(port)) throw new Error(`MCP_PORT must be numeric, got ${process.env.MCP_PORT}`);
-    await runHttpTransport(server, port);
+    await runHttpTransport(endpoint, port);
   } else {
     const stdio = new StdioServerTransport();
-    await server.connect(stdio);
+    await endpoint.connect(stdio);
   }
 
   startTelegramPoller();
