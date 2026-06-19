@@ -1,4 +1,5 @@
 import "dotenv/config";
+import "../openai-native-fetch";
 import { appendFileSync } from "node:fs";
 import { config as loadEnv } from "dotenv";
 import { createAgentDb } from "../db/client";

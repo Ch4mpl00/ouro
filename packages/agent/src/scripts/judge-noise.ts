@@ -1,4 +1,5 @@
 import "dotenv/config";
+import "../openai-native-fetch";
 import { readFileSync, writeFileSync } from "node:fs";
 import { config as loadEnv } from "dotenv";
 import OpenAI from "openai";

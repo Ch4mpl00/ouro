@@ -1,4 +1,5 @@
 import "dotenv/config";
+import "./openai-native-fetch";
 import { createServer as createHttpServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { randomUUID } from "node:crypto";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
