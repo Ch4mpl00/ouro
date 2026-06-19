@@ -29,6 +29,27 @@ look sane. Two deploy notes below.
   quota recovers + the cheaper code is redeployed. Restart: `docker compose up -d
   --build improve-worker` (shadow), watch, then flip `IMPROVE_APPLY=true`.
 
+### Worker live (shadow) + known issue (2026-06-18, parked with user)
+- `improve-worker` DEPLOYED + RUNNING in shadow with the cost cuts (cap=1/tick,
+  faithfulness skipped, retry off). Confirmed: cap honored ("running 1 this
+  tick"), round-robin rotates (coverage→composition across ticks), taxonomy +
+  author produce sensible lessons.
+- **Durable audit works**: `improver-audit.jsonl` on the agent-data volume gets
+  one line per cycle (incl. rejected + error) and per monitor event — reviewable
+  across recreates. Review: `docker compose exec improve-worker cat
+  packages/agent/data/improver-audit.jsonl`.
+- **KNOWN ISSUE (parked — user chose "accumulate audit"):** the news-digest gate
+  REGENERATION fails consistently with OpenAI `Invalid response body … Premature
+  close` (the agent runs gpt-5.4/-mini, not deepseek; large map-stage news-digest
+  outputs drop the stream). The connection-retry fix (commit 423dea6, retry
+  APIConnectionError) did NOT catch it — this error isn't classed as
+  APIConnectionError (no `[retry]` logs), so it bubbles up. Not blocking: the
+  worker audits the error, rotates to other pairs (planner/process = small JSON,
+  tech-digest) which should yield real verdicts. Fix options for later: (a)
+  broaden retry to message-match "Premature close"/"fetch failed"/ECONNRESET;
+  (b) restrict the gate to the reduce/terminal node (skip huge map inputs — the
+  design's own note); (c) lower samples. Decide after a week of audit.
+
 ### Deploy notes (2026-06-18)
 - **judge prompt n1→n4 on prod.** Prod corpus was judged at n1; the deploy moved
   the judge to n4 (de-tasted composition). judge-worker is RE-JUDGING the corpus
