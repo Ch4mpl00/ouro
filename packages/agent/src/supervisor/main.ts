@@ -1,4 +1,5 @@
 import "dotenv/config";
+import "../openai-native-fetch";
 import OpenAI from "openai";
 import { createAgentDb } from "../db/client";
 import { createMemoryStore } from "../db/memory";

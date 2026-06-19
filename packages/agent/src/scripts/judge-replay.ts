@@ -1,4 +1,5 @@
 import "dotenv/config";
+import "../openai-native-fetch";
 import { readFileSync, writeFileSync } from "node:fs";
 import OpenAI from "openai";
 import type { ChatCompletionMessageParam } from "openai/resources/chat/completions";

@@ -1,4 +1,5 @@
 import "dotenv/config";
+import "../openai-native-fetch";
 import { config as loadEnv } from "dotenv";
 import { createAgentDb } from "../db/client";
 import { createTraceStore } from "../db/trace-store";
