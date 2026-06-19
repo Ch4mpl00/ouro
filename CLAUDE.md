@@ -59,8 +59,9 @@ mcp-tools/
     │   ├── data/{schema.sql, tokens.db}     OAuth, watermarks, signals, scheduled_tasks
     │   └── src/
     │       ├── server.ts                    starts pollers + HTTP/stdio transport
+    │       ├── gateway.config.json          third-party MCP upstreams (git-tracked, secret-free)
     │       ├── tools/                       MCP-exposed actions
-    │       └── services/{gmail,telegram,monobank,scheduler,news,pdf,signals,settings}
+    │       └── services/{gmail,telegram,monobank,scheduler,news,pdf,signals,settings,gateway}
     └── agent/
         ├── data/agent.db                    agent-side state (memory KV + trace mirror)
         └── src/
@@ -229,6 +230,11 @@ also see them when running `claude` locally with `.mcp.json` registered.
 - **Scheduler** — `schedule_task`, `list_scheduled_tasks`,
   `cancel_scheduled_task`
 - **Env** — `get_timezone`, `set_timezone`
+- **Third-party (via gateway)** — when `gateway.config.json` lists upstreams,
+  `services/gateway/` makes own-MCP an MCP *client* to them too and re-exposes
+  their tools namespaced as `${prefix}__${tool}` (e.g. `tavily__tavily_search`).
+  The agent still sees one merged endpoint. Onboarding (config + secret + skill
+  frontmatter, no code) is in `.claude/tasks/mcp-gateway.md`.
 
 ## Agent skills
 

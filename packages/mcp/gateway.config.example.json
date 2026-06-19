@@ -1,0 +1,13 @@
+{
+  "// doc": "Third-party MCP servers own-MCP aggregates and re-exposes to the agent. Secrets are ${ENV_VAR} refs resolved from the mcp container's env (.env.mcp) at boot — keep this file secret-free. A missing/empty referenced var makes that upstream skip (logged), never fatal. Only StreamableHTTP (transport: http) upstreams are supported; stdio is out of scope until the gateway runs in its own container. Tools are re-exposed as `${prefix}__${toolName}` (own-MCP tools stay un-prefixed). Enable a tool for the model by adding its namespaced name to the relevant skill's `tools:` frontmatter.",
+  "upstreams": [
+    {
+      "name": "tavily",
+      "transport": "http",
+      "url": "https://mcp.tavily.com/mcp/?tavilyApiKey=${TAVILY_API_KEY}",
+      "prefix": "tavily",
+      "enabled": true,
+      "headers": {}
+    }
+  ]
+}
