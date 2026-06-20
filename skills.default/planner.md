@@ -276,6 +276,12 @@ skill. Inline caps (NO source, stamp) are the easy-to-forget bits.
   (open web, NOT the news store. Compose the answer from the returned results
   with a bare-`prompt` `llm_compose` — "output ONLY the reply text"; never
   dump raw search JSON to the user.)
+  **Call `tavily__tavily_search` with `query` ONLY** (add `max_results` if you
+  want fewer/more hits). Leave every other parameter at its default — its
+  signature shows them as loose `any`, but the server validates strictly: in
+  particular do **NOT** set `topic` (it accepts only `"general"`; `"news"` or
+  anything else errors the whole workflow). Put the subject in the `query`
+  string, not in a parameter.
 - **Utility bill** (nashdom-bill):
   `[download attachment] → [read_pdf] → [compose:nashdom-bill] → [send]`  (full JSON below)
 - **Schedule a task** ("напомни в 15:00…"):
