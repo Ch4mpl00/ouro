@@ -13,6 +13,7 @@ import {
 } from "./execute";
 import { createStore } from "./variables";
 import { PATCH_MARKER } from "../skills";
+import type { CodexClient } from "../codex-client";
 
 // ─── shared mocks ────────────────────────────────────────────────────
 
@@ -425,6 +426,92 @@ describe("executor.execute — set_memory step (agent-side builtin)", () => {
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.reason).toBe("tool_error");
     expect(memWrites).toEqual([]);
+  });
+});
+
+describe("executor.execute — code_agent step (agent-side builtin)", () => {
+  it("dispatches to the injected codex backend, not MCP, and binds the result", async () => {
+    const engine = makeMockEngine();
+    const runs: unknown[] = [];
+    const codex: CodexClient = {
+      run: async (req) => {
+        runs.push(req);
+        return { ok: true, content: "  42\n", stderr: "" };
+      },
+    };
+    const executor = createExecutor({
+      engine,
+      readSkill: nullReadSkill(),
+      setMemory: () => {},
+      codex,
+    });
+    const ctx = baseCtx();
+    ctx.store.set("csv", "a,b\n1,2");
+
+    const r = await executor.execute(
+      {
+        version: 1,
+        steps: [
+          {
+            kind: "tool",
+            tool: "code_agent",
+            args: { task: "sum b", data: "${csv}" },
+            bind: "n",
+          },
+          { kind: "terminal" },
+        ],
+      },
+      ctx,
+    );
+
+    expect(r.ok).toBe(true);
+    expect(runs).toHaveLength(1);
+    // trimmed result bound; never forwarded to MCP
+    expect(ctx.store.get("n")).toBe("42");
+    expect(engine.toolCalls).toEqual([]);
+  });
+
+  it("fails as tool_error when no codex backend is configured", async () => {
+    const engine = makeMockEngine();
+    const executor = createExecutor({ engine, readSkill: nullReadSkill(), setMemory: () => {} });
+
+    const r = await executor.execute(
+      {
+        version: 1,
+        steps: [
+          { kind: "tool", tool: "code_agent", args: { task: "2+2" }, bind: "x" },
+          { kind: "terminal" },
+        ],
+      },
+      baseCtx(),
+    );
+
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.reason).toBe("tool_error");
+  });
+
+  it("surfaces a codex failure as tool_error", async () => {
+    const engine = makeMockEngine();
+    const codex: CodexClient = {
+      run: async () => {
+        throw new Error("codex service returned 502");
+      },
+    };
+    const executor = createExecutor({ engine, readSkill: nullReadSkill(), setMemory: () => {}, codex });
+
+    const r = await executor.execute(
+      {
+        version: 1,
+        steps: [
+          { kind: "tool", tool: "code_agent", args: { task: "2+2" }, bind: "x" },
+          { kind: "terminal" },
+        ],
+      },
+      baseCtx(),
+    );
+
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.reason).toBe("tool_error");
   });
 });
 

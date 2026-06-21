@@ -18,7 +18,12 @@ COPY packages/codex/package.json ./packages/codex/
 RUN pnpm install --frozen-lockfile
 
 FROM node:22-bookworm-slim AS runtime
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
+# ca-certificates for TLS; python3 + pandas/openpyxl give the codex `code_agent`
+# sandbox a spreadsheet/data toolchain (xlsx/csv parsing, aggregation) — Codex
+# can't pip-install at run time inside its sandbox, so the libs must be baked in.
+# (Shared image across all services; only the codex container exercises these.)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates python3 python3-pandas python3-openpyxl \
  && rm -rf /var/lib/apt/lists/*
 RUN npm install -g pnpm@10
 # Codex CLI runtime for the generic codex service. Auth is persisted by mounting

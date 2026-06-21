@@ -1,6 +1,7 @@
 import "dotenv/config";
 import "../openai-native-fetch";
 import OpenAI from "openai";
+import { createCodexClient } from "../codex-client";
 import { createAgentDb } from "../db/client";
 import { createMemoryStore } from "../db/memory";
 import { createTraceStore } from "../db/trace-store";
@@ -145,6 +146,9 @@ async function main(): Promise<void> {
   const traceStore = createTraceStore(db);
   const skillStore = createSkillStore();
   const mcp = await connectMcp();
+  // Sandboxed code execution (Codex service). Same client used by the
+  // `code_agent` tool on both the workflow and AgentLoop paths.
+  const codex = createCodexClient();
 
   // Validate every skill on disk against the live MCP registry. Crashes
   // early with a precise error if any skill is missing frontmatter, has
@@ -183,6 +187,7 @@ async function main(): Promise<void> {
     skillStore,
     memory,
     tracer,
+    codex,
   });
 
   console.log(`[supervisor] mcp tools: ${mcp.tools.map((t) => t.function.name).join(", ")}`);
@@ -219,6 +224,7 @@ async function main(): Promise<void> {
     mcpTools: mcp.tools,
     knownSkills,
     setMemory: (key, value) => memory.set(key, value),
+    codex,
   });
 
   const fallback = createFallback({ engine });

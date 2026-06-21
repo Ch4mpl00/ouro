@@ -3,6 +3,8 @@ import type { ModelPreset, PresetName } from "../models";
 import type { ChatProvider } from "../providers";
 import type { AgentLoopOpts } from "../agent-loop";
 import { SET_MEMORY_TOOL_NAME, SetMemoryArgsSchema } from "../synthetic-tools";
+import { CODE_AGENT_TOOL_NAME, CodeAgentArgsSchema, runCodeAgent } from "../code-agent";
+import type { CodexClient } from "../codex-client";
 import { JUDGE_NODE_META } from "../trace-model";
 import { appendPatch } from "../skills";
 import type { Span, SpanKind, TraceContext } from "../tracing";
@@ -116,6 +118,10 @@ export interface ExecutorDeps {
   // tool with no MCP counterpart. Injected (rather than imported) so the
   // executor stays decoupled from db/memory and tests can spy on it.
   setMemory: (key: string, value: string) => void;
+  // Sandboxed code-execution backend (Codex) for `code_agent` tool steps.
+  // Optional so eval/test executors that never emit a code_agent step need
+  // not wire it; a code_agent step without it fails as a tool_error.
+  codex?: CodexClient;
 }
 
 export function createExecutor(deps: ExecutorDeps): Executor {
@@ -371,6 +377,14 @@ async function execTool(
     return out;
   }
 
+  // code_agent is also a synthetic agent-side tool (delegates to the Codex
+  // sandbox) with no MCP counterpart — dispatch it in-process.
+  if (step.tool === CODE_AGENT_TOOL_NAME) {
+    const out = await execCodeAgent(resolvedArgs, deps);
+    if (step.bind) store.set(step.bind, out);
+    return out;
+  }
+
   let raw: string;
   try {
     raw = await deps.engine.mcp.callTool(step.tool, resolvedArgs);
@@ -423,6 +437,31 @@ function execSetMemory(
   }
   deps.setMemory(parsed.data.key, parsed.data.value);
   return { ok: true, key: parsed.data.key };
+}
+
+// code_agent — delegate computation/code to the Codex sandbox. Same
+// CodeAgentArgsSchema validation as the synthetic-tools registry; a missing
+// codex dep or a Codex failure surfaces as a ToolCallError so the executor
+// classifies it as tool_error (→ the supervisor's fallback path).
+async function execCodeAgent(
+  args: Record<string, unknown>,
+  deps: ExecutorDeps,
+): Promise<string> {
+  if (!deps.codex) {
+    throw new ToolCallError(CODE_AGENT_TOOL_NAME, "codex backend not configured");
+  }
+  const parsed = CodeAgentArgsSchema.safeParse(args);
+  if (!parsed.success) {
+    const detail = parsed.error.issues
+      .map((i) => `${i.path.join(".") || "args"}: ${i.message}`)
+      .join("; ");
+    throw new ToolCallError(CODE_AGENT_TOOL_NAME, detail);
+  }
+  try {
+    return await runCodeAgent(deps.codex, parsed.data);
+  } catch (err) {
+    throw new ToolCallError(CODE_AGENT_TOOL_NAME, (err as Error).message);
+  }
 }
 
 // ─── llm_compose ─────────────────────────────────────────────────────

@@ -1,6 +1,8 @@
 import type { ChatCompletionMessageParam, ChatCompletionTool } from "openai/resources/chat/completions";
 import { z } from "zod";
 import { isPresetName, PRESET_NAMES } from "./models";
+import { CODE_AGENT_TOOL, CodeAgentArgsSchema, runCodeAgent } from "./code-agent";
+import type { CodexClient } from "./codex-client";
 import type { MemoryStore } from "./db/memory";
 import type { SkillStore } from "./skills";
 import type { AgentLoopOpts } from "./agent-loop";
@@ -37,6 +39,8 @@ export interface SyntheticToolContext {
   log(...parts: unknown[]): void;
   skillStore: SkillStore;
   memory: MemoryStore;
+  // Sandboxed code-execution backend for the `code_agent` tool.
+  codex: CodexClient;
   // Spawn/end a child loop (invoke_sub_agent). Narrow structural handle —
   // the handler only pushes the prompt and runs to completion.
   startAgentLoop(opts: AgentLoopOpts): Promise<{
@@ -316,6 +320,20 @@ export const SYNTHETIC_TOOLS: SyntheticTool[] = [
       ctx.memory.set(key, value);
       ctx.log(`set_memory ${key} = ${value.slice(0, 80)}`);
       return `ok — stored ${key}`;
+    },
+  }),
+
+  defineTool({
+    def: CODE_AGENT_TOOL,
+    schema: CodeAgentArgsSchema,
+    handle: async (ctx, args) => {
+      try {
+        const out = await runCodeAgent(ctx.codex, args);
+        ctx.log(`code_agent ${args.task.slice(0, 80)} → ${out.slice(0, 80)}`);
+        return out;
+      } catch (err) {
+        return `[code_agent error] ${(err as Error).message}`;
+      }
     },
   }),
 
