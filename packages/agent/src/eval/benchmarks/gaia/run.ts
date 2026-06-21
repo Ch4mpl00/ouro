@@ -1,5 +1,6 @@
 import "dotenv/config";
 import "../../../openai-native-fetch";
+import { readFileSync } from "node:fs";
 import { config as loadEnv } from "dotenv";
 import OpenAI from "openai";
 import { createCodexClient } from "../../../codex-client";
@@ -44,6 +45,9 @@ interface CliOpts {
   maxTasks: number | null;
   accessibleOnly: boolean;
   dryRun: boolean;
+  // Run only tasks whose taskId starts with one of these (full id or short
+  // prefix). Overrides --max-tasks (runs every match). null = no id filter.
+  taskIds: string[] | null;
 }
 
 function parseArgs(argv: string[]): CliOpts {
@@ -51,9 +55,20 @@ function parseArgs(argv: string[]): CliOpts {
   let maxTasks: number | null = 10;
   let accessibleOnly = false;
   let dryRun = false;
+  let taskIds: string[] | null = null;
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
-    if (arg === "--dry-run") {
+    if (arg === "--task-ids") {
+      // Comma-separated ids/prefixes, or "@path" to read them from a file
+      // (one per line and/or comma-separated). Handy for re-running failures.
+      const v = argv[++i] ?? "";
+      const raw = v.startsWith("@") ? readFileSync(v.slice(1), "utf8") : v;
+      taskIds = raw
+        .split(/[\s,]+/)
+        .map((s) => s.trim())
+        .filter(Boolean);
+      if (taskIds.length === 0) throw new Error("--task-ids resolved to an empty list");
+    } else if (arg === "--dry-run") {
       // Print the selected/excluded tasks and exit — no LLM calls, no cost.
       dryRun = true;
     } else if (arg === "--level") {
@@ -72,7 +87,32 @@ function parseArgs(argv: string[]): CliOpts {
       accessibleOnly = true;
     }
   }
-  return { level, maxTasks, accessibleOnly, dryRun };
+  return { level, maxTasks, accessibleOnly, dryRun, taskIds };
+}
+
+// Apply the explicit --task-ids selection (full id or short prefix). Errors
+// loudly on a prefix that matches nothing — a typo'd id should not silently
+// shrink the run.
+function selectByIds(pool: GaiaTask[], ids: string[]): GaiaTask[] {
+  const unmatched = ids.filter((id) => !pool.some((t) => t.taskId.startsWith(id)));
+  if (unmatched.length > 0) {
+    throw new Error(`--task-ids: no task matches: ${unmatched.join(", ")}`);
+  }
+  return pool.filter((t) => ids.some((id) => t.taskId.startsWith(id)));
+}
+
+// Resolve the task set to run from the CLI opts. Explicit --task-ids wins
+// (runs exactly those, ignoring the capability filter + --max-tasks). Else
+// apply the accessibility filter (reporting tool-gap exclusions), then the
+// --max-tasks cap.
+async function selectTasks(opts: CliOpts): Promise<GaiaTask[]> {
+  let pool = await loadGaiaTasks({ level: opts.level });
+  if (opts.taskIds) return selectByIds(pool, opts.taskIds);
+  if (opts.accessibleOnly) {
+    reportExcluded(pool.filter((t) => !isAccessible(t)));
+    pool = pool.filter((t) => isAccessible(t));
+  }
+  return opts.maxTasks === null ? pool : pool.slice(0, opts.maxTasks);
 }
 
 // Outcome category — a coarse first cut at the failure taxonomy. The full
@@ -98,12 +138,7 @@ async function main(): Promise<void> {
 
   // --dry-run: preview the selection (no API keys, no MCP, no cost) and exit.
   if (opts.dryRun) {
-    let pool = await loadGaiaTasks({ level: opts.level });
-    if (opts.accessibleOnly) {
-      reportExcluded(pool.filter((t) => !isAccessible(t)));
-      pool = pool.filter((t) => isAccessible(t));
-    }
-    const selected = opts.maxTasks === null ? pool : pool.slice(0, opts.maxTasks);
+    const selected = await selectTasks(opts);
     console.log(`[dry-run] would run ${selected.length} task(s) (level=${opts.level}):`);
     for (const t of selected) {
       console.log(`  L${t.level} ${t.taskId.slice(0, 8)} :: ${t.question.slice(0, 90)}`);
@@ -211,18 +246,10 @@ async function main(): Promise<void> {
     userEmail: process.env.USER_EMAIL ?? null,
   };
 
-  // Load the level first, apply the capability filter, THEN cap with
-  // --max-tasks so the cap counts accessible tasks (not ones we'd skip).
-  let pool = await loadGaiaTasks({ level: opts.level });
-  if (opts.accessibleOnly) {
-    const excluded = pool.filter((t) => !isAccessible(t));
-    pool = pool.filter((t) => isAccessible(t));
-    reportExcluded(excluded);
-  }
-  const tasks = opts.maxTasks === null ? pool : pool.slice(0, opts.maxTasks);
+  const tasks = await selectTasks(opts);
   console.log(
     `[bench] running ${tasks.length} GAIA task(s) (level=${opts.level}` +
-      `${opts.accessibleOnly ? ", accessible-only" : ""})\n`,
+      `${opts.taskIds ? ", task-ids" : opts.accessibleOnly ? ", accessible-only" : ""})\n`,
   );
 
   const results: TaskResult[] = [];
