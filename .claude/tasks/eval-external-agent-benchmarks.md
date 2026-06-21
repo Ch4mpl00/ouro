@@ -367,14 +367,47 @@ NOT fall back to llm_agent.** The regression was the DeepSeek leak, not the
 orchestration, and the leak is provider-specific + fixable. The replan
 planner change STAYS on the branch.
 
+### Result: replan + gpt-5.4-mini (2026-06-21) — leak FIXED, matches baseline
+
+Same 27, replan planner + `AGENT_SMART_MODEL=gpt-5.4-mini`, own-MCP,
+`--max-passes 10`. **7/27 (25.9%), tool-call leak 0/20** (was 15/22 on
+replan+DeepSeek, 6/18 on llm_agent+DeepSeek). Zero execute_fail.
+
+Three-way on the 27 hardest:
+
+| variant | correct | leak | note |
+|---|---|---|---|
+| llm_agent + DeepSeek | 7/27 | 6 | deeper iterative research |
+| replan + DeepSeek | 3/27 | 15 | leak explosion (tool-less compose) |
+| **replan + gpt-5.4-mini** | **7/27** | **0** | clean; better format |
+
+**Cause #2 DEFINITIVELY fixed by the model, not the orchestration** — the
+leak was DeepSeek's native tool-call markup; gpt emits none. replan jumped
+3→7 just from the swap, now matching the llm_agent baseline with zero leak.
+
+**Complementary, not strictly better:** the two 7/27 sets overlap on only 2
+tasks → **union = 12/27**. replan+gpt wins format/shallow (recovered the
+`green,white`, `Braintree, Honolulu`, `100`, `Right` near-misses);
+llm_agent+DeepSeek wins deep iterative research (`Mercedes Sosa=3`, `fluffy`,
+`diamond`, `FunkMonk`) — more search hops than bounded replan managed.
+
+**Remaining wrong are now clean + addressable:**
+- **`pred="answer"` literal (3 tasks: b816bfce, 5188369a, d0633230)** — the
+  `gaia` skill's "bind the final answer to `answer`" makes the model output
+  the literal word when it has no real answer. Skill-prompt bug, easy fix.
+- **format/framing**: `INT. THE CASTLE - DAY` vs `THE CASTLE`, `17000` vs
+  `17` (unit). → tighten gaia answer-format rules.
+- **deep-research depth**: the 5 llm_agent got that replan missed need more
+  aggressive query reformulation (or gpt-5.4 over mini).
+
 **Next steps (ordered):**
-1. **Push replan + kill the leak by model**: re-run the 27 with the replan
-   planner AND `-e AGENT_SMART_MODEL=gpt-5.4-mini` (clean tool-call model,
-   no native markup). Expectation: the 15 leaks collapse and replan beats
-   the 7/27 llm_agent baseline. This is "дожать replan", not revert it.
-2. If the decide/extract compose steps need more quality, try `gpt-5.4`
-   for smart and/or tighten the planner's replan prose further.
-3. Tighten the `gaia` skill answer-format rules (recover the ~5 near-miss).
+1. **Fix the `gaia` skill** — kill the literal-`answer` output + tighten
+   answer-format (number/list/string rules, strip framing). Cheap, likely
+   recovers ~3-5 and pushes replan past the baseline.
+2. **Push research depth**: try `AGENT_SMART_MODEL=gpt-5.4` and/or stronger
+   replan-reformulation guidance — recover the deep-research misses.
+3. Decide model policy broadly: acting/extract steps → gpt (no leak),
+   reserve DeepSeek for non-tool editorial. (Relevant to prod sub-agents.)
 4. Then PR2 taxonomy automation + Excel reader; clean full-39 own-MCP run.
 5. Text-processing toolkit → own task: [[text-processing-toolkit]].
 
