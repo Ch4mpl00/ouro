@@ -22,6 +22,7 @@ import { createSkillStore } from "../../../skills";
 import { createLocalRecorderTracer } from "../../../tracing/local-recorder";
 import { createWorkflowRunner, type WorkflowSignal } from "../../../workflow";
 import { createBenchMcpClient } from "./bench-mcp-client";
+import { isAccessible, missingCapabilities } from "./capabilities";
 import { downloadAttachment, loadGaiaTasks, type GaiaLevel, type GaiaTask } from "./dataset";
 import { questionScorer } from "./scorer";
 
@@ -38,25 +39,38 @@ loadEnv({ path: ".env.agent" });
 
 interface CliOpts {
   level: GaiaLevel | "all";
-  maxTasks: number;
+  maxTasks: number | null;
+  accessibleOnly: boolean;
+  dryRun: boolean;
 }
 
 function parseArgs(argv: string[]): CliOpts {
   let level: GaiaLevel | "all" = "all";
-  let maxTasks = 10;
+  let maxTasks: number | null = 10;
+  let accessibleOnly = false;
+  let dryRun = false;
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
-    if (arg === "--level") {
+    if (arg === "--dry-run") {
+      // Print the selected/excluded tasks and exit — no LLM calls, no cost.
+      dryRun = true;
+    } else if (arg === "--level") {
       const v = argv[++i];
       if (v === "all") level = "all";
       else if (v === "1" || v === "2" || v === "3") level = Number(v) as GaiaLevel;
       else throw new Error("--level must be 1, 2, 3, or all");
     } else if (arg === "--max-tasks") {
-      maxTasks = Number(argv[++i]);
-      if (!Number.isFinite(maxTasks) || maxTasks <= 0) throw new Error("--max-tasks must be a positive number");
+      const v = argv[++i];
+      maxTasks = v === "all" ? null : Number(v);
+      if (maxTasks !== null && (!Number.isFinite(maxTasks) || maxTasks <= 0))
+        throw new Error("--max-tasks must be a positive number or 'all'");
+    } else if (arg === "--accessible-only") {
+      // Run only tasks whose required capabilities the current toolbelt has
+      // — keeps known tool-coverage gaps out of the accuracy number.
+      accessibleOnly = true;
     }
   }
-  return { level, maxTasks };
+  return { level, maxTasks, accessibleOnly, dryRun };
 }
 
 // Outcome category — a coarse first cut at the failure taxonomy. The full
@@ -79,6 +93,21 @@ interface TaskResult {
 
 async function main(): Promise<void> {
   const opts = parseArgs(process.argv.slice(2));
+
+  // --dry-run: preview the selection (no API keys, no MCP, no cost) and exit.
+  if (opts.dryRun) {
+    let pool = await loadGaiaTasks({ level: opts.level });
+    if (opts.accessibleOnly) {
+      reportExcluded(pool.filter((t) => !isAccessible(t)));
+      pool = pool.filter((t) => isAccessible(t));
+    }
+    const selected = opts.maxTasks === null ? pool : pool.slice(0, opts.maxTasks);
+    console.log(`[dry-run] would run ${selected.length} task(s) (level=${opts.level}):`);
+    for (const t of selected) {
+      console.log(`  L${t.level} ${t.taskId.slice(0, 8)} :: ${t.question.slice(0, 90)}`);
+    }
+    return;
+  }
 
   const deepseekApiKey = process.env.DEEPSEEK_API_KEY;
   if (!deepseekApiKey) throw new Error("DEEPSEEK_API_KEY is not set in .env.agent");
@@ -167,8 +196,19 @@ async function main(): Promise<void> {
     userEmail: process.env.USER_EMAIL ?? null,
   };
 
-  const tasks = await loadGaiaTasks({ level: opts.level, maxTasks: opts.maxTasks });
-  console.log(`[bench] running ${tasks.length} GAIA task(s) (level=${opts.level})\n`);
+  // Load the level first, apply the capability filter, THEN cap with
+  // --max-tasks so the cap counts accessible tasks (not ones we'd skip).
+  let pool = await loadGaiaTasks({ level: opts.level });
+  if (opts.accessibleOnly) {
+    const excluded = pool.filter((t) => !isAccessible(t));
+    pool = pool.filter((t) => isAccessible(t));
+    reportExcluded(excluded);
+  }
+  const tasks = opts.maxTasks === null ? pool : pool.slice(0, opts.maxTasks);
+  console.log(
+    `[bench] running ${tasks.length} GAIA task(s) (level=${opts.level}` +
+      `${opts.accessibleOnly ? ", accessible-only" : ""})\n`,
+  );
 
   const results: TaskResult[] = [];
   for (const [i, task] of tasks.entries()) {
@@ -247,6 +287,19 @@ async function runOne(
   } finally {
     trace.end();
   }
+}
+
+function reportExcluded(excluded: GaiaTask[]): void {
+  if (excluded.length === 0) return;
+  const byCap = new Map<string, number>();
+  for (const t of excluded) {
+    for (const cap of missingCapabilities(t)) byCap.set(cap, (byCap.get(cap) ?? 0) + 1);
+  }
+  console.log(`[bench] excluded ${excluded.length} task(s) as tool-coverage gaps:`);
+  for (const [cap, n] of [...byCap.entries()].sort((a, b) => b[1] - a[1])) {
+    console.log(`    needs ${cap}: ${n}`);
+  }
+  console.log("");
 }
 
 function printReport(results: TaskResult[], suppressedCalls: number): void {
