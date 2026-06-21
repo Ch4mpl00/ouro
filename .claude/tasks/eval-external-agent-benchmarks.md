@@ -306,14 +306,48 @@ code_agent (no sandbox network) — exhausted budget.
 **Takeaway:** 30.8% is pessimistic — at least the name-mismatch slice is a
 harness artifact, not agent capability. So:
 
+### Own-MCP re-run of the 27 failures (2026-06-21, on the droplet)
+
+Ran the 27 Tavily-direct failures on the **droplet's own-MCP** (dedicated
+`bench-mcp` container, `MCP_NO_POLLERS=1`, gateway → prefixed `tavily__*`
++ read_pdf/read_file; prod mcp is single-connection so a separate instance
+was needed). `--task-ids`, Langfuse + local tracing.
+
+**7/27 recovered (25.9%)** — clean split:
+- **7 fixed by correct tool names** (`3`, `fluffy`, `Guatemala`, `diamond`,
+  `FunkMonk`, `Louvrier`). **Cause #1 confirmed & closed** — those were
+  the prefixed/unprefixed artifact.
+- **6/18 still tool-call leak**, in MULTIPLE model formats:
+  `<｜｜DSML｜｜tool_calls>` (DeepSeek), `<function_calls><invoke>`
+  (Anthropic-style), `<tool_call>`, `<search>`. **Cause #2 confirmed
+  path-independent** — a real tool-calling integration bug in the
+  `llm_agent`/compose sub-agent path.
+- **~5 format / near-miss** — answer essentially right, format wrong:
+  `green-white` vs `green, white`, `INT. THE CASTLE - DAY` vs `THE CASTLE`,
+  `answer = right` vs `Right`, `0 or 100` vs `100`. → tighten the `gaia`
+  skill's answer-format rules.
+- ~7 genuine reasoning/retrieval wrong.
+
+**Extrapolated own-MCP full-L1:** 12 (Tavily-direct passes) + 7 recovered
+≈ **19/39 ≈ 49%** (the 12 weren't re-run; assumes they hold).
+
+### Decided (2026-06-21): planner prefers `replan` over `llm_agent`
+
+Cause #2 lives in the `llm_agent` ReAct sub-session (runs on DeepSeek-smart;
+leaks native tool-call markup as text). The compiler is cheap + mostly
+cached, so a few extra replan passes beat one ReAct loop. Reframed
+`planner.md` (LAST RESORT for `llm_agent`; iterative research = a `replan`
+chain) + added `bench --max-passes`. **On branch `feat/gaia-harness` only;
+prod (main) untouched until the A/B proves out.**
+
 **Next steps (ordered):**
-1. **Re-run on the own-MCP/gateway path** (prefixed names match; adds
-   read_pdf/read_file). Local PG+TAVILY via docker, or run on the droplet.
-   This removes cause #1 and gives a clean tool-gap-vs-reasoning number.
-2. **Investigate the DeepSeek tool-call leak** (cause #2) — reproduce,
-   confirm whether it also bites prod sub-agents; likely a provider
-   tool-call-parsing fix. Spin a separate task if confirmed.
-3. Then PR2 taxonomy automation + Excel reader.
+1. **A/B the replan-variant** on the same 27 (own-MCP, `--max-passes ~10`)
+   vs this 7/27 baseline — does avoiding `llm_agent` recover the 6 leak
+   failures?
+2. Tighten the `gaia` skill answer-format rules (recover the ~5 near-miss).
+3. If the leak persists even without `llm_agent` (i.e. it's the compose
+   step too), spin a dedicated task on the tool-call-parsing fix.
+4. Then PR2 taxonomy automation + Excel reader; clean full-39 own-MCP run.
 
 ## Notes
 
