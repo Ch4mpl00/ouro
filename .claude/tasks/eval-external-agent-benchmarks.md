@@ -266,9 +266,54 @@ Dataset note: the repo migrated metadata to **parquet** (no more
 `metadata.jsonl`); loader now reads via the datasets-server `/rows` API
 (config `2023_all`, 165 validation rows), cached to `${split}.rows.json`.
 
-**Next (still PR1/PR2):** run the full L1 set behind the *own-MCP* toolbelt
-(read_pdf/read_file + a network-enabled code path) to separate tool-gap
-from reasoning failures cleanly, then the PR2 taxonomy + Excel reader.
+### Full accessible-L1 run (2026-06-21) — 39 tasks, Tavily-direct
+
+`pnpm bench:gaia --level 1 --max-tasks all --accessible-only` (capability
+filter excluded 14: file_read 4, video 3, excel 3, vision 2, audio 2).
+
+**Raw: L1 12/39 correct (30.8%)** — but the failure split is the real
+story:
+
+| bucket | n | nature |
+|---|---|---|
+| correct | 12 | — |
+| **tool-call syntax leaked into the answer** | **15** | loop/integration, NOT reasoning |
+| genuine wrong | 8 | reasoning/retrieval/format |
+| execute_fail | 4 | burned iterations on failing tools |
+
+**Dominant failure = tool-call text-leak (15/39).** The model "calls" a
+tool as plain text — `<search>…</search>`, `<｜｜DSML｜｜tool_calls>`,
+`<tool_calls>`, `<use_tool>`, `<menu_mcp>`, `<read1>` — and that text gets
+bound as `${answer}`. Two compounding causes:
+1. **Tool-name mismatch (artifact of the Tavily-direct shortcut).** The
+   `gaia` skill frontmatter + planner expect the gateway-prefixed
+   `tavily__tavily_search`, but Tavily-direct exposes the **unprefixed**
+   `tavily_search`. The sub-agent calls the prefixed name → `[tool error]
+   Unknown tool` → it falls back to inventing `<search>` plaintext or
+   wastes its iteration budget. **This specific cause disappears on the
+   own-MCP/gateway path** (names match).
+2. **DeepSeek tool-call serialization leak (real, path-independent).** The
+   `<｜｜DSML｜｜tool_calls>` blobs are DeepSeek's native markup leaking as
+   content instead of being parsed as structured `tool_calls` (smart/
+   sub-agent preset = `deepseek-v4-pro`). Worth its own investigation —
+   prod sub-agents use the same path.
+
+Genuine-wrong sample: `17000` vs `17` (answered hours, not thousand-hours),
+`12000` vs `16000`, literal `answer` vs `Right`, `EGY` vs `CUB`.
+execute_fail: agent looped calling the unknown prefixed tool, then
+code_agent (no sandbox network) — exhausted budget.
+
+**Takeaway:** 30.8% is pessimistic — at least the name-mismatch slice is a
+harness artifact, not agent capability. So:
+
+**Next steps (ordered):**
+1. **Re-run on the own-MCP/gateway path** (prefixed names match; adds
+   read_pdf/read_file). Local PG+TAVILY via docker, or run on the droplet.
+   This removes cause #1 and gives a clean tool-gap-vs-reasoning number.
+2. **Investigate the DeepSeek tool-call leak** (cause #2) — reproduce,
+   confirm whether it also bites prod sub-agents; likely a provider
+   tool-call-parsing fix. Spin a separate task if confirmed.
+3. Then PR2 taxonomy automation + Excel reader.
 
 ## Notes
 
