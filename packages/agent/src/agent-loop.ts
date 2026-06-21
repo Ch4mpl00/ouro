@@ -216,6 +216,7 @@ export function createAgentLoop(engine: Engine, opts: AgentLoopOpts): AgentLoop 
     log: (...parts) => engine.log(id, ...parts),
     skillStore: engine.skillStore,
     memory: engine.memory,
+    codex: engine.codex,
     startAgentLoop: (o) => engine.startAgentLoop(o),
     endAgentLoop: (loopId) => engine.endAgentLoop(loopId),
     // `__sub` (double underscore) keeps the id ASCII-only and unique

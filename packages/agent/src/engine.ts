@@ -2,6 +2,7 @@ import type { McpHandle } from "./mcp-client";
 import type { ModelPreset, PresetName } from "./models";
 import type { ChatProvider } from "./providers";
 import { createAgentLoop, type AgentLoop, type AgentLoopOpts } from "./agent-loop";
+import type { CodexClient } from "./codex-client";
 import type { MemoryStore } from "./db/memory";
 import type { SkillStore } from "./skills";
 import type { Tracer } from "./tracing";
@@ -36,6 +37,10 @@ export interface Engine {
   readonly tracer: Tracer;
   readonly skillStore: SkillStore;
   readonly memory: MemoryStore;
+  // Sandboxed code-execution backend (Codex). Shared so both the AgentLoop
+  // (via the `code_agent` synthetic tool) and the workflow executor reach the
+  // same connection.
+  readonly codex: CodexClient;
   // Pick the provider wrapper based on the model name. The model name is
   // the source of truth — a loop resolves a preset name to a concrete
   // model at construction time; this method only routes that model to
@@ -69,10 +74,11 @@ export interface EngineDeps {
   skillStore: SkillStore;
   memory: MemoryStore;
   tracer: Tracer;
+  codex: CodexClient;
 }
 
 export function createEngine(deps: EngineDeps): Engine {
-  const { providers, mcp, presets, skillStore, memory, tracer } = deps;
+  const { providers, mcp, presets, skillStore, memory, tracer, codex } = deps;
   const engineSkills: readonly string[] = deps.skills ?? [];
   const agentLoops = new Map<string, AgentLoop>();
 
@@ -87,6 +93,7 @@ export function createEngine(deps: EngineDeps): Engine {
     tracer,
     skillStore,
     memory,
+    codex,
     log,
 
     resolveProvider(model) {

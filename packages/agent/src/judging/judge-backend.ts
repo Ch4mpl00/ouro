@@ -1,5 +1,5 @@
 import OpenAI from "openai";
-import { createCodexClient, type CodexClient } from "./codex-client";
+import { createCodexClient, type CodexClient } from "../codex-client";
 import { JUDGE_MODEL } from "./schema";
 
 // A judge backend runs ONE structured-output completion: a system instruction

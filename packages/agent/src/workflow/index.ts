@@ -1,6 +1,8 @@
 import type { ChatCompletionTool } from "openai/resources/chat/completions";
 import type { EnvData } from "../session-context";
 import { SET_MEMORY_TOOL } from "../synthetic-tools";
+import { CODE_AGENT_TOOL } from "../code-agent";
+import type { CodexClient } from "../codex-client";
 import type { TraceContext } from "../tracing";
 import {
   createCompiler,
@@ -89,6 +91,9 @@ export interface WorkflowRunnerDeps {
   // `set_memory` tool steps (watermark writes). Injected by the
   // composition root, same instance the AgentLoop path uses.
   setMemory: (key: string, value: string) => void;
+  // Sandboxed code-execution backend (Codex) for `code_agent` tool steps.
+  // Same instance the AgentLoop path uses; optional for eval/test runners.
+  codex?: CodexClient;
   // Compiler retry budget (initial attempt + retries). Default 3.
   maxAttempts?: number;
   // Total planning passes per signal: the initial plan plus replans.
@@ -101,10 +106,11 @@ export function createWorkflowRunner(deps: WorkflowRunnerDeps): WorkflowRunner {
     engine: deps.engine,
     readSkill: deps.readSkill,
     readPatch: deps.readPatch,
-    // set_memory is a synthetic agent-side tool with no MCP counterpart;
-    // surface it to the compiler too so it appears in the schema enum and
-    // the prompt's tool signatures (the executor dispatches it directly).
-    mcpTools: [...deps.mcpTools, SET_MEMORY_TOOL],
+    // set_memory and code_agent are synthetic agent-side tools with no MCP
+    // counterpart; surface them to the compiler too so they appear in the
+    // schema enum and the prompt's tool signatures (the executor dispatches
+    // them directly).
+    mcpTools: [...deps.mcpTools, SET_MEMORY_TOOL, CODE_AGENT_TOOL],
     knownSkills: deps.knownSkills,
     maxAttempts: deps.maxAttempts,
   });
@@ -113,6 +119,7 @@ export function createWorkflowRunner(deps: WorkflowRunnerDeps): WorkflowRunner {
     readSkill: deps.readSkill,
     readPatch: deps.readPatch,
     setMemory: deps.setMemory,
+    codex: deps.codex,
   });
 
   const maxPasses = deps.maxPasses ?? 3;

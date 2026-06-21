@@ -59,11 +59,13 @@ services:
     environment:
       MCP_TRANSPORT: http
       MCP_URL: http://mcp:3000/mcp
+      CODEX_URL: http://codex:3010      # code_agent tool delegates to the codex sandbox
     volumes:
       - agent-data:/app/packages/agent/data    # agent.db (bills, memory)
       - agent-skills:/app/skills               # live skills overlay (dreaming writes here)
     depends_on:
       - mcp
+      - codex
     restart: unless-stopped
 
   codex:
