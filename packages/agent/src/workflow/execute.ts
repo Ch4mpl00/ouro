@@ -3,12 +3,13 @@ import type { ModelPreset, PresetName } from "../models";
 import type { ChatProvider } from "../providers";
 import type { AgentLoopOpts } from "../agent-loop";
 import { SET_MEMORY_TOOL_NAME, SetMemoryArgsSchema } from "../synthetic-tools";
-import { CODE_AGENT_TOOL_NAME, CodeAgentArgsSchema, runCodeAgent } from "../code-agent";
+import { runCodeAgent } from "../code-agent";
 import type { CodexClient } from "../codex-client";
 import { JUDGE_NODE_META } from "../trace-model";
 import { appendPatch } from "../skills";
 import type { Span, SpanKind, TraceContext } from "../tracing";
 import type {
+  CodeAgentStep,
   LlmAgentStep,
   LlmComposeStep,
   ParallelStep,
@@ -240,14 +241,20 @@ function spanOutput(result: DispatchResult): unknown {
   return { ok: true };
 }
 
-// Trace observation kind per step kind, so each renders with the right
-// badge in the UI: a tool step IS a tool call; an llm_agent step spawns a
+// Trace observation kind per step, so each renders with the right badge in
+// the UI: a tool step IS a tool call; an llm_agent step spawns a sub-agent;
+// llm_compose / parallel are multi-part links in the chain. `code_agent` is a
+// `tool` step structurally, but it delegates to a sandboxed code agent (Codex
+// writes + runs code), so badge it as an agent like llm_agent / invoke_sub_agent.
+// Trace observation kind per step kind, so each renders with the right badge
+// in the UI: a tool step IS a tool call; llm_agent / code_agent spawn a
 // sub-agent; llm_compose / parallel are multi-part links in the chain.
 function stepSpanKind(kind: Step["kind"]): SpanKind {
   switch (kind) {
     case "tool":
       return "tool";
     case "llm_agent":
+    case "code_agent":
       return "agent";
     case "llm_compose":
     case "parallel":
@@ -276,6 +283,8 @@ function stepMetadata(step: Step): Record<string, unknown> {
         tool_count: step.tools.length,
         max_iterations: step.maxIterations,
       };
+    case "code_agent":
+      return { bind: step.bind, has_data: step.data !== undefined };
     case "parallel":
       return { child_count: step.steps.length };
     case "terminal":
@@ -308,6 +317,8 @@ async function dispatch(
       return { stop: false, output: await execLlmCompose(step, store, span, deps) };
     case "llm_agent":
       return { stop: false, output: await execLlmAgent(step, store, span, ctx, deps) };
+    case "code_agent":
+      return { stop: false, output: await execCodeAgent(step, store, span, deps) };
     case "parallel":
       await execParallel(step, store, span, ctx, deps);
       return { stop: false };
@@ -377,14 +388,6 @@ async function execTool(
     return out;
   }
 
-  // code_agent is also a synthetic agent-side tool (delegates to the Codex
-  // sandbox) with no MCP counterpart — dispatch it in-process.
-  if (step.tool === CODE_AGENT_TOOL_NAME) {
-    const out = await execCodeAgent(resolvedArgs, deps);
-    if (step.bind) store.set(step.bind, out);
-    return out;
-  }
-
   let raw: string;
   try {
     raw = await deps.engine.mcp.callTool(step.tool, resolvedArgs);
@@ -439,29 +442,26 @@ function execSetMemory(
   return { ok: true, key: parsed.data.key };
 }
 
-// code_agent — delegate computation/code to the Codex sandbox. Same
-// CodeAgentArgsSchema validation as the synthetic-tools registry; a missing
-// codex dep or a Codex failure surfaces as a ToolCallError so the executor
-// classifies it as tool_error (→ the supervisor's fallback path).
+// ─── code_agent ──────────────────────────────────────────────────────
+
+// Delegate a computational/coding task to the Codex sandbox (it writes + runs
+// code, returns the result). A sub-agent delegation like llm_agent — a Codex
+// failure (or a missing backend) propagates and classifies as step_failed,
+// routing to the supervisor's fallback path.
 async function execCodeAgent(
-  args: Record<string, unknown>,
+  step: CodeAgentStep,
+  store: VariableStore,
+  span: Span,
   deps: ExecutorDeps,
 ): Promise<string> {
-  if (!deps.codex) {
-    throw new ToolCallError(CODE_AGENT_TOOL_NAME, "codex backend not configured");
-  }
-  const parsed = CodeAgentArgsSchema.safeParse(args);
-  if (!parsed.success) {
-    const detail = parsed.error.issues
-      .map((i) => `${i.path.join(".") || "args"}: ${i.message}`)
-      .join("; ");
-    throw new ToolCallError(CODE_AGENT_TOOL_NAME, detail);
-  }
-  try {
-    return await runCodeAgent(deps.codex, parsed.data);
-  } catch (err) {
-    throw new ToolCallError(CODE_AGENT_TOOL_NAME, (err as Error).message);
-  }
+  if (!deps.codex) throw new Error("code_agent: codex backend not configured");
+  const task = substituteText(step.task, store);
+  const data = step.data !== undefined ? substituteText(step.data, store) : undefined;
+  span.update({ input: { task, has_data: data !== undefined } });
+
+  const result = await runCodeAgent(deps.codex, { task, data });
+  store.set(step.bind, result);
+  return result;
 }
 
 // ─── llm_compose ─────────────────────────────────────────────────────

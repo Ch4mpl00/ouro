@@ -429,13 +429,13 @@ describe("executor.execute — set_memory step (agent-side builtin)", () => {
   });
 });
 
-describe("executor.execute — code_agent step (agent-side builtin)", () => {
-  it("dispatches to the injected codex backend, not MCP, and binds the result", async () => {
+describe("executor.execute — code_agent step (Codex delegation)", () => {
+  it("substitutes task/data, delegates to codex (not MCP), and binds the trimmed result", async () => {
     const engine = makeMockEngine();
-    const runs: unknown[] = [];
+    const runs: Array<{ prompt: string; input?: unknown }> = [];
     const codex: CodexClient = {
       run: async (req) => {
-        runs.push(req);
+        runs.push({ prompt: req.prompt, input: req.input });
         return { ok: true, content: "  42\n", stderr: "" };
       },
     };
@@ -452,12 +452,7 @@ describe("executor.execute — code_agent step (agent-side builtin)", () => {
       {
         version: 1,
         steps: [
-          {
-            kind: "tool",
-            tool: "code_agent",
-            args: { task: "sum b", data: "${csv}" },
-            bind: "n",
-          },
+          { kind: "code_agent", task: "sum column b", data: "${csv}", bind: "n" },
           { kind: "terminal" },
         ],
       },
@@ -466,12 +461,13 @@ describe("executor.execute — code_agent step (agent-side builtin)", () => {
 
     expect(r.ok).toBe(true);
     expect(runs).toHaveLength(1);
-    // trimmed result bound; never forwarded to MCP
-    expect(ctx.store.get("n")).toBe("42");
-    expect(engine.toolCalls).toEqual([]);
+    expect(runs[0]!.prompt).toContain("sum column b");
+    expect(runs[0]!.input).toBe("a,b\n1,2"); // data substituted from the store
+    expect(ctx.store.get("n")).toBe("42"); // trimmed result bound
+    expect(engine.toolCalls).toEqual([]); // never forwarded to MCP
   });
 
-  it("fails as tool_error when no codex backend is configured", async () => {
+  it("fails as step_failed when no codex backend is configured", async () => {
     const engine = makeMockEngine();
     const executor = createExecutor({ engine, readSkill: nullReadSkill(), setMemory: () => {} });
 
@@ -479,7 +475,7 @@ describe("executor.execute — code_agent step (agent-side builtin)", () => {
       {
         version: 1,
         steps: [
-          { kind: "tool", tool: "code_agent", args: { task: "2+2" }, bind: "x" },
+          { kind: "code_agent", task: "2+2", bind: "x" },
           { kind: "terminal" },
         ],
       },
@@ -487,10 +483,10 @@ describe("executor.execute — code_agent step (agent-side builtin)", () => {
     );
 
     expect(r.ok).toBe(false);
-    if (!r.ok) expect(r.reason).toBe("tool_error");
+    if (!r.ok) expect(r.reason).toBe("step_failed");
   });
 
-  it("surfaces a codex failure as tool_error", async () => {
+  it("surfaces a codex failure as step_failed", async () => {
     const engine = makeMockEngine();
     const codex: CodexClient = {
       run: async () => {
@@ -503,7 +499,7 @@ describe("executor.execute — code_agent step (agent-side builtin)", () => {
       {
         version: 1,
         steps: [
-          { kind: "tool", tool: "code_agent", args: { task: "2+2" }, bind: "x" },
+          { kind: "code_agent", task: "2+2", bind: "x" },
           { kind: "terminal" },
         ],
       },
@@ -511,7 +507,7 @@ describe("executor.execute — code_agent step (agent-side builtin)", () => {
     );
 
     expect(r.ok).toBe(false);
-    if (!r.ok) expect(r.reason).toBe("tool_error");
+    if (!r.ok) expect(r.reason).toBe("step_failed");
   });
 });
 

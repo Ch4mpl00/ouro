@@ -4,12 +4,14 @@ import { PRESET_NAMES } from "../models";
 
 // Workflow DSL — the language the compiler LLM emits and the executor runs.
 //
-// Six step kinds, no control flow primitives beyond `parallel`:
+// Seven step kinds, no control flow primitives beyond `parallel`:
 //
 //   tool         — runtime → MCP tool with literal args, result bound
 //   llm_compose  — LLM with no tools, structured output, result bound
 //   llm_agent    — LLM with a bounded tool whitelist + maxIterations,
 //                  internal ReAct loop, final text bound
+//   code_agent   — delegate a computational/coding task to the Codex sandbox
+//                  (writes + runs code), result bound
 //   parallel     — flat list of independent leaf steps, run concurrently
 //   terminal     — explicit end of workflow
 //   replan       — terminator that bounces back to the compiler with the
@@ -109,6 +111,20 @@ export function createWorkflowSchema(deps: WorkflowSchemaDeps): WorkflowSchemaBu
     })
     .strict();
 
+  // `code_agent` delegates a computational/coding task to the sandboxed Codex
+  // agent (writes + runs code, returns the result). A distinct kind — not a
+  // `tool` step — because it spawns a sub-agent like `llm_agent`, so it badges
+  // as an agent in traces and takes a natural-language `task` rather than typed
+  // tool args. `data` is optional stdin for the program.
+  const CodeAgentStepSchema = z
+    .object({
+      kind: z.literal("code_agent"),
+      task: z.string().min(1),
+      data: z.string().optional(),
+      bind: z.string().min(1),
+    })
+    .strict();
+
   const TerminalStepSchema = z
     .object({
       kind: z.literal("terminal"),
@@ -142,6 +158,7 @@ export function createWorkflowSchema(deps: WorkflowSchemaDeps): WorkflowSchemaBu
     ToolStepSchema,
     LlmComposeStepSchema,
     LlmAgentStepSchema,
+    CodeAgentStepSchema,
   ]);
 
   const ParallelStepSchema = z
@@ -155,6 +172,7 @@ export function createWorkflowSchema(deps: WorkflowSchemaDeps): WorkflowSchemaBu
     ToolStepSchema,
     LlmComposeStepSchema,
     LlmAgentStepSchema,
+    CodeAgentStepSchema,
     TerminalStepSchema,
     ParallelStepSchema,
     ReplanStepSchema,
@@ -212,6 +230,13 @@ export interface LlmAgentStep {
   bind: string;
 }
 
+export interface CodeAgentStep {
+  kind: "code_agent";
+  task: string;
+  data?: string;
+  bind: string;
+}
+
 export interface ParallelStep {
   kind: "parallel";
   steps: LeafStep[];
@@ -227,7 +252,7 @@ export interface ReplanStep {
   note?: string;
 }
 
-export type LeafStep = ToolStep | LlmComposeStep | LlmAgentStep;
+export type LeafStep = ToolStep | LlmComposeStep | LlmAgentStep | CodeAgentStep;
 export type Step = LeafStep | TerminalStep | ParallelStep | ReplanStep;
 
 export interface Workflow {
