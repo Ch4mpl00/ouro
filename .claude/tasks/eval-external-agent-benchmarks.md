@@ -360,19 +360,23 @@ the harmless `--max-passes` flag).
 
 **The real fix for cause #2 is the MODEL, not the orchestration.** The leak
 is provider-specific (DeepSeek's native markup). Isolated test needs NO
-prompt change — the bench honors `AGENT_SMART_MODEL`:
+prompt change — the bench honors `AGENT_SMART_MODEL`.
+
+**Decision (2026-06-21): KEEP the replan direction and push it to work — do
+NOT fall back to llm_agent.** The regression was the DeepSeek leak, not the
+orchestration, and the leak is provider-specific + fixable. The replan
+planner change STAYS on the branch.
 
 **Next steps (ordered):**
-1. **Revert the planner replan-change** (measured worse). Keep `--max-passes`.
-2. **A/B the model**: llm_agent baseline + `-e AGENT_SMART_MODEL=gpt-5.4-mini`
-   on the 27 — does the leak vanish + accuracy beat 7/27? If yes, cause #2 =
-   run the acting sub-agent on a clean-tool-call model, not DeepSeek.
+1. **Push replan + kill the leak by model**: re-run the 27 with the replan
+   planner AND `-e AGENT_SMART_MODEL=gpt-5.4-mini` (clean tool-call model,
+   no native markup). Expectation: the 15 leaks collapse and replan beats
+   the 7/27 llm_agent baseline. This is "дожать replan", not revert it.
+2. If the decide/extract compose steps need more quality, try `gpt-5.4`
+   for smart and/or tighten the planner's replan prose further.
 3. Tighten the `gaia` skill answer-format rules (recover the ~5 near-miss).
 4. Then PR2 taxonomy automation + Excel reader; clean full-39 own-MCP run.
-5. (Parked design task) text-processing toolkit: by-handle agent-side tools
-   (`text_stats`/`keyword_search`/`vector_search`/`read_span`) over the
-   VariableStore + planner strategy-selection via classify→replan. Separate
-   task to be written.
+5. Text-processing toolkit → own task: [[text-processing-toolkit]].
 
 ## Notes
 
