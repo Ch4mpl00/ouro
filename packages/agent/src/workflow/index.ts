@@ -1,7 +1,6 @@
 import type { ChatCompletionTool } from "openai/resources/chat/completions";
 import type { EnvData } from "../session-context";
 import { SET_MEMORY_TOOL } from "../synthetic-tools";
-import { CODE_AGENT_TOOL } from "../code-agent";
 import type { CodexClient } from "../codex-client";
 import type { TraceContext } from "../tracing";
 import {
@@ -106,11 +105,11 @@ export function createWorkflowRunner(deps: WorkflowRunnerDeps): WorkflowRunner {
     engine: deps.engine,
     readSkill: deps.readSkill,
     readPatch: deps.readPatch,
-    // set_memory and code_agent are synthetic agent-side tools with no MCP
-    // counterpart; surface them to the compiler too so they appear in the
-    // schema enum and the prompt's tool signatures (the executor dispatches
-    // them directly).
-    mcpTools: [...deps.mcpTools, SET_MEMORY_TOOL, CODE_AGENT_TOOL],
+    // set_memory is a synthetic agent-side tool with no MCP counterpart;
+    // surface it to the compiler too so it appears in the schema enum and
+    // the prompt's tool signatures (the executor dispatches it directly).
+    // (code_agent is a first-class step kind, not a tool — see dsl.ts.)
+    mcpTools: [...deps.mcpTools, SET_MEMORY_TOOL],
     knownSkills: deps.knownSkills,
     maxAttempts: deps.maxAttempts,
   });

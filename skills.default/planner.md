@@ -16,11 +16,11 @@ principles and hard constraints, not recipes to copy.
 
 **The tool list is your full capability surface — and it grows.** It already
 includes web search and page extraction (`tavily__tavily_search`,
-`tavily__tavily_extract`), a sandboxed code/computation agent (`code_agent`),
-the news store, scheduler, notes, Telegram, Gmail, Monobank. Scan ALL of it
-on every signal and match the signal to whatever fits; never assume the
-handful of tools named in the shapes below is everything you have, and never
-answer from your own memory when a tool can fetch the real thing.
+`tavily__tavily_extract`), the news store, scheduler, notes, Telegram, Gmail,
+Monobank — plus the `code_agent` step kind for computation. Scan ALL of it on
+every signal and match the signal to whatever fits; never assume the handful
+of tools named in the shapes below is everything you have, and never answer
+from your own memory when a tool can fetch the real thing.
 
 **Always emit a real workflow.** Dumping the whole signal into a catch-all
 agent is a failure, not a fallback. The runtime has a separate safety net
@@ -39,13 +39,17 @@ Every workflow is `{ "version": 1, "steps": [...] }`. Step kinds:
 { "kind": "llm_agent", "preset": "base"|"smart", "skill": "<name>",
   "prompt": "<text>", "tools": ["<name>", ...], "maxIterations": <1-20>,
   "bind": "<name>" }
+{ "kind": "code_agent", "task": "<text>", "data"?: "<text>", "bind": "<name>" }
 { "kind": "parallel", "steps": [ ...leaf steps, each with its own bind... ] }
 { "kind": "replan", "context": ["<bind>", ...], "note"?: "<text>" }
 { "kind": "terminal" }
 ```
 
-- `parallel` holds only work steps (`tool` / `llm_compose` / `llm_agent`) —
-  it cannot nest another `parallel`, `terminal`, or `replan`.
+- `parallel` holds only work steps (`tool` / `llm_compose` / `llm_agent` /
+  `code_agent`) — it cannot nest another `parallel`, `terminal`, or `replan`.
+- `code_agent` runs a sandboxed coding sub-agent (Codex) that writes + runs
+  code and returns the result — see the compute rule below. `task` is the
+  natural-language job; `data` is optional input handed to the program.
 - `llm_compose` needs `skill` OR `prompt` (or both).
 - `bind` names are unique across the whole workflow.
 - `tool` / `skill` / `tools[]` must be names from the lists you receive.
@@ -95,16 +99,16 @@ a reminder. (A generic news sweep — «какие новости / что но�
 происходит / новости за сегодня» with NO named subject — is NOT a search:
 that's the news-digest map-reduce shape below.)
 
-**Compute with `code_agent`, never do math in an `llm_compose`.** Anything
-that must be CALCULATED — exact arithmetic, counting, date/time math,
+**Compute with a `code_agent` step, never do math in an `llm_compose`.**
+Anything that must be CALCULATED — exact arithmetic, counting, date/time math,
 statistics, parsing or aggregating CSV / Excel / JSON, data and string
-transforms, regex extraction, unit conversions — goes to a `code_agent` tool
-step: it writes AND runs code in a sandbox (Python with pandas/openpyxl, or
-Node) and returns the result. A model writing a number from its head is
-unreliable. Pass the input data in the step's `args.data` (it reaches the
-program on stdin); state precisely what the output should be ("return only
-the number"). Then compose the user-facing wording around its result. Use it
-ONLY for computation/code — not web access, not reasoning, not prose.
+transforms, regex extraction, unit conversions — goes to a `code_agent` step:
+it writes AND runs code in a sandbox (Python with pandas/openpyxl, or Node)
+and returns the result. A model writing a number from its head is unreliable.
+Put input data in the step's `data` field (it reaches the program on stdin);
+state precisely what the output should be ("return only the number"). Then
+compose the user-facing wording around its `${bind}` result. Use it ONLY for
+computation/code — not web access, not reasoning, not prose.
 
 **Personal facts are a separate store — `find_notes`, not `search_news`.**
 Things the user told you to remember live in the knowledge base, not the
