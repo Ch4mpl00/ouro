@@ -164,6 +164,112 @@ direction.
   taxonomy is the real deliverable — the absolute score is secondary
   (see reward-hacking note below).
 
+## Progress / locked PR1 plan (2026-06-21)
+
+**Toolbelt reconciliation — Phase A is ~90% already shipped** (the table
+in Tier 1 predates these commits):
+
+| Capability | Now | Closed by |
+|---|---|---|
+| web search (API) | ✅ | `tavily__tavily_search` via gateway |
+| web fetch (HTML→md) | ✅ | `tavily__tavily_extract` + `fetch_article` takes any URL (`z.string().url()`, `external` branch) |
+| code execution | ✅ | `code_agent` DSL step kind (Codex sandbox) |
+| read PDF / file | ✅ | `read_pdf`, `read_file` |
+| read Excel/CSV | ❌ | **PR2** — only real Phase A gap left |
+| vision / audio | ❌ | Phase B |
+
+So PR1 is **harness only, no new tools**. The DI seam is `McpHandle`
+(`{ tools, callTool, close }`) → `createEngine({ mcp })` →
+`createWorkflowRunner({ engine })`. Swap `McpHandle` for `BenchMCPClient`
+and the prod plan→act→replan loop runs unchanged.
+
+**Decisions locked** (with the user, 2026-06-21): (1) first slice is a
+**thin vertical slice** — L1 only, ~10–20 tasks, no Excel/vision;
+(2) dataset = **HF `gaia-benchmark/GAIA` validation split** (gated, needs
+`HF_TOKEN` in env; validation has answers, ~165 tasks across L1–3).
+
+**GAIA facts pinned down (don't re-research):**
+- Row schema: `task_id`, `Question`, `Level` (1/2/3), `Final answer`,
+  `file_name`, `file_path`, `Annotator Metadata`.
+- Scorer (port faithfully from the official logic, mirrored in
+  camel-ai `camel/benchmarks/gaia.py`): `question_scorer` routes by GT
+  type — float (`normalize_number_str`: strip `$ % ,` → float, `inf` on
+  fail), comma/semicolon list (`split_string` → element-wise, numeric or
+  string per element), else `normalize_str` (lowercase + strip all
+  whitespace; `remove_punct` strips punctuation via `str.translate`).
+  Quasi-exact-match.
+
+**Three design cruxes (the harness IS these):**
+1. **Answer extraction.** `runForSignal` returns a `VariableStore`, not a
+   string. Convention: a `gaia` skill whose terminal `llm_compose` step
+   writes `${answer}` in GAIA's normalized format; harness reads
+   `store.get("answer")`.
+2. **Scorer.** TS port of the official `question_scorer` above.
+3. **File attachments.** Download `file_path` for the task, pass the
+   local path to the agent via `envContext` (same channel prod uses for
+   the Telegram chat id).
+
+**PR1 file plan** (`packages/agent/src/eval/benchmarks/gaia/`):
+- `dataset.ts` — pull validation split via HF datasets API (`HF_TOKEN`),
+  cache to `eval/fixtures/gaia/`, filter by `--level`.
+- `bench-mcp-client.ts` — `McpHandle` impl: proxy read-only tools
+  (tavily search/extract, fetch_article, read_pdf, read_file, code_agent)
+  to a real `connectMcp()`; side-effect tools (telegram/schedule/memory)
+  → record + no-op.
+- `scorer.ts` — TS port of `question_scorer` + helpers.
+- `run.ts` — for each task: build `WorkflowSignal {source:"gaia",
+  content: Question, envContext: file path}` → `runForSignal` →
+  `store.get("answer")` → score → results table.
+- `skills.default/gaia.md` — terminal step writes `${answer}`.
+- root script `bench:gaia` → `pnpm bench:gaia --level 1 --max-tasks N`.
+- *Exit criterion: one green end-to-end run on 10–20 L1 tasks.*
+
+**Prereq to RUN PR1:** `HUGGING_FACE_KEY` (in `.env.agent`) **whose HF
+account is on the GAIA authorized list** — the dataset is gated by
+manual approval, not just by token. A valid token alone 403s
+("not in the authorized list"); request access at
+https://huggingface.co/datasets/gaia-benchmark/GAIA and wait for grant.
+
+**PR1 status (2026-06-21): code complete on branch `feat/gaia-harness`,
+typechecks, scorer unit-tested (10/10). Blocked on the HF access grant
+above for the first live run.** Shipped:
+- `packages/agent/src/eval/benchmarks/gaia/{scorer,scorer.test,dataset,
+  bench-mcp-client,run}.ts`
+- `skills.default/gaia.md` (terminal step binds `${answer}`)
+- `pnpm bench:gaia --level <1|2|3|all> --max-tasks N`
+- `MCP_NO_POLLERS=1` guard in `packages/mcp/src/server.ts` (tools-only MCP,
+  no Telegram 409) so the bench can borrow the tool surface locally.
+- compiler default moved to `gpt-5.4` in `models.ts` (was gemini; prod
+  already overrode via `AGENT_COMPILER_MODEL`) — local runs need no Gemini key.
+- The dataset cache (`eval/fixtures/gaia/`) is gitignored — gated data,
+  never committed.
+
+### First live run (2026-06-21) — PR1 exit criterion MET
+
+Ran `pnpm bench:gaia --level 1 --max-tasks 5` end-to-end against the
+**Tavily-hosted MCP directly** (zero-infra path: web search/extract only,
+no local PG/own-MCP). The full prod plan→act→replan loop compiled, called
+tools, extracted `${answer}`, and scored.
+
+**Result: L1 1/5 correct (20%)** — breakdown `correct 1 | wrong 3 |
+execute_fail 1`.
+
+Toolbelt caveat for this run: only `tavily_search` + `tavily_extract`
+(Tavily-direct). No `read_pdf` / `read_file` / network-capable
+`code_agent`, so attachment + calc + audio/video tasks are inherently
+capped. First visible failure mode: a YouTube-video task → `execute_fail`
+because the **Codex sandbox has no network** (the llm_agent retried
+curl/wget/yt-dlp 7× against a DNS-less sandbox, then exhausted
+maxIterations). That's a **tool-coverage gap**, not a loop/reasoning bug.
+
+Dataset note: the repo migrated metadata to **parquet** (no more
+`metadata.jsonl`); loader now reads via the datasets-server `/rows` API
+(config `2023_all`, 165 validation rows), cached to `${split}.rows.json`.
+
+**Next (still PR1/PR2):** run the full L1 set behind the *own-MCP* toolbelt
+(read_pdf/read_file + a network-enabled code path) to separate tool-gap
+from reasoning failures cleanly, then the PR2 taxonomy + Excel reader.
+
 ## Notes
 
 - **Why bother when we have e2e evals.** Internal evals are *relative*

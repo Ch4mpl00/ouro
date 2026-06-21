@@ -160,6 +160,16 @@ async function main(): Promise<void> {
     await endpoint.connect(stdio);
   }
 
+  // MCP_NO_POLLERS lets an eval harness spin up a tools-only MCP (gateway +
+  // tool handlers) without the event pollers. The Telegram getUpdates poll is
+  // exclusive — a second poller against the same bot 409s the droplet — so the
+  // GAIA bench (and any local tool smoke-test) sets this to borrow the tool
+  // surface without competing for signals.
+  if (process.env.MCP_NO_POLLERS === "1") {
+    console.error("[mcp] MCP_NO_POLLERS=1 — tools only, pollers disabled");
+    return;
+  }
+
   startTelegramPoller();
   startGmailPoller();
   startSchedulerPoller();
