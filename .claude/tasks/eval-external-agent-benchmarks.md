@@ -439,16 +439,74 @@ remedy. The `composer` skill is committed (27c5898); see [[project_deepseek_tool
 - **deep-research depth**: the 5 llm_agent got that replan missed need more
   aggressive query reformulation (or gpt-5.4 over mini).
 
+### Full failure taxonomy (all 21 fails of the 18/39 composer run, 2026-06-21)
+
+Diagnosed every non-correct task by dumping its trace (plan → tool results →
+compose → answer/error) and fanning out per-task diagnosis. Hard datum from
+the traces: across 39 tasks only **13 `tavily_extract` calls, 10/39 tasks
+ever extracted a page** — the rest do `tavily_search` → compose on snippets.
+
+Root causes, by frequency:
+- **#1 — planner searches but never reads the page (~11/21, DOMINANT).** The
+  needed fact lives in a PDF/table/roster/page body; search returns only
+  ranked SNIPPETS; no `tavily_extract` hop follows, so the fact never enters
+  context. Then the compose either fabricates a plausible value or wrongly
+  says "not found". (5d0080cb, 46719c30, 72e110e7, 5188369a, cabe07ed,
+  305ac316, 7d4a7d1d, 3f57289b, a0068077, cf106601, a0c07678.) When the
+  planner DID extract, it mostly succeeded — extraction correlates with pass.
+- **#2 — finalizer fabricates over an upstream "empty" (~5/21).** A gather
+  step honestly returns NOT_FOUND/null, a later tool-less compose invents an
+  answer anyway. (composer rule #3 only governs a single step's own inputs.)
+- **#3 — execution/binding defects (4/21, mechanical, 2 near-free wins):**
+  dup `bind:"answer"` threw away an ALREADY-CORRECT answer (935e2cff);
+  `code_agent` output not JSON-parsed → `${path}` unbound (c365c1c7); `null`
+  substituted into a required tool arg → hard fail (7673d772); codex sandbox
+  traceback bound as the answer (dc22a632).
+- **#4 — format/normalization (4/21):** substantively right, scorer-failed —
+  unit (17000 vs "17 thousand", e1fc63a2), slugline vs location (4b6bb5f7),
+  abbreviation (St. vs Saint, bda648d7), list separator ("and" vs comma,
+  50ec8903).
+- **#5 — search query malformed → 0 results (1):** b415aba4.
+- **#6 — genuine reasoning/math error (1):** e142056d (game theory + ×$1000).
+
+### Result: planner search→extract fix (2026-06-21) — 6/8 of the search-only fails recovered
+
+Edited `planner.md` (commit 2d11f1b): added the **snippet-vs-body rule**
+(web search returns snippets, not page bodies; chain `search → tavily_extract`
+via a replan hop when the fact lives inside a document; pick the MOST SPECIFIC
+matching URL, not the parent/index page) + a second web-lookup pipeline shape
+for buried facts (honest "not found" over a fabricated value). Did NOT touch
+`gaia.md` (its "always guess" rule is weakly optimal for exact-match scoring;
+the real lever was the missing extract).
+
+Re-ran 8 of the root-cause-#1 fails (DeepSeek + replan + max-passes 10,
+Tavily-direct): **6/8 recovered to correct, leak 0.** 0.1777 (was hallucinated
+7.8), Annie Levin (was "insufficient"), Louvrier (was wrong parent URL),
+Wojciech (was hallucinated Mikołaj), 519 (was honest refusal), CUB (was null).
+The 2 residual (a0068077 200-vs-90, a0c07678 wrong roster names) **now EXTRACT
+the page but mis-read the specific row** — moved from fabrication to a
+table-precision problem (→ `code_agent` over the extracted table, see
+[[text-processing-toolkit]]).
+
 **Next steps (ordered):**
-1. **Fix the `gaia` skill** — kill the literal-`answer` output + tighten
-   answer-format (number/list/string rules, strip framing). Cheap, likely
-   recovers ~3-5 and pushes replan past the baseline.
-2. **Push research depth**: try `AGENT_SMART_MODEL=gpt-5.4` and/or stronger
-   replan-reformulation guidance — recover the deep-research misses.
-3. Decide model policy broadly: acting/extract steps → gpt (no leak),
-   reserve DeepSeek for non-tool editorial. (Relevant to prod sub-agents.)
-4. Then PR2 taxonomy automation + Excel reader; clean full-39 own-MCP run.
-5. Text-processing toolkit → own task: [[text-processing-toolkit]].
+1. **Execution guards (cheap, 4 tasks, 2 near-free):** reject/auto-unique
+   duplicate `bind` (935e2cff lost a correct answer); JSON-parse `code_agent`
+   output before `${path}` access (c365c1c7); short-circuit a tool step when a
+   required arg substitutes to `null` (7673d772); detect a traceback/sandbox
+   error in a step result and fail the step instead of binding it (dc22a632).
+2. **Table-precision via `code_agent`** over extracted page bodies — the
+   residual extract-but-misread fails (a0068077, a0c07678); ties into
+   [[text-processing-toolkit]].
+3. **gaia answer-format rules** (units, list separators, expand abbreviations
+   when asked, return just the requested field) — the 4 format near-misses.
+4. **Push research depth**: `AGENT_SMART_MODEL=gpt-5.4` and/or stronger
+   replan-reformulation — the deep-research misses.
+5. Then PR2 taxonomy automation + Excel reader; clean full-39 own-MCP run.
+6. Text-processing toolkit → own task: [[text-processing-toolkit]].
+
+**Shipped to prod (feat/gaia-harness):** composer base skill (27c5898) +
+planner search→extract (2d11f1b). Prod tracks this branch; deployed via
+`git pull && docker compose up -d --build`. Not merged to main (branch deploy).
 
 ## Notes
 
