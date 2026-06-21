@@ -20,6 +20,8 @@ import {
 import { gatherEnvData, type EnvDataDeps } from "../../../session-context";
 import { createSkillStore } from "../../../skills";
 import { createLocalRecorderTracer } from "../../../tracing/local-recorder";
+import { langfuseTracerFromEnv } from "../../../tracing/langfuse";
+import { teeTracer } from "../../../tracing/tee";
 import { createWorkflowRunner, type WorkflowSignal } from "../../../workflow";
 import { createBenchMcpClient } from "./bench-mcp-client";
 import { isAccessible, missingCapabilities } from "./capabilities";
@@ -161,7 +163,20 @@ async function main(): Promise<void> {
   const mcp = createBenchMcpClient(realMcp);
   console.log(`[bench] toolbelt: ${mcp.tools.map((t) => t.function.name).join(", ")}`);
 
-  const tracer = createLocalRecorderTracer(traceStore);
+  // Local mirror always on (agent.db); tee to Langfuse too when creds are
+  // present — gives the trace UI + lets the per-node judge score GAIA runs,
+  // exactly like the prod supervisor.
+  const local = createLocalRecorderTracer(traceStore);
+  const langfuse = langfuseTracerFromEnv();
+  const tracer = langfuse ? teeTracer(langfuse, local) : local;
+  console.log(`[bench] tracing: ${langfuse ? "langfuse + local mirror" : "local mirror only"}`);
+
+  // Unique per-run id so successive benchmark runs don't clobber each other's
+  // traces (trace id is the PRIMARY KEY; a fixed gaia:<index> scheme would
+  // upsert-overwrite the prior run). Stamped once here, woven into every
+  // task's trace id + session id.
+  const runId = new Date().toISOString().replace(/[:.]/g, "-");
+  console.log(`[bench] run id: ${runId}`);
   const engine = createEngine({
     providers,
     mcp,
@@ -212,7 +227,7 @@ async function main(): Promise<void> {
 
   const results: TaskResult[] = [];
   for (const [i, task] of tasks.entries()) {
-    const result = await runOne(i, task, runner, engine, envDeps);
+    const result = await runOne(runId, i, task, runner, engine, envDeps);
     results.push(result);
     const gold = task.finalAnswer || "(no gold)";
     console.log(
@@ -228,6 +243,7 @@ async function main(): Promise<void> {
 }
 
 async function runOne(
+  runId: string,
   index: number,
   task: GaiaTask,
   runner: ReturnType<typeof createWorkflowRunner>,
@@ -252,14 +268,17 @@ async function runOne(
     envContext,
   };
 
-  const signalLabel = `gaia:${signal.id}`;
+  // Trace id unique per (run, task) so runs are preserved side by side; the
+  // human-readable task-id prefix makes traces easy to find. Session groups
+  // all tasks of one run together in the Langfuse Sessions view.
+  const traceId = `gaia:${runId}:${task.taskId.slice(0, 8)}`;
   const trace = engine.tracer.trace({
-    id: signalLabel,
+    id: traceId,
     name: "signal:gaia",
     kind: "agent",
-    sessionId: signalLabel,
+    sessionId: `gaia:${runId}`,
     tags: ["gaia", "bench", `level-${task.level}`],
-    metadata: { gaia_task_id: task.taskId, gaia_level: task.level },
+    metadata: { gaia_task_id: task.taskId, gaia_level: task.level, run_id: runId },
   });
 
   try {
