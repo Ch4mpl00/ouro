@@ -48,6 +48,10 @@ interface CliOpts {
   // Run only tasks whose taskId starts with one of these (full id or short
   // prefix). Overrides --max-tasks (runs every match). null = no id filter.
   taskIds: string[] | null;
+  // Workflow plan→act→replan ceiling. null = level-based default. Raise it
+  // for the replan-driven variant (the planner iterates via replan instead
+  // of delegating to an llm_agent ReAct loop).
+  maxPasses: number | null;
 }
 
 function parseArgs(argv: string[]): CliOpts {
@@ -56,9 +60,14 @@ function parseArgs(argv: string[]): CliOpts {
   let accessibleOnly = false;
   let dryRun = false;
   let taskIds: string[] | null = null;
+  let maxPasses: number | null = null;
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
-    if (arg === "--task-ids") {
+    if (arg === "--max-passes") {
+      maxPasses = Number(argv[++i]);
+      if (!Number.isInteger(maxPasses) || maxPasses <= 0)
+        throw new Error("--max-passes must be a positive integer");
+    } else if (arg === "--task-ids") {
       // Comma-separated ids/prefixes, or "@path" to read them from a file
       // (one per line and/or comma-separated). Handy for re-running failures.
       const v = argv[++i] ?? "";
@@ -87,7 +96,7 @@ function parseArgs(argv: string[]): CliOpts {
       accessibleOnly = true;
     }
   }
-  return { level, maxTasks, accessibleOnly, dryRun, taskIds };
+  return { level, maxTasks, accessibleOnly, dryRun, taskIds, maxPasses };
 }
 
 // Apply the explicit --task-ids selection (full id or short prefix). Errors
@@ -235,10 +244,12 @@ async function main(): Promise<void> {
     knownSkills,
     setMemory: (key, value) => memory.set(key, value),
     codex,
-    // Lift the autonomous-loop ceiling for L2/L3 long-horizon tasks; PR2 will
-    // tag where even this is too shallow.
-    maxPasses: opts.level === 1 ? 3 : 5,
+    // Autonomous-loop ceiling. Explicit --max-passes wins; else a level-based
+    // default. The replan-driven planner variant needs this raised (it does
+    // research as gather→replan hops rather than one llm_agent ReAct loop).
+    maxPasses: opts.maxPasses ?? (opts.level === 1 ? 3 : 5),
   });
+  if (opts.maxPasses) console.log(`[bench] maxPasses: ${opts.maxPasses}`);
 
   const envDeps: EnvDataDeps = {
     mcp,

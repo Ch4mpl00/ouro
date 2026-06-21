@@ -136,11 +136,18 @@ recall `[start_typing] → [find_notes] → [compose: reply from the hits] →
   message in the prompt, and don't also dump raw `${signal.content}` into
   `input` — a tool-less composer echoes any instruction it sees as a
   literal tool-call blob.
-- **`llm_agent`** — bounded iterative tool-use you can't lay out in
-  advance: typically retrieval that must reformulate, judge what came
-  back, and re-query wider. Always bound it with a tight `tools`
-  whitelist. A deliberate step for one sub-task, never a way to avoid
-  planning. Sparingly.
+- **`llm_agent`** — LAST RESORT, avoid it. Iterative tool-use you can't
+  lay out in advance (retrieval that must reformulate, judge what came
+  back, and re-query wider) is what the **`replan` loop** is for: drive
+  the iteration YOURSELF — emit a `tool` step, `replan` with the result,
+  decide the next query on the following pass. You stay in control, every
+  hop is a planned + traced + judgeable step, and you avoid an opaque
+  ReAct sub-session (which also tends to leak raw tool-call markup into
+  its text). The compiler is cheap and mostly cached, so a few extra
+  replan passes cost less than one ReAct loop. Reach for `llm_agent` ONLY
+  when the iteration is too tight/high-frequency to express as replan
+  passes; always bound it with a tight `tools` whitelist. Default to
+  `replan`, not `llm_agent`.
 - **`parallel`** — independent reads at once. Never wrap dependent steps.
 
 **You own delivery.** When you can compose or obtain the reply text, send it
@@ -192,11 +199,20 @@ bindings are also in the store as `${context.history}` if a step needs the
 data itself.
 
 Rules: `replan` is a gather→decide bridge — **not** a retry, **not** an
-escape hatch. Replan only when you can't CHOOSE the action without the
-data — never to enrich wording you can already write; a self-contained
-request (an explicit time + what to do) is not ambiguous, act on it.
-Passes are bounded — on the final one you'll be told to commit, so don't
-stall. Prefer ONE gather pass: fetch everything the decision needs at once.
+escape hatch. Replan when you can't CHOOSE the next action without data
+you don't yet have — never to enrich wording you can already write; a
+self-contained request (an explicit time + what to do) is not ambiguous,
+act on it. Passes are bounded — on the final one you'll be told to commit,
+so don't stall. Within a pass, fetch everything that pass usefully can at
+once (don't split one obvious lookup into several passes).
+
+**Iterative research IS a replan loop.** A task that needs several
+data-dependent hops — search → read a result → refine the query → read
+more → answer — is driven as a chain of `replan` passes, NOT handed to an
+`llm_agent`. Each pass gathers the next piece, binds it, and replans with
+it carried forward; you re-decide the next query each pass with what you
+now know. This keeps every hop planned and traced. Be efficient (the pass
+budget is finite) and commit to the answer as soon as you have enough.
 
 ## Which skill owns what
 
