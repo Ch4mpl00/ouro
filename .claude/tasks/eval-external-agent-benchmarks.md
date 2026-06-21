@@ -340,14 +340,39 @@ cached, so a few extra replan passes beat one ReAct loop. Reframed
 chain) + added `bench --max-passes`. **On branch `feat/gaia-harness` only;
 prod (main) untouched until the A/B proves out.**
 
+### A/B result: replan-variant is WORSE (2026-06-21) — hypothesis falsified
+
+Ran the same 27 with the replan-preferring planner + `--max-passes 10`
+(own-MCP). **3/27 (11.1%) — worse than the llm_agent baseline 7/27**, and
+the tool-call leak GREW **6→15 of the wrong preds**. Tasks the llm_agent
+baseline got right regressed into leak (`8e867cd7`, `72e110e7`, `b415aba4`,
+`b816bfce`…).
+
+**Diagnosis — the leak is DeepSeek in a tool-less context, not "the agent."**
+The `<｜｜DSML｜｜tool_calls>` / improvised `<search>` markup lands in the
+final `answer` because: when DeepSeek (`smart` preset) WANTS to act but sits
+in a tool-less `llm_compose` (which the replan loop forces — "decide what to
+search next" with no tools), it hallucinates tool-call markup into its text.
+So `llm_agent` with REAL structured tools leaks LESS; removing it put
+DeepSeek in MORE tool-less spots → more leak. **"replan > llm_agent" is
+falsified for GAIA by the numbers.** → revert the planner.md change (keep
+the harmless `--max-passes` flag).
+
+**The real fix for cause #2 is the MODEL, not the orchestration.** The leak
+is provider-specific (DeepSeek's native markup). Isolated test needs NO
+prompt change — the bench honors `AGENT_SMART_MODEL`:
+
 **Next steps (ordered):**
-1. **A/B the replan-variant** on the same 27 (own-MCP, `--max-passes ~10`)
-   vs this 7/27 baseline — does avoiding `llm_agent` recover the 6 leak
-   failures?
-2. Tighten the `gaia` skill answer-format rules (recover the ~5 near-miss).
-3. If the leak persists even without `llm_agent` (i.e. it's the compose
-   step too), spin a dedicated task on the tool-call-parsing fix.
+1. **Revert the planner replan-change** (measured worse). Keep `--max-passes`.
+2. **A/B the model**: llm_agent baseline + `-e AGENT_SMART_MODEL=gpt-5.4-mini`
+   on the 27 — does the leak vanish + accuracy beat 7/27? If yes, cause #2 =
+   run the acting sub-agent on a clean-tool-call model, not DeepSeek.
+3. Tighten the `gaia` skill answer-format rules (recover the ~5 near-miss).
 4. Then PR2 taxonomy automation + Excel reader; clean full-39 own-MCP run.
+5. (Parked design task) text-processing toolkit: by-handle agent-side tools
+   (`text_stats`/`keyword_search`/`vector_search`/`read_span`) over the
+   VariableStore + planner strategy-selection via classify→replan. Separate
+   task to be written.
 
 ## Notes
 
