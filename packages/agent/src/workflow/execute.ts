@@ -26,6 +26,11 @@ import {
   type VariableStore,
 } from "./variables";
 
+// Base skill prepended to the system message of every `llm_compose` step.
+// Defines the contract of a tool-less one-shot call so the model doesn't try
+// to "call a tool" and leak its native tool-call markup into the bound text.
+const COMPOSER_BASE_SKILL = "composer";
+
 // Workflow execution runtime. Given a validated `Workflow`, walk its steps
 // in order and execute each one against the engine. Variable store is
 // opt-in: each step declares what bindings it needs in `input`/`args`,
@@ -489,14 +494,26 @@ async function execLlmCompose(
   const preset = deps.engine.presets[step.preset];
   const provider = deps.engine.resolveProvider(preset.model);
 
-  let system: string | undefined;
+  // Base composer skill — loaded for EVERY compose step, ahead of any
+  // step-specific skill. It states the rules of a tool-less compose (no tools
+  // in this turn; never emit tool-call markup; if you can't answer, say so).
+  // This is the prompt-layer guard against a provider leaking native tool-call
+  // tokens as text when it wants to act but has none — most compiled compose
+  // steps carry no `step.skill` and would otherwise run with no system at all.
+  // Absent (null) only in tests / minimal layouts → falls back to prior shape.
+  const baseBody = await deps.readSkill(COMPOSER_BASE_SKILL);
+
+  let system: string | undefined = baseBody ?? undefined;
   if (step.skill) {
     const body = await deps.readSkill(step.skill);
     if (body === null) throw new SkillNotFoundError(step.skill);
     // Append the live improver patch (if any) at the end — same placement the
     // gate replay measures, so prod runs exactly what the gate scored.
     const patch = deps.readPatch ? await deps.readPatch(step.skill) : null;
-    system = appendPatch(body, patch ?? "");
+    const stepSystem = appendPatch(body, patch ?? "");
+    // Base rules first (stable prefix → prompt-cache friendly), the step's
+    // domain skill layered on top.
+    system = baseBody ? `${baseBody}\n\n${stepSystem}` : stepSystem;
   }
 
   const resolvedInput: Record<string, unknown> = {};

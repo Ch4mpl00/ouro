@@ -586,6 +586,60 @@ describe("executor.execute — llm_compose step", () => {
     expect(system).toContain("PATCH LESSON");
   });
 
+  it("prepends the base composer skill ahead of the step skill", async () => {
+    const engine = makeMockEngine({ llmResponses: ["composed"] });
+    const executor = createExecutor({
+      engine,
+      readSkill: fixedReadSkill({
+        composer: "BASE COMPOSE RULES",
+        "news-digest": "RULES go here",
+      }),
+      setMemory: () => {},
+    });
+    const ctx = baseCtx();
+    const r = await executor.execute(
+      {
+        version: 1,
+        steps: [
+          { kind: "llm_compose", preset: "smartest", skill: "news-digest", input: {}, bind: "d" },
+          { kind: "terminal" },
+        ],
+      },
+      ctx,
+    );
+    expect(r.ok).toBe(true);
+    const body = engine.llmCalls[0] as { messages: ChatCompletionMessageParam[] };
+    const system = body.messages[0]!.content as string;
+    // Base rules form the stable prefix; the domain skill is layered on top.
+    expect(system.startsWith("BASE COMPOSE RULES")).toBe(true);
+    expect(system).toContain("RULES go here");
+    expect(system.indexOf("BASE COMPOSE RULES")).toBeLessThan(system.indexOf("RULES go here"));
+  });
+
+  it("applies the base composer skill even when the step has no skill", async () => {
+    const engine = makeMockEngine({ llmResponses: ["composed"] });
+    const executor = createExecutor({
+      engine,
+      readSkill: fixedReadSkill({ composer: "BASE COMPOSE RULES" }),
+      setMemory: () => {},
+    });
+    const ctx = baseCtx();
+    const r = await executor.execute(
+      {
+        version: 1,
+        steps: [
+          { kind: "llm_compose", preset: "base", input: {}, prompt: "hi", bind: "d" },
+          { kind: "terminal" },
+        ],
+      },
+      ctx,
+    );
+    expect(r.ok).toBe(true);
+    const body = engine.llmCalls[0] as { messages: ChatCompletionMessageParam[] };
+    // A compiled compose step carries no skill — it must still get the base rules.
+    expect(body.messages[0]).toEqual({ role: "system", content: "BASE COMPOSE RULES" });
+  });
+
   it("stringifies a whole-placeholder prompt bound to a non-string value", async () => {
     // `substitute` preserves type for whole-string placeholders — right for
     // tool args, but a prompt must stay TEXT: a raw array in message.content
