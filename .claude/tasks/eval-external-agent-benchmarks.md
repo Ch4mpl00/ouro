@@ -391,10 +391,49 @@ tasks → **union = 12/27**. replan+gpt wins format/shallow (recovered the
 llm_agent+DeepSeek wins deep iterative research (`Mercedes Sosa=3`, `fluffy`,
 `diamond`, `FunkMonk`) — more search hops than bounded replan managed.
 
+### Result: replan + DeepSeek + base composer skill (2026-06-21) — leak FIXED BY PROMPT
+
+Full accessible-L1 (39 tasks), replan planner, **`smart`=DeepSeek (default,
+no model swap)**, `--max-passes 10`, Tavily-direct, **with the new always-on
+`composer` base skill** (`skills.default/composer.md`, prepended to every
+`llm_compose` system message — states the rules of a tool-less one-shot:
+no tools this turn, never emit tool-call markup, say so honestly when inputs
+are insufficient). One variable changed vs the 3/27-leak run: the skill.
+
+**18/39 correct (46.2%), tool-call leak 0/39** (scan: `DSML` / `tool_calls`
+/ `<search>` / `<tool_call>` → none). Best DeepSeek number to date AND zero
+leak.
+
+| variant (accessible-L1, DeepSeek) | correct | tool-call leak |
+|---|---|---|
+| DeepSeek, default planner (orig) | 12/39 (30.8%) | 15/39 |
+| replan + DeepSeek (27-subset) | 3/27 | 15/22 |
+| replan + gpt-5.4-mini (27-subset) | 7/27 | 0 |
+| **replan + DeepSeek + composer skill** | **18/39 (46.2%)** | **0/39** |
+
+**Cause #2 is fixable at the PROMPT layer, not only the model.** The earlier
+read ("the real fix is the model, not the orchestration") was right that
+orchestration alone didn't help — but a *base skill that teaches the
+tool-less contract* does: leak 15→0 on DeepSeek with no swap. Accuracy rose
+12→18 because ex-leak answers now either answer correctly or honestly return
+"insufficient information" (composer rule #3). All three named leak-regression
+tasks (8e867cd7, 72e110e7, b415aba4) came back clean; the `pred="answer"`
+literal bug also vanished (5188369a/d0633230/b816bfce now clean/correct).
+Model-routing (acting→gpt) is now a belt-and-suspenders backup, not the only
+remedy. The `composer` skill is committed (27c5898); see [[project_deepseek_toolcall_leak]].
+
+**Two residual NON-leak failures (separate class, follow-up):**
+- **3 execute_fail** (935e2cff, 7673d772, c365c1c7) — pred=null, workflow
+  threw; not a leak.
+- **1 codex traceback bound as answer** (dc22a632) — a `code_agent` step hit
+  a litellm/httpx error in the sandbox and the error text became the answer.
+  `code_agent` robustness, not a tool-call leak.
+
 **Remaining wrong are now clean + addressable:**
 - **`pred="answer"` literal (3 tasks: b816bfce, 5188369a, d0633230)** — the
   `gaia` skill's "bind the final answer to `answer`" makes the model output
   the literal word when it has no real answer. Skill-prompt bug, easy fix.
+  (NOTE: composer already incidentally cleared these in the run above.)
 - **format/framing**: `INT. THE CASTLE - DAY` vs `THE CASTLE`, `17000` vs
   `17` (unit). → tighten gaia answer-format rules.
 - **deep-research depth**: the 5 llm_agent got that replan missed need more
