@@ -90,8 +90,22 @@ compose-on-results:
   spec, a how-to, a one-off current fact, "загугли / поищи в интернете".
   If it isn't curated news, it's a web search — don't force it into
   `search_news` (the store won't have it) and don't answer from memory.
-  (`tavily__tavily_extract` pulls a specific URL's full text when you already
-  have the link.)
+
+**Web search returns SNIPPETS, not page bodies — read the page when the fact
+lives inside it.** `tavily_search` hands back a ranked list of titles + short
+relevance snippets, NOT the full text. A snippet is enough for a headline
+figure, a definition, a current price. It is NOT enough for a fact buried in
+a document — a number in a paper/PDF, a value in a table, a name in a roster,
+a quote's attribution, an enrollment/stat figure, a specific line on a page.
+For those: **chain `search → tavily_extract`.** Search to locate the right
+URL, then in the next pass `tavily_extract` the **most specific matching
+link** (the exact subpage/PDF, not the parent/index page) and compose from
+its extracted body. Because you pick the URL from results you can't see yet,
+this is a `replan` hop: `search → bind → replan(context=[search]) → extract
+the chosen URL → compose`. Composing a buried fact straight off snippets is
+the #1 failure mode — it either fabricates a plausible value or wrongly
+reports "not found" when the answer was one extract away. When in doubt
+whether the snippet really contains the answer, extract.
 
 Only compose a reply WITHOUT retrieval when the task isn't a retrievable fact
 at all — translate this, draft a greeting, format these numbers, acknowledge
@@ -306,7 +320,16 @@ skill. Inline caps (NO source, stamp) are the easy-to-forget bits.
   `[start_typing] → [status "🌐 ищу в интернете"] → [tavily__tavily_search] → [status "✍️ пишу ответ"] → [compose: reply from results] → [send] → [status ""]`
   (open web, NOT the news store. Compose the answer from the returned results
   with a bare-`prompt` `llm_compose` — "output ONLY the reply text"; never
-  dump raw search JSON to the user.)
+  dump raw search JSON to the user. **This snippet-only shape is for facts a
+  snippet can carry.**)
+- **Web lookup, fact buried in a page** (a number/value/name inside a
+  document, table, paper, PDF, roster — the snippet won't carry it):
+  `[tavily_search] → replan(context=[search]) → [tavily_extract: the most specific matching URL] → [compose: answer from the extracted body]`
+  (the extra `tavily_extract` hop is mandatory here — see the snippet-vs-body
+  rule above. Pick the exact subpage/PDF link, not the parent/index page. If
+  the extract still doesn't contain the fact, the compose says so — **never
+  invent a value to fill the gap; an honest "not found" beats a fabricated
+  number**.)
   **Call `tavily__tavily_search` with `query` ONLY** (add `max_results` if you
   want fewer/more hits). Leave every other parameter at its default — its
   signature shows them as loose `any`, but the server validates strictly: in
