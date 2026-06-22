@@ -12,6 +12,7 @@ import { registerTelegramTools } from "./tools/telegram";
 import { registerMonobankTools } from "./tools/monobank";
 import { registerPdfTools } from "./tools/pdf";
 import { registerFsTools } from "./tools/fs";
+import { registerFetchTools } from "./tools/fetch";
 import { registerSignalsTools } from "./tools/signals";
 import { registerNewsTools } from "./tools/news";
 import { registerKnowledgeTools } from "./tools/knowledge";
@@ -42,6 +43,7 @@ export function createServer(deps: ServerDeps): McpServer {
   registerMonobankTools(server);
   registerPdfTools(server);
   registerFsTools(server);
+  registerFetchTools(server);
   registerSignalsTools(server);
   registerNewsTools(server, deps.news);
   registerKnowledgeTools(server, deps.knowledge);
