@@ -4,6 +4,7 @@ import { registerTelegramTools, registerTelegramSendTools } from "./tools/telegr
 import { registerMonobankTools } from "./tools/monobank";
 import { registerPdfTools } from "./tools/pdf";
 import { registerFsTools } from "./tools/fs";
+import { registerFetchTools } from "./tools/fetch";
 import { registerSignalsTools } from "./tools/signals";
 import { registerNewsTools } from "./tools/news";
 import { registerKnowledgeTools } from "./tools/knowledge";
@@ -40,6 +41,9 @@ const TOOLSETS = {
   monobank: (server) => registerMonobankTools(server),
   pdf: (server) => registerPdfTools(server),
   fs: (server) => registerFsTools(server),
+  // fetch_url — arbitrary page fetch behind an SSRF guard. Deliberately NOT
+  // handed to third-party clients: it turns our server into their proxy.
+  fetch: (server) => registerFetchTools(server),
   signals: (server) => registerSignalsTools(server),
   // search_news, list_news, fetch_article — the whole of tools/news.ts. It
   // reads the store (fetch_article also caches what it downloaded) and touches
@@ -62,6 +66,7 @@ export const DEFAULT_TOOLSETS: readonly ToolsetName[] = [
   "monobank",
   "pdf",
   "fs",
+  "fetch",
   "signals",
   "news-read",
   "knowledge",

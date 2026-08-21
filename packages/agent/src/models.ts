@@ -38,23 +38,21 @@ export type PresetName = "base" | "smart" | "smartest" | "compiler";
 //              real editorial / parsing work (digests, semantic dedup,
 //              PDF amount extraction).
 // `smartest` — OpenAI full GPT-5.4. A reserve high-end preset, still
-//              selectable by sub-agents/handoff; no longer the compiler's
-//              default (see `compiler`).
-// `compiler` — Gemini 3 Flash (preview). The model the WORKFLOW COMPILER runs
-//              on: Test A showed the Gemini-3 generation rebuilds the
-//              non-obvious dedup step 5/5 (vs gpt-5.4-mini 3/5, gemini-2.5-flash
-//              0/10), on par with gemini-3.5-flash but ~3x cheaper. The compiler
+//              selectable by sub-agents/handoff.
+// `compiler` — OpenAI GPT-5.4. The model the WORKFLOW COMPILER runs on. It
 //              emits ONE structured plan per signal, so structured-output
-//              reliability + cost win here. Not in PRESET_NAMES: it's the
+//              reliability matters more than per-call cost. Routes through the
+//              OpenAI provider, so `reasoningEffort` is documentation only (see
+//              the NOTE above). Prod can still override via AGENT_COMPILER_MODEL
+//              (e.g. to a cheaper Gemini route). Not in PRESET_NAMES: it's the
 //              compiler's own model, not a preset a workflow step or sub-agent
 //              picks. (Availability wobbles are absorbed by the engine-level
-//              withRetry wrapper — every provider retries 429/5xx, so a
-//              transient blip doesn't fail compilation on any route.)
+//              withRetry wrapper — every provider retries 429/5xx.)
 export const DEFAULT_PRESETS: Record<PresetName, ModelPreset> = {
   base: { model: "gpt-5.4-mini", reasoningEffort: "disabled" },
   smart: { model: "deepseek-v4-pro", reasoningEffort: "medium" },
   smartest: { model: "gpt-5.4", reasoningEffort: "max" },
-  compiler: { model: "gemini-3-flash-preview", reasoningEffort: "low" },
+  compiler: { model: "gpt-5.4", reasoningEffort: "medium" },
 };
 
 // Presets selectable inside a workflow (llm_compose/llm_agent `preset`) or by

@@ -90,8 +90,22 @@ compose-on-results:
   spec, a how-to, a one-off current fact, "загугли / поищи в интернете".
   If it isn't curated news, it's a web search — don't force it into
   `search_news` (the store won't have it) and don't answer from memory.
-  (`tavily__tavily_extract` pulls a specific URL's full text when you already
-  have the link.)
+
+**Web search returns SNIPPETS, not page bodies — read the page when the fact
+lives inside it.** `tavily_search` hands back a ranked list of titles + short
+relevance snippets, NOT the full text. A snippet is enough for a headline
+figure, a definition, a current price. It is NOT enough for a fact buried in
+a document — a number in a paper/PDF, a value in a table, a name in a roster,
+a quote's attribution, an enrollment/stat figure, a specific line on a page.
+For those: **chain `search → tavily_extract`.** Search to locate the right
+URL, then in the next pass `tavily_extract` the **most specific matching
+link** (the exact subpage/PDF, not the parent/index page) and compose from
+its extracted body. Because you pick the URL from results you can't see yet,
+this is a `replan` hop: `search → bind → replan(context=[search]) → extract
+the chosen URL → compose`. Composing a buried fact straight off snippets is
+the #1 failure mode — it either fabricates a plausible value or wrongly
+reports "not found" when the answer was one extract away. When in doubt
+whether the snippet really contains the answer, extract.
 
 Only compose a reply WITHOUT retrieval when the task isn't a retrievable fact
 at all — translate this, draft a greeting, format these numbers, acknowledge
@@ -136,11 +150,18 @@ recall `[start_typing] → [find_notes] → [compose: reply from the hits] →
   message in the prompt, and don't also dump raw `${signal.content}` into
   `input` — a tool-less composer echoes any instruction it sees as a
   literal tool-call blob.
-- **`llm_agent`** — bounded iterative tool-use you can't lay out in
-  advance: typically retrieval that must reformulate, judge what came
-  back, and re-query wider. Always bound it with a tight `tools`
-  whitelist. A deliberate step for one sub-task, never a way to avoid
-  planning. Sparingly.
+- **`llm_agent`** — LAST RESORT, avoid it. Iterative tool-use you can't
+  lay out in advance (retrieval that must reformulate, judge what came
+  back, and re-query wider) is what the **`replan` loop** is for: drive
+  the iteration YOURSELF — emit a `tool` step, `replan` with the result,
+  decide the next query on the following pass. You stay in control, every
+  hop is a planned + traced + judgeable step, and you avoid an opaque
+  ReAct sub-session (which also tends to leak raw tool-call markup into
+  its text). The compiler is cheap and mostly cached, so a few extra
+  replan passes cost less than one ReAct loop. Reach for `llm_agent` ONLY
+  when the iteration is too tight/high-frequency to express as replan
+  passes; always bound it with a tight `tools` whitelist. Default to
+  `replan`, not `llm_agent`.
 - **`parallel`** — independent reads at once. Never wrap dependent steps.
 
 **You own delivery.** When you can compose or obtain the reply text, send it
@@ -192,11 +213,20 @@ bindings are also in the store as `${context.history}` if a step needs the
 data itself.
 
 Rules: `replan` is a gather→decide bridge — **not** a retry, **not** an
-escape hatch. Replan only when you can't CHOOSE the action without the
-data — never to enrich wording you can already write; a self-contained
-request (an explicit time + what to do) is not ambiguous, act on it.
-Passes are bounded — on the final one you'll be told to commit, so don't
-stall. Prefer ONE gather pass: fetch everything the decision needs at once.
+escape hatch. Replan when you can't CHOOSE the next action without data
+you don't yet have — never to enrich wording you can already write; a
+self-contained request (an explicit time + what to do) is not ambiguous,
+act on it. Passes are bounded — on the final one you'll be told to commit,
+so don't stall. Within a pass, fetch everything that pass usefully can at
+once (don't split one obvious lookup into several passes).
+
+**Iterative research IS a replan loop.** A task that needs several
+data-dependent hops — search → read a result → refine the query → read
+more → answer — is driven as a chain of `replan` passes, NOT handed to an
+`llm_agent`. Each pass gathers the next piece, binds it, and replans with
+it carried forward; you re-decide the next query each pass with what you
+now know. This keeps every hop planned and traced. Be efficient (the pass
+budget is finite) and commit to the answer as soon as you have enough.
 
 ## Which skill owns what
 
@@ -290,7 +320,16 @@ skill. Inline caps (NO source, stamp) are the easy-to-forget bits.
   `[start_typing] → [status "🌐 ищу в интернете"] → [tavily__tavily_search] → [status "✍️ пишу ответ"] → [compose: reply from results] → [send] → [status ""]`
   (open web, NOT the news store. Compose the answer from the returned results
   with a bare-`prompt` `llm_compose` — "output ONLY the reply text"; never
-  dump raw search JSON to the user.)
+  dump raw search JSON to the user. **This snippet-only shape is for facts a
+  snippet can carry.**)
+- **Web lookup, fact buried in a page** (a number/value/name inside a
+  document, table, paper, PDF, roster — the snippet won't carry it):
+  `[tavily_search] → replan(context=[search]) → [tavily_extract: the most specific matching URL] → [compose: answer from the extracted body]`
+  (the extra `tavily_extract` hop is mandatory here — see the snippet-vs-body
+  rule above. Pick the exact subpage/PDF link, not the parent/index page. If
+  the extract still doesn't contain the fact, the compose says so — **never
+  invent a value to fill the gap; an honest "not found" beats a fabricated
+  number**.)
   **Call `tavily__tavily_search` with `query` ONLY** (add `max_results` if you
   want fewer/more hits). Leave every other parameter at its default — its
   signature shows them as loose `any`, but the server validates strictly: in
