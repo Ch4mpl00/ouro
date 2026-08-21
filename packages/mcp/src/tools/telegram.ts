@@ -26,7 +26,13 @@ const chatIdAsNumber = z
   .union([z.string(), z.number().int()])
   .transform((v) => (typeof v === "string" ? Number(v) : v));
 
-export function registerTelegramTools(server: McpServer): void {
+// The write-only slice of the Telegram surface: post a message as the
+// assistant bot, nothing else. Split out of `registerTelegramTools` so a
+// restricted instance (`MCP_TOOLSETS=telegram-send`, e.g. the ChatGPT tunnel)
+// can register it without also handing out chat history, edits, or the
+// typing/status machinery. `registerTelegramTools` calls this first, so the
+// full surface is unchanged.
+export function registerTelegramSendTools(server: McpServer): void {
   server.registerTool(
     "send_telegram_message",
     {
@@ -82,6 +88,10 @@ export function registerTelegramTools(server: McpServer): void {
       });
     },
   );
+}
+
+export function registerTelegramTools(server: McpServer): void {
+  registerTelegramSendTools(server);
 
   server.registerTool(
     "edit_telegram_message",

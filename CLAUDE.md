@@ -49,7 +49,7 @@ mcp-tools/
 ├── .env.mcp                MCP container env (integration creds)
 ├── .env.agent              agent container env (DeepSeek key, model)
 ├── .env.example, .env.mcp.example, .env.agent.example
-├── docker-compose.yml      two services: mcp + agent
+├── docker-compose.yml      mcp + agent, plus mcp-tunnel + tunnel-client
 ├── Dockerfile              one image for both
 ├── skills.default/         shipped skills (git-tracked, read-only fallback)
 ├── skills/                 live overlay, gitignored; dreaming writes here
@@ -59,6 +59,7 @@ mcp-tools/
     │   ├── data/{schema.sql, tokens.db}     OAuth, watermarks, signals, scheduled_tasks
     │   └── src/
     │       ├── server.ts                    starts pollers + HTTP/stdio transport
+    │       ├── toolsets.ts                  named tool groups (MCP_TOOLSETS scoping)
     │       ├── gateway.config.json          third-party MCP upstreams (git-tracked, secret-free)
     │       ├── tools/                       MCP-exposed actions
     │       └── services/{gmail,telegram,monobank,scheduler,news,pdf,signals,settings,gateway}
@@ -221,7 +222,7 @@ also see them when running `claude` locally with `.mcp.json` registered.
 - **Telegram userbot (read-only MTProto)** — `list_userbot_dialogs`,
   `list_channel_posts`
 - **Monobank** — `list_monobank_transactions` (no poller; reactive only)
-- **News** — `list_news_headlines`, `fetch_article` (HN, Habr — both
+- **News** — `list_news`, `fetch_article` (HN, Habr — both
   upsert into news_items and embed inline), `search_news` (semantic
   search across the unified store: HN, Habr, channel posts)
 - **PDF** — `read_pdf`
@@ -235,6 +236,21 @@ also see them when running `claude` locally with `.mcp.json` registered.
   their tools namespaced as `${prefix}__${tool}` (e.g. `tavily__tavily_search`).
   The agent still sees one merged endpoint. Onboarding (config + secret + skill
   frontmatter, no code) is in `.claude/tasks/mcp-gateway.md`.
+
+### Tool scoping (`MCP_TOOLSETS`)
+
+One MCP process serves one audience. `packages/mcp/src/toolsets.ts` holds the
+named toolset → registrar map (`gmail`, `telegram`, `telegram-send`,
+`monobank`, `pdf`, `fs`, `signals`, `news-read`, `knowledge`, `dreaming`,
+`userbot`, `scheduler`); `MCP_TOOLSETS=news-read,telegram-send` makes an
+instance register only those groups. Unset/empty = every group, i.e. the
+behaviour before scoping existed. An unknown name is a boot error.
+
+Scoping works by **not registering**, so an out-of-scope tool never appears in
+`tools/list` — invisible, not merely rejected. A restricted instance also skips
+the gateway entirely, because upstream tools are namespaced at runtime
+(`tavily__*`) and can't be expressed in the allow-list. Rationale and the wider
+auth design: `.claude/tasks/mcp-auth-and-tool-scoping.md`.
 
 ## Agent skills
 
@@ -282,3 +298,28 @@ droplet; named volumes (`mcp-data`, `mcp-storage`, `agent-data`,
 `agent-skills`, `pg-data`) persist state across rebuilds. First boot
 needs `.env.postgres` (POSTGRES_USER / PASSWORD / DB) and
 `OPENAI_API_KEY` in `.env.mcp`.
+
+### ChatGPT connector (Secure MCP Tunnel)
+
+Two extra compose services, both optional — the rest of the stack runs
+without them:
+
+- **`mcp-tunnel`** — a second `mcp` process on port 3001 with
+  `MCP_NO_POLLERS=1` and `MCP_TOOLSETS=news-read,telegram-send`, i.e. exactly
+  `search_news` / `list_news` / `fetch_article` / `send_telegram_message` and
+  no gateway. `expose` only, like `mcp` — never `ports`. It shares the
+  `mcp-data` volume because `send_telegram_message` appends to the
+  `telegram_messages` chat log.
+- **`tunnel-client`** — `ghcr.io/openai/tunnel-client`, OpenAI's daemon. It
+  long-polls `api.openai.com` outbound and forwards MCP requests to
+  `http://mcp-tunnel:3001/mcp`. Nothing is published; ChatGPT only ever knows
+  a `tunnel_id`. In ChatGPT the connector is a developer-mode app with
+  *Connection → Tunnel*.
+
+  Credentials live in `.env.mcp` as `OPENAI_TUNNEL_ID` +
+  `OPENAI_TUNNEL_API_KEY`; the service's entrypoint is the single place that
+  maps them onto the daemon's `CONTROL_PLANE_TUNNEL_ID` /
+  `--control-plane.api-key`. Note that compose expands `${VAR}` from the
+  shell and the project-root `.env`, **not** from a service's `env_file`, so
+  the mapping has to happen inside the container. The key should be a
+  restricted one (Tunnels Read + Use), never the admin key.
