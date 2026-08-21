@@ -7,28 +7,25 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
-import { registerGmailTools } from "./tools/gmail";
-import { registerTelegramTools } from "./tools/telegram";
-import { registerMonobankTools } from "./tools/monobank";
-import { registerPdfTools } from "./tools/pdf";
-import { registerFsTools } from "./tools/fs";
-import { registerSignalsTools } from "./tools/signals";
-import { registerNewsTools } from "./tools/news";
-import { registerKnowledgeTools } from "./tools/knowledge";
-import { registerDreamingTools } from "./tools/dreaming";
-import { registerUserbotTools } from "./tools/userbot";
-import { registerSchedulerTools } from "./tools/scheduler";
 import { startTelegramPoller } from "./services/telegram";
 import { startGmailPoller } from "./services/gmail";
 import { startSchedulerPoller } from "./services/scheduler";
 import { createPgClient } from "./db/pg/client";
-import { createNewsModule, startNewsModule, type NewsRepository } from "./services/news";
-import { createKnowledgeModule, type KnowledgeRepository } from "./services/knowledge";
+import { createNewsModule, startNewsModule } from "./services/news";
+import { createKnowledgeModule } from "./services/knowledge";
 import { createGatewayModule, loadGatewayConfig } from "./services/gateway";
+import {
+  DEFAULT_TOOLSETS,
+  parseToolsets,
+  registerToolsets,
+  type ToolsetDeps,
+  type ToolsetName,
+} from "./toolsets";
 
-export interface ServerDeps {
-  news: NewsRepository;
-  knowledge: KnowledgeRepository;
+export interface ServerDeps extends ToolsetDeps {
+  // Which tool groups this instance exposes. Omitted → DEFAULT_TOOLSETS, the
+  // full surface (unchanged pre-scoping behaviour). See toolsets.ts.
+  toolsets?: readonly ToolsetName[];
 }
 
 export function createServer(deps: ServerDeps): McpServer {
@@ -37,17 +34,7 @@ export function createServer(deps: ServerDeps): McpServer {
     version: "0.1.0",
   });
 
-  registerGmailTools(server);
-  registerTelegramTools(server);
-  registerMonobankTools(server);
-  registerPdfTools(server);
-  registerFsTools(server);
-  registerSignalsTools(server);
-  registerNewsTools(server, deps.news);
-  registerKnowledgeTools(server, deps.knowledge);
-  registerDreamingTools(server);
-  registerUserbotTools(server);
-  registerSchedulerTools(server);
+  registerToolsets(server, deps, deps.toolsets ?? DEFAULT_TOOLSETS);
 
   return server;
 }
@@ -137,15 +124,29 @@ async function main(): Promise<void> {
   const newsModule = createNewsModule({ db: pg.db });
   const knowledgeModule = createKnowledgeModule({ db: pg.db });
 
+  // MCP_TOOLSETS narrows the tool surface for an instance serving a specific
+  // audience (the ChatGPT tunnel gets news-read,telegram-send). Unset → the
+  // full surface, exactly as before.
+  const toolsets = parseToolsets(process.env.MCP_TOOLSETS);
+  if (toolsets.restricted) {
+    console.error(`[mcp] MCP_TOOLSETS=${toolsets.names.join(",")} — restricted tool surface`);
+  }
+
   const ownServer = createServer({
     news: newsModule.repository,
     knowledge: knowledgeModule.repository,
+    toolsets: toolsets.names,
   });
 
   // Gateway: if any third-party MCP upstreams are configured + resolvable, front
   // own-MCP with the aggregating gateway so the agent sees one merged, namespaced
   // tool list. With no upstreams, serve own-MCP directly — zero behaviour change.
-  const upstreams = loadGatewayConfig();
+  //
+  // A restricted instance never attaches the gateway: upstream tools arrive
+  // namespaced at runtime (tavily__*, …), so they cannot be expressed in the
+  // allow-list and would otherwise leak past it — and third-party calls cost
+  // money per call.
+  const upstreams = toolsets.restricted ? [] : loadGatewayConfig();
   const endpoint: ConnectableServer =
     upstreams.length > 0 ? (await createGatewayModule({ ownServer, upstreams })).server : ownServer;
 
@@ -158,6 +159,16 @@ async function main(): Promise<void> {
   } else {
     const stdio = new StdioServerTransport();
     await endpoint.connect(stdio);
+  }
+
+  // MCP_NO_POLLERS lets an eval harness spin up a tools-only MCP (gateway +
+  // tool handlers) without the event pollers. The Telegram getUpdates poll is
+  // exclusive — a second poller against the same bot 409s the droplet — so the
+  // GAIA bench (and any local tool smoke-test) sets this to borrow the tool
+  // surface without competing for signals.
+  if (process.env.MCP_NO_POLLERS === "1") {
+    console.error("[mcp] MCP_NO_POLLERS=1 — tools only, pollers disabled");
+    return;
   }
 
   startTelegramPoller();

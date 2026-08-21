@@ -1,5 +1,7 @@
-# Three services: postgres (news + pgvector), mcp (integrations), agent
-# (supervisor). The agent never touches Telegram/Gmail/Monobank credentials,
+# Core services: postgres (news + pgvector), mcp (integrations), agent
+# (supervisor); plus mcp-tunnel + tunnel-client, a second, tool-restricted MCP
+# reachable only by ChatGPT through OpenAI's Secure MCP Tunnel.
+# The agent never touches Telegram/Gmail/Monobank credentials,
 # the Gmail attachments storage, the MCP sqlite, or the postgres URL — it
 # only has its own agent.db, the live skills overlay, and the network link
 # to mcp:3000. Postgres lives behind mcp; the agent talks to it solely
@@ -49,6 +51,74 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+    restart: unless-stopped
+
+  # Second MCP instance, restricted surface, for ChatGPT via OpenAI's Secure
+  # MCP Tunnel (.claude/tasks/mcp-auth-and-tool-scoping.md, A2 + A6). Same
+  # image and same code as `mcp`; the only difference is MCP_TOOLSETS, which
+  # makes it register exactly four tools — search_news, list_news,
+  # fetch_article, send_telegram_message. Everything else (Gmail, Monobank,
+  # fs, the signals queue, the scheduler, the userbot, dreaming, knowledge,
+  # pdf) is never registered, so it does not appear in tools/list at all. A
+  # restricted instance also skips the gateway, so no third-party upstream
+  # tool (tavily__*, …) is reachable through the tunnel.
+  #
+  # MCP_NO_POLLERS=1 is mandatory: Telegram getUpdates is exclusive, and a
+  # second poller against the same bot 409s the `mcp` service.
+  #
+  # It DOES mount mcp-data: send_telegram_message writes every outgoing
+  # message into the `telegram_messages` table in tokens.db, so without the
+  # shared volume the chat log the agent reads would silently miss anything
+  # ChatGPT sent. mcp-storage (Gmail attachments) is deliberately NOT
+  # mounted — nothing in the restricted surface touches it.
+  mcp-tunnel:
+    build: .
+    image: mcp-tools-image
+    command: sh -c "pnpm setup:mcp && pnpm mcp:serve"
+    env_file:
+      - .env.mcp
+    environment:
+      MCP_TRANSPORT: http
+      MCP_PORT: "3001"
+      MCP_NO_POLLERS: "1"
+      MCP_TOOLSETS: news-read,telegram-send
+      DATABASE_URL: postgres://${POSTGRES_USER:-mcp}:${POSTGRES_PASSWORD:-mcp}@postgres:5432/${POSTGRES_DB:-mcp}
+    volumes:
+      - mcp-data:/app/packages/mcp/data        # telegram_messages chat log (shared with mcp)
+    expose:
+      - "3001"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      # Not a correctness guarantee, only ordering: let `mcp` apply schema.sql
+      # to the shared sqlite first so the two `pnpm setup:mcp` runs are less
+      # likely to collide. `restart: unless-stopped` covers the residual race.
+      mcp:
+        condition: service_started
+    restart: unless-stopped
+
+  # OpenAI's customer-run tunnel daemon. Outbound-only HTTPS long-poll to
+  # api.openai.com; it pulls queued MCP requests and forwards them to
+  # mcp-tunnel over the compose network. No inbound port is published, here or
+  # anywhere — that is the whole point of A6/A3.
+  #
+  # Config is env-only (no profile YAML needed). CONTROL_PLANE_API_KEY must be
+  # a *restricted* key with Tunnels Read + Use — not an admin key; the admin
+  # key (OPENAI_ADMIN_KEY) is only for tunnel CRUD and must not be given to a
+  # long-lived daemon. Both values live in .env.tunnel (git-ignored).
+  #
+  # Image tag is pinned; `latest` on a security-boundary component is not
+  # something to inherit silently on a rebuild.
+  tunnel-client:
+    image: ghcr.io/openai/tunnel-client:v0.0.12
+    env_file:
+      - .env.tunnel
+    environment:
+      MCP_SERVER_URL: http://mcp-tunnel:3001/mcp
+      LOG_LEVEL: info
+      LOG_FORMAT: json
+    depends_on:
+      - mcp-tunnel
     restart: unless-stopped
 
   agent:
