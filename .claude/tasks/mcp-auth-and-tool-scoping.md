@@ -180,10 +180,17 @@ The ChatGPT slice of A2 + A6 is in `docker-compose.yml` and
   boundary is one process per audience.
 - The tunnel's audience is a second service `mcp-tunnel`
   (`MCP_TOOLSETS=news-read,telegram-send`, `MCP_NO_POLLERS=1`, `expose`
-  only) plus `tunnel-client` reading `.env.tunnel`. Nothing is published.
+  only) plus `tunnel-client`. Nothing is published.
 - A restricted instance never attaches the gateway, so the `tavily__*`
   clause below already holds for this path — upstream tools can't be named
   in the allow-list, so they're excluded wholesale rather than filtered.
+  That matters concretely: `.env.mcp` on the droplet holds `TAVILY_API_KEY`,
+  so a gateway-fronted tunnel would let ChatGPT spend upstream credits.
+- Open hygiene item: `tunnel-client` takes `env_file: .env.mcp`, so a
+  third-party binary's process env holds every integration secret we own.
+  It only reads `OPENAI_TUNNEL_*`, and the tunnel key is presently a
+  project key rather than a `Tunnels Read + Use` restricted one. Splitting
+  the key out into its own env file is the tightening step.
 - `?api-key=` (A4) is not needed yet: the tunnel reaches an unauthenticated
   endpoint on the private compose network, exactly as the agent does. It
   becomes necessary the moment a second audience shares one instance.

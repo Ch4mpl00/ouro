@@ -48,8 +48,7 @@ mcp-tools/
 ├── .mcp.json               registers packages/mcp with Claude Code (stdio)
 ├── .env.mcp                MCP container env (integration creds)
 ├── .env.agent              agent container env (DeepSeek key, model)
-├── .env.tunnel             tunnel-client creds (gitignored)
-├── .env.example, .env.mcp.example, .env.agent.example, .env.tunnel.example
+├── .env.example, .env.mcp.example, .env.agent.example
 ├── docker-compose.yml      mcp + agent, plus mcp-tunnel + tunnel-client
 ├── Dockerfile              one image for both
 ├── skills.default/         shipped skills (git-tracked, read-only fallback)
@@ -314,7 +313,13 @@ without them:
 - **`tunnel-client`** — `ghcr.io/openai/tunnel-client`, OpenAI's daemon. It
   long-polls `api.openai.com` outbound and forwards MCP requests to
   `http://mcp-tunnel:3001/mcp`. Nothing is published; ChatGPT only ever knows
-  a `tunnel_id`. Credentials go in `.env.tunnel` (see `.env.tunnel.example`):
-  `CONTROL_PLANE_TUNNEL_ID` plus a restricted `CONTROL_PLANE_API_KEY`
-  (Tunnels Read + Use — never an admin key). In ChatGPT the connector is a
-  developer-mode app with *Connection → Tunnel*.
+  a `tunnel_id`. In ChatGPT the connector is a developer-mode app with
+  *Connection → Tunnel*.
+
+  Credentials live in `.env.mcp` as `OPENAI_TUNNEL_ID` +
+  `OPENAI_TUNNEL_API_KEY`; the service's entrypoint is the single place that
+  maps them onto the daemon's `CONTROL_PLANE_TUNNEL_ID` /
+  `--control-plane.api-key`. Note that compose expands `${VAR}` from the
+  shell and the project-root `.env`, **not** from a service's `env_file`, so
+  the mapping has to happen inside the container. The key should be a
+  restricted one (Tunnels Read + Use), never the admin key.

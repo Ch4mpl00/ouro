@@ -5,7 +5,6 @@ dist/
 .env.mcp
 .env.agent
 .env.postgres
-.env.tunnel
 *.log
 
 # Local attachment / blob storage
