@@ -92,15 +92,48 @@ describe("registerToolsets", () => {
   // The contract the ChatGPT tunnel deployment depends on: exactly these six
   // tools, and nothing from Gmail / Monobank / fs / signals / scheduler /
   // userbot / dreaming / knowledge / pdf.
-  it("exposes exactly the six tunnel tools for news-read + telegram-send + skills", async () => {
-    expect(await listToolNames(["news-read", "telegram-send", "skills"])).toEqual([
+  // Pins docker-compose's MCP_TOOLSETS for mcp-tunnel exactly. If this list
+  // and that env var drift apart, ChatGPT silently gets a surface nobody
+  // decided on — in either direction.
+  it("exposes exactly the tunnel surface for news-read + telegram-send + skills + memory", async () => {
+    expect(await listToolNames(["news-read", "telegram-send", "skills", "memory"])).toEqual([
+      "append_doc",
+      "create_project",
+      "doc_history",
       "fetch_article",
+      "get_fact",
+      "list_memory",
       "list_news",
       "list_skills",
+      "patch_doc",
+      "read_doc",
       "read_skill",
+      "recall",
+      "remember",
+      "revert_patch",
       "search_news",
       "send_telegram_message",
+      "update_fact",
+      "write_doc",
     ]);
+  });
+
+  // Everything a third-party client can reach must be safe to hand out: no
+  // personal account, no signal delivery, no arbitrary fetch.
+  it("keeps the tunnel surface clear of the tools that must never leave the droplet", async () => {
+    const tunnel = await listToolNames(["news-read", "telegram-send", "skills", "memory"]);
+
+    for (const forbidden of [
+      "get_next_signal",
+      "list_nashdom_mails",
+      "list_monobank_transactions",
+      "read_file",
+      "fetch_url",
+      "schedule_task",
+      "get_telegram_chat_history",
+    ]) {
+      expect(tunnel).not.toContain(forbidden);
+    }
   });
 
   it("keeps shared tunnel capabilities in the default surface", async () => {

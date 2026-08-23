@@ -42,6 +42,7 @@ services:
     environment:
       MCP_TRANSPORT: http
       MCP_PORT: "3000"
+      MCP_MEMORY_ACTOR: supervisor
       DATABASE_URL: postgres://${POSTGRES_USER:-mcp}:${POSTGRES_PASSWORD:-mcp}@postgres:5432/${POSTGRES_DB:-mcp}
     volumes:
       - mcp-data:/app/packages/mcp/data        # tokens.db, OAuth, signals, watermarks
@@ -56,11 +57,10 @@ services:
   # Second MCP instance, restricted surface, for ChatGPT via OpenAI's Secure
   # MCP Tunnel (.claude/tasks/mcp-auth-and-tool-scoping.md, A2 + A6). Same
   # image and same code as `mcp`; the only difference is MCP_TOOLSETS, which
-  # makes it register exactly six tools — search_news, list_news,
-  # fetch_article, send_telegram_message, list_skills, read_skill. Everything
-  # else (Gmail, Monobank,
-  # fs, the signals queue, the scheduler, the userbot, dreaming, knowledge,
-  # pdf) is never registered, so it does not appear in tools/list at all. A
+  # makes it register news reading, one Telegram write, the skills export and
+  # unified memory — and nothing else. Gmail, Monobank, fs, the signals queue,
+  # the scheduler, the userbot, dreaming, knowledge and pdf are never
+  # registered, so they do not appear in tools/list at all. A
   # restricted instance also skips the gateway, so no third-party upstream
   # tool (tavily__*, …) is reachable through the tunnel.
   #
@@ -82,11 +82,18 @@ services:
       MCP_TRANSPORT: http
       MCP_PORT: "3001"
       MCP_NO_POLLERS: "1"
-      MCP_TOOLSETS: news-read,telegram-send,skills
+      MCP_TOOLSETS: news-read,telegram-send,skills,memory
+      # Signs ChatGPT's writes to shared memory, so doc_history says who did
+      # what. Audit metadata, not access control — the space is shared.
+      MCP_MEMORY_ACTOR: chatgpt
       DATABASE_URL: postgres://${POSTGRES_USER:-mcp}:${POSTGRES_PASSWORD:-mcp}@postgres:5432/${POSTGRES_DB:-mcp}
     volumes:
       - mcp-data:/app/packages/mcp/data        # telegram_messages chat log (shared with mcp)
       - agent-skills:/app/skills:ro            # live skills overlay exported to ChatGPT
+    # Memory lives in the shared Postgres above, so ChatGPT reads and writes
+    # the SAME projects and facts as the supervisor — that is the point of the
+    # task. Several clients can hold this instance at once because a restricted
+    # instance is multi-session and has no signals tools to race over.
     expose:
       - "3001"
     # tunnel-client probes its MCP target once at startup and does NOT retry a
