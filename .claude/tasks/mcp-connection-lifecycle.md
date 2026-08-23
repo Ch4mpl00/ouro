@@ -20,8 +20,9 @@ the same signals (double-processing, lost work). So single-connect is a
 correctness constraint, not just a simplification.
 
 The problem is resilience, not concurrency. When the agent container
-restarts ungracefully (which is its normal failure mode — `supervisor`
-exits with code 1 on any MCP error and Docker restarts it), the old
+restarts ungracefully (which was its normal failure mode — `supervisor`
+exited with code 1 on any MCP error at startup and Docker restarted
+it; see the client half of the update below), the old
 session's transport is never closed, so `transport.onclose` never fires
 and the stale session is never removed. The single `server` stays bound
 to the dead transport. Every subsequent `initialize` from the
@@ -43,9 +44,53 @@ Resilience (P1, the real outage path):
   transport and/or detach the old server so `server.connect` is valid
   again. Single-connect semantics preserved: at most one live session,
   newest wins.
+- The agent survives an MCP that is unreachable or erroring **at
+  startup**: it retries the initial connect with capped backoff and
+  logs each attempt, instead of exiting 1 and letting Docker be the
+  retry loop. Deterministic startup failures (missing env var, sqlite
+  migration, a skill naming an unknown MCP tool, a 4xx from the MCP
+  endpoint) stay fatal — retrying those forever only hides them.
 - Verify: kill the agent ungracefully (`docker kill agent`), let Docker
   restart it, confirm it reconnects without an MCP restart.
 
+> **Update 2026-08-23 (later): the P1 resilience item is DONE, both
+> sides.**
+>
+> *Server* (`packages/mcp/src/http-transport.ts`): a new `initialize`
+> evicts the bound session ("newest wins") before connecting, so a
+> reconnecting agent always gets in. Covered by
+> `http-transport.test.ts`, which fails without the eviction.
+>
+> *Client* (`packages/agent/src/mcp-client.ts`): `connectMcp` takes a
+> `startupRetry` policy and the supervisor passes `RETRY_UNTIL_UP`
+> (1s → 30s capped, unbounded attempts, one log line per attempt). The
+> mid-flight reconnect inside `callTool` uses the bounded
+> `CONNECT_RETRY` instead, so a tool call the workflow executor is
+> awaiting can still fail rather than hang. `isFatalConnectError` keeps
+> 4xx (bar 408/429) and `UnauthorizedError` fatal, and `MCP_URL` is
+> parsed once outside the loop so a typo still crashes on boot.
+> Covered by `mcp-client.test.ts`, which fails without the retry.
+>
+> Two halves because either one alone leaves a hole: the eviction stops
+> the 500 that started the loop, the client retry stops *any* startup
+> blip (an MCP that is merely slow to boot — compose has no healthcheck
+> gate on `mcp` for the agent) from becoming exit-1-restart-repeat.
+>
+> Not verified: nobody has reproduced the live crash-loop against a real
+> ungracefully-killed container. The `docker kill agent` check above is
+> still owed.
+>
+> Runtime detachment was investigated and is NOT a third hole: the SDK's
+> `StreamableHTTPClientTransport` does not close itself on a failed
+> `send`, so after an MCP restart the agent's next call gets the 400
+> "No valid session id", `isSessionLostError` fires, and it reconnects.
+> The poll loop's own catch+sleep covers the interval.
+>
+> It recurred first: after an `mcp` restart the supervisor hit
+> `Already connected` → 500 → exit 1 → restart, 78 times, and only a
+> manual `docker compose restart mcp` broke it. Exactly the 2026-06-15
+> incident, so the "resilience, not concurrency" framing below was right.
+>
 > **Update 2026-08-23.** Multi-connect now exists for *restricted*
 > instances only: `runHttpTransport({ multiSession })` builds an
 > `McpServer` per session, and `main()` turns it on exactly when
