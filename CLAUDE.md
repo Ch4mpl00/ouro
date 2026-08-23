@@ -313,6 +313,12 @@ Rules worth knowing before touching the code:
 The rules live in `service.ts` and the store underneath is dumb CRUD, so the
 whole contract is tested against `store.memory.ts` without a Postgres.
 
+**Who writes:** `MCP_MEMORY_ACTOR` names the instance (`supervisor` for `mcp`,
+`chatgpt` for `mcp-tunnel`) and is stamped onto every patch. Audit metadata,
+never access control — one shared space (D6). It is a property of the
+instance, not something a client declares, because a self-declared actor is
+forgeable; real per-token identity is `.claude/tasks/mcp-auth-and-tool-scoping.md` A2.
+
 ## Agent skills
 
 Live under `skills.default/` (git-tracked, shipped in image) with an
@@ -376,12 +382,16 @@ Two extra compose services, both optional — the rest of the stack runs
 without them:
 
 - **`mcp-tunnel`** — a second `mcp` process on port 3001 with
-  `MCP_NO_POLLERS=1` and `MCP_TOOLSETS=news-read,telegram-send,skills`, i.e.
-  exactly `search_news` / `list_news` / `fetch_article` /
-  `send_telegram_message` / `list_skills` / `read_skill` and
-  no gateway. `expose` only, like `mcp` — never `ports`. It shares the
-  `mcp-data` volume because `send_telegram_message` appends to the
-  `telegram_messages` chat log.
+  `MCP_NO_POLLERS=1` and
+  `MCP_TOOLSETS=news-read,telegram-send,skills,memory`: news reading, one
+  Telegram write, the skills export, unified memory, and no gateway. The exact
+  list is pinned by a test in `toolsets.test.ts` — if that list and this env
+  var drift apart, ChatGPT silently gets a surface nobody chose. `expose`
+  only, like `mcp` — never `ports`. It shares the `mcp-data` volume because
+  `send_telegram_message` appends to the `telegram_messages` chat log, and the
+  same Postgres as `mcp`, so **memory really is shared**: ChatGPT reads and
+  writes the same projects and facts as the supervisor, signed
+  `MCP_MEMORY_ACTOR=chatgpt` in `doc_history`.
 - **`tunnel-client`** — `ghcr.io/openai/tunnel-client`, OpenAI's daemon. It
   long-polls `api.openai.com` outbound and forwards MCP requests to
   `http://mcp-tunnel:3001/mcp`. Nothing is published; ChatGPT only ever knows
