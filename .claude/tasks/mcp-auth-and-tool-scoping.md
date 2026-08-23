@@ -87,6 +87,13 @@ instances (D1) register only the permitted tools, so an unauthorised
 tool is not merely rejected — it is **invisible**, which is also what
 keeps prompts small.
 
+> **Shipped so far (2026-08-23):** scoping is **per instance**, not yet
+> per token — `MCP_TOOLSETS` picks the groups an MCP process registers,
+> and the tunnel gets its own process. Per-session `McpServer` instances
+> now exist too (`http-transport.ts`, `multiSession`), enabled for
+> restricted instances so several clients can connect at once. The token
+> store, `mcp_tokens`, and role-derived scoping are still to do.
+
 **A3 — prefer not publishing the endpoint at all.** Every client can be
 served without a public listener:
 

@@ -87,6 +87,22 @@ services:
       - mcp-data:/app/packages/mcp/data        # telegram_messages chat log (shared with mcp)
     expose:
       - "3001"
+    # tunnel-client probes its MCP target once at startup and does NOT retry a
+    # refused connection — on 2026-08-23 it came up before this service was
+    # listening and sat there dead until a manual restart. So the daemon waits
+    # for this healthcheck instead of for "container started".
+    # A bare POST with no session is answered 400 by design ("send an
+    # initialize request first"), which is proof the HTTP listener is up.
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:3001/mcp',{method:'POST'}).then(r=>process.exit(r.status<500?0:1)).catch(()=>process.exit(1))"
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
     depends_on:
       postgres:
         condition: service_healthy
@@ -148,7 +164,8 @@ services:
         export CONTROL_PLANE_TUNNEL_ID="$${OPENAI_TUNNEL_ID:?set OPENAI_TUNNEL_ID in .env.mcp}"
         exec /usr/bin/tunnel-client run --control-plane.api-key=env:OPENAI_TUNNEL_API_KEY
     depends_on:
-      - mcp-tunnel
+      mcp-tunnel:
+        condition: service_healthy
     restart: unless-stopped
 
   agent:
