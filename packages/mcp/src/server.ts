@@ -1,5 +1,6 @@
 import "dotenv/config";
 import "./openai-native-fetch";
+import path from "node:path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { runHttpTransport, type ConnectableServer } from "./http-transport";
@@ -9,6 +10,7 @@ import { startSchedulerPoller } from "./services/scheduler";
 import { createPgClient } from "./db/pg/client";
 import { createNewsModule, startNewsModule } from "./services/news";
 import { createKnowledgeModule } from "./services/knowledge";
+import { createSkillsModule } from "./services/skills";
 import { createGatewayModule, loadGatewayConfig } from "./services/gateway";
 import {
   DEFAULT_TOOLSETS,
@@ -43,9 +45,13 @@ async function main(): Promise<void> {
 
   const newsModule = createNewsModule({ db: pg.db });
   const knowledgeModule = createKnowledgeModule({ db: pg.db });
+  const skillsModule = createSkillsModule({
+    liveDir: path.resolve(process.cwd(), "skills"),
+    defaultsDir: path.resolve(process.cwd(), "skills.default"),
+  });
 
   // MCP_TOOLSETS narrows the tool surface for an instance serving a specific
-  // audience (the ChatGPT tunnel gets news-read,telegram-send). Unset → the
+  // audience (the ChatGPT tunnel gets news-read,telegram-send,skills). Unset → the
   // full surface, exactly as before.
   const toolsets = parseToolsets(process.env.MCP_TOOLSETS);
   if (toolsets.restricted) {
@@ -67,6 +73,7 @@ async function main(): Promise<void> {
     const ownServer = createServer({
       news: newsModule.repository,
       knowledge: knowledgeModule.repository,
+      skills: skillsModule.catalog,
       toolsets: toolsets.names,
     });
     if (upstreams.length === 0) return ownServer;

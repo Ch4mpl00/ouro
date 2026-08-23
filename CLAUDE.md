@@ -227,6 +227,9 @@ also see them when running `claude` locally with `.mcp.json` registered.
   search across the unified store: HN, Habr, channel posts)
 - **PDF** — `read_pdf`
 - **Files** — `read_file`
+- **Skills** — `list_skills`, `read_skill` (exact active `.md` filenames +
+  contents, plus the improver's `.patch.md` overlay and the composed
+  `effectiveInstructions` the agent actually runs)
 - **Signals queue** — `get_next_signal`, `list_signals`
 - **Scheduler** — `schedule_task`, `list_scheduled_tasks`,
   `cancel_scheduled_task`
@@ -242,9 +245,10 @@ also see them when running `claude` locally with `.mcp.json` registered.
 One MCP process serves one audience. `packages/mcp/src/toolsets.ts` holds the
 named toolset → registrar map (`gmail`, `telegram`, `telegram-send`,
 `monobank`, `pdf`, `fs`, `signals`, `news-read`, `knowledge`, `dreaming`,
-`userbot`, `scheduler`); `MCP_TOOLSETS=news-read,telegram-send` makes an
-instance register only those groups. Unset/empty = every group, i.e. the
-behaviour before scoping existed. An unknown name is a boot error.
+`userbot`, `scheduler`, `skills`);
+`MCP_TOOLSETS=news-read,telegram-send,skills` makes an instance register only
+those groups. Unset/empty = every group, i.e. the behaviour before scoping
+existed. An unknown name is a boot error.
 
 Scoping works by **not registering**, so an out-of-scope tool never appears in
 `tools/list` — invisible, not merely rejected. A restricted instance also skips
@@ -266,6 +270,14 @@ volume — written by the `dreaming` skill when it self-revises).
 - `routing` — always loaded on top (fallback agentic path only).
 - `planner` — the workflow compiler's system prompt.
 - `recovery` — spawned by the fallback path to phrase failures to the user.
+
+The improver writes an append-only overlay at `skills/<name>.patch.md`; the
+runtime glues it onto the end of the body with `appendPatch`, so the
+instructions in force are body + patch. **`packages/mcp/src/services/skills/`
+re-implements that composition** for the `read_skill` export — the two
+packages may not import each other, so if you change `appendPatch` (marker,
+spacing), change the MCP copy too or the export starts describing a skill
+nobody runs. `module.test.ts` pins the expected output as a literal.
 
 ## Running
 
@@ -305,8 +317,9 @@ Two extra compose services, both optional — the rest of the stack runs
 without them:
 
 - **`mcp-tunnel`** — a second `mcp` process on port 3001 with
-  `MCP_NO_POLLERS=1` and `MCP_TOOLSETS=news-read,telegram-send`, i.e. exactly
-  `search_news` / `list_news` / `fetch_article` / `send_telegram_message` and
+  `MCP_NO_POLLERS=1` and `MCP_TOOLSETS=news-read,telegram-send,skills`, i.e.
+  exactly `search_news` / `list_news` / `fetch_article` /
+  `send_telegram_message` / `list_skills` / `read_skill` and
   no gateway. `expose` only, like `mcp` — never `ports`. It shares the
   `mcp-data` volume because `send_telegram_message` appends to the
   `telegram_messages` chat log.
