@@ -6,7 +6,7 @@ import { createAgentDb } from "../db/client";
 import { createMemoryStore } from "../db/memory";
 import { createTraceStore } from "../db/trace-store";
 import { createEngine, type Engine } from "../engine";
-import { connectMcp } from "../mcp-client";
+import { connectMcp, RETRY_UNTIL_UP } from "../mcp-client";
 import { DEFAULT_PRESETS } from "../models";
 import {
   createDeepseekProvider,
@@ -145,7 +145,24 @@ async function main(): Promise<void> {
   const memory = createMemoryStore(db);
   const traceStore = createTraceStore(db);
   const skillStore = createSkillStore();
-  const mcp = await connectMcp();
+  // The ONE startup step allowed to be slow instead of fatal. Everything else
+  // in this function (missing env var, sqlite migration failure, a skill that
+  // names a tool the MCP doesn't have) is a deterministic misconfiguration:
+  // it must still crash, loudly, because retrying it forever only hides it.
+  // An unreachable or 500-ing MCP is different — it is the other half of a
+  // two-container deploy, and the correct response is to wait for it.
+  //
+  // Without this, `connect()` throwing fell through to `main().catch` →
+  // exit(1) → Docker restart → connect → … which is exactly how the
+  // 2026-06-15 and 2026-08-23 (78 restarts) crash-loops sustained themselves.
+  // See .claude/tasks/mcp-connection-lifecycle.md.
+  console.log(
+    `[supervisor] connecting to mcp (${process.env.MCP_TRANSPORT ?? "stdio"}${
+      process.env.MCP_URL ? ` ${process.env.MCP_URL}` : ""
+    })…`,
+  );
+  const mcp = await connectMcp({ startupRetry: RETRY_UNTIL_UP });
+  console.log("[supervisor] mcp connected");
   // Sandboxed code execution (Codex service). Same client used by the
   // `code_agent` tool on both the workflow and AgentLoop paths.
   const codex = createCodexClient();
