@@ -9,6 +9,16 @@ const TOOLS_ARRAY_RE = /^tools:\s*\[(.*?)\]\s*$/m;
 
 export type SkillSource = "live" | "default";
 
+// The improver's append-only overlay: `skills/<name>.patch.md`. At runtime the
+// agent glues it onto the END of the skill body (agent-side `appendPatch`,
+// packages/agent/src/skills.ts) behind this marker, so the instructions in
+// force are body + patch, not the body alone. Exporting the body on its own
+// would show a reader a skill the agent no longer runs.
+//
+// Patches live ONLY in the live overlay — defaults never ship one — so they do
+// not fall back to skills.default/, mirroring the agent's `readPatch`.
+const PATCH_MARKER = "<!-- improver-patch -->";
+
 export interface SkillSummary {
   id: string;
   name: string;
@@ -19,10 +29,21 @@ export interface SkillSummary {
   source: SkillSource;
   sizeBytes: number;
   modifiedAt: string;
+  // Whether an improver patch is currently in force. Surfaced in the catalog
+  // so a reader can tell without a second call which skills carry one.
+  patched: boolean;
 }
 
 export interface SkillDocument extends SkillSummary {
+  // The exact bytes of the active .md file — frontmatter included, patch NOT
+  // applied. This is the editable source.
   content: string;
+  // The exact bytes of the patch overlay, or null when there is none.
+  patch: string | null;
+  // What the agent actually runs: body (frontmatter stripped, as the agent
+  // strips it) with the patch appended behind PATCH_MARKER. Equal to the
+  // stripped body when unpatched.
+  effectiveInstructions: string;
 }
 
 export interface SkillCatalog {
@@ -69,6 +90,15 @@ function validateFileName(fileName: string): string {
 function bodyWithoutFrontmatter(raw: string): string {
   const match = FRONTMATTER_RE.exec(raw);
   return match ? raw.slice(match[0].length) : raw;
+}
+
+// Byte-for-byte the agent's `appendPatch`. The two MUST agree: if this export
+// composes the patch differently from the runtime, a reader is being shown a
+// skill nobody runs — the exact failure the patch export exists to prevent.
+function appendPatch(body: string, patch: string): string {
+  const trimmed = patch.trim();
+  if (trimmed.length === 0) return body;
+  return `${body.replace(/\s+$/, "")}\n\n${PATCH_MARKER}\n${trimmed}\n`;
 }
 
 function fallbackTitle(name: string): string {
@@ -165,8 +195,22 @@ export function createSkillsModule(deps: SkillsModuleDeps): SkillsModule {
     return files;
   }
 
+  // The improver's overlay for one skill, live layer only. Absent is the
+  // normal case, so ENOENT is not an error.
+  async function readPatch(name: string): Promise<string | null> {
+    try {
+      return await fs.readFile(path.join(liveDir, `${name}.patch.md`), "utf-8");
+    } catch (error) {
+      if (isMissingFile(error)) return null;
+      throw error;
+    }
+  }
+
   async function readFromRef(ref: SkillFileRef): Promise<SkillDocument> {
-    const content = await fs.readFile(ref.file, "utf-8");
+    const [content, patch] = await Promise.all([
+      fs.readFile(ref.file, "utf-8"),
+      readPatch(ref.name),
+    ]);
     const title = extractTitle(ref.name, content);
     return {
       id: ref.name,
@@ -178,7 +222,10 @@ export function createSkillsModule(deps: SkillsModuleDeps): SkillsModule {
       source: ref.source,
       sizeBytes: Buffer.byteLength(content, "utf-8"),
       modifiedAt: new Date(ref.modifiedAtMs).toISOString(),
+      patched: patch !== null && patch.trim().length > 0,
       content,
+      patch,
+      effectiveInstructions: appendPatch(bodyWithoutFrontmatter(content), patch ?? ""),
     };
   }
 
@@ -187,7 +234,7 @@ export function createSkillsModule(deps: SkillsModuleDeps): SkillsModule {
       const files = await activeFiles();
       const documents = await Promise.all([...files.values()].map(readFromRef));
       return documents
-        .map(({ content: _content, ...summary }) => summary)
+        .map(({ content: _c, patch: _p, effectiveInstructions: _e, ...summary }) => summary)
         .sort((a, b) => a.name.localeCompare(b.name));
     },
 

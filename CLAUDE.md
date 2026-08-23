@@ -227,7 +227,9 @@ also see them when running `claude` locally with `.mcp.json` registered.
   search across the unified store: HN, Habr, channel posts)
 - **PDF** — `read_pdf`
 - **Files** — `read_file`
-- **Skills** — `list_skills`, `read_skill` (exact active `.md` filenames/content)
+- **Skills** — `list_skills`, `read_skill` (exact active `.md` filenames +
+  contents, plus the improver's `.patch.md` overlay and the composed
+  `effectiveInstructions` the agent actually runs)
 - **Signals queue** — `get_next_signal`, `list_signals`
 - **Scheduler** — `schedule_task`, `list_scheduled_tasks`,
   `cancel_scheduled_task`
@@ -268,6 +270,14 @@ volume — written by the `dreaming` skill when it self-revises).
 - `routing` — always loaded on top (fallback agentic path only).
 - `planner` — the workflow compiler's system prompt.
 - `recovery` — spawned by the fallback path to phrase failures to the user.
+
+The improver writes an append-only overlay at `skills/<name>.patch.md`; the
+runtime glues it onto the end of the body with `appendPatch`, so the
+instructions in force are body + patch. **`packages/mcp/src/services/skills/`
+re-implements that composition** for the `read_skill` export — the two
+packages may not import each other, so if you change `appendPatch` (marker,
+spacing), change the MCP copy too or the export starts describing a skill
+nobody runs. `module.test.ts` pins the expected output as a literal.
 
 ## Running
 

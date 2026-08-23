@@ -52,13 +52,54 @@ describe("skills catalog", () => {
       description: "Active overlay instructions.",
       tools: [],
       source: "live",
+      // alpha.patch.md is not a skill of its own, but it IS alpha's patch.
+      patched: true,
     });
     expect(skills[1]).toMatchObject({
       fileName: "beta.md",
       title: "Beta title",
       tools: "*",
       source: "default",
+      patched: false,
     });
+  });
+
+  // The agent runs body + improver patch (appendPatch, packages/agent/src/skills.ts).
+  // Exporting only the body would show a reader a skill that is no longer the
+  // one in force — which is the whole reason the patch is exported.
+  it("composes the patch into effectiveInstructions exactly as the agent does", async () => {
+    const raw = "---\ntools: []\n---\n\n# Patched\n\nBase instructions.\n";
+    await fs.writeFile(path.join(defaultsDir, "patched.md"), raw);
+    await fs.writeFile(path.join(liveDir, "patched.patch.md"), "Lesson learned.\n");
+    const { catalog } = createSkillsModule({ liveDir, defaultsDir });
+
+    const skill = await catalog.readSkill("patched.md");
+
+    // Source file stays byte-exact — it is what an editor would write back.
+    expect(skill?.content).toBe(raw);
+    expect(skill?.patch).toBe("Lesson learned.\n");
+    expect(skill?.patched).toBe(true);
+    // Frontmatter stripped, single blank line, marker, patch, trailing newline.
+    // This literal must stay in step with the agent's appendPatch; the two
+    // packages must not import each other, so parity is asserted, not shared.
+    expect(skill?.effectiveInstructions).toBe(
+      "# Patched\n\nBase instructions.\n\n<!-- improver-patch -->\nLesson learned.\n",
+    );
+  });
+
+  // A patch belongs to the live overlay only — defaults never ship one, and a
+  // deleted patch must revert the skill rather than linger.
+  it("reports no patch when the overlay has none", async () => {
+    const raw = "---\ntools: []\n---\n\n# Plain\n\nBase only.\n";
+    await fs.writeFile(path.join(defaultsDir, "plain.md"), raw);
+    await fs.writeFile(path.join(defaultsDir, "plain.patch.md"), "must be ignored\n");
+    const { catalog } = createSkillsModule({ liveDir, defaultsDir });
+
+    const skill = await catalog.readSkill("plain.md");
+
+    expect(skill?.patch).toBeNull();
+    expect(skill?.patched).toBe(false);
+    expect(skill?.effectiveInstructions).toBe("# Plain\n\nBase only.\n");
   });
 
   it("reads the exact selected file contents and rejects stems or paths", async () => {

@@ -32,8 +32,15 @@ describe("skills MCP tools", () => {
       source: "default",
       sizeBytes: 42,
       modifiedAt: "2026-08-23T00:00:00.000Z",
+      patched: true,
     };
-    const document: SkillDocument = { ...summary, content: "# Telegram\n" };
+    const document: SkillDocument = {
+      ...summary,
+      content: "---\ntools: *\n---\n\n# Telegram\n",
+      patch: "Always reply in Russian.\n",
+      effectiveInstructions:
+        "# Telegram\n\n<!-- improver-patch -->\nAlways reply in Russian.\n",
+    };
     const catalog: SkillCatalog = {
       listSkills: async () => [summary],
       readSkill: async (fileName) => fileName === summary.fileName ? document : null,
@@ -54,10 +61,14 @@ describe("skills MCP tools", () => {
         arguments: { fileName: "telegram.md" },
       })).content,
     );
+    // The patch must reach the caller as its own field — a reader that only
+    // gets `content` would be looking at instructions the agent no longer runs.
     expect(read).toEqual({
       found: true,
       fileName: "telegram.md",
       content: document.content,
+      patch: document.patch,
+      effectiveInstructions: document.effectiveInstructions,
       metadata: summary,
     });
 
