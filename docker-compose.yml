@@ -56,8 +56,9 @@ services:
   # Second MCP instance, restricted surface, for ChatGPT via OpenAI's Secure
   # MCP Tunnel (.claude/tasks/mcp-auth-and-tool-scoping.md, A2 + A6). Same
   # image and same code as `mcp`; the only difference is MCP_TOOLSETS, which
-  # makes it register exactly four tools — search_news, list_news,
-  # fetch_article, send_telegram_message. Everything else (Gmail, Monobank,
+  # makes it register exactly six tools — search_news, list_news,
+  # fetch_article, send_telegram_message, list_skills, read_skill. Everything
+  # else (Gmail, Monobank,
   # fs, the signals queue, the scheduler, the userbot, dreaming, knowledge,
   # pdf) is never registered, so it does not appear in tools/list at all. A
   # restricted instance also skips the gateway, so no third-party upstream
@@ -81,10 +82,11 @@ services:
       MCP_TRANSPORT: http
       MCP_PORT: "3001"
       MCP_NO_POLLERS: "1"
-      MCP_TOOLSETS: news-read,telegram-send
+      MCP_TOOLSETS: news-read,telegram-send,skills
       DATABASE_URL: postgres://${POSTGRES_USER:-mcp}:${POSTGRES_PASSWORD:-mcp}@postgres:5432/${POSTGRES_DB:-mcp}
     volumes:
       - mcp-data:/app/packages/mcp/data        # telegram_messages chat log (shared with mcp)
+      - agent-skills:/app/skills:ro            # live skills overlay exported to ChatGPT
     expose:
       - "3001"
     # tunnel-client probes its MCP target once at startup and does NOT retry a

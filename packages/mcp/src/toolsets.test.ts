@@ -31,6 +31,10 @@ function stubDeps(): ToolsetDeps {
       findNotes: unused,
       embedMissingBatch: unused,
     },
+    skills: {
+      listSkills: unused,
+      readSkill: unused,
+    },
   };
 }
 
@@ -69,22 +73,32 @@ describe("parseToolsets", () => {
 });
 
 describe("registerToolsets", () => {
-  // The contract the ChatGPT tunnel deployment depends on: exactly these four
+  // The contract the ChatGPT tunnel deployment depends on: exactly these six
   // tools, and nothing from Gmail / Monobank / fs / signals / scheduler /
   // userbot / dreaming / knowledge / pdf.
-  it("exposes exactly the four tunnel tools for news-read + telegram-send", async () => {
-    expect(await listToolNames(["news-read", "telegram-send"])).toEqual([
+  it("exposes exactly the six tunnel tools for news-read + telegram-send + skills", async () => {
+    expect(await listToolNames(["news-read", "telegram-send", "skills"])).toEqual([
       "fetch_article",
       "list_news",
+      "list_skills",
+      "read_skill",
       "search_news",
       "send_telegram_message",
     ]);
   });
 
-  it("keeps the default surface a strict superset of every restricted one", async () => {
+  it("keeps shared tunnel capabilities in the default surface", async () => {
     const all = await listToolNames(DEFAULT_TOOLSETS);
-    const restricted = await listToolNames(["news-read", "telegram-send"]);
-    expect(restricted.every((name) => all.includes(name))).toBe(true);
+    const restricted = await listToolNames(["news-read", "telegram-send", "skills"]);
+    expect(
+      restricted
+        .filter((name) => name !== "list_skills" && name !== "read_skill")
+        .every((name) => all.includes(name)),
+    ).toBe(true);
+    // The agent already owns synthetic tools with these names. Keep the
+    // MCP-backed export scoped to the ChatGPT tunnel to avoid duplicates.
+    expect(all).not.toContain("list_skills");
+    expect(all).not.toContain("read_skill");
     expect(all).toContain("get_next_signal");
     expect(all).toContain("get_telegram_chat_history");
   });

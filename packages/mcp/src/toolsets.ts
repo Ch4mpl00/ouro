@@ -11,8 +11,10 @@ import { registerKnowledgeTools } from "./tools/knowledge";
 import { registerDreamingTools } from "./tools/dreaming";
 import { registerUserbotTools } from "./tools/userbot";
 import { registerSchedulerTools } from "./tools/scheduler";
+import { registerSkillsTools } from "./tools/skills";
 import type { NewsRepository } from "./services/news";
 import type { KnowledgeRepository } from "./services/knowledge";
+import type { SkillCatalog } from "./services/skills";
 
 // Named tool groups a server instance can register. One MCP process serves one
 // audience: the droplet supervisor gets everything, a third-party client (e.g.
@@ -24,6 +26,7 @@ import type { KnowledgeRepository } from "./services/knowledge";
 export interface ToolsetDeps {
   news: NewsRepository;
   knowledge: KnowledgeRepository;
+  skills: SkillCatalog;
 }
 
 type ToolsetRegistrar = (server: McpServer, deps: ToolsetDeps) => void;
@@ -53,6 +56,7 @@ const TOOLSETS = {
   dreaming: (server) => registerDreamingTools(server),
   userbot: (server) => registerUserbotTools(server),
   scheduler: (server) => registerSchedulerTools(server),
+  skills: (server, deps) => registerSkillsTools(server, deps.skills),
 } satisfies Record<string, ToolsetRegistrar>;
 
 export type ToolsetName = keyof typeof TOOLSETS;
