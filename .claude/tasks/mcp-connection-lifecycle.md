@@ -46,6 +46,17 @@ Resilience (P1, the real outage path):
 - Verify: kill the agent ungracefully (`docker kill agent`), let Docker
   restart it, confirm it reconnects without an MCP restart.
 
+> **Update 2026-08-23 (later): the P1 resilience item is DONE.** A new
+> `initialize` now evicts the bound session ("newest wins") before
+> connecting, so a reconnecting agent always gets in and the crash-loop
+> cannot form. Covered by `http-transport.test.ts`, which fails without
+> the eviction.
+>
+> It recurred first: after an `mcp` restart the supervisor hit
+> `Already connected` → 500 → exit 1 → restart, 78 times, and only a
+> manual `docker compose restart mcp` broke it. Exactly the 2026-06-15
+> incident, so the "resilience, not concurrency" framing below was right.
+>
 > **Update 2026-08-23.** Multi-connect now exists for *restricted*
 > instances only: `runHttpTransport({ multiSession })` builds an
 > `McpServer` per session, and `main()` turns it on exactly when

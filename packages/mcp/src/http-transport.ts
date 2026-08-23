@@ -29,6 +29,10 @@ export interface HttpTransportOptions {
   // raced and each session can cheaply own its server. The ChatGPT tunnel needs
   // this: tunnel-client holds a probe session of its own, so an arriving
   // ChatGPT client is *always* the second connection.
+  //
+  // With it off, at most one session is live and **the newest wins**: a fresh
+  // `initialize` evicts the previous one rather than being refused. See the
+  // eviction note in the handler.
   multiSession: boolean;
 }
 
@@ -57,9 +61,35 @@ async function readBody(req: IncomingMessage): Promise<unknown> {
 export async function runHttpTransport(options: HttpTransportOptions): Promise<RunningHttpTransport> {
   const { createEndpoint, multiSession } = options;
   const transports = new Map<string, StreamableHTTPServerTransport>();
-  // Single-session mode keeps the historical behaviour exactly: build the
-  // endpoint once, before listening, and hand every session the same one.
+  // Single-session mode builds the endpoint once, before listening — so a
+  // broken endpoint (e.g. unreachable gateway upstream) fails at boot rather
+  // than on the first request.
   const sharedEndpoint = multiSession ? undefined : await createEndpoint();
+  // The transport the shared endpoint is currently bound to. Tracked
+  // separately from `transports` because a client can die between `connect`
+  // and `onsessioninitialized`, leaving the endpoint bound to a transport that
+  // never made it into the map.
+  let boundTransport: StreamableHTTPServerTransport | undefined;
+
+  // Newest wins. A second `initialize` means the previous client is gone —
+  // in practice the supervisor restarting after an unclean death, which never
+  // closed its transport. Without eviction the SDK refuses the new connection
+  // ("Already connected"), the agent exits 1, Docker restarts it, and it 500s
+  // again: a crash-loop only an MCP restart can break. Seen in production
+  // twice (2026-06-15, 2026-08-23 — 78 restarts).
+  const evictBoundSession = async (): Promise<void> => {
+    const stale = boundTransport;
+    boundTransport = undefined;
+    if (!stale) return;
+    if (stale.sessionId) transports.delete(stale.sessionId);
+    try {
+      // Closing fires the SDK's onclose, which clears the endpoint's
+      // `_transport` and makes the next connect() legal again.
+      await stale.close();
+    } catch (err) {
+      console.error("[mcp-http] evicting stale session failed:", err);
+    }
+  };
 
   const http = createHttpServer(async (req: IncomingMessage, res: ServerResponse) => {
     if (!req.url || !req.url.startsWith("/mcp")) {
@@ -79,6 +109,7 @@ export async function runHttpTransport(options: HttpTransportOptions): Promise<R
               transports.set(sid, transport!);
             },
           });
+          if (sharedEndpoint) await evictBoundSession();
           const endpoint = sharedEndpoint ?? (await createEndpoint());
           // Latch: closing the endpoint closes its transport, which fires
           // onclose again — without this the two bounce until the stack blows.
@@ -87,6 +118,7 @@ export async function runHttpTransport(options: HttpTransportOptions): Promise<R
             if (teardownStarted) return;
             teardownStarted = true;
             if (transport!.sessionId) transports.delete(transport!.sessionId);
+            if (boundTransport === transport) boundTransport = undefined;
             // A per-session endpoint dies with its session; the shared one
             // outlives every session and must never be closed here.
             if (!sharedEndpoint) {
@@ -96,6 +128,7 @@ export async function runHttpTransport(options: HttpTransportOptions): Promise<R
             }
           };
           await endpoint.connect(transport);
+          if (sharedEndpoint) boundTransport = transport;
         } else {
           res.writeHead(400, { "content-type": "application/json" });
           res.end(

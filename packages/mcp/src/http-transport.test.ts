@@ -80,17 +80,42 @@ describe("runHttpTransport", () => {
     expect(built).toBe(1);
   });
 
-  // Pins the deliberate single-connect semantics of the full instance — and
-  // proves the multiSession test above is not vacuous: without it, this is
-  // exactly what the ChatGPT tunnel hit ("Already connected" → 500).
-  it("rejects a second concurrent client when multiSession is off", async () => {
+  // The production crash-loop (2026-08-23, 78 agent restarts): the supervisor
+  // dies without closing its transport, and every reconnect gets "Already
+  // connected" → 500 → exit 1 → restart → 500. Newest wins breaks it.
+  it("evicts the previous session when multiSession is off", async () => {
     running = await runHttpTransport({
       port: 0,
       multiSession: false,
       createEndpoint: async () => buildEndpoint(),
     });
 
-    await connectClient(running.port, "agent");
-    await expect(connectClient(running.port, "intruder")).rejects.toThrow();
+    const first = await connectClient(running.port, "agent-before-crash");
+    await expect(first.listTools()).resolves.toMatchObject({ tools: [{ name: "ping" }] });
+
+    // The reconnecting agent must get in, and must be able to work — an
+    // accepted-but-unusable session would be the same outage wearing a hat.
+    const second = await connectClient(running.port, "agent-after-restart");
+    await expect(second.listTools()).resolves.toMatchObject({ tools: [{ name: "ping" }] });
+
+    // And a third, because the loop repeated on every restart.
+    const third = await connectClient(running.port, "agent-after-restart-2");
+    await expect(third.listTools()).resolves.toMatchObject({ tools: [{ name: "ping" }] });
+  });
+
+  it("keeps serving the newest session after eviction, not the evicted one", async () => {
+    running = await runHttpTransport({
+      port: 0,
+      multiSession: false,
+      createEndpoint: async () => buildEndpoint(),
+    });
+
+    const evicted = await connectClient(running.port, "old");
+    const current = await connectClient(running.port, "new");
+
+    // The evicted client's session id is gone, so its calls must fail rather
+    // than silently share the newcomer's session.
+    await expect(evicted.listTools()).rejects.toThrow();
+    await expect(current.listTools()).resolves.toMatchObject({ tools: [{ name: "ping" }] });
   });
 });
