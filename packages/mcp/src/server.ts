@@ -10,6 +10,7 @@ import { startSchedulerPoller } from "./services/scheduler";
 import { createPgClient } from "./db/pg/client";
 import { createNewsModule, startNewsModule } from "./services/news";
 import { createKnowledgeModule } from "./services/knowledge";
+import { createMemoryModule } from "./services/memory";
 import { createSkillsModule } from "./services/skills";
 import { createGatewayModule, loadGatewayConfig } from "./services/gateway";
 import {
@@ -45,6 +46,7 @@ async function main(): Promise<void> {
 
   const newsModule = createNewsModule({ db: pg.db });
   const knowledgeModule = createKnowledgeModule({ db: pg.db });
+  const memoryModule = createMemoryModule({ db: pg.db });
   const skillsModule = createSkillsModule({
     liveDir: path.resolve(process.cwd(), "skills"),
     defaultsDir: path.resolve(process.cwd(), "skills.default"),
@@ -54,6 +56,10 @@ async function main(): Promise<void> {
   // audience (the ChatGPT tunnel gets news-read,telegram-send,skills). Unset → the
   // full surface, exactly as before.
   const toolsets = parseToolsets(process.env.MCP_TOOLSETS);
+  // Who this instance writes to shared memory as. One MCP process serves one
+  // audience, so the instance knows its own identity — the client does not
+  // declare it (a self-declared actor would be forgeable and bound nothing).
+  const memoryActor = process.env.MCP_MEMORY_ACTOR ?? "mcp";
   if (toolsets.restricted) {
     console.error(`[mcp] MCP_TOOLSETS=${toolsets.names.join(",")} — restricted tool surface`);
   }
@@ -74,6 +80,8 @@ async function main(): Promise<void> {
       news: newsModule.repository,
       knowledge: knowledgeModule.repository,
       skills: skillsModule.catalog,
+      memory: memoryModule.service,
+      memoryActor,
       toolsets: toolsets.names,
     });
     if (upstreams.length === 0) return ownServer;

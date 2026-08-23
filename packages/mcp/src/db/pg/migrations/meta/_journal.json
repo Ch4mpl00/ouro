@@ -22,6 +22,13 @@
       "when": 1781001341744,
       "tag": "0002_wooden_anthem",
       "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "7",
+      "when": 1787496077308,
+      "tag": "0003_lazy_puppet_master",
+      "breakpoints": true
     }
   ]
 }

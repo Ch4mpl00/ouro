@@ -31,6 +31,7 @@
     "db:generate:pg": "pnpm --filter @mcp-tools/mcp exec drizzle-kit generate",
     "db:generate:agent": "pnpm --filter @mcp-tools/agent exec drizzle-kit generate",
     "db:migrate:channel-posts": "tsx packages/mcp/src/scripts/migrate-channel-posts-to-pg.ts",
+    "memory:import-notes": "tsx packages/mcp/src/scripts/migrate-notes-to-memory.ts",
     "embed:backfill": "tsx packages/mcp/src/scripts/embed-backfill.ts",
     "eval:snapshot": "tsx packages/mcp/src/scripts/eval-snapshot.ts",
     "eval:rag": "tsx packages/mcp/src/scripts/eval-rag.ts",

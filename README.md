@@ -171,8 +171,10 @@ integration:
 history) · **Telegram userbot** (read-only MTProto channel reading) ·
 **Monobank** (transactions) · **News / RAG** (headlines, article fetch,
 semantic `search_news` over HN + Habr + channel posts) · **PDF / files** ·
-**Skills** (`list_skills`, `read_skill`) · **Signals queue** · **Scheduler**
-(cron tasks) · **Env** (timezone)
+**Skills** (`list_skills`, `read_skill`) · **Unified memory** (projects of
+markdown documents + facts, semantic `recall` across both, versioned
+patch/revert) · **Signals queue** · **Scheduler** (cron tasks) · **Env**
+(timezone)
 
 ## Layout
 
