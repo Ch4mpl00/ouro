@@ -46,6 +46,19 @@ Resilience (P1, the real outage path):
 - Verify: kill the agent ungracefully (`docker kill agent`), let Docker
   restart it, confirm it reconnects without an MCP restart.
 
+> **Update 2026-08-23.** Multi-connect now exists for *restricted*
+> instances only: `runHttpTransport({ multiSession })` builds an
+> `McpServer` per session, and `main()` turns it on exactly when
+> `MCP_TOOLSETS` narrows the surface. Such an instance has no signals
+> tools, so the delivery race below cannot occur — the constraint is
+> sidestepped, not solved. The full instance still shares one server and
+> still throws `Already connected` on a second `initialize`; the P1
+> resilience item is therefore **still open**.
+>
+> Found the hard way: `tunnel-client` holds a probe session of its own,
+> so ChatGPT arriving through the tunnel was permanently the second
+> connection and got HTTP 500 every time.
+
 Multi-connect (P3, deferred — do NOT start without solving delivery):
 
 - Only meaningful once the signals queue coordinates delivery so
