@@ -62,7 +62,7 @@ mcp-tools/
     │       ├── toolsets.ts                  named tool groups (MCP_TOOLSETS scoping)
     │       ├── gateway.config.json          third-party MCP upstreams (git-tracked, secret-free)
     │       ├── tools/                       MCP-exposed actions
-    │       └── services/{gmail,telegram,monobank,scheduler,news,pdf,signals,settings,gateway}
+    │       └── services/{gmail,telegram,monobank,scheduler,news,memory,pdf,signals,settings,gateway}
     └── agent/
         ├── data/agent.db                    agent-side state (memory KV + trace mirror)
         └── src/
@@ -106,13 +106,16 @@ mcp-tools/
   generated with `pnpm db:generate:agent` and applied on boot
   (`db/client.ts`, also `pnpm setup:agent`).
 - **Postgres + pgvector** (containerized, `postgres` service in
-  docker-compose) — the news / RAG store. One table `news_items` unifies
-  HN/Habr articles and harvested Telegram channel posts; rows have a
-  1536-dim `embedding` column (text-embedding-3-small). Owned by MCP;
-  the agent reaches it only through MCP tools (`search_news`,
-  `list_channel_posts`, …). Schema lives in code at
-  `packages/mcp/src/db/pg/schema.ts` (Drizzle ORM); migrations are
-  generated with `pnpm db:generate:pg` and applied on server boot.
+  docker-compose) — the news / RAG store **and unified memory**. One table
+  `news_items` unifies HN/Habr articles and harvested Telegram channel posts;
+  rows have a 1536-dim `embedding` column (text-embedding-3-small). Unified
+  memory adds `memory_projects` / `memory_project_docs` / `memory_doc_patches`
+  / `memory_facts` (the read models) plus `memory_index` (the search
+  projection — the only memory table with vectors). Owned by MCP; the agent
+  reaches it only through MCP tools (`search_news`, `recall`, `read_doc`, …).
+  Schema lives in code at `packages/mcp/src/db/pg/schema.ts` (Drizzle ORM);
+  migrations are generated with `pnpm db:generate:pg` and applied on server
+  boot.
 
 Schemas: `packages/mcp/data/schema.sql` (mcp sqlite, raw),
 `packages/agent/src/db/schema.ts` (agent sqlite, Drizzle),
@@ -230,6 +233,10 @@ also see them when running `claude` locally with `.mcp.json` registered.
 - **Skills** — `list_skills`, `read_skill` (exact active `.md` filenames +
   contents, plus the improver's `.patch.md` overlay and the composed
   `effectiveInstructions` the agent actually runs)
+- **Unified memory** — shared by every agent, see the section below.
+  `recall`, `remember`, `get_fact`, `update_fact`, `list_memory`,
+  `create_project`, `read_doc`, `append_doc`, `patch_doc`, `write_doc`,
+  `doc_history`, `revert_patch`
 - **Signals queue** — `get_next_signal`, `list_signals`
 - **Scheduler** — `schedule_task`, `list_scheduled_tasks`,
   `cancel_scheduled_task`
@@ -245,16 +252,66 @@ also see them when running `claude` locally with `.mcp.json` registered.
 One MCP process serves one audience. `packages/mcp/src/toolsets.ts` holds the
 named toolset → registrar map (`gmail`, `telegram`, `telegram-send`,
 `monobank`, `pdf`, `fs`, `signals`, `news-read`, `knowledge`, `dreaming`,
-`userbot`, `scheduler`, `skills`);
+`userbot`, `scheduler`, `skills`, `memory`);
 `MCP_TOOLSETS=news-read,telegram-send,skills` makes an instance register only
 those groups. Unset/empty = every group, i.e. the behaviour before scoping
 existed. An unknown name is a boot error.
+
+A **restricted instance is also multi-session** (`runHttpTransport`'s
+`multiSession`), which is what lets several agents hold a memory connection at
+once: an instance scoped to `memory` has no signals tools, so nothing races
+for signal delivery.
 
 Scoping works by **not registering**, so an out-of-scope tool never appears in
 `tools/list` — invisible, not merely rejected. A restricted instance also skips
 the gateway entirely, because upstream tools are namespaced at runtime
 (`tavily__*`) and can't be expressed in the allow-list. Rationale and the wider
 auth design: `.claude/tasks/mcp-auth-and-tool-scoping.md`.
+
+## Unified memory
+
+One memory every agent shares — the droplet supervisor, Claude Code sessions,
+anything on the far side of the ChatGPT tunnel. Lives in
+`packages/mcp/src/services/memory/`; design and rationale in
+`.claude/tasks/unified-memory.md`.
+
+Two read models, one search projection:
+
+- **Projects** are folders of markdown documents (`passport.md`, `roadmap.md`,
+  `progress.md`, …), not a fixed schema. The agent reads and patches each
+  document individually, which is the interface LLMs are best at.
+- **Facts** are flat freeform statements — what `knowledge_base_notes` held,
+  plus a lifecycle state and an update path.
+- **`memory_index`** is the only table with embeddings. Both read models are
+  chunked into it with their subject denormalised into the indexed text, so a
+  fragment matches even though the stored document stays clean.
+
+The agent's flow is two-step, the same search→read shape that fixed the
+planner's snippet failures on GAIA: `recall` returns **refs**
+(`doc:leetcode-graphs/roadmap.md#2`, `fact:88`), then `read_doc` / `get_fact`
+loads the whole thing.
+
+Rules worth knowing before touching the code:
+
+- **Writes are search/replace on quoted literals, never line numbers.** An
+  off-by-one line number corrupts silently; a quote that doesn't match fails
+  loudly and changes nothing. Each `old` must be unique, all edits apply or
+  none do, and a miss comes back with the literal from the document that
+  nearly matched (the model normalised an em-dash, a «quote», ё→е).
+- **`append_doc` is the safe default** — it cannot destroy text and needs no
+  version. `patch_doc` needs `expected_version`. `write_doc` is the only op
+  that can lose content.
+- **Every write is versioned with a compare-and-swap**, which is the whole
+  concurrency story for several agents on one document.
+- **Every write records a patch** with the previous body, an actor and the
+  rationale (the utterance that caused it). `revert_patch` undoes one; an
+  older patch whose text later writes touched fails cleanly and names the
+  version a `rollback: true` would restore. History is never rewritten.
+- **Indexing failure never fails a write.** Documents read and patch with the
+  embedder down; `pnpm embed:backfill` drains the NULL-vector backlog.
+
+The rules live in `service.ts` and the store underneath is dumb CRUD, so the
+whole contract is tested against `store.memory.ts` without a Postgres.
 
 ## Agent skills
 
@@ -301,6 +358,8 @@ nobody runs. `module.test.ts` pins the expected output as a literal.
   applied on agent/judge-worker boot via `db/client.ts`).
 - `pnpm db:migrate:channel-posts` — one-shot copy of the legacy sqlite
   `channel_posts` table into PG `news_items` + inline-embed. Idempotent.
+- `pnpm memory:import-notes` — one-shot copy of `knowledge_base_notes` into
+  memory facts (idempotent; the source table is left untouched).
 - `pnpm embed:backfill` — re-attempt embeddings for any `news_items`
   rows where `embedding IS NULL` (typically left behind by an OpenAI
   outage during inline embed).

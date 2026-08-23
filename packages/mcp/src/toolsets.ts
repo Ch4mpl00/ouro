@@ -12,9 +12,11 @@ import { registerDreamingTools } from "./tools/dreaming";
 import { registerUserbotTools } from "./tools/userbot";
 import { registerSchedulerTools } from "./tools/scheduler";
 import { registerSkillsTools } from "./tools/skills";
+import { registerMemoryTools } from "./tools/memory";
 import type { NewsRepository } from "./services/news";
 import type { KnowledgeRepository } from "./services/knowledge";
 import type { SkillCatalog } from "./services/skills";
+import type { MemoryService } from "./services/memory";
 
 // Named tool groups a server instance can register. One MCP process serves one
 // audience: the droplet supervisor gets everything, a third-party client (e.g.
@@ -27,6 +29,10 @@ export interface ToolsetDeps {
   news: NewsRepository;
   knowledge: KnowledgeRepository;
   skills: SkillCatalog;
+  memory: MemoryService;
+  // Stamped onto every memory write so history says who did it (D6). One
+  // shared space, many agents — this is audit metadata, never access control.
+  memoryActor: string;
 }
 
 type ToolsetRegistrar = (server: McpServer, deps: ToolsetDeps) => void;
@@ -57,6 +63,10 @@ const TOOLSETS = {
   userbot: (server) => registerUserbotTools(server),
   scheduler: (server) => registerSchedulerTools(server),
   skills: (server, deps) => registerSkillsTools(server, deps.skills),
+  // Unified memory — projects, documents and facts shared by every agent
+  // (.claude/tasks/unified-memory.md). Safe to hand to a third-party client:
+  // it touches no personal account and no signal delivery.
+  memory: (server, deps) => registerMemoryTools(server, { memory: deps.memory, actor: deps.memoryActor }),
 } satisfies Record<string, ToolsetRegistrar>;
 
 export type ToolsetName = keyof typeof TOOLSETS;
@@ -77,6 +87,7 @@ export const DEFAULT_TOOLSETS: readonly ToolsetName[] = [
   "dreaming",
   "userbot",
   "scheduler",
+  "memory",
 ];
 
 export function isToolsetName(name: string): name is ToolsetName {

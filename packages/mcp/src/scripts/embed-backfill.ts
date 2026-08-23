@@ -2,6 +2,7 @@ import "dotenv/config";
 import { createPgClient } from "../db/pg/client";
 import { createNewsModule } from "../services/news";
 import { createKnowledgeModule } from "../services/knowledge";
+import { createMemoryModule } from "../services/memory";
 
 // Re-attempts embeddings for rows where the inline embed previously
 // failed (embedding IS NULL), across every embedded store. Safe to
@@ -48,10 +49,12 @@ async function main(): Promise<void> {
   await pg.ensureReady();
   const { repository: news } = createNewsModule({ db: pg.db });
   const { repository: knowledge } = createKnowledgeModule({ db: pg.db });
+  const { indexer: memory } = createMemoryModule({ db: pg.db });
 
   try {
     await drain("news", news.embedMissingBatch);
     await drain("knowledge", knowledge.embedMissingBatch);
+    await drain("memory", memory.embedMissingBatch);
   } finally {
     await pg.close();
   }

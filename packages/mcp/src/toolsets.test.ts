@@ -35,6 +35,22 @@ function stubDeps(): ToolsetDeps {
       listSkills: unused,
       readSkill: unused,
     },
+    memory: {
+      createProject: unused,
+      listProjects: unused,
+      listDocs: unused,
+      readDoc: unused,
+      writeDoc: unused,
+      appendDoc: unused,
+      patchDoc: unused,
+      history: unused,
+      revert: unused,
+      remember: unused,
+      getFact: unused,
+      updateFact: unused,
+      recall: unused,
+    },
+    memoryActor: "test",
   };
 }
 
