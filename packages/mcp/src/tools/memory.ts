@@ -49,22 +49,24 @@ export function registerMemoryTools(server: McpServer, deps: MemoryToolDeps): vo
         "Semantic search across ALL shared memory — project documents and " +
         "standalone facts alike. Use it whenever the user refers to something " +
         'from the past ("что там у нас было по X", "напомни про Y") and ' +
-        "before starting work that might already have a project.\n\n" +
+        "before starting work that might already have a project. Archived facts " +
+        "are intentionally excluded from this ordinary recall path.\n\n" +
         "Returns REFS, not full content: `doc:<project>/<file>#<chunk>` or " +
         "`fact:<id>`. Follow the interesting ones with read_doc / get_fact — " +
         "the snippet is for choosing, the document is for answering.",
       inputSchema: {
         query: z.string().min(1).describe("What to look for, in natural language."),
         limit: z.number().int().min(1).max(50).optional().describe("Max hits (default 10)."),
-        states: z
-          .array(stateEnum)
-          .optional()
-          .describe('Which lifecycle states to search. Default ["active"]; pass ["archived"] to dig up old items.'),
         tags: z.array(z.string().min(1)).optional().describe("Keep only hits carrying one of these tags."),
       },
     },
-    async ({ query, limit, states, tags }) =>
-      run(async () => ({ hits: await memory.recall({ query, limit, states, tags }) })),
+    async ({ query, limit, tags }) =>
+      // Public recall is deliberately active-only. Letting the model choose
+      // lifecycle states made ordinary queries opt into archived facts and
+      // then resolve them through get_fact, defeating archive as a discovery
+      // boundary. The service keeps its states filter for a future explicit
+      // history/admin surface; this general-purpose tool never forwards it.
+      run(async () => ({ hits: await memory.recall({ query, limit, tags }) })),
   );
 
   server.registerTool(

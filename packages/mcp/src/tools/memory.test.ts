@@ -79,6 +79,13 @@ describe("memory tool surface", () => {
 
     expect(schema?.description).toMatch(/ONLY\s+OP THAT CAN LOSE CONTENT/);
   });
+
+  it("does not let an agent opt ordinary recall into archived memory", async () => {
+    const schema = (await client.listTools()).tools.find((t) => t.name === "recall");
+    const properties = schema?.inputSchema.properties ?? {};
+
+    expect(properties).not.toHaveProperty("states");
+  });
 });
 
 describe("memory tools end to end", () => {
@@ -163,6 +170,23 @@ describe("memory tools end to end", () => {
       ok: true,
       fact: { body: "Dijkstra не любит отрицательные веса" },
     });
+  });
+
+  it("keeps archived facts out even when a client sends the removed states argument", async () => {
+    const remembered = await call("remember", {
+      body: "Секретный тестовый факт для архива",
+      tags: ["archive-test"],
+    });
+    const factId = (remembered.fact as { id: number }).id;
+    await call("update_fact", { id: factId, state: "archived" });
+
+    const recalled = await call("recall", {
+      query: "Секретный тестовый факт для архива",
+      states: ["archived"],
+    });
+    const hits = recalled.hits as { ref: string }[];
+
+    expect(hits.map((hit) => hit.ref)).not.toContain(`fact:${factId}`);
   });
 
   it("reports an unknown project as a result listing the real ones", async () => {

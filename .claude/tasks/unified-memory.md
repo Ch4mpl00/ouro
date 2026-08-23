@@ -382,7 +382,10 @@ whose entire value is that it does not lose things.
 
 The short-lived lists from use case 3 are **facts with a state**, not
 documents: they have no internal structure worth patching, and `done` /
-`archived` is exactly their lifecycle.
+`archived` is exactly their lifecycle. The public MCP `recall` surface is
+active-only: lifecycle selection remains an internal service capability until
+there is a separately named history/admin tool. Letting a general-purpose
+agent pass `states: ["archived"]` defeated archive as a discovery boundary.
 
 ## Open questions
 
