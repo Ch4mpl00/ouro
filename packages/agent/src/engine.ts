@@ -8,8 +8,9 @@ import type { SkillStore } from "./skills";
 import type { Tracer } from "./tracing";
 
 // Process-level hub for shared, expensive resources:
-//   - three ChatProviders (DeepSeek for thinking-mode sessions, OpenAI for
-//     non-thinking, Gemini — each on its own API key + rate-limit bucket)
+//   - three ChatProviders (Gemini for thinking-mode sessions, OpenAI for
+//     non-thinking, DeepSeek kept as an opt-in route via AGENT_*_MODEL —
+//     each on its own API key + rate-limit bucket)
 //   - one MCP connection
 //   - one Tracer (observability backend)
 //   - the skill store and the agent-side memory KV

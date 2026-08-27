@@ -34,7 +34,7 @@ The sub-agent runs on one of two presets:
 
 - **`base`** (default) — cheap chat model, no thinking. Use for trivial
   one-offs, single-tool lookups, simple text manipulation.
-- **`smart`** — DeepSeek with thinking on. Use when the sub-agent does
+- **`smart`** — thinking-mode model. Use when the sub-agent does
   **real editorial / judgment work** — filtering against a quality bar,
   semantic dedup, multi-step consolidation, schema parsing where
   mistakes are damaging.
