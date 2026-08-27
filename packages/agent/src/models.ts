@@ -34,9 +34,13 @@ export type PresetName = "base" | "smart" | "smartest" | "compiler";
 // `base`     — non-thinking chat, OpenAI provider. Default for primary
 //              Telegram replies, scheduler dispatch, recovery — the
 //              bulk of signals.
-// `smart`    — DeepSeek with thinking on. Used for sub-agents that do
-//              real editorial / parsing work (digests, semantic dedup,
-//              PDF amount extraction).
+// `smart`    — Gemini 3.7 Flash with thinking on. Used for sub-agents that
+//              do real editorial / parsing work (digests, semantic dedup,
+//              PDF amount extraction). Was `deepseek-v4-pro` — same role,
+//              swapped model. `reasoningEffort: "medium"` maps to Gemini's
+//              "high" (see the provider's mapping): keep the thinking budget
+//              up, this preset exists for quality, not latency. Fall back
+//              with AGENT_SMART_MODEL if Gemini misbehaves.
 // `smartest` — OpenAI full GPT-5.4. A reserve high-end preset, still
 //              selectable by sub-agents/handoff.
 // `compiler` — OpenAI GPT-5.4. The model the WORKFLOW COMPILER runs on. It
@@ -50,7 +54,7 @@ export type PresetName = "base" | "smart" | "smartest" | "compiler";
 //              withRetry wrapper — every provider retries 429/5xx.)
 export const DEFAULT_PRESETS: Record<PresetName, ModelPreset> = {
   base: { model: "gpt-5.4-mini", reasoningEffort: "disabled" },
-  smart: { model: "deepseek-v4-pro", reasoningEffort: "medium" },
+  smart: { model: "gemini-3.7-flash", reasoningEffort: "medium" },
   smartest: { model: "gpt-5.4", reasoningEffort: "max" },
   compiler: { model: "gpt-5.4", reasoningEffort: "medium" },
 };

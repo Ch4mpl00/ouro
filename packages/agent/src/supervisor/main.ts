@@ -107,7 +107,7 @@ async function main(): Promise<void> {
 
   // Build the preset registry from defaults + per-preset env overrides.
   // `base` runs on OpenAI (non-thinking — primary replies, recovery,
-  // scheduler dispatch). `smart` runs on DeepSeek with thinking on —
+  // scheduler dispatch). `smart` runs on Gemini Flash with thinking on —
   // sub-agents that do real editorial / parsing work (news-digest,
   // tech-digest, nashdom-bill, …). `compiler` powers the workflow
   // compiler. `smartest` is a reserve high-end preset.
