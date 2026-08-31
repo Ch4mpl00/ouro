@@ -1,10 +1,20 @@
 # Per-node judge + closed-loop self-improvement
 
-**Status:** Phase 1/2/3 DONE and DEPLOYED to prod 2026-06-18 (merged to main,
+**Status:** PAUSED 2026-08-31 — both workers moved behind the `evals` compose
+profile and stopped on prod. Judging live prod runs didn't earn its codex quota;
+the direction is golden sets instead, and this loop gets revisited (if at all)
+against those. Nothing was deleted: code, schema and the judged corpus in
+`agent-data` are intact, and the local trace mirror keeps recording every run, so
+`docker compose --profile evals up -d judge-worker improve-worker` resumes with
+the backlog waiting.
+
+Everything below is the state as of the last active phase.
+
+Phase 1/2/3 DONE and DEPLOYED to prod 2026-06-18 (merged to main,
 `docker compose up -d --build` on the droplet; 236 tests green). All 6 services
-running incl. new `improve-worker` in SHADOW mode (`IMPROVE_APPLY=false`). NEXT:
-watch the shadow loop on real data, then flip `IMPROVE_APPLY=true` when proposals
-look sane. Two deploy notes below.
+running incl. new `improve-worker` in SHADOW mode (`IMPROVE_APPLY=false`). NEXT
+(at the time): watch the shadow loop on real data, then flip `IMPROVE_APPLY=true`
+when proposals look sane. Two deploy notes below.
 
 ### First prod run + cost reduction (2026-06-18)
 - **End-to-end run on prod (shadow)** on news-digest/coverage worked: select

@@ -376,6 +376,15 @@ droplet; named volumes (`mcp-data`, `mcp-storage`, `agent-data`,
 needs `.env.postgres` (POSTGRES_USER / PASSWORD / DB) and
 `OPENAI_API_KEY` in `.env.mcp`.
 
+The two evaluation services — `judge-worker` (per-node Codex judge) and
+`improve-worker` (closed-loop improver) — sit behind the `evals` compose
+profile and are OFF since 2026-08-31: scoring live prod runs wasn't worth
+the codex quota, and the plan is golden sets instead. A plain
+`docker compose up -d --build` skips them; bring them back with
+`docker compose --profile evals up -d judge-worker improve-worker`. The
+`codex` service itself stays ON regardless — the agent's `code_agent` tool
+runs through it.
+
 ### ChatGPT connector (Secure MCP Tunnel)
 
 Two extra compose services, both optional — the rest of the stack runs
