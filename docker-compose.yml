@@ -207,7 +207,16 @@ services:
       - "3010"
     restart: unless-stopped
 
+  # Per-node Codex judge. OFF by default since 2026-08-31 — scoring live prod
+  # runs turned out not to be worth the codex/ChatGPT quota it burns; the plan
+  # is golden sets instead. Behind the `evals` profile, so a plain
+  # `docker compose up -d` skips it. Bring it back with:
+  #   docker compose --profile evals up -d judge-worker
+  # Nothing is destroyed by leaving it off: agent-data keeps the judged corpus
+  # and the local trace mirror keeps recording every run, so whenever it is
+  # switched on again it picks up the backlog.
   judge-worker:
+    profiles: ["evals"]
     build: .
     image: mcp-tools-image
     command: sh -c "pnpm setup:agent && pnpm judge:worker"
@@ -225,7 +234,12 @@ services:
   # Closed-loop improver (Phase 3, п3). Shares agent-data (the judged corpus +
   # improver_state) and agent-skills (writes skills/<skill>.patch.md). Ships only
   # when IMPROVE_APPLY=true — leave it OFF until `improve` is prod-validated.
+  #
+  # Also behind the `evals` profile (2026-08-31): it eats the same judged corpus
+  # judge-worker fills and runs its own codex gate passes, so with judging off it
+  # would keep spending quota on a corpus that no longer grows.
   improve-worker:
+    profiles: ["evals"]
     build: .
     image: mcp-tools-image
     command: sh -c "pnpm setup:agent && pnpm improve:worker"
