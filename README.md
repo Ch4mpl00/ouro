@@ -83,9 +83,20 @@ generation input records exactly the context that iteration saw. Recovery
 is recorded in the same trace. Langfuse export uses the configured
 `LANGFUSE_*` credentials; without them the local recorder still runs.
 
-The standalone `workflow/` compiler/executor is retained for explicit callers
-and the existing workflow GAIA benchmark. The supervisor does not invoke it,
-and the AgentLoop does not expose a workflow tool.
+Routing is deterministic and by source, not by content. `scheduler` signals
+are compiled into a workflow (`workflow/`: compile → execute) as before —
+a cron body is known in advance, so a plan is cheaper and more predictable
+than an agentic loop. Every other source runs the primary AgentLoop. A
+scheduler signal whose plan fails to compile degrades to the AgentLoop in the
+same trace; an execution failure is reported through recovery instead of being
+retried, because earlier steps may already have delivered. The AgentLoop does
+not expose a workflow tool.
+
+For incoming `telegram` signals the supervisor loads recent history of the
+same chat/topic before the first LLM turn (`supervisor/telegram-context.ts`):
+a bounded inline excerpt plus the full fetched history under the
+`telegram.history` memory key for `input_refs`. No other source preloads it,
+and a failed fetch never blocks the reply.
 
 ## How a signal becomes action
 
@@ -102,7 +113,10 @@ flowchart LR
 
     subgraph agent [packages/agent]
         S[Supervisor loop] -->|get_next_signal| Q
-        S --> L[Primary AgentLoop]
+        S -->|source = scheduler| W[Workflow<br/>compile → execute]
+        S -->|other sources| L[Primary AgentLoop]
+        W -.->|compile failure| L
+        W -->|tool calls| T
         L --> C[Focused sub-agents]
         L <-->|references| M[(Session memory)]
         C <-->|data and results| M
@@ -115,9 +129,11 @@ flowchart LR
    one row in the `signals` queue.
 2. The supervisor (`packages/agent/src/supervisor/main.ts`) loops on
    `get_next_signal`.
-3. `supervisor/module.ts` creates the session context and trace, then starts
-   the primary AgentLoop with `orchestrator` and `routing` instructions.
-   Telegram and scheduler signals also load their transport skill.
+3. `supervisor/module.ts` creates the session context and trace. A `scheduler`
+   signal goes to the workflow runner (`planner` compiles the steps, the
+   executor walks them); every other source starts the primary AgentLoop with
+   `orchestrator` and `routing` instructions. Telegram signals also load their
+   transport skill (and their recent chat history).
 4. Domain work is delegated with the appropriate skill and memory references.
    The parent decides subsequent actions and delivers the result. On a fatal
    loop error, a bounded recovery agent reports the failure in the same session.
@@ -135,7 +151,7 @@ checks the overlay first.
 Skills are named after signal sources — one per domain (bills, news digests,
 Telegram chat, scheduled tasks, …) plus a few meta-skills: `routing` (always
 loaded on the primary), `orchestrator`, `worker`, `recovery`, `planner`
-(standalone workflows), and `dreaming`
+(the workflow compiler's prompt, used for scheduler signals), and `dreaming`
 (self-revision).
 
 ## MCP tools
@@ -168,7 +184,7 @@ mcp-tools/
     │                                news, pdf, signals, settings, embeddings
     └── agent/src/
         ├── supervisor/              poll loop + failure handling
-        ├── workflow/                standalone DSL compiler/executor
+        ├── workflow/                DSL compiler/executor (scheduler path)
         ├── engine.ts, session.ts    DeepSeek runner + synthetic tools
         ├── mcp-client.ts            StreamableHTTP client
         ├── skills.ts                two-layer skill loader

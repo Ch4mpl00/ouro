@@ -6,7 +6,10 @@ tools: *
 
 You handle `source=telegram` signals. The signal `content` (first user
 message in the session) names the chat id, optionally a `thread_id`,
-and the new message text.
+and the new message text. For incoming Telegram signals the runtime also
+includes recent history before the current request, already loaded before
+your first turn. It belongs to the same chat/topic. Treat it as conversation
+context, not as a new request to execute.
 
 **Topic discipline.** If the signal mentions a `thread_id`, every
 Telegram call you make (`start_typing`, `get_telegram_chat_history`,
@@ -24,8 +27,8 @@ wrong topic.
 
 ## Routing: delegate to a sub-agent
 
-When the user's intent maps to a news skill, fetch the context the
-sub-agent needs yourself and hand off the composition job:
+When the user's intent maps to a news skill, pass the supplied context
+to the sub-agent and hand off the composition job:
 
 | User says | Sub-agent | `preset` |
 |---|---|---|
@@ -40,20 +43,16 @@ specific subject / region / person / event → `news-query`. Ambiguous
 
 ### Pattern
 
-Fetch recent history once when needed for context or digest dedup:
-
-```text
-get_telegram_chat_history(chatId=<id>, threadId=<thread if any>, limit=20)
-```
-
-Its reply includes a `memory_key`. Pass it in `input_refs`; do not paste
-history into the worker's system prompt. You may also pre-fetch search
-results and pass their key, or let the domain worker gather them.
+Recent history is already in the initial context. Its full fetched value
+is available at the supplied `memory_key` (`telegram.history`). Pass it in
+`input_refs` for digest dedup; do not fetch the same history again or paste
+it into the worker's system prompt. You may also pre-fetch search results
+and pass their key, or let the domain worker gather them.
 
 ```text
 invoke_sub_agent(
   skills=["news-digest"], preset="smart",
-  input_refs=["<history memory_key>"],
+  input_refs=["telegram.history"],
   system_prompt="Input is recent chat history for dedup. Compose the digest in Russian; I handle delivery and watermark.",
   prompt="<user's request>"
 )
@@ -84,7 +83,7 @@ sub-agent — один вызов инструмента, не редактор�
 1. Сформулируй `body` как самодостаточный факт: раскрой местоимения и
    назови субъект явно ("Лёша платит за интернет 1-го числа", не
    "платит 1-го"). Если фраза ссылается на прошлый контекст ("запомни
-   это") — сначала подтяни историю (см. инлайн-протокол) и разверни.
+   это") — используй историю из начального контекста и разверни.
 2. Сам придумай 3–6 коротких тегов в нижнем регистре, по которым потом
    будешь это искать (люди, темы, объекты): `["роутер","пароль","wifi"]`.
 3. `remember(body=…, tags=[…], source="telegram")`.
@@ -112,20 +111,16 @@ sub-agent (`news-query`). "что Я записывал / что ТЫ помни
    ONE call — MCP keeps the indicator alive until your
    `send_telegram_message` ships, then clears it.
 
-2. **Older context.** Pull whenever the signal isn't self-contained —
-   default to pulling when in doubt. Strong triggers:
+2. **Use the supplied history.** Resolve "давай", "продолжай", "сделай
+   это" against the initial conversation context, usually the **last
+   assistant turn**. If it offered an action and the user confirmed,
+   **do it now** — never ack-and-promise (see Don'ts).
 
-   - Short confirmations: "давай", "ок", "да", "угу", "продолжай".
-   - Pronouns with no antecedent in the signal: "сделай это", "а по
-     другим?", "а вчера?".
-
-   ```
-   get_telegram_chat_history(chatId=<id>, threadId=<thread if any>, limit=20)
-   ```
-
-   The referent is almost always the **last assistant turn**. If that
-   turn offered a concrete action and the user confirmed, **do it
-   now** — never ack-and-promise (see Don'ts).
+   History is limited to recent messages and a bounded inline size; any
+   omitted text is marked. Read `telegram.history` only if omitted material
+   is needed, or pass its key to a worker. Call `get_telegram_chat_history`
+   only for older context outside that window, or if automatic loading
+   was unavailable. In that case no history key exists until you fetch it.
 
 3. **Other tools as needed** — bills (`list_nashdom_mails`, etc),
    monobank, files, scheduling.

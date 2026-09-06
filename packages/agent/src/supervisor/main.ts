@@ -22,6 +22,7 @@ import type { Tracer } from "../tracing";
 import { langfuseTracerFromEnv } from "../tracing/langfuse";
 import { createLocalRecorderTracer } from "../tracing/local-recorder";
 import { teeTracer } from "../tracing/tee";
+import { createWorkflowRunner } from "../workflow";
 import { createSupervisorModule, type PendingSignal } from "./module";
 
 // Long-running supervisor — and the composition root: every long-lived
@@ -33,8 +34,10 @@ import { createSupervisorModule, type PendingSignal } from "./module";
 // (Telegram, Gmail, cron, webhook) lives inside the MCP server, which
 // queues signals into its own DB. Each signal flows:
 //
-//   signal → primary AgentLoop → tools / focused sub-agents → delivery
-//          ↳ crash → recovery report within the same trace
+//   scheduler → workflow (compile → execute)
+//              ↳ compile failure → AgentLoop; execution failure → recovery
+//   other sources → primary AgentLoop → tools / focused sub-agents → delivery
+//                   ↳ crash → recovery report within the same trace
 //
 // The per-signal context, trace and recovery lifecycle live in ./module.
 
@@ -58,7 +61,7 @@ async function main(): Promise<void> {
   if (!geminiApiKey) throw new Error("GEMINI_API_KEY is not set in .env (smart agents)");
 
   // Primary agents and reasoning workers use smart. Recovery and simple
-  // workers use base; compiler remains available to standalone workflow callers.
+  // workers use base; compiler plans scheduler workflows.
   const withEnvModel = (name: keyof typeof DEFAULT_PRESETS, envVar: string) => ({
     ...DEFAULT_PRESETS[name],
     model: process.env[envVar] ?? DEFAULT_PRESETS[name].model,
@@ -159,7 +162,22 @@ async function main(): Promise<void> {
     userEmail: process.env.USER_EMAIL ?? null,
   };
 
-  const supervisor = createSupervisorModule({ engine, env: envDeps });
+  // Compile against the available tools and domain skills. Meta-skills belong
+  // to the supervisor/compiler, not to workflow work steps.
+  const nonWorkflowSkills = new Set(["planner", "orchestrator", "routing", "recovery"]);
+  const knownSkills = (await skillStore.listSkills())
+    .map((skill) => skill.name)
+    .filter((name) => !nonWorkflowSkills.has(name));
+  const workflow = createWorkflowRunner({
+    engine,
+    mcpTools: mcp.tools,
+    knownSkills,
+    readSkill: async (name) => (await skillStore.readSkill(name))?.body ?? null,
+    readPatch: (name) => skillStore.readPatch(name),
+    setMemory: (key, value) => memory.set(key, value),
+    codex,
+  });
+  const supervisor = createSupervisorModule({ engine, env: envDeps, workflow });
 
   let stopping = false;
   const stop = async (sig: string): Promise<void> => {
@@ -173,7 +191,7 @@ async function main(): Promise<void> {
   process.on("SIGINT", () => void stop("SIGINT"));
   process.on("SIGTERM", () => void stop("SIGTERM"));
 
-  console.log("[supervisor] entering main loop (agent-loop)");
+  console.log("[supervisor] entering main loop (scheduler → workflow, other sources → agent-loop)");
   while (!stopping) {
     try {
       const raw = await mcp.callTool("get_next_signal", {});

@@ -22,18 +22,22 @@ the other. Deployed as two containers (`docker-compose.yml`).
    envContext })` which inserts a row into the `signals` queue in
    `packages/mcp/data/tokens.db`.
 3. The supervisor (`packages/agent/src/supervisor/main.ts`) loops on
-   `get_next_signal`. When a signal pops, it runs the signal through the
-   `workflow/` module (compile → execute); the steps below describe the
-   agentic fallback path, which loads two things:
-   - `skills/<signal.source>.md` (with `skills.default/` fallback) — the
-     primary domain skill.
-   - `skills/routing.md` — always loaded; tells the model to delegate to
-     another skill if the prompt matches a different domain.
+   `get_next_signal`. Routing is by source, decided in `supervisor/module.ts`:
+   `scheduler` runs through the `workflow/` module (compile → execute), every
+   other source runs the primary AgentLoop. A compile failure degrades to the
+   AgentLoop in the same trace; an execute failure goes to `recovery` instead
+   of being retried. The AgentLoop path loads:
+   - `skills/orchestrator.md` + `skills/routing.md` — always; how to use
+     working memory and when to delegate to a domain skill.
+   - `skills/<signal.source>.md` (with `skills.default/` fallback) — only for
+     transport sources (`telegram`, `scheduler`); domain work is delegated to
+     a sub-agent with that source's skill.
 4. Plus a session-context block (local time, tz, watermarks) and the signal's
    `envContext` (per-source env addendum, e.g. default Telegram chat id).
-5. The signal's `content` is pushed as the first user message. DeepSeek
-   runs the session; every side effect (Telegram reply, DB write) is a
-   tool call.
+   For `telegram` signals the supervisor also preloads recent chat/topic
+   history (`supervisor/telegram-context.ts`) before the first LLM turn.
+5. The signal's `content` is pushed as the first user message. The loop runs;
+   every side effect (Telegram reply, DB write) is a tool call.
 
 To add a new domain: drop a `skills.default/<name>.md` + emit signals with
 `source=<name>` from a new poller. No supervisor change.
@@ -67,7 +71,8 @@ mcp-tools/
         ├── data/agent.db                    agent-side state (memory KV + trace mirror)
         └── src/
             ├── db/{client,memory,trace-store,schema}.ts + migrations/  Drizzle (sqlite)
-            ├── supervisor/{main,fallback}.ts  poll loop + workflow failure handling
+            ├── supervisor/{main,module,telegram-context}.ts  poll loop,
+            │                                     per-signal routing, tg history
             ├── workflow/                      dynamic-workflow module (compile + execute)
             │   ├── index.ts                   createWorkflowRunner facade (runForSignal)
             │   ├── compile.ts                 signal → validated Workflow (LLM)
@@ -330,9 +335,10 @@ volume — written by the `dreaming` skill when it self-revises).
 
 - `nashdom-bill`, `news-digest`, `tech-digest`, `dreaming`, `scheduler`,
   `telegram` — primary domain skills, loaded per signal.source.
-- `routing` — always loaded on top (fallback agentic path only).
-- `planner` — the workflow compiler's system prompt.
-- `recovery` — spawned by the fallback path to phrase failures to the user.
+- `routing`, `orchestrator`, `worker` — always loaded on the AgentLoop path
+  (`worker` is the default skill for a sub-agent with no domain skill).
+- `planner` — the workflow compiler's system prompt (scheduler signals).
+- `recovery` — spawned on a failed signal to phrase the failure to the user.
 
 The improver writes an append-only overlay at `skills/<name>.patch.md`; the
 runtime glues it onto the end of the body with `appendPatch`, so the

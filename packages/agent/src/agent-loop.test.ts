@@ -9,6 +9,9 @@ import { createLocalRecorderTracer } from "./tracing/local-recorder";
 import { teeTracer } from "./tracing/tee";
 import type { StoredTraceInput, TraceStore } from "./db/trace-store";
 import { createSupervisorModule } from "./supervisor/module";
+import type { WorkflowRunner, WorkflowRunResult } from "./workflow";
+import type { Step } from "./workflow/dsl";
+import { createStore } from "./workflow/variables";
 import { createSkillStore } from "./skills";
 import { createLangfuseTracer } from "./tracing/langfuse";
 import { LangfuseOtelSpanAttributes } from "@langfuse/tracing";
@@ -359,6 +362,98 @@ function recording() {
 describe("primary AgentLoop and tracing", () => {
   const signal = { id: 1, source: "telegram", content: "chatId=42: summarize", envContext: "chatId=42", created_at: "2026-09-06T12:00:00Z" };
 
+  // Routing is by source, not by content: scheduler compiles a workflow,
+  // everything else runs the AgentLoop and must never reach the runner.
+  const neverWorkflow: WorkflowRunner = {
+    runForSignal: () => { throw new Error("Workflow must not run for this source"); },
+  };
+
+  function supervisor(h: ReturnType<typeof harness>, workflow: WorkflowRunner = neverWorkflow) {
+    return createSupervisorModule({
+      engine: h.engine,
+      env: { mcp: { callTool: async () => '{"timezone":"UTC"}' }, memory: h.engine.memory, userEmail: null },
+      workflow,
+    });
+  }
+
+  it("loads Telegram history before the first generation and shares its reference with workers", async () => {
+    const { tracer, written } = recording();
+    const history = { messages: [
+      { id: 1, chat_id: 42, thread_id: null, role: "assistant", text: "Собрать сводку за неделю?", created_at: "2026-09-06 11:59:00" },
+    ] };
+    const h = harness([
+      ({ messages }) => {
+        expect(h.callTool).toHaveBeenCalledExactlyOnceWith("get_telegram_chat_history", { chatId: "42", limit: 20 });
+        expect(JSON.stringify(messages)).toContain("Собрать сводку за неделю?");
+        return call("invoke_sub_agent", { prompt: "summarize", input_refs: ["telegram.history"] });
+      },
+      ({ messages }) => {
+        expect(JSON.stringify(messages)).toContain("Собрать сводку за неделю?");
+        return answer("summary");
+      },
+      () => answer("done"),
+    ], JSON.stringify(history), tracer);
+    const runner = supervisor(h);
+    const content = 'Telegram message in chat 42.\nText: "давай"';
+    expect(await runner.runSignal({ ...signal, content })).toBe("done");
+    expect(h.callTool).toHaveBeenCalledTimes(1); // no worker fetch or extra LLM retrieval turn
+    const trace = written[0]!;
+    expect(trace.input).toBe(content);
+    expect(trace.observations.find((o) => o.name === "get_telegram_chat_history")).toMatchObject({
+      type: "TOOL", metadata: { automatic: true, memory_key: "telegram.history" },
+    });
+    expect(trace.observations.filter((o) => o.type === "GENERATION")).toHaveLength(3);
+  });
+
+  it("compiles scheduler signals into a workflow instead of running the primary loop", async () => {
+    const { tracer, written } = recording();
+    const h = harness([], "unused", tracer);
+    const runForSignal = vi.fn(async (): Promise<WorkflowRunResult> => (
+      { ok: true, attempts: 1, stepCount: 3, store: createStore({}) }
+    ));
+    const starts = vi.spyOn(h.engine, "startAgentLoop");
+    const output = await supervisor(h, { runForSignal }).runSignal({ ...signal, source: "scheduler" });
+    expect(JSON.parse(output)).toEqual({ ok: true, attempts: 1, stepCount: 3 });
+    expect(runForSignal).toHaveBeenCalledOnce();
+    expect(starts).not.toHaveBeenCalled();
+    expect(h.callTool).not.toHaveBeenCalled(); // no Telegram preload on this path
+    expect(written[0]).toMatchObject({ tags: ["scheduler", "planner-mode"], output: { ok: true } });
+  });
+
+  it("degrades to the primary loop in the same trace when a scheduler workflow does not compile", async () => {
+    const { tracer, written } = recording();
+    const h = harness([({ messages }) => {
+      expect(messages.at(-1)?.content).toBe(signal.content); // no Telegram preload
+      return answer("done");
+    }], "unused", tracer);
+    const workflow: WorkflowRunner = {
+      runForSignal: async () => ({ ok: false, stage: "compile", reason: "schema_invalid", errors: ["step 0: unknown tool"], attempts: 3 }),
+    };
+    const starts = vi.spyOn(h.engine, "startAgentLoop");
+    expect(await supervisor(h, workflow).runSignal({ ...signal, source: "scheduler" })).toBe("done");
+    expect(starts.mock.calls[0]?.[0]).toMatchObject({ preset: "base", skills: ["scheduler"] });
+    expect(written).toHaveLength(1);
+    expect(written[0]?.observations.find((o) => o.name === "fallback")).toMatchObject({
+      type: "EVENT", level: "WARNING", metadata: { stage: "compile", reason: "schema_invalid" },
+    });
+  });
+
+  it("reports a scheduler execution failure instead of restarting the task agentically", async () => {
+    const { tracer, written } = recording();
+    const h = harness([() => answer("recovery report")], "unused", tracer);
+    const step: Step = { kind: "tool", tool: "send_telegram_message", args: {} };
+    const workflow: WorkflowRunner = {
+      runForSignal: async () => ({ ok: false, stage: "execute", reason: "tool_error", error: new Error("telegram 400"), stepIndex: 2, step }),
+    };
+    const starts = vi.spyOn(h.engine, "startAgentLoop");
+    await expect(supervisor(h, workflow).runSignal({ ...signal, source: "scheduler" })).rejects.toThrow("telegram 400");
+    expect(starts.mock.calls.map(([opts]) => opts.skills)).toEqual([["recovery"]]);
+    expect(written[0]?.observations.find((o) => o.name === "fallback")).toMatchObject({
+      type: "EVENT", level: "ERROR", metadata: { stage: "execute", reason: "tool_error", step_index: 2 },
+    });
+    expect(written[0]?.observations.find((o) => o.name === "recovery")).toMatchObject({ output: "recovery report" });
+  });
+
   it("runs a signal directly and records parent/worker/tool IO, memory references and per-iteration usage", async () => {
     const primary = recording();
     const mirror = recording();
@@ -369,11 +464,9 @@ describe("primary AgentLoop and tracing", () => {
       () => answer("short summary"),
       () => answer("finished"),
     ], payload, teeTracer(primary.tracer, mirror.tracer));
-    const supervisor = createSupervisorModule({ engine: h.engine, env: {
-      mcp: { callTool: async () => '{"timezone":"UTC"}' }, memory: h.engine.memory, userEmail: null,
-    } });
+    const runner = supervisor(h);
     const starts = vi.spyOn(h.engine, "startAgentLoop");
-    expect(await supervisor.runSignal(signal)).toBe("finished");
+    expect(await runner.runSignal(signal)).toBe("finished");
     expect(starts.mock.calls[0]?.[0]).toMatchObject({ preset: "smart", skills: ["telegram"] });
     expect(starts.mock.calls[1]?.[0].sessionContext).toBe(starts.mock.calls[0]?.[0].sessionContext);
     expect(primary.written).toHaveLength(1);
@@ -423,10 +516,8 @@ describe("primary AgentLoop and tracing", () => {
     ], "unused", tracer);
     const starts = vi.spyOn(h.engine, "startAgentLoop");
     const ends = vi.spyOn(h.engine, "endAgentLoop");
-    const supervisor = createSupervisorModule({ engine: h.engine, env: {
-      mcp: { callTool: async () => '{"timezone":"UTC"}' }, memory: h.engine.memory, userEmail: null,
-    } });
-    await expect(supervisor.runSignal(signal)).rejects.toThrow("primary model offline");
+    const runner = supervisor(h);
+    await expect(runner.runSignal(signal)).rejects.toThrow("primary model offline");
     expect(starts.mock.calls[1]?.[0].sessionContext).toBe(starts.mock.calls[0]?.[0].sessionContext);
     expect(starts.mock.calls[1]?.[0]).toMatchObject({ skills: ["recovery"], includeEngineSkills: false, maxIterations: 5 });
     expect(ends.mock.calls.map(([id]) => id)).toEqual(["telegram:1__recovery", "telegram:1"]);
@@ -438,10 +529,8 @@ describe("primary AgentLoop and tracing", () => {
   it("delegates domain signals without loading the domain skill into the parent", async () => {
     const h = harness([() => answer("done")]);
     const starts = vi.spyOn(h.engine, "startAgentLoop");
-    const supervisor = createSupervisorModule({ engine: h.engine, env: {
-      mcp: { callTool: async () => '{"timezone":"UTC"}' }, memory: h.engine.memory, userEmail: null,
-    } });
-    await supervisor.runSignal({ ...signal, source: "news-digest" });
+    const runner = supervisor(h);
+    await runner.runSignal({ ...signal, source: "news-digest" });
     expect(starts.mock.calls[0]?.[0].skills).toEqual([]);
     expect(starts.mock.calls[0]?.[0].systemPrompt).toContain('Delegate the domain work to skill "news-digest"');
   });
@@ -465,11 +554,9 @@ describe("primary AgentLoop and tracing", () => {
       () => answer("summary"),
       () => answer("done"),
     ], "large result ".repeat(1_000), tracer);
-    const supervisor = createSupervisorModule({ engine: h.engine, env: {
-      mcp: { callTool: async () => '{"timezone":"UTC"}' }, memory: h.engine.memory, userEmail: null,
-    } });
+    const runner = supervisor(h);
     try {
-      await supervisor.runSignal(signal);
+      await runner.runSignal(signal);
       const attrs = LangfuseOtelSpanAttributes;
       const root = exported.find((s) => s.name === "signal:telegram")!;
       const primary = exported.find((s) => s.name === "agent_loop")!;
