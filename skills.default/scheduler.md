@@ -33,54 +33,32 @@ Recurring: yes | no (one-shot)
    "IT-новости / tech-digest", "квитанции / nashdom-bill"). If yes, go
    to **§3 Delegated path**. Otherwise **§4 Inline path**.
 
-3. **§3 Delegated path — fetch chat context yourself, then invoke
-   sub-agent.** Same pattern `telegram.md` uses: sub-agents have no
-   Telegram tools and no env-context block. Pre-fetch chat history
-   yourself with one call before delegating:
+3. **§3 Delegated path.** Fetch chat history if needed for digest dedup:
 
-   ```
-   get_telegram_chat_history(chatId=<default chat id from your env>, limit=30)
+   ```text
+   get_telegram_chat_history(chatId=<default chat id>, limit=30)
    ```
 
-   Then:
+   Pass the result's `memory_key` to the domain worker:
 
-   ```
+   ```text
    invoke_sub_agent(
-     skills=["news-digest"],          // or "tech-digest"
-     preset="smart",
-     system_prompt="""
-   Environment:
-   - Date: <today, local>
-   - Timezone: <from `get_timezone` if needed, else local time from your context>
-   - Output language: Russian
-   - <watermark key>: <from current-context, or "never (bootstrap with now − 24h)">
-     # news-digest → news_digest.last_read_at
-     # tech-digest → tech_digest.last_read_at
-
-   Recent chat history (last 30 messages — scan assistant messages
-   starting with 📰 Новости / 🧠 IT-дайджест to avoid duplicates):
-   <JSON output of get_telegram_chat_history>
-
-   Goal: compose the digest per skill rules. Return as plain text — do
-   not call any Telegram tool, do not stamp the watermark. I deliver.
-   """,
-     prompt="<the user's prompt body verbatim from the signal>",
+     skills=["news-digest"], preset="smart",
+     input_refs=["<history memory_key>"],
+     system_prompt="Input is recent chat history for dedup. Return the finished Russian text; I handle delivery and bookkeeping.",
+     prompt="<the scheduled task body>"
    )
    ```
 
-   After the sub-agent returns the composed text, **send delivery +
-   bookkeeping in ONE assistant turn** (parallel tool calls, see
-   `routing.md`). The watermark key matches the digest:
-
-   ```
-   send_telegram_message(text=<sub-agent return value>, chatId=<id>)
-       +
-   set_memory(key="<news_digest.last_read_at | tech_digest.last_read_at>",
-              value="<current ISO timestamp>")
-   ```
-
-   Skip `set_memory` only for narrow Topic-mode peeks ("что там по такой-то
-   теме за час") that shouldn't shift the global watermark.
+   The worker gets date, timezone and news watermark from the session.
+   It can fetch missing domain evidence itself. Use multiple workers when
+   useful, passing result keys between them instead of copying payloads.
+   Read `content`, or explicitly read its memory key if the result was
+   large, then send the finished text with `send_telegram_message`.
+   Only after a successful full news-digest delivery, update
+   `news_digest.last_read_at`. A topical query does not advance it.
+   If delivery was explicitly assigned to a worker, inspect its completion
+   report and do not deliver again.
 
 4. **§4 Inline path — handle the task yourself.**
    - **Reminder / notification.** Send one short Russian Telegram

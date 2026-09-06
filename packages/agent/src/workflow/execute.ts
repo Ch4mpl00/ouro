@@ -2,6 +2,7 @@ import type { ChatCompletionMessageParam } from "openai/resources/chat/completio
 import type { ModelPreset, PresetName } from "../models";
 import type { ChatProvider } from "../providers";
 import type { AgentLoopOpts } from "../agent-loop";
+import type { SessionContext } from "../session-context";
 import { SET_MEMORY_TOOL_NAME, SetMemoryArgsSchema } from "../synthetic-tools";
 import { runCodeAgent } from "../code-agent";
 import type { CodexClient } from "../codex-client";
@@ -73,6 +74,7 @@ export type ExecResult =
     };
 
 export interface ExecContext {
+  sessionContext: SessionContext;
   store: VariableStore;
   // Caller-provided trace scope. Executor opens its own root span inside
   // for the whole workflow, and per-step children inside that.
@@ -623,6 +625,7 @@ async function execLlmAgent(
 
   const child = await deps.engine.startAgentLoop({
     id: childId,
+    sessionContext: ctx.sessionContext,
     skills: [step.skill],
     includeEngineSkills: false,
     preset: step.preset,

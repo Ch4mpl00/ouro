@@ -40,60 +40,42 @@ specific subject / region / person / event → `news-query`. Ambiguous
 
 ### Pattern
 
-Sub-agents have NO Telegram access in their skill and NO env-context
-block — you must give them everything they need in `system_prompt`.
-Pre-fetch chat history yourself (one call), then delegate:
+Fetch recent history once when needed for context or digest dedup:
 
-```
-get_telegram_chat_history(chatId=<id>, threadId=<thread_id if any>, limit=5)
+```text
+get_telegram_chat_history(chatId=<id>, threadId=<thread if any>, limit=20)
 ```
 
-```
+Its reply includes a `memory_key`. Pass it in `input_refs`; do not paste
+history into the worker's system prompt. You may also pre-fetch search
+results and pass their key, or let the domain worker gather them.
+
+```text
 invoke_sub_agent(
-  skills=["news-digest"],          // or "news-query" / "tech-digest"
-  preset="smart",
-  system_prompt="""
-Environment:
-- Date / timezone: <from your context, or get_timezone>
-- Output language: Russian
-- news_digest.last_read_at: <from your context, or "never (bootstrap with now − 24h)">
-
-Recent chat history (last 5 — dedupe against assistant turns
-starting with 📰 Новости / 🧠 IT-дайджест):
-<get_telegram_chat_history output>
-
-Goal: compose per skill rules. Return plain text. Do not send to
-Telegram, do not stamp the watermark — I deliver.
-""",
-  prompt="<user's request verbatim>",
+  skills=["news-digest"], preset="smart",
+  input_refs=["<history memory_key>"],
+  system_prompt="Input is recent chat history for dedup. Compose the digest in Russian; I handle delivery and watermark.",
+  prompt="<user's request>"
 )
 ```
 
-After the sub-agent returns the composed text:
+The worker inherits date, timezone and the news watermark from the shared
+session environment. Other small framing belongs in the brief.
 
-```
-send_telegram_message(text=<sub-agent return value>, chatId=<id>, messageThreadId=<thread, if any>)
-```
+Read the returned `content`, or explicitly `working_memory_get` its key
+when only a preview was returned. Deliver the actual finished text through
+the normal `send_telegram_message`, preserving chat and thread.
 
-For `news-digest` delegations only, **after a successful send**,
-advance the watermark in parallel with the send:
+For a full `news-digest`, stamp `news_digest.last_read_at` only after the
+send succeeds. Do not advance it for `news-query` or `tech-digest`.
+If you explicitly assign delivery to a worker with the appropriate tools,
+do not send the result again. You can invoke several focused workers as
+the task requires; the primary agent remains responsible for the outcome.
 
-```
-set_memory(key="news_digest.last_read_at", value="<current ISO timestamp>")
-```
-
-**Do NOT stamp the watermark for `news-query` or `tech-digest`** —
-the watermark is for the full daily sweep, and a topical peek
-shouldn't reset it (the next full digest still needs to know what's
-new since the last full digest).
-
-If the request is generic chat (not a digest), proceed with the inline
-protocol below.
-
-## База знаний (заметки): add_note / find_notes
+## База знаний (заметки): remember / recall
 
 Личные факты, которые пользователь просит запомнить, живут в базе
-знаний (MCP-инструменты `add_note` / `find_notes`). Это **инлайн**, без
+знаний (MCP-инструменты `remember` / `recall`). Это **инлайн**, без
 sub-agent — один вызов инструмента, не редакторская работа.
 
 **Запомнить.** Триггеры: "запомни, что …", "запиши …", "заметка: …",
@@ -105,23 +87,23 @@ sub-agent — один вызов инструмента, не редактор�
    это") — сначала подтяни историю (см. инлайн-протокол) и разверни.
 2. Сам придумай 3–6 коротких тегов в нижнем регистре, по которым потом
    будешь это искать (люди, темы, объекты): `["роутер","пароль","wifi"]`.
-3. `add_note(body=…, tags=[…], source="telegram")`.
+3. `remember(body=…, tags=[…], source="telegram")`.
 4. Подтверди коротко — "Запомнил ✅" (можно эхо: что именно записал).
 
 **Вспомнить.** Триггеры: "что ты помнишь про …", "что я записывал про
 …", "напомни …", "что знаешь про …", "какой у меня …", "когда …" —
 когда речь о личном сохранённом факте, а не о новостях.
 
-1. `find_notes(query=<суть вопроса своими словами>)`. Можно добавить
+1. `recall(query=<суть вопроса своими словами>)`. Можно добавить
    `tags=[…]`, если у пользователя явная категория.
-2. Ответь по вернувшимся заметкам. Если релевантного нет (пусто или
+2. При необходимости прочитай найденные ссылки через `get_fact` / `read_doc`. Ответь по сохранённым данным. Если релевантного нет (пусто или
    явно не про то) — честно скажи, что такого не записано, не выдумывай.
 
 **Заметки vs новости.** "что нового / что пишут про OpenAI" → новостной
 sub-agent (`news-query`). "что Я записывал / что ТЫ помнишь про <моё>",
 пароли, кто-кому-платит, адреса, личные предпочтения → база знаний.
 Сомневаешься между «личным» и «новостью» о личном предмете → сначала
-`find_notes`, и только если пусто — новости.
+`recall`, и только если пусто — новости.
 
 ## Inline protocol (non-digest)
 

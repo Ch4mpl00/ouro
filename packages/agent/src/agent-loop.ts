@@ -1,7 +1,10 @@
 import type { ChatCompletionMessageParam } from "openai/resources/chat/completions";
 import type { Engine } from "./engine";
 import type { PresetName, ReasoningEffort } from "./models";
-import type { Trace, TraceContext } from "./tracing";
+import type { Span, Trace, TraceContext } from "./tracing";
+import type { SessionContext } from "./session-context";
+import { isToolError, storeToolResult, WORKING_MEMORY_INSTRUCTIONS } from "./tool-results";
+import { z } from "zod";
 import {
   INVOKE_SUB_AGENT_TOOL_NAME,
   SYNTHETIC_TOOLS,
@@ -14,25 +17,20 @@ import {
 // the engine's providers and MCP connection — does not create or close
 // them.
 //
-// An AgentLoop is one of the two sibling strategies for handling a signal
-// (the other being a compiled Workflow). The unit of work — handling one
-// signal — is the "session" (see `sessionId`, the trace-grouping id); an
-// AgentLoop is the LLM-driven loop that may run inside it. It's used in
-// exactly two places: (1) an `llm_agent` workflow step (the executor
-// spawns a sub-loop with a bounded tool whitelist), and (2) the
-// supervisor fallback path (when the compiler can't produce a valid
-// workflow, or to phrase a failure via the `recovery` skill). The default
-// workflow path does NOT go through here — it runs tool / llm_compose
-// steps directly against the engine.
+// The primary path for a signal. Focused child loops share working memory,
+// while keeping separate conversations. The standalone workflow executor
+// can also spawn a loop, but workflow is not part of the signal hot path.
 
 export interface AgentLoopOpts {
   id: string;
+  // Shared by every loop working on this task; never engine-global.
+  sessionContext: SessionContext;
   // Pre-assembled context that goes at the top of the system prompt (e.g.
   // the session-context block + the signal's envContext). Skills are
   // resolved separately by the engine and appended after this.
   systemPrompt?: string;
-  // Per-session skills — typically the primary domain skill matching the
-  // signal source (e.g. `nashdom-bill`). The engine resolves these via
+  // Per-loop skills — transport instructions for the primary agent, or
+  // domain instructions (e.g. `nashdom-bill`) for a worker. The engine resolves these via
   // the skill store at `startAgentLoop` time. Missing here is a hard
   // error — the caller decides whether to skip the signal. Engine-level
   // meta-skill (`routing`) comes from `EngineDeps.skills` and is added
@@ -83,16 +81,17 @@ export interface AgentLoopOpts {
   // Pre-created trace scope from a caller. When present, this session
   // nests its generations and tool spans inside the given scope instead
   // of creating a new top-level trace. Used for sub-agents — the parent's
-  // `invoke_sub_agent` tool span IS the child's scope, so a sub-agent's
-  // iters/tool calls render under the parent's trace in the UI. Omit for
-  // top-level sessions (primary + recovery).
+  // `invoke_sub_agent` tool span IS the child's scope. The supervisor
+  // also supplies scopes for the primary loop and recovery. Omit when
+  // a standalone caller wants the loop to own a new trace.
   traceScope?: TraceContext;
 }
 
 // Public surface of one loop. Consumers (engine registry, workflow
-// executor, fallback, invoke_sub_agent) speak only this interface.
+// executor, supervisor, invoke_sub_agent) speak only this interface.
 export interface AgentLoop {
   readonly id: string;
+  readonly sessionContext: SessionContext;
   readonly parentId?: string;
   readonly sessionId?: string;
   readonly messages: ChatCompletionMessageParam[];
@@ -112,7 +111,8 @@ export interface AgentLoop {
 const DEFAULT_MAX_ITERATIONS = 100;
 
 export function createAgentLoop(engine: Engine, opts: AgentLoopOpts): AgentLoop {
-  const { id, parentId, sessionId } = opts;
+  const { id, parentId, sessionContext } = opts;
+  const sessionId = opts.sessionId ?? sessionContext.id;
   const messages: ChatCompletionMessageParam[] = [];
   // Pick a preset from the engine registry. `base` (cheap chat,
   // non-thinking) is the default — most signals stay here. Callers
@@ -135,6 +135,7 @@ export function createAgentLoop(engine: Engine, opts: AgentLoopOpts): AgentLoop 
   const systemParts: string[] = [];
   if (opts.systemPrompt) systemParts.push(opts.systemPrompt);
   for (const content of Object.values(skillsMap)) systemParts.push(content);
+  systemParts.push(WORKING_MEMORY_INSTRUCTIONS);
   const combinedSystem = systemParts.join("\n\n---\n\n");
   if (combinedSystem.length > 0) {
     messages.push({ role: "system", content: combinedSystem });
@@ -144,30 +145,26 @@ export function createAgentLoop(engine: Engine, opts: AgentLoopOpts): AgentLoop 
   //   - top-level: create a new Trace (and own its input/output/metadata).
   //   - sub-agent: reuse the parent's `invoke_sub_agent` span so all the
   //     child's iter generations + tool spans render nested inside the
-  //     parent's trace. We don't take ownership of the scope's
-  //     input/output — those describe the tool call from the parent's
-  //     POV — but we annotate it with sub-agent identity & config so the
-  //     UI can show what was loaded into the child.
+  //     parent's trace. The loop records its resolved input, final output
+  //     and identity; the caller owns closing the supplied scope.
   let scope: TraceContext;
-  // Non-null when this loop owns its trace scope (top-level). Used as
-  // both a "may touch input/output" gate and the handle for explicitly
-  // ending the root trace span at end-of-run (v5/OTel needs it).
+  // Non-null only when this loop owns the trace lifecycle. Supplied
+  // scopes are ended by the supervisor or parent tool dispatcher.
   let trace: Trace | null;
   if (opts.traceScope) {
     scope = opts.traceScope;
     trace = null;
-    // Annotate the parent's `invoke_sub_agent` span with sub-agent
-    // identity. Skills go in as NAMES, not bodies — metadata is for
-    // short K/V; the full skill text already lives in this session's
-    // first generation.input (system message), where it belongs.
     scope.update({
       metadata: {
-        sub_agent_id: id,
-        sub_agent_skills: Object.keys(skillsMap),
-        sub_agent_preset: presetName,
-        sub_agent_model: model,
-        sub_agent_reasoning_effort: reasoningEffort,
-        sub_agent_max_iterations: maxIterations,
+        ...opts.metadata,
+        agent_id: id,
+        ...(parentId ? { parent_id: parentId } : {}),
+        skill: Object.keys(skillsMap)[0] ?? "worker",
+        skills: Object.keys(skillsMap),
+        preset: presetName,
+        model,
+        reasoning_effort: reasoningEffort,
+        max_iterations: maxIterations,
       },
     });
   } else {
@@ -214,6 +211,7 @@ export function createAgentLoop(engine: Engine, opts: AgentLoopOpts): AgentLoop 
     parentId,
     sessionId,
     log: (...parts) => engine.log(id, ...parts),
+    sessionContext,
     skillStore: engine.skillStore,
     memory: engine.memory,
     codex: engine.codex,
@@ -225,24 +223,41 @@ export function createAgentLoop(engine: Engine, opts: AgentLoopOpts): AgentLoop 
     allocSubAgentId: () => `${id}__sub${++subAgentCounter}`,
   };
 
+  function endToolSpan(span: Span, result: string): void {
+    span.end({
+      output: result,
+      ...(isToolError(result) ? { level: "ERROR", statusMessage: result } : {}),
+    });
+  }
+
+  async function invokeTool(name: string, args: Record<string, unknown>, span: TraceContext): Promise<string> {
+    try {
+      const synthetic = SYNTHETIC_TOOLS_BY_NAME.get(name);
+      if (synthetic) {
+        if (!(synthetic.visibleTo?.(toolCtx) ?? true)) return `[tool error] ${name} is unavailable in this loop`;
+        return await synthetic.run(toolCtx, args, span);
+      }
+      if (!engine.mcp.tools.some((tool) => tool.function.name === name) || (allowedTools !== null && !allowedTools.has(name))) {
+        return `[tool error] ${name} is unavailable in this loop`;
+      }
+      return await engine.mcp.callTool(name, args);
+    } catch (err) {
+      // A failed action is an observation the agent can reason about. Never
+      // retry side effects automatically; let it inspect the failure first.
+      return `[tool error] ${name}: ${err instanceof Error ? err.message : String(err)}`;
+    }
+  }
+
   async function runUntilSettled(): Promise<string> {
     const { mcp } = engine;
     // Resolve provider once per run. Model is fixed for the loop's
     // lifetime, so the provider does not change across iterations either.
     const provider = engine.resolveProvider(model);
 
-    // Surface the user's prompt on the trace so the Session-replay UI
-    // renders a real `user → assistant` exchange. Done here (not at
-    // construction) because the caller pushes the user message AFTER
-    // startAgentLoop returns. Skip for sub-agents — their scope is the
-    // parent's tool span and the input there is the tool args, not the
-    // user message; overwriting would erase the parent's view.
-    if (trace) {
-      const firstUserMessage = messages.find((m) => m.role === "user");
-      if (firstUserMessage) {
-        scope.update({ input: firstUserMessage.content });
-      }
-    }
+    // Scoped workers expose their resolved input as well, so the trace and
+    // per-node judge can see what data was actually supplied by input_refs.
+    const firstUserMessage = messages.find((m) => m.role === "user");
+    if (firstUserMessage) scope.update({ input: firstUserMessage.content });
 
     try {
       for (let i = 0; i < maxIterations; i++) {
@@ -271,7 +286,7 @@ export function createAgentLoop(engine: Engine, opts: AgentLoopOpts): AgentLoop 
             reasoning_effort: reasoningEffort,
             thinking: reasoningEffort === "disabled" ? "disabled" : "enabled",
           },
-          input: messages,
+          input: structuredClone(messages),
           metadata: observationMeta,
         });
 
@@ -306,9 +321,7 @@ export function createAgentLoop(engine: Engine, opts: AgentLoopOpts): AgentLoop 
         engine.log(id, `iter ${i} finish=${result.finishReason} tool_calls=${message.tool_calls?.length ?? 0}`);
 
         if (!message.tool_calls?.length) {
-          if (trace) {
-            scope.update({ output: message.content ?? "" });
-          }
+          scope.update({ output: message.content ?? "" });
           return message.content ?? "";
         }
 
@@ -319,6 +332,7 @@ export function createAgentLoop(engine: Engine, opts: AgentLoopOpts): AgentLoop 
         // message buffer is deterministic regardless of completion order.
         const toolResults = await Promise.all(
           message.tool_calls.map(async (call) => {
+            const synthetic = SYNTHETIC_TOOLS_BY_NAME.get(call.function.name);
             // Span per tool call. We open it BEFORE parsing args so a
             // malformed-JSON case still leaves a measurable, attributed
             // span in the trace.
@@ -330,50 +344,31 @@ export function createAgentLoop(engine: Engine, opts: AgentLoopOpts): AgentLoop 
               kind:
                 call.function.name === INVOKE_SUB_AGENT_TOOL_NAME ? "agent" : "tool",
               input: { raw_arguments: call.function.arguments },
-              metadata: observationMeta,
+              metadata: { ...observationMeta, tool_call_id: call.id },
             });
-
-            // Malformed JSON in the arguments is the MODEL's mistake, not an
-            // infra failure — feed it back as a tool result so the model can
-            // correct itself, instead of crashing the whole session (which
-            // would also leave the sibling tool_calls in this round without
-            // tool messages, corrupting the buffer for good).
-            let args: Record<string, unknown>;
-            try {
-              args = JSON.parse(call.function.arguments || "{}") as Record<string, unknown>;
-            } catch (err) {
-              const msg = `[tool error] invalid JSON in arguments: ${(err as Error).message}`;
-              span.end({ output: { error: msg }, level: "ERROR", statusMessage: msg });
-              return { call, result: msg };
-            }
 
             let result: string;
             try {
+              const args = z.record(z.unknown()).parse(JSON.parse(call.function.arguments || "{}"));
               span.update({ input: args });
-              engine.log(id, `→ ${call.function.name}(${JSON.stringify(args)})`);
-
-              const synthetic = SYNTHETIC_TOOLS_BY_NAME.get(call.function.name);
-              if (synthetic) {
-                // Pass the span — `invoke_sub_agent` reuses it as the child
-                // loop's trace scope so the sub-agent's iters render nested
-                // here in the UI.
-                result = await synthetic.run(toolCtx, args, span);
-              } else {
-                result = await mcp.callTool(call.function.name, args);
-              }
+              result = await invokeTool(call.function.name, args, span);
             } catch (err) {
-              span.end({
-                output: { error: (err as Error).message },
-                level: "ERROR",
-                statusMessage: (err as Error).message,
-              });
-              throw err;
+              result = `[tool error] arguments must be a JSON object: ${err instanceof Error ? err.message : String(err)}`;
             }
 
-            span.end({ output: result });
-            engine.log(id, `← ${call.function.name} ${result.length}b: ${result}`);
-
-            return { call, result };
+            let presented = result;
+            if (synthetic?.resultMode !== "inline") {
+              const stored = storeToolResult(sessionContext.memory, result);
+              presented = JSON.stringify(stored);
+              span.update({ metadata: {
+                memory_key: stored.memory_key,
+                result_size_bytes: stored.size_bytes,
+                result_truncated: stored.truncated,
+              } });
+            }
+            endToolSpan(span, result);
+            engine.log(id, `← ${call.function.name}: ${presented}`);
+            return { call, result: presented };
           }),
         );
 
@@ -390,15 +385,12 @@ export function createAgentLoop(engine: Engine, opts: AgentLoopOpts): AgentLoop 
     } catch (err) {
       // Trace-level error marker. Individual generation/span errors are
       // already attributed above; this surfaces failed sessions in the
-      // tracing list view. Sub-agents skip this — the parent's
-      // `invoke_sub_agent` span captures the error via its own
-      // `.end({ level: ERROR })` once the exception propagates back.
-      if (trace) {
-        scope.update({
-          output: { error: (err as Error).message },
-          metadata: { error: true },
-        });
-      }
+      // tracing list view. The owner closes a supplied scope with ERROR
+      // when the exception propagates back to the parent or supervisor.
+      scope.update({
+        output: { error: err instanceof Error ? err.message : String(err) },
+        metadata: { error: true },
+      });
       throw err;
     } finally {
       // Close the root trace span for top-level sessions. v5/OTel keeps
@@ -411,6 +403,7 @@ export function createAgentLoop(engine: Engine, opts: AgentLoopOpts): AgentLoop 
 
   return {
     id,
+    sessionContext,
     parentId,
     sessionId,
     messages,

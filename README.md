@@ -34,81 +34,58 @@ Two independent processes in one pnpm workspace, deployed as two containers:
 | Package | Role | Knows about |
 | --- | --- | --- |
 | **`packages/mcp`** | Stateless MCP server. Wraps Gmail / Telegram / Monobank / news as primitive tools; runs the pollers that turn external events into signals. | Nothing about the agent. |
-| **`packages/agent`** | Agent supervisor. Pulls one signal, compiles a workflow (or falls back to an agentic session), runs it, stops. | Nothing about MCP internals — only the tools the protocol exposes. |
+| **`packages/agent`** | Agent supervisor. Pulls one signal and runs a primary AgentLoop with shared working memory and focused sub-agents. | Nothing about MCP internals — only the tools the protocol exposes. |
 
 Neither imports code from the other. The boundary *is* the protocol.
 
-## ✨ Dynamic workflows: plan-then-execute instead of ReAct
+## AgentLoop and working memory
 
-The core engineering piece of this project. The naive way to run an LLM agent
-is a **ReAct loop** — feed the model a prompt and tools, let it think-act-think
-until it stops. It works, but it's opaque (the plan only exists implicitly in
-the conversation history), unbounded (no limit on the number of model
-round-trips), and every step pays the full context cost.
-
-Here the supervisor inverts that: **one planning call compiles the signal into
-a typed workflow, then a deterministic runtime executes it.**
-
-What the compiler emits for *"what did that Telegram thread decide?"* — and
-how the runtime walks it:
+The primary agent handles each signal in a ReAct loop: call tools, observe
+results and decide the next action. It can delegate several focused tasks
+to sub-agents, each with a fresh conversation and the same session memory.
+The primary uses the `smart` preset; workers choose a preset for their task.
 
 ```mermaid
 flowchart LR
-    SIG(["signal<br/>'what did that<br/>thread decide?'"]) --> C
-
-    C{{"compiler LLM<br/>one planning call<br/>→ validated workflow"}}
-
-    C --> S1
-
-    subgraph runtime ["deterministic runtime — walks the steps, no LLM driving"]
-        direction LR
-        S1["kind: tool<br/>get_telegram_chat_history<br/>bind: history"]
-        S2["kind: llm_compose<br/>'summarize the decision'<br/>input: $history → bind: summary"]
-        S3["kind: tool<br/>send_telegram_message<br/>text: $summary"]
-        S4([terminal])
-        S1 -->|history| S2 -->|summary| S3 --> S4
-    end
-
-    style C fill:#4b6bfb,color:#fff
-    style S2 fill:#4b6bfb,color:#fff
+    S[Signal] --> A[Primary AgentLoop]
+    A --> T[MCP tools]
+    T --> M[(Session working memory)]
+    M -->|short content or key + preview| A
+    A -->|input_refs| W[Focused sub-agent]
+    M -->|selected full inputs| W
+    W -->|final result| M
+    A --> D[Delivery]
 ```
 
-LLM calls are the two blue nodes — everything else is plain code: the
-runtime dispatches tools, resolves `${bindings}`, and never re-asks the
-model what to do next.
+Ordinary tool schemas and arguments stay unchanged. Runtime stores every
+ordinary tool result under a fresh memory key. Results up to 8,000 UTF-8
+bytes include full `content`; larger ones include a preview of at most 512
+bytes. `working_memory_get` explicitly loads a full value into the calling
+agent's context. `put`, `list` and `delete` manage the temporary string KV.
+Memory operations return directly, without creating another stored copy.
 
-The DSL (`packages/agent/src/workflow/dsl.ts`) has six step kinds — `tool`,
-`llm_compose`, `llm_agent` (a *bounded* ReAct sub-loop with a tool whitelist
-and `maxIterations`), `parallel`, `terminal`, `replan` — and deliberately **no
-branching or loops**. Design decisions that make it hold up in practice:
+`invoke_sub_agent` accepts `input_refs`: runtime loads those exact values
+into the worker's user message without copying them into the parent's
+history. Workers return full final answers normally; runtime decides whether
+the parent sees their complete content or a memory reference. A worker cannot
+spawn further workers. A general focused task can omit the optional `skills`.
 
-- **Hallucinated tools die at compile time.** The Zod schema is built at
-  engine boot from the live MCP tool registry and skill list — tool and skill
-  names are closed enums, so a typo or invented tool is a validation error,
-  not a runtime crash.
-- **Validation errors feed a retry loop.** Zod issues are flattened to
-  one-line `at steps[2].tool: …` messages and handed back to the compiler —
-  cheap, and first-retry success is high precisely because the errors are
-  readable.
-- **Explicit data flow.** Steps publish results via `bind` and reference them
-  with `${path.to.value}` placeholders; each LLM step sees *only* the bindings
-  it names — the inverse of the grow-forever conversation-history model.
-- **`replan` instead of `if`.** When the plan depends on data the model hasn't
-  seen ("can't decide until I read X"), it emits a gather-workflow ending in
-  `replan` with named bindings; the runtime recompiles with that context. The
-  plan→act→replan loop is bounded by `maxPasses`, so a planner that never
-  commits degrades cleanly instead of looping forever.
-- **Failure routing is a discriminated union.** A `compile` failure is safe —
-  nothing ran — so the supervisor degrades to a classic agentic session. An
-  `execute` failure means side effects may have already fired, so it is
-  reported to the user instead of silently retried.
-- **Every pass is traced.** Compile attempts, step execution, and sub-LLM
-  calls all land in Langfuse as one tree per signal, with an LLM-as-judge
-  pipeline (`pnpm judge`) scoring trajectories offline.
+The parent owns completion and delivery unless it explicitly assigns delivery
+to a worker. Normal delivery calls take actual text; the parent can explicitly
+read a result when needed. Dependent bookkeeping follows a successful send.
+Temporary memory is shared through the task and its recovery, then released.
+Persistent `set_memory` and MCP knowledge storage remain separate.
 
-The payoff: most signals run as a handful of cheap, parallelizable,
-individually-traced steps — and the free-form agent is the *fallback*, not
-the default.
+Each signal has one Langfuse trace and a local mirror. The primary loop,
+LLM iterations (including usage), tools, memory references and nested workers
+form a single observation tree. Full tool output stays in the tool span;
+generation input records exactly the context that iteration saw. Recovery
+is recorded in the same trace. Langfuse export uses the configured
+`LANGFUSE_*` credentials; without them the local recorder still runs.
+
+The standalone `workflow/` compiler/executor is retained for explicit callers
+and the existing workflow GAIA benchmark. The supervisor does not invoke it,
+and the AgentLoop does not expose a workflow tool.
 
 ## How a signal becomes action
 
@@ -125,10 +102,12 @@ flowchart LR
 
     subgraph agent [packages/agent]
         S[Supervisor loop] -->|get_next_signal| Q
-        S --> W[workflow/<br/>compile → execute]
-        W -.fallback.-> L[Agentic session<br/>skill + routing + handoff]
-        W -->|tool calls| T
+        S --> L[Primary AgentLoop]
+        L --> C[Focused sub-agents]
+        L <-->|references| M[(Session memory)]
+        C <-->|data and results| M
         L -->|tool calls| T
+        C -->|tool calls| T
     end
 ```
 
@@ -136,15 +115,12 @@ flowchart LR
    one row in the `signals` queue.
 2. The supervisor (`packages/agent/src/supervisor/main.ts`) loops on
    `get_next_signal`.
-3. A popped signal first goes through the
-   [**dynamic-workflow module**](#-dynamic-workflows-plan-then-execute-instead-of-react)
-   (`workflow/compile.ts` → `workflow/execute.ts`): the LLM compiles the
-   signal into a validated step DSL, and a deterministic runtime walks the
-   steps.
-4. If compilation isn't possible, the **agentic fallback** kicks in: load
-   `skills/<signal.source>.md` (plus `routing.md` and `handoff.md`), push the
-   signal content as the first user message, and let DeepSeek drive — every
-   side effect is a tool call.
+3. `supervisor/module.ts` creates the session context and trace, then starts
+   the primary AgentLoop with `orchestrator` and `routing` instructions.
+   Telegram and scheduler signals also load their transport skill.
+4. Domain work is delegated with the appropriate skill and memory references.
+   The parent decides subsequent actions and delivers the result. On a fatal
+   loop error, a bounded recovery agent reports the failure in the same session.
 
 **Adding a new domain = dropping a `skills.default/<name>.md` and emitting
 signals with `source=<name>`.** No supervisor change.
@@ -158,7 +134,8 @@ checks the overlay first.
 
 Skills are named after signal sources — one per domain (bills, news digests,
 Telegram chat, scheduled tasks, …) plus a few meta-skills: `routing` (always
-loaded, delegates across domains), `planner`, `recovery`, and `dreaming`
+loaded on the primary), `orchestrator`, `worker`, `recovery`, `planner`
+(standalone workflows), and `dreaming`
 (self-revision).
 
 ## MCP tools
@@ -191,7 +168,7 @@ mcp-tools/
     │                                news, pdf, signals, settings, embeddings
     └── agent/src/
         ├── supervisor/              poll loop + failure handling
-        ├── workflow/                signal → DSL compile + deterministic execute
+        ├── workflow/                standalone DSL compiler/executor
         ├── engine.ts, session.ts    DeepSeek runner + synthetic tools
         ├── mcp-client.ts            StreamableHTTP client
         ├── skills.ts                two-layer skill loader

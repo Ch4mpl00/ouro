@@ -18,7 +18,7 @@ import {
   DEEPSEEK_BASE_URL,
   GEMINI_BASE_URL,
 } from "../../../providers";
-import { gatherEnvData, type EnvDataDeps } from "../../../session-context";
+import { createSessionContext, gatherEnvData, type EnvDataDeps } from "../../../session-context";
 import { createSkillStore } from "../../../skills";
 import { createLocalRecorderTracer } from "../../../tracing/local-recorder";
 import { langfuseTracerFromEnv } from "../../../tracing/langfuse";
@@ -321,7 +321,8 @@ async function runOne(
 
   try {
     const envData = await gatherEnvData(envDeps);
-    const result = await runner.runForSignal(signal, envData, trace);
+    const sessionContext = createSessionContext({ id: traceId, env: envData });
+    const result = await runner.runForSignal(signal, sessionContext, trace);
 
     if (!result.ok) {
       const outcome: Outcome =

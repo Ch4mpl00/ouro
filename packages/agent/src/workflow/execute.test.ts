@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it } from "vitest";
 import type { ChatCompletionMessageParam } from "openai/resources/chat/completions";
 import type { ModelPreset, PresetName } from "../models";
 import type { ChatProvider } from "../providers";
+import { createSessionContext } from "../session-context";
 import type { AgentLoopOpts } from "../agent-loop";
 import type { Generation, Span, Trace, TraceContext } from "../tracing";
 import { createWorkflowSchema, type Workflow } from "./dsl";
@@ -215,7 +216,13 @@ function fixedReadSkill(map: Record<string, string>): (
   return async (name: string) => map[name] ?? null;
 }
 
+const testSessionContext = () => createSessionContext({
+  id: "test:1",
+  env: { now: new Date("2026-09-06T12:00:00Z"), timezone: "UTC", userEmail: null, newsLastReadAt: null },
+});
+
 const baseCtx = () => ({
+  sessionContext: testSessionContext(),
   store: createStore({ env: { chatId: 42 } }),
   parentTrace: recordingTrace() as TraceContext,
   signalLabel: "test:1",
@@ -275,7 +282,7 @@ describe("executor.execute — tool step", () => {
           { kind: "terminal" },
         ],
       },
-      { store: createStore({ env: {} }), parentTrace: trace, signalLabel: "test:1" },
+      { ...baseCtx(), store: createStore({ env: {} }), parentTrace: trace },
     );
 
     expect(r.ok).toBe(true);
@@ -1015,6 +1022,7 @@ describe("executor.execute — llm_agent step", () => {
 
     expect(engine.agentLoopStarts.length).toBe(1);
     const opts = engine.agentLoopStarts[0]!;
+    expect(opts.sessionContext).toBe(ctx.sessionContext);
     expect(opts.skills).toEqual(["news-query"]);
     expect(opts.includeEngineSkills).toBe(false);
     expect(opts.preset).toBe("smart");

@@ -1,13 +1,9 @@
+import { Buffer } from "node:buffer";
 import { MEMORY_KEYS, type MemoryStore } from "./db/memory";
 
-// `Current context` block prepended to every session's system prompt.
-// Saves the agent a few tool calls per session (no `get_timezone`,
-// no `get_last_news_read_at`) and gives every skill a single canonical
-// place to look for "what's the current state of the world".
-//
-// Kept deliberately small — only data that's cheap to gather, useful in
-// most sessions, and stable enough that a ~minute of staleness is fine.
-// Bigger / per-source state still goes through tool calls.
+// A session owns its environment and working memory. Prompt rendering is a
+// separate operation: renderContext includes the small environment block,
+// while stored tool results are passed to consumers explicitly.
 
 // Narrow dependency surface: gathering env data needs one MCP call, one
 // memory read and the user's email — not the whole Engine. `userEmail` is
@@ -28,6 +24,75 @@ export interface EnvData {
   timezone: string;
   userEmail: string | null;
   newsLastReadAt: string | null;
+}
+
+// A caller-supplied label. The store neither parses nor validates JSON.
+export type WorkingMemoryFormat = "text" | "json";
+
+export interface WorkingMemoryEntry {
+  key: string;
+  format: WorkingMemoryFormat;
+  sizeBytes: number;
+}
+
+export interface WorkingMemory {
+  // Insert only: keys are exact, non-empty strings. An occupied key throws.
+  put(key: string, value: string, format?: WorkingMemoryFormat): void;
+  // Returns the original string, including empty strings. Missing keys throw.
+  get(key: string): string;
+  // Detached metadata in insertion order; payloads stay out of the listing.
+  list(): WorkingMemoryEntry[];
+  // True if removed, false if absent. The deleted key may then be reused.
+  delete(key: string): boolean;
+}
+
+export interface SessionContext {
+  readonly id: string;
+  readonly env: EnvData;
+  readonly memory: WorkingMemory;
+}
+
+interface StoredValue {
+  value: string;
+  format: WorkingMemoryFormat;
+  sizeBytes: number;
+}
+
+// Each call creates independent memory. Callers share the context explicitly
+// with the components working on the same task and control its lifetime.
+export function createSessionContext({ id, env }: { id: string; env: EnvData }): SessionContext {
+  const entries = new Map<string, StoredValue>();
+
+  return {
+    id,
+    env,
+    memory: {
+      put(key, value, format = "text") {
+        if (key.length === 0) throw new Error("Key must not be empty");
+        if (entries.has(key)) throw new Error(`Key ${JSON.stringify(key)} already exists`);
+
+        entries.set(key, { value, format, sizeBytes: Buffer.byteLength(value, "utf8") });
+      },
+
+      get(key) {
+        const entry = entries.get(key);
+        if (entry === undefined) throw new Error(`Key ${JSON.stringify(key)} not found`);
+        return entry.value;
+      },
+
+      list() {
+        return Array.from(entries, ([key, { format, sizeBytes }]) => ({
+          key,
+          format,
+          sizeBytes,
+        }));
+      },
+
+      delete(key) {
+        return entries.delete(key);
+      },
+    },
+  };
 }
 
 function formatLocalTime(now: Date, tz: string): string {
@@ -69,7 +134,7 @@ export async function gatherEnvData(deps: EnvDataDeps): Promise<EnvData> {
 }
 
 // Pure render of the already-gathered EnvData into the markdown block.
-export function buildSessionContext(env: EnvData): string {
+export function renderContext(env: EnvData): string {
   const lines = [
     "## Current context",
     `- Local time: ${formatLocalTime(env.now, env.timezone)} (${env.timezone})`,

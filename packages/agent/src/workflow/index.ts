@@ -1,5 +1,5 @@
 import type { ChatCompletionTool } from "openai/resources/chat/completions";
-import type { EnvData } from "../session-context";
+import type { SessionContext } from "../session-context";
 import { SET_MEMORY_TOOL } from "../synthetic-tools";
 import type { CodexClient } from "../codex-client";
 import type { TraceContext } from "../tracing";
@@ -67,7 +67,7 @@ export type WorkflowRunFailure = Exclude<WorkflowRunResult, { ok: true }>;
 export interface WorkflowRunner {
   runForSignal(
     signal: WorkflowSignal,
-    envData: EnvData,
+    sessionContext: SessionContext,
     parentTrace: TraceContext,
   ): Promise<WorkflowRunResult>;
 }
@@ -124,7 +124,8 @@ export function createWorkflowRunner(deps: WorkflowRunnerDeps): WorkflowRunner {
   const maxPasses = deps.maxPasses ?? 3;
 
   return {
-    async runForSignal(signal, envData, parentTrace) {
+    async runForSignal(signal, sessionContext, parentTrace) {
+      const envData = sessionContext.env;
       const signalLabel = `${signal.source}:${signal.id}`;
       // The plan→act→replan loop. Pass 0 is the initial plan; each `replan`
       // step carries context into the next pass. Bounded by `maxPasses` so
@@ -175,6 +176,7 @@ export function createWorkflowRunner(deps: WorkflowRunnerDeps): WorkflowRunner {
         });
 
         const executed = await executor.execute(compiled.workflow, {
+          sessionContext,
           store,
           parentTrace,
           signalLabel,

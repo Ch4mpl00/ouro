@@ -5,7 +5,7 @@ import { createCodexClient } from "../codex-client";
 import { createAgentDb } from "../db/client";
 import { createMemoryStore } from "../db/memory";
 import { createTraceStore } from "../db/trace-store";
-import { createEngine, type Engine } from "../engine";
+import { createEngine } from "../engine";
 import { connectMcp, RETRY_UNTIL_UP } from "../mcp-client";
 import { DEFAULT_PRESETS } from "../models";
 import {
@@ -16,14 +16,13 @@ import {
   DEEPSEEK_BASE_URL,
   GEMINI_BASE_URL,
 } from "../providers";
-import { gatherEnvData, type EnvDataDeps } from "../session-context";
+import type { EnvDataDeps } from "../session-context";
 import { createSkillStore } from "../skills";
-import { type Tracer } from "../tracing";
+import type { Tracer } from "../tracing";
 import { langfuseTracerFromEnv } from "../tracing/langfuse";
 import { createLocalRecorderTracer } from "../tracing/local-recorder";
 import { teeTracer } from "../tracing/tee";
-import { createWorkflowRunner, type WorkflowRunner } from "../workflow";
-import { createFallback, type Fallback, type PendingSignal } from "./fallback";
+import { createSupervisorModule, type PendingSignal } from "./module";
 
 // Long-running supervisor — and the composition root: every long-lived
 // resource (sqlite handle, providers, MCP connection, tracer, skill store)
@@ -34,12 +33,10 @@ import { createFallback, type Fallback, type PendingSignal } from "./fallback";
 // (Telegram, Gmail, cron, webhook) lives inside the MCP server, which
 // queues signals into its own DB. Each signal flows:
 //
-//   signal → workflow runner (compile → execute)
-//          ↳ compile failed → fallback: agentic AgentLoop
-//          ↳ execute failed → fallback: recovery report
+//   signal → primary AgentLoop → tools / focused sub-agents → delivery
+//          ↳ crash → recovery report within the same trace
 //
-// The poll loop and trace setup live here; everything past a workflow
-// failure lives in ./fallback.
+// The per-signal context, trace and recovery lifecycle live in ./module.
 
 const POLL_INTERVAL_MS = 2_000;
 
@@ -52,65 +49,16 @@ function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-async function runSignal(
-  engine: Engine,
-  envDeps: EnvDataDeps,
-  signal: PendingSignal,
-  runner: WorkflowRunner,
-  fallback: Fallback,
-): Promise<void> {
-  const signalLabel = `${signal.source}:${signal.id}`;
-  const envData = await gatherEnvData(envDeps);
-
-  // One trace per signal — owns the workflow (compile + execute) and (if
-  // we fall back) the session. Same sessionId so the Langfuse Sessions
-  // view groups them.
-  const trace = engine.tracer.trace({
-    id: signalLabel,
-    name: `signal:${signal.source}`,
-    kind: "agent",
-    sessionId: signalLabel,
-    tags: [signal.source, "planner-mode"],
-    metadata: {
-      signal_id: signal.id,
-      signal_source: signal.source,
-      signal_created_at: signal.created_at,
-    },
-  });
-
-  try {
-    const result = await runner.runForSignal(signal, envData, trace);
-
-    if (!result.ok) {
-      await fallback.handle(signal, envData, result, trace);
-      return;
-    }
-
-    console.log(
-      `[supervisor] signal #${signal.id} workflow ok (attempts=${result.attempts}, steps=${result.stepCount})`,
-    );
-  } catch (err) {
-    console.error(`[supervisor] signal #${signal.id} unexpected error:`, err);
-    await fallback.handleCrash(signal, err, trace);
-  } finally {
-    trace.end();
-  }
-}
-
 async function main(): Promise<void> {
   const deepseekApiKey = process.env.DEEPSEEK_API_KEY;
   if (!deepseekApiKey) throw new Error("DEEPSEEK_API_KEY is not set in .env");
   const openaiApiKey = process.env.OPENAI_API_KEY;
   if (!openaiApiKey) throw new Error("OPENAI_API_KEY is not set in .env");
   const geminiApiKey = process.env.GEMINI_API_KEY;
-  if (!geminiApiKey) throw new Error("GEMINI_API_KEY is not set in .env (workflow compiler)");
+  if (!geminiApiKey) throw new Error("GEMINI_API_KEY is not set in .env (smart agents)");
 
-  // Build the preset registry from defaults + per-preset env overrides.
-  // `base` runs on OpenAI (non-thinking — primary replies, recovery,
-  // scheduler dispatch). `smart` runs on Gemini Flash with thinking on —
-  // sub-agents that do real editorial / parsing work (news-digest,
-  // tech-digest, nashdom-bill, …). `compiler` powers the workflow
-  // compiler. `smartest` is a reserve high-end preset.
+  // Primary agents and reasoning workers use smart. Recovery and simple
+  // workers use base; compiler remains available to standalone workflow callers.
   const withEnvModel = (name: keyof typeof DEFAULT_PRESETS, envVar: string) => ({
     ...DEFAULT_PRESETS[name],
     model: process.env[envVar] ?? DEFAULT_PRESETS[name].model,
@@ -122,11 +70,7 @@ async function main(): Promise<void> {
     compiler: withEnvModel("compiler", "AGENT_COMPILER_MODEL"),
   };
 
-  // Every provider is wrapped in withRetry (429/5xx, exponential backoff):
-  // the workflow compiler is on the hot path regardless of which provider
-  // AGENT_COMPILER_MODEL routes to, and agentic sessions only benefit from
-  // riding out a transient blip too. Each retry attempt is surfaced as a
-  // WARNING `llm_retry` event on the caller's trace scope.
+  // Provider retries appear as WARNING events in the active AgentLoop scope.
   const providers = {
     deepseek: withRetry(
       createDeepseekProvider(
@@ -197,10 +141,8 @@ async function main(): Promise<void> {
     providers,
     mcp,
     presets,
-    // Meta-skills loaded into every session: routing (cross-skill
-    // delegation when intent ≠ source). Only used on the fallback
-    // session path now; workflow-mode signals never load these.
-    skills: ["routing"],
+    // Root agents coordinate the task; workers opt out of these meta-skills.
+    skills: ["orchestrator", "routing"],
     skillStore,
     memory,
     tracer,
@@ -209,43 +151,6 @@ async function main(): Promise<void> {
 
   console.log(`[supervisor] mcp tools: ${mcp.tools.map((t) => t.function.name).join(", ")}`);
 
-  // Build the workflow runner once at startup: tool & skill names baked
-  // into the compiler's schema enums. New tools / skills require an agent
-  // restart to be emittable. The full MCP tool definitions go in so the
-  // compiler can render compact `name(arg: type, ...)` signatures in its
-  // user prompt — without those it guesses parameter names from
-  // training-data conventions and produces invalid args.
-  const skillEntries = await skillStore.listSkills();
-  // Exclude `planner` itself (it's the compiler's system prompt), `routing`
-  // (engine-level meta-skill, not directly invokable) and `recovery` (the
-  // failure-reporting skill — only the fallback path spawns it; a workflow
-  // step has no business invoking it).
-  const NON_WORKFLOW_SKILLS = new Set(["planner", "routing", "recovery"]);
-  const knownSkills = skillEntries
-    .map((s) => s.name)
-    .filter((n) => !NON_WORKFLOW_SKILLS.has(n));
-
-  console.log(
-    `[supervisor] workflow: ${mcp.tools.length} tools, ${knownSkills.length} skills`,
-  );
-
-  const runner = createWorkflowRunner({
-    engine,
-    // The runner (compiler + executor) needs only the skill BODY — the
-    // full SkillFile shape (frontmatter tools list) stays internal to
-    // engine.startAgentLoop.
-    readSkill: async (name) => (await skillStore.readSkill(name))?.body ?? null,
-    // Live improver patches (skills/<name>.patch.md) — appended to the planner
-    // and compose system messages so shipped patches actually take effect.
-    readPatch: (name) => skillStore.readPatch(name),
-    mcpTools: mcp.tools,
-    knownSkills,
-    setMemory: (key, value) => memory.set(key, value),
-    codex,
-  });
-
-  const fallback = createFallback({ engine });
-
   // Per-signal env gathering deps. USER_EMAIL is read here, once — the
   // business path (runSignal → gatherEnvData) never touches process.env.
   const envDeps: EnvDataDeps = {
@@ -253,6 +158,8 @@ async function main(): Promise<void> {
     memory,
     userEmail: process.env.USER_EMAIL ?? null,
   };
+
+  const supervisor = createSupervisorModule({ engine, env: envDeps });
 
   let stopping = false;
   const stop = async (sig: string): Promise<void> => {
@@ -266,7 +173,7 @@ async function main(): Promise<void> {
   process.on("SIGINT", () => void stop("SIGINT"));
   process.on("SIGTERM", () => void stop("SIGTERM"));
 
-  console.log("[supervisor] entering main loop (workflow-mode)");
+  console.log("[supervisor] entering main loop (agent-loop)");
   while (!stopping) {
     try {
       const raw = await mcp.callTool("get_next_signal", {});
@@ -280,7 +187,7 @@ async function main(): Promise<void> {
       console.log(
         `[supervisor] signal #${result.signal.id} source=${result.signal.source} (${result.pendingAfter} pending after)`,
       );
-      await runSignal(engine, envDeps, result.signal, runner, fallback);
+      await supervisor.runSignal(result.signal);
     } catch (err) {
       console.error("[supervisor] loop error:", err);
       await sleep(POLL_INTERVAL_MS);

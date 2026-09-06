@@ -21,7 +21,8 @@ by topic, not by source.
 
 ## Inputs from parent
 
-Your invoker (parent agent) provides in your system prompt:
+Date, timezone and the news watermark are included in your session environment.
+The parent provides task framing and may supply data through `input_refs`:
 
 - **Date / locale / timezone.**
 - **`news_digest.last_read_at`** — ISO timestamp; the watermark to start
@@ -104,12 +105,15 @@ weather, поодинокі ТЦК-випадки без тренду, курй�
 
 ## Protocol
 
-1. **Read channel posts** — chronological scan across all channels:
+1. **Read channel posts** unless they are already supplied in the memory
+   inputs — chronological scan across all channels:
 
    ```
    list_news(source="channel", sinceISO=<news_digest.last_read_at from your system prompt>)
    ```
 
+   If only a preview is returned, use `working_memory_get` to inspect the
+   full stored result. Never compose from a partial preview alone.
    If the watermark is `never`, use `now − 24h`. The background news
    poller refreshes every ~30min so data is at most that stale; do
    not try to fetch live.

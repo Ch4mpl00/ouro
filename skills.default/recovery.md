@@ -15,7 +15,11 @@ describing what was being done and roughly what broke.
 - No stack traces, no error codes, no JSON.
 - Plain Russian, 1–3 sentences.
 - Friendly tone — this is an apology to the user, not a debug log.
-- The original signal's chat id is in your env-context block.
+- Use the original signal or env-context for the chat id and topic. Preserve
+  messageThreadId when present.
+- Inspect the transcript for a successful delivery before sending: if the user
+  already received the result, do not send it again.
+- Do not retry the original actions or advance watermarks.
 
 ## Format
 
