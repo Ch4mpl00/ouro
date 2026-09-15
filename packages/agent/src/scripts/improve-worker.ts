@@ -8,10 +8,14 @@ import {
   createTraceStore,
 } from "../db";
 import { createSkillStore } from "../agent-loop";
-import { createJudgeBackend } from "../judging/judge-backend";
-import { loadSigmaBaseline } from "../judging/sigma-baseline";
-import { improveWorkerOptsFromEnv, runImproveWorker } from "../judging/improve-worker";
-import { createLangfuseTraceSource, createLocalTraceSource } from "../judging/trace-source";
+import {
+  createJudgeBackend,
+  createLangfuseTraceSource,
+  createLocalTraceSource,
+  improveWorkerOptsFromEnv,
+  loadSigmaBaseline,
+  runImproveWorker,
+} from "../judging";
 
 loadEnv({ path: ".env.agent" });
 

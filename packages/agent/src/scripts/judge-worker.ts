@@ -5,9 +5,13 @@ import {
   createAgentDb,
   createTraceStore,
 } from "../db";
-import { createScoreWriter } from "../judging/langfuse-scores";
-import { createLangfuseTraceSource, createLocalTraceSource } from "../judging/trace-source";
-import { judgeWorkerOptsFromEnv, runJudgeWorker } from "../judging/worker";
+import {
+  createLangfuseTraceSource,
+  createLocalTraceSource,
+  createScoreWriter,
+  judgeWorkerOptsFromEnv,
+  runJudgeWorker,
+} from "../judging";
 
 loadEnv({ path: ".env.agent" });
 

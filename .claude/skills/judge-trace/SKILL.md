@@ -9,7 +9,7 @@ You replace the GPT-5.4 judge from `packages/agent/src/scripts/judge.ts` for
 cheap experimentation. The judge is PER NODE: one score per generative LLM node
 (the planner generation, each `llm_compose`, each `llm_agent` step), each scored
 against THAT node's owner contract. The rubrics below are kept verbatim-synced
-with `packages/agent/src/judging/schema.ts` (`PLANNER_NODE_PROMPT`,
+with the schema section of `packages/agent/src/judging.ts` (`PLANNER_NODE_PROMPT`,
 `COMPOSER_NODE_PROMPT`, `FAITH_SYSTEM_PROMPT`, prompt version `n4`) — do not
 improvise your own criteria, or scores stop being comparable between the two
 judges.

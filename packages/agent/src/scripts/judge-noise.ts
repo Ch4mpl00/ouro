@@ -8,21 +8,23 @@ import {
   createAgentDb,
   createTraceStore,
 } from "../db";
-import { assembleNodeMaterials, type NodeMaterial } from "../judging/materials";
-import { createJudgeBackend, type JudgeProvider } from "../judging/judge-backend";
-import { judgeNode } from "../judging/node-judge";
-import { JUDGE_MODEL, JUDGE_PROMPT_VERSION, type NodeJudgement } from "../judging/schema";
 import {
+  JUDGE_MODEL,
+  JUDGE_PROMPT_VERSION,
+  assembleNodeMaterials,
   collectNodeNoise,
-  summarizeNoise,
-  type NodeNoise,
-  type NoiseReport,
-} from "../judging/noise";
-import {
+  createJudgeBackend,
   createLangfuseTraceSource,
   createLocalTraceSource,
+  judgeNode,
+  summarizeNoise,
+  type JudgeProvider,
+  type NodeJudgement,
+  type NodeMaterial,
+  type NodeNoise,
+  type NoiseReport,
   type TraceSource,
-} from "../judging/trace-source";
+} from "../judging";
 
 loadEnv({ path: ".env.agent" });
 
@@ -37,7 +39,7 @@ loadEnv({ path: ".env.agent" });
 //   pnpm judge:noise --provider codex --runs 5 <traceId>
 //   pnpm judge:noise --model gpt-5.4 --out path.json <traceId>
 
-const DEFAULT_OUT = "packages/agent/src/judging/noise-baseline.json";
+const DEFAULT_OUT = "packages/agent/src/judging-noise-baseline.json";
 
 interface CliOpts {
   provider: JudgeProvider;

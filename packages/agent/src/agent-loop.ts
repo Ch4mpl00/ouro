@@ -796,7 +796,7 @@ const NAME_PATTERN = /^[a-z0-9][a-z0-9_-]*$/i;
 // Append-only improver patch marker. The improver writes lessons to
 // `skills/<name>.patch.md`; appendPatch glues them onto the END of a skill's
 // effective system text. This is the ONE injection used by BOTH prod runtime
-// (compile.ts/execute.ts, below) and the gate replay (judging/patch.ts) — they
+// (workflow.ts compile/execute) and the gate replay (judging.ts) — they
 // MUST agree or the gate measures fiction. Appending at the very end keeps the
 // planner's prompt-cache prefix (body + <tools>/<skills>) intact.
 export const PATCH_MARKER = "<!-- improver-patch -->";

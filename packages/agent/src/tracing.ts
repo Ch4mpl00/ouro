@@ -28,7 +28,7 @@ import type { TraceStore } from "./db";
 //
 // Outside this file: ./db/trace-store owns the table the recorder writes to
 // (imported type-only, so the cycle between the two is erased at compile
-// time), and judging/ consumes the read shape.
+// time), and judging.ts consumes the read shape.
 
 // ═══════════════════════════════════════════════════════════════════
 // Trace model

@@ -96,6 +96,19 @@ mcp-tools/
             │                                  results · skills (live → default
             │                                  overlay) · code_agent · synthetic
             │                                  tools · ReAct loop · engine
+            ├── judging.ts                   evaluation, one file: schema ·
+            │                                  patch · monitor · trace source ·
+            │                                  noise · print · sigma baseline ·
+            │                                  judge backend · node judge ·
+            │                                  materials · langfuse scores ·
+            │                                  gate · gate runtime · improver ·
+            │                                  improve cycle · improve worker ·
+            │                                  judge worker
+            ├── judging-noise-baseline.json  committed per-(model|version) σ
+            │                                  floor, written by judge:noise
+            ├── scripts/                     the one directory left on purpose:
+            │                                  each file is a separate CLI entry
+            │                                  point named by path in package.json
             ├── eval-gaia.ts                 the GAIA benchmark harness, one
             │                                  file: dataset · scorer ·
             │                                  capabilities · bench MCP client ·
@@ -189,8 +202,11 @@ Done so far, all under `packages/agent/src/`:
 - `eval-gaia.ts` — the GAIA harness: dataset, scorer, capabilities, the
   side-effect-suppressing MCP client, and the runner. Same entry-point guard.
   Its gitignored dataset cache moved to `packages/agent/eval-fixtures/`.
+- `judging.ts` — the whole evaluation stack, 17 sections from the scorecard
+  schema to the two cron workers. Its committed noise baseline sits beside it
+  as `judging-noise-baseline.json`.
 
-Still split: `judging/` and the whole `packages/mcp` tree.
+Still split: the whole `packages/mcp` tree.
 
 `scripts/` stays a directory on purpose: each file there is a separate CLI
 entry point that `package.json` names by path (`pnpm judge`, `pnpm improve`,
