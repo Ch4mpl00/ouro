@@ -52,8 +52,6 @@ export const memory = sqliteTable("memory", {
   updatedAt: text("updated_at").notNull().default(nowDefault),
 });
 
-export type MemoryRow = typeof memory.$inferSelect;
-
 // Local mirror of every agent run's trace. Written by the local-recorder
 // tracer (tee'd alongside Langfuse) so the judge and the self-improvement loop
 // read runs from here — fast, and independent of Langfuse uptime. `id` IS the
@@ -81,8 +79,6 @@ export const traces = sqliteTable(
   },
   (t) => [index("traces_started").on(t.startedAt), index("traces_skill").on(t.skill)],
 );
-
-export type TraceRow = typeof traces.$inferSelect;
 
 // One row per JUDGED NODE: (trace, observation, judge provider, prompt
 // version). A node is one generative LLM observation — the planner generation,
@@ -120,8 +116,6 @@ export const judgements = sqliteTable(
     index("judgements_skill").on(t.skill, t.promptVersion),
   ],
 );
-
-export type JudgementRow = typeof judgements.$inferSelect;
 
 // Closed-loop improver state (Phase 3, п3), one row per (skill, axis). The cron
 // worker watermarks each cycle's outcome here, and — crucially — when it SHIPS a
