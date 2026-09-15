@@ -1,8 +1,10 @@
 import "dotenv/config";
 import { readFileSync } from "node:fs";
 import { config as loadEnv } from "dotenv";
-import { createAgentDb } from "../db/client";
-import { createTraceStore } from "../db/trace-store";
+import {
+  createAgentDb,
+  createTraceStore,
+} from "../db";
 import { assembleNodeMaterials } from "../judging/materials";
 import { createJudgeBackend, type JudgeProvider } from "../judging/judge-backend";
 import { runNodeGate } from "../judging/gate";

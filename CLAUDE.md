@@ -70,7 +70,12 @@ mcp-tools/
     └── agent/
         ├── data/agent.db                    agent-side state (memory KV + trace mirror)
         └── src/
-            ├── db/{client,memory,trace-store,schema}.ts + migrations/  Drizzle (sqlite)
+            ├── db.ts                        the agent's whole sqlite layer, one
+            │                                  file: schema (Drizzle tables) ·
+            │                                  client (createAgentDb, migrates on
+            │                                  boot) · memory KV · trace store ·
+            │                                  improver store. Generated SQL
+            │                                  stays in db/migrations/
             ├── supervisor/{main,module,telegram-context}.ts  poll loop,
             │                                     per-signal routing, tg history
             ├── workflow.ts                  the dynamic-workflow module, one
@@ -89,11 +94,10 @@ mcp-tools/
             │                                  tools · ReAct loop · engine
             ├── mcp-client.ts                StreamableHTTP client
             ├── codex-client.ts              sandboxed code execution
-            ├── tracing.ts                   observability, one file: trace
-            │                                  model (read shape + judge tag) ·
-            │                                  Tracer interface · Langfuse
-            │                                  adapter · local recorder · tee
-            └── db/{client.ts, memory.ts}    KV helpers
+            └── tracing.ts                   observability, one file: trace
+                                               model (read shape + judge tag) ·
+                                               Tracer interface · Langfuse
+                                               adapter · local recorder · tee
 ```
 
 ## Stack
@@ -165,9 +169,16 @@ Done so far: `packages/agent/src/agent-loop.ts` (errors, model presets, LLM
 providers, generation, session context, tool results, the skill store,
 code_agent, synthetic tools, the ReAct loop, the engine) and
 `packages/agent/src/workflow.ts` (dsl, variables, compile, execute, the
-runner facade) and `packages/agent/src/tracing.ts` (trace model, tracer
-interface, Langfuse adapter, local recorder, tee). Still split: `judging/`,
-`supervisor/`, and the whole `packages/mcp` tree.
+runner facade), `packages/agent/src/tracing.ts` (trace model, tracer
+interface, Langfuse adapter, local recorder, tee) and
+`packages/agent/src/db.ts` (schema, client, memory KV, trace store, improver
+store — `db/migrations/` stays a directory, being drizzle-kit output rather
+than source). Still split: `judging/`, `supervisor/`, `eval/`, and the whole
+`packages/mcp` tree.
+
+`scripts/` stays a directory on purpose: each file there is a separate CLI
+entry point that `package.json` names by path (`pnpm judge`, `pnpm improve`,
+…), not a module of one domain.
 
 ## Code structure: modules + DI
 

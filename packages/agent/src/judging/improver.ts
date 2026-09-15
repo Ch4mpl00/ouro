@@ -2,7 +2,7 @@ import { z } from "zod";
 import type { JudgeBackend } from "./judge-backend";
 import type { AxisGrade, NodeGateResult } from "./gate";
 import type { NoiseAxis } from "./noise";
-import type { JudgementRecord } from "../db/trace-store";
+import type { JudgementRecord } from "../db";
 
 // The improver's brain (Phase 3, п2): turn a corpus of judged nodes into a
 // candidate append-only patch, then decide whether the gate's measured Δ earns

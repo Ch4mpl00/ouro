@@ -4,8 +4,10 @@ import { readFileSync, writeFileSync } from "node:fs";
 import { config as loadEnv } from "dotenv";
 import OpenAI from "openai";
 import { fetchRecentTraces } from "./langfuse-api";
-import { createAgentDb } from "../db/client";
-import { createTraceStore } from "../db/trace-store";
+import {
+  createAgentDb,
+  createTraceStore,
+} from "../db";
 import { assembleNodeMaterials, type NodeMaterial } from "../judging/materials";
 import { createJudgeBackend, type JudgeProvider } from "../judging/judge-backend";
 import { judgeNode } from "../judging/node-judge";

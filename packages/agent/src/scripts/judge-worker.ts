@@ -1,8 +1,10 @@
 import "dotenv/config";
 import "../openai-native-fetch";
 import { config as loadEnv } from "dotenv";
-import { createAgentDb } from "../db/client";
-import { createTraceStore } from "../db/trace-store";
+import {
+  createAgentDb,
+  createTraceStore,
+} from "../db";
 import { createScoreWriter } from "../judging/langfuse-scores";
 import { createLangfuseTraceSource, createLocalTraceSource } from "../judging/trace-source";
 import { judgeWorkerOptsFromEnv, runJudgeWorker } from "../judging/worker";

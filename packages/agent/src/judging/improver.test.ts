@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { decideShip, dominantMode, selectCandidates, type Taxonomy } from "./improver";
 import type { AxisGrade, NodeGateResult } from "./gate";
 import type { NoiseAxis } from "./noise";
-import type { JudgementRecord } from "../db/trace-store";
+import type { JudgementRecord } from "../db";
 
 function rec(id: string, coverage: number | null, startedAt = "2026-06-18T00:00:00.000Z"): JudgementRecord {
   return {

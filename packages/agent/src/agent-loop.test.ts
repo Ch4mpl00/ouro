@@ -31,7 +31,7 @@ import {
   type Span,
   type Tracer,
 } from "./tracing";
-import type { StoredTraceInput, TraceStore } from "./db/trace-store";
+import type { StoredTraceInput, TraceStore } from "./db";
 import { createSupervisorModule } from "./supervisor/module";
 import { createWorkflowRunner, type WorkflowRunner, type WorkflowRunResult } from "./workflow";
 import type { Step } from "./workflow";

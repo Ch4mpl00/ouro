@@ -7,7 +7,7 @@ import {
   type Trace,
   type Tracer,
 } from "./tracing";
-import type { StoredTraceInput, TraceStore } from "./db/trace-store";
+import type { StoredTraceInput, TraceStore } from "./db";
 
 // A fake "Langfuse" tracer that hands out deterministic ids, standing in for
 // the OTel/Langfuse backend whose observation ids the local mirror must adopt.

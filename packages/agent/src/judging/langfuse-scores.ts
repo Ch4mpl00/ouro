@@ -1,5 +1,5 @@
 import { apiPost } from "../scripts/langfuse-api";
-import type { TraceStore } from "../db/trace-store";
+import type { TraceStore } from "../db";
 import { type Faithfulness, type NodeKind, type Scorecard } from "./schema";
 
 // Persists ONE node's verdict to two places: the local `judgements` table (the

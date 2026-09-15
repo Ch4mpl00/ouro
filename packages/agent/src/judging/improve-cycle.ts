@@ -1,5 +1,5 @@
 import { z } from "zod";
-import type { JudgementRecord, TraceStore } from "../db/trace-store";
+import type { JudgementRecord, TraceStore } from "../db";
 import type { Observation } from "../tracing";
 import type { SkillStore } from "../agent-loop";
 import { assembleNodeMaterials, type NodeMaterial } from "./materials";

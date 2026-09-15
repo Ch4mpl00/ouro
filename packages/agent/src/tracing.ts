@@ -9,7 +9,7 @@ import {
 } from "@langfuse/tracing";
 import { NodeTracerProvider } from "@opentelemetry/sdk-trace-node";
 import { randomUUID } from "node:crypto";
-import type { TraceStore } from "./db/trace-store";
+import type { TraceStore } from "./db";
 
 // Observability, end to end: the canonical READ shape of a recorded run, the
 // write-side Tracer interface the agent runtime emits through, and the three

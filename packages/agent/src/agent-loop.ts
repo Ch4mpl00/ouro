@@ -15,7 +15,7 @@ import { z } from "zod";
 import { Cause, Duration, Effect, Exit, Schedule } from "effect";
 import type { McpHandle } from "./mcp-client";
 import type { CodexClient } from "./codex-client";
-import { MEMORY_KEYS, type MemoryStore } from "./db/memory";
+import { MEMORY_KEYS, type MemoryStore } from "./db";
 import type {
   GenerationEndOpts,
   GenerationStartOpts,

@@ -1,6 +1,6 @@
 import path from "node:path";
 import { mkdirSync } from "node:fs";
-import { createAgentDb } from "../db/client";
+import { createAgentDb } from "../db";
 
 // Apply pending Drizzle migrations to agent.db. Opening the handle runs the
 // migrator (see db/client.ts), so this is just: ensure the data dir exists,

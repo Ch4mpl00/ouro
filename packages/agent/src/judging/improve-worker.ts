@@ -1,5 +1,8 @@
-import type { JudgementRecord, TraceStore } from "../db/trace-store";
-import type { ImproverStore } from "../db/improver-store";
+import {
+  type ImproverStore,
+  type JudgementRecord,
+  type TraceStore,
+} from "../db";
 import type { SkillStore } from "../agent-loop";
 import type { JudgeBackend, JudgeProvider } from "./judge-backend";
 import { NOISE_AXES, type NoiseAxis } from "./noise";

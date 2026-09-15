@@ -1,7 +1,9 @@
 import "dotenv/config";
 import { config as loadEnv } from "dotenv";
-import { createAgentDb } from "../db/client";
-import { createTraceStore } from "../db/trace-store";
+import {
+  createAgentDb,
+  createTraceStore,
+} from "../db";
 import { createSkillStore } from "../agent-loop";
 import { createJudgeBackend, type JudgeProvider } from "../judging/judge-backend";
 import { type NoiseAxis } from "../judging/noise";

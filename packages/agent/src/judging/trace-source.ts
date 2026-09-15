@@ -1,6 +1,6 @@
 import { fetchRecentTraces, fetchTraceById } from "../scripts/langfuse-api";
 import type { Observation, TraceRecord, TraceSummary } from "../tracing";
-import type { TraceStore } from "../db/trace-store";
+import type { TraceStore } from "../db";
 
 // Where the judge reads runs from. Two implementations — the local mirror
 // (fast, complete, Langfuse-independent) and the Langfuse public API — behind
