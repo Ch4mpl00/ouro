@@ -15,7 +15,7 @@ import {
   createLocalTraceSource,
   type TraceSource,
 } from "../judging/trace-source";
-import type { Observation } from "../trace-model";
+import type { Observation } from "../tracing";
 import { buildGateTarget, runModel } from "../judging/gate-runtime";
 
 loadEnv({ path: ".env.agent" });

@@ -1,5 +1,5 @@
 import { and, desc, eq, isNull } from "drizzle-orm";
-import type { Observation, Trace, TraceSummary } from "../trace-model";
+import type { Observation, TraceRecord, TraceSummary } from "../tracing";
 import type { AgentDatabase } from "./client";
 import { judgements, traces } from "./schema";
 
@@ -71,7 +71,7 @@ export interface TraceStore {
   writeTrace(t: StoredTraceInput): void;
   // Read-back in the canonical {trace, observations} shape (same as a Langfuse
   // fetch), so the judge's material assembly is source-agnostic.
-  getTrace(id: string): { trace: Trace; observations: Observation[] } | null;
+  getTrace(id: string): { trace: TraceRecord; observations: Observation[] } | null;
   // Newest-first, mirrors fetchRecentTraces. Optionally only traces lacking a
   // judgement for (provider, promptVersion) — the local replacement for the
   // memory-KV dedup + age window.
@@ -126,7 +126,7 @@ export function createTraceStore(db: AgentDatabase): TraceStore {
       const row = db.select().from(traces).where(eq(traces.id, id)).get();
       if (!row) return null;
       const observations = row.observations ?? [];
-      const trace: Trace = {
+      const trace: TraceRecord = {
         id: row.id,
         name: row.name,
         sessionId: row.sessionId,

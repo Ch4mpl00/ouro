@@ -89,7 +89,10 @@ mcp-tools/
             │                                  tools · ReAct loop · engine
             ├── mcp-client.ts                StreamableHTTP client
             ├── codex-client.ts              sandboxed code execution
-            ├── tracing/{index,langfuse}.ts  Tracer interface + Langfuse adapter
+            ├── tracing.ts                   observability, one file: trace
+            │                                  model (read shape + judge tag) ·
+            │                                  Tracer interface · Langfuse
+            │                                  adapter · local recorder · tee
             └── db/{client.ts, memory.ts}    KV helpers
 ```
 
@@ -162,8 +165,9 @@ Done so far: `packages/agent/src/agent-loop.ts` (errors, model presets, LLM
 providers, generation, session context, tool results, the skill store,
 code_agent, synthetic tools, the ReAct loop, the engine) and
 `packages/agent/src/workflow.ts` (dsl, variables, compile, execute, the
-runner facade). Still split: `judging/`, `supervisor/`, `tracing/`, and the
-whole `packages/mcp` tree.
+runner facade) and `packages/agent/src/tracing.ts` (trace model, tracer
+interface, Langfuse adapter, local recorder, tee). Still split: `judging/`,
+`supervisor/`, and the whole `packages/mcp` tree.
 
 ## Code structure: modules + DI
 

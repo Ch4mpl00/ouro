@@ -4,7 +4,7 @@ import { DEEPSEEK_BASE_URL, GEMINI_BASE_URL, retryOnTransient } from "../agent-l
 import type { GateNodeTarget } from "./gate";
 import type { NodeMaterial } from "./materials";
 import type { ChatMessage } from "./patch";
-import type { Observation } from "../trace-model";
+import type { Observation } from "../tracing";
 
 // Generator-replay runtime for the gate / improver: re-running the generator
 // under the recorded model, and lifting a NodeMaterial + its observation into a

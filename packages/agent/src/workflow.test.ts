@@ -14,8 +14,13 @@ import {
   type ModelPreset,
   type PresetName,
 } from "./agent-loop";
-import type { Generation, Span, Trace, TraceContext } from "./tracing";
-import { JUDGE_NODE_META } from "./trace-model";
+import {
+  JUDGE_NODE_META,
+  type Generation,
+  type Span,
+  type Trace,
+  type TraceContext,
+} from "./tracing";
 import type { CodexClient } from "./codex-client";
 import {
   __testing,

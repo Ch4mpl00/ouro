@@ -78,19 +78,19 @@ export async function apiPost<T>(
   throw lastErr ?? new Error(`langfuse POST failed on ${path}`);
 }
 
-// Read-shape types now live in ../trace-model (shared with the local mirror).
+// Read-shape types now live in ../tracing (shared with the local mirror).
 // Re-export so existing `from "../scripts/langfuse-api"` imports keep working.
-export type { ObservationType, Observation, Trace, TraceSummary } from "../trace-model";
-import type { Observation, Trace, TraceSummary } from "../trace-model";
+export type { ObservationType, Observation, TraceRecord, TraceSummary } from "../tracing";
+import type { Observation, TraceRecord, TraceSummary } from "../tracing";
 
 // Fetch one trace by id with every observation resolved to a full object.
 // `/traces/<id>` inlines Observation objects; the string-id form (returned by
 // `/traces?sessionId`) is resolved with a per-id follow-up, fanned out.
 export async function fetchTraceById(
   id: string,
-): Promise<{ trace: Trace; observations: Observation[] }> {
+): Promise<{ trace: TraceRecord; observations: Observation[] }> {
   try {
-    const trace = await api<Trace>(`/traces/${encodeURIComponent(id)}`);
+    const trace = await api<TraceRecord>(`/traces/${encodeURIComponent(id)}`);
     const observations = await Promise.all(
       trace.observations.map((entry) =>
         typeof entry === "string"
@@ -108,7 +108,7 @@ export async function fetchTraceById(
     const observations = await fetchObservationsByTrace(id);
     const root =
       observations.find((o) => o.parentObservationId === null) ?? observations[0];
-    const trace: Trace = {
+    const trace: TraceRecord = {
       id,
       name: root?.name ?? id,
       sessionId: null,

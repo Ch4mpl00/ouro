@@ -23,8 +23,14 @@ import {
   type SessionContext,
 } from "./agent-loop";
 import type { CodexClient } from "./codex-client";
-import { JUDGE_NODE_META } from "./trace-model";
-import type { Generation, Span, SpanKind, Trace, TraceContext } from "./tracing";
+import {
+  JUDGE_NODE_META,
+  type Generation,
+  type Span,
+  type SpanKind,
+  type Trace,
+  type TraceContext,
+} from "./tracing";
 
 // The dynamic-workflow module, end to end: the plan DSL, the variable store
 // the plan binds into, the compiler that writes a plan from a signal, the
@@ -40,8 +46,8 @@ import type { Generation, Span, SpanKind, Trace, TraceContext } from "./tracing"
 //                parallel, replan, terminal
 //   runner       createWorkflowRunner — compile then execute, replan loop
 //
-// The agent runtime it sits on is ./agent-loop; ./codex-client, ./tracing
-// and ./trace-model are the transport, observability and judge-tag surfaces.
+// The agent runtime it sits on is ./agent-loop; ./codex-client and ./tracing
+// are the transport, observability and judge-tag surfaces.
 
 // ═══════════════════════════════════════════════════════════════════
 // DSL

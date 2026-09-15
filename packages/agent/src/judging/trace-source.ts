@@ -1,5 +1,5 @@
 import { fetchRecentTraces, fetchTraceById } from "../scripts/langfuse-api";
-import type { Observation, Trace, TraceSummary } from "../trace-model";
+import type { Observation, TraceRecord, TraceSummary } from "../tracing";
 import type { TraceStore } from "../db/trace-store";
 
 // Where the judge reads runs from. Two implementations — the local mirror
@@ -9,7 +9,7 @@ import type { TraceStore } from "../db/trace-store";
 // on); the manual CLI keeps reading Langfuse.
 
 export interface TraceSource {
-  getTrace(id: string): Promise<{ trace: Trace; observations: Observation[] }>;
+  getTrace(id: string): Promise<{ trace: TraceRecord; observations: Observation[] }>;
   // Newest-first. `unjudgedFor` (local only) returns just the runs without a
   // judgement for that (provider, promptVersion) — the dedup lives in the
   // query, not a separate KV.

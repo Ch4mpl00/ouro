@@ -22,15 +22,20 @@ import {
   type CompletionParams,
   type RetryInfo,
 } from "./agent-loop";
-import { nullTracer, type EventStartOpts, type Span, type Tracer } from "./tracing";
-import { createLocalRecorderTracer } from "./tracing/local-recorder";
-import { teeTracer } from "./tracing/tee";
+import {
+  createLangfuseTracer,
+  createLocalRecorderTracer,
+  nullTracer,
+  teeTracer,
+  type EventStartOpts,
+  type Span,
+  type Tracer,
+} from "./tracing";
 import type { StoredTraceInput, TraceStore } from "./db/trace-store";
 import { createSupervisorModule } from "./supervisor/module";
 import { createWorkflowRunner, type WorkflowRunner, type WorkflowRunResult } from "./workflow";
 import type { Step } from "./workflow";
 import { createStore } from "./workflow";
-import { createLangfuseTracer } from "./tracing/langfuse";
 import { LangfuseOtelSpanAttributes } from "@langfuse/tracing";
 import type { ReadableSpan } from "@opentelemetry/sdk-trace-node";
 import { trace as otelTrace, context as otelContext, propagation } from "@opentelemetry/api";

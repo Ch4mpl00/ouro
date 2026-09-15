@@ -1,6 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { Observation, Trace } from "../trace-model";
-import { JUDGE_NODE_META } from "../trace-model";
+import { JUDGE_NODE_META, type Observation, type TraceRecord } from "../tracing";
 import { assembleNodeMaterials, classify, ROOT_SKIP } from "./materials";
 import type { TraceSource } from "./trace-source";
 
@@ -28,7 +27,7 @@ function obs(p: Partial<Observation> & Pick<Observation, "id" | "name" | "type">
 // A realistic news-digest workflow tree: planner attempt → runner → a
 // skill compose, a prompt-only compose, an llm_agent step (with an inner
 // iteration), plus tool/embedding spans that must be ignored.
-function newsDigestTree(plannerGenName = "attempt-1"): { trace: Trace; observations: Observation[] } {
+function newsDigestTree(plannerGenName = "attempt-1"): { trace: TraceRecord; observations: Observation[] } {
   const observations: Observation[] = [
     // Trace root is an AGENT span — the supervisor / agent-loop start every
     // trace with kind:"agent" (so the root is type AGENT, not CHAIN). The judge
@@ -80,7 +79,7 @@ function newsDigestTree(plannerGenName = "attempt-1"): { trace: Trace; observati
     obs({ id: "step-agent", name: "step[3]:llm_agent", type: "AGENT", parentObservationId: "runner", metadata: { skill: "researcher", bind: "answer" }, input: { skill: "researcher", prompt: "research X" }, output: "agent answer", startTime: "2026-06-14T00:00:04.000Z" }),
     obs({ id: "agent-iter", name: "iter-0", type: "GENERATION", parentObservationId: "step-agent", metadata: { [JUDGE_NODE_META]: "compose" }, output: "inner", startTime: "2026-06-14T00:00:04.200Z" }),
   ];
-  const trace: Trace = {
+  const trace: TraceRecord = {
     id: "trace-1",
     name: "news-digest",
     sessionId: "scheduler:1",
@@ -96,7 +95,7 @@ function newsDigestTree(plannerGenName = "attempt-1"): { trace: Trace; observati
   return { trace, observations };
 }
 
-function sourceFor(fixture: { trace: Trace; observations: Observation[] }): TraceSource {
+function sourceFor(fixture: { trace: TraceRecord; observations: Observation[] }): TraceSource {
   return {
     async getTrace() {
       return fixture;

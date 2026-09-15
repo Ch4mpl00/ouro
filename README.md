@@ -190,7 +190,9 @@ mcp-tools/
         │                            ReAct loop, engine
         ├── mcp-client.ts            StreamableHTTP client
         ├── codex-client.ts          sandboxed code execution
-        └── tracing/                 Langfuse adapter
+        └── tracing.ts               trace model (read shape), Tracer
+                                     interface, Langfuse adapter, local
+                                     recorder, tee
 ```
 
 Domain code follows a strict **modules + dependency-injection** discipline:
