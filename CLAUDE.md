@@ -79,7 +79,6 @@ mcp-tools/
             │                                  compile (signal → Workflow) ·
             │                                  execute (walks the steps) ·
             │                                  createWorkflowRunner facade
-            ├── workflow.example.json        worked example plan (schema fixture)
             ├── agent-loop.ts                the whole agent runtime, one file:
             │                                  errors · model presets · LLM
             │                                  providers (openai/deepseek/gemini

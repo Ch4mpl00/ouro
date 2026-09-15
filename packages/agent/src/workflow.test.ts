@@ -696,14 +696,65 @@ describe("workflowToJsonSchema", () => {
   });
 });
 
+// A worked plan in the shape the compiler emits: two parallel fan-outs
+// around a compose step, placeholders bound from `env` and from earlier
+// steps, closed by a terminal. Doubles as the readable reference for what
+// the DSL looks like in practice.
+const EXAMPLE_PLAN = {
+  version: 1,
+  steps: [
+    {
+      kind: "parallel",
+      steps: [
+        {
+          kind: "tool",
+          tool: "list_news",
+          args: { source: "channel", sinceISO: "${env.watermark}" },
+          bind: "posts",
+        },
+        {
+          kind: "tool",
+          tool: "get_telegram_chat_history",
+          args: { chatId: "${env.chatId}", limit: 5 },
+          bind: "history",
+        },
+      ],
+    },
+    {
+      kind: "llm_compose",
+      preset: "smart",
+      skill: "news-digest",
+      input: {
+        posts: "${posts}",
+        history: "${history}",
+        date: "${env.date}",
+        timezone: "${env.timezone}",
+      },
+      bind: "digest",
+    },
+    {
+      kind: "parallel",
+      steps: [
+        {
+          kind: "tool",
+          tool: "send_telegram_message",
+          args: { chatId: "${env.chatId}", text: "${digest}" },
+        },
+        {
+          kind: "tool",
+          tool: "set_memory",
+          args: { key: "news_digest.last_read_at", value: "${env.now}" },
+        },
+      ],
+    },
+    { kind: "terminal" },
+  ],
+};
+
 describe("example fixture matches schema", () => {
-  it("loads and validates workflow.example.json", async () => {
-    const url = new URL("./workflow.example.json", import.meta.url);
-    const fs = await import("node:fs/promises");
-    const raw = await fs.readFile(url, "utf8");
-    const parsed = JSON.parse(raw);
+  it("validates a realistic hand-written plan", () => {
     const { WorkflowSchema } = makeSchema();
-    const r = WorkflowSchema.safeParse(parsed);
+    const r = WorkflowSchema.safeParse(EXAMPLE_PLAN);
     if (!r.success) {
       // Show why on failure so the test output explains itself.
       console.error(formatWorkflowErrors(r.error));
