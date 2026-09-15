@@ -386,7 +386,7 @@ OpenAI/codex key + a real trace) but the path is exercised.
 ### Original plan
 
 1. **Stamp the planner generation with `metadata.skill = "planner"`**
-   (`workflow/compile.ts`, the `attempt-N` generation). Today it's identified
+   (`workflow.ts` compile section, the `attempt-N` generation). Today it's identified
    only by name; uniform attribution (node → skill always one way).
 2. **`judging/materials.ts` → `assembleNodeMaterials(trace, observations)`**
    returning `NodeMaterial[]`: walk observations, classify judgeable nodes:

@@ -79,7 +79,7 @@ page-sized docs; revisit only if texts get huge.
 ### Strategy selection — via classify → replan
 
 > **Design note (2026-09-06):** the sketch below requires the document to
-> survive the replan. Today's `workflow/index.ts` creates a new store per
+> survive the replan. Today's `workflow.ts` creates a new store per
 > pass and carries only `context`, so carrying just `stats` loses `doc`.
 > The proposed [[agent-working-memory]] module separates artifact lifetime
 > from what the planner sees and would provide this shared data layer.

@@ -23,7 +23,7 @@ the other. Deployed as two containers (`docker-compose.yml`).
    `packages/mcp/data/tokens.db`.
 3. The supervisor (`packages/agent/src/supervisor/main.ts`) loops on
    `get_next_signal`. Routing is by source, decided in `supervisor/module.ts`:
-   `scheduler` runs through the `workflow/` module (compile → execute), every
+   `scheduler` runs through `workflow.ts` (compile → execute), every
    other source runs the primary AgentLoop. A compile failure degrades to the
    AgentLoop in the same trace; an execute failure goes to `recovery` instead
    of being retried. The AgentLoop path loads:
@@ -73,12 +73,13 @@ mcp-tools/
             ├── db/{client,memory,trace-store,schema}.ts + migrations/  Drizzle (sqlite)
             ├── supervisor/{main,module,telegram-context}.ts  poll loop,
             │                                     per-signal routing, tg history
-            ├── workflow/                      dynamic-workflow module (compile + execute)
-            │   ├── index.ts                   createWorkflowRunner facade (runForSignal)
-            │   ├── compile.ts                 signal → validated Workflow (LLM)
-            │   ├── execute.ts                 runtime that walks the steps
-            │   ├── dsl.ts                     Workflow step schema + parse
-            │   └── variables.ts               ${path} substitution + variable store
+            ├── workflow.ts                  the dynamic-workflow module, one
+            │                                  file: dsl (step schema + parse) ·
+            │                                  variables (${path} substitution) ·
+            │                                  compile (signal → Workflow) ·
+            │                                  execute (walks the steps) ·
+            │                                  createWorkflowRunner facade
+            ├── workflow.example.json        worked example plan (schema fixture)
             ├── agent-loop.ts                the whole agent runtime, one file:
             │                                  errors · model presets · LLM
             │                                  providers (openai/deepseek/gemini
@@ -160,9 +161,10 @@ need different slices of it.
 
 Done so far: `packages/agent/src/agent-loop.ts` (errors, model presets, LLM
 providers, generation, session context, tool results, the skill store,
-code_agent, synthetic tools, the ReAct loop, the engine). Still split:
-`workflow/`, `judging/`, `supervisor/`, `tracing/`, and the whole
-`packages/mcp` tree.
+code_agent, synthetic tools, the ReAct loop, the engine) and
+`packages/agent/src/workflow.ts` (dsl, variables, compile, execute, the
+runner facade). Still split: `judging/`, `supervisor/`, `tracing/`, and the
+whole `packages/mcp` tree.
 
 ## Code structure: modules + DI
 
@@ -233,7 +235,7 @@ business code.
    Reuse `generationEffect` / `runGeneration` in `agent-loop.ts` for LLM
    generation/tracing and `withRetry` there for transient failures. Keep automatic retries in
    one layer (SDK retries are disabled), and do not automatically replay
-   tool side effects. See `agent-loop.ts` and `workflow/execute.ts` for
+   tool side effects. See `agent-loop.ts` and `workflow.ts` for
    existing patterns. Simple sequential SDK adapters can remain
    `async`/`await`; add Effect when introducing orchestration.
 

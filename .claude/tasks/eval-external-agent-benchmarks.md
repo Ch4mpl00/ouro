@@ -45,7 +45,7 @@ agent) is what's under test.
 
 We want to benchmark the **workflow path** (the prod default:
 compile → execute, with the bounded `plan → act → replan` loop in
-`workflow/index.ts:129-207`). That loop is **autonomous**: each
+`workflow.ts`, `createWorkflowRunner`). That loop is **autonomous**: each
 `replan` recompiles the whole workflow carrying forward `context` =
 data **the agent itself gathered via tools**. It is NOT a
 human-dialogue loop — there is no "send a message, wait for the

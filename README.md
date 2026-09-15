@@ -84,7 +84,7 @@ is recorded in the same trace. Langfuse export uses the configured
 `LANGFUSE_*` credentials; without them the local recorder still runs.
 
 Routing is deterministic and by source, not by content. `scheduler` signals
-are compiled into a workflow (`workflow/`: compile → execute) as before —
+are compiled into a workflow (`workflow.ts`: compile → execute) as before —
 a cron body is known in advance, so a plan is cheaper and more predictable
 than an agentic loop. Every other source runs the primary AgentLoop. A
 scheduler signal whose plan fails to compile degrades to the AgentLoop in the
@@ -184,7 +184,7 @@ mcp-tools/
     │                                news, pdf, signals, settings, embeddings
     └── agent/src/
         ├── supervisor/              poll loop + failure handling
-        ├── workflow/                DSL compiler/executor (scheduler path)
+        ├── workflow.ts              DSL compiler/executor (scheduler path)
         ├── agent-loop.ts            the whole runtime: providers, generation,
         │                            session context, skills, synthetic tools,
         │                            ReAct loop, engine
@@ -206,7 +206,7 @@ clients. Convert to Promises at public API boundaries. Reuse
 `generationEffect` / `runGeneration` in `packages/agent/src/agent-loop.ts` for
 LLM generation/tracing and `withRetry` there for transient failures; automatic retries belong in one
 layer and must not replay tool side effects. See `agent-loop.ts` and
-`workflow/execute.ts` for the parallel execution patterns.
+`workflow.ts` for the parallel execution patterns.
 
 ## Stack
 
@@ -239,6 +239,23 @@ pnpm agent:start      # supervisor loop
 Env files: `.env.mcp` (integration creds + `OPENAI_API_KEY` for embeddings),
 `.env.agent` (DeepSeek key + model), `.env.postgres` (PG credentials).
 Examples are checked in as `*.example`.
+
+### Git merges with Weave
+
+Use [Weave](https://github.com/Ataraxy-Labs/weave) for semantic merging.
+Install both `weave` (the CLI release archive) and `weave-driver` from the
+[v0.5.4 releases](https://github.com/Ataraxy-Labs/weave/releases/tag/v0.5.4)
+for your platform and put both binaries on `PATH`. Then, from the repo root:
+
+```bash
+weave setup --local
+```
+
+This registers the driver in `.git/config` and its supported file patterns in
+`.git/info/attributes`, shared by this clone's worktrees. Repeat setup for each
+new clone. Use `git merge`, `git rebase` and `git cherry-pick` as usual; real
+conflicts still require resolution. Use `weave explain <file>` to inspect a
+conflict and `weave check` to check the resolution before staging it.
 
 ### Useful scripts
 

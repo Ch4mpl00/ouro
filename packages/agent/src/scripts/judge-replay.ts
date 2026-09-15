@@ -8,7 +8,7 @@ import { config as loadEnv } from "dotenv";
 import { z } from "zod";
 import { fetchTraceById, type Observation } from "./langfuse-api";
 import { DEEPSEEK_BASE_URL, GEMINI_BASE_URL, retryOnTransient } from "../agent-loop";
-import { createWorkflowSchema, parseWorkflow } from "../workflow/dsl";
+import { createWorkflowSchema, parseWorkflow } from "../workflow";
 
 // A/B replay over a captured trace. Both tests reduce to ONE pattern: take a
 // generation's recorded input (which already pins everything but the model —

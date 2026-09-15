@@ -1157,7 +1157,7 @@ export async function runCodeAgent(codex: CodexClient, args: CodeAgentArgs, sign
 // The one exception is `set_memory`, which a workflow `tool` step also
 // needs (watermark writes) — the executor dispatches it to the same
 // agent.db writer without going through an AgentLoop (see
-// workflow/execute.ts execSetMemory).
+// the workflow executor's execSetMemory).
 
 // What a synthetic-tool handler may touch. Provided by the AgentLoop at
 // dispatch time; every field is something at least one tool genuinely uses.
@@ -1278,7 +1278,7 @@ export const SET_MEMORY_TOOL: ChatCompletionTool = {
 };
 
 // Shared with the workflow executor's set_memory step (see
-// workflow/execute.ts) so both paths validate identically.
+// the workflow executor) so both paths validate identically.
 export const SetMemoryArgsSchema = z.object({
   key: z.string().min(1),
   value: z.string(),
