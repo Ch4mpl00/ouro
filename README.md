@@ -93,7 +93,8 @@ retried, because earlier steps may already have delivered. The AgentLoop does
 not expose a workflow tool.
 
 For incoming `telegram` signals the supervisor loads recent history of the
-same chat/topic before the first LLM turn (`supervisor/telegram-context.ts`):
+same chat/topic before the first LLM turn (the telegram-context section of
+`supervisor.ts`):
 a bounded inline excerpt plus the full fetched history under the
 `telegram.history` memory key for `input_refs`. No other source preloads it,
 and a failed fetch never blocks the reply.
@@ -127,9 +128,9 @@ flowchart LR
 
 1. A poller notices something new and calls `recordSignal({ source, content, envContext })` —
    one row in the `signals` queue.
-2. The supervisor (`packages/agent/src/supervisor/main.ts`) loops on
+2. The supervisor (`packages/agent/src/supervisor.ts`) loops on
    `get_next_signal`.
-3. `supervisor/module.ts` creates the session context and trace. A `scheduler`
+3. Its module section creates the session context and trace. A `scheduler`
    signal goes to the workflow runner (`planner` compiles the steps, the
    executor walks them); every other source starts the primary AgentLoop with
    `orchestrator` and `routing` instructions. Telegram signals also load their
@@ -183,7 +184,8 @@ mcp-tools/
     │   └── services/                gmail, telegram, monobank, scheduler,
     │                                news, pdf, signals, settings, embeddings
     └── agent/src/
-        ├── supervisor/              poll loop + failure handling
+        ├── supervisor.ts            poll loop, routing, recovery, and the
+        │                            composition root
         ├── workflow.ts              DSL compiler/executor (scheduler path)
         ├── agent-loop.ts            the whole runtime: providers, generation,
         │                            session context, skills, synthetic tools,

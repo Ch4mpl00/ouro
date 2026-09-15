@@ -1,11 +1,14 @@
 import { describe, expect, it, vi } from "vitest";
-import { createSessionContext } from "../agent-loop";
-import { nullTracer } from "../tracing";
+// ./supervisor registers the openai web shim (see ./openai-native-fetch), and
+// the SDK refuses a shim once `openai` itself has been imported — so this
+// import stays ahead of anything that reaches the SDK.
 import {
   prepareTelegramInput,
   TELEGRAM_HISTORY_KEY,
   TELEGRAM_HISTORY_MAX_BYTES,
-} from "./telegram-context";
+} from "./supervisor";
+import { createSessionContext } from "./agent-loop";
+import { nullTracer } from "./tracing";
 
 const signal = {
   id: 1,

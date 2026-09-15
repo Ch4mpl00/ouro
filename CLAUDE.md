@@ -21,9 +21,9 @@ the other. Deployed as two containers (`docker-compose.yml`).
 2. When it sees something new, it calls `recordSignal({ source, content,
    envContext })` which inserts a row into the `signals` queue in
    `packages/mcp/data/tokens.db`.
-3. The supervisor (`packages/agent/src/supervisor/main.ts`) loops on
-   `get_next_signal`. Routing is by source, decided in `supervisor/module.ts`:
-   `scheduler` runs through `workflow.ts` (compile → execute), every
+3. The supervisor (`packages/agent/src/supervisor.ts`) loops on
+   `get_next_signal`. Routing is by source, decided in that file's module
+   section: `scheduler` runs through `workflow.ts` (compile → execute), every
    other source runs the primary AgentLoop. A compile failure degrades to the
    AgentLoop in the same trace; an execute failure goes to `recovery` instead
    of being retried. The AgentLoop path loads:
@@ -35,7 +35,8 @@ the other. Deployed as two containers (`docker-compose.yml`).
 4. Plus a session-context block (local time, tz, watermarks) and the signal's
    `envContext` (per-source env addendum, e.g. default Telegram chat id).
    For `telegram` signals the supervisor also preloads recent chat/topic
-   history (`supervisor/telegram-context.ts`) before the first LLM turn.
+   history (the telegram-context section of `supervisor.ts`) before the
+   first LLM turn.
 5. The signal's `content` is pushed as the first user message. The loop runs;
    every side effect (Telegram reply, DB write) is a tool call.
 
@@ -76,8 +77,11 @@ mcp-tools/
             │                                  boot) · memory KV · trace store ·
             │                                  improver store. Generated SQL
             │                                  stays in db/migrations/
-            ├── supervisor/{main,module,telegram-context}.ts  poll loop,
-            │                                     per-signal routing, tg history
+            ├── supervisor.ts                the supervisor, one file: signal ·
+            │                                  telegram context (history preload) ·
+            │                                  module (routing + recovery) ·
+            │                                  main (composition root, runs only
+            │                                  as the process entry point)
             ├── workflow.ts                  the dynamic-workflow module, one
             │                                  file: dsl (step schema + parse) ·
             │                                  variables (${path} substitution) ·
@@ -165,16 +169,21 @@ factory + DI discipline below intact — it governs how the code is
 warranted when a domain genuinely has several independent consumers that
 need different slices of it.
 
-Done so far: `packages/agent/src/agent-loop.ts` (errors, model presets, LLM
-providers, generation, session context, tool results, the skill store,
-code_agent, synthetic tools, the ReAct loop, the engine) and
-`packages/agent/src/workflow.ts` (dsl, variables, compile, execute, the
-runner facade), `packages/agent/src/tracing.ts` (trace model, tracer
-interface, Langfuse adapter, local recorder, tee) and
-`packages/agent/src/db.ts` (schema, client, memory KV, trace store, improver
-store — `db/migrations/` stays a directory, being drizzle-kit output rather
-than source). Still split: `judging/`, `supervisor/`, `eval/`, and the whole
-`packages/mcp` tree.
+Done so far, all under `packages/agent/src/`:
+
+- `agent-loop.ts` — errors, model presets, LLM providers, generation, session
+  context, tool results, the skill store, code_agent, synthetic tools, the
+  ReAct loop, the engine.
+- `workflow.ts` — dsl, variables, compile, execute, the runner facade.
+- `tracing.ts` — trace model, tracer interface, Langfuse adapter, local
+  recorder, tee.
+- `db.ts` — schema, client, memory KV, trace store, improver store.
+  `db/migrations/` stays a directory: it is drizzle-kit output, not source.
+- `supervisor.ts` — signal, telegram context, routing module, composition
+  root. `main()` runs behind an entry-point guard, so importing the file for
+  its module does not start the process.
+
+Still split: `judging/`, `eval/`, and the whole `packages/mcp` tree.
 
 `scripts/` stays a directory on purpose: each file there is a separate CLI
 entry point that `package.json` names by path (`pnpm judge`, `pnpm improve`,

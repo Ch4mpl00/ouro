@@ -81,7 +81,7 @@ renderContext(env) → текст окружения для prompt
 
 ## Маршрутизация сигналов
 
-- `supervisor/module.ts` решает по `signal.source`. `scheduler` идёт в
+- Секция module в `supervisor.ts` решает по `signal.source`. `scheduler` идёт в
   `workflow.runForSignal` (compile → execute): тело cron-задачи известно заранее,
   поэтому план дешевле и предсказуемее агентного цикла. Ошибка компиляции
   (или исчерпанный replan) деградирует в AgentLoop на `base` в том же trace и

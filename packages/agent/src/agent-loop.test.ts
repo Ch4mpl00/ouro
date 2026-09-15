@@ -1,3 +1,7 @@
+// ./supervisor registers the openai web shim (see ./openai-native-fetch), and
+// the SDK refuses a shim once `openai` itself has been imported — so this
+// import stays above every other import in this file.
+import { createSupervisorModule } from "./supervisor";
 import type { ChatCompletionMessage, ChatCompletionMessageParam, ChatCompletionTool } from "openai/resources/chat/completions";
 import OpenAI from "openai";
 import { describe, expect, expectTypeOf, it, vi } from "vitest";
@@ -32,7 +36,6 @@ import {
   type Tracer,
 } from "./tracing";
 import type { StoredTraceInput, TraceStore } from "./db";
-import { createSupervisorModule } from "./supervisor/module";
 import { createWorkflowRunner, type WorkflowRunner, type WorkflowRunResult } from "./workflow";
 import type { Step } from "./workflow";
 import { createStore } from "./workflow";

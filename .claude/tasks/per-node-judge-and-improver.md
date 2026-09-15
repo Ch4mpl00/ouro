@@ -345,7 +345,7 @@ prompt-cache prefix `compile.ts` deliberately builds.
 
 - `agent.db` local mirror: `traces` + (per-trace) `judgements` tables,
   `db/trace-store.ts`, the local recorder + tee in `tracing.ts`, wired in
-  `supervisor/main.ts`. Commit bb8c292 (NOT yet deployed → no prod data → the
+  `supervisor.ts`. Commit bb8c292 (NOT yet deployed → no prod data → the
   `judgements` table can be redefined freely).
 - Codex judge stack: `judging/` (schema, materials, openai/codex judges, score
   writer, worker), `judging/trace-source.ts` (local-first + Langfuse fallback),
