@@ -344,7 +344,7 @@ prompt-cache prefix `compile.ts` deliberately builds.
 ## What already exists (build on, don't rebuild)
 
 - `agent.db` local mirror: `traces` + (per-trace) `judgements` tables,
-  `db/trace-store.ts`, `tracing/local-recorder.ts` + `tracing/tee.ts`, wired in
+  `db/trace-store.ts`, the local recorder + tee in `tracing.ts`, wired in
   `supervisor/main.ts`. Commit bb8c292 (NOT yet deployed → no prod data → the
   `judgements` table can be redefined freely).
 - Codex judge stack: `judging/` (schema, materials, openai/codex judges, score
@@ -366,7 +366,7 @@ OpenAI/codex key + a real trace) but the path is exercised.
   `skill="planner"` on the planner generation would poison `resolveSkill` (it
   takes the first `metadata.skill` in the tree for the `traces.skill` column =
   "which skill COMPOSED the output"), turning every workflow trace's skill into
-  "planner". So node role got its own key (`JUDGE_NODE_META` in `trace-model.ts`),
+  "planner". So node role got its own key (`JUDGE_NODE_META` in `tracing.ts`),
   orthogonal to `skill`. Compose generations are tagged the same way
   (`judge_node="compose"`, with the owner `skill` riding along, null=prompt-only).
 - **Classification is metadata-only, never by observation NAME.** `attempt-N` /

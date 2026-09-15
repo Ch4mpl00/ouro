@@ -1,6 +1,6 @@
 import { sql } from "drizzle-orm";
 import { index, primaryKey, real, sqliteTable, text } from "drizzle-orm/sqlite-core";
-import type { Observation } from "../trace-model";
+import type { Observation } from "../tracing";
 
 // Drizzle schema for the agent's sqlite state (agent.db). The query layer
 // (db/memory.ts, db/trace-store.ts) builds on this; migrations are generated

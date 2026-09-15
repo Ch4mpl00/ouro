@@ -22,9 +22,7 @@ import {
   type EnvDataDeps,
 } from "../../../agent-loop";
 import { connectMcp } from "../../../mcp-client";
-import { createLocalRecorderTracer } from "../../../tracing/local-recorder";
-import { langfuseTracerFromEnv } from "../../../tracing/langfuse";
-import { teeTracer } from "../../../tracing/tee";
+import { createLocalRecorderTracer, langfuseTracerFromEnv, teeTracer } from "../../../tracing";
 import { createWorkflowRunner, type WorkflowSignal } from "../../../workflow";
 import { createBenchMcpClient } from "./bench-mcp-client";
 import { isAccessible, missingCapabilities } from "./capabilities";

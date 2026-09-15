@@ -1,4 +1,4 @@
-import { JUDGE_NODE_META, type Observation, type Trace } from "../trace-model";
+import { JUDGE_NODE_META, type Observation, type TraceRecord } from "../tracing";
 import { createSkillStore } from "../agent-loop";
 import type { NodeKind } from "./schema";
 import type { TraceSource } from "./trace-source";
@@ -83,7 +83,7 @@ function hasAgentAncestor(obs: Observation, byId: Map<string, Observation>): boo
 export async function assembleNodeMaterials(
   source: TraceSource,
   traceId: string,
-): Promise<{ trace: Trace; nodes: NodeMaterial[] }> {
+): Promise<{ trace: TraceRecord; nodes: NodeMaterial[] }> {
   const { trace, observations } = await source.getTrace(traceId);
   const byId = new Map(observations.map((o) => [o.id, o]));
 
@@ -127,7 +127,7 @@ export async function assembleNodeMaterials(
 // pin the rules without rendering or skill IO.
 export function classify(
   o: Observation,
-  trace: Pick<Trace, "name">,
+  trace: Pick<TraceRecord, "name">,
   byId: Map<string, Observation>,
 ): { kind: NodeKind; skill: string } | null | typeof ROOT_SKIP {
   if (o.parentObservationId === null && o.name === trace.name) return ROOT_SKIP;

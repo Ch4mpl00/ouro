@@ -18,10 +18,12 @@ import {
   type EnvDataDeps,
 } from "../agent-loop";
 import { connectMcp, RETRY_UNTIL_UP } from "../mcp-client";
-import type { Tracer } from "../tracing";
-import { langfuseTracerFromEnv } from "../tracing/langfuse";
-import { createLocalRecorderTracer } from "../tracing/local-recorder";
-import { teeTracer } from "../tracing/tee";
+import {
+  createLocalRecorderTracer,
+  langfuseTracerFromEnv,
+  teeTracer,
+  type Tracer,
+} from "../tracing";
 import { createWorkflowRunner } from "../workflow";
 import { createSupervisorModule, type PendingSignal } from "./module";
 
