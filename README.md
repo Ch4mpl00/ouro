@@ -190,9 +190,12 @@ mcp-tools/
         │                            ReAct loop, engine
         ├── mcp-client.ts            StreamableHTTP client
         ├── codex-client.ts          sandboxed code execution
-        └── tracing.ts               trace model (read shape), Tracer
-                                     interface, Langfuse adapter, local
-                                     recorder, tee
+        ├── tracing.ts               trace model (read shape), Tracer
+        │                            interface, Langfuse adapter, local
+        │                            recorder, tee
+        └── db.ts                    sqlite: schema, client, memory KV, trace
+                                     store, improver store (generated SQL in
+                                     db/migrations/)
 ```
 
 Domain code follows a strict **modules + dependency-injection** discipline:
