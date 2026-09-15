@@ -5,18 +5,18 @@ import { createCodexClient } from "../codex-client";
 import { createAgentDb } from "../db/client";
 import { createMemoryStore } from "../db/memory";
 import { createTraceStore } from "../db/trace-store";
-import { createEngine } from "../engine";
-import { connectMcp, RETRY_UNTIL_UP } from "../mcp-client";
-import { DEFAULT_PRESETS } from "../models";
 import {
+  DEEPSEEK_BASE_URL,
+  DEFAULT_PRESETS,
+  GEMINI_BASE_URL,
   createDeepseekProvider,
+  createEngine,
   createGeminiProvider,
   createOpenAiProvider,
   withRetry,
-  DEEPSEEK_BASE_URL,
-  GEMINI_BASE_URL,
-} from "../providers";
-import type { EnvDataDeps } from "../session-context";
+  type EnvDataDeps,
+} from "../agent-loop";
+import { connectMcp, RETRY_UNTIL_UP } from "../mcp-client";
 import { createSkillStore } from "../skills";
 import type { Tracer } from "../tracing";
 import { langfuseTracerFromEnv } from "../tracing/langfuse";

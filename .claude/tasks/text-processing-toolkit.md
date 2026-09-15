@@ -54,7 +54,7 @@ leak). Instead:
 ### The enabling primitive: by-handle agent-side text tools
 
 Add **agent-side synthetic tools** (precedent: `set_memory` in
-`synthetic-tools.ts`, dispatched by the executor which already holds the
+`agent-loop.ts`, dispatched by the executor which already holds the
 `VariableStore`) that take a **variable NAME as a literal handle** and read
 the store in-process — text never crosses MCP, never enters a prompt:
 

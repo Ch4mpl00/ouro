@@ -1,6 +1,8 @@
 import type { ChatCompletionTool } from "openai/resources/chat/completions";
-import type { SessionContext } from "../session-context";
-import { SET_MEMORY_TOOL } from "../synthetic-tools";
+import {
+  SET_MEMORY_TOOL,
+  type SessionContext,
+} from "../agent-loop";
 import type { CodexClient } from "../codex-client";
 import type { TraceContext } from "../tracing";
 import {

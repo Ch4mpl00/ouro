@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { createSessionContext } from "../session-context";
+import { createSessionContext } from "../agent-loop";
 import { nullTracer } from "../tracing";
 import {
   prepareTelegramInput,

@@ -1,13 +1,17 @@
 import type { ChatCompletionMessageParam } from "openai/resources/chat/completions";
-import type { ModelPreset, PresetName } from "../models";
-import type { ChatProvider } from "../providers";
-import { runGeneration } from "../generation";
+import {
+  SET_MEMORY_TOOL_NAME,
+  SetMemoryArgsSchema,
+  runCodeAgent,
+  runGeneration,
+  toError,
+  type AgentLoopOpts,
+  type ChatProvider,
+  type ModelPreset,
+  type PresetName,
+  type SessionContext,
+} from "../agent-loop";
 import { Cause, Effect, Exit } from "effect";
-import { toError } from "../errors";
-import type { AgentLoopOpts } from "../agent-loop";
-import type { SessionContext } from "../session-context";
-import { SET_MEMORY_TOOL_NAME, SetMemoryArgsSchema } from "../synthetic-tools";
-import { runCodeAgent } from "../code-agent";
 import type { CodexClient } from "../codex-client";
 import { JUDGE_NODE_META } from "../trace-model";
 import { appendPatch } from "../skills";

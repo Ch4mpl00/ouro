@@ -3,8 +3,11 @@ import type {
   ChatCompletionMessageParam,
   ChatCompletionTool,
 } from "openai/resources/chat/completions";
-import type { ModelPreset, PresetName } from "../models";
-import type { ChatProvider } from "../providers";
+import {
+  type ChatProvider,
+  type ModelPreset,
+  type PresetName,
+} from "../agent-loop";
 import type { Generation, Span, Trace, TraceContext } from "../tracing";
 import { JUDGE_NODE_META } from "../trace-model";
 import { createCompiler, type CompileRequest } from "./compile";

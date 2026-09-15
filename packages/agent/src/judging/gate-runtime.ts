@@ -1,6 +1,6 @@
 import OpenAI from "openai";
 import type { ChatCompletionMessageParam } from "openai/resources/chat/completions";
-import { DEEPSEEK_BASE_URL, GEMINI_BASE_URL, retryOnTransient } from "../providers";
+import { DEEPSEEK_BASE_URL, GEMINI_BASE_URL, retryOnTransient } from "../agent-loop";
 import type { GateNodeTarget } from "./gate";
 import type { NodeMaterial } from "./materials";
 import type { ChatMessage } from "./patch";

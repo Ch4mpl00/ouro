@@ -185,8 +185,11 @@ mcp-tools/
     └── agent/src/
         ├── supervisor/              poll loop + failure handling
         ├── workflow/                DSL compiler/executor (scheduler path)
-        ├── engine.ts, session.ts    DeepSeek runner + synthetic tools
+        ├── agent-loop.ts            the whole runtime: providers, generation,
+        │                            session context, synthetic tools, ReAct
+        │                            loop, engine
         ├── mcp-client.ts            StreamableHTTP client
+        ├── codex-client.ts          sandboxed code execution
         ├── skills.ts                two-layer skill loader
         └── tracing/                 Langfuse adapter
 ```
@@ -201,8 +204,8 @@ concurrency limits, cancellation, timeouts, retries/backoff and resource
 cleanup. Keep child tasks within their parent's lifetime, propagate
 `AbortSignal` to SDK/HTTP calls and await cleanup before closing traces or
 clients. Convert to Promises at public API boundaries. Reuse
-`packages/agent/src/generation.ts` for LLM generation/tracing and
-`providers/retry.ts` for transient failures; automatic retries belong in one
+`generationEffect` / `runGeneration` in `packages/agent/src/agent-loop.ts` for
+LLM generation/tracing and `withRetry` there for transient failures; automatic retries belong in one
 layer and must not replay tool side effects. See `agent-loop.ts` and
 `workflow/execute.ts` for the parallel execution patterns.
 

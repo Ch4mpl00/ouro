@@ -79,10 +79,15 @@ mcp-tools/
             │   ├── execute.ts                 runtime that walks the steps
             │   ├── dsl.ts                     Workflow step schema + parse
             │   └── variables.ts               ${path} substitution + variable store
-            ├── engine.ts, agent-loop.ts     LLM runner (ReAct loop)
-            ├── synthetic-tools.ts           agent-side tools (set_memory, …)
+            ├── agent-loop.ts                the whole agent runtime, one file:
+            │                                  errors · model presets · LLM
+            │                                  providers (openai/deepseek/gemini
+            │                                  + retry) · generation · session
+            │                                  context + working memory · tool
+            │                                  results · code_agent · synthetic
+            │                                  tools · ReAct loop · engine
             ├── mcp-client.ts                StreamableHTTP client
-            ├── session-context.ts           markdown context block builder
+            ├── codex-client.ts              sandboxed code execution
             ├── skills.ts                    two-layer loader (live → default)
             ├── tracing/{index,langfuse}.ts  Tracer interface + Langfuse adapter
             └── db/{client.ts, memory.ts}    KV helpers
@@ -137,6 +142,26 @@ sqlite3      packages/agent/data/agent.db "UPDATE memory SET value=? WHERE key=?
 
 For multi-line / quote-heavy SQL, use a heredoc. Always single-quote
 string literals; double single quotes inside (`'O''Brien'`).
+
+## File granularity: one domain, one file
+
+Nobody navigates this codebase by hand — an LLM reads it. So the unit of
+organisation is the **domain**, not the file: a whole domain lives in one
+large file, with sections inside it, rather than a directory of small
+modules that have to be opened one by one. One read gets the full picture,
+including the parts that a human reader would have skipped.
+
+Inside such a file, order sections so each only depends on the ones above
+it, and open with a table of contents comment naming them. Keep the
+factory + DI discipline below intact — it governs how the code is
+*structured*, not how it is *split across files*. A `module.ts` is only
+warranted when a domain genuinely has several independent consumers that
+need different slices of it.
+
+Done so far: `packages/agent/src/agent-loop.ts` (errors, model presets, LLM
+providers, generation, session context, tool results, code_agent, synthetic
+tools, the ReAct loop, the engine). Still split: `workflow/`, `judging/`,
+`supervisor/`, `tracing/`, and the whole `packages/mcp` tree.
 
 ## Code structure: modules + DI
 
@@ -204,8 +229,8 @@ business code.
    with an explicit concurrency limit; convert to Promises at public API
    boundaries. Keep the factory + DI structure above.
 
-   Reuse `packages/agent/src/generation.ts` for LLM generation/tracing and
-   `providers/retry.ts` for transient failures. Keep automatic retries in
+   Reuse `generationEffect` / `runGeneration` in `agent-loop.ts` for LLM
+   generation/tracing and `withRetry` there for transient failures. Keep automatic retries in
    one layer (SDK retries are disabled), and do not automatically replay
    tool side effects. See `agent-loop.ts` and `workflow/execute.ts` for
    existing patterns. Simple sequential SDK adapters can remain

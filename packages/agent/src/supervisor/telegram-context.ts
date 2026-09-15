@@ -1,8 +1,10 @@
 import { Buffer } from "node:buffer";
 import { z } from "zod";
 import type { McpHandle } from "../mcp-client";
-import type { SessionContext } from "../session-context";
-import { isToolError } from "../tool-results";
+import {
+  isToolError,
+  type SessionContext,
+} from "../agent-loop";
 import type { TraceContext } from "../tracing";
 import type { PendingSignal } from "./module";
 

@@ -1,9 +1,12 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import type { ChatCompletionMessageParam } from "openai/resources/chat/completions";
-import type { ModelPreset, PresetName } from "../models";
-import type { ChatProvider } from "../providers";
-import { createSessionContext } from "../session-context";
-import type { AgentLoopOpts } from "../agent-loop";
+import {
+  createSessionContext,
+  type AgentLoopOpts,
+  type ChatProvider,
+  type ModelPreset,
+  type PresetName,
+} from "../agent-loop";
 import type { Generation, Span, Trace, TraceContext } from "../tracing";
 import { createWorkflowSchema, type Workflow } from "./dsl";
 import {

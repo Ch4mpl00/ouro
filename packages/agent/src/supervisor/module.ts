@@ -1,10 +1,16 @@
-import type { Engine } from "../engine";
-import type { AgentLoop } from "../agent-loop";
-import { createSessionContext, gatherEnvData, renderContext, type EnvDataDeps, type SessionContext } from "../session-context";
+import {
+  createSessionContext,
+  gatherEnvData,
+  isAbortError,
+  renderContext,
+  type AgentLoop,
+  type Engine,
+  type EnvDataDeps,
+  type SessionContext,
+} from "../agent-loop";
 import type { Span, Trace } from "../tracing";
 import type { WorkflowRunner } from "../workflow";
 import { prepareTelegramInput } from "./telegram-context";
-import { isAbortError } from "../errors";
 
 export interface PendingSignal {
   id: number;

@@ -1,11 +1,27 @@
 import type { ChatCompletionMessage, ChatCompletionMessageParam, ChatCompletionTool } from "openai/resources/chat/completions";
-import { describe, expect, it, vi } from "vitest";
-import { createEngine } from "./engine";
-import type { AgentLoopOpts } from "./agent-loop";
-import { DEFAULT_PRESETS } from "./models";
-import type { CompletionParams, ChatProvider } from "./providers";
-import { createSessionContext } from "./session-context";
-import { nullTracer, type Tracer } from "./tracing";
+import OpenAI from "openai";
+import { describe, expect, expectTypeOf, it, vi } from "vitest";
+import { Effect, Fiber } from "effect";
+import { TestClock } from "effect/testing";
+import {
+  createEngine,
+  createSessionContext,
+  createOpenAiProvider,
+  retryOnTransientEffect,
+  runGeneration,
+  createDeepseekProvider,
+  createGeminiProvider,
+  withRetry,
+  storeToolResult,
+  DEFAULT_PRESETS,
+  TOOL_RESULT_INLINE_MAX_BYTES,
+  TOOL_RESULT_PREVIEW_MAX_BYTES,
+  type AgentLoopOpts,
+  type ChatProvider,
+  type CompletionParams,
+  type RetryInfo,
+} from "./agent-loop";
+import { nullTracer, type EventStartOpts, type Span, type Tracer } from "./tracing";
 import { createLocalRecorderTracer } from "./tracing/local-recorder";
 import { teeTracer } from "./tracing/tee";
 import type { StoredTraceInput, TraceStore } from "./db/trace-store";
@@ -18,7 +34,6 @@ import { createLangfuseTracer } from "./tracing/langfuse";
 import { LangfuseOtelSpanAttributes } from "@langfuse/tracing";
 import type { ReadableSpan } from "@opentelemetry/sdk-trace-node";
 import { trace as otelTrace, context as otelContext, propagation } from "@opentelemetry/api";
-
 // Exercise the actual Langfuse adapter + OTel SDK. Only the network exporter
 // is replaced, so tests cannot send telemetry to a live project.
 const exported = vi.hoisted(() => new Array<ReadableSpan>());
@@ -747,3 +762,644 @@ describe("primary AgentLoop and tracing", () => {
     }
   });
 });
+
+// ─── session context ───────────────────────────────────────────
+
+function createTestContext(id = "session") {
+  return createSessionContext({
+    id,
+    env: {
+      now: new Date("2026-09-06T12:00:00Z"),
+      timezone: "Europe/Chisinau",
+      userEmail: null,
+      newsLastReadAt: null,
+    },
+  });
+}
+
+describe("session context", () => {
+  it("owns its identity, environment and a stable memory instance", () => {
+    const context = createTestContext("telegram:42");
+    expect(context.id).toBe("telegram:42");
+    expect(context.env).toEqual({
+      now: new Date("2026-09-06T12:00:00Z"),
+      timezone: "Europe/Chisinau",
+      userEmail: null,
+      newsLastReadAt: null,
+    });
+
+    const memory = context.memory;
+    memory.put("news", "shared result");
+    expect(context.memory).toBe(memory);
+    expect(context.memory.get("news")).toBe("shared result");
+  });
+});
+
+describe("session context memory invariants", () => {
+  it("accepts and returns strings in its public contract", () => {
+    const memory = createTestContext().memory;
+    expectTypeOf(memory.put).parameter(1).toEqualTypeOf<string>();
+    expectTypeOf(memory.get).returns.toEqualTypeOf<string>();
+  });
+
+  it("starts empty without shared state between instances", () => {
+    const first = createTestContext().memory;
+    const second = createTestContext().memory;
+
+    expect(first.list()).toEqual([]);
+    expect(second.list()).toEqual([]);
+    first.put("news", "first run");
+    expect(second.list()).toEqual([]);
+    expect(() => second.get("news")).toThrow('Key "news" not found');
+
+    second.put("news", "second run");
+    first.delete("news");
+    expect(second.get("news")).toBe("second run");
+  });
+
+  it.each([
+    { label: "empty text", value: "" },
+    { label: "whitespace and line endings", value: "  first\r\nsecond\n\t" },
+    { label: "unicode", value: "Новини 📰 e\u0301" },
+    { label: "JSON-looking text", value: '{ "items": [1, null, false] }' },
+    { label: "placeholder-looking text", value: '${news.raw} {"ref":"news"}' },
+    { label: "long text", value: "новость\n".repeat(10_000) },
+  ])("preserves $label exactly on repeated reads", ({ value }) => {
+    const memory = createTestContext().memory;
+    memory.put("data", value);
+
+    expect(memory.get("data")).toBe(value);
+    expect(memory.get("data")).toBe(value);
+    expect(memory.list()).toHaveLength(1);
+  });
+
+  it("uses exact flat keys without interpreting paths or object properties", () => {
+    const memory = createTestContext().memory;
+    const keys = ["news", "news.raw", "news[0]", "__proto__", "constructor", " news "];
+
+    for (const key of keys) memory.put(key, `value of ${key}`);
+    for (const key of keys) expect(memory.get(key)).toBe(`value of ${key}`);
+    expect(() => memory.get("news.raw.title")).toThrow('Key "news.raw.title" not found');
+    expect(() => memory.get("News")).toThrow('Key "News" not found');
+    expect(memory.list()).toHaveLength(keys.length);
+  });
+
+  it("rejects an empty key without changing stored data", () => {
+    const memory = createTestContext().memory;
+    memory.put("existing", "keep");
+
+    expect(() => memory.put("", "value")).toThrow("Key must not be empty");
+    expect(memory.list()).toEqual([{ key: "existing", format: "text", sizeBytes: 4 }]);
+    expect(memory.get("existing")).toBe("keep");
+  });
+
+  it("rejects duplicate keys without replacing their value or format", () => {
+    const memory = createTestContext().memory;
+    memory.put("result", "original");
+    const before = memory.list();
+
+    expect(() => memory.put("result", "original")).toThrow('Key "result" already exists');
+    expect(() => memory.put("result", '{"new":true}', "json"))
+      .toThrow('Key "result" already exists');
+    expect(memory.get("result")).toBe("original");
+    expect(memory.list()).toEqual(before);
+  });
+
+  it("reports a missing key while preserving an existing empty string", () => {
+    const memory = createTestContext().memory;
+    memory.put("empty", "");
+
+    expect(memory.get("empty")).toBe("");
+    expect(() => memory.get("missing")).toThrow('Key "missing" not found');
+    expect(memory.list()).toEqual([{ key: "empty", format: "text", sizeBytes: 0 }]);
+  });
+
+  it("defaults to text and keeps an explicit format without parsing the value", () => {
+    const memory = createTestContext().memory;
+    memory.put("text", "null");
+    memory.put("json", ' { "a": [1, true] }\n', "json");
+    memory.put("incomplete-json", '{"a":', "json");
+
+    expect(memory.get("text")).toBe("null");
+    expect(memory.get("json")).toBe(' { "a": [1, true] }\n');
+    expect(memory.get("incomplete-json")).toBe('{"a":');
+    expect(memory.list().map(({ key, format }) => ({ key, format }))).toEqual([
+      { key: "text", format: "text" },
+      { key: "json", format: "json" },
+      { key: "incomplete-json", format: "json" },
+    ]);
+  });
+
+  it("lists only metadata with UTF-8 byte sizes, without exposing payloads", () => {
+    const memory = createTestContext().memory;
+    memory.put("ascii", "abc");
+    memory.put("unicode", "Я📰");
+    memory.put("json", "[1,2]", "json");
+
+    expect(memory.list()).toEqual([
+      { key: "ascii", format: "text", sizeBytes: 3 },
+      { key: "unicode", format: "text", sizeBytes: 6 },
+      { key: "json", format: "json", sizeBytes: 5 },
+    ]);
+  });
+
+  it("returns detached metadata so callers cannot modify the store", () => {
+    const memory = createTestContext().memory;
+    memory.put("news", "data", "json");
+    const entries = memory.list();
+    const [entry] = entries;
+    if (!entry) throw new Error("Expected metadata for news");
+
+    entry.key = "renamed";
+    entry.format = "text";
+    entry.sizeBytes = 999;
+    entries.splice(0);
+
+    expect(memory.get("news")).toBe("data");
+    expect(() => memory.get("renamed")).toThrow('Key "renamed" not found');
+    expect(memory.list()).toEqual([{ key: "news", format: "json", sizeBytes: 4 }]);
+  });
+
+  it("deletes only the exact key and reports whether it existed", () => {
+    const memory = createTestContext().memory;
+    memory.put("news", "");
+    memory.put("news.raw", "keep");
+
+    expect(memory.delete("missing")).toBe(false);
+    expect(memory.delete("news")).toBe(true);
+    expect(memory.delete("news")).toBe(false);
+    expect(() => memory.get("news")).toThrow('Key "news" not found');
+    expect(memory.get("news.raw")).toBe("keep");
+    expect(memory.list()).toEqual([{ key: "news.raw", format: "text", sizeBytes: 4 }]);
+  });
+
+  it("allows a deleted key to be explicitly reused", () => {
+    const memory = createTestContext().memory;
+    memory.put("result", "old");
+    memory.delete("result");
+    memory.put("result", "[1]", "json");
+
+    expect(memory.get("result")).toBe("[1]");
+    expect(memory.list()).toEqual([{ key: "result", format: "json", sizeBytes: 3 }]);
+  });
+});
+
+// ─── tool results ───────────────────────────────────────────
+
+
+function memory() {
+  return createSessionContext({
+    id: "test",
+    env: { now: new Date(), timezone: "UTC", userEmail: null, newsLastReadAt: null },
+  }).memory;
+}
+
+describe("tool result storage", () => {
+  it.each(["", "plain text ${key}", "{\"answer\":42}", "null", "{broken JSON"])(
+    "preserves the exact small result: %j", (value) => {
+      const store = memory();
+      const reply = storeToolResult(store, value);
+      expect(reply).toMatchObject({ content: value, truncated: false, size_bytes: Buffer.byteLength(value) });
+      expect(store.get(reply.memory_key)).toBe(value);
+      expect(store.list()).toEqual([{ key: reply.memory_key, format: reply.format, sizeBytes: reply.size_bytes }]);
+      expect(reply).not.toHaveProperty("preview");
+    },
+  );
+
+  it("keeps the exact byte threshold inline and hides larger content", () => {
+    const store = memory();
+    expect(storeToolResult(store, "x".repeat(TOOL_RESULT_INLINE_MAX_BYTES)).truncated).toBe(false);
+    const value = "x".repeat(TOOL_RESULT_INLINE_MAX_BYTES) + "hidden tail";
+    const reply = storeToolResult(store, value);
+    expect(reply.truncated).toBe(true);
+    if (!reply.truncated) throw new Error("Expected a preview");
+    expect(reply).not.toHaveProperty("content");
+    expect(reply.preview).toBe("x".repeat(TOOL_RESULT_PREVIEW_MAX_BYTES));
+    expect(store.get(reply.memory_key)).toBe(value);
+  });
+
+  it("measures UTF-8 bytes and never cuts a preview inside a character", () => {
+    const store = memory();
+    const value = "я🦊".repeat(2_000);
+    const reply = storeToolResult(store, value);
+    expect(reply.truncated).toBe(true);
+    expect(reply.size_bytes).toBe(12_000);
+    if (!reply.truncated) throw new Error("Expected a preview");
+    expect(Buffer.byteLength(reply.preview)).toBeLessThanOrEqual(TOOL_RESULT_PREVIEW_MAX_BYTES);
+    expect(reply.preview).not.toContain("�");
+    expect(value.startsWith(reply.preview)).toBe(true);
+    expect(store.get(reply.memory_key)).toBe(value);
+  });
+
+  it("allocates distinct keys for identical outputs", () => {
+    const store = memory();
+    const replies = Array.from({ length: 20 }, () => storeToolResult(store, "same"));
+    expect(new Set(replies.map((r) => r.memory_key)).size).toBe(20);
+    expect(store.list()).toHaveLength(20);
+  });
+});
+
+// ─── providers ───────────────────────────────────────────
+
+
+// Fake OpenAI-shaped client: captures the request body and returns a canned
+// completion. Casting an incomplete stand-in to the full SDK type is the
+// established test pattern here — the provider only ever touches
+// chat.completions.create.
+function fakeClient(usage: Record<string, unknown>): {
+  client: OpenAI;
+  bodies: Array<Record<string, unknown>>;
+} {
+  const bodies: Array<Record<string, unknown>> = [];
+  const client = {
+    chat: {
+      completions: {
+        create: async (body: Record<string, unknown>) => {
+          bodies.push(body);
+          return {
+            choices: [
+              { message: { role: "assistant", content: "ok" }, finish_reason: "stop" },
+            ],
+            usage,
+          };
+        },
+      },
+    },
+  } as unknown as OpenAI;
+  return { client, bodies };
+}
+
+const OPENAI_USAGE = {
+  prompt_tokens: 100,
+  completion_tokens: 20,
+  total_tokens: 120,
+  prompt_tokens_details: { cached_tokens: 64 },
+};
+
+const DEEPSEEK_USAGE = {
+  prompt_tokens: 100,
+  completion_tokens: 20,
+  total_tokens: 120,
+  prompt_cache_hit_tokens: 48,
+  prompt_cache_miss_tokens: 52,
+};
+
+describe("openai provider", () => {
+  it("sends no thinking / no reasoning_effort, omits empty tools", async () => {
+    const { client, bodies } = fakeClient(OPENAI_USAGE);
+    const provider = createOpenAiProvider(client);
+    await provider.complete({
+      model: "gpt-5.4",
+      messages: [{ role: "user", content: "x" }],
+      reasoningEffort: "max",
+    });
+    expect(bodies[0]).toEqual({
+      model: "gpt-5.4",
+      messages: [{ role: "user", content: "x" }],
+    });
+    expect(bodies[0]!.thinking).toBeUndefined();
+    expect(bodies[0]!.reasoning_effort).toBeUndefined();
+  });
+
+  it("passes tools and response_format through when provided", async () => {
+    const { client, bodies } = fakeClient(OPENAI_USAGE);
+    const provider = createOpenAiProvider(client);
+    const tools = [
+      { type: "function" as const, function: { name: "t", parameters: {} } },
+    ];
+    await provider.complete({
+      model: "gpt-5.4",
+      messages: [],
+      reasoningEffort: "disabled",
+      tools,
+      responseFormat: { type: "json_object" },
+    });
+    expect(bodies[0]!.tools).toEqual(tools);
+    expect(bodies[0]!.response_format).toEqual({ type: "json_object" });
+  });
+
+  it("normalizes usage incl. cached from prompt_tokens_details", async () => {
+    const { client } = fakeClient(OPENAI_USAGE);
+    const provider = createOpenAiProvider(client);
+    const r = await provider.complete({ model: "gpt-5.4", messages: [], reasoningEffort: "disabled" });
+    expect(r.usage).toEqual({ input: 100, output: 20, total: 120, cached: 64 });
+    expect(r.finishReason).toBe("stop");
+    expect(r.message.content).toBe("ok");
+  });
+});
+
+describe("deepseek provider", () => {
+  it("disabled effort: thinking:disabled, no reasoning_effort", async () => {
+    const { client, bodies } = fakeClient(DEEPSEEK_USAGE);
+    const provider = createDeepseekProvider(client);
+    await provider.complete({ model: "deepseek-v4-pro", messages: [], reasoningEffort: "disabled" });
+    expect(bodies[0]!.thinking).toEqual({ type: "disabled" });
+    expect(bodies[0]!.reasoning_effort).toBeUndefined();
+  });
+
+  it("enabled effort: thinking:enabled + reasoning_effort", async () => {
+    const { client, bodies } = fakeClient(DEEPSEEK_USAGE);
+    const provider = createDeepseekProvider(client);
+    await provider.complete({ model: "deepseek-v4-pro", messages: [], reasoningEffort: "max" });
+    expect(bodies[0]!.thinking).toEqual({ type: "enabled" });
+    expect(bodies[0]!.reasoning_effort).toBe("max");
+  });
+
+  it("stamps reasoning_content on prior assistant turns when thinking-enabled", async () => {
+    const { client } = fakeClient(DEEPSEEK_USAGE);
+    const provider = createDeepseekProvider(client);
+    const messages: ChatCompletionMessageParam[] = [
+      { role: "user", content: "hi" },
+      { role: "assistant", content: "prior" },
+    ];
+    await provider.complete({ model: "deepseek-v4-pro", messages, reasoningEffort: "max" });
+    const assistant = messages[1] as { reasoning_content?: string };
+    expect(assistant.reasoning_content).toBe("");
+  });
+
+  it("does NOT stamp reasoning_content when thinking-disabled", async () => {
+    const { client } = fakeClient(DEEPSEEK_USAGE);
+    const provider = createDeepseekProvider(client);
+    const messages: ChatCompletionMessageParam[] = [
+      { role: "assistant", content: "prior" },
+    ];
+    await provider.complete({ model: "deepseek-v4-pro", messages, reasoningEffort: "disabled" });
+    const assistant = messages[0] as { reasoning_content?: string };
+    expect(assistant.reasoning_content).toBeUndefined();
+  });
+
+  it("normalizes usage incl. cached from prompt_cache_hit_tokens", async () => {
+    const { client } = fakeClient(DEEPSEEK_USAGE);
+    const provider = createDeepseekProvider(client);
+    const r = await provider.complete({ model: "deepseek-v4-pro", messages: [], reasoningEffort: "max" });
+    expect(r.usage).toEqual({ input: 100, output: 20, total: 120, cached: 48 });
+  });
+});
+
+describe("gemini provider", () => {
+  it("disabled effort: omits reasoning_effort (dynamic thinking budget)", async () => {
+    const { client, bodies } = fakeClient(OPENAI_USAGE);
+    const provider = createGeminiProvider(client);
+    await provider.complete({
+      model: "gemini-3.5-flash",
+      messages: [{ role: "user", content: "x" }],
+      reasoningEffort: "disabled",
+    });
+    expect(bodies[0]).toEqual({
+      model: "gemini-3.5-flash",
+      messages: [{ role: "user", content: "x" }],
+    });
+    expect(bodies[0]!.reasoning_effort).toBeUndefined();
+    expect(bodies[0]!.thinking).toBeUndefined();
+  });
+
+  it("non-disabled effort: maps to reasoning_effort 'high' (no 'max' in Gemini's enum)", async () => {
+    const { client, bodies } = fakeClient(OPENAI_USAGE);
+    const provider = createGeminiProvider(client);
+    await provider.complete({ model: "gemini-3.5-flash", messages: [], reasoningEffort: "max" });
+    expect(bodies[0]!.reasoning_effort).toBe("high");
+  });
+
+  it("low effort: maps to reasoning_effort 'low' (the compiler's latency knob)", async () => {
+    const { client, bodies } = fakeClient(OPENAI_USAGE);
+    const provider = createGeminiProvider(client);
+    await provider.complete({ model: "gemini-3-flash-preview", messages: [], reasoningEffort: "low" });
+    expect(bodies[0]!.reasoning_effort).toBe("low");
+  });
+
+  it("passes tools and response_format through, normalizes usage like OpenAI", async () => {
+    const { client, bodies } = fakeClient(OPENAI_USAGE);
+    const provider = createGeminiProvider(client);
+    const tools = [{ type: "function" as const, function: { name: "t", parameters: {} } }];
+    const r = await provider.complete({
+      model: "gemini-3.5-flash",
+      messages: [],
+      reasoningEffort: "disabled",
+      tools,
+      responseFormat: { type: "json_object" },
+    });
+    expect(bodies[0]!.tools).toEqual(tools);
+    expect(bodies[0]!.response_format).toEqual({ type: "json_object" });
+    expect(r.usage).toEqual({ input: 100, output: 20, total: 120, cached: 64 });
+  });
+});
+
+// ─── withRetry decorator ─────────────────────────────────────────────
+
+// Provider that throws the queued errors first, then succeeds.
+function flakyProvider(errors: unknown[]): { provider: ChatProvider; calls: () => number } {
+  let n = 0;
+  const provider: ChatProvider = {
+    kind: "openai",
+    async complete() {
+      n++;
+      const next = errors.shift();
+      if (next) throw next;
+      return {
+        message: { role: "assistant", content: "ok", refusal: null },
+        finishReason: "stop",
+      };
+    },
+  };
+  return { provider, calls: () => n };
+}
+
+// Minimal TraceContext stub that records emitted events.
+function captureTrace(): { ctx: Span; events: EventStartOpts[] } {
+  const events: EventStartOpts[] = [];
+  const ctx: Span = {
+    id: "test-span",
+    update() {},
+    end() {},
+    event(o) {
+      events.push(o);
+    },
+    generation: () => ({ id: "test-gen", end() {} }),
+    span: () => ctx,
+  };
+  return { ctx, events };
+}
+
+function apiError(status: number) {
+  return new OpenAI.APIError(status, undefined, `status ${status}`, undefined);
+}
+
+describe("withRetry decorator", () => {
+  it("retries 429/5xx and emits a WARNING llm_retry event per attempt on the trace", async () => {
+    const { provider, calls } = flakyProvider([apiError(429), apiError(503)]);
+    const { ctx, events } = captureTrace();
+    const r = await withRetry(provider, { baseDelayMs: 1 }).complete({
+      model: "gpt-5.4-mini",
+      messages: [],
+      reasoningEffort: "disabled",
+      trace: ctx,
+    });
+    expect(r.message.content).toBe("ok");
+    expect(calls()).toBe(3);
+    expect(events.map((e) => e.name)).toEqual(["llm_retry", "llm_retry"]);
+    expect(events.every((e) => e.level === "WARNING")).toBe(true);
+    expect(events[0]!.metadata).toMatchObject({ attempt: 1, status: 429, model: "gpt-5.4-mini" });
+    expect(events[1]!.metadata).toMatchObject({ attempt: 2, status: 503 });
+  });
+
+  it("retries a connection-level failure (no HTTP status, e.g. Premature close)", async () => {
+    const connErr = new OpenAI.APIConnectionError({ message: "Premature close" });
+    const { provider, calls } = flakyProvider([connErr]);
+    const { ctx, events } = captureTrace();
+    const r = await withRetry(provider, { baseDelayMs: 1 }).complete({
+      model: "gpt-5.4-mini",
+      messages: [],
+      reasoningEffort: "disabled",
+      trace: ctx,
+    });
+    expect(r.message.content).toBe("ok");
+    expect(calls()).toBe(2);
+    expect(events.map((e) => e.name)).toEqual(["llm_retry"]);
+    expect(events[0]!.metadata).toMatchObject({ attempt: 1, status: null });
+  });
+
+  it("rethrows non-retryable 4xx immediately, no events", async () => {
+    const { provider, calls } = flakyProvider([apiError(400)]);
+    const { ctx, events } = captureTrace();
+    await expect(
+      withRetry(provider, { baseDelayMs: 1 }).complete({
+        model: "gpt-5.4-mini",
+        messages: [],
+        reasoningEffort: "disabled",
+        trace: ctx,
+      }),
+    ).rejects.toThrow("status 400");
+    expect(calls()).toBe(1);
+    expect(events).toEqual([]);
+  });
+
+  it("gives up after maxRetries and rethrows the last error", async () => {
+    const { provider, calls } = flakyProvider([apiError(429), apiError(429), apiError(429)]);
+    await expect(
+      withRetry(provider, { maxRetries: 2, baseDelayMs: 1 }).complete({
+        model: "gpt-5.4-mini",
+        messages: [],
+        reasoningEffort: "disabled",
+      }),
+    ).rejects.toThrow("status 429");
+    expect(calls()).toBe(3); // initial + 2 retries
+  });
+
+  it("works without a trace (scripts) — retry path doesn't require one", async () => {
+    const { provider, calls } = flakyProvider([apiError(500)]);
+    const r = await withRetry(provider, { baseDelayMs: 1 }).complete({
+      model: "gpt-5.4-mini",
+      messages: [],
+      reasoningEffort: "disabled",
+    });
+    expect(r.message.content).toBe("ok");
+    expect(calls()).toBe(2);
+  });
+});
+
+// ─── retry policy ───────────────────────────────────────────
+
+describe("Effect retry policy", () => {
+  it("uses exponential delays and stops exactly at the retry budget", async () => {
+    const events: RetryInfo[] = [];
+    const failure = new OpenAI.APIError(503, undefined, "offline", undefined);
+    let calls = 0;
+    const task = retryOnTransientEffect(async () => { calls++; throw failure; }, {
+      maxRetries: 2, baseDelayMs: 1000, jitter: false, onRetry: (info) => { events.push(info); },
+    });
+    await Effect.runPromise(Effect.gen(function* () {
+      const fiber = yield* task.pipe(Effect.forkChild);
+      yield* TestClock.adjust(0);
+      expect(calls).toBe(1);
+      yield* TestClock.adjust(999);
+      expect(calls).toBe(1);
+      yield* TestClock.adjust(1);
+      expect(calls).toBe(2);
+      yield* TestClock.adjust(2000);
+      expect(yield* Fiber.join(fiber).pipe(Effect.flip)).toBe(failure);
+      expect(calls).toBe(3);
+      expect(events.map((e) => e.delayMs)).toEqual([1000, 2000]);
+      expect(events.map((e) => e.attempt)).toEqual([1, 2]);
+    }).pipe(Effect.provide(TestClock.layer())));
+  });
+
+  it("cancels the backoff without making another request", async () => {
+    let calls = 0;
+    const task = retryOnTransientEffect(async () => {
+      calls++;
+      throw new OpenAI.APIConnectionError({ message: "offline" });
+    }, { baseDelayMs: 1000, jitter: false });
+    await Effect.runPromise(Effect.gen(function* () {
+      const fiber = yield* task.pipe(Effect.forkChild);
+      yield* TestClock.adjust(0);
+      expect(calls).toBe(1);
+      yield* Fiber.interrupt(fiber);
+      yield* TestClock.adjust("1 hour");
+      expect(calls).toBe(1);
+    }).pipe(Effect.provide(TestClock.layer())));
+  });
+
+  it("propagates interruption through the Promise provider adapter", async () => {
+    const controller = new AbortController();
+    let requestSignal: AbortSignal | undefined;
+    const provider = withRetry({
+      kind: "openai",
+      complete: ({ signal }) => {
+        requestSignal = signal;
+        return new Promise(() => {});
+      },
+    });
+    const completed = provider.complete({ model: "test", messages: [], reasoningEffort: "disabled", signal: controller.signal });
+    const rejected = expect(completed).rejects.toThrow();
+    controller.abort();
+    await rejected;
+    expect(requestSignal?.aborted).toBe(true);
+  });
+
+  it("applies the generation deadline to backoff as well as HTTP requests", async () => {
+    vi.useFakeTimers();
+    try {
+      let calls = 0;
+      const provider = withRetry({
+        kind: "openai",
+        complete: async () => {
+          calls++;
+          throw new OpenAI.APIError(503, undefined, "offline", undefined);
+        },
+      }, { baseDelayMs: 1000, jitter: false });
+      const rejected = expect(runGeneration({
+        provider,
+        params: { model: "test", messages: [], reasoningEffort: "disabled" },
+        scope: nullTracer.trace({ id: "test", name: "test" }),
+        observation: { name: "generation" }, timeoutMs: 10,
+      })).rejects.toThrow("Generation timed out after 10ms");
+      await vi.advanceTimersByTimeAsync(10);
+      await rejected;
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(calls).toBe(1);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  for (const [name, create] of Object.entries({ openai: createOpenAiProvider, gemini: createGeminiProvider, deepseek: createDeepseekProvider })) {
+    it(`${name} disables SDK retries and passes the AbortSignal to the actual request`, async () => {
+      let calls = 0;
+      const client = new OpenAI({
+        apiKey: "test-key", maxRetries: 8,
+        fetch: async (_url, init) => {
+          calls++;
+          expect(init?.signal).toBeDefined();
+          return new Response(JSON.stringify({ error: { message: "offline" } }), {
+            status: 503, headers: { "content-type": "application/json" },
+          });
+        },
+      });
+      const provider = withRetry(create(client), { maxRetries: 1, baseDelayMs: 0 });
+      await expect(provider.complete({ model: "test", messages: [], reasoningEffort: "disabled" })).rejects.toMatchObject({ status: 503 });
+      expect(calls).toBe(2);
+    });
+  }
+});
+

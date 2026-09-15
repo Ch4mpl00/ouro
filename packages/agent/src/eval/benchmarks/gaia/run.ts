@@ -7,18 +7,20 @@ import { createCodexClient } from "../../../codex-client";
 import { createAgentDb } from "../../../db/client";
 import { createMemoryStore } from "../../../db/memory";
 import { createTraceStore } from "../../../db/trace-store";
-import { createEngine } from "../../../engine";
-import { connectMcp } from "../../../mcp-client";
-import { DEFAULT_PRESETS } from "../../../models";
 import {
+  DEEPSEEK_BASE_URL,
+  DEFAULT_PRESETS,
+  GEMINI_BASE_URL,
   createDeepseekProvider,
+  createEngine,
   createGeminiProvider,
   createOpenAiProvider,
+  createSessionContext,
+  gatherEnvData,
   withRetry,
-  DEEPSEEK_BASE_URL,
-  GEMINI_BASE_URL,
-} from "../../../providers";
-import { createSessionContext, gatherEnvData, type EnvDataDeps } from "../../../session-context";
+  type EnvDataDeps,
+} from "../../../agent-loop";
+import { connectMcp } from "../../../mcp-client";
 import { createSkillStore } from "../../../skills";
 import { createLocalRecorderTracer } from "../../../tracing/local-recorder";
 import { langfuseTracerFromEnv } from "../../../tracing/langfuse";

@@ -2,13 +2,16 @@ import type {
   ChatCompletionMessageParam,
   ChatCompletionTool,
 } from "openai/resources/chat/completions";
-import type { ModelPreset, PresetName } from "../models";
-import type { ChatProvider } from "../providers";
-import type { EnvData } from "../session-context";
+import {
+  toError,
+  traceGenerationEffect,
+  type ChatProvider,
+  type EnvData,
+  type ModelPreset,
+  type PresetName,
+} from "../agent-loop";
 import type { Span, TraceContext } from "../tracing";
 import { Effect } from "effect";
-import { traceGenerationEffect } from "../generation";
-import { toError } from "../errors";
 import { JUDGE_NODE_META } from "../trace-model";
 import { appendPatch } from "../skills";
 import { createWorkflowSchema, parseWorkflow, type Workflow } from "./dsl";

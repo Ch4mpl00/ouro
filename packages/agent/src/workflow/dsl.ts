@@ -1,6 +1,6 @@
 import { z } from "zod";
 import { zodToJsonSchema } from "zod-to-json-schema";
-import { PRESET_NAMES } from "../models";
+import { PRESET_NAMES } from "../agent-loop";
 
 // Workflow DSL — the language the compiler LLM emits and the executor runs.
 //

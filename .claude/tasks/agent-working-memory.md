@@ -13,8 +13,8 @@
 
 ## Первый этап: строковый KV
 
-Реализация: [`session-context.ts`](../../packages/agent/src/session-context.ts).
-Тесты: [`session-context.test.ts`](../../packages/agent/src/session-context.test.ts).
+Реализация: [`agent-loop.ts`](../../packages/agent/src/agent-loop.ts).
+Тесты: [`agent-loop.test.ts`](../../packages/agent/src/agent-loop.test.ts).
 
 ```text
 createSessionContext({ id, env }) → { id, env, memory }
@@ -77,7 +77,7 @@ renderContext(env) → текст окружения для prompt
   писать постоянное состояние в SQLite; рабочая память освобождается вместе с задачей.
 
 Проверки интеграции: [`agent-loop.test.ts`](../../packages/agent/src/agent-loop.test.ts),
-порогов и сохранности данных: [`tool-results.test.ts`](../../packages/agent/src/tool-results.test.ts).
+порогов и сохранности данных: [`agent-loop.test.ts`](../../packages/agent/src/agent-loop.test.ts).
 
 ## Маршрутизация сигналов
 
