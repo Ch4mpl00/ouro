@@ -54,7 +54,7 @@ leak). Instead:
 ### The enabling primitive: by-handle agent-side text tools
 
 Add **agent-side synthetic tools** (precedent: `set_memory` in
-`synthetic-tools.ts`, dispatched by the executor which already holds the
+`agent-loop.ts`, dispatched by the executor which already holds the
 `VariableStore`) that take a **variable NAME as a literal handle** and read
 the store in-process — text never crosses MCP, never enters a prompt:
 
@@ -79,7 +79,7 @@ page-sized docs; revisit only if texts get huge.
 ### Strategy selection — via classify → replan
 
 > **Design note (2026-09-06):** the sketch below requires the document to
-> survive the replan. Today's `workflow/index.ts` creates a new store per
+> survive the replan. Today's `workflow.ts` creates a new store per
 > pass and carries only `context`, so carrying just `stats` loses `doc`.
 > The proposed [[agent-working-memory]] module separates artifact lifetime
 > from what the planner sees and would provide this shared data layer.

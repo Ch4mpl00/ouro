@@ -66,7 +66,7 @@ committed**.
 - `langfuse-api.ts` — shared read client (`api` + `Trace`/`Observation` types +
   `fetchTraceById`), 5xx/network retry (Langfuse Cloud 502s are transient).
   `langfuse-trace.ts` deduplicated onto it.
-- `readSkillRaw` in `skills.ts` — raw contract text (live→default) without
+- `readSkillRaw` in `agent-loop.ts` — raw contract text (live→default) without
   frontmatter validation.
 - Holistic axes: `coverage`, `query_formulation`, `composition`; orchestrator
   (`planner`) + composer contracts both fed; structured output; prompt

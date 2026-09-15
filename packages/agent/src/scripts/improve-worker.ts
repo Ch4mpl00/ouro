@@ -2,14 +2,20 @@ import "dotenv/config";
 import "../openai-native-fetch";
 import { appendFileSync } from "node:fs";
 import { config as loadEnv } from "dotenv";
-import { createAgentDb } from "../db/client";
-import { createTraceStore } from "../db/trace-store";
-import { createImproverStore } from "../db/improver-store";
-import { createSkillStore } from "../skills";
-import { createJudgeBackend } from "../judging/judge-backend";
-import { loadSigmaBaseline } from "../judging/sigma-baseline";
-import { improveWorkerOptsFromEnv, runImproveWorker } from "../judging/improve-worker";
-import { createLangfuseTraceSource, createLocalTraceSource } from "../judging/trace-source";
+import {
+  createAgentDb,
+  createImproverStore,
+  createTraceStore,
+} from "../db";
+import { createSkillStore } from "../agent-loop";
+import {
+  createJudgeBackend,
+  createLangfuseTraceSource,
+  createLocalTraceSource,
+  improveWorkerOptsFromEnv,
+  loadSigmaBaseline,
+  runImproveWorker,
+} from "../judging";
 
 loadEnv({ path: ".env.agent" });
 

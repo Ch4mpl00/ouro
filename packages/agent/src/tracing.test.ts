@@ -1,13 +1,13 @@
 import { describe, expect, it } from "vitest";
-import { createLocalRecorderTracer } from "./local-recorder";
-import { teeTracer } from "./tee";
-import type {
-  Generation,
-  Span,
-  Trace,
-  Tracer,
-} from "./index";
-import type { StoredTraceInput, TraceStore } from "../db/trace-store";
+import {
+  createLocalRecorderTracer,
+  teeTracer,
+  type Generation,
+  type Span,
+  type Trace,
+  type Tracer,
+} from "./tracing";
+import type { StoredTraceInput, TraceStore } from "./db";
 
 // A fake "Langfuse" tracer that hands out deterministic ids, standing in for
 // the OTel/Langfuse backend whose observation ids the local mirror must adopt.

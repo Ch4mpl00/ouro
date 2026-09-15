@@ -344,8 +344,8 @@ prompt-cache prefix `compile.ts` deliberately builds.
 ## What already exists (build on, don't rebuild)
 
 - `agent.db` local mirror: `traces` + (per-trace) `judgements` tables,
-  `db/trace-store.ts`, `tracing/local-recorder.ts` + `tracing/tee.ts`, wired in
-  `supervisor/main.ts`. Commit bb8c292 (NOT yet deployed → no prod data → the
+  `db/trace-store.ts`, the local recorder + tee in `tracing.ts`, wired in
+  `supervisor.ts`. Commit bb8c292 (NOT yet deployed → no prod data → the
   `judgements` table can be redefined freely).
 - Codex judge stack: `judging/` (schema, materials, openai/codex judges, score
   writer, worker), `judging/trace-source.ts` (local-first + Langfuse fallback),
@@ -366,7 +366,7 @@ OpenAI/codex key + a real trace) but the path is exercised.
   `skill="planner"` on the planner generation would poison `resolveSkill` (it
   takes the first `metadata.skill` in the tree for the `traces.skill` column =
   "which skill COMPOSED the output"), turning every workflow trace's skill into
-  "planner". So node role got its own key (`JUDGE_NODE_META` in `trace-model.ts`),
+  "planner". So node role got its own key (`JUDGE_NODE_META` in `tracing.ts`),
   orthogonal to `skill`. Compose generations are tagged the same way
   (`judge_node="compose"`, with the owner `skill` riding along, null=prompt-only).
 - **Classification is metadata-only, never by observation NAME.** `attempt-N` /
@@ -386,7 +386,7 @@ OpenAI/codex key + a real trace) but the path is exercised.
 ### Original plan
 
 1. **Stamp the planner generation with `metadata.skill = "planner"`**
-   (`workflow/compile.ts`, the `attempt-N` generation). Today it's identified
+   (`workflow.ts` compile section, the `attempt-N` generation). Today it's identified
    only by name; uniform attribution (node → skill always one way).
 2. **`judging/materials.ts` → `assembleNodeMaterials(trace, observations)`**
    returning `NodeMaterial[]`: walk observations, classify judgeable nodes:
@@ -491,7 +491,7 @@ not the recorded temperature/reasoning preset; revisit if it skews Δ.
 
 ### п1 — runtime patch injection — DONE (2026-06-16)
 Shipped `skills/<skill>.patch.md` now actually take effect. `appendPatch` (in
-skills.ts, the shared primitive; judging/patch.ts re-exports it) glues the patch
+agent-loop.ts, the shared primitive; judging/patch.ts re-exports it) glues the patch
 onto the END of the node's final system message — planner: after <tools>/<skills>
 (keeps cache prefix); compose: after the body. `SkillStore.readPatch`/`savePatch`
 own the file. `readPatch` threaded composition-root → runner → compiler/executor

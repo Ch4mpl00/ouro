@@ -1,13 +1,13 @@
 import "dotenv/config";
-import { api, type Observation, type Trace } from "./langfuse-api";
+import { api, type Observation, type TraceRecord } from "./langfuse-api";
 
 // Inspect a Langfuse trace from the terminal. Usage:
 //   pnpm trace <sessionId>            — all traces in a session, summarised
 //   pnpm trace <sessionId> --raw      — also dump full input/output JSON
 //   pnpm trace <traceId> --by-id      — fetch a single trace by its trace id
 //
-// Auth + the api()/Trace/Observation types live in ./langfuse-api (shared with
-// the eval judge). This file owns only the terminal rendering.
+// Auth + the api()/TraceRecord/Observation types live in ./langfuse-api
+// (shared with the eval judge). This file owns only the terminal rendering.
 
 function truncate(s: string, n: number): string {
   if (s.length <= n) return s;
@@ -63,7 +63,7 @@ interface PrintOpts {
   raw: boolean;
 }
 
-function renderTrace(t: Trace, observations: Observation[], opts: PrintOpts): void {
+function renderTrace(t: TraceRecord, observations: Observation[], opts: PrintOpts): void {
   const meta = t.metadata ?? {};
   const preset = meta.preset ?? "—";
   const model = meta.model ?? "—";
@@ -142,12 +142,12 @@ async function main(): Promise<void> {
   const raw = args.includes("--raw");
   const opts: PrintOpts = { raw };
 
-  let traces: Trace[];
+  let traces: TraceRecord[];
   if (byId) {
-    const t = await api<Trace>(`/traces/${encodeURIComponent(id)}`);
+    const t = await api<TraceRecord>(`/traces/${encodeURIComponent(id)}`);
     traces = [t];
   } else {
-    const list = await api<{ data: Trace[] }>(
+    const list = await api<{ data: TraceRecord[] }>(
       `/traces?sessionId=${encodeURIComponent(id)}`,
     );
     traces = list.data;

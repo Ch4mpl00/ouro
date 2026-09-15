@@ -1,22 +1,28 @@
 import "dotenv/config";
 import { readFileSync } from "node:fs";
 import { config as loadEnv } from "dotenv";
-import { createAgentDb } from "../db/client";
-import { createTraceStore } from "../db/trace-store";
-import { assembleNodeMaterials } from "../judging/materials";
-import { createJudgeBackend, type JudgeProvider } from "../judging/judge-backend";
-import { runNodeGate } from "../judging/gate";
-import { judgeNode } from "../judging/node-judge";
-import { extractAxisScores, type NoiseAxis } from "../judging/noise";
-import { loadSigmaBaseline } from "../judging/sigma-baseline";
-import { JUDGE_MODEL, JUDGE_PROMPT_VERSION } from "../judging/schema";
 import {
+  createAgentDb,
+  createTraceStore,
+} from "../db";
+import {
+  JUDGE_MODEL,
+  JUDGE_PROMPT_VERSION,
+  assembleNodeMaterials,
+  buildGateTarget,
+  createJudgeBackend,
   createLangfuseTraceSource,
   createLocalTraceSource,
+  extractAxisScores,
+  judgeNode,
+  loadSigmaBaseline,
+  runModel,
+  runNodeGate,
+  type JudgeProvider,
+  type NoiseAxis,
   type TraceSource,
-} from "../judging/trace-source";
-import type { Observation } from "../trace-model";
-import { buildGateTarget, runModel } from "../judging/gate-runtime";
+} from "../judging";
+import type { Observation } from "../tracing";
 
 loadEnv({ path: ".env.agent" });
 

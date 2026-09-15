@@ -64,7 +64,7 @@ describe("skills catalog", () => {
     });
   });
 
-  // The agent runs body + improver patch (appendPatch, packages/agent/src/skills.ts).
+  // The agent runs body + improver patch (appendPatch, packages/agent/src/agent-loop.ts).
   // Exporting only the body would show a reader a skill that is no longer the
   // one in force — which is the whole reason the patch is exported.
   it("composes the patch into effectiveInstructions exactly as the agent does", async () => {

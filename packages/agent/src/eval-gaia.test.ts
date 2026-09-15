@@ -1,6 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { questionScorer } from "./scorer";
-
+import { questionScorer } from "./eval-gaia";
 describe("questionScorer — float ground truth", () => {
   it("matches bare numbers", () => {
     expect(questionScorer("90", "90")).toBe(true);
