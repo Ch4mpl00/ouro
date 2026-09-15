@@ -2,9 +2,9 @@
 // ../skills (the skill-overlay home) and is the SAME function prod runtime uses
 // (compile.ts/execute.ts) — re-exported here so the gate and prod can't drift.
 // This module adds the chat-message variant the replay needs.
-import { appendPatch } from "../skills";
+import { appendPatch } from "../agent-loop";
 
-export { appendPatch, PATCH_MARKER } from "../skills";
+export { appendPatch, PATCH_MARKER } from "../agent-loop";
 
 export interface ChatMessage {
   role: string;

@@ -491,7 +491,7 @@ not the recorded temperature/reasoning preset; revisit if it skews Δ.
 
 ### п1 — runtime patch injection — DONE (2026-06-16)
 Shipped `skills/<skill>.patch.md` now actually take effect. `appendPatch` (in
-skills.ts, the shared primitive; judging/patch.ts re-exports it) glues the patch
+agent-loop.ts, the shared primitive; judging/patch.ts re-exports it) glues the patch
 onto the END of the node's final system message — planner: after <tools>/<skills>
 (keeps cache prefix); compose: after the body. `SkillStore.readPatch`/`savePatch`
 own the file. `readPatch` threaded composition-root → runner → compiler/executor

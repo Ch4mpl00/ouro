@@ -13,11 +13,11 @@ import {
   createEngine,
   createGeminiProvider,
   createOpenAiProvider,
+  createSkillStore,
   withRetry,
   type EnvDataDeps,
 } from "../agent-loop";
 import { connectMcp, RETRY_UNTIL_UP } from "../mcp-client";
-import { createSkillStore } from "../skills";
 import type { Tracer } from "../tracing";
 import { langfuseTracerFromEnv } from "../tracing/langfuse";
 import { createLocalRecorderTracer } from "../tracing/local-recorder";

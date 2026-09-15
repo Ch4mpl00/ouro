@@ -1,6 +1,6 @@
 import type { JudgementRecord, TraceStore } from "../db/trace-store";
 import type { ImproverStore } from "../db/improver-store";
-import type { SkillStore } from "../skills";
+import type { SkillStore } from "../agent-loop";
 import type { JudgeBackend, JudgeProvider } from "./judge-backend";
 import { NOISE_AXES, type NoiseAxis } from "./noise";
 import { JUDGE_PROMPT_VERSION } from "./schema";

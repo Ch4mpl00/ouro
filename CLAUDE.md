@@ -84,11 +84,11 @@ mcp-tools/
             │                                  providers (openai/deepseek/gemini
             │                                  + retry) · generation · session
             │                                  context + working memory · tool
-            │                                  results · code_agent · synthetic
+            │                                  results · skills (live → default
+            │                                  overlay) · code_agent · synthetic
             │                                  tools · ReAct loop · engine
             ├── mcp-client.ts                StreamableHTTP client
             ├── codex-client.ts              sandboxed code execution
-            ├── skills.ts                    two-layer loader (live → default)
             ├── tracing/{index,langfuse}.ts  Tracer interface + Langfuse adapter
             └── db/{client.ts, memory.ts}    KV helpers
 ```
@@ -159,9 +159,10 @@ warranted when a domain genuinely has several independent consumers that
 need different slices of it.
 
 Done so far: `packages/agent/src/agent-loop.ts` (errors, model presets, LLM
-providers, generation, session context, tool results, code_agent, synthetic
-tools, the ReAct loop, the engine). Still split: `workflow/`, `judging/`,
-`supervisor/`, `tracing/`, and the whole `packages/mcp` tree.
+providers, generation, session context, tool results, the skill store,
+code_agent, synthetic tools, the ReAct loop, the engine). Still split:
+`workflow/`, `judging/`, `supervisor/`, `tracing/`, and the whole
+`packages/mcp` tree.
 
 ## Code structure: modules + DI
 

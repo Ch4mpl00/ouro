@@ -186,11 +186,10 @@ mcp-tools/
         ├── supervisor/              poll loop + failure handling
         ├── workflow/                DSL compiler/executor (scheduler path)
         ├── agent-loop.ts            the whole runtime: providers, generation,
-        │                            session context, synthetic tools, ReAct
-        │                            loop, engine
+        │                            session context, skills, synthetic tools,
+        │                            ReAct loop, engine
         ├── mcp-client.ts            StreamableHTTP client
         ├── codex-client.ts          sandboxed code execution
-        ├── skills.ts                two-layer skill loader
         └── tracing/                 Langfuse adapter
 ```
 

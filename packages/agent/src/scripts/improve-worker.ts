@@ -5,7 +5,7 @@ import { config as loadEnv } from "dotenv";
 import { createAgentDb } from "../db/client";
 import { createTraceStore } from "../db/trace-store";
 import { createImproverStore } from "../db/improver-store";
-import { createSkillStore } from "../skills";
+import { createSkillStore } from "../agent-loop";
 import { createJudgeBackend } from "../judging/judge-backend";
 import { loadSigmaBaseline } from "../judging/sigma-baseline";
 import { improveWorkerOptsFromEnv, runImproveWorker } from "../judging/improve-worker";

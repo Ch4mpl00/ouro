@@ -2,7 +2,7 @@ import "dotenv/config";
 import { config as loadEnv } from "dotenv";
 import { createAgentDb } from "../db/client";
 import { createTraceStore } from "../db/trace-store";
-import { createSkillStore } from "../skills";
+import { createSkillStore } from "../agent-loop";
 import { createJudgeBackend, type JudgeProvider } from "../judging/judge-backend";
 import { type NoiseAxis } from "../judging/noise";
 import { JUDGE_PROMPT_VERSION } from "../judging/schema";

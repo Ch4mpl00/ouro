@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import type { ChatCompletionMessageParam } from "openai/resources/chat/completions";
 import {
+  PATCH_MARKER,
   createSessionContext,
   type AgentLoopOpts,
   type ChatProvider,
@@ -16,7 +17,6 @@ import {
   __testing,
 } from "./execute";
 import { createStore } from "./variables";
-import { PATCH_MARKER } from "../skills";
 import type { CodexClient } from "../codex-client";
 
 // ─── shared mocks ────────────────────────────────────────────────────

@@ -1,7 +1,7 @@
 import { z } from "zod";
 import type { JudgementRecord, TraceStore } from "../db/trace-store";
 import type { Observation } from "../trace-model";
-import type { SkillStore } from "../skills";
+import type { SkillStore } from "../agent-loop";
 import { assembleNodeMaterials, type NodeMaterial } from "./materials";
 import { runNodeGate, type NodeGateResult } from "./gate";
 import { buildGateTarget, runModel as defaultRunModel } from "./gate-runtime";

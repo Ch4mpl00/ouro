@@ -16,12 +16,12 @@ import {
   createGeminiProvider,
   createOpenAiProvider,
   createSessionContext,
+  createSkillStore,
   gatherEnvData,
   withRetry,
   type EnvDataDeps,
 } from "../../../agent-loop";
 import { connectMcp } from "../../../mcp-client";
-import { createSkillStore } from "../../../skills";
 import { createLocalRecorderTracer } from "../../../tracing/local-recorder";
 import { langfuseTracerFromEnv } from "../../../tracing/langfuse";
 import { teeTracer } from "../../../tracing/tee";

@@ -275,7 +275,7 @@ function salvageFirstJson(text: string): string | null {
 
 // Swap the planner-skill body in the recorded system message for the given
 // on-disk file, keeping the recorded <tools>/<skills> reference intact.
-// skills.ts strips frontmatter before the body reaches the compiler —
+// the skill store strips frontmatter before the body reaches the compiler —
 // mirrored here so the swapped prompt matches what production would send.
 function swapPlannerBody(
   messages: ChatCompletionMessageParam[],

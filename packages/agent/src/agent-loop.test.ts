@@ -4,18 +4,19 @@ import { describe, expect, expectTypeOf, it, vi } from "vitest";
 import { Effect, Fiber } from "effect";
 import { TestClock } from "effect/testing";
 import {
-  createEngine,
-  createSessionContext,
-  createOpenAiProvider,
-  retryOnTransientEffect,
-  runGeneration,
-  createDeepseekProvider,
-  createGeminiProvider,
-  withRetry,
-  storeToolResult,
   DEFAULT_PRESETS,
   TOOL_RESULT_INLINE_MAX_BYTES,
   TOOL_RESULT_PREVIEW_MAX_BYTES,
+  createDeepseekProvider,
+  createEngine,
+  createGeminiProvider,
+  createOpenAiProvider,
+  createSessionContext,
+  createSkillStore,
+  retryOnTransientEffect,
+  runGeneration,
+  storeToolResult,
+  withRetry,
   type AgentLoopOpts,
   type ChatProvider,
   type CompletionParams,
@@ -29,7 +30,6 @@ import { createSupervisorModule } from "./supervisor/module";
 import { createWorkflowRunner, type WorkflowRunner, type WorkflowRunResult } from "./workflow";
 import type { Step } from "./workflow/dsl";
 import { createStore } from "./workflow/variables";
-import { createSkillStore } from "./skills";
 import { createLangfuseTracer } from "./tracing/langfuse";
 import { LangfuseOtelSpanAttributes } from "@langfuse/tracing";
 import type { ReadableSpan } from "@opentelemetry/sdk-trace-node";

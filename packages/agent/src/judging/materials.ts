@@ -1,5 +1,5 @@
 import { JUDGE_NODE_META, type Observation, type Trace } from "../trace-model";
-import { createSkillStore } from "../skills";
+import { createSkillStore } from "../agent-loop";
 import type { NodeKind } from "./schema";
 import type { TraceSource } from "./trace-source";
 

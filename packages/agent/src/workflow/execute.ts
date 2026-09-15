@@ -2,6 +2,7 @@ import type { ChatCompletionMessageParam } from "openai/resources/chat/completio
 import {
   SET_MEMORY_TOOL_NAME,
   SetMemoryArgsSchema,
+  appendPatch,
   runCodeAgent,
   runGeneration,
   toError,
@@ -14,7 +15,6 @@ import {
 import { Cause, Effect, Exit } from "effect";
 import type { CodexClient } from "../codex-client";
 import { JUDGE_NODE_META } from "../trace-model";
-import { appendPatch } from "../skills";
 import type { Span, SpanKind, TraceContext } from "../tracing";
 import type {
   CodeAgentStep,
@@ -121,7 +121,7 @@ export interface AgentLoopHandle {
 
 export interface ExecutorDeps {
   engine: EngineSurface;
-  // Decoupled from skills.ts so tests can pass a stub. Returns the
+  // Decoupled from the skill store so tests can pass a stub. Returns the
   // skill body (no frontmatter); null when not found.
   readSkill: (name: string) => Promise<string | null>;
   // Optional improver patch loader. When present and a `skills/<skill>.patch.md`

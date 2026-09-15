@@ -3,6 +3,7 @@ import type {
   ChatCompletionTool,
 } from "openai/resources/chat/completions";
 import {
+  appendPatch,
   toError,
   traceGenerationEffect,
   type ChatProvider,
@@ -13,7 +14,6 @@ import {
 import type { Span, TraceContext } from "../tracing";
 import { Effect } from "effect";
 import { JUDGE_NODE_META } from "../trace-model";
-import { appendPatch } from "../skills";
 import { createWorkflowSchema, parseWorkflow, type Workflow } from "./dsl";
 
 // Compiler — turns a signal into a validated Workflow via one LLM call (with
