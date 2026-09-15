@@ -96,6 +96,10 @@ mcp-tools/
             │                                  results · skills (live → default
             │                                  overlay) · code_agent · synthetic
             │                                  tools · ReAct loop · engine
+            ├── eval-gaia.ts                 the GAIA benchmark harness, one
+            │                                  file: dataset · scorer ·
+            │                                  capabilities · bench MCP client ·
+            │                                  run (entry point for bench:gaia)
             ├── mcp-client.ts                StreamableHTTP client
             ├── codex-client.ts              sandboxed code execution
             └── tracing.ts                   observability, one file: trace
@@ -182,8 +186,11 @@ Done so far, all under `packages/agent/src/`:
 - `supervisor.ts` — signal, telegram context, routing module, composition
   root. `main()` runs behind an entry-point guard, so importing the file for
   its module does not start the process.
+- `eval-gaia.ts` — the GAIA harness: dataset, scorer, capabilities, the
+  side-effect-suppressing MCP client, and the runner. Same entry-point guard.
+  Its gitignored dataset cache moved to `packages/agent/eval-fixtures/`.
 
-Still split: `judging/`, `eval/`, and the whole `packages/mcp` tree.
+Still split: `judging/` and the whole `packages/mcp` tree.
 
 `scripts/` stays a directory on purpose: each file there is a separate CLI
 entry point that `package.json` names by path (`pnpm judge`, `pnpm improve`,

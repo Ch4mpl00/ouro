@@ -190,6 +190,7 @@ mcp-tools/
         ├── agent-loop.ts            the whole runtime: providers, generation,
         │                            session context, skills, synthetic tools,
         │                            ReAct loop, engine
+        ├── eval-gaia.ts             GAIA benchmark harness (bench:gaia)
         ├── mcp-client.ts            StreamableHTTP client
         ├── codex-client.ts          sandboxed code execution
         ├── tracing.ts               trace model (read shape), Tracer
