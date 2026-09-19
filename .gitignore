@@ -5,6 +5,7 @@ dist/
 .env.mcp
 .env.agent
 .env.postgres
+n8n/.env.n8n
 *.log
 
 # Local attachment / blob storage

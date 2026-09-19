@@ -177,6 +177,8 @@ mcp-tools/
 ├── docker-compose.yml      three services: postgres + mcp + agent
 ├── skills.default/         shipped skills (git-tracked fallback)
 ├── skills/                 live overlay (gitignored; dreaming writes here)
+├── n8n/                    side experiment: the same news digest built
+│                             statically in n8n (own README + compose overlay)
 └── packages/
     ├── mcp/src/
     │   ├── server.ts                pollers + HTTP/stdio transport
