@@ -1,0 +1,120 @@
+# n8n subproject — a static twin of the supervisor's news-digest workflow.
+#
+# Compose OVERLAY, not a standalone file. Always used together with the root
+# compose file, from the repo root, so that relative paths (`build: .`,
+# `env_file: .env.mcp`) and the shared named volumes resolve:
+#
+#   docker compose -f docker-compose.yml -f n8n/docker-compose.n8n.yml up -d n8n mcp-n8n
+#
+# It adds exactly two services and never touches the existing ones:
+#
+#   mcp-n8n  a third MCP instance, tool-scoped for this workflow
+#   n8n      the workflow engine + editor, loopback-only
+#
+# See n8n/README.md for why each choice is what it is.
+
+services:
+  # Third MCP instance (after `mcp` and `mcp-tunnel`), same image and code.
+  # Reasons it is separate rather than reusing `mcp`:
+  #
+  #   1. The full instance is SINGLE-session and "newest wins": an arriving
+  #      `initialize` EVICTS the supervisor's session (http-transport.ts). n8n
+  #      opening a session against port 3000 would knock the agent off its own
+  #      MCP. A restricted instance (MCP_TOOLSETS set) is multi-session, so n8n
+  #      comes and goes without disturbing anything.
+  #   2. It has no signals tools, so nothing races the agent for signal
+  #      delivery.
+  #   3. MCP_NO_POLLERS=1 is mandatory: Telegram getUpdates is exclusive and a
+  #      second poller 409s the `mcp` service.
+  #
+  # Toolsets: `news-read` (list_news), `telegram` (send_telegram_message +
+  # get_telegram_chat_history — the digest needs the history for dedup, which
+  # the narrower `telegram-send` group does not expose) and `skills`
+  # (read_skill, so the workflow runs the same instructions as the agent).
+  # Gmail, Monobank, fs, fetch, signals, scheduler, userbot, dreaming,
+  # knowledge, pdf and memory are never registered — they do not appear in
+  # tools/list at all.
+  mcp-n8n:
+    build: .
+    image: mcp-tools-image
+    command: sh -c "pnpm setup:mcp && pnpm mcp:serve"
+    env_file:
+      - .env.mcp
+    environment:
+      MCP_TRANSPORT: http
+      MCP_PORT: "3002"
+      MCP_NO_POLLERS: "1"
+      MCP_TOOLSETS: news-read,telegram,skills
+      MCP_MEMORY_ACTOR: n8n
+      DATABASE_URL: postgres://${POSTGRES_USER:-mcp}:${POSTGRES_PASSWORD:-mcp}@postgres:5432/${POSTGRES_DB:-mcp}
+    volumes:
+      # tokens.db: the news store's watermarks live in Postgres, but the
+      # telegram_messages chat log this workflow reads AND appends to is here.
+      - mcp-data:/app/packages/mcp/data
+      # The skills the workflow reads through read_skill — live overlay first,
+      # exactly like the agent. Read-only: n8n never writes a skill.
+      - agent-skills:/app/skills:ro
+    expose:
+      - "3002"
+    # A bare POST with no session is answered 400 by design ("send an
+    # initialize request first"), which is proof the HTTP listener is up.
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:3002/mcp',{method:'POST'}).then(r=>process.exit(r.status<500?0:1)).catch(()=>process.exit(1))"
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    depends_on:
+      postgres:
+        condition: service_healthy
+      # Ordering only: let `mcp` apply schema.sql to the shared sqlite first.
+      mcp:
+        condition: service_started
+    restart: unless-stopped
+
+  # The workflow engine. Pin the tag you validated the workflows against —
+  # node `typeVersion`s in workflows/*.json are the conservative ones a newer
+  # n8n still loads, but the editor UI and defaults move between releases.
+  n8n:
+    image: n8nio/n8n:2.40.3
+    env_file:
+      - n8n/.env.n8n
+    environment:
+      # Cron fires in this timezone; the digest workflow also pins it in its
+      # own settings so an import onto another instance keeps 21:00 local.
+      GENERIC_TIMEZONE: ${N8N_TIMEZONE:-Europe/Kyiv}
+      TZ: ${N8N_TIMEZONE:-Europe/Kyiv}
+      N8N_HOST: localhost
+      N8N_PORT: "5678"
+      N8N_PROTOCOL: http
+      # The editor is reachable through an SSH tunnel only (see ports below),
+      # so a public base URL would be wrong.
+      WEBHOOK_URL: http://localhost:5678/
+      N8N_DIAGNOSTICS_ENABLED: "false"
+      N8N_VERSION_NOTIFICATIONS_ENABLED: "false"
+      # Keep failed executions (that is the whole audit trail) and 30 days of
+      # successes; the default retention grows the sqlite forever.
+      EXECUTIONS_DATA_PRUNE: "true"
+      EXECUTIONS_DATA_MAX_AGE: "720"
+      N8N_LOG_LEVEL: info
+    volumes:
+      - n8n-data:/home/node/.n8n
+      # The workflow exports, mounted for the CLI importer. Read-only: the
+      # source of truth is git, and a UI edit is exported back by hand.
+      - ./n8n/workflows:/workflows:ro
+    # Loopback only. The editor has no auth beyond n8n's own login and must
+    # never be published on the droplet's public interface — reach it with
+    #   ssh -L 5678:localhost:5678 root@<droplet>
+    ports:
+      - "127.0.0.1:5678:5678"
+    depends_on:
+      mcp-n8n:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  n8n-data:

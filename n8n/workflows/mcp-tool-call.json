@@ -1,0 +1,369 @@
+{
+  "name": "MCP tool call",
+  "id": "mcp-tool-call",
+  "active": false,
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## MCP client (Streamable HTTP)\n\nOne MCP session per call, N `tools/call` requests on it, parsed payloads back.\n\n**Input items** — `{ label, tool, argsJson, mcpUrl }`. `label` is a free tag the caller reads back; `argsJson` is the tool arguments as a JSON string.\n**Output items** — `{ label, tool, result }`, one per input item, in order.\n\nWhy four HTTP calls: MCP is stateful. `initialize` mints the session id (response header), `notifications/initialized` closes the handshake, `tools/call` does the work, `DELETE` frees the server-side session — a restricted MCP instance builds one server per session, so leaked sessions leak memory.\n\nThe handshake is retried (idempotent). **`tools/call` is not** — a tool call has side effects, and `send_telegram_message` replayed is a second message in the user's chat.",
+        "height": 320,
+        "width": 760,
+        "color": 4
+      },
+      "id": "about-this-sub-workflow",
+      "name": "About this sub-workflow",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -660,
+        -60
+      ]
+    },
+    {
+      "parameters": {
+        "inputSource": "workflowInputs",
+        "workflowInputs": {
+          "values": [
+            {
+              "name": "label",
+              "type": "string"
+            },
+            {
+              "name": "tool",
+              "type": "string"
+            },
+            {
+              "name": "argsJson",
+              "type": "string"
+            },
+            {
+              "name": "mcpUrl",
+              "type": "string"
+            }
+          ]
+        }
+      },
+      "id": "trigger",
+      "name": "When called by another workflow",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        -620,
+        300
+      ],
+      "notes": "One item per tool call: label (free-form tag the caller reads back), tool, argsJson (JSON string), mcpUrl."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.mcpUrl }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "accept",
+              "value": "application/json, text/event-stream"
+            },
+            {
+              "name": "mcp-protocol-version",
+              "value": "2025-06-18"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ jsonrpc: \"2.0\", id: 1, method: \"initialize\", params: { protocolVersion: \"2025-06-18\", capabilities: {}, clientInfo: { name: \"n8n\", version: \"1.0.0\" } } }) }}",
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true,
+              "responseFormat": "text"
+            }
+          },
+          "timeout": 180000
+        }
+      },
+      "id": "initialize",
+      "name": "MCP: initialize",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -400,
+        300
+      ],
+      "executeOnce": true,
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "notes": "Streamable-HTTP handshake. The session id comes back as the mcp-session-id response header."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $('When called by another workflow').first().json.mcpUrl }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "accept",
+              "value": "application/json, text/event-stream"
+            },
+            {
+              "name": "mcp-protocol-version",
+              "value": "2025-06-18"
+            },
+            {
+              "name": "mcp-session-id",
+              "value": "={{ $json.headers['mcp-session-id'] }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ jsonrpc: \"2.0\", method: \"notifications/initialized\" }) }}",
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true,
+              "responseFormat": "text"
+            }
+          },
+          "timeout": 180000
+        }
+      },
+      "id": "initialized",
+      "name": "MCP: initialized",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -180,
+        300
+      ],
+      "executeOnce": true,
+      "notes": "Spec-mandated notification that closes the handshake. Answered 202 with an empty body."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "// One MCP-over-HTTP response body → the JSON-RPC envelope.\n// StreamableHTTP answers a POST with an SSE frame (\"event: message\\ndata: {…}\")\n// unless the server enables JSON responses, so handle both shapes.\nfunction parseRpc(body, what) {\n  const text = typeof body === 'string' ? body : JSON.stringify(body ?? '');\n  const trimmed = text.trim();\n  if (trimmed.startsWith('{')) return JSON.parse(trimmed);\n  const frames = trimmed\n    .split('\\n')\n    .filter((line) => line.startsWith('data:'))\n    .map((line) => line.slice(5).trim())\n    .filter((line) => line.length > 0);\n  if (frames.length === 0) {\n    throw new Error(what + ': no JSON-RPC payload in MCP response — ' + trimmed.slice(0, 300));\n  }\n  return JSON.parse(frames[frames.length - 1]);\n}\n\n// The initialize response carries the session id in a header; every later\n// request on this session must echo it back.\nconst init = $('MCP: initialize').first().json;\nif (init.statusCode >= 400) {\n  throw new Error('MCP initialize failed with HTTP ' + init.statusCode + ' — ' + String(init.body).slice(0, 300));\n}\nconst envelope = parseRpc(init.body, 'initialize');\nif (envelope.error) {\n  throw new Error('MCP initialize rejected: ' + envelope.error.code + ' ' + envelope.error.message);\n}\nconst sessionId = (init.headers || {})['mcp-session-id'];\nif (!sessionId) {\n  throw new Error('MCP initialize returned no mcp-session-id header — is MCP_TRANSPORT=http on the target instance?');\n}\n\n// One request per incoming call item. Ids only have to be unique within the\n// session; 1 belongs to initialize.\nconst calls = $('When called by another workflow').all();\nreturn calls.map((item, index) => {\n  const tool = item.json.tool;\n  const label = item.json.label || tool;\n  if (!tool) throw new Error('call #' + index + ' has no \\'tool\\' field');\n  let args;\n  try {\n    args = item.json.argsJson ? JSON.parse(item.json.argsJson) : {};\n  } catch (err) {\n    throw new Error('call #' + index + ' (' + tool + '): argsJson is not valid JSON — ' + err.message);\n  }\n  return {\n    json: {\n      label,\n      tool,\n      sessionId,\n      rpcBody: {\n        jsonrpc: '2.0',\n        id: index + 2,\n        method: 'tools/call',\n        params: { name: tool, arguments: args },\n      },\n    },\n  };\n});"
+      },
+      "id": "fanout",
+      "name": "Fan out tool calls",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        40,
+        300
+      ],
+      "notes": "Back to N items — one JSON-RPC tools/call body per requested tool, all on the one session."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $('When called by another workflow').first().json.mcpUrl }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "accept",
+              "value": "application/json, text/event-stream"
+            },
+            {
+              "name": "mcp-protocol-version",
+              "value": "2025-06-18"
+            },
+            {
+              "name": "mcp-session-id",
+              "value": "={{ $json.sessionId }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.rpcBody) }}",
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true,
+              "responseFormat": "text"
+            }
+          },
+          "timeout": 180000
+        }
+      },
+      "id": "toolscall",
+      "name": "MCP: tools/call",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        260,
+        300
+      ],
+      "notes": "One request per item. No retry — tool calls have side effects and must not be replayed."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "// One MCP-over-HTTP response body → the JSON-RPC envelope.\n// StreamableHTTP answers a POST with an SSE frame (\"event: message\\ndata: {…}\")\n// unless the server enables JSON responses, so handle both shapes.\nfunction parseRpc(body, what) {\n  const text = typeof body === 'string' ? body : JSON.stringify(body ?? '');\n  const trimmed = text.trim();\n  if (trimmed.startsWith('{')) return JSON.parse(trimmed);\n  const frames = trimmed\n    .split('\\n')\n    .filter((line) => line.startsWith('data:'))\n    .map((line) => line.slice(5).trim())\n    .filter((line) => line.length > 0);\n  if (frames.length === 0) {\n    throw new Error(what + ': no JSON-RPC payload in MCP response — ' + trimmed.slice(0, 300));\n  }\n  return JSON.parse(frames[frames.length - 1]);\n}\n\n// Zip the tools/call responses back onto the call specs by position: the HTTP\n// node replaced the items with its own output, so the label lives next door.\nconst calls = $('Fan out tool calls').all();\nconst responses = $input.all();\n\nreturn responses.map((response, index) => {\n  const call = calls[index] ? calls[index].json : {};\n  const tool = call.tool || 'unknown-tool';\n  const label = call.label || tool;\n  const status = response.json.statusCode;\n  if (status >= 400) {\n    throw new Error(label + ' (' + tool + '): HTTP ' + status + ' — ' + String(response.json.body).slice(0, 300));\n  }\n  const envelope = parseRpc(response.json.body, label);\n  if (envelope.error) {\n    throw new Error(label + ' (' + tool + '): JSON-RPC ' + envelope.error.code + ' ' + envelope.error.message);\n  }\n  const result = envelope.result || {};\n  const text = (result.content || [])\n    .filter((part) => part.type === 'text')\n    .map((part) => part.text)\n    .join('\\n');\n  // MCP reports a tool-level failure in-band: isError with the message as text.\n  if (result.isError) {\n    throw new Error(label + ' (' + tool + ') failed: ' + text.slice(0, 500));\n  }\n  // Our tools answer with pretty JSON in one text part (see packages/mcp/src/result.ts).\n  // Anything that is not JSON stays a string — same lenient rule the agent's\n  // workflow executor uses when it binds a tool result.\n  let payload = text;\n  if (result.structuredContent !== undefined) {\n    payload = result.structuredContent;\n  } else {\n    try {\n      payload = JSON.parse(text);\n    } catch {\n      payload = text;\n    }\n  }\n  return { json: { label, tool, result: payload } };\n});"
+      },
+      "id": "parse",
+      "name": "Parse MCP results",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        480,
+        300
+      ],
+      "notes": "SSE → JSON-RPC → tool payload, with the caller's label put back on each item."
+    },
+    {
+      "parameters": {
+        "method": "DELETE",
+        "url": "={{ $('When called by another workflow').first().json.mcpUrl }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "accept",
+              "value": "application/json, text/event-stream"
+            },
+            {
+              "name": "mcp-protocol-version",
+              "value": "2025-06-18"
+            },
+            {
+              "name": "mcp-session-id",
+              "value": "={{ $('MCP: initialize').first().json.headers['mcp-session-id'] }}"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true,
+              "responseFormat": "text"
+            }
+          },
+          "timeout": 180000
+        }
+      },
+      "id": "close",
+      "name": "MCP: close session",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        700,
+        300
+      ],
+      "executeOnce": true,
+      "onError": "continueRegularOutput",
+      "notes": "Frees the server-side session. A restricted MCP instance builds one server per session, so leaking sessions leaks memory. Failure here must not fail the run."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "// The DELETE above replaced the items with its own response; hand the\n// caller back the parsed tool results instead.\nreturn $('Parse MCP results').all();"
+      },
+      "id": "return",
+      "name": "Return results",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        920,
+        300
+      ],
+      "notes": "Sub-workflow output: one item per call — { label, tool, result }."
+    }
+  ],
+  "connections": {
+    "When called by another workflow": {
+      "main": [
+        [
+          {
+            "node": "MCP: initialize",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "MCP: initialize": {
+      "main": [
+        [
+          {
+            "node": "MCP: initialized",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "MCP: initialized": {
+      "main": [
+        [
+          {
+            "node": "Fan out tool calls",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fan out tool calls": {
+      "main": [
+        [
+          {
+            "node": "MCP: tools/call",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "MCP: tools/call": {
+      "main": [
+        [
+          {
+            "node": "Parse MCP results",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse MCP results": {
+      "main": [
+        [
+          {
+            "node": "MCP: close session",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "MCP: close session": {
+      "main": [
+        [
+          {
+            "node": "Return results",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "callerPolicy": "workflowsFromSameOwner",
+    "saveDataErrorExecution": "all"
+  }
+}

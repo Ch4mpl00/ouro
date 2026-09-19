@@ -7,7 +7,7 @@
 
 ## Context
 
-Сейчас в DSL (`packages/agent/src/workflow/dsl.ts`) единственный способ
+Сейчас в DSL (`packages/agent/src/workflow.ts`) единственный способ
 «вычислить» что-то — `llm_compose` (LLM прозой трансформирует данные). LLM
 ненадёжен в ТОЧНЫХ вычислениях: арифметика, агрегации/фильтрация по большим
 спискам, точные операции над строками, дата-арифметика, парсинг, дедуп, join'ы,
@@ -78,7 +78,7 @@ planner → delegate_code_task("разбери файл IN.txt КОДОМ: на�
           в OUT.txt") → llm_compose(читает OUT.txt и формулирует ответ)
 ```
 
-- Новый synthetic-tool (`synthetic-tools.ts`), напр. `delegate_code_task`:
+- Новый synthetic-tool (`agent-loop.ts`), напр. `delegate_code_task`:
   тонкая обёртка над `codexClient.run(...)`. `sandbox=workspace-write` (нужна
   запись результирующего файла), `network_access=false`, `approvalPolicy:
   "never"`. Возвращает путь к выходному файлу (+ короткий статус), НЕ сами данные.

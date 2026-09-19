@@ -11,7 +11,7 @@ export type SkillSource = "live" | "default";
 
 // The improver's append-only overlay: `skills/<name>.patch.md`. At runtime the
 // agent glues it onto the END of the skill body (agent-side `appendPatch`,
-// packages/agent/src/skills.ts) behind this marker, so the instructions in
+// packages/agent/src/agent-loop.ts) behind this marker, so the instructions in
 // force are body + patch, not the body alone. Exporting the body on its own
 // would show a reader a skill the agent no longer runs.
 //

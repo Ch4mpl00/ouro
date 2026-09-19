@@ -21,9 +21,9 @@ the other. Deployed as two containers (`docker-compose.yml`).
 2. When it sees something new, it calls `recordSignal({ source, content,
    envContext })` which inserts a row into the `signals` queue in
    `packages/mcp/data/tokens.db`.
-3. The supervisor (`packages/agent/src/supervisor/main.ts`) loops on
-   `get_next_signal`. Routing is by source, decided in `supervisor/module.ts`:
-   `scheduler` runs through the `workflow/` module (compile → execute), every
+3. The supervisor (`packages/agent/src/supervisor.ts`) loops on
+   `get_next_signal`. Routing is by source, decided in that file's module
+   section: `scheduler` runs through `workflow.ts` (compile → execute), every
    other source runs the primary AgentLoop. A compile failure degrades to the
    AgentLoop in the same trace; an execute failure goes to `recovery` instead
    of being retried. The AgentLoop path loads:
@@ -35,7 +35,8 @@ the other. Deployed as two containers (`docker-compose.yml`).
 4. Plus a session-context block (local time, tz, watermarks) and the signal's
    `envContext` (per-source env addendum, e.g. default Telegram chat id).
    For `telegram` signals the supervisor also preloads recent chat/topic
-   history (`supervisor/telegram-context.ts`) before the first LLM turn.
+   history (the telegram-context section of `supervisor.ts`) before the
+   first LLM turn.
 5. The signal's `content` is pushed as the first user message. The loop runs;
    every side effect (Telegram reply, DB write) is a tool call.
 
@@ -70,22 +71,54 @@ mcp-tools/
     └── agent/
         ├── data/agent.db                    agent-side state (memory KV + trace mirror)
         └── src/
-            ├── db/{client,memory,trace-store,schema}.ts + migrations/  Drizzle (sqlite)
-            ├── supervisor/{main,module,telegram-context}.ts  poll loop,
-            │                                     per-signal routing, tg history
-            ├── workflow/                      dynamic-workflow module (compile + execute)
-            │   ├── index.ts                   createWorkflowRunner facade (runForSignal)
-            │   ├── compile.ts                 signal → validated Workflow (LLM)
-            │   ├── execute.ts                 runtime that walks the steps
-            │   ├── dsl.ts                     Workflow step schema + parse
-            │   └── variables.ts               ${path} substitution + variable store
-            ├── engine.ts, agent-loop.ts     LLM runner (ReAct loop)
-            ├── synthetic-tools.ts           agent-side tools (set_memory, …)
+            ├── db.ts                        the agent's whole sqlite layer, one
+            │                                  file: schema (Drizzle tables) ·
+            │                                  client (createAgentDb, migrates on
+            │                                  boot) · memory KV · trace store ·
+            │                                  improver store. Generated SQL
+            │                                  stays in db/migrations/
+            ├── supervisor.ts                the supervisor, one file: signal ·
+            │                                  telegram context (history preload) ·
+            │                                  module (routing + recovery) ·
+            │                                  main (composition root, runs only
+            │                                  as the process entry point)
+            ├── workflow.ts                  the dynamic-workflow module, one
+            │                                  file: dsl (step schema + parse) ·
+            │                                  variables (${path} substitution) ·
+            │                                  compile (signal → Workflow) ·
+            │                                  execute (walks the steps) ·
+            │                                  createWorkflowRunner facade
+            ├── agent-loop.ts                the whole agent runtime, one file:
+            │                                  errors · model presets · LLM
+            │                                  providers (openai/deepseek/gemini
+            │                                  + retry) · generation · session
+            │                                  context + working memory · tool
+            │                                  results · skills (live → default
+            │                                  overlay) · code_agent · synthetic
+            │                                  tools · ReAct loop · engine
+            ├── judging.ts                   evaluation, one file: schema ·
+            │                                  patch · monitor · trace source ·
+            │                                  noise · print · sigma baseline ·
+            │                                  judge backend · node judge ·
+            │                                  materials · langfuse scores ·
+            │                                  gate · gate runtime · improver ·
+            │                                  improve cycle · improve worker ·
+            │                                  judge worker
+            ├── judging-noise-baseline.json  committed per-(model|version) σ
+            │                                  floor, written by judge:noise
+            ├── scripts/                     the one directory left on purpose:
+            │                                  each file is a separate CLI entry
+            │                                  point named by path in package.json
+            ├── eval-gaia.ts                 the GAIA benchmark harness, one
+            │                                  file: dataset · scorer ·
+            │                                  capabilities · bench MCP client ·
+            │                                  run (entry point for bench:gaia)
             ├── mcp-client.ts                StreamableHTTP client
-            ├── session-context.ts           markdown context block builder
-            ├── skills.ts                    two-layer loader (live → default)
-            ├── tracing/{index,langfuse}.ts  Tracer interface + Langfuse adapter
-            └── db/{client.ts, memory.ts}    KV helpers
+            ├── codex-client.ts              sandboxed code execution
+            └── tracing.ts                   observability, one file: trace
+                                               model (read shape + judge tag) ·
+                                               Tracer interface · Langfuse
+                                               adapter · local recorder · tee
 ```
 
 ## Stack
@@ -137,6 +170,47 @@ sqlite3      packages/agent/data/agent.db "UPDATE memory SET value=? WHERE key=?
 
 For multi-line / quote-heavy SQL, use a heredoc. Always single-quote
 string literals; double single quotes inside (`'O''Brien'`).
+
+## File granularity: one domain, one file
+
+Nobody navigates this codebase by hand — an LLM reads it. So the unit of
+organisation is the **domain**, not the file: a whole domain lives in one
+large file, with sections inside it, rather than a directory of small
+modules that have to be opened one by one. One read gets the full picture,
+including the parts that a human reader would have skipped.
+
+Inside such a file, order sections so each only depends on the ones above
+it, and open with a table of contents comment naming them. Keep the
+factory + DI discipline below intact — it governs how the code is
+*structured*, not how it is *split across files*. A `module.ts` is only
+warranted when a domain genuinely has several independent consumers that
+need different slices of it.
+
+Done so far, all under `packages/agent/src/`:
+
+- `agent-loop.ts` — errors, model presets, LLM providers, generation, session
+  context, tool results, the skill store, code_agent, synthetic tools, the
+  ReAct loop, the engine.
+- `workflow.ts` — dsl, variables, compile, execute, the runner facade.
+- `tracing.ts` — trace model, tracer interface, Langfuse adapter, local
+  recorder, tee.
+- `db.ts` — schema, client, memory KV, trace store, improver store.
+  `db/migrations/` stays a directory: it is drizzle-kit output, not source.
+- `supervisor.ts` — signal, telegram context, routing module, composition
+  root. `main()` runs behind an entry-point guard, so importing the file for
+  its module does not start the process.
+- `eval-gaia.ts` — the GAIA harness: dataset, scorer, capabilities, the
+  side-effect-suppressing MCP client, and the runner. Same entry-point guard.
+  Its gitignored dataset cache moved to `packages/agent/eval-fixtures/`.
+- `judging.ts` — the whole evaluation stack, 17 sections from the scorecard
+  schema to the two cron workers. Its committed noise baseline sits beside it
+  as `judging-noise-baseline.json`.
+
+Still split: the whole `packages/mcp` tree.
+
+`scripts/` stays a directory on purpose: each file there is a separate CLI
+entry point that `package.json` names by path (`pnpm judge`, `pnpm improve`,
+…), not a module of one domain.
 
 ## Code structure: modules + DI
 
@@ -204,10 +278,10 @@ business code.
    with an explicit concurrency limit; convert to Promises at public API
    boundaries. Keep the factory + DI structure above.
 
-   Reuse `packages/agent/src/generation.ts` for LLM generation/tracing and
-   `providers/retry.ts` for transient failures. Keep automatic retries in
+   Reuse `generationEffect` / `runGeneration` in `agent-loop.ts` for LLM
+   generation/tracing and `withRetry` there for transient failures. Keep automatic retries in
    one layer (SDK retries are disabled), and do not automatically replay
-   tool side effects. See `agent-loop.ts` and `workflow/execute.ts` for
+   tool side effects. See `agent-loop.ts` and `workflow.ts` for
    existing patterns. Simple sequential SDK adapters can remain
    `async`/`await`; add Effect when introducing orchestration.
 

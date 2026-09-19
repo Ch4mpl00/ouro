@@ -45,7 +45,7 @@ agent) is what's under test.
 
 We want to benchmark the **workflow path** (the prod default:
 compile → execute, with the bounded `plan → act → replan` loop in
-`workflow/index.ts:129-207`). That loop is **autonomous**: each
+`workflow.ts`, `createWorkflowRunner`). That loop is **autonomous**: each
 `replan` recompiles the whole workflow carrying forward `context` =
 data **the agent itself gathered via tools**. It is NOT a
 human-dialogue loop — there is no "send a message, wait for the
@@ -157,7 +157,7 @@ direction.
 - `BenchMCPClient` is a clean `MCPClient` implementation — no edits
   to prod tool code, no writes to prod DBs (side-effect tools mocked,
   same isolation rule as the [[eval-agent-e2e]] sandbox).
-- Each benchmark adapter lives under `eval/benchmarks/<name>/` with
+- Each benchmark adapter lives in one `eval-<name>.ts` at `packages/agent/src/`, with
   its own scorer; harness shared, adapters pluggable.
 - A written readout per tier: score, the 3–5 most common failure
   modes, and the **tool-coverage vs loop/reasoning** split. The
@@ -211,7 +211,7 @@ and the prod plan→act→replan loop runs unchanged.
 
 **PR1 file plan** (`packages/agent/src/eval/benchmarks/gaia/`):
 - `dataset.ts` — pull validation split via HF datasets API (`HF_TOKEN`),
-  cache to `eval/fixtures/gaia/`, filter by `--level`.
+  cache to `packages/agent/eval-fixtures/gaia/`, filter by `--level`.
 - `bench-mcp-client.ts` — `McpHandle` impl: proxy read-only tools
   (tavily search/extract, fetch_article, read_pdf, read_file, code_agent)
   to a real `connectMcp()`; side-effect tools (telegram/schedule/memory)
@@ -241,7 +241,7 @@ above for the first live run.** Shipped:
   no Telegram 409) so the bench can borrow the tool surface locally.
 - compiler default moved to `gpt-5.4` in `models.ts` (was gemini; prod
   already overrode via `AGENT_COMPILER_MODEL`) — local runs need no Gemini key.
-- The dataset cache (`eval/fixtures/gaia/`) is gitignored — gated data,
+- The dataset cache (`packages/agent/eval-fixtures/gaia/`) is gitignored — gated data,
   never committed.
 
 ### First live run (2026-06-21) — PR1 exit criterion MET

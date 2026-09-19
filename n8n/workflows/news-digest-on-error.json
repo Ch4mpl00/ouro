@@ -1,0 +1,197 @@
+{
+  "name": "News digest — on error",
+  "id": "news-digest-on-error",
+  "active": false,
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## Error workflow\n\nRegistered as `errorWorkflow` in the digest workflow's settings — n8n runs it whenever that workflow's execution fails.\n\nSame job as the agent's `recovery` skill: one short Russian Telegram message naming the step that broke. No stack traces, no retries, no second delivery attempt.",
+        "height": 220,
+        "width": 620,
+        "color": 4
+      },
+      "id": "about-this-workflow",
+      "name": "About this workflow",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -660,
+        60
+      ]
+    },
+    {
+      "parameters": {},
+      "id": "error-trigger",
+      "name": "On workflow error",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [
+        -600,
+        300
+      ],
+      "notes": "Set as `errorWorkflow` in the digest workflow's settings."
+    },
+    {
+      "parameters": {
+        "mode": "manual",
+        "includeOtherFields": true,
+        "assignments": {
+          "assignments": [
+            {
+              "id": "mcpUrl",
+              "name": "mcpUrl",
+              "value": "http://mcp-n8n:3002/mcp",
+              "type": "string"
+            },
+            {
+              "id": "telegramChatId",
+              "name": "telegramChatId",
+              "value": 0,
+              "type": "number"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "recovery-config",
+      "name": "Config: recovery",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        -380,
+        300
+      ],
+      "notes": "Same two values as the digest workflow's Config. telegramChatId must be set."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "// n8n hands the Error Trigger one item describing the failed execution.\nconst e = $json;\nconst wf = (e.workflow && e.workflow.name) || 'workflow';\nconst node = (e.execution && e.execution.lastNodeExecuted) || 'unknown node';\nconst message = ((e.execution && e.execution.error && e.execution.error.message) || 'no error message').slice(0, 400);\nconst url = (e.execution && e.execution.url) || '';\n\n// Same job as the agent's `recovery` skill: one short Russian message that says\n// what broke, never a stack trace.\nconst text = [\n  '⚠️ Сводка новостей не отправлена.',\n  '',\n  'Сбой на шаге: ' + node,\n  'Причина: ' + message,\n  url ? '' : null,\n  url ? url : null,\n].filter((line) => line !== null).join('\\n');\n\nreturn [\n  {\n    json: {\n      label: 'recovery',\n      tool: 'send_telegram_message',\n      argsJson: JSON.stringify({ chatId: $('Config: recovery').first().json.telegramChatId, text }),\n      mcpUrl: $('Config: recovery').first().json.mcpUrl,\n      failedWorkflow: wf,\n    },\n  },\n];"
+      },
+      "id": "recovery-text",
+      "name": "Phrase the failure",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -160,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "workflowId": {
+          "__rl": true,
+          "value": "mcp-tool-call",
+          "mode": "list",
+          "cachedResultName": "MCP tool call"
+        },
+        "workflowInputs": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "label": "={{ $json.label }}",
+            "tool": "={{ $json.tool }}",
+            "argsJson": "={{ $json.argsJson }}",
+            "mcpUrl": "={{ $json.mcpUrl }}"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "label",
+              "displayName": "label",
+              "required": false,
+              "defaultMatch": "",
+              "display": true,
+              "canBeUsedToMatch": true,
+              "type": "string",
+              "removed": false
+            },
+            {
+              "id": "tool",
+              "displayName": "tool",
+              "required": false,
+              "defaultMatch": "",
+              "display": true,
+              "canBeUsedToMatch": true,
+              "type": "string",
+              "removed": false
+            },
+            {
+              "id": "argsJson",
+              "displayName": "argsJson",
+              "required": false,
+              "defaultMatch": "",
+              "display": true,
+              "canBeUsedToMatch": true,
+              "type": "string",
+              "removed": false
+            },
+            {
+              "id": "mcpUrl",
+              "displayName": "mcpUrl",
+              "required": false,
+              "defaultMatch": "",
+              "display": true,
+              "canBeUsedToMatch": true,
+              "type": "string",
+              "removed": false
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": true
+        },
+        "options": {
+          "waitForSubWorkflow": true
+        }
+      },
+      "id": "recovery-send",
+      "name": "MCP: notify user",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.2,
+      "position": [
+        60,
+        300
+      ],
+      "notes": "One user-visible outcome per failure, exactly like the agent's recovery path."
+    }
+  ],
+  "connections": {
+    "On workflow error": {
+      "main": [
+        [
+          {
+            "node": "Config: recovery",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Config: recovery": {
+      "main": [
+        [
+          {
+            "node": "Phrase the failure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Phrase the failure": {
+      "main": [
+        [
+          {
+            "node": "MCP: notify user",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveDataErrorExecution": "all"
+  }
+}

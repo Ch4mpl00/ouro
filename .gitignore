@@ -5,6 +5,7 @@ dist/
 .env.mcp
 .env.agent
 .env.postgres
+n8n/.env.n8n
 *.log
 
 # Local attachment / blob storage
@@ -12,7 +13,7 @@ storage/
 
 # GAIA benchmark cache (gated dataset — must not be committed/reshared;
 # metadata.jsonl + attachments are pulled per-machine from HuggingFace)
-packages/agent/src/eval/fixtures/gaia/
+packages/agent/eval-fixtures/
 
 # Live (runtime) skills — mutable, edited by the `dreaming` signal-handler.
 # Defaults checked in under skills.default/ act as fallback when a live

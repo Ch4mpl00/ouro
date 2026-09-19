@@ -84,7 +84,7 @@ is recorded in the same trace. Langfuse export uses the configured
 `LANGFUSE_*` credentials; without them the local recorder still runs.
 
 Routing is deterministic and by source, not by content. `scheduler` signals
-are compiled into a workflow (`workflow/`: compile → execute) as before —
+are compiled into a workflow (`workflow.ts`: compile → execute) as before —
 a cron body is known in advance, so a plan is cheaper and more predictable
 than an agentic loop. Every other source runs the primary AgentLoop. A
 scheduler signal whose plan fails to compile degrades to the AgentLoop in the
@@ -93,7 +93,8 @@ retried, because earlier steps may already have delivered. The AgentLoop does
 not expose a workflow tool.
 
 For incoming `telegram` signals the supervisor loads recent history of the
-same chat/topic before the first LLM turn (`supervisor/telegram-context.ts`):
+same chat/topic before the first LLM turn (the telegram-context section of
+`supervisor.ts`):
 a bounded inline excerpt plus the full fetched history under the
 `telegram.history` memory key for `input_refs`. No other source preloads it,
 and a failed fetch never blocks the reply.
@@ -127,9 +128,9 @@ flowchart LR
 
 1. A poller notices something new and calls `recordSignal({ source, content, envContext })` —
    one row in the `signals` queue.
-2. The supervisor (`packages/agent/src/supervisor/main.ts`) loops on
+2. The supervisor (`packages/agent/src/supervisor.ts`) loops on
    `get_next_signal`.
-3. `supervisor/module.ts` creates the session context and trace. A `scheduler`
+3. Its module section creates the session context and trace. A `scheduler`
    signal goes to the workflow runner (`planner` compiles the steps, the
    executor walks them); every other source starts the primary AgentLoop with
    `orchestrator` and `routing` instructions. Telegram signals also load their
@@ -176,6 +177,8 @@ mcp-tools/
 ├── docker-compose.yml      three services: postgres + mcp + agent
 ├── skills.default/         shipped skills (git-tracked fallback)
 ├── skills/                 live overlay (gitignored; dreaming writes here)
+├── n8n/                    side experiment: the same news digest built
+│                             statically in n8n (own README + compose overlay)
 └── packages/
     ├── mcp/src/
     │   ├── server.ts                pollers + HTTP/stdio transport
@@ -183,12 +186,24 @@ mcp-tools/
     │   └── services/                gmail, telegram, monobank, scheduler,
     │                                news, pdf, signals, settings, embeddings
     └── agent/src/
-        ├── supervisor/              poll loop + failure handling
-        ├── workflow/                DSL compiler/executor (scheduler path)
-        ├── engine.ts, session.ts    DeepSeek runner + synthetic tools
+        ├── supervisor.ts            poll loop, routing, recovery, and the
+        │                            composition root
+        ├── workflow.ts              DSL compiler/executor (scheduler path)
+        ├── agent-loop.ts            the whole runtime: providers, generation,
+        │                            session context, skills, synthetic tools,
+        │                            ReAct loop, engine
+        ├── judging.ts               evaluation: per-node judge, noise model,
+        │                            gate, improver, the two cron workers
+        ├── scripts/                 one CLI entry point per file
+        ├── eval-gaia.ts             GAIA benchmark harness (bench:gaia)
         ├── mcp-client.ts            StreamableHTTP client
-        ├── skills.ts                two-layer skill loader
-        └── tracing/                 Langfuse adapter
+        ├── codex-client.ts          sandboxed code execution
+        ├── tracing.ts               trace model (read shape), Tracer
+        │                            interface, Langfuse adapter, local
+        │                            recorder, tee
+        └── db.ts                    sqlite: schema, client, memory KV, trace
+                                     store, improver store (generated SQL in
+                                     db/migrations/)
 ```
 
 Domain code follows a strict **modules + dependency-injection** discipline:
@@ -201,10 +216,10 @@ concurrency limits, cancellation, timeouts, retries/backoff and resource
 cleanup. Keep child tasks within their parent's lifetime, propagate
 `AbortSignal` to SDK/HTTP calls and await cleanup before closing traces or
 clients. Convert to Promises at public API boundaries. Reuse
-`packages/agent/src/generation.ts` for LLM generation/tracing and
-`providers/retry.ts` for transient failures; automatic retries belong in one
+`generationEffect` / `runGeneration` in `packages/agent/src/agent-loop.ts` for
+LLM generation/tracing and `withRetry` there for transient failures; automatic retries belong in one
 layer and must not replay tool side effects. See `agent-loop.ts` and
-`workflow/execute.ts` for the parallel execution patterns.
+`workflow.ts` for the parallel execution patterns.
 
 ## Stack
 
@@ -237,6 +252,23 @@ pnpm agent:start      # supervisor loop
 Env files: `.env.mcp` (integration creds + `OPENAI_API_KEY` for embeddings),
 `.env.agent` (DeepSeek key + model), `.env.postgres` (PG credentials).
 Examples are checked in as `*.example`.
+
+### Git merges with Weave
+
+Use [Weave](https://github.com/Ataraxy-Labs/weave) for semantic merging.
+Install both `weave` (the CLI release archive) and `weave-driver` from the
+[v0.5.4 releases](https://github.com/Ataraxy-Labs/weave/releases/tag/v0.5.4)
+for your platform and put both binaries on `PATH`. Then, from the repo root:
+
+```bash
+weave setup --local
+```
+
+This registers the driver in `.git/config` and its supported file patterns in
+`.git/info/attributes`, shared by this clone's worktrees. Repeat setup for each
+new clone. Use `git merge`, `git rebase` and `git cherry-pick` as usual; real
+conflicts still require resolution. Use `weave explain <file>` to inspect a
+conflict and `weave check` to check the resolution before staging it.
 
 ### Useful scripts
 

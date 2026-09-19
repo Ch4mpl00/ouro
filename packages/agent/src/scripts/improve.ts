@@ -1,14 +1,21 @@
 import "dotenv/config";
 import { config as loadEnv } from "dotenv";
-import { createAgentDb } from "../db/client";
-import { createTraceStore } from "../db/trace-store";
-import { createSkillStore } from "../skills";
-import { createJudgeBackend, type JudgeProvider } from "../judging/judge-backend";
-import { type NoiseAxis } from "../judging/noise";
-import { JUDGE_PROMPT_VERSION } from "../judging/schema";
-import { runImproveCycle } from "../judging/improve-cycle";
-import { loadSigmaBaseline } from "../judging/sigma-baseline";
-import { createLangfuseTraceSource, createLocalTraceSource, type TraceSource } from "../judging/trace-source";
+import {
+  createAgentDb,
+  createTraceStore,
+} from "../db";
+import { createSkillStore } from "../agent-loop";
+import {
+  JUDGE_PROMPT_VERSION,
+  createJudgeBackend,
+  createLangfuseTraceSource,
+  createLocalTraceSource,
+  loadSigmaBaseline,
+  runImproveCycle,
+  type JudgeProvider,
+  type NoiseAxis,
+  type TraceSource,
+} from "../judging";
 
 loadEnv({ path: ".env.agent" });
 
