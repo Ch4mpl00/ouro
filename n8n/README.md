@@ -92,6 +92,14 @@ The chunks are then processed concurrently, but by a different mechanism than
 the agent's: not three steps in a `parallel` block, one node with **Batch
 Size 4**. Same wall time for a 3-chunk window, invisible on the diagram.
 
+The two numbers are easy to mix up: `maxCharsPerChunk` sets how many posts end
+up in **one** LLM call (context size), `batching.batchSize` sets how many of
+those calls run **at once** (rate-limit pressure). A batch item is always a
+whole chunk. With the trace's 367 posts that is 3 items of 146 / 145 / 76
+posts, all four slots covering them in one round; a 900-post window would go
+4 then 3. Each call is ~50k input tokens, which is the ceiling to keep in mind
+before raising either number.
+
 **Side effects are never retried.** The handshake nodes retry (idempotent);
 `tools/call` does not. A replayed `send_telegram_message` is a second message in
 the user's chat. Same rule the agent runtime follows — automatic retries in one

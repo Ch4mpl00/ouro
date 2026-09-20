@@ -499,8 +499,8 @@
     },
     {
       "parameters": {
-        "content": "### Chunking is ours, not MCP's\n\nThe agent asks `list_news` for a fixed `chunks: 3` because its plan DSL can only reference `${bind.chunks.0}` statically. n8n iterates over items, so the chunking lives in **Chunk posts** and follows a character budget instead of a fixed count.\n\n### Parallelism\n\nA canvas branch is not a thread — n8n walks branches one after another, and a node normally processes its items in a loop. So the agent's three-way `parallel` step has **no shape on this canvas**: it is one node, run per item.\n\nThe chain node still gets it done concurrently: at `typeVersion 1.7+`, **Batch Size** > 1 fires that many items at once (`Promise.allSettled`). Set to 4 here, so a 3-chunk window is one round trip — the same wall time as the agent's fan-out, expressed as a node setting instead of a plan shape.",
-        "height": 420,
+        "content": "### Chunking is ours, not MCP's\n\nThe agent asks `list_news` for a fixed `chunks: 3` because its plan DSL can only reference `${bind.chunks.0}` statically. n8n iterates over items, so the chunking lives in **Chunk posts** and follows a character budget instead of a fixed count.\n\n### Parallelism\n\nA canvas branch is not a thread — n8n walks branches one after another, and a node normally processes its items in a loop. So the agent's three-way `parallel` step has **no shape on this canvas**: it is one node, run per item.\n\nTwo knobs, often confused: **`maxCharsPerChunk`** (Config) decides how many posts go into one call — the context size; **Batch Size** decides how many of those calls run at once — the rate-limit pressure. A batch item is a whole chunk, never a single post.\n\nThe chain node still gets it done concurrently: at `typeVersion 1.7+`, **Batch Size** > 1 fires that many items at once (`Promise.allSettled`). Set to 4 here, so a 3-chunk window is one round trip — the same wall time as the agent's fan-out, expressed as a node setting instead of a plan shape.",
+        "height": 500,
         "width": 520,
         "color": 5
       },
