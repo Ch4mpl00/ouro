@@ -104,6 +104,15 @@ for (const { file, wf } of workflows) {
       }
     }
 
+    // MCP Client nodes: an endpoint and a tool name are the whole contract.
+    if (node.type === "@n8n/n8n-nodes-langchain.mcpClient") {
+      if (!node.parameters?.endpointUrl) problems.push(where(`"${node.name}" has no MCP endpoint URL`));
+      if (!node.parameters?.tool?.value) problems.push(where(`"${node.name}" names no tool`));
+      if (node.parameters?.inputMode === "json" && !node.parameters?.jsonInput) {
+        problems.push(where(`"${node.name}" is in JSON input mode with no jsonInput`));
+      }
+    }
+
     // Execute Workflow nodes must point at a workflow this repo defines.
     if (node.type === "n8n-nodes-base.executeWorkflow") {
       const target = node.parameters?.workflowId?.value;

@@ -22,11 +22,11 @@ $0.2193 across 20 observations.
 | --- | --- |
 | cron row fires → signal on the queue → supervisor picks it up | **Every day at 21:00** (Schedule Trigger, timezone in workflow settings) |
 | `planner` step: gpt-5.4 writes the plan (5.7s, $0.0379) | — the plan *is* the canvas |
-| `step[0]` parallel: `list_news(source=channel, sinceISO=<watermark>, chunks=3)` + `get_telegram_chat_history(limit=30)` | **Window + MCP calls** → **MCP: posts + history + skills** — four `tools/call` on one MCP session |
-| skills read from disk by the agent runtime (`composer.md` + `news-digest.md`, patch appended) | the same two files, read through `read_skill` in that same batch |
+| `step[0]` parallel: `list_news(source=channel, sinceISO=<watermark>, chunks=3)` + `get_telegram_chat_history(limit=30)` | **Open the window** → four **MCP Client** nodes fanning out (`list_news`, `get_telegram_chat_history`, `read_skill` ×2) → **Collect MCP results** |
+| skills read from disk by the agent runtime (`composer.md` + `news-digest.md`, patch appended) | the same two files, read through `read_skill` on the same fan-out |
 | `step[1]` parallel: 3 × `llm_compose` (preset `base` → gpt-5.4-mini, skill `news-digest`) | **Chunk posts** → **Map: select candidates** (one LLM call per chunk item) |
 | `step[2]` `llm_compose` (preset `smart` → gemini-3.7-flash) | **Prepare reduce input** → **Reduce: compose digest** |
-| `step[3]` parallel: `send_telegram_message` + `set_memory news_digest.last_read_at` | **Digest deliverable?** → **Build send call** → **MCP: send digest** → **Stamp watermark** |
+| `step[3]` parallel: `send_telegram_message` + `set_memory news_digest.last_read_at` | **Digest deliverable?** → **MCP: send digest** → **Stamp watermark** |
 | `step[4]` terminal | end of the canvas |
 | a failed step → `recovery` skill phrases it to the user | **News digest — on error** (n8n error workflow) |
 
@@ -43,7 +43,7 @@ n8n/
 ├── .env.n8n.example            n8n's own env (encryption key, timezone)
 ├── workflows/
 │   ├── news-digest-daily.json  the pipeline
-│   ├── mcp-tool-call.json      reusable MCP client (sub-workflow)
+│   ├── mcp-tool-call.json      hand-rolled MCP client (alternative, unused)
 │   └── news-digest-on-error.json   error workflow
 └── scripts/
     ├── validate-workflows.mjs  static lint of the exports (no deps)
@@ -59,8 +59,9 @@ plumbing. It would also be wrong twice over: Postgres is MCP's private store
 — it appends the outgoing text to the `telegram_messages` log in `tokens.db`.
 That log is what the *next* run reads through `get_telegram_chat_history` to
 avoid re-sending yesterday's events. Deliver around MCP and the dedup goes
-blind. So every side effect and every read goes through one reusable
-sub-workflow, and the native nodes stay unused on purpose.
+blind. So every side effect and every read goes through n8n's own **MCP
+Client** node (`@n8n/n8n-nodes-langchain.mcpClient`) pointed at `mcp-n8n`, and
+the native Postgres/Telegram nodes stay unused on purpose.
 
 **A third MCP instance, not the supervisor's.** The full instance is
 single-session with "newest wins" semantics: an arriving `initialize` **evicts**
@@ -70,6 +71,19 @@ the live session (`packages/mcp/src/http-transport.ts`). Pointing n8n at
 multi-session → safe to connect and disconnect at will, with no signals tools
 to race over and no gateway upstreams exposed. `MCP_NO_POLLERS=1` keeps Telegram
 `getUpdates` exclusive to the `mcp` service.
+
+**Two MCP clients ship here; one is used.** The workflows call the stock MCP
+Client node: it is a normal transform node (not the AI-Agent tool sub-node), it
+owns the session handshake, closes the session in a `finally`, throws on a
+tool's `isError`, JSON-parses a text payload, authenticates through a
+credential (bearer / header / OAuth2) and populates a tool dropdown from a live
+`tools/list`. `workflows/mcp-tool-call.json` does the same thing by hand out of
+HTTP Request nodes and is kept for two reasons: it spells out what the protocol
+actually is (`initialize` → `notifications/initialized` → `tools/call` →
+`DELETE`, answers framed as SSE), and it is the one way to put several calls on
+**one** session — the node opens a session per call. Swap it back in by
+replacing the four MCP nodes with one Execute Workflow node feeding it
+`{ label, tool, argsJson, mcpUrl }` items.
 
 **The system prompt is read, not copied.** `read_skill` returns
 `effectiveInstructions` — the skill body with frontmatter stripped and the
@@ -193,12 +207,14 @@ truth, the running instance is a cache of it.
   ignored and the map phase silently goes back to one chunk at a time. The
   image is pinned to `n8nio/n8n:2.40.3`; after an upgrade, open each node once
   — n8n keeps old versions working but new parameters default in.
-- **`mcp-tool-call` is four HTTP requests per batch**, because Streamable HTTP
-  is stateful: `initialize` (session id in a response header) →
-  `notifications/initialized` → `tools/call` (one per item) → `DELETE`. The
-  server answers each POST as an SSE frame, so the parser handles both
-  `data: {…}` and plain JSON. Batch your calls into one Execute Workflow node
-  and you pay the handshake once.
-- **Session hygiene matters.** A restricted MCP instance builds one server per
-  session, so the `DELETE` is not optional politeness; leaked sessions leak
-  memory in a long-running instance.
+- **One MCP session per node.** The MCP Client node connects, calls, and
+  closes; four nodes on the fan-out means four handshakes against `mcp-n8n`.
+  That is cheap here (~4 short round trips on the compose network) and it keeps
+  session hygiene automatic — a restricted MCP instance builds one server per
+  session, so a leaked session leaks memory. The hand-rolled sub-workflow is
+  the lever if you ever need N calls on one session.
+- **The node's output is `{ content: [{ type, text }] }`**, with `text` already
+  JSON-parsed when the tool answered with JSON (our tools do — see
+  `packages/mcp/src/result.ts`). `Chunk posts` keys the four results by shape
+  (`items` / `messages` / `fileName`) rather than by branch order, so
+  rearranging the canvas cannot silently swap two inputs.

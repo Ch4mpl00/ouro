@@ -67,7 +67,7 @@
       "parameters": {
         "mode": "runOnceForAllItems",
         "language": "javaScript",
-        "jsCode": "// n8n hands the Error Trigger one item describing the failed execution.\nconst e = $json;\nconst wf = (e.workflow && e.workflow.name) || 'workflow';\nconst node = (e.execution && e.execution.lastNodeExecuted) || 'unknown node';\nconst message = ((e.execution && e.execution.error && e.execution.error.message) || 'no error message').slice(0, 400);\nconst url = (e.execution && e.execution.url) || '';\n\n// Same job as the agent's `recovery` skill: one short Russian message that says\n// what broke, never a stack trace.\nconst text = [\n  '⚠️ Сводка новостей не отправлена.',\n  '',\n  'Сбой на шаге: ' + node,\n  'Причина: ' + message,\n  url ? '' : null,\n  url ? url : null,\n].filter((line) => line !== null).join('\\n');\n\nreturn [\n  {\n    json: {\n      label: 'recovery',\n      tool: 'send_telegram_message',\n      argsJson: JSON.stringify({ chatId: $('Config: recovery').first().json.telegramChatId, text }),\n      mcpUrl: $('Config: recovery').first().json.mcpUrl,\n      failedWorkflow: wf,\n    },\n  },\n];"
+        "jsCode": "// n8n hands the Error Trigger one item describing the failed execution.\nconst e = $json;\nconst node = (e.execution && e.execution.lastNodeExecuted) || 'unknown node';\nconst message = ((e.execution && e.execution.error && e.execution.error.message) || 'no error message').slice(0, 400);\nconst url = (e.execution && e.execution.url) || '';\n\n// Same job as the agent's `recovery` skill: one short Russian message that says\n// what broke, never a stack trace.\nconst text = [\n  '⚠️ Сводка новостей не отправлена.',\n  '',\n  'Сбой на шаге: ' + node,\n  'Причина: ' + message,\n  url ? '' : null,\n  url ? url : null,\n].filter((line) => line !== null).join('\\n');\n\nconst cfg = $('Config: recovery').first().json;\nreturn [{ json: { text, mcpUrl: cfg.mcpUrl, telegramChatId: cfg.telegramChatId } }];"
       },
       "id": "recovery-text",
       "name": "Phrase the failure",
@@ -80,74 +80,24 @@
     },
     {
       "parameters": {
-        "workflowId": {
+        "serverTransport": "httpStreamable",
+        "endpointUrl": "={{ $json.mcpUrl }}",
+        "authentication": "none",
+        "tool": {
           "__rl": true,
-          "value": "mcp-tool-call",
-          "mode": "list",
-          "cachedResultName": "MCP tool call"
+          "mode": "id",
+          "value": "send_telegram_message"
         },
-        "workflowInputs": {
-          "mappingMode": "defineBelow",
-          "value": {
-            "label": "={{ $json.label }}",
-            "tool": "={{ $json.tool }}",
-            "argsJson": "={{ $json.argsJson }}",
-            "mcpUrl": "={{ $json.mcpUrl }}"
-          },
-          "matchingColumns": [],
-          "schema": [
-            {
-              "id": "label",
-              "displayName": "label",
-              "required": false,
-              "defaultMatch": "",
-              "display": true,
-              "canBeUsedToMatch": true,
-              "type": "string",
-              "removed": false
-            },
-            {
-              "id": "tool",
-              "displayName": "tool",
-              "required": false,
-              "defaultMatch": "",
-              "display": true,
-              "canBeUsedToMatch": true,
-              "type": "string",
-              "removed": false
-            },
-            {
-              "id": "argsJson",
-              "displayName": "argsJson",
-              "required": false,
-              "defaultMatch": "",
-              "display": true,
-              "canBeUsedToMatch": true,
-              "type": "string",
-              "removed": false
-            },
-            {
-              "id": "mcpUrl",
-              "displayName": "mcpUrl",
-              "required": false,
-              "defaultMatch": "",
-              "display": true,
-              "canBeUsedToMatch": true,
-              "type": "string",
-              "removed": false
-            }
-          ],
-          "attemptToConvertTypes": false,
-          "convertFieldsToString": true
-        },
+        "inputMode": "json",
+        "jsonInput": "={{ { chatId: $json.telegramChatId, text: $json.text } }}",
         "options": {
-          "waitForSubWorkflow": true
+          "timeout": 30000
         }
       },
       "id": "recovery-send",
       "name": "MCP: notify user",
-      "type": "n8n-nodes-base.executeWorkflow",
-      "typeVersion": 1.2,
+      "type": "@n8n/n8n-nodes-langchain.mcpClient",
+      "typeVersion": 1.1,
       "position": [
         60,
         300

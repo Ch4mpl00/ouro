@@ -5,7 +5,7 @@
   "nodes": [
     {
       "parameters": {
-        "content": "## News digest — the supervisor's plan, made static\n\nThis is the hand-built twin of what `packages/agent` compiles on the fly for a `source=scheduler` signal (Langfuse trace `bcd6ebda2eba7db1b3786c4258100d8b`). Same five stages, same models, same prompts — no planner LLM, no replan, no tool choice at runtime.\n\n**fetch** → one MCP session, four `tools/call`: the post window, the chat history (dedup corpus) and the two skill files that make up the system prompt.\n**map** → one LLM call per chunk, selecting candidate events. Keeps when unsure.\n**reduce** → one LLM call composing the single Russian message.\n**deliver** → `send_telegram_message` through MCP, so the outgoing text also lands in the `telegram_messages` log the next run dedups against.\n**stamp** → the watermark moves only after a confirmed delivery.\n\nEverything configurable lives in **Config**. `telegramChatId` ships as `0` on purpose — set it before the first run.",
+        "content": "## News digest — the supervisor's plan, made static\n\nThis is the hand-built twin of what `packages/agent` compiles on the fly for a `source=scheduler` signal (Langfuse trace `bcd6ebda2eba7db1b3786c4258100d8b`). Same five stages, same models, same prompts — no planner LLM, no replan, no tool choice at runtime.\n\n**fetch** → four **MCP Client** nodes (the stock n8n one) fan out from the window: the post window, the chat history (dedup corpus) and the two skill files that make up the system prompt. Each node opens its own MCP session and closes it again.\n**map** → one LLM call per chunk, selecting candidate events. Keeps when unsure.\n**reduce** → one LLM call composing the single Russian message.\n**deliver** → `send_telegram_message` through MCP, so the outgoing text also lands in the `telegram_messages` log the next run dedups against.\n**stamp** → the watermark moves only after a confirmed delivery.\n\nEverything configurable lives in **Config**. `telegramChatId` ships as `0` on purpose — set it before the first run.",
         "height": 400,
         "width": 840,
         "color": 4
@@ -118,106 +118,30 @@
       "parameters": {
         "mode": "runOnceForAllItems",
         "language": "javaScript",
-        "jsCode": "const cfg = $json;\nif (!cfg.telegramChatId) {\n  throw new Error('Config.telegramChatId is still 0 — set it to your chat id (pnpm telegram:get-chat-id in the parent repo).');\n}\n\n// The watermark. In the agent this is agent.db memory (set_memory\n// 'news_digest.last_read_at'); here it is n8n's own per-workflow static data,\n// which n8n persists between PRODUCTION executions (manual runs do not save it).\nconst store = $getWorkflowStaticData('global');\nconst nowISO = new Date().toISOString();\nconst sinceISO =\n  store.newsDigestLastReadAt ||\n  new Date(Date.now() - cfg.bootstrapHours * 3600 * 1000).toISOString();\n\nconst call = (label, tool, args) => ({\n  json: {\n    label,\n    tool,\n    argsJson: JSON.stringify(args),\n    mcpUrl: cfg.mcpUrl,\n    sinceISO,\n    nowISO,\n  },\n});\n\n// One batch, one MCP session. 'posts' is the digest window; 'history' is the\n// dedup corpus; the two skills are the system prompt the agent runs, read from\n// the same files the supervisor reads — so the digest cannot drift from the\n// agent's own instructions.\nreturn [\n  call('posts', 'list_news', { source: 'channel', sinceISO, limit: cfg.postLimit }),\n  call('history', 'get_telegram_chat_history', { chatId: cfg.telegramChatId, limit: cfg.historyLimit }),\n  call('skill:composer', 'read_skill', { fileName: cfg.composerSkill }),\n  call('skill:digest', 'read_skill', { fileName: cfg.digestSkill }),\n];"
+        "jsCode": "const cfg = $json;\nif (!cfg.telegramChatId) {\n  throw new Error('Config.telegramChatId is still 0 — set it to your chat id (pnpm telegram:get-chat-id in the parent repo).');\n}\n\n// The watermark. In the agent this is agent.db memory (set_memory\n// 'news_digest.last_read_at'); here it is n8n's own per-workflow static data,\n// which n8n persists between PRODUCTION executions (manual runs do not save it).\nconst store = $getWorkflowStaticData('global');\nconst nowISO = new Date().toISOString();\nconst sinceISO =\n  store.newsDigestLastReadAt ||\n  new Date(Date.now() - cfg.bootstrapHours * 3600 * 1000).toISOString();\n\n// One item carrying the window plus the config the four MCP nodes read from\n// their own expressions. Everything downstream that needs a config value takes\n// it from here or from $('Config').\nreturn [{ json: { ...cfg, sinceISO, nowISO } }];"
       },
       "id": "plan",
-      "name": "Window + MCP calls",
+      "name": "Open the window",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
         -460,
         300
       ],
-      "notes": "Reads the watermark, opens the window, and emits the four MCP calls this run needs."
-    },
-    {
-      "parameters": {
-        "workflowId": {
-          "__rl": true,
-          "value": "mcp-tool-call",
-          "mode": "list",
-          "cachedResultName": "MCP tool call"
-        },
-        "workflowInputs": {
-          "mappingMode": "defineBelow",
-          "value": {
-            "label": "={{ $json.label }}",
-            "tool": "={{ $json.tool }}",
-            "argsJson": "={{ $json.argsJson }}",
-            "mcpUrl": "={{ $json.mcpUrl }}"
-          },
-          "matchingColumns": [],
-          "schema": [
-            {
-              "id": "label",
-              "displayName": "label",
-              "required": false,
-              "defaultMatch": "",
-              "display": true,
-              "canBeUsedToMatch": true,
-              "type": "string",
-              "removed": false
-            },
-            {
-              "id": "tool",
-              "displayName": "tool",
-              "required": false,
-              "defaultMatch": "",
-              "display": true,
-              "canBeUsedToMatch": true,
-              "type": "string",
-              "removed": false
-            },
-            {
-              "id": "argsJson",
-              "displayName": "argsJson",
-              "required": false,
-              "defaultMatch": "",
-              "display": true,
-              "canBeUsedToMatch": true,
-              "type": "string",
-              "removed": false
-            },
-            {
-              "id": "mcpUrl",
-              "displayName": "mcpUrl",
-              "required": false,
-              "defaultMatch": "",
-              "display": true,
-              "canBeUsedToMatch": true,
-              "type": "string",
-              "removed": false
-            }
-          ],
-          "attemptToConvertTypes": false,
-          "convertFieldsToString": true
-        },
-        "options": {
-          "waitForSubWorkflow": true
-        }
-      },
-      "id": "fetch",
-      "name": "MCP: posts + history + skills",
-      "type": "n8n-nodes-base.executeWorkflow",
-      "typeVersion": 1.2,
-      "position": [
-        -240,
-        300
-      ],
-      "notes": "Four tools/call requests on one MCP session: list_news, get_telegram_chat_history, read_skill ×2."
+      "notes": "Guards the config, reads the watermark, opens the window. One item — the four MCP nodes below fan out from it."
     },
     {
       "parameters": {
         "mode": "runOnceForAllItems",
         "language": "javaScript",
-        "jsCode": "const cfg = $('Config').first().json;\n\nconst byLabel = {};\nfor (const item of $input.all()) byLabel[item.json.label] = item.json.result;\n\nconst posts = (byLabel.posts && byLabel.posts.items) || [];\nconst history = (byLabel.history && byLabel.history.messages) || [];\n\nconst skillText = (entry, fileName) => {\n  if (!entry || entry.found !== true) throw new Error('read_skill could not find ' + fileName);\n  return entry.effectiveInstructions;\n};\n// Same layering as the agent's compose step: the always-on composer rules\n// first (stable prefix, prompt-cache friendly), the domain skill on top.\nconst systemPrompt = [\n  skillText(byLabel['skill:composer'], cfg.composerSkill),\n  skillText(byLabel['skill:digest'], cfg.digestSkill),\n].join('\\n\\n');\n\nconst historyJson = JSON.stringify(history, null, 2);\n\n// The agent asks MCP for a fixed chunk count (list_news chunks:3) because its\n// plan DSL can only reference ${bind.chunks.0}, ${bind.chunks.1}, … statically.\n// n8n has real iteration, so chunk here instead — by character budget, which\n// keeps one map call's context flat whether the window holds 40 posts or 900.\n// Contiguous, never round-robin: list_news is time-ordered, so neighbours are\n// the posts most likely to describe the same event and to consolidate locally.\nconst budget = cfg.maxCharsPerChunk;\nconst chunks = [];\nlet current = [];\nlet currentChars = 0;\nfor (const post of posts) {\n  // Measured the way the prompt renders it (pretty JSON), so the budget is\n  // the real prompt size and not a compact-JSON underestimate.\n  const size = JSON.stringify(post, null, 2).length;\n  if (current.length > 0 && currentChars + size > budget) {\n    chunks.push(current);\n    current = [];\n    currentChars = 0;\n  }\n  current.push(post);\n  currentChars += size;\n}\n// Always emit at least one chunk: an empty window must still reach the reduce\n// step, which is what produces the \"тихий день\" message.\nchunks.push(current);\n\nreturn chunks.map((chunk, index) => ({\n  json: {\n    chunkIndex: index,\n    chunkCount: chunks.length,\n    postCount: chunk.length,\n    postsJson: JSON.stringify(chunk, null, 2),\n    historyJson,\n    systemPrompt,\n  },\n}));"
+        "jsCode": "const cfg = $('Config').first().json;\n\n// The MCP Client node returns { content: [{ type: 'text', text: <parsed JSON> }] }\n// — it already JSON-parses a text payload, so this is the tool's own result.\nconst payloads = $input.all().map((item) => {\n  const part = (item.json.content || []).find((c) => c.type === 'text');\n  return item.json.structuredContent ?? (part ? part.text : null);\n});\n\n// Keyed by shape rather than by branch order: list_news answers with items,\n// get_telegram_chat_history with messages, read_skill with a fileName. A\n// reordered canvas cannot silently swap two inputs.\nconst posts = (payloads.find((p) => p && Array.isArray(p.items)) || {}).items || [];\nconst history = (payloads.find((p) => p && Array.isArray(p.messages)) || {}).messages || [];\n\nconst skillText = (fileName) => {\n  const entry = payloads.find((p) => p && p.fileName === fileName);\n  if (!entry || entry.found !== true) throw new Error('read_skill could not find ' + fileName);\n  return entry.effectiveInstructions;\n};\n// Same layering as the agent's compose step: the always-on composer rules\n// first (stable prefix, prompt-cache friendly), the domain skill on top.\nconst systemPrompt = [skillText(cfg.composerSkill), skillText(cfg.digestSkill)].join('\\n\\n');\n\nconst historyJson = JSON.stringify(history, null, 2);\n\n// The agent asks MCP for a fixed chunk count (list_news chunks:3) because its\n// plan DSL can only reference ${bind.chunks.0}, ${bind.chunks.1}, … statically.\n// n8n has real iteration, so chunk here instead — by character budget, which\n// keeps one map call's context flat whether the window holds 40 posts or 900.\n// Contiguous, never round-robin: list_news is time-ordered, so neighbours are\n// the posts most likely to describe the same event and to consolidate locally.\nconst budget = cfg.maxCharsPerChunk;\nconst chunks = [];\nlet current = [];\nlet currentChars = 0;\nfor (const post of posts) {\n  // Measured the way the prompt renders it (pretty JSON), so the budget is\n  // the real prompt size and not a compact-JSON underestimate.\n  const size = JSON.stringify(post, null, 2).length;\n  if (current.length > 0 && currentChars + size > budget) {\n    chunks.push(current);\n    current = [];\n    currentChars = 0;\n  }\n  current.push(post);\n  currentChars += size;\n}\n// Always emit at least one chunk: an empty window must still reach the reduce\n// step, which is what produces the \"тихий день\" message.\nchunks.push(current);\n\nreturn chunks.map((chunk, index) => ({\n  json: {\n    chunkIndex: index,\n    chunkCount: chunks.length,\n    postCount: chunk.length,\n    postsJson: JSON.stringify(chunk, null, 2),\n    historyJson,\n    systemPrompt,\n  },\n}));"
       },
       "id": "chunk",
       "name": "Chunk posts",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
-        -20,
+        240,
         300
       ],
       "notes": "Builds the system prompt from the two skills and splits the window into contiguous chunks by character budget. One item per chunk = the map phase."
@@ -243,7 +167,7 @@
       "type": "@n8n/n8n-nodes-langchain.chainLlm",
       "typeVersion": 1.7,
       "position": [
-        200,
+        460,
         300
       ],
       "notes": "Runs once per chunk item. typeVersion 1.7 + batching.batchSize>1 makes the node fire a whole batch concurrently (Promise.allSettled), which is the map phase parallel again. XML input blocks, same rendering as the agent compose step."
@@ -263,7 +187,7 @@
       "type": "@n8n/n8n-nodes-langchain.lmChatOpenAi",
       "typeVersion": 1.2,
       "position": [
-        200,
+        460,
         520
       ],
       "credentials": {
@@ -277,14 +201,14 @@
       "parameters": {
         "mode": "runOnceForAllItems",
         "language": "javaScript",
-        "jsCode": "// Every map item is one selection array. The map LLM was told to answer with a\n// JSON array; parse it the same lenient way the agent's executor binds a\n// compose result — non-JSON stays a string and the reduce step sees it verbatim\n// instead of the run dying here.\nconst selections = $input.all().map((item) => {\n  const raw = (item.json.text || '').trim();\n  const cleaned = raw.replace(/^```(?:json)?/i, '').replace(/```$/, '').trim();\n  try {\n    return JSON.parse(cleaned);\n  } catch {\n    return cleaned;\n  }\n});\n\nconst first = $('Chunk posts').first().json;\nreturn [\n  {\n    json: {\n      systemPrompt: first.systemPrompt,\n      historyJson: first.historyJson,\n      selectionsJson: JSON.stringify(selections, null, 2),\n      nowISO: $('Window + MCP calls').first().json.nowISO,\n      chunkCount: selections.length,\n    },\n  },\n];"
+        "jsCode": "// Every map item is one selection array. The map LLM was told to answer with a\n// JSON array; parse it the same lenient way the agent's executor binds a\n// compose result — non-JSON stays a string and the reduce step sees it verbatim\n// instead of the run dying here.\nconst selections = $input.all().map((item) => {\n  const raw = (item.json.text || '').trim();\n  const cleaned = raw.replace(/^```(?:json)?/i, '').replace(/```$/, '').trim();\n  try {\n    return JSON.parse(cleaned);\n  } catch {\n    return cleaned;\n  }\n});\n\nconst first = $('Chunk posts').first().json;\nreturn [\n  {\n    json: {\n      systemPrompt: first.systemPrompt,\n      historyJson: first.historyJson,\n      selectionsJson: JSON.stringify(selections, null, 2),\n      nowISO: $('Open the window').first().json.nowISO,\n      chunkCount: selections.length,\n    },\n  },\n];"
       },
       "id": "reduce-input",
       "name": "Prepare reduce input",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
-        420,
+        680,
         300
       ],
       "notes": "Collects every map result into one selections array — the fan-in."
@@ -306,7 +230,7 @@
       "type": "@n8n/n8n-nodes-langchain.chainLlm",
       "typeVersion": 1.7,
       "position": [
-        640,
+        900,
         300
       ],
       "notes": "The one step that writes the user-visible text. Output lands in $json.text."
@@ -321,7 +245,7 @@
       "type": "@n8n/n8n-nodes-langchain.lmChatGoogleGemini",
       "typeVersion": 1,
       "position": [
-        640,
+        900,
         520
       ],
       "credentials": {
@@ -370,115 +294,50 @@
       "type": "n8n-nodes-base.if",
       "typeVersion": 2.2,
       "position": [
-        860,
+        1120,
         300
       ],
       "notes": "One message, Telegram-sized. The skill says drop the lowest-priority items instead of splitting."
     },
     {
       "parameters": {
-        "mode": "runOnceForAllItems",
-        "language": "javaScript",
-        "jsCode": "const cfg = $('Config').first().json;\nconst digest = ($json.text || '').trim();\n\nreturn [\n  {\n    json: {\n      label: 'sent',\n      tool: 'send_telegram_message',\n      argsJson: JSON.stringify({ chatId: cfg.telegramChatId, text: digest }),\n      mcpUrl: cfg.mcpUrl,\n    },\n  },\n];"
-      },
-      "id": "send-call",
-      "name": "Build send call",
-      "type": "n8n-nodes-base.code",
-      "typeVersion": 2,
-      "position": [
-        1080,
-        200
-      ]
-    },
-    {
-      "parameters": {
-        "workflowId": {
+        "serverTransport": "httpStreamable",
+        "endpointUrl": "={{ $('Open the window').first().json.mcpUrl }}",
+        "authentication": "none",
+        "tool": {
           "__rl": true,
-          "value": "mcp-tool-call",
-          "mode": "list",
-          "cachedResultName": "MCP tool call"
+          "mode": "id",
+          "value": "send_telegram_message"
         },
-        "workflowInputs": {
-          "mappingMode": "defineBelow",
-          "value": {
-            "label": "={{ $json.label }}",
-            "tool": "={{ $json.tool }}",
-            "argsJson": "={{ $json.argsJson }}",
-            "mcpUrl": "={{ $json.mcpUrl }}"
-          },
-          "matchingColumns": [],
-          "schema": [
-            {
-              "id": "label",
-              "displayName": "label",
-              "required": false,
-              "defaultMatch": "",
-              "display": true,
-              "canBeUsedToMatch": true,
-              "type": "string",
-              "removed": false
-            },
-            {
-              "id": "tool",
-              "displayName": "tool",
-              "required": false,
-              "defaultMatch": "",
-              "display": true,
-              "canBeUsedToMatch": true,
-              "type": "string",
-              "removed": false
-            },
-            {
-              "id": "argsJson",
-              "displayName": "argsJson",
-              "required": false,
-              "defaultMatch": "",
-              "display": true,
-              "canBeUsedToMatch": true,
-              "type": "string",
-              "removed": false
-            },
-            {
-              "id": "mcpUrl",
-              "displayName": "mcpUrl",
-              "required": false,
-              "defaultMatch": "",
-              "display": true,
-              "canBeUsedToMatch": true,
-              "type": "string",
-              "removed": false
-            }
-          ],
-          "attemptToConvertTypes": false,
-          "convertFieldsToString": true
-        },
+        "inputMode": "json",
+        "jsonInput": "={{ { chatId: $('Config').first().json.telegramChatId, text: $json.text.trim() } }}",
         "options": {
-          "waitForSubWorkflow": true
+          "timeout": 120000
         }
       },
       "id": "send",
       "name": "MCP: send digest",
-      "type": "n8n-nodes-base.executeWorkflow",
-      "typeVersion": 1.2,
+      "type": "@n8n/n8n-nodes-langchain.mcpClient",
+      "typeVersion": 1.1,
       "position": [
-        1300,
-        200
+        1340,
+        180
       ],
-      "notes": "send_telegram_message goes through MCP on purpose: it also appends the message to the telegram_messages chat log that the next run's dedup reads. A native Telegram node would deliver but leave the log — and therefore the dedup — blind."
+      "notes": "Delivery goes through MCP on purpose: send_telegram_message also appends the message to the telegram_messages chat log that the next run's dedup reads. A native Telegram node would deliver but leave that log — and therefore the dedup — blind."
     },
     {
       "parameters": {
         "mode": "runOnceForAllItems",
         "language": "javaScript",
-        "jsCode": "const sent = $input.first().json.result;\nif (!sent || sent.delivered !== true) {\n  throw new Error('send_telegram_message did not confirm delivery: ' + JSON.stringify(sent).slice(0, 300));\n}\n\n// Advance the watermark only after a confirmed delivery — exactly the agent's\n// rule (\"only after a successful full news-digest delivery\"). A failed send\n// leaves the window open, so the next run re-reads the same posts.\nconst store = $getWorkflowStaticData('global');\nstore.newsDigestLastReadAt = $('Window + MCP calls').first().json.nowISO;\n\nreturn [\n  {\n    json: {\n      delivered: true,\n      chatId: sent.chatId,\n      messageId: sent.messageId,\n      watermark: store.newsDigestLastReadAt,\n      chunks: $('Prepare reduce input').first().json.chunkCount,\n    },\n  },\n];"
+        "jsCode": "const part = ($input.first().json.content || []).find((c) => c.type === 'text');\nconst sent = part ? part.text : null;\nif (!sent || sent.delivered !== true) {\n  throw new Error('send_telegram_message did not confirm delivery: ' + JSON.stringify(sent).slice(0, 300));\n}\n\n// Advance the watermark only after a confirmed delivery — exactly the agent's\n// rule (\"only after a successful full news-digest delivery\"). A failed send\n// leaves the window open, so the next run re-reads the same posts.\nconst store = $getWorkflowStaticData('global');\nstore.newsDigestLastReadAt = $('Open the window').first().json.nowISO;\n\nreturn [\n  {\n    json: {\n      delivered: true,\n      chatId: sent.chatId,\n      messageId: sent.messageId,\n      watermark: store.newsDigestLastReadAt,\n      chunks: $('Prepare reduce input').first().json.chunkCount,\n    },\n  },\n];"
       },
       "id": "stamp",
       "name": "Stamp watermark",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
-        1520,
-        200
+        1560,
+        180
       ],
       "notes": "Watermark moves only after a confirmed delivery."
     },
@@ -492,8 +351,8 @@
       "type": "n8n-nodes-base.stopAndError",
       "typeVersion": 1,
       "position": [
-        1080,
-        420
+        1340,
+        440
       ],
       "notes": "Fails the execution, which hands the run to the error workflow."
     },
@@ -512,6 +371,126 @@
         -40,
         -140
       ]
+    },
+    {
+      "parameters": {
+        "serverTransport": "httpStreamable",
+        "endpointUrl": "={{ $json.mcpUrl }}",
+        "authentication": "none",
+        "tool": {
+          "__rl": true,
+          "mode": "id",
+          "value": "list_news"
+        },
+        "inputMode": "json",
+        "jsonInput": "={{ { source: 'channel', sinceISO: $json.sinceISO, limit: $json.postLimit } }}",
+        "options": {
+          "timeout": 120000
+        }
+      },
+      "id": "mcp-posts",
+      "name": "MCP: list_news",
+      "type": "@n8n/n8n-nodes-langchain.mcpClient",
+      "typeVersion": 1.1,
+      "position": [
+        -220,
+        60
+      ],
+      "notes": "The digest window: every channel post since the watermark."
+    },
+    {
+      "parameters": {
+        "serverTransport": "httpStreamable",
+        "endpointUrl": "={{ $json.mcpUrl }}",
+        "authentication": "none",
+        "tool": {
+          "__rl": true,
+          "mode": "id",
+          "value": "get_telegram_chat_history"
+        },
+        "inputMode": "json",
+        "jsonInput": "={{ { chatId: $json.telegramChatId, limit: $json.historyLimit } }}",
+        "options": {
+          "timeout": 120000
+        }
+      },
+      "id": "mcp-history",
+      "name": "MCP: chat history",
+      "type": "@n8n/n8n-nodes-langchain.mcpClient",
+      "typeVersion": 1.1,
+      "position": [
+        -220,
+        240
+      ],
+      "notes": "The dedup corpus — what was already sent to this chat."
+    },
+    {
+      "parameters": {
+        "serverTransport": "httpStreamable",
+        "endpointUrl": "={{ $json.mcpUrl }}",
+        "authentication": "none",
+        "tool": {
+          "__rl": true,
+          "mode": "id",
+          "value": "read_skill"
+        },
+        "inputMode": "json",
+        "jsonInput": "={{ { fileName: $json.composerSkill } }}",
+        "options": {
+          "timeout": 120000
+        }
+      },
+      "id": "mcp-skill-composer",
+      "name": "MCP: skill composer.md",
+      "type": "@n8n/n8n-nodes-langchain.mcpClient",
+      "typeVersion": 1.1,
+      "position": [
+        -220,
+        420
+      ],
+      "notes": "Always-on compose rules, first half of the system prompt."
+    },
+    {
+      "parameters": {
+        "serverTransport": "httpStreamable",
+        "endpointUrl": "={{ $json.mcpUrl }}",
+        "authentication": "none",
+        "tool": {
+          "__rl": true,
+          "mode": "id",
+          "value": "read_skill"
+        },
+        "inputMode": "json",
+        "jsonInput": "={{ { fileName: $json.digestSkill } }}",
+        "options": {
+          "timeout": 120000
+        }
+      },
+      "id": "mcp-skill-digest",
+      "name": "MCP: skill news-digest.md",
+      "type": "@n8n/n8n-nodes-langchain.mcpClient",
+      "typeVersion": 1.1,
+      "position": [
+        -220,
+        600
+      ],
+      "notes": "The domain skill the agent runs, second half of the system prompt. effectiveInstructions = body + improver patch."
+    },
+    {
+      "parameters": {
+        "mode": "append",
+        "numberInputs": 4,
+        "options": {}
+      },
+      "id": "merge",
+      "name": "Collect MCP results",
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3.2,
+      "position": [
+        20,
+        300
+      ],
+      "notes": "Waits for all four calls, then appends them into one stream. Order is input order, but Chunk posts keys by shape, not by index."
     }
   ],
   "connections": {
@@ -530,25 +509,84 @@
       "main": [
         [
           {
-            "node": "Window + MCP calls",
+            "node": "Open the window",
             "type": "main",
             "index": 0
           }
         ]
       ]
     },
-    "Window + MCP calls": {
+    "Open the window": {
       "main": [
         [
           {
-            "node": "MCP: posts + history + skills",
+            "node": "MCP: list_news",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "MCP: chat history",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "MCP: skill composer.md",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "MCP: skill news-digest.md",
             "type": "main",
             "index": 0
           }
         ]
       ]
     },
-    "MCP: posts + history + skills": {
+    "MCP: list_news": {
+      "main": [
+        [
+          {
+            "node": "Collect MCP results",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "MCP: chat history": {
+      "main": [
+        [
+          {
+            "node": "Collect MCP results",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "MCP: skill composer.md": {
+      "main": [
+        [
+          {
+            "node": "Collect MCP results",
+            "type": "main",
+            "index": 2
+          }
+        ]
+      ]
+    },
+    "MCP: skill news-digest.md": {
+      "main": [
+        [
+          {
+            "node": "Collect MCP results",
+            "type": "main",
+            "index": 3
+          }
+        ]
+      ]
+    },
+    "Collect MCP results": {
       "main": [
         [
           {
@@ -629,7 +667,7 @@
       "main": [
         [
           {
-            "node": "Build send call",
+            "node": "MCP: send digest",
             "type": "main",
             "index": 0
           }
@@ -637,17 +675,6 @@
         [
           {
             "node": "Refuse to send",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "Build send call": {
-      "main": [
-        [
-          {
-            "node": "MCP: send digest",
             "type": "main",
             "index": 0
           }

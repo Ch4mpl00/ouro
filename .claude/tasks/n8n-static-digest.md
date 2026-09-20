@@ -21,6 +21,14 @@ README with the step-by-step mapping.
 
 ## Decisions that shaped it
 
+- **The stock `MCP Client` node does the talking** (`@n8n/n8n-nodes-langchain.mcpClient`,
+  a normal transform node, not the AI-Agent tool sub-node): session handshake,
+  close-in-finally, throw on `isError`, JSON-parsed text payload, credential-based
+  auth, tool dropdown from a live `tools/list`. The hand-rolled HTTP version
+  (`mcp-tool-call.json`) stays in the repo as the alternative — it shows the raw
+  protocol and is the only way to put N calls on ONE session (the node opens one
+  per call). First build missed the node entirely: pre-2.x knowledge said MCP in
+  n8n existed only as an AI-Agent tool.
 - **MCP stays the tool layer**, even though native Postgres + Telegram nodes
   would be less plumbing: PG is MCP's private store, and
   `send_telegram_message` also appends to the `telegram_messages` log that the
@@ -53,8 +61,12 @@ README with the step-by-step mapping.
       parse of map output, delivery guard, watermark stamping, error phrasing.
 - [x] `docker compose -f docker-compose.yml -f n8n/docker-compose.n8n.yml
       config` valid.
-- [ ] Imported and run once against live MCP — not done; needs the two model
-      credentials and a chat id in the editor.
+- [x] Fan-out executed for real: local `n8nio/n8n:2.40.3` against a local
+      restricted MCP (`MCP_NO_POLLERS=1`, `news-read,telegram,skills`, throwaway
+      pgvector). All four MCP Client nodes, the 4-input Merge and `Chunk posts`
+      ran green; system prompt assembled to 10 062 chars from the two skills.
+- [ ] Full run end to end — not done; needs the two model credentials and a
+      chat id in the editor.
 
 ## Notes
 
