@@ -85,7 +85,7 @@
         }
       },
       "id": "initialize",
-      "name": "MCP: initialize",
+      "name": "Open MCP session",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
       "position": [
@@ -134,7 +134,7 @@
         }
       },
       "id": "initialized",
-      "name": "MCP: initialized",
+      "name": "Finish the handshake",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
       "position": [
@@ -148,10 +148,10 @@
       "parameters": {
         "mode": "runOnceForAllItems",
         "language": "javaScript",
-        "jsCode": "// One MCP-over-HTTP response body → the JSON-RPC envelope.\n// StreamableHTTP answers a POST with an SSE frame (\"event: message\\ndata: {…}\")\n// unless the server enables JSON responses, so handle both shapes.\nfunction parseRpc(body, what) {\n  const text = typeof body === 'string' ? body : JSON.stringify(body ?? '');\n  const trimmed = text.trim();\n  if (trimmed.startsWith('{')) return JSON.parse(trimmed);\n  const frames = trimmed\n    .split('\\n')\n    .filter((line) => line.startsWith('data:'))\n    .map((line) => line.slice(5).trim())\n    .filter((line) => line.length > 0);\n  if (frames.length === 0) {\n    throw new Error(what + ': no JSON-RPC payload in MCP response — ' + trimmed.slice(0, 300));\n  }\n  return JSON.parse(frames[frames.length - 1]);\n}\n\n// The initialize response carries the session id in a header; every later\n// request on this session must echo it back.\nconst init = $('MCP: initialize').first().json;\nif (init.statusCode >= 400) {\n  throw new Error('MCP initialize failed with HTTP ' + init.statusCode + ' — ' + String(init.body).slice(0, 300));\n}\nconst envelope = parseRpc(init.body, 'initialize');\nif (envelope.error) {\n  throw new Error('MCP initialize rejected: ' + envelope.error.code + ' ' + envelope.error.message);\n}\nconst sessionId = (init.headers || {})['mcp-session-id'];\nif (!sessionId) {\n  throw new Error('MCP initialize returned no mcp-session-id header — is MCP_TRANSPORT=http on the target instance?');\n}\n\n// One request per incoming call item. Ids only have to be unique within the\n// session; 1 belongs to initialize.\nconst calls = $('When called by another workflow').all();\nreturn calls.map((item, index) => {\n  const tool = item.json.tool;\n  const label = item.json.label || tool;\n  if (!tool) throw new Error('call #' + index + ' has no \\'tool\\' field');\n  let args;\n  try {\n    args = item.json.argsJson ? JSON.parse(item.json.argsJson) : {};\n  } catch (err) {\n    throw new Error('call #' + index + ' (' + tool + '): argsJson is not valid JSON — ' + err.message);\n  }\n  return {\n    json: {\n      label,\n      tool,\n      sessionId,\n      rpcBody: {\n        jsonrpc: '2.0',\n        id: index + 2,\n        method: 'tools/call',\n        params: { name: tool, arguments: args },\n      },\n    },\n  };\n});"
+        "jsCode": "// One MCP-over-HTTP response body → the JSON-RPC envelope.\n// StreamableHTTP answers a POST with an SSE frame (\"event: message\\ndata: {…}\")\n// unless the server enables JSON responses, so handle both shapes.\nfunction parseRpc(body, what) {\n  const text = typeof body === 'string' ? body : JSON.stringify(body ?? '');\n  const trimmed = text.trim();\n  if (trimmed.startsWith('{')) return JSON.parse(trimmed);\n  const frames = trimmed\n    .split('\\n')\n    .filter((line) => line.startsWith('data:'))\n    .map((line) => line.slice(5).trim())\n    .filter((line) => line.length > 0);\n  if (frames.length === 0) {\n    throw new Error(what + ': no JSON-RPC payload in MCP response — ' + trimmed.slice(0, 300));\n  }\n  return JSON.parse(frames[frames.length - 1]);\n}\n\n// The initialize response carries the session id in a header; every later\n// request on this session must echo it back.\nconst init = $('Open MCP session').first().json;\nif (init.statusCode >= 400) {\n  throw new Error('MCP initialize failed with HTTP ' + init.statusCode + ' — ' + String(init.body).slice(0, 300));\n}\nconst envelope = parseRpc(init.body, 'initialize');\nif (envelope.error) {\n  throw new Error('MCP initialize rejected: ' + envelope.error.code + ' ' + envelope.error.message);\n}\nconst sessionId = (init.headers || {})['mcp-session-id'];\nif (!sessionId) {\n  throw new Error('MCP initialize returned no mcp-session-id header — is MCP_TRANSPORT=http on the target instance?');\n}\n\n// One request per incoming call item. Ids only have to be unique within the\n// session; 1 belongs to initialize.\nconst calls = $('When called by another workflow').all();\nreturn calls.map((item, index) => {\n  const tool = item.json.tool;\n  const label = item.json.label || tool;\n  if (!tool) throw new Error('call #' + index + ' has no \\'tool\\' field');\n  let args;\n  try {\n    args = item.json.argsJson ? JSON.parse(item.json.argsJson) : {};\n  } catch (err) {\n    throw new Error('call #' + index + ' (' + tool + '): argsJson is not valid JSON — ' + err.message);\n  }\n  return {\n    json: {\n      label,\n      tool,\n      sessionId,\n      rpcBody: {\n        jsonrpc: '2.0',\n        id: index + 2,\n        method: 'tools/call',\n        params: { name: tool, arguments: args },\n      },\n    },\n  };\n});"
       },
       "id": "fanout",
-      "name": "Fan out tool calls",
+      "name": "Build one request per call",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
@@ -196,7 +196,7 @@
         }
       },
       "id": "toolscall",
-      "name": "MCP: tools/call",
+      "name": "Call the tools",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
       "position": [
@@ -209,10 +209,10 @@
       "parameters": {
         "mode": "runOnceForAllItems",
         "language": "javaScript",
-        "jsCode": "// One MCP-over-HTTP response body → the JSON-RPC envelope.\n// StreamableHTTP answers a POST with an SSE frame (\"event: message\\ndata: {…}\")\n// unless the server enables JSON responses, so handle both shapes.\nfunction parseRpc(body, what) {\n  const text = typeof body === 'string' ? body : JSON.stringify(body ?? '');\n  const trimmed = text.trim();\n  if (trimmed.startsWith('{')) return JSON.parse(trimmed);\n  const frames = trimmed\n    .split('\\n')\n    .filter((line) => line.startsWith('data:'))\n    .map((line) => line.slice(5).trim())\n    .filter((line) => line.length > 0);\n  if (frames.length === 0) {\n    throw new Error(what + ': no JSON-RPC payload in MCP response — ' + trimmed.slice(0, 300));\n  }\n  return JSON.parse(frames[frames.length - 1]);\n}\n\n// Zip the tools/call responses back onto the call specs by position: the HTTP\n// node replaced the items with its own output, so the label lives next door.\nconst calls = $('Fan out tool calls').all();\nconst responses = $input.all();\n\nreturn responses.map((response, index) => {\n  const call = calls[index] ? calls[index].json : {};\n  const tool = call.tool || 'unknown-tool';\n  const label = call.label || tool;\n  const status = response.json.statusCode;\n  if (status >= 400) {\n    throw new Error(label + ' (' + tool + '): HTTP ' + status + ' — ' + String(response.json.body).slice(0, 300));\n  }\n  const envelope = parseRpc(response.json.body, label);\n  if (envelope.error) {\n    throw new Error(label + ' (' + tool + '): JSON-RPC ' + envelope.error.code + ' ' + envelope.error.message);\n  }\n  const result = envelope.result || {};\n  const text = (result.content || [])\n    .filter((part) => part.type === 'text')\n    .map((part) => part.text)\n    .join('\\n');\n  // MCP reports a tool-level failure in-band: isError with the message as text.\n  if (result.isError) {\n    throw new Error(label + ' (' + tool + ') failed: ' + text.slice(0, 500));\n  }\n  // Our tools answer with pretty JSON in one text part (see packages/mcp/src/result.ts).\n  // Anything that is not JSON stays a string — same lenient rule the agent's\n  // workflow executor uses when it binds a tool result.\n  let payload = text;\n  if (result.structuredContent !== undefined) {\n    payload = result.structuredContent;\n  } else {\n    try {\n      payload = JSON.parse(text);\n    } catch {\n      payload = text;\n    }\n  }\n  return { json: { label, tool, result: payload } };\n});"
+        "jsCode": "// One MCP-over-HTTP response body → the JSON-RPC envelope.\n// StreamableHTTP answers a POST with an SSE frame (\"event: message\\ndata: {…}\")\n// unless the server enables JSON responses, so handle both shapes.\nfunction parseRpc(body, what) {\n  const text = typeof body === 'string' ? body : JSON.stringify(body ?? '');\n  const trimmed = text.trim();\n  if (trimmed.startsWith('{')) return JSON.parse(trimmed);\n  const frames = trimmed\n    .split('\\n')\n    .filter((line) => line.startsWith('data:'))\n    .map((line) => line.slice(5).trim())\n    .filter((line) => line.length > 0);\n  if (frames.length === 0) {\n    throw new Error(what + ': no JSON-RPC payload in MCP response — ' + trimmed.slice(0, 300));\n  }\n  return JSON.parse(frames[frames.length - 1]);\n}\n\n// Zip the tools/call responses back onto the call specs by position: the HTTP\n// node replaced the items with its own output, so the label lives next door.\nconst calls = $('Build one request per call').all();\nconst responses = $input.all();\n\nreturn responses.map((response, index) => {\n  const call = calls[index] ? calls[index].json : {};\n  const tool = call.tool || 'unknown-tool';\n  const label = call.label || tool;\n  const status = response.json.statusCode;\n  if (status >= 400) {\n    throw new Error(label + ' (' + tool + '): HTTP ' + status + ' — ' + String(response.json.body).slice(0, 300));\n  }\n  const envelope = parseRpc(response.json.body, label);\n  if (envelope.error) {\n    throw new Error(label + ' (' + tool + '): JSON-RPC ' + envelope.error.code + ' ' + envelope.error.message);\n  }\n  const result = envelope.result || {};\n  const text = (result.content || [])\n    .filter((part) => part.type === 'text')\n    .map((part) => part.text)\n    .join('\\n');\n  // MCP reports a tool-level failure in-band: isError with the message as text.\n  if (result.isError) {\n    throw new Error(label + ' (' + tool + ') failed: ' + text.slice(0, 500));\n  }\n  // Our tools answer with pretty JSON in one text part (see packages/mcp/src/result.ts).\n  // Anything that is not JSON stays a string — same lenient rule the agent's\n  // workflow executor uses when it binds a tool result.\n  let payload = text;\n  if (result.structuredContent !== undefined) {\n    payload = result.structuredContent;\n  } else {\n    try {\n      payload = JSON.parse(text);\n    } catch {\n      payload = text;\n    }\n  }\n  return { json: { label, tool, result: payload } };\n});"
       },
       "id": "parse",
-      "name": "Parse MCP results",
+      "name": "Parse the responses",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
@@ -238,7 +238,7 @@
             },
             {
               "name": "mcp-session-id",
-              "value": "={{ $('MCP: initialize').first().json.headers['mcp-session-id'] }}"
+              "value": "={{ $('Open MCP session').first().json.headers['mcp-session-id'] }}"
             }
           ]
         },
@@ -254,7 +254,7 @@
         }
       },
       "id": "close",
-      "name": "MCP: close session",
+      "name": "Close MCP session",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
       "position": [
@@ -269,10 +269,10 @@
       "parameters": {
         "mode": "runOnceForAllItems",
         "language": "javaScript",
-        "jsCode": "// The DELETE above replaced the items with its own response; hand the\n// caller back the parsed tool results instead.\nreturn $('Parse MCP results').all();"
+        "jsCode": "// The DELETE above replaced the items with its own response; hand the\n// caller back the parsed tool results instead.\nreturn $('Parse the responses').all();"
       },
       "id": "return",
-      "name": "Return results",
+      "name": "Return results to the caller",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
@@ -287,73 +287,73 @@
       "main": [
         [
           {
-            "node": "MCP: initialize",
+            "node": "Open MCP session",
             "type": "main",
             "index": 0
           }
         ]
       ]
     },
-    "MCP: initialize": {
+    "Open MCP session": {
       "main": [
         [
           {
-            "node": "MCP: initialized",
+            "node": "Finish the handshake",
             "type": "main",
             "index": 0
           }
         ]
       ]
     },
-    "MCP: initialized": {
+    "Finish the handshake": {
       "main": [
         [
           {
-            "node": "Fan out tool calls",
+            "node": "Build one request per call",
             "type": "main",
             "index": 0
           }
         ]
       ]
     },
-    "Fan out tool calls": {
+    "Build one request per call": {
       "main": [
         [
           {
-            "node": "MCP: tools/call",
+            "node": "Call the tools",
             "type": "main",
             "index": 0
           }
         ]
       ]
     },
-    "MCP: tools/call": {
+    "Call the tools": {
       "main": [
         [
           {
-            "node": "Parse MCP results",
+            "node": "Parse the responses",
             "type": "main",
             "index": 0
           }
         ]
       ]
     },
-    "Parse MCP results": {
+    "Parse the responses": {
       "main": [
         [
           {
-            "node": "MCP: close session",
+            "node": "Close MCP session",
             "type": "main",
             "index": 0
           }
         ]
       ]
     },
-    "MCP: close session": {
+    "Close MCP session": {
       "main": [
         [
           {
-            "node": "Return results",
+            "node": "Return results to the caller",
             "type": "main",
             "index": 0
           }

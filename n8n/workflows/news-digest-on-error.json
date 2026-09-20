@@ -54,23 +54,23 @@
         "options": {}
       },
       "id": "recovery-config",
-      "name": "Config: recovery",
+      "name": "Recovery settings",
       "type": "n8n-nodes-base.set",
       "typeVersion": 3.4,
       "position": [
         -380,
         300
       ],
-      "notes": "Same two values as the digest workflow's Config. telegramChatId must be set."
+      "notes": "Same two values as the digest workflow's Settings node. telegramChatId must be set."
     },
     {
       "parameters": {
         "mode": "runOnceForAllItems",
         "language": "javaScript",
-        "jsCode": "// n8n hands the Error Trigger one item describing the failed execution.\nconst e = $json;\nconst node = (e.execution && e.execution.lastNodeExecuted) || 'unknown node';\nconst message = ((e.execution && e.execution.error && e.execution.error.message) || 'no error message').slice(0, 400);\nconst url = (e.execution && e.execution.url) || '';\n\n// Same job as the agent's `recovery` skill: one short Russian message that says\n// what broke, never a stack trace.\nconst text = [\n  '⚠️ Сводка новостей не отправлена.',\n  '',\n  'Сбой на шаге: ' + node,\n  'Причина: ' + message,\n  url ? '' : null,\n  url ? url : null,\n].filter((line) => line !== null).join('\\n');\n\nconst cfg = $('Config: recovery').first().json;\nreturn [{ json: { text, mcpUrl: cfg.mcpUrl, telegramChatId: cfg.telegramChatId } }];"
+        "jsCode": "// n8n hands the Error Trigger one item describing the failed execution.\nconst e = $json;\nconst node = (e.execution && e.execution.lastNodeExecuted) || 'unknown node';\nconst message = ((e.execution && e.execution.error && e.execution.error.message) || 'no error message').slice(0, 400);\nconst url = (e.execution && e.execution.url) || '';\n\n// Same job as the agent's `recovery` skill: one short Russian message that says\n// what broke, never a stack trace.\nconst text = [\n  '⚠️ Сводка новостей не отправлена.',\n  '',\n  'Сбой на шаге: ' + node,\n  'Причина: ' + message,\n  url ? '' : null,\n  url ? url : null,\n].filter((line) => line !== null).join('\\n');\n\nconst cfg = $('Recovery settings').first().json;\nreturn [{ json: { text, mcpUrl: cfg.mcpUrl, telegramChatId: cfg.telegramChatId } }];"
       },
       "id": "recovery-text",
-      "name": "Phrase the failure",
+      "name": "Write the failure message",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
@@ -95,7 +95,7 @@
         }
       },
       "id": "recovery-send",
-      "name": "MCP: notify user",
+      "name": "MCP: tell the user",
       "type": "@n8n/n8n-nodes-langchain.mcpClient",
       "typeVersion": 1.1,
       "position": [
@@ -110,29 +110,29 @@
       "main": [
         [
           {
-            "node": "Config: recovery",
+            "node": "Recovery settings",
             "type": "main",
             "index": 0
           }
         ]
       ]
     },
-    "Config: recovery": {
+    "Recovery settings": {
       "main": [
         [
           {
-            "node": "Phrase the failure",
+            "node": "Write the failure message",
             "type": "main",
             "index": 0
           }
         ]
       ]
     },
-    "Phrase the failure": {
+    "Write the failure message": {
       "main": [
         [
           {
-            "node": "MCP: notify user",
+            "node": "MCP: tell the user",
             "type": "main",
             "index": 0
           }

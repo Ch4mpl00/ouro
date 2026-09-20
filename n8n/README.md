@@ -22,11 +22,11 @@ $0.2193 across 20 observations.
 | --- | --- |
 | cron row fires → signal on the queue → supervisor picks it up | **Every day at 21:00** (Schedule Trigger, timezone in workflow settings) |
 | `planner` step: gpt-5.4 writes the plan (5.7s, $0.0379) | — the plan *is* the canvas |
-| `step[0]` parallel: `list_news(source=channel, sinceISO=<watermark>, chunks=3)` + `get_telegram_chat_history(limit=30)` | **Open the window** → four **MCP Client** nodes fanning out (`list_news`, `get_telegram_chat_history`, `read_skill` ×2) → **Collect MCP results** |
+| `step[0]` parallel: `list_news(source=channel, sinceISO=<watermark>, chunks=3)` + `get_telegram_chat_history(limit=30)` | **Resolve digest window** → four **MCP Client** nodes fanning out (`list_news`, `get_telegram_chat_history`, `read_skill` ×2) → **Collect all MCP responses** |
 | skills read from disk by the agent runtime (`composer.md` + `news-digest.md`, patch appended) | the same two files, read through `read_skill` on the same fan-out |
-| `step[1]` parallel: 3 × `llm_compose` (preset `base` → gpt-5.4-mini, skill `news-digest`) | **Chunk posts** → **Map: select candidates** (one LLM call per chunk item) |
-| `step[2]` `llm_compose` (preset `smart` → gemini-3.7-flash) | **Prepare reduce input** → **Reduce: compose digest** |
-| `step[3]` parallel: `send_telegram_message` + `set_memory news_digest.last_read_at` | **Digest deliverable?** → **MCP: send digest** → **Stamp watermark** |
+| `step[1]` parallel: 3 × `llm_compose` (preset `base` → gpt-5.4-mini, skill `news-digest`) | **Split posts into chunks** → **Shortlist events in each chunk** (one LLM call per chunk item) |
+| `step[2]` `llm_compose` (preset `smart` → gemini-3.7-flash) | **Combine the shortlists** → **Compose the digest message** |
+| `step[3]` parallel: `send_telegram_message` + `set_memory news_digest.last_read_at` | **Digest ready to send?** → **MCP: send digest to Telegram** → **Remember what was read** |
 | `step[4]` terminal | end of the canvas |
 | a failed step → `recovery` skill phrases it to the user | **News digest — on error** (n8n error workflow) |
 
@@ -96,7 +96,7 @@ is more self-contained and instantly stale.
 **Chunking moved into n8n.** The agent asks `list_news` for `chunks: 3` because
 its plan DSL can only reference `${bind.chunks.0}`, `${bind.chunks.1}` …
 statically — the chunk count has to be known before the data is seen. n8n
-iterates over items, so **Chunk posts** splits the window itself, by character
+iterates over items, so **Split posts into chunks** splits the window itself, by character
 budget (100k) rather than by a fixed count: one map call's context stays flat
 whether the window holds 40 posts or 900. Chunks stay contiguous, never
 round-robin, because `list_news` is time-ordered and neighbouring posts are the
@@ -119,7 +119,7 @@ before raising either number.
 the user's chat. Same rule the agent runtime follows — automatic retries in one
 layer only, never over tool side effects.
 
-**The watermark moves last.** `Stamp watermark` runs only after
+**The watermark moves last.** `Remember what was read` runs only after
 `send_telegram_message` confirms `delivered: true`, so a failed delivery leaves
 the window open and the next run re-reads the same posts. It lives in n8n's own
 per-workflow static data (`$getWorkflowStaticData('global')`), which is this
@@ -154,7 +154,7 @@ Then, in the editor (`ssh -L 5678:localhost:5678 root@<droplet>` →
    the same keys as `.env.agent` — and re-select them on the two model nodes.
    The exports carry `REPLACE_WITH_…` placeholders, which
    `validate-workflows.mjs` reports as warnings until you do.
-2. **News digest — daily 21:00** → `Config` → set `telegramChatId`.
+2. **News digest — daily 21:00** → `Settings` → set `telegramChatId`.
 3. Run it once manually (nothing is stamped, so it is repeatable), check the
    message, then activate the workflow.
 
@@ -215,6 +215,6 @@ truth, the running instance is a cache of it.
   the lever if you ever need N calls on one session.
 - **The node's output is `{ content: [{ type, text }] }`**, with `text` already
   JSON-parsed when the tool answered with JSON (our tools do — see
-  `packages/mcp/src/result.ts`). `Chunk posts` keys the four results by shape
+  `packages/mcp/src/result.ts`). `Split posts into chunks` keys the four results by shape
   (`items` / `messages` / `fileName`) rather than by branch order, so
   rearranging the canvas cannot silently swap two inputs.
