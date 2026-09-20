@@ -88,6 +88,10 @@ whether the window holds 40 posts or 900. Chunks stay contiguous, never
 round-robin, because `list_news` is time-ordered and neighbouring posts are the
 ones that consolidate into one bullet.
 
+The chunks are then processed concurrently, but by a different mechanism than
+the agent's: not three steps in a `parallel` block, one node with **Batch
+Size 4**. Same wall time for a 3-chunk window, invisible on the diagram.
+
 **Side effects are never retried.** The handshake nodes retry (idempotent);
 `tools/call` does not. A replayed `send_telegram_message` is a second message in
 the user's chat. Same rule the agent runtime follows — automatic retries in one
@@ -152,10 +156,12 @@ truth, the running instance is a cache of it.
   equivalent here by design. (An AI Agent node with `mcp-n8n` attached as a tool
   server would reintroduce runtime tool choice — and with it the failure modes
   this project exists to avoid.)
-- **Sequential map.** n8n runs a node's items one after another, so N chunks
-  cost N × latency. The agent's `parallel` step fires all three at once: 16.0s
-  wall for 8.0 + 15.9 + 3.6s of work. Expect ~41s end to end here against the
-  trace's 34.9s.
+- **Parallelism has no shape on the canvas.** A branch is not a thread: n8n
+  walks branches one after another, and a node normally loops over its items.
+  The agent's three-way `parallel` step is one node here, run per item. It is
+  still concurrent — `chainLlm` at `typeVersion 1.7+` fires **Batch Size**
+  items at once (`Promise.allSettled`), set to 4 on the map node — but that is
+  a node setting you open a panel to see, not something the diagram shows.
 - **No per-node judging.** The agent's runs are traced to Langfuse and scored
   per node (`packages/agent/src/judging.ts`). Here the audit trail is n8n's own
   execution list — full input/output per node, kept for failures forever and
@@ -174,9 +180,11 @@ truth, the running instance is a cache of it.
 ## Caveats worth knowing
 
 - **Node `typeVersion`s are deliberately conservative** (the 1.x-era versions a
-  2.x n8n still loads). The image is pinned to `n8nio/n8n:2.40.3`; after an
-  upgrade, open each node once — n8n keeps old versions working but new
-  parameters default in.
+  2.x n8n still loads), with one exception: the two chain nodes are on `1.7`,
+  the version that introduced batching — below it, `batching.batchSize` is
+  ignored and the map phase silently goes back to one chunk at a time. The
+  image is pinned to `n8nio/n8n:2.40.3`; after an upgrade, open each node once
+  — n8n keeps old versions working but new parameters default in.
 - **`mcp-tool-call` is four HTTP requests per batch**, because Streamable HTTP
   is stateful: `initialize` (session id in a response header) →
   `notifications/initialized` → `tools/call` (one per item) → `DELETE`. The

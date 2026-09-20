@@ -232,17 +232,21 @@
               "message": "={{ $json.systemPrompt }}"
             }
           ]
+        },
+        "batching": {
+          "batchSize": 4,
+          "delayBetweenBatches": 0
         }
       },
       "id": "map",
       "name": "Map: select candidates",
       "type": "@n8n/n8n-nodes-langchain.chainLlm",
-      "typeVersion": 1.5,
+      "typeVersion": 1.7,
       "position": [
         200,
         300
       ],
-      "notes": "Runs once per chunk item (n8n iterates items sequentially — the agent fires these in parallel). XML input blocks, same rendering as the agent's compose step."
+      "notes": "Runs once per chunk item. typeVersion 1.7 + batching.batchSize>1 makes the node fire a whole batch concurrently (Promise.allSettled), which is the map phase parallel again. XML input blocks, same rendering as the agent compose step."
     },
     {
       "parameters": {
@@ -300,7 +304,7 @@
       "id": "reduce",
       "name": "Reduce: compose digest",
       "type": "@n8n/n8n-nodes-langchain.chainLlm",
-      "typeVersion": 1.5,
+      "typeVersion": 1.7,
       "position": [
         640,
         300
@@ -495,8 +499,8 @@
     },
     {
       "parameters": {
-        "content": "### Chunking is ours, not MCP's\n\nThe agent asks `list_news` for a fixed `chunks: 3` because its plan DSL can only reference `${bind.chunks.0}` statically. n8n iterates over items, so the chunking lives in **Chunk posts** and follows a character budget instead of a fixed count.\n\nTrade-off: n8n runs a node's items **sequentially**, so N chunks cost N × latency, where the agent fans the same map phase out in parallel.",
-        "height": 340,
+        "content": "### Chunking is ours, not MCP's\n\nThe agent asks `list_news` for a fixed `chunks: 3` because its plan DSL can only reference `${bind.chunks.0}` statically. n8n iterates over items, so the chunking lives in **Chunk posts** and follows a character budget instead of a fixed count.\n\n### Parallelism\n\nA canvas branch is not a thread — n8n walks branches one after another, and a node normally processes its items in a loop. So the agent's three-way `parallel` step has **no shape on this canvas**: it is one node, run per item.\n\nThe chain node still gets it done concurrently: at `typeVersion 1.7+`, **Batch Size** > 1 fires that many items at once (`Promise.allSettled`). Set to 4 here, so a 3-chunk window is one round trip — the same wall time as the agent's fan-out, expressed as a node setting instead of a plan shape.",
+        "height": 420,
         "width": 520,
         "color": 5
       },

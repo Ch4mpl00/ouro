@@ -38,6 +38,11 @@ README with the step-by-step mapping.
   Separate from the agent's `news_digest.last_read_at` → the two must never run
   at once.
 - **No retry on `tools/call`** (side effects), retry on the handshake only.
+- **Map parallelism is a node setting, not a plan shape.** n8n walks branches
+  sequentially, so the agent's 3-way `parallel` step has no canvas equivalent;
+  `chainLlm` `typeVersion 1.7` + `batching.batchSize: 4` gets the concurrency
+  back (`Promise.allSettled` over a batch). Verified against the node source in
+  `n8nio/n8n:2.40.3` — at ≤1.6 the parameter is ignored silently.
 
 ## Acceptance
 
