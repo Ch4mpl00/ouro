@@ -441,14 +441,14 @@
         }
       },
       "id": "mcp-skill-composer",
-      "name": "MCP: skill composer.md",
+      "name": "MCP: load compose rules",
       "type": "@n8n/n8n-nodes-langchain.mcpClient",
       "typeVersion": 1.1,
       "position": [
         -220,
         420
       ],
-      "notes": "Always-on compose rules, first half of the system prompt."
+      "notes": "Always-on compose rules (skills.default/composer.md by default — the exact file name comes from Config.composerSkill). First half of the system prompt."
     },
     {
       "parameters": {
@@ -467,14 +467,14 @@
         }
       },
       "id": "mcp-skill-digest",
-      "name": "MCP: skill news-digest.md",
+      "name": "MCP: load news digest rules",
       "type": "@n8n/n8n-nodes-langchain.mcpClient",
       "typeVersion": 1.1,
       "position": [
         -220,
         600
       ],
-      "notes": "The domain skill the agent runs, second half of the system prompt. effectiveInstructions = body + improver patch."
+      "notes": "The domain skill the agent itself runs (Config.digestSkill, default news-digest.md). Second half of the system prompt: effectiveInstructions = body + improver patch, live overlay first."
     },
     {
       "parameters": {
@@ -530,12 +530,12 @@
             "index": 0
           },
           {
-            "node": "MCP: skill composer.md",
+            "node": "MCP: load compose rules",
             "type": "main",
             "index": 0
           },
           {
-            "node": "MCP: skill news-digest.md",
+            "node": "MCP: load news digest rules",
             "type": "main",
             "index": 0
           }
@@ -564,7 +564,7 @@
         ]
       ]
     },
-    "MCP: skill composer.md": {
+    "MCP: load compose rules": {
       "main": [
         [
           {
@@ -575,7 +575,7 @@
         ]
       ]
     },
-    "MCP: skill news-digest.md": {
+    "MCP: load news digest rules": {
       "main": [
         [
           {
