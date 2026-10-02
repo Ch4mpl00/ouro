@@ -10,20 +10,20 @@
 
 use std::time::Duration;
 
-use chrono::{DateTime, NaiveDateTime, SecondsFormat, TimeZone, Utc};
+use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
 use chrono_tz::Tz;
 use croner::Cron;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::CallToolResult;
-use rmcp::{ErrorData, schemars, tool, tool_router};
+use rmcp::{schemars, tool, tool_router};
 use rusqlite::{Row, params};
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
 use crate::db::Db;
-use crate::server::{McpTools, internal, invalid_params, json_result};
+use crate::server::{McpTools, ToolResult, invalid_params, json_result, tool_failed};
 use crate::settings::{SetTimezoneError, Settings};
 use crate::signals::Signals;
+use crate::time::iso;
 
 // ── 1. storage ───────────────────────────────────────────────────────────────
 
@@ -137,12 +137,6 @@ fn preview_next_fires(cron: &Cron, tz: Tz, count: usize, now: DateTime<Utc>) -> 
         cursor = next;
     }
     out
-}
-
-// JS Date#toISOString, which the agent's skills have always been handed:
-// "2026-10-02T09:00:00.000Z".
-fn iso(t: DateTime<Utc>) -> String {
-    t.to_rfc3339_opts(SecondsFormat::Millis, true)
 }
 
 // The slot a task's next fire is computed from: the slot it last fired for,
@@ -261,7 +255,7 @@ struct Failure {
     error: String,
 }
 
-fn failure(error: String) -> Result<CallToolResult, ErrorData> {
+fn failure(error: String) -> ToolResult {
     json_result(&Failure { ok: false, error })
 }
 
@@ -330,7 +324,7 @@ impl McpTools {
     async fn schedule_task(
         &self,
         Parameters(ScheduleTaskParams { cron_expr, recurring, prompt }): Parameters<ScheduleTaskParams>,
-    ) -> Result<CallToolResult, ErrorData> {
+    ) -> ToolResult {
         if cron_expr.is_empty() || prompt.is_empty() {
             return Err(invalid_params("cron_expr and prompt must be non-empty"));
         }
@@ -340,7 +334,7 @@ impl McpTools {
         };
         let tz = self.deps.settings.timezone();
         let upcoming_fires = preview_next_fires(&cron, tz, upcoming_count(recurring), Utc::now());
-        let task = self.deps.scheduler.insert(&cron_expr, recurring, &prompt, None).map_err(internal)?;
+        let task = crate::try_tool!(self.deps.scheduler.insert(&cron_expr, recurring, &prompt, None));
         json_result(&Scheduled { ok: true, task, timezone: tz.name().to_owned(), upcoming_fires })
     }
 
@@ -352,14 +346,10 @@ impl McpTools {
             cron expression, prompt, last fire time, and the next 1-3 upcoming \
             fire timestamps in the user's timezone for sanity-checking."
     )]
-    async fn list_scheduled_tasks(&self) -> Result<CallToolResult, ErrorData> {
+    async fn list_scheduled_tasks(&self) -> ToolResult {
         let tz = self.deps.settings.timezone();
         let now = Utc::now();
-        let tasks: Vec<ListedTask> = self
-            .deps
-            .scheduler
-            .list_active()
-            .map_err(internal)?
+        let tasks: Vec<ListedTask> = crate::try_tool!(self.deps.scheduler.list_active())
             .into_iter()
             .map(|t| {
                 let recurring = t.recurring == 1;
@@ -393,11 +383,11 @@ impl McpTools {
     async fn cancel_scheduled_task(
         &self,
         Parameters(CancelTaskParams { id }): Parameters<CancelTaskParams>,
-    ) -> Result<CallToolResult, ErrorData> {
+    ) -> ToolResult {
         if id < 1 {
             return Err(invalid_params("id must be a positive integer"));
         }
-        let ok = self.deps.scheduler.delete(id).map_err(internal)?;
+        let ok = crate::try_tool!(self.deps.scheduler.delete(id));
         json_result(&Cancelled { ok, id })
     }
 
@@ -407,7 +397,7 @@ impl McpTools {
         description = "Return the IANA timezone driving cron evaluation and digest \
             schedule decisions. Defaults to UTC when unset."
     )]
-    async fn get_timezone(&self) -> Result<CallToolResult, ErrorData> {
+    async fn get_timezone(&self) -> ToolResult {
         let now = self.deps.settings.local_time(Utc::now());
         json_result(&TimezoneInfo { ok: None, timezone: now.tz.name().to_owned(), local_now: now.display() })
     }
@@ -421,17 +411,14 @@ impl McpTools {
             Existing tasks keep their cron string as-is, so their next-fire \
             wall-clock time shifts. Invalid IANA names are rejected."
     )]
-    async fn set_timezone(
-        &self,
-        Parameters(SetTimezoneParams { tz }): Parameters<SetTimezoneParams>,
-    ) -> Result<CallToolResult, ErrorData> {
+    async fn set_timezone(&self, Parameters(SetTimezoneParams { tz }): Parameters<SetTimezoneParams>) -> ToolResult {
         if tz.is_empty() {
             return Err(invalid_params("tz must be non-empty"));
         }
         match self.deps.settings.set_timezone(&tz) {
             Ok(_) => {}
             Err(err @ SetTimezoneError::Invalid(_)) => return failure(format!("Invalid timezone '{tz}': {err}")),
-            Err(SetTimezoneError::Db(err)) => return Err(internal(err)),
+            Err(SetTimezoneError::Db(err)) => return tool_failed(err),
         }
         let now = self.deps.settings.local_time(Utc::now());
         json_result(&TimezoneInfo { ok: Some(true), timezone: tz, local_now: now.display() })

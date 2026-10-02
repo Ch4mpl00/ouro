@@ -151,38 +151,37 @@ pub fn parse_toolsets(raw: Option<&str>) -> Result<ToolsetSelection, UnknownTool
 
 // ── 3. routers ───────────────────────────────────────────────────────────────
 
-// Port in progress: a toolset whose domain has not moved to Rust yet is
-// refused at boot rather than skipped, for the same reason an unknown name is.
-#[derive(Debug, thiserror::Error)]
-#[error("toolset(s) not ported to Rust yet: {0}. Narrow MCP_TOOLSETS or run the TS server.")]
-pub struct NotPorted(String);
+impl Toolset {
+    // The Postgres-backed groups. An instance without DATABASE_URL can still
+    // serve the rest; selecting one of these there is a boot error.
+    pub fn needs_postgres(self) -> bool {
+        matches!(self, Toolset::NewsRead | Toolset::Knowledge | Toolset::Memory)
+    }
 
-fn router(toolset: Toolset) -> Option<ToolRouter<McpTools>> {
-    match toolset {
-        Toolset::Signals => Some(McpTools::signals_tools()),
-        Toolset::Dreaming => Some(McpTools::dreaming_tools()),
-        Toolset::Scheduler => Some(McpTools::scheduler_tools()),
-        Toolset::Gmail
-        | Toolset::Telegram
-        | Toolset::TelegramSend
-        | Toolset::Monobank
-        | Toolset::Pdf
-        | Toolset::Fs
-        | Toolset::Fetch
-        | Toolset::NewsRead
-        | Toolset::Knowledge
-        | Toolset::Userbot
-        | Toolset::Skills
-        | Toolset::Memory => None,
+    fn router(self) -> ToolRouter<McpTools> {
+        match self {
+            Toolset::Gmail => McpTools::gmail_tools(),
+            // The full telegram surface includes the send slice.
+            Toolset::Telegram => McpTools::telegram_send_tools() + McpTools::telegram_tools(),
+            Toolset::TelegramSend => McpTools::telegram_send_tools(),
+            Toolset::Monobank => McpTools::monobank_tools(),
+            Toolset::Pdf => McpTools::pdf_tools(),
+            Toolset::Fs => McpTools::fs_tools(),
+            Toolset::Fetch => McpTools::fetch_tools(),
+            Toolset::Signals => McpTools::signals_tools(),
+            Toolset::NewsRead => McpTools::news_tools(),
+            Toolset::Knowledge => McpTools::knowledge_tools(),
+            Toolset::Dreaming => McpTools::dreaming_tools(),
+            Toolset::Userbot => McpTools::userbot_tools(),
+            Toolset::Scheduler => McpTools::scheduler_tools(),
+            Toolset::Skills => McpTools::skills_tools(),
+            Toolset::Memory => McpTools::memory_tools(),
+        }
     }
 }
 
-pub fn compose_router(names: &[Toolset]) -> Result<ToolRouter<McpTools>, NotPorted> {
-    let missing: Vec<&str> = names.iter().filter(|t| router(**t).is_none()).map(|t| t.name()).collect();
-    if !missing.is_empty() {
-        return Err(NotPorted(missing.join(", ")));
-    }
-    Ok(names.iter().filter_map(|t| router(*t)).fold(ToolRouter::new(), |acc, r| acc + r))
+pub fn compose_router(names: &[Toolset]) -> ToolRouter<McpTools> {
+    names.iter().fold(ToolRouter::new(), |acc, t| acc + t.router())
 }
 
 #[cfg(test)]
@@ -190,8 +189,7 @@ mod tests {
     use super::*;
 
     fn tool_names(names: &[Toolset]) -> Vec<String> {
-        let mut out: Vec<String> =
-            compose_router(names).unwrap().list_all().into_iter().map(|t| t.name.into_owned()).collect();
+        let mut out: Vec<String> = compose_router(names).list_all().into_iter().map(|t| t.name.into_owned()).collect();
         out.sort();
         out
     }
@@ -220,19 +218,102 @@ mod tests {
         assert!(err.contains("unknown toolset(s) telegramm"), "{err}");
     }
 
+    // Pins docker-compose's MCP_TOOLSETS for mcp-tunnel exactly. If this list
+    // and that env var drift apart, ChatGPT silently gets a surface nobody
+    // decided on — in either direction.
+    const TUNNEL: &[Toolset] = &[Toolset::NewsRead, Toolset::TelegramSend, Toolset::Skills, Toolset::Memory];
+
     #[test]
-    fn refuses_unported_toolsets_instead_of_skipping_them() {
-        let err = compose_router(&[Toolset::Signals, Toolset::Gmail]).unwrap_err().to_string();
-        assert!(err.contains("gmail"), "{err}");
+    fn exposes_exactly_the_tunnel_surface() {
+        assert_eq!(
+            tool_names(TUNNEL),
+            [
+                "append_doc",
+                "create_project",
+                "doc_history",
+                "fetch_article",
+                "get_fact",
+                "list_memory",
+                "list_news",
+                "list_skills",
+                "patch_doc",
+                "read_doc",
+                "read_skill",
+                "recall",
+                "remember",
+                "revert_patch",
+                "search_news",
+                "send_telegram_message",
+                "update_fact",
+                "write_doc",
+            ]
+        );
+    }
+
+    // Everything a third-party client can reach must be safe to hand out: no
+    // personal account, no signal delivery, no arbitrary fetch.
+    #[test]
+    fn keeps_the_tunnel_clear_of_tools_that_must_never_leave_the_droplet() {
+        let tunnel = tool_names(TUNNEL);
+        for forbidden in [
+            "get_next_signal",
+            "list_nashdom_mails",
+            "list_monobank_transactions",
+            "read_file",
+            "fetch_url",
+            "schedule_task",
+            "get_telegram_chat_history",
+        ] {
+            assert!(!tunnel.iter().any(|t| t == forbidden), "{forbidden}");
+        }
     }
 
     #[test]
-    fn registers_exactly_the_ported_tools() {
-        assert_eq!(tool_names(&[Toolset::Signals]), ["get_next_signal"]);
-        assert_eq!(tool_names(&[Toolset::Dreaming]), ["list_signals"]);
+    fn the_default_surface_matches_the_ts_server() {
+        let all = tool_names(DEFAULT_TOOLSETS);
         assert_eq!(
-            tool_names(&[Toolset::Scheduler]),
-            ["cancel_scheduled_task", "get_timezone", "list_scheduled_tasks", "schedule_task", "set_timezone"]
+            all,
+            [
+                "add_note",
+                "append_doc",
+                "cancel_scheduled_task",
+                "create_project",
+                "doc_history",
+                "download_gmail_attachment",
+                "edit_telegram_message",
+                "fetch_article",
+                "fetch_url",
+                "find_notes",
+                "get_fact",
+                "get_next_signal",
+                "get_telegram_chat_history",
+                "get_timezone",
+                "list_memory",
+                "list_monobank_transactions",
+                "list_nashdom_mails",
+                "list_news",
+                "list_scheduled_tasks",
+                "list_signals",
+                "list_userbot_dialogs",
+                "patch_doc",
+                "read_doc",
+                "read_file",
+                "read_pdf",
+                "recall",
+                "remember",
+                "revert_patch",
+                "schedule_task",
+                "search_news",
+                "send_telegram_chat_action",
+                "send_telegram_message",
+                "set_timezone",
+                "start_typing",
+                "telegram_send_status",
+                "update_fact",
+                "write_doc",
+            ]
         );
+        // The agent owns synthetic tools with these names.
+        assert!(!all.iter().any(|t| t == "list_skills" || t == "read_skill"));
     }
 }

@@ -2,42 +2,97 @@
 // `#[tool_router]` block to, and the two transports it is served over.
 //
 // Sections:
-//   1. handler   — `McpTools` + its injected `Deps`
-//   2. results   — the JSON-text result shape and error helpers tools share
-//   3. sessions  — "newest wins" policy for the single-session instance
-//   4. transport — stdio and Streamable HTTP
+//   1. deps      — everything a tool handler may reach, built once in main
+//   2. handler   — `McpTools`: own tools + gateway upstreams behind one list
+//   3. results   — the JSON-text result shape and how failures surface
+//   4. sessions  — "newest wins" policy for the single-session instance
+//   5. transport — stdio and Streamable HTTP
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use futures::Stream;
 use rmcp::handler::server::router::tool::ToolRouter;
-use rmcp::model::{CallToolResult, ClientJsonRpcMessage, ContentBlock, ServerJsonRpcMessage};
+use rmcp::handler::server::tool::ToolCallContext;
+use rmcp::model::{
+    CallToolRequestParams, CallToolResponse, CallToolResult, ClientJsonRpcMessage, ContentBlock, ListToolsResult,
+    PaginatedRequestParams, ServerJsonRpcMessage, Tool,
+};
+use rmcp::service::RequestContext;
 use rmcp::transport::streamable_http_server::session::local::{LocalSessionManager, LocalSessionManagerError};
 use rmcp::transport::streamable_http_server::session::{EventStore, ServerSseMessage};
 use rmcp::transport::streamable_http_server::{RestoreOutcome, SessionId, SessionManager};
 use rmcp::transport::{StreamableHttpServerConfig, StreamableHttpService};
-use rmcp::{ErrorData, ServerHandler, ServiceExt, tool_handler};
+use rmcp::{ErrorData, RoleServer, ServerHandler, ServiceExt, tool_handler};
 use serde::Serialize;
 use tokio_util::sync::CancellationToken;
 
+use crate::gateway::Gateway;
+use crate::gmail::GmailModule;
+use crate::knowledge::KnowledgeRepository;
+use crate::memory::MemoryService;
+use crate::monobank::Monobank;
+use crate::news::NewsRepository;
 use crate::scheduler::Scheduler;
 use crate::settings::Settings;
 use crate::signals::Signals;
-use crate::telegram::TelegramConfig;
+use crate::skills::SkillCatalog;
+use crate::telegram::TelegramModule;
+use crate::userbot::Userbot;
 
-// ── 1. handler ───────────────────────────────────────────────────────────────
+// ── 1. deps ──────────────────────────────────────────────────────────────────
 
-// Everything a tool handler may touch, built once in `main` and shared by
-// every session. A handler's reach is exactly this struct — no globals.
+// Built once in the composition root and shared by every session. A
+// handler's reach is exactly this struct — no globals, no service locators.
 pub struct Deps {
     pub settings: Settings,
     pub signals: Signals,
     pub scheduler: Scheduler,
-    pub telegram: TelegramConfig,
+    pub telegram: TelegramModule,
+    pub gmail: GmailModule,
+    pub monobank: Monobank,
+    pub userbot: Userbot,
+    pub skills: SkillCatalog,
+    // The SSRF-guarded client behind fetch_url (fetch.rs).
+    pub fetcher: reqwest::Client,
+    // Where downloaded attachments land (STORAGE_DIR, default ./storage).
+    pub storage_dir: PathBuf,
+    // The Postgres-backed domains. None when the instance runs without
+    // DATABASE_URL; `toolsets.rs` refuses a toolset that would need one, so
+    // a handler that reaches for these always finds them.
+    pub news: Option<NewsRepository>,
+    pub knowledge: Option<KnowledgeRepository>,
+    pub memory: Option<MemoryService>,
+    // Stamped onto every memory write: who the instance writes as. Audit
+    // metadata, never access control (one shared space).
+    pub memory_actor: String,
+    // Third-party MCP upstreams, re-exposed namespaced. Only on an
+    // unrestricted instance with upstreams configured.
+    pub gateway: Option<Arc<Gateway>>,
 }
 
-// One per MCP session. Cheap to build: the deps are shared and the router is
-// a clone of the one composed from the selected toolsets.
+fn not_configured(what: &str) -> ErrorData {
+    ErrorData::internal_error(format!("{what} is not configured on this instance (DATABASE_URL unset)"), None)
+}
+
+impl Deps {
+    pub fn news(&self) -> Result<&NewsRepository, ErrorData> {
+        self.news.as_ref().ok_or_else(|| not_configured("the news store"))
+    }
+
+    pub fn knowledge(&self) -> Result<&KnowledgeRepository, ErrorData> {
+        self.knowledge.as_ref().ok_or_else(|| not_configured("the knowledge base"))
+    }
+
+    pub fn memory(&self) -> Result<&MemoryService, ErrorData> {
+        self.memory.as_ref().ok_or_else(|| not_configured("unified memory"))
+    }
+}
+
+// ── 2. handler ───────────────────────────────────────────────────────────────
+
+// One per MCP session. Cheap: the deps are shared and the router is a clone
+// of the one composed from the selected toolsets.
 #[derive(Clone)]
 pub struct McpTools {
     pub(crate) deps: Arc<Deps>,
@@ -50,28 +105,86 @@ impl McpTools {
     }
 }
 
+// Own tools come first and win any name collision; gateway tools follow,
+// already namespaced (`tavily__tavily_search`). The agent sees one list.
 #[tool_handler(router = self.tool_router.clone(), name = "mcp-tools", version = "0.1.0")]
-impl ServerHandler for McpTools {}
+impl ServerHandler for McpTools {
+    async fn list_tools(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListToolsResult, ErrorData> {
+        let mut tools = self.tool_router.list_all();
+        if let Some(gateway) = &self.deps.gateway {
+            tools.extend(gateway.tools().iter().cloned());
+        }
+        Ok(ListToolsResult::with_all_items(tools))
+    }
 
-// ── 2. results ───────────────────────────────────────────────────────────────
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, ErrorData> {
+        if !self.tool_router.has_route(&request.name)
+            && let Some(gateway) = &self.deps.gateway
+            && gateway.has_tool(&request.name)
+        {
+            return Ok(gateway.call(request).await.into());
+        }
+        let tcc = ToolCallContext::new(self, request, context);
+        self.tool_router.call(tcc).await
+    }
+
+    fn get_tool(&self, name: &str) -> Option<Tool> {
+        self.tool_router.get(name).cloned().or_else(|| self.deps.gateway.as_ref()?.tool(name))
+    }
+}
+
+// ── 3. results ───────────────────────────────────────────────────────────────
+
+pub type ToolResult = Result<CallToolResult, ErrorData>;
 
 // A single text block of pretty JSON — what every tool has always returned,
 // and what clients without structured-content support can still read.
-pub fn json_result(value: &impl Serialize) -> Result<CallToolResult, ErrorData> {
-    let text = serde_json::to_string_pretty(value).map_err(internal)?;
+pub fn json_result(value: &impl Serialize) -> ToolResult {
+    let text = serde_json::to_string_pretty(value).map_err(|err| ErrorData::internal_error(err.to_string(), None))?;
     Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
 }
 
-pub fn internal(err: impl std::fmt::Display) -> ErrorData {
-    tracing::error!(%err, "tool failed");
-    ErrorData::internal_error(err.to_string(), None)
+// A failure inside a handler — an API error, a missing file — comes back as
+// an `isError` result carrying the message, which is what the TS SDK did
+// with a thrown error. The model reads it and adapts; a JSON-RPC error would
+// be invisible to it. Protocol errors (bad params) stay `ErrorData`.
+pub fn tool_failed(err: impl std::fmt::Display) -> ToolResult {
+    let text = err.to_string();
+    tracing::warn!(error = %text, "tool failed");
+    Ok(CallToolResult::error(vec![ContentBlock::text(text)]))
+}
+
+pub fn respond<T: Serialize>(result: anyhow::Result<T>) -> ToolResult {
+    match result {
+        Ok(value) => json_result(&value),
+        Err(err) => tool_failed(format!("{err:#}")),
+    }
+}
+
+// `?` for handlers: an Err becomes an isError result via `tool_failed`.
+#[macro_export]
+macro_rules! try_tool {
+    ($e:expr) => {
+        match $e {
+            Ok(value) => value,
+            Err(err) => return $crate::server::tool_failed(err),
+        }
+    };
 }
 
 pub fn invalid_params(message: &'static str) -> ErrorData {
     ErrorData::invalid_params(message, None)
 }
 
-// ── 3. sessions ──────────────────────────────────────────────────────────────
+// ── 4. sessions ──────────────────────────────────────────────────────────────
 
 // The full instance serves exactly one client — the supervisor — and a fresh
 // `initialize` means the previous one is gone (it restarted after an unclean
@@ -162,7 +275,7 @@ impl SessionManager for SessionPolicy {
     }
 }
 
-// ── 4. transport ─────────────────────────────────────────────────────────────
+// ── 5. transport ─────────────────────────────────────────────────────────────
 
 pub async fn serve_stdio(tools: McpTools, cancel: CancellationToken) -> anyhow::Result<()> {
     let running = tools.serve_with_ct(rmcp::transport::stdio(), cancel).await?;
@@ -193,11 +306,7 @@ pub async fn serve_http(
     );
     let app = axum::Router::new().nest_service("/mcp", service);
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", options.port)).await?;
-    tracing::info!(
-        addr = %listener.local_addr()?,
-        multi_session = options.multi_session,
-        "mcp http listening"
-    );
+    tracing::info!(addr = %listener.local_addr()?, multi_session = options.multi_session, "mcp http listening");
     axum::serve(listener, app).with_graceful_shutdown(cancel.cancelled_owned()).await?;
     Ok(())
 }
@@ -222,5 +331,11 @@ mod tests {
         let (second, _t2) = policy.create_session().await.unwrap();
         assert!(policy.has_session(&first).await.unwrap());
         assert!(policy.has_session(&second).await.unwrap());
+    }
+
+    #[test]
+    fn handler_failures_become_is_error_results_not_protocol_errors() {
+        let result = respond::<()>(Err(anyhow::anyhow!("Telegram sendMessage failed (400): chat not found"))).unwrap();
+        assert_eq!(result.is_error, Some(true));
     }
 }

@@ -10,13 +10,12 @@
 //                    `dreaming` toolset (list_signals)
 
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::CallToolResult;
-use rmcp::{ErrorData, schemars, tool, tool_router};
+use rmcp::{schemars, tool, tool_router};
 use rusqlite::{OptionalExtension, params_from_iter};
 use serde::{Deserialize, Serialize};
 
 use crate::db::Db;
-use crate::server::{McpTools, internal, invalid_params, json_result};
+use crate::server::{McpTools, ToolResult, invalid_params, json_result};
 use crate::telegram::TelegramConfig;
 
 // ── 1. queue ─────────────────────────────────────────────────────────────────
@@ -176,14 +175,14 @@ impl McpTools {
             queue is empty. This is the agent's only way to learn about \
             external events."
     )]
-    async fn get_next_signal(&self) -> Result<CallToolResult, ErrorData> {
+    async fn get_next_signal(&self) -> ToolResult {
         let signals = &self.deps.signals;
-        let Some(signal) = signals.pop_next().map_err(internal)? else {
+        let Some(signal) = crate::try_tool!(signals.pop_next()) else {
             return json_result(&NextSignalResult { signal: None, pending_after: 0 });
         };
         json_result(&NextSignalResult {
-            signal: Some(NextSignal { signal, env_context: env_context(&self.deps.telegram) }),
-            pending_after: signals.count_pending().map_err(internal)?,
+            signal: Some(NextSignal { signal, env_context: env_context(&self.deps.telegram.config) }),
+            pending_after: crate::try_tool!(signals.count_pending()),
         })
     }
 }
@@ -220,11 +219,11 @@ impl McpTools {
     async fn list_signals(
         &self,
         Parameters(ListSignalsParams { since, source, limit }): Parameters<ListSignalsParams>,
-    ) -> Result<CallToolResult, ErrorData> {
+    ) -> ToolResult {
         if limit.is_some_and(|l| !(1..=2000).contains(&l)) {
             return Err(invalid_params("limit must be between 1 and 2000"));
         }
-        let signals = self.deps.signals.list(&ListSignals { since, source, limit }).map_err(internal)?;
+        let signals = crate::try_tool!(self.deps.signals.list(&ListSignals { since, source, limit }));
         json_result(&ListSignalsResult { count: signals.len(), signals })
     }
 }
@@ -264,7 +263,8 @@ mod tests {
     #[test]
     fn env_context_matches_the_ts_wording() {
         assert_eq!(env_context(&TelegramConfig::default()), None);
-        let cfg = TelegramConfig { default_chat_id: Some("123".into()), topics: vec![("bills".into(), 42)] };
+        let cfg =
+            TelegramConfig { bot_token: None, default_chat_id: Some("123".into()), topics: vec![("bills".into(), 42)] };
         assert_eq!(
             env_context(&cfg).unwrap(),
             "\n## Environment\nDefault Telegram chat id: 123.\n\

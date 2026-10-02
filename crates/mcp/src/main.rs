@@ -1,65 +1,134 @@
-// Composition root of the Rust MCP server — the only place that knows the
-// whole graph. Builds every long-lived dependency once, threads it into the
-// tool handler and the pollers, and owns shutdown.
-//
-// Port status: signals, dreaming (list_signals) and scheduler are in Rust;
-// the other toolsets are refused at boot until their domain moves over (see
-// toolsets.rs). Plan and order: .claude/tasks/rust-rewrite.md.
-
-mod db;
-mod scheduler;
-mod server;
-mod settings;
-mod signals;
-mod telegram;
-mod toolsets;
+// Composition root of the MCP server — the only place that knows the whole
+// graph. Builds every long-lived dependency once, threads it into the tool
+// handler and the pollers, and owns shutdown.
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Context;
+use mcp_tools::db::Db;
+use mcp_tools::embeddings::{OpenAiEmbedder, SharedEmbedder};
+use mcp_tools::gateway::{self, Gateway};
+use mcp_tools::gmail::GmailModule;
+use mcp_tools::knowledge::KnowledgeRepository;
+use mcp_tools::memory::{MemoryService, PgMemoryStore};
+use mcp_tools::monobank::Monobank;
+use mcp_tools::news::{Habr, HackerNews, NewsProvider, NewsRepository, TelegramChannels};
+use mcp_tools::scheduler::Scheduler;
+use mcp_tools::server::{Deps, HttpOptions, McpTools};
+use mcp_tools::settings::Settings;
+use mcp_tools::signals::Signals;
+use mcp_tools::skills::SkillCatalog;
+use mcp_tools::telegram::{TelegramConfig, TelegramModule};
+use mcp_tools::userbot::Userbot;
+use mcp_tools::{fetch, news, pg, scheduler, telegram, toolsets};
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
 
-use crate::db::Db;
-use crate::scheduler::Scheduler;
-use crate::server::{Deps, HttpOptions, McpTools};
-use crate::settings::Settings;
-use crate::signals::Signals;
-use crate::telegram::TelegramConfig;
-
 const DEFAULT_DB_PATH: &str = "packages/mcp/data/tokens.db";
+const DEFAULT_GATEWAY_CONFIG: &str = "crates/mcp/gateway.config.json";
 const DEFAULT_ALLOWED_HOSTS: &str = "localhost,127.0.0.1,::1";
 
 fn env(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|v| !v.trim().is_empty())
 }
 
+struct PgModules {
+    pool: pg::PgPool,
+    news: NewsRepository,
+    knowledge: KnowledgeRepository,
+    memory: MemoryService,
+}
+
+async fn connect_pg(http: &reqwest::Client) -> anyhow::Result<PgModules> {
+    // Postgres must be up and migrated before any handler or poller touches it.
+    let pool = pg::connect(&pg::database_url()?)?;
+    pg::migrate(&pool).await.context("applying pg migrations")?;
+    let embedder: SharedEmbedder = Arc::new(OpenAiEmbedder::from_env(http.clone())?);
+    Ok(PgModules {
+        news: NewsRepository::new(pool.clone(), embedder.clone()),
+        knowledge: KnowledgeRepository::new(pool.clone(), embedder.clone()),
+        memory: MemoryService::new(Arc::new(PgMemoryStore::new(pool.clone())), embedder),
+        pool,
+    })
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // `./.env` only, like dotenv/config. dotenvy::dotenv() would also walk up
+    // parent directories and pick up some other checkout's secrets.
+    let _ = dotenvy::from_path(".env");
     // Logs go to stderr: on the stdio transport stdout is the MCP channel.
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
         .with_writer(std::io::stderr)
         .init();
 
+    // MCP_TOOLSETS narrows the surface for an instance serving one audience
+    // (the ChatGPT tunnel). Unset → everything.
     let selection = toolsets::parse_toolsets(env("MCP_TOOLSETS").as_deref())?;
-    let router = toolsets::compose_router(&selection.names)?;
     if selection.restricted {
         let names: Vec<&str> = selection.names.iter().map(|t| t.name()).collect();
         tracing::info!(toolsets = names.join(","), "restricted tool surface");
     }
+    // MCP_NO_POLLERS: tools only. The Telegram getUpdates poll is exclusive
+    // per bot, so a second poller against the same bot would 409 the droplet.
+    let pollers_enabled = env("MCP_NO_POLLERS").as_deref() != Some("1");
 
+    let http = reqwest::Client::builder().build()?;
     let db_path = env("MCP_DB_PATH").map_or_else(|| PathBuf::from(DEFAULT_DB_PATH), PathBuf::from);
+    if let Some(dir) = db_path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
     let db = Db::open(&db_path).with_context(|| format!("opening {}", db_path.display()))?;
     let settings = Settings::new(db.clone());
     let signals = Signals::new(db.clone());
     let scheduler = Scheduler::new(db.clone(), settings.clone());
+    let telegram = TelegramModule::new(TelegramConfig::from_env(), http.clone(), db.clone());
+    let gmail = GmailModule::new(db.clone(), http.clone());
+    let userbot = Userbot::new(db.clone());
+
+    // The news poller and three toolsets live on Postgres; an instance that
+    // needs none of them runs without it.
+    let needs_pg = pollers_enabled || selection.names.iter().any(|t| t.needs_postgres());
+    let pg = if needs_pg { Some(connect_pg(&http).await?) } else { None };
+
+    // Who this instance writes to shared memory as — a property of the
+    // instance, not something a client declares.
+    let memory_actor = env("MCP_MEMORY_ACTOR").unwrap_or_else(|| "mcp".into());
+    let router = toolsets::compose_router(&selection.names);
+
+    // A restricted instance never fronts upstreams: their tools arrive
+    // namespaced at runtime and can't be expressed in the allow-list.
+    let gateway = if selection.restricted {
+        None
+    } else {
+        let path = env("GATEWAY_CONFIG").map_or_else(|| PathBuf::from(DEFAULT_GATEWAY_CONFIG), PathBuf::from);
+        let upstreams = gateway::load_config(&path, &|name| std::env::var(name).ok())?;
+        if upstreams.is_empty() {
+            None
+        } else {
+            let own: Vec<String> = router.list_all().into_iter().map(|t| t.name.into_owned()).collect();
+            Some(Arc::new(Gateway::connect(upstreams, &own).await))
+        }
+    };
+
     let deps = Arc::new(Deps {
         settings,
         signals: signals.clone(),
         scheduler: scheduler.clone(),
-        telegram: TelegramConfig::from_env(),
+        telegram: telegram.clone(),
+        gmail: gmail.clone(),
+        monobank: Monobank::new(http.clone()),
+        userbot: userbot.clone(),
+        skills: SkillCatalog::new(PathBuf::from("skills"), PathBuf::from("skills.default")),
+        fetcher: fetch::guarded_client(),
+        storage_dir: env("STORAGE_DIR").map_or_else(|| PathBuf::from("./storage"), PathBuf::from),
+        news: pg.as_ref().map(|p| p.news.clone()),
+        knowledge: pg.as_ref().map(|p| p.knowledge.clone()),
+        memory: pg.as_ref().map(|p| p.memory.clone()),
+        memory_actor,
+        gateway,
     });
     let make_tools = move || McpTools::new(deps.clone(), router.clone());
 
@@ -73,14 +142,31 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    // MCP_NO_POLLERS: a tools-only instance (eval harness, the ChatGPT tunnel).
-    // The Telegram getUpdates poll is exclusive per bot, so a second poller
-    // would 409 the droplet.
-    let mut pollers = tokio::task::JoinSet::new();
-    if env("MCP_NO_POLLERS").as_deref() == Some("1") {
-        tracing::info!("MCP_NO_POLLERS=1 — tools only, pollers disabled");
+    let mut background = tokio::task::JoinSet::new();
+    // Keep-alives behind start_typing / telegram_send_status: part of the
+    // tools, not pollers, so they run on every instance.
+    background.spawn(telegram.typing.clone().run(cancel.clone()));
+    background.spawn(telegram.status.clone().run(cancel.clone()));
+    if pollers_enabled {
+        background.spawn(telegram::run_poller(
+            telegram.bot.clone(),
+            telegram.log.clone(),
+            signals.clone(),
+            telegram.config.clone(),
+            cancel.clone(),
+        ));
+        background.spawn(gmail.run_poller(signals.clone(), cancel.clone()));
+        background.spawn(scheduler::run_poller(scheduler, signals, cancel.clone()));
+        if let Some(pg) = &pg {
+            let providers: Vec<Box<dyn NewsProvider>> = vec![
+                Box::new(HackerNews::new(http.clone())),
+                Box::new(Habr::new(http.clone())),
+                Box::new(TelegramChannels::new(userbot, pg.pool.clone())),
+            ];
+            background.spawn(news::run_poller(providers, pg.news.clone(), cancel.clone()));
+        }
     } else {
-        pollers.spawn(scheduler::run_poller(scheduler, signals, cancel.clone()));
+        tracing::info!("MCP_NO_POLLERS=1 — tools only, pollers disabled");
     }
 
     let transport = env("MCP_TRANSPORT").unwrap_or_else(|| "stdio".into()).to_lowercase();
@@ -93,15 +179,15 @@ async fn main() -> anyhow::Result<()> {
             .filter(|h| !h.is_empty())
             .collect();
         let options = HttpOptions { port, allowed_hosts, multi_session: selection.restricted };
-        server::serve_http(make_tools, options, cancel.clone()).await
+        mcp_tools::server::serve_http(make_tools, options, cancel.clone()).await
     } else {
-        server::serve_stdio(make_tools(), cancel.clone()).await
+        mcp_tools::server::serve_stdio(make_tools(), cancel.clone()).await
     };
 
     // The transport ending (stdin closed, or a shutdown signal) ends the
-    // process; let the pollers observe the cancel and finish their tick.
+    // process; background tasks observe the cancel and finish their tick.
     cancel.cancel();
-    while pollers.join_next().await.is_some() {}
+    while background.join_next().await.is_some() {}
     served
 }
 
