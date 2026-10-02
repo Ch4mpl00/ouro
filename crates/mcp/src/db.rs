@@ -1,7 +1,7 @@
-// MCP-owned sqlite state: `packages/mcp/data/tokens.db`. The same file the TS
-// server uses — the Rust port must open a production DB in place, so the
-// schema here is byte-for-byte the one in `packages/mcp/data/schema.sql` and
-// the additive migrations are the ones `db/client.ts` runs on boot.
+// MCP-owned sqlite state: `crates/mcp/data/tokens.db` (MCP_DB_PATH). The
+// schema is the one the TS server created (packages/mcp/data/schema.sql
+// before the Rust port), so a production DB opens in place; the additive
+// migrations cover DBs older than that schema.
 //
 // Sections:
 //   1. handle   — `Db`, a cloneable, injected connection
@@ -55,8 +55,9 @@ impl Db {
 
 // ── 2. schema ────────────────────────────────────────────────────────────────
 
-// Mirrors packages/mcp/data/schema.sql (comments there explain each table).
 const SCHEMA: &str = r#"
+-- OAuth / session credentials per integration: Gmail tokens, the userbot's
+-- MTProto session string.
 CREATE TABLE IF NOT EXISTS integration_account (
   provider      TEXT NOT NULL,
   account_key   TEXT NOT NULL,
@@ -69,6 +70,8 @@ CREATE TABLE IF NOT EXISTS integration_account (
   PRIMARY KEY (provider, account_key)
 );
 
+-- Every message the bot sees or sends: role='user' incoming, 'assistant'
+-- outgoing. thread_id is the forum topic (NULL for non-topic / General).
 CREATE TABLE IF NOT EXISTS telegram_messages (
   id             INTEGER PRIMARY KEY AUTOINCREMENT,
   chat_id        INTEGER NOT NULL,
@@ -80,12 +83,16 @@ CREATE TABLE IF NOT EXISTS telegram_messages (
 );
 CREATE INDEX IF NOT EXISTS telegram_messages_chat_id_id ON telegram_messages(chat_id, id);
 
+-- Poller scratch space: Telegram cursor, Gmail watermarks, and three legacy
+-- KVs from pollers since folded into the scheduler.
 CREATE TABLE IF NOT EXISTS telegram_kv (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS gmail_kv (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS news_kv (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS dreaming_kv (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS news_digest_kv (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 
+-- Legacy userbot harvest, superseded by Postgres news_items (copied over by
+-- the migrate-channel-posts CLI). Kept so old DBs still open.
 CREATE TABLE IF NOT EXISTS channel_posts (
   id            INTEGER PRIMARY KEY AUTOINCREMENT,
   chat_id       TEXT NOT NULL,
@@ -102,12 +109,15 @@ CREATE TABLE IF NOT EXISTS channel_posts (
 CREATE INDEX IF NOT EXISTS channel_posts_posted_at ON channel_posts(posted_at);
 CREATE INDEX IF NOT EXISTS channel_posts_chat_posted_at ON channel_posts(chat_id, posted_at);
 
+-- User-facing settings: `timezone` (IANA), the system-task seed flag.
 CREATE TABLE IF NOT EXISTS settings (
   key        TEXT PRIMARY KEY,
   value      TEXT NOT NULL,
   updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+-- Cron-driven tasks in the user's timezone. One-shots (recurring=0) retire
+-- once last_run_at is set; cancel = DELETE. source NULL fires as `scheduler`.
 CREATE TABLE IF NOT EXISTS scheduled_tasks (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
   cron_expr   TEXT NOT NULL,
@@ -118,6 +128,8 @@ CREATE TABLE IF NOT EXISTS scheduled_tasks (
   created_at  TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+-- The signal queue: pollers enqueue, the agent pops via get_next_signal.
+-- consumed_at IS NULL = pending.
 CREATE TABLE IF NOT EXISTS signals (
   id           INTEGER PRIMARY KEY AUTOINCREMENT,
   source       TEXT NOT NULL,

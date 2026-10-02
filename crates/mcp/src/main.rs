@@ -25,7 +25,7 @@ use mcp_tools::{fetch, news, pg, scheduler, telegram, toolsets};
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
 
-const DEFAULT_DB_PATH: &str = "packages/mcp/data/tokens.db";
+const DEFAULT_DB_PATH: &str = "crates/mcp/data/tokens.db";
 const DEFAULT_GATEWAY_CONFIG: &str = "crates/mcp/gateway.config.json";
 const DEFAULT_ALLOWED_HOSTS: &str = "localhost,127.0.0.1,::1";
 
@@ -172,12 +172,15 @@ async fn main() -> anyhow::Result<()> {
     let transport = env("MCP_TRANSPORT").unwrap_or_else(|| "stdio".into()).to_lowercase();
     let served = if transport == "http" {
         let port = env("MCP_PORT").map_or(Ok(3000), |p| p.parse()).context("MCP_PORT must be a port number")?;
-        let allowed_hosts = env("MCP_ALLOWED_HOSTS")
-            .unwrap_or_else(|| DEFAULT_ALLOWED_HOSTS.into())
-            .split(',')
-            .map(|h| h.trim().to_owned())
-            .filter(|h| !h.is_empty())
-            .collect();
+        // "*" turns Host validation off — for a listener only reachable inside
+        // the compose network, where the caller's Host header isn't ours to
+        // predict (tunnel-client).
+        let raw_hosts = env("MCP_ALLOWED_HOSTS").unwrap_or_else(|| DEFAULT_ALLOWED_HOSTS.into());
+        let allowed_hosts = if raw_hosts.trim() == "*" {
+            Vec::new()
+        } else {
+            raw_hosts.split(',').map(|h| h.trim().to_owned()).filter(|h| !h.is_empty()).collect()
+        };
         let options = HttpOptions { port, allowed_hosts, multi_session: selection.restricted };
         mcp_tools::server::serve_http(make_tools, options, cancel.clone()).await
     } else {

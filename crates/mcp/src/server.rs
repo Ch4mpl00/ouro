@@ -288,6 +288,7 @@ pub struct HttpOptions {
     // Hosts (`host` or `host:port`) accepted in the Host header. rmcp only
     // accepts loopback by default, which would reject the compose service
     // names (`mcp:3000`, `mcp-tunnel:3001`) the agent and tunnel dial.
+    // Empty = no validation.
     pub allowed_hosts: Vec<String>,
     pub multi_session: bool,
 }
@@ -297,7 +298,11 @@ pub async fn serve_http(
     options: HttpOptions,
     cancel: CancellationToken,
 ) -> anyhow::Result<()> {
-    let mut config = StreamableHttpServerConfig::default().with_allowed_hosts(options.allowed_hosts);
+    let mut config = if options.allowed_hosts.is_empty() {
+        StreamableHttpServerConfig::default().disable_allowed_hosts()
+    } else {
+        StreamableHttpServerConfig::default().with_allowed_hosts(options.allowed_hosts)
+    };
     config.cancellation_token = cancel.child_token();
     let service = StreamableHttpService::new(
         move || Ok(make_tools()),

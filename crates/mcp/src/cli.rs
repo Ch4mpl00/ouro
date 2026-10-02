@@ -3,7 +3,7 @@
 
 use std::path::PathBuf;
 
-pub const DEFAULT_DB_PATH: &str = "packages/mcp/data/tokens.db";
+pub const DEFAULT_DB_PATH: &str = "crates/mcp/data/tokens.db";
 pub const EVAL_DIR: &str = "crates/mcp/eval";
 
 // `.env` like the server, plus `.env.mcp` — the CLIs run on a dev machine

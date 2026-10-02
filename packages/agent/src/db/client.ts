@@ -10,8 +10,7 @@ import * as schema from "./schema";
 // Drizzle handle for the agent's domain state (memory KV + the local trace /
 // judgement mirror), in agent.db. Built once in the composition root
 // (supervisor main / a script's main) and passed down — no module-level
-// singleton, per the workspace DI rules. Mirrors the MCP-side Drizzle setup
-// (packages/mcp/src/db/pg/client.ts), only for sqlite.
+// singleton, per the workspace DI rules.
 
 export type AgentDatabase = BetterSQLite3Database<typeof schema> & {
   $client: Database.Database;

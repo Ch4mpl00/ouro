@@ -33,19 +33,25 @@ services:
       retries: 10
     restart: unless-stopped
 
+  # The Rust MCP server (crates/mcp). It applies the sqlite schema and the
+  # Postgres migrations itself on boot, so there is no separate setup step.
   mcp:
     build: .
     image: mcp-tools-image
-    command: sh -c "pnpm setup:mcp && pnpm mcp:serve"
+    command: mcp-tools
     env_file:
       - .env.mcp
     environment:
       MCP_TRANSPORT: http
       MCP_PORT: "3000"
+      # rmcp validates the Host header (DNS-rebinding guard); the agent dials
+      # mcp:3000, the healthcheck-style probes use loopback.
+      MCP_ALLOWED_HOSTS: mcp,mcp:3000,localhost,127.0.0.1
+      MCP_DB_PATH: /app/crates/mcp/data/tokens.db
       MCP_MEMORY_ACTOR: supervisor
       DATABASE_URL: postgres://${POSTGRES_USER:-mcp}:${POSTGRES_PASSWORD:-mcp}@postgres:5432/${POSTGRES_DB:-mcp}
     volumes:
-      - mcp-data:/app/packages/mcp/data        # tokens.db, OAuth, signals, watermarks
+      - mcp-data:/app/crates/mcp/data          # tokens.db, OAuth, signals, watermarks
       - mcp-storage:/app/storage               # Gmail attachments
     expose:
       - "3000"
@@ -75,12 +81,17 @@ services:
   mcp-tunnel:
     build: .
     image: mcp-tools-image
-    command: sh -c "pnpm setup:mcp && pnpm mcp:serve"
+    command: mcp-tools
     env_file:
       - .env.mcp
     environment:
       MCP_TRANSPORT: http
       MCP_PORT: "3001"
+      # Host validation off: tunnel-client forwards requests whose Host header
+      # isn't ours to predict, and this port is only reachable inside the
+      # compose network (`expose`, never `ports`).
+      MCP_ALLOWED_HOSTS: "*"
+      MCP_DB_PATH: /app/crates/mcp/data/tokens.db
       MCP_NO_POLLERS: "1"
       MCP_TOOLSETS: news-read,telegram-send,skills,memory
       # Signs ChatGPT's writes to shared memory, so doc_history says who did
@@ -88,7 +99,7 @@ services:
       MCP_MEMORY_ACTOR: chatgpt
       DATABASE_URL: postgres://${POSTGRES_USER:-mcp}:${POSTGRES_PASSWORD:-mcp}@postgres:5432/${POSTGRES_DB:-mcp}
     volumes:
-      - mcp-data:/app/packages/mcp/data        # telegram_messages chat log (shared with mcp)
+      - mcp-data:/app/crates/mcp/data          # telegram_messages chat log (shared with mcp)
       - agent-skills:/app/skills:ro            # live skills overlay exported to ChatGPT
     # Memory lives in the shared Postgres above, so ChatGPT reads and writes
     # the SAME projects and facts as the supervisor — that is the point of the
@@ -115,9 +126,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-      # Not a correctness guarantee, only ordering: let `mcp` apply schema.sql
-      # to the shared sqlite first so the two `pnpm setup:mcp` runs are less
-      # likely to collide. `restart: unless-stopped` covers the residual race.
+      # Ordering only: let `mcp` create the shared sqlite schema first. The
+      # Postgres migrations are serialised by an advisory lock either way.
       mcp:
         condition: service_started
     restart: unless-stopped

@@ -1,10 +1,12 @@
 # mcp-tools
 
-A personal-agent system structured as two independent processes in one pnpm workspace:
+A personal-agent system structured as two independent processes in one repo:
 
-- **`packages/mcp`** — stateless MCP server. Wraps Gmail / Telegram / Monobank
-  as primitive tools and runs the pollers that turn external events into
-  signals on a queue. Knows nothing about the agent.
+- **`crates/mcp`** — stateless MCP server, in Rust (Cargo workspace at the
+  root). Wraps Gmail / Telegram / Monobank as primitive tools and runs the
+  pollers that turn external events into signals on a queue. Knows nothing
+  about the agent. Rewritten from the former TS `packages/mcp`; the rest of
+  the system is moving the same way (`.claude/tasks/rust-rewrite.md`).
 - **`packages/agent`** — agent supervisor. Pulls one signal at a time from
   MCP, loads the matching skill, runs one DeepSeek session, and stops.
   Knows nothing about MCP internals — only the actions exposed by the
@@ -15,12 +17,12 @@ the other. Deployed as two containers (`docker-compose.yml`).
 
 ## How a signal turns into action
 
-1. A poller inside `packages/mcp` fires on its own cadence — Gmail (1 min),
+1. A poller inside `crates/mcp` fires on its own cadence — Gmail (1 min),
    Telegram bot getUpdates (long-poll), userbot channels (30 min),
    scheduler (30s, fires cron rows from `scheduled_tasks`).
-2. When it sees something new, it calls `recordSignal({ source, content,
-   envContext })` which inserts a row into the `signals` queue in
-   `packages/mcp/data/tokens.db`.
+2. When it sees something new, it calls `Signals::record(source, content)`,
+   which inserts a row into the `signals` queue in
+   `crates/mcp/data/tokens.db`.
 3. The supervisor (`packages/agent/src/supervisor/main.ts`) loops on
    `get_next_signal`. Routing is by source, decided in `supervisor/module.ts`:
    `scheduler` runs through the `workflow/` module (compile → execute), every
@@ -46,28 +48,37 @@ To add a new domain: drop a `skills.default/<name>.md` + emit signals with
 
 ```
 mcp-tools/
-├── pnpm-workspace.yaml
-├── package.json            workspace orchestration scripts only
-├── tsconfig.json           shared TS config (covers both packages)
-├── .mcp.json               registers packages/mcp with Claude Code (stdio)
+├── Cargo.toml              Rust workspace (crates/*)
+├── pnpm-workspace.yaml     TS workspace (packages/*)
+├── package.json            orchestration scripts only (pnpm → tsx / cargo)
+├── tsconfig.json           shared TS config (packages/*)
+├── .mcp.json               registers the MCP server with Claude Code (stdio)
 ├── .env.mcp                MCP container env (integration creds)
 ├── .env.agent              agent container env (DeepSeek key, model)
 ├── .env.example, .env.mcp.example, .env.agent.example
 ├── docker-compose.yml      mcp + agent, plus mcp-tunnel + tunnel-client
-├── Dockerfile              one image for both
+├── Dockerfile              one image for everything (Rust stage + node stage)
 ├── skills.default/         shipped skills (git-tracked, read-only fallback)
 ├── skills/                 live overlay, gitignored; dreaming writes here
 ├── storage/                downloaded Gmail attachments (gitignored)
+├── crates/
+│   └── mcp/                                 one domain, one file — each opens with a
+│       │                                      table of contents of its sections
+│       ├── data/tokens.db                   OAuth, watermarks, signals, scheduled_tasks (gitignored)
+│       ├── gateway.config.json              third-party MCP upstreams (git-tracked, secret-free)
+│       ├── migrations/pg/*.sql              Postgres migrations (drizzle-compatible journal)
+│       ├── eval/{configs,fixtures}/         RAG eval golden set
+│       └── src/
+│           ├── main.rs                      composition root: deps, pollers, transport
+│           ├── server.rs                    handler, results, sessions, stdio/HTTP
+│           ├── toolsets.rs                  named tool groups (MCP_TOOLSETS scoping)
+│           ├── db.rs, pg.rs                 sqlite schema · Postgres pool + migrator
+│           ├── signals.rs, scheduler.rs, settings.rs, telegram.rs, gmail.rs,
+│           │   monobank.rs, userbot.rs, news.rs, knowledge.rs, memory.rs,
+│           │   skills.rs, gateway.rs, fetch.rs, pdf.rs, fs.rs, embeddings.rs
+│           ├── eval.rs, time.rs, cli.rs
+│           └── bin/                         one CLI per file (gmail-auth, embed-backfill, …)
 └── packages/
-    ├── mcp/
-    │   ├── data/{schema.sql, tokens.db}     OAuth, watermarks, signals, scheduled_tasks
-    │   └── src/
-    │       ├── server.ts                    starts pollers + HTTP/stdio transport
-    │       ├── toolsets.ts                  named tool groups (MCP_TOOLSETS scoping)
-    │       ├── gateway.config.json          third-party MCP upstreams (git-tracked, secret-free)
-    │       ├── tools/                       MCP-exposed actions
-    │       └── services/{gmail,telegram,monobank,scheduler,news,memory,pdf,signals,settings,gateway}
-    └── agent/
         ├── data/agent.db                    agent-side state (memory KV + trace mirror)
         └── src/
             ├── db/{client,memory,trace-store,schema}.ts + migrations/  Drizzle (sqlite)
@@ -88,20 +99,30 @@ mcp-tools/
             └── db/{client.ts, memory.ts}    KV helpers
 ```
 
+`target/` is the Cargo build output (gitignored).
+
 ## Stack
 
+MCP server (`crates/mcp`, Rust 2024 edition):
+- `rmcp` (official Rust MCP SDK) — stdio + Streamable HTTP, and the client
+  side of the gateway
+- `tokio` for async; `rusqlite` (bundled sqlite); `tokio-postgres` +
+  `deadpool-postgres` for Postgres, vectors passed as `'[…]'::vector` text
+- `reqwest` 0.13 (rustls) for every HTTP API — Gmail, Telegram Bot API,
+  Monobank, OpenAI embeddings are plain REST
+- `grammers` (MTProto) for the userbot; `croner` for cron; `pdf-extract`;
+  `dom_smoothie` (Readability) + `feed-rs` for news
+
+Agent (`packages/agent`, TypeScript):
 - TypeScript (ESM, `module: Preserve`, `moduleResolution: Bundler`)
 - Effect 4 (`effect@4.0.0-rc.113`, pinned) for asynchronous orchestration
-- `@modelcontextprotocol/sdk` (stdio + StreamableHTTP transport)
+- `@modelcontextprotocol/sdk` (StreamableHTTP client)
 - `better-sqlite3` for Node code; `sqlite3` CLI from Bash for ad-hoc queries
-- `googleapis` + `google-auth-library` (Gmail)
-- `telegram` (gramjs / MTProto) for userbot channel reading
-- `cron-parser` v5 for scheduled tasks
 - `openai` SDK pointed at DeepSeek (OpenAI-compatible)
 
 ## Three databases — split by ownership
 
-- **`packages/mcp/data/tokens.db`** (sqlite) — MCP's private state. OAuth
+- **`crates/mcp/data/tokens.db`** (sqlite, `MCP_DB_PATH`) — MCP's private state. OAuth
   tokens, Gmail watermarks, Telegram poll cursors, the `signals` queue,
   the `scheduled_tasks` table, userbot channel watermarks. Don't read or
   write this from agent code — go through MCP tools.
@@ -119,14 +140,17 @@ mcp-tools/
   / `memory_facts` (the read models) plus `memory_index` (the search
   projection — the only memory table with vectors). Owned by MCP; the agent
   reaches it only through MCP tools (`search_news`, `recall`, `read_doc`, …).
-  Schema lives in code at `packages/mcp/src/db/pg/schema.ts` (Drizzle ORM);
-  migrations are generated with `pnpm db:generate:pg` and applied on server
-  boot.
+  Migrations are numbered SQL files in `crates/mcp/migrations/pg/`, applied
+  on server boot by `pg.rs`, which keeps drizzle's journal table
+  (`drizzle.__drizzle_migrations`, same hashes) so a database migrated by the
+  former TS server is recognised as-is. The first four files came from
+  drizzle-kit and must stay byte-identical; add a migration as a new file +
+  a row in `pg.rs`'s `MIGRATIONS` list.
 
-Schemas: `packages/mcp/data/schema.sql` (mcp sqlite, raw),
+Schemas: `crates/mcp/src/db.rs` (mcp sqlite, created on open),
 `packages/agent/src/db/schema.ts` (agent sqlite, Drizzle),
-`packages/mcp/src/db/pg/schema.ts` (PG, Drizzle). Re-apply with `pnpm db:init`
-(idempotent); agent + PG migrations apply automatically on boot.
+`crates/mcp/migrations/pg/` (PG). Everything applies automatically on boot;
+`pnpm db:init` does it without starting the servers.
 
 For ad-hoc queries during development:
 
@@ -139,6 +163,17 @@ For multi-line / quote-heavy SQL, use a heredoc. Always single-quote
 string literals; double single quotes inside (`'O''Brien'`).
 
 ## Code structure: modules + DI
+
+The rules below are written in TypeScript terms for `packages/agent`. The
+Rust crate keeps the same discipline in its own idiom: every long-lived
+handle (sqlite `Db`, `PgPool`, the embedder, HTTP clients) is built once in
+`main.rs` (or a `src/bin/*` CLI's `main`) and passed to constructors
+(`NewsRepository::new(pool, embedder)`); tool handlers reach only
+`self.deps` (`server.rs::Deps`), never a global; generic infrastructure
+(`embeddings.rs`) declares a trait (`Embedder`) and domains supply data;
+storage behind a port (`memory.rs::MemoryStore`) so rules are tested
+against an in-memory store. Async orchestration is plain `tokio`
+(`JoinSet`, `CancellationToken`, `try_join_all`), not Effect.
 
 Domain code is organised as **modules** with explicit **dependency
 injection**. Every long-lived piece of state (DB pool, OpenAI client,
@@ -237,20 +272,26 @@ doesn't evaporate.
 
 ## MCP tools (signal-emitting + agent-callable)
 
-Defined in `packages/mcp/src/tools/`. The agent calls these via MCP; you
-also see them when running `claude` locally with `.mcp.json` registered.
+Each domain file in `crates/mcp/src/` ends with its `#[tool_router]` block.
+The agent calls these via MCP; you also see them when running `claude`
+locally with `.mcp.json` registered. A handler failure (an API error, a
+missing file) comes back as an `isError` result the model can read, not a
+protocol error — that is what the TS SDK did with a thrown error.
 
 - **Gmail** — `list_nashdom_mails`, `download_gmail_attachment`
 - **Telegram bot** — `send_telegram_message`, `edit_telegram_message`,
-  `send_telegram_chat_action`, `get_telegram_chat_history`
-- **Telegram userbot (read-only MTProto)** — `list_userbot_dialogs`,
-  `list_channel_posts`
+  `start_typing`, `send_telegram_chat_action`, `telegram_send_status`,
+  `get_telegram_chat_history`
+- **Telegram userbot (read-only MTProto)** — `list_userbot_dialogs` (channel
+  posts reach the agent through `list_news` / `search_news`)
 - **Monobank** — `list_monobank_transactions` (no poller; reactive only)
 - **News** — `list_news`, `fetch_article` (HN, Habr — both
   upsert into news_items and embed inline), `search_news` (semantic
   search across the unified store: HN, Habr, channel posts)
 - **PDF** — `read_pdf`
-- **Files** — `read_file`
+- **Files** — `read_file`; **Fetch** — `fetch_url` (SSRF-guarded at DNS
+  resolution, every redirect hop included)
+- **Knowledge base (legacy)** — `add_note`, `find_notes`
 - **Skills** — `list_skills`, `read_skill` (exact active `.md` filenames +
   contents, plus the improver's `.patch.md` overlay and the composed
   `effectiveInstructions` the agent actually runs)
@@ -263,25 +304,31 @@ also see them when running `claude` locally with `.mcp.json` registered.
   `cancel_scheduled_task`
 - **Env** — `get_timezone`, `set_timezone`
 - **Third-party (via gateway)** — when `gateway.config.json` lists upstreams,
-  `services/gateway/` makes own-MCP an MCP *client* to them too and re-exposes
+  `gateway.rs` makes own-MCP an MCP *client* to them too and re-exposes
   their tools namespaced as `${prefix}__${tool}` (e.g. `tavily__tavily_search`).
   The agent still sees one merged endpoint. Onboarding (config + secret + skill
   frontmatter, no code) is in `.claude/tasks/mcp-gateway.md`.
 
 ### Tool scoping (`MCP_TOOLSETS`)
 
-One MCP process serves one audience. `packages/mcp/src/toolsets.ts` holds the
-named toolset → registrar map (`gmail`, `telegram`, `telegram-send`,
+One MCP process serves one audience. `crates/mcp/src/toolsets.rs` holds the
+named toolset → router map (`gmail`, `telegram`, `telegram-send`,
 `monobank`, `pdf`, `fs`, `signals`, `news-read`, `knowledge`, `dreaming`,
 `userbot`, `scheduler`, `skills`, `memory`);
 `MCP_TOOLSETS=news-read,telegram-send,skills` makes an instance register only
 those groups. Unset/empty = every group, i.e. the behaviour before scoping
-existed. An unknown name is a boot error.
+existed. An unknown name is a boot error, and so is a Postgres-backed group
+(`news-read`, `knowledge`, `memory`) on an instance without `DATABASE_URL`.
 
-A **restricted instance is also multi-session** (`runHttpTransport`'s
-`multiSession`), which is what lets several agents hold a memory connection at
-once: an instance scoped to `memory` has no signals tools, so nothing races
-for signal delivery.
+A **restricted instance is also multi-session** (`server.rs::SessionPolicy`),
+which is what lets several agents hold a memory connection at once: an
+instance scoped to `memory` has no signals tools, so nothing races for signal
+delivery. The full instance keeps one session and the **newest wins** — a
+fresh `initialize` evicts the old one instead of being refused (refusing
+crash-looped the supervisor in production).
+
+rmcp validates the HTTP `Host` header; `MCP_ALLOWED_HOSTS` lists what an
+instance accepts (`*` turns the check off, used for the tunnel).
 
 Scoping works by **not registering**, so an out-of-scope tool never appears in
 `tools/list` — invisible, not merely rejected. A restricted instance also skips
@@ -293,7 +340,7 @@ auth design: `.claude/tasks/mcp-auth-and-tool-scoping.md`.
 
 One memory every agent shares — the droplet supervisor, Claude Code sessions,
 anything on the far side of the ChatGPT tunnel. Lives in
-`packages/mcp/src/services/memory/`; design and rationale in
+`crates/mcp/src/memory.rs`; design and rationale in
 `.claude/tasks/unified-memory.md`.
 
 Two read models, one search projection:
@@ -331,8 +378,9 @@ Rules worth knowing before touching the code:
 - **Indexing failure never fails a write.** Documents read and patch with the
   embedder down; `pnpm embed:backfill` drains the NULL-vector backlog.
 
-The rules live in `service.ts` and the store underneath is dumb CRUD, so the
-whole contract is tested against `store.memory.ts` without a Postgres.
+The rules live in `MemoryService` and the `MemoryStore` underneath is dumb
+CRUD, so the whole contract is tested against an in-memory store; the same
+flow also runs against Postgres when `TEST_DATABASE_URL` is set.
 
 **Who writes:** `MCP_MEMORY_ACTOR` names the instance (`supervisor` for `mcp`,
 `chatgpt` for `mcp-tunnel`) and is stamped onto every patch. Audit metadata,
@@ -358,13 +406,17 @@ volume — written by the `dreaming` skill when it self-revises).
 
 The improver writes an append-only overlay at `skills/<name>.patch.md`; the
 runtime glues it onto the end of the body with `appendPatch`, so the
-instructions in force are body + patch. **`packages/mcp/src/services/skills/`
-re-implements that composition** for the `read_skill` export — the two
-packages may not import each other, so if you change `appendPatch` (marker,
-spacing), change the MCP copy too or the export starts describing a skill
-nobody runs. `module.test.ts` pins the expected output as a literal.
+instructions in force are body + patch. **`crates/mcp/src/skills.rs`
+re-implements that composition** (`append_patch`) for the `read_skill`
+export — the two sides may not share code, so if you change `appendPatch`
+(marker, spacing), change the Rust copy too or the export starts describing a
+skill nobody runs. Its tests pin the expected output as a literal.
 
 ## Running
+
+Every `pnpm` script that touches the MCP side is a thin `cargo run --release`
+of a binary in `crates/mcp`; inside the container the same binaries are on
+`PATH` (`docker compose exec mcp embed-backfill`).
 
 - `pnpm db:init` — apply both schemas (mcp/tokens.db + agent/agent.db).
 - `pnpm mcp:serve` — start the MCP server. **Do not run locally if the
@@ -372,15 +424,16 @@ nobody runs. `module.test.ts` pins the expected output as a literal.
   second poller causes 409 Conflict.
 - `pnpm agent:start` — start the supervisor (long-running loop).
 - `pnpm gmail:auth` — one-time OAuth bootstrap. Writes to
-  `packages/mcp/data/tokens.db`.
+  `crates/mcp/data/tokens.db`.
 - `pnpm gmail:list-unread` — debug helper.
 - `pnpm telegram:get-chat-id` — discover your chat id (after sending any
   message to your bot).
-- `pnpm userbot:auth` — one-time MTProto login (phone + code).
-- `pnpm typecheck` — typecheck both packages.
-- `pnpm db:generate:pg` — regenerate Drizzle migrations after editing
-  `packages/mcp/src/db/pg/schema.ts`. The new `*.sql` file lands in
-  `packages/mcp/src/db/pg/migrations/` and is applied on next mcp boot.
+- `pnpm userbot:auth` — one-time MTProto login (phone + code). The session
+  is stored in gramjs `StringSession` format, which the Rust server imports.
+- `pnpm typecheck` — typecheck the TS packages.
+- `pnpm test:mcp` — `cargo test -p mcp-tools`. With
+  `TEST_DATABASE_URL=postgres://…` the Postgres integration tests run too
+  (point it at a throwaway pgvector database, never prod).
 - `pnpm db:generate:agent` — same for the agent sqlite schema
   (`packages/agent/src/db/schema.ts` → `packages/agent/src/db/migrations/`,
   applied on agent/judge-worker boot via `db/client.ts`).
@@ -388,9 +441,10 @@ nobody runs. `module.test.ts` pins the expected output as a literal.
   `channel_posts` table into PG `news_items` + inline-embed. Idempotent.
 - `pnpm memory:import-notes` — one-shot copy of `knowledge_base_notes` into
   memory facts (idempotent; the source table is left untouched).
-- `pnpm embed:backfill` — re-attempt embeddings for any `news_items`
-  rows where `embedding IS NULL` (typically left behind by an OpenAI
-  outage during inline embed).
+- `pnpm embed:backfill` — re-attempt embeddings left NULL by an OpenAI
+  outage during an inline embed, in news, knowledge notes and memory.
+- `pnpm eval:rag` / `eval:inspect` / `eval:snapshot` — the RAG eval harness
+  over `crates/mcp/eval/` (see its `fixtures/README.md`).
 
 Deploy: see `docker-compose.yml`. `docker compose up -d --build` on the
 droplet; named volumes (`mcp-data`, `mcp-storage`, `agent-data`,
@@ -416,7 +470,7 @@ without them:
   `MCP_NO_POLLERS=1` and
   `MCP_TOOLSETS=news-read,telegram-send,skills,memory`: news reading, one
   Telegram write, the skills export, unified memory, and no gateway. The exact
-  list is pinned by a test in `toolsets.test.ts` — if that list and this env
+  list is pinned by a test in `crates/mcp/src/toolsets.rs` — if that list and this env
   var drift apart, ChatGPT silently gets a surface nobody chose. `expose`
   only, like `mcp` — never `ports`. It shares the `mcp-data` volume because
   `send_telegram_message` appends to the `telegram_messages` chat log, and the

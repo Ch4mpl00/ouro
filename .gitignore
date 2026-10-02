@@ -37,3 +37,6 @@ packages/*/data/*.db-shm
 
 # Rust build output
 /target/
+
+# Rust MCP sqlite state (MCP_DB_PATH default)
+crates/*/data/

@@ -13,6 +13,10 @@ packages/*/data/*.db
 packages/*/data/*.db-journal
 packages/*/data/*.db-wal
 packages/*/data/*.db-shm
+crates/*/data
+
+# Rust build output — the image compiles its own
+target
 
 # Gmail attachments — runtime data, not part of image
 storage

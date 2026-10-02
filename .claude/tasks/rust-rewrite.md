@@ -1,80 +1,79 @@
-# Rewrite in Rust — packages/mcp first
+# Rewrite in Rust — the MCP server first, then the agent
 
-**Status:** in-progress
+**Status:** in-progress (MCP done on `feat/rust-rewrite`, not yet deployed; agent next)
 **Priority:** P2
-**Area:** whole repo; currently `crates/mcp`
+**Area:** whole repo; `crates/mcp` done, `packages/agent` next
 **Created:** 2026-10-02
 
 ## Context
 
-The whole system moves to Rust. `packages/mcp` goes first: it talks to the
-agent only over the MCP protocol, so a Rust `mcp` container can replace the
-TS one without the agent noticing. `packages/agent` follows once the server
-side is at parity.
-
-The Rust port lives beside the TS one in a Cargo workspace (`Cargo.toml` at
-the root, `crates/mcp`) until the swap. It opens the **same**
-`packages/mcp/data/tokens.db` and will open the same Postgres — no data
-migration, so the swap is reversible by redeploying the TS image.
+The whole system moves to Rust. The MCP server went first: it talks to the
+agent only over the MCP protocol, so the Rust `mcp` container replaces the
+TS one without the agent noticing. `packages/mcp` is deleted; `crates/mcp`
+is the server.
 
 **One domain, one file** carries over: `scheduler.rs` holds storage, cron,
-the poller and the tools; `signals.rs` the queue and its tools; and so on.
-Each domain adds its tools as a `#[tool_router(router = <x>_tools)]` block on
-`McpTools`; `toolsets.rs` maps a toolset name to that router.
+the poller and the tools; `memory.rs` the types, patch engine, projection,
+store, indexer, service and tools; and so on. Each domain adds its tools as
+a `#[tool_router(router = <x>_tools)]` block on `McpTools`; `toolsets.rs`
+maps a toolset name to that router.
 
-A toolset whose domain is not ported yet is **refused at boot**, not skipped.
-That is why the default (unset `MCP_TOOLSETS`) surface does not start yet.
+## Compatibility kept on purpose
 
-## Ported
+So the switch is reversible by redeploying the previous image:
 
-- [x] Skeleton: `main.rs` (composition root, shutdown), `server.rs` (handler,
-      stdio + Streamable HTTP, "newest wins" sessions), `toolsets.rs`
-- [x] `db.rs` — sqlite schema, additive migrations, system-task seed
-- [x] `settings.rs` — settings KV, timezone
-- [x] `signals.rs` — `signals` (get_next_signal), `dreaming` (list_signals)
-- [x] `scheduler.rs` — poller + schedule/list/cancel + get/set timezone
-- [ ] `telegram.rs` — config only so far; Bot API client, chat log,
-      long-poll poller, typing/status, `telegram` + `telegram-send` tools
-- [ ] `gmail.rs` — OAuth (`gmail:auth` CLI), poller, attachments
-- [ ] `monobank.rs`
-- [ ] `pdf.rs`, `fs.rs`, `fetch.rs` (SSRF guard)
-- [ ] Postgres layer (`sqlx` + `pgvector`) — needed by news, knowledge, memory.
-      Drizzle migrations: keep applying the existing SQL files in order and
-      read drizzle's `__drizzle_migrations` journal, so a DB migrated by TS is
-      not re-migrated
-- [ ] `embeddings.rs`, `news.rs` (HN, Habr, channel posts, article extract)
-- [ ] `knowledge.rs`, `memory.rs` (port `service.ts` with its tests first —
-      the whole contract is tested against an in-memory store)
-- [ ] `skills.rs` — keep `appendPatch` byte-identical with the agent's copy
-- [ ] `userbot.rs` — MTProto via `grammers`
-- [ ] `gateway.rs` — third-party MCP upstreams via rmcp's client
-- [ ] CLI entry points (`gmail:auth`, `userbot:auth`, `embed:backfill`, …) as
-      `[[bin]]` targets
-- [ ] Dockerfile stage + compose swap for `mcp` and `mcp-tunnel`
+- **sqlite** — the same `tokens.db` schema, created/migrated on open. Only
+  the mount point moves (`mcp-data` → `/app/crates/mcp/data`); the named
+  volume, and so the data, stays.
+- **Postgres** — `pg.rs` re-implements drizzle's migrator: same journal
+  table, same hashes, same `when` ordering. Verified both ways on a
+  throwaway pgvector DB: the Rust migrator applies nothing after the real
+  drizzle migrator, and a Rust-migrated DB `pg_dump`s to the same schema.
+  Migrations now take an advisory lock (fixes the `mcp` / `mcp-tunnel`
+  concurrent-boot race the TS server also had).
+- **Userbot** — the session stays in gramjs `StringSession` format and is
+  imported into grammers; no re-login. Confirmed against the real local
+  session (dialog listing works).
+- **Gmail** — tokens in `integration_account` exactly as googleapis stored
+  them; refresh 5 min early, retry once on 401.
+- **Wire shapes** — tool names, input field names, JSON result shapes,
+  signal content, ISO timestamps (`…000Z`) and the env-context text are
+  unchanged; `toolsets.rs` tests pin both the default and the tunnel
+  surface. A handler failure is an `isError` result, as with the TS SDK.
+- **Sessions** — newest-wins for the full instance, multi-session for a
+  restricted one; an unknown session id answers 404 "Session not found",
+  which the agent's reconnect logic already matches.
+
+## Deliberate differences
+
+- `fetch_url`'s SSRF guard runs in the HTTP client's DNS resolver, so every
+  redirect hop and a DNS answer that changed after validation are checked
+  too (the TS guard only checked the first URL).
+- `fetch_article` goes through the same guarded client.
+- rmcp validates the `Host` header: compose sets `MCP_ALLOWED_HOSTS` (`*` on
+  the tunnel, whose forwarded Host isn't predictable).
+- `.env` is read from the working directory only (dotenv/config semantics).
 
 ## Acceptance
 
-- `crates/mcp` serves the full default surface and the tunnel surface;
-  `toolsets.rs` tests pin both lists, matching `toolsets.test.ts`.
-- Running against a copy of the prod `tokens.db` + Postgres dump: no schema
-  change, all pollers emit the same signal content (the agent's skills parse
-  scheduler headers literally).
-- Compose `mcp` and `mcp-tunnel` run the Rust binary; the TS package is
-  deleted.
+- [x] Every toolset, poller and CLI ported; TS package removed.
+- [x] Unit tests + Postgres integration tests (`TEST_DATABASE_URL`).
+- [x] End-to-end HTTP smoke of the full surface against a copy of a real
+      `tokens.db` and a test Postgres.
+- [ ] Image builds (`docker compose build`) — not run in the porting
+      session.
+- [ ] Deployed on the droplet; one day of signals processed normally
+      (Telegram replies, a NashDom bill, the 08:00/09:00 digests, dreaming).
+- [ ] Agent port: `packages/agent` → `crates/agent`.
 
-## Notes
+## Deploy notes
 
-- **Host allowlist.** rmcp rejects any `Host` that is not loopback by
-  default. Compose must set `MCP_ALLOWED_HOSTS=mcp,mcp:3000` (and
-  `mcp-tunnel,mcp-tunnel:3001` on the tunnel) or the agent and tunnel-client
-  get 403.
-- **Cron semantics.** `croner` defaults match `cron-parser`: day-of-month OR
-  day-of-week, optional seconds field. Pinned by a test.
-- **Timestamps** handed to the agent keep JS `toISOString()` format
-  (`…T09:00:00.000Z`).
-- **Userbot risk.** `grammers` is younger than gramjs; the gramjs session
-  string won't carry over, so expect one `userbot:auth` re-login.
-- **Langfuse** has no Rust SDK — relevant for the agent port, not this one.
-- The 2026-07-28 MCP protocol is sessionless; rmcp serves it statelessly,
-  so "newest wins" only applies to legacy-protocol clients (the current
-  agent).
+- **Local dev**: the sqlite file moves —
+  `mkdir -p crates/mcp/data && mv packages/mcp/data/tokens.db* crates/mcp/data/`.
+- **Droplet**: a release build of the crate is heavy (hundreds of crates,
+  aws-lc). If the droplet is small, build the image elsewhere or add swap
+  before `docker compose up -d --build`.
+- **Rollback**: redeploy the previous commit; both servers read the same
+  sqlite rows, Postgres journal and userbot session.
+- `glass_pumpkin` is pinned to `2.0.0-rc0` in Cargo.lock: `grammers-crypto`
+  0.10 does not compile against rc1. Don't `cargo update` it away.
