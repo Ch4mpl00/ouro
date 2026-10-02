@@ -67,6 +67,7 @@ const MIGRATIONS: &[Migration] = &[
     Migration { when: 1780326897486, sql: include_str!("../migrations/pg/0001_fancy_omega_red.sql") },
     Migration { when: 1781001341744, sql: include_str!("../migrations/pg/0002_wooden_anthem.sql") },
     Migration { when: 1787496077308, sql: include_str!("../migrations/pg/0003_lazy_puppet_master.sql") },
+    Migration { when: 1790957842163, sql: include_str!("../migrations/pg/0004_news_chronological_indexes.sql") },
 ];
 
 const BREAKPOINT: &str = "--> statement-breakpoint";
@@ -205,18 +206,76 @@ mod tests {
                 ("5829fed5a52485b9".to_owned(), 1780326897486),
                 ("2d868dbf377baa83".to_owned(), 1781001341744),
                 ("563cc5c374b93cd7".to_owned(), 1787496077308),
+                ("ede5123f9e74197b".to_owned(), 1790957842163),
             ]
         );
     }
 
     #[test]
     fn migration_files_hash_like_drizzle_recorded_them() {
-        // The hashes the TS migrator stored. A changed byte here would make
-        // drizzle and this migrator disagree about what has been applied.
+        // The first four hashes came from TS; every applied SQL file stays
+        // immutable so both migrators agree about the migration history.
         let hashes: Vec<String> =
             MIGRATIONS.iter().map(|m| hex::encode(Sha256::digest(m.sql.as_bytes()))[..16].to_owned()).collect();
-        assert_eq!(hashes, ["6fe80692cd40ace1", "5829fed5a52485b9", "2d868dbf377baa83", "563cc5c374b93cd7"]);
+        assert_eq!(
+            hashes,
+            ["6fe80692cd40ace1", "5829fed5a52485b9", "2d868dbf377baa83", "563cc5c374b93cd7", "ede5123f9e74197b"]
+        );
         assert!(MIGRATIONS.windows(2).all(|w| w[0].when < w[1].when));
+    }
+
+    #[tokio::test]
+    async fn chronological_indexes_cover_both_directions_and_preserve_null_order() {
+        let Some(pool) = test_pool().await else { return };
+        let mut client = pool.get().await.unwrap();
+        let tx = client.transaction().await.unwrap();
+        tx.batch_execute(
+            "CREATE TEMP TABLE news_index_probe (
+                id integer PRIMARY KEY, source text NOT NULL,
+                posted_at timestamptz, body text NOT NULL
+             ) ON COMMIT DROP;
+             INSERT INTO news_index_probe
+             SELECT n, CASE WHEN n % 100 = 0 THEN 'habr' ELSE 'channel' END,
+                    CASE WHEN n % 1000 = 0 THEN NULL
+                         ELSE '2026-01-01'::timestamptz + n * interval '1 minute' END,
+                    repeat('fixture body ', 50)
+             FROM generate_series(1, 10000) AS n;",
+        )
+        .await
+        .unwrap();
+        tx.batch_execute(
+            &include_str!("../migrations/pg/0004_news_chronological_indexes.sql")
+                .replace("\"news_items\"", "\"news_index_probe\""),
+        )
+        .await
+        .unwrap();
+        tx.batch_execute("ANALYZE news_index_probe").await.unwrap();
+
+        for (filter, index) in
+            [("", "news_items_posted_at_order"), ("WHERE source = 'habr'", "news_items_source_posted_order")]
+        {
+            for direction in ["ASC", "DESC"] {
+                let select =
+                    format!("SELECT id, body FROM news_index_probe {filter} ORDER BY posted_at {direction} LIMIT 20");
+                let plan: serde_json::Value =
+                    tx.query_one(&format!("EXPLAIN (FORMAT JSON) {select}"), &[]).await.unwrap().get(0);
+                let plan = plan.to_string();
+                assert!(plan.contains(index), "{select}: {plan}");
+                assert!(!plan.contains("\"Node Type\":\"Sort\""), "{select}: {plan}");
+                let first: Option<chrono::DateTime<chrono::Utc>> = tx
+                    .query_one(
+                        &format!(
+                            "SELECT posted_at FROM news_index_probe {filter} ORDER BY posted_at {direction} LIMIT 1"
+                        ),
+                        &[],
+                    )
+                    .await
+                    .unwrap()
+                    .get(0);
+                assert_eq!(first.is_none(), direction == "DESC");
+            }
+        }
+        tx.rollback().await.unwrap();
     }
 
     #[test]
