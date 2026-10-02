@@ -34,3 +34,6 @@ packages/*/data/*.db-shm
 # but not lock files / session state).
 .claude/scheduled_tasks.lock
 .claude/projects/
+
+# Rust build output
+/target/

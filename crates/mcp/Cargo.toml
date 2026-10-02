@@ -1,0 +1,22 @@
+[package]
+name = "mcp-tools"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+axum = "0.8.9"
+chrono = "0.4.45"
+chrono-tz = "0.10.4"
+croner = "4.0.1"
+futures = "0.3.34"
+rmcp = { version = "3.5", features = ["server", "macros", "transport-io", "transport-streamable-http-server"] }
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+schemars = "1.2.2"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = { version = "1.0.151", features = ["preserve_order"] }
+thiserror = "2.0.21"
+tokio = { version = "1.53.1", features = ["full"] }
+tokio-util = "0.7.19"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
