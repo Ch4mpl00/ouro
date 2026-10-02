@@ -1,175 +1,216 @@
-// MCP-owned sqlite state: `crates/mcp/data/tokens.db` (MCP_DB_PATH). The
-// schema is the one the TS server created (packages/mcp/data/schema.sql
-// before the Rust port), so a production DB opens in place; the additive
-// migrations cover DBs older than that schema.
+// MCP-owned state: the `mcp_state` database in the same Postgres cluster as
+// the news store. OAuth tokens and the userbot session, the signal queue,
+// scheduled tasks, settings, the Telegram chat log and poller cursors.
+// (It used to be the sqlite file `tokens.db`; `import-sqlite-state` copies
+// one over.)
 //
 // Sections:
-//   1. handle   — `Db`, a cloneable, injected connection
-//   2. schema   — CREATE TABLE IF NOT EXISTS for every table
-//   3. migrate  — additive ALTERs for DBs older than the schema
-//   4. seed     — system scheduled tasks, once per fresh DB
+//   1. handle  — `Db`, a cloneable, injected pool on `mcp_state`
+//   2. locate  — which database, and creating it on first boot
+//   3. schema  — versioned migrations under an advisory lock
+//   4. seed    — system scheduled tasks, once per fresh database
+//   5. format  — timestamps as the agent has always seen them
+//   6. import  — one-shot copy of the old sqlite `tokens.db`
+//
+// A separate database rather than tables next to news_items: different
+// lifecycle (small, hot, transactional vs. large and append-mostly), and it
+// can be backed up or moved on its own.
 
 use std::path::Path;
-use std::sync::{Arc, Mutex, MutexGuard};
 
-use rusqlite::{Connection, OptionalExtension, params};
+use chrono::{DateTime, Utc};
+use serde::Serialize;
+use tokio_postgres::Config;
+
+use crate::pg::{self, PgPool};
 
 // ── 1. handle ────────────────────────────────────────────────────────────────
 
-// One connection behind a mutex, built once in the composition root and
-// cloned into every module that needs it. Statements are short point
-// lookups on tiny tables, so holding a std mutex inside an async handler is
-// cheaper than a spawn_blocking round-trip; never hold it across an await.
 #[derive(Clone)]
 pub struct Db {
-    conn: Arc<Mutex<Connection>>,
+    pool: PgPool,
 }
+
+pub type Client = deadpool_postgres::Object;
 
 impl Db {
-    pub fn open(path: &Path) -> anyhow::Result<Self> {
-        Self::init(Connection::open(path)?)
+    // Creates the database if missing, migrates it, seeds it.
+    pub async fn connect(database_url: &str) -> anyhow::Result<Self> {
+        let config = state_config(database_url)?;
+        ensure_database(database_url, &config).await?;
+        Self::open(config).await
     }
 
+    async fn open(config: Config) -> anyhow::Result<Self> {
+        let db = Self { pool: pg::connect_config(config)? };
+        let client = db.client().await?;
+        pg::lock(&client, STATE_LOCK).await?;
+        let result = async {
+            migrate(&client).await?;
+            seed_system_tasks(&client).await
+        }
+        .await;
+        pg::unlock(&client, STATE_LOCK).await?;
+        result?;
+        Ok(db)
+    }
+
+    pub async fn client(&self) -> anyhow::Result<Client> {
+        Ok(self.pool.get().await?)
+    }
+
+    // A fresh schema per test inside TEST_DATABASE_URL, selected through
+    // search_path, so parallel tests never see each other's rows. None (the
+    // test returns early) without a test database.
     #[cfg(test)]
-    pub fn open_in_memory() -> anyhow::Result<Self> {
-        Self::init(Connection::open_in_memory()?)
-    }
-
-    fn init(conn: Connection) -> anyhow::Result<Self> {
-        conn.pragma_update(None, "journal_mode", "WAL")?;
-        conn.pragma_update(None, "foreign_keys", "ON")?;
-        // CLI scripts (gmail:auth, userbot:auth) open the same file while the
-        // server runs; wait for their write lock instead of failing.
-        conn.busy_timeout(std::time::Duration::from_secs(5))?;
-        migrate(&conn)?;
-        seed_system_tasks(&conn)?;
-        Ok(Self { conn: Arc::new(Mutex::new(conn)) })
-    }
-
-    pub fn conn(&self) -> MutexGuard<'_, Connection> {
-        // A panic while holding the lock leaves sqlite itself consistent
-        // (statements are atomic), so a poisoned mutex is safe to reuse.
-        self.conn.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    pub async fn test() -> Option<Self> {
+        let url = std::env::var("TEST_DATABASE_URL").ok()?;
+        let schema = format!("t_{:016x}", rand::random::<u64>());
+        let admin = pg::connect(&url).expect("TEST_DATABASE_URL must parse");
+        admin.get().await.unwrap().batch_execute(&format!("CREATE SCHEMA {schema}")).await.unwrap();
+        let mut config: Config = url.parse().unwrap();
+        config.options(format!("-c search_path={schema}"));
+        Some(Self::open(config).await.expect("state migrations apply"))
     }
 }
 
-// ── 2. schema ────────────────────────────────────────────────────────────────
+// ── 2. locate ────────────────────────────────────────────────────────────────
 
-const SCHEMA: &str = r#"
--- OAuth / session credentials per integration: Gmail tokens, the userbot's
--- MTProto session string.
-CREATE TABLE IF NOT EXISTS integration_account (
-  provider      TEXT NOT NULL,
-  account_key   TEXT NOT NULL,
-  access_token  TEXT,
-  refresh_token TEXT,
-  expires_at    TEXT,
-  metadata      TEXT,
-  created_at    TEXT NOT NULL DEFAULT (datetime('now')),
-  updated_at    TEXT NOT NULL DEFAULT (datetime('now')),
+const DEFAULT_STATE_DB: &str = "mcp_state";
+
+// STATE_DATABASE_URL wins; otherwise DATABASE_URL with the database name
+// swapped, so compose needs no extra secret.
+fn state_config(database_url: &str) -> anyhow::Result<Config> {
+    if let Some(url) = std::env::var("STATE_DATABASE_URL").ok().filter(|v| !v.is_empty()) {
+        return Ok(url.parse()?);
+    }
+    let mut config: Config = database_url.parse()?;
+    config.dbname(DEFAULT_STATE_DB);
+    Ok(config)
+}
+
+// CREATE DATABASE through the news database's connection. Both MCP
+// instances may try at once; the loser's duplicate_database is success.
+async fn ensure_database(admin_url: &str, state: &Config) -> anyhow::Result<()> {
+    let Some(name) = state.get_dbname().map(str::to_owned) else { return Ok(()) };
+    let admin = pg::connect(admin_url)?;
+    let client = admin.get().await?;
+    if client.query_opt("SELECT 1 FROM pg_database WHERE datname = $1", &[&name]).await?.is_some() {
+        return Ok(());
+    }
+    let quoted = format!("\"{}\"", name.replace('"', "\"\""));
+    match client.batch_execute(&format!("CREATE DATABASE {quoted}")).await {
+        Ok(()) => {
+            tracing::info!(database = name, "created state database");
+            Ok(())
+        }
+        Err(err) if err.code() == Some(&tokio_postgres::error::SqlState::DUPLICATE_DATABASE) => Ok(()),
+        Err(err) => Err(err.into()),
+    }
+}
+
+// ── 3. schema ────────────────────────────────────────────────────────────────
+
+const STATE_LOCK: i64 = 0x006d_6370_5f73_7461; // "mcp_sta"
+
+// Append-only: a change is a new entry, never an edit to an applied one.
+const MIGRATIONS: &[(i32, &str)] = &[(
+    1,
+    r#"
+-- OAuth / session credentials per integration: Gmail tokens (expires_at is
+-- an ISO string, as googleapis wrote it), the userbot's MTProto session.
+CREATE TABLE integration_account (
+  provider      text NOT NULL,
+  account_key   text NOT NULL,
+  access_token  text,
+  refresh_token text,
+  expires_at    text,
+  metadata      text,
+  created_at    timestamptz NOT NULL DEFAULT now(),
+  updated_at    timestamptz NOT NULL DEFAULT now(),
   PRIMARY KEY (provider, account_key)
 );
 
--- Every message the bot sees or sends: role='user' incoming, 'assistant'
+-- Every message the bot sees or sends: role 'user' incoming, 'assistant'
 -- outgoing. thread_id is the forum topic (NULL for non-topic / General).
-CREATE TABLE IF NOT EXISTS telegram_messages (
-  id             INTEGER PRIMARY KEY AUTOINCREMENT,
-  chat_id        INTEGER NOT NULL,
-  tg_message_id  INTEGER,
-  thread_id      INTEGER,
-  role           TEXT NOT NULL CHECK (role IN ('user', 'assistant')),
-  text           TEXT NOT NULL,
-  created_at     TEXT NOT NULL DEFAULT (datetime('now'))
+CREATE TABLE telegram_messages (
+  id            bigserial PRIMARY KEY,
+  chat_id       bigint NOT NULL,
+  tg_message_id bigint,
+  thread_id     bigint,
+  role          text NOT NULL CHECK (role IN ('user', 'assistant')),
+  text          text NOT NULL,
+  created_at    timestamptz NOT NULL DEFAULT now()
 );
-CREATE INDEX IF NOT EXISTS telegram_messages_chat_id_id ON telegram_messages(chat_id, id);
+CREATE INDEX telegram_messages_chat_id_id ON telegram_messages (chat_id, id);
+CREATE INDEX telegram_messages_chat_thread_id ON telegram_messages (chat_id, thread_id, id);
 
--- Poller scratch space: Telegram cursor, Gmail watermarks, and three legacy
--- KVs from pollers since folded into the scheduler.
-CREATE TABLE IF NOT EXISTS telegram_kv (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS gmail_kv (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS news_kv (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS dreaming_kv (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS news_digest_kv (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-
--- Legacy userbot harvest, superseded by Postgres news_items (copied over by
--- the migrate-channel-posts CLI). Kept so old DBs still open.
-CREATE TABLE IF NOT EXISTS channel_posts (
-  id            INTEGER PRIMARY KEY AUTOINCREMENT,
-  chat_id       TEXT NOT NULL,
-  chat_title    TEXT,
-  chat_username TEXT,
-  tg_message_id INTEGER NOT NULL,
-  posted_at     TEXT NOT NULL,
-  text          TEXT NOT NULL,
-  views         INTEGER,
-  forwards      INTEGER,
-  fetched_at    TEXT NOT NULL DEFAULT (datetime('now')),
-  UNIQUE (chat_id, tg_message_id)
-);
-CREATE INDEX IF NOT EXISTS channel_posts_posted_at ON channel_posts(posted_at);
-CREATE INDEX IF NOT EXISTS channel_posts_chat_posted_at ON channel_posts(chat_id, posted_at);
+-- Poller cursors: Telegram's last_update_id, Gmail's per-subscription
+-- watermarks.
+CREATE TABLE telegram_kv (key text PRIMARY KEY, value text NOT NULL);
+CREATE TABLE gmail_kv (key text PRIMARY KEY, value text NOT NULL);
 
 -- User-facing settings: `timezone` (IANA), the system-task seed flag.
-CREATE TABLE IF NOT EXISTS settings (
-  key        TEXT PRIMARY KEY,
-  value      TEXT NOT NULL,
-  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+CREATE TABLE settings (
+  key        text PRIMARY KEY,
+  value      text NOT NULL,
+  updated_at timestamptz NOT NULL DEFAULT now()
 );
 
--- Cron-driven tasks in the user's timezone. One-shots (recurring=0) retire
--- once last_run_at is set; cancel = DELETE. source NULL fires as `scheduler`.
-CREATE TABLE IF NOT EXISTS scheduled_tasks (
-  id          INTEGER PRIMARY KEY AUTOINCREMENT,
-  cron_expr   TEXT NOT NULL,
-  recurring   INTEGER NOT NULL CHECK (recurring IN (0, 1)),
-  prompt      TEXT NOT NULL,
-  source      TEXT,
-  last_run_at INTEGER,
-  created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+-- Cron-driven tasks in the user's timezone. One-shots retire once
+-- last_run_at (unix seconds of the slot fired for) is set; cancel = DELETE.
+-- source NULL fires as `scheduler`.
+CREATE TABLE scheduled_tasks (
+  id          bigserial PRIMARY KEY,
+  cron_expr   text NOT NULL,
+  recurring   boolean NOT NULL,
+  prompt      text NOT NULL,
+  source      text,
+  last_run_at bigint,
+  created_at  timestamptz NOT NULL DEFAULT now()
 );
+CREATE INDEX scheduled_tasks_pending ON scheduled_tasks (recurring, last_run_at);
 
 -- The signal queue: pollers enqueue, the agent pops via get_next_signal.
--- consumed_at IS NULL = pending.
-CREATE TABLE IF NOT EXISTS signals (
-  id           INTEGER PRIMARY KEY AUTOINCREMENT,
-  source       TEXT NOT NULL,
-  content      TEXT NOT NULL,
-  created_at   TEXT NOT NULL DEFAULT (datetime('now')),
-  consumed_at  TEXT
+CREATE TABLE signals (
+  id          bigserial PRIMARY KEY,
+  source      text NOT NULL,
+  content     text NOT NULL,
+  created_at  timestamptz NOT NULL DEFAULT now(),
+  consumed_at timestamptz
 );
-CREATE INDEX IF NOT EXISTS signals_pending ON signals(consumed_at, id);
-"#;
+CREATE INDEX signals_pending ON signals (id) WHERE consumed_at IS NULL;
+"#,
+)];
 
-// ── 3. migrate ───────────────────────────────────────────────────────────────
-
-fn has_column(conn: &Connection, table: &str, column: &str) -> rusqlite::Result<bool> {
-    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
-    let names = stmt.query_map([], |row| row.get::<_, String>("name"))?;
-    for name in names {
-        if name? == column {
-            return Ok(true);
+async fn migrate(client: &Client) -> anyhow::Result<()> {
+    client
+        .batch_execute(
+            "CREATE TABLE IF NOT EXISTS state_migrations (
+               version    integer PRIMARY KEY,
+               applied_at timestamptz NOT NULL DEFAULT now()
+             )",
+        )
+        .await?;
+    let current: Option<i32> = client.query_one("SELECT max(version) FROM state_migrations", &[]).await?.get(0);
+    for (version, sql) in MIGRATIONS.iter().filter(|(v, _)| current.is_none_or(|c| *v > c)) {
+        client.batch_execute("BEGIN").await?;
+        let applied = async {
+            client.batch_execute(sql).await?;
+            client.execute("INSERT INTO state_migrations (version) VALUES ($1)", &[version]).await?;
+            anyhow::Ok(())
         }
+        .await;
+        match applied {
+            Ok(()) => client.batch_execute("COMMIT").await?,
+            Err(err) => {
+                client.batch_execute("ROLLBACK").await?;
+                return Err(err.context(format!("state migration {version}")));
+            }
+        }
+        tracing::info!(version, "state migration applied");
     }
-    Ok(false)
-}
-
-// Idempotent. CREATE IF NOT EXISTS covers new tables; columns added after a
-// table first shipped need an explicit ALTER on older DBs, and their indexes
-// can only be created once the column exists.
-fn migrate(conn: &Connection) -> rusqlite::Result<()> {
-    conn.execute_batch(SCHEMA)?;
-    if !has_column(conn, "telegram_messages", "thread_id")? {
-        conn.execute_batch("ALTER TABLE telegram_messages ADD COLUMN thread_id INTEGER")?;
-    }
-    if !has_column(conn, "scheduled_tasks", "source")? {
-        conn.execute_batch("ALTER TABLE scheduled_tasks ADD COLUMN source TEXT")?;
-    }
-    conn.execute_batch(
-        "CREATE INDEX IF NOT EXISTS telegram_messages_chat_thread_id
-           ON telegram_messages(chat_id, thread_id, id);
-         CREATE INDEX IF NOT EXISTS scheduled_tasks_pending
-           ON scheduled_tasks(recurring, last_run_at);",
-    )
+    Ok(())
 }
 
 // ── 4. seed ──────────────────────────────────────────────────────────────────
@@ -214,66 +255,316 @@ const SYSTEM_TASKS: &[SystemTask] = &[
     },
 ];
 
-// Once per fresh DB, guarded by a flag in `settings` rather than by row
-// presence: a system task the user cancelled must stay cancelled.
-fn seed_system_tasks(conn: &Connection) -> rusqlite::Result<()> {
-    let seeded: Option<String> =
-        conn.query_row("SELECT value FROM settings WHERE key = ?1", [SEEDED_FLAG], |r| r.get(0)).optional()?;
-    if seeded.is_some() {
+// Once per fresh database, guarded by a settings flag rather than row
+// presence: a system task the user cancelled must stay cancelled. An import
+// from the old sqlite file copies that flag along with the tasks.
+async fn seed_system_tasks(client: &Client) -> anyhow::Result<()> {
+    if client.query_opt("SELECT 1 FROM settings WHERE key = $1", &[&SEEDED_FLAG]).await?.is_some() {
         return Ok(());
     }
-    let tx = conn.unchecked_transaction()?;
-    for task in SYSTEM_TASKS {
-        tx.execute(
-            "INSERT INTO scheduled_tasks (cron_expr, recurring, prompt, source) VALUES (?1, 1, ?2, ?3)",
-            params![task.cron, task.prompt, task.source],
-        )?;
+    client.batch_execute("BEGIN").await?;
+    let seeded = async {
+        for task in SYSTEM_TASKS {
+            client
+                .execute(
+                    "INSERT INTO scheduled_tasks (cron_expr, recurring, prompt, source) VALUES ($1, true, $2, $3)",
+                    &[&task.cron, &task.prompt, &task.source],
+                )
+                .await?;
+        }
+        client.execute("INSERT INTO settings (key, value) VALUES ($1, '1')", &[&SEEDED_FLAG]).await?;
+        anyhow::Ok(())
     }
-    tx.execute(
-        "INSERT INTO settings (key, value) VALUES (?1, '1')
-         ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = datetime('now')",
-        [SEEDED_FLAG],
-    )?;
-    tx.commit()?;
+    .await;
+    match seeded {
+        Ok(()) => client.batch_execute("COMMIT").await?,
+        Err(err) => {
+            client.batch_execute("ROLLBACK").await?;
+            return Err(err);
+        }
+    }
     tracing::info!(count = SYSTEM_TASKS.len(), "seeded system scheduled tasks");
     Ok(())
+}
+
+// ── 5. format ────────────────────────────────────────────────────────────────
+
+// "2026-10-02 09:00:00", UTC — sqlite's datetime('now'), which is what
+// created_at / consumed_at have always looked like to the agent.
+pub fn sql_time(t: DateTime<Utc>) -> String {
+    t.format("%Y-%m-%d %H:%M:%S").to_string()
+}
+
+// ── 6. import ────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Default, Serialize, PartialEq)]
+pub struct ImportReport {
+    pub integration_accounts: usize,
+    pub telegram_messages: usize,
+    pub telegram_kv: usize,
+    pub gmail_kv: usize,
+    pub settings: usize,
+    pub scheduled_tasks: usize,
+    pub signals: usize,
+}
+
+// sqlite's datetime('now') text, read as UTC.
+fn sqlite_time(raw: Option<String>) -> Option<DateTime<Utc>> {
+    raw.as_deref().and_then(crate::time::parse_js_date)
+}
+
+fn has_table(conn: &rusqlite::Connection, table: &str) -> rusqlite::Result<bool> {
+    conn.query_row("SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = ?1", [table], |r| {
+        r.get::<_, i64>(0)
+    })
+    .map(|n| n > 0)
+}
+
+type Row = Vec<rusqlite::types::Value>;
+
+fn read_all(conn: &rusqlite::Connection, table: &str, columns: &str) -> anyhow::Result<Vec<Row>> {
+    if !has_table(conn, table)? {
+        return Ok(Vec::new());
+    }
+    let mut stmt = conn.prepare(&format!("SELECT {columns} FROM {table} ORDER BY rowid"))?;
+    let width = stmt.column_count();
+    let rows = stmt.query_map([], |r| (0..width).map(|i| r.get::<_, rusqlite::types::Value>(i)).collect())?;
+    Ok(rows.collect::<Result<_, _>>()?)
+}
+
+fn text(v: &rusqlite::types::Value) -> Option<String> {
+    match v {
+        rusqlite::types::Value::Text(s) => Some(s.clone()),
+        rusqlite::types::Value::Integer(i) => Some(i.to_string()),
+        rusqlite::types::Value::Real(f) => Some(f.to_string()),
+        _ => None,
+    }
+}
+
+fn int(v: &rusqlite::types::Value) -> Option<i64> {
+    match v {
+        rusqlite::types::Value::Integer(i) => Some(*i),
+        rusqlite::types::Value::Text(s) => s.parse().ok(),
+        _ => None,
+    }
+}
+
+// Copies the live tables of the TS-era sqlite file into a FRESH state
+// database, keeping ids (cancel_scheduled_task takes them; signal ids are in
+// traces). Refuses when the target already holds signals, messages or
+// accounts, so a second run cannot duplicate anything. The legacy tables no
+// code reads any more (news_kv, dreaming_kv, news_digest_kv, channel_posts)
+// stay behind in the file.
+pub async fn import_sqlite(db: &Db, sqlite: &Path) -> anyhow::Result<ImportReport> {
+    let (accounts, messages, tg_kv, gm_kv, settings, tasks, signals) = {
+        let conn = rusqlite::Connection::open_with_flags(sqlite, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        (
+            read_all(
+                &conn,
+                "integration_account",
+                "provider, account_key, access_token, refresh_token, expires_at, metadata, created_at, updated_at",
+            )?,
+            read_all(&conn, "telegram_messages", "id, chat_id, tg_message_id, thread_id, role, text, created_at")?,
+            read_all(&conn, "telegram_kv", "key, value")?,
+            read_all(&conn, "gmail_kv", "key, value")?,
+            read_all(&conn, "settings", "key, value, updated_at")?,
+            read_all(&conn, "scheduled_tasks", "id, cron_expr, recurring, prompt, source, last_run_at, created_at")?,
+            read_all(&conn, "signals", "id, source, content, created_at, consumed_at")?,
+        )
+    };
+
+    let mut client = db.client().await?;
+    let busy: i64 = client
+        .query_one(
+            "SELECT (SELECT count(*) FROM signals) + (SELECT count(*) FROM telegram_messages)
+                  + (SELECT count(*) FROM integration_account)",
+            &[],
+        )
+        .await?
+        .get(0);
+    anyhow::ensure!(busy == 0, "the state database already holds data — import only runs into a fresh one");
+
+    let tx = client.transaction().await?;
+    let mut report = ImportReport::default();
+    for r in &accounts {
+        tx.execute(
+            "INSERT INTO integration_account (provider, account_key, access_token, refresh_token, expires_at, metadata, created_at, updated_at)
+             VALUES ($1, $2, $3, $4, $5, $6, COALESCE($7, now()), COALESCE($8, now()))",
+            &[&text(&r[0]), &text(&r[1]), &text(&r[2]), &text(&r[3]), &text(&r[4]), &text(&r[5]), &sqlite_time(text(&r[6])), &sqlite_time(text(&r[7]))],
+        )
+        .await?;
+        report.integration_accounts += 1;
+    }
+    for r in &messages {
+        tx.execute(
+            "INSERT INTO telegram_messages (id, chat_id, tg_message_id, thread_id, role, text, created_at)
+             VALUES ($1, $2, $3, $4, $5, $6, COALESCE($7, now()))",
+            &[
+                &int(&r[0]),
+                &int(&r[1]),
+                &int(&r[2]),
+                &int(&r[3]),
+                &text(&r[4]),
+                &text(&r[5]).unwrap_or_default(),
+                &sqlite_time(text(&r[6])),
+            ],
+        )
+        .await?;
+        report.telegram_messages += 1;
+    }
+    for (table, rows, count) in
+        [("telegram_kv", &tg_kv, &mut report.telegram_kv), ("gmail_kv", &gm_kv, &mut report.gmail_kv)]
+    {
+        for r in rows {
+            tx.execute(
+                &format!("INSERT INTO {table} (key, value) VALUES ($1, $2) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value"),
+                &[&text(&r[0]), &text(&r[1])],
+            )
+            .await?;
+            *count += 1;
+        }
+    }
+    for r in &settings {
+        tx.execute(
+            "INSERT INTO settings (key, value, updated_at) VALUES ($1, $2, COALESCE($3, now()))
+             ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at",
+            &[&text(&r[0]), &text(&r[1]), &sqlite_time(text(&r[2]))],
+        )
+        .await?;
+        report.settings += 1;
+    }
+    // The fresh database seeded its own system tasks on connect; the file's
+    // tasks — including any the user cancelled or edited — replace them.
+    if !tasks.is_empty() {
+        tx.execute("DELETE FROM scheduled_tasks", &[]).await?;
+    }
+    for r in &tasks {
+        tx.execute(
+            "INSERT INTO scheduled_tasks (id, cron_expr, recurring, prompt, source, last_run_at, created_at)
+             VALUES ($1, $2, $3, $4, $5, $6, COALESCE($7, now()))",
+            &[
+                &int(&r[0]),
+                &text(&r[1]),
+                &(int(&r[2]) == Some(1)),
+                &text(&r[3]),
+                &text(&r[4]),
+                &int(&r[5]),
+                &sqlite_time(text(&r[6])),
+            ],
+        )
+        .await?;
+        report.scheduled_tasks += 1;
+    }
+    for r in &signals {
+        tx.execute(
+            "INSERT INTO signals (id, source, content, created_at, consumed_at) VALUES ($1, $2, $3, COALESCE($4, now()), $5)",
+            &[&int(&r[0]), &text(&r[1]), &text(&r[2]), &sqlite_time(text(&r[3])), &sqlite_time(text(&r[4]))],
+        )
+        .await?;
+        report.signals += 1;
+    }
+    // Explicit ids leave the sequences behind; the next insert must not
+    // collide with an imported row.
+    for table in ["telegram_messages", "scheduled_tasks", "signals"] {
+        tx.execute(
+            &format!(
+                "SELECT setval(pg_get_serial_sequence('{table}', 'id'), GREATEST((SELECT max(id) FROM {table}), 1))"
+            ),
+            &[],
+        )
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(report)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn seeds_system_tasks_once() {
-        let db = Db::open_in_memory().unwrap();
-        let conn = db.conn();
-        let count =
-            |c: &Connection| -> i64 { c.query_row("SELECT COUNT(*) FROM scheduled_tasks", [], |r| r.get(0)).unwrap() };
-        assert_eq!(count(&conn), 3);
+    #[tokio::test]
+    async fn seeds_system_tasks_once_and_respects_cancellations() {
+        let Some(db) = Db::test().await else { return };
+        let client = db.client().await.unwrap();
+        const COUNT: &str = "SELECT count(*) FROM scheduled_tasks";
+        assert_eq!(client.query_one(COUNT, &[]).await.unwrap().get::<_, i64>(0), 3);
+        client.execute("DELETE FROM scheduled_tasks WHERE source = 'dreaming'", &[]).await.unwrap();
+        migrate(&client).await.unwrap();
+        seed_system_tasks(&client).await.unwrap();
+        assert_eq!(client.query_one(COUNT, &[]).await.unwrap().get::<_, i64>(0), 2);
+    }
 
-        // A cancelled system task stays cancelled across reboots.
-        conn.execute("DELETE FROM scheduled_tasks WHERE source = 'dreaming'", []).unwrap();
-        migrate(&conn).unwrap();
-        seed_system_tasks(&conn).unwrap();
-        assert_eq!(count(&conn), 2);
+    #[tokio::test]
+    async fn imports_a_ts_era_sqlite_file_once() {
+        let Some(db) = Db::test().await else { return };
+        let path = std::env::temp_dir().join(format!("legacy-{}.db", rand::random::<u64>()));
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE integration_account (provider TEXT, account_key TEXT, access_token TEXT, refresh_token TEXT,
+                   expires_at TEXT, metadata TEXT, created_at TEXT, updated_at TEXT);
+                 INSERT INTO integration_account VALUES ('gmail', 'me@x', 'at', 'rt', '2026-10-02T10:00:00.000Z', NULL,
+                   '2026-06-01 10:00:00', '2026-06-01 10:00:00');
+                 CREATE TABLE telegram_messages (id INTEGER PRIMARY KEY, chat_id INTEGER, tg_message_id INTEGER,
+                   thread_id INTEGER, role TEXT, text TEXT, created_at TEXT);
+                 INSERT INTO telegram_messages VALUES (41, 7, 100, NULL, 'user', 'привет', '2026-10-01 09:00:00');
+                 CREATE TABLE telegram_kv (key TEXT PRIMARY KEY, value TEXT);
+                 INSERT INTO telegram_kv VALUES ('last_update_id', '555');
+                 CREATE TABLE gmail_kv (key TEXT PRIMARY KEY, value TEXT);
+                 CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT, updated_at TEXT);
+                 INSERT INTO settings VALUES ('timezone', 'Europe/Kiev', '2026-06-01 10:00:00'),
+                                             ('system.seeded_default_tasks', '1', '2026-06-01 10:00:00');
+                 CREATE TABLE scheduled_tasks (id INTEGER PRIMARY KEY, cron_expr TEXT, recurring INTEGER, prompt TEXT,
+                   source TEXT, last_run_at INTEGER, created_at TEXT);
+                 INSERT INTO scheduled_tasks VALUES (2, '0 8 * * *', 1, 'tech digest', NULL, 1780000000, '2026-06-01 10:00:00'),
+                                                    (9, '30 14 2 10 *', 0, 'take pills', NULL, NULL, '2026-10-01 10:00:00');
+                 CREATE TABLE signals (id INTEGER PRIMARY KEY, source TEXT, content TEXT, created_at TEXT, consumed_at TEXT);
+                 INSERT INTO signals VALUES (300, 'telegram', 'old', '2026-10-01 09:00:00', '2026-10-01 09:00:05'),
+                                            (301, 'gmail', 'pending', '2026-10-02 09:00:00', NULL);
+                 CREATE TABLE news_kv (key TEXT PRIMARY KEY, value TEXT);",
+            )
+            .unwrap();
+        }
+        let report = import_sqlite(&db, &path).await.unwrap();
+        assert_eq!(
+            report,
+            ImportReport {
+                integration_accounts: 1,
+                telegram_messages: 1,
+                telegram_kv: 1,
+                gmail_kv: 0,
+                settings: 2,
+                scheduled_tasks: 2,
+                signals: 2
+            }
+        );
+        // A second run is refused instead of duplicating.
+        assert!(import_sqlite(&db, &path).await.is_err());
+        std::fs::remove_file(&path).unwrap();
+
+        let signals = crate::signals::Signals::new(db.clone());
+        let popped = signals.pop_next().await.unwrap().unwrap();
+        assert_eq!((popped.id, popped.created_at.as_str()), (301, "2026-10-02 09:00:00"));
+        // Sequences moved past the imported ids.
+        assert_eq!(signals.record("x", "y").await.unwrap(), 302);
+        let tasks = crate::scheduler::Scheduler::new(db.clone(), crate::settings::Settings::new(db.clone()))
+            .list_active()
+            .await
+            .unwrap();
+        assert_eq!(tasks.iter().map(|t| t.id).collect::<Vec<_>>(), [2, 9]);
+        assert_eq!(crate::settings::Settings::new(db.clone()).timezone().await, chrono_tz::Europe::Kiev);
     }
 
     #[test]
-    fn migrates_a_pre_thread_id_db() {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(
-            "CREATE TABLE telegram_messages (
-               id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER NOT NULL,
-               tg_message_id INTEGER, role TEXT NOT NULL, text TEXT NOT NULL,
-               created_at TEXT NOT NULL DEFAULT (datetime('now')));
-             CREATE TABLE scheduled_tasks (
-               id INTEGER PRIMARY KEY AUTOINCREMENT, cron_expr TEXT NOT NULL,
-               recurring INTEGER NOT NULL, prompt TEXT NOT NULL, last_run_at INTEGER,
-               created_at TEXT NOT NULL DEFAULT (datetime('now')));",
-        )
-        .unwrap();
-        migrate(&conn).unwrap();
-        assert!(has_column(&conn, "telegram_messages", "thread_id").unwrap());
-        assert!(has_column(&conn, "scheduled_tasks", "source").unwrap());
+    fn derives_the_state_database_from_database_url() {
+        let config = state_config("postgres://u:p@postgres:5432/mcp").unwrap();
+        assert_eq!(config.get_dbname(), Some("mcp_state"));
+        assert_eq!(config.get_user(), Some("u"));
+    }
+
+    #[test]
+    fn formats_times_like_sqlite() {
+        let t = DateTime::parse_from_rfc3339("2026-10-02T09:00:00.123Z").unwrap().with_timezone(&Utc);
+        assert_eq!(sql_time(t), "2026-10-02 09:00:00");
     }
 }

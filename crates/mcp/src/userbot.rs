@@ -8,7 +8,7 @@
 //   4. tools   — `userbot` toolset: list_userbot_dialogs
 //
 // The session string is the long-lived credential: whoever has it has the
-// account. It lives only in the local sqlite store. It is kept in the exact
+// account. It lives only in the `mcp_state` database. It is kept in the exact
 // format gramjs wrote ("1" + base64(dc, address, port, 256-byte key)), so the
 // TS and Rust servers read the same row and a switch needs no re-login.
 
@@ -25,7 +25,6 @@ use grammers_client::session::{Session, SessionData};
 use grammers_client::{Client, SenderPool, SignInError, tl};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::{schemars, tool, tool_router};
-use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::sync::Mutex;
@@ -169,30 +168,41 @@ impl Userbot {
         Self { db, client: Arc::default() }
     }
 
-    pub fn saved_session(&self) -> rusqlite::Result<Option<(String, String)>> {
-        self.db
-            .conn()
-            .query_row(
-                "SELECT account_key, access_token FROM integration_account WHERE provider = ?1 ORDER BY created_at DESC LIMIT 1",
-                [PROVIDER],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+    pub async fn saved_session(&self) -> anyhow::Result<Option<(String, String)>> {
+        let row = self
+            .db
+            .client()
+            .await?
+            .query_opt(
+                "SELECT account_key, access_token FROM integration_account WHERE provider = $1 ORDER BY created_at DESC LIMIT 1",
+                &[&PROVIDER],
             )
-            .optional()
+            .await?;
+        Ok(row.map(|r| (r.get(0), r.get(1))))
     }
 
-    pub fn has_session(&self) -> bool {
-        matches!(self.saved_session(), Ok(Some(_)))
+    pub async fn has_session(&self) -> bool {
+        matches!(self.saved_session().await, Ok(Some(_)))
     }
 
-    pub fn save_session(&self, account_key: &str, session: &str, metadata: &serde_json::Value) -> rusqlite::Result<()> {
-        self.db.conn().execute(
-            "INSERT INTO integration_account (provider, account_key, access_token, metadata) VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(provider, account_key) DO UPDATE SET
-               access_token = excluded.access_token,
-               metadata = excluded.metadata,
-               updated_at = datetime('now')",
-            params![PROVIDER, account_key, session, metadata.to_string()],
-        )?;
+    pub async fn save_session(
+        &self,
+        account_key: &str,
+        session: &str,
+        metadata: &serde_json::Value,
+    ) -> anyhow::Result<()> {
+        self.db
+            .client()
+            .await?
+            .execute(
+                "INSERT INTO integration_account (provider, account_key, access_token, metadata) VALUES ($1, $2, $3, $4)
+                 ON CONFLICT (provider, account_key) DO UPDATE SET
+                   access_token = EXCLUDED.access_token,
+                   metadata = EXCLUDED.metadata,
+                   updated_at = now()",
+                &[&PROVIDER, &account_key, &session, &metadata.to_string()],
+            )
+            .await?;
         Ok(())
     }
 
@@ -201,7 +211,7 @@ impl Userbot {
         if let Some(client) = slot.as_ref() {
             return Ok(client.clone());
         }
-        let (_, raw) = self.saved_session()?.ok_or_else(|| {
+        let (_, raw) = self.saved_session().await?.ok_or_else(|| {
             anyhow::anyhow!("Telegram userbot is not authorized. Run `pnpm userbot:auth` once to log in.")
         })?;
         let creds = api_credentials()?;
@@ -325,7 +335,7 @@ pub async fn login(userbot: &Userbot, prompts: Prompts<'_>) -> anyhow::Result<(S
     let account_key = user.id().bare_id().map_or_else(|| user.id().to_string(), |id| id.to_string());
     let encoded = StringSession::from_session(&session)?.encode();
     let metadata = json!({ "username": user.username(), "firstName": user.first_name(), "phone": user.phone() });
-    userbot.save_session(&account_key, &encoded, &metadata)?;
+    userbot.save_session(&account_key, &encoded, &metadata).await?;
     client.disconnect();
     Ok((account_key, user.username().map(str::to_owned)))
 }

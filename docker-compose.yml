@@ -33,8 +33,10 @@ services:
       retries: 10
     restart: unless-stopped
 
-  # The Rust MCP server (crates/mcp). It applies the sqlite schema and the
-  # Postgres migrations itself on boot, so there is no separate setup step.
+  # The Rust MCP server (crates/mcp). All its state lives in Postgres: the
+  # news / memory store in $POSTGRES_DB, and the signal queue, tokens,
+  # scheduled tasks and chat log in a sibling database `mcp_state`, which
+  # it creates and migrates itself on boot — no setup step.
   mcp:
     build: .
     image: mcp-tools-image
@@ -47,11 +49,9 @@ services:
       # rmcp validates the Host header (DNS-rebinding guard); the agent dials
       # mcp:3000, the healthcheck-style probes use loopback.
       MCP_ALLOWED_HOSTS: mcp,mcp:3000,localhost,127.0.0.1
-      MCP_DB_PATH: /app/crates/mcp/data/tokens.db
       MCP_MEMORY_ACTOR: supervisor
       DATABASE_URL: postgres://${POSTGRES_USER:-mcp}:${POSTGRES_PASSWORD:-mcp}@postgres:5432/${POSTGRES_DB:-mcp}
     volumes:
-      - mcp-data:/app/crates/mcp/data          # tokens.db, OAuth, signals, watermarks
       - mcp-storage:/app/storage               # Gmail attachments
     expose:
       - "3000"
@@ -73,11 +73,10 @@ services:
   # MCP_NO_POLLERS=1 is mandatory: Telegram getUpdates is exclusive, and a
   # second poller against the same bot 409s the `mcp` service.
   #
-  # It DOES mount mcp-data: send_telegram_message writes every outgoing
-  # message into the `telegram_messages` table in tokens.db, so without the
-  # shared volume the chat log the agent reads would silently miss anything
-  # ChatGPT sent. mcp-storage (Gmail attachments) is deliberately NOT
-  # mounted — nothing in the restricted surface touches it.
+  # send_telegram_message writes every outgoing message into the chat log in
+  # `mcp_state`, the same Postgres database `mcp` uses, so the log the agent
+  # reads includes whatever ChatGPT sent. mcp-storage (Gmail attachments) is
+  # deliberately NOT mounted — nothing in the restricted surface touches it.
   mcp-tunnel:
     build: .
     image: mcp-tools-image
@@ -91,7 +90,6 @@ services:
       # isn't ours to predict, and this port is only reachable inside the
       # compose network (`expose`, never `ports`).
       MCP_ALLOWED_HOSTS: "*"
-      MCP_DB_PATH: /app/crates/mcp/data/tokens.db
       MCP_NO_POLLERS: "1"
       MCP_TOOLSETS: news-read,telegram-send,skills,memory
       # Signs ChatGPT's writes to shared memory, so doc_history says who did
@@ -99,7 +97,6 @@ services:
       MCP_MEMORY_ACTOR: chatgpt
       DATABASE_URL: postgres://${POSTGRES_USER:-mcp}:${POSTGRES_PASSWORD:-mcp}@postgres:5432/${POSTGRES_DB:-mcp}
     volumes:
-      - mcp-data:/app/crates/mcp/data          # telegram_messages chat log (shared with mcp)
       - agent-skills:/app/skills:ro            # live skills overlay exported to ChatGPT
     # Memory lives in the shared Postgres above, so ChatGPT reads and writes
     # the SAME projects and facts as the supervisor — that is the point of the
@@ -270,6 +267,8 @@ services:
     restart: unless-stopped
 
 volumes:
+  # The TS-era sqlite tokens.db. Nothing mounts it any more; it is kept for
+  # rollback and as the source of the one-time import-sqlite-state.
   mcp-data:
   mcp-storage:
   agent-data:

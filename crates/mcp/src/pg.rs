@@ -21,9 +21,25 @@ use tokio_postgres::NoTls;
 pub type PgPool = Pool;
 
 pub fn connect(database_url: &str) -> anyhow::Result<PgPool> {
-    let config: tokio_postgres::Config = database_url.parse()?;
+    connect_config(database_url.parse()?)
+}
+
+pub fn connect_config(config: tokio_postgres::Config) -> anyhow::Result<PgPool> {
     let manager = Manager::from_config(config, NoTls, ManagerConfig { recycling_method: RecyclingMethod::Fast });
     Ok(Pool::builder(manager).max_size(10).build()?)
+}
+
+// Session-level advisory lock around `f`'s critical section, held on one
+// pooled connection: `mcp` and `mcp-tunnel` boot against one cluster at the
+// same moment, and unserialised they would race through the same DDL.
+pub async fn lock(client: &deadpool_postgres::Object, key: i64) -> anyhow::Result<()> {
+    client.execute("SELECT pg_advisory_lock($1)", &[&key]).await?;
+    Ok(())
+}
+
+pub async fn unlock(client: &deadpool_postgres::Object, key: i64) -> anyhow::Result<()> {
+    client.execute("SELECT pg_advisory_unlock($1)", &[&key]).await?;
+    Ok(())
 }
 
 pub fn database_url() -> anyhow::Result<String> {
@@ -55,16 +71,14 @@ const MIGRATIONS: &[Migration] = &[
 
 const BREAKPOINT: &str = "--> statement-breakpoint";
 
-// `mcp` and `mcp-tunnel` boot against one database at the same moment;
-// unserialised, both would race through the same DDL. A session advisory
-// lock makes the second wait and then find nothing left to apply.
+// The second instance waits on the lock, then finds nothing left to apply.
 const MIGRATION_LOCK: i64 = 0x006d_6370_5f6d_6967; // "mcp_mig"
 
 pub async fn migrate(pool: &PgPool) -> anyhow::Result<()> {
     let mut client = pool.get().await?;
-    client.execute("SELECT pg_advisory_lock($1)", &[&MIGRATION_LOCK]).await?;
+    lock(&client, MIGRATION_LOCK).await?;
     let result = migrate_locked(&mut client).await;
-    client.execute("SELECT pg_advisory_unlock($1)", &[&MIGRATION_LOCK]).await?;
+    unlock(&client, MIGRATION_LOCK).await?;
     result
 }
 

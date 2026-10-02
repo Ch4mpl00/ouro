@@ -194,7 +194,7 @@ impl McpTools {
         if p.body.is_empty() || p.tags.as_ref().is_some_and(|t| t.len() > 12 || t.iter().any(String::is_empty)) {
             return Err(invalid_params("body must be non-empty; at most 12 non-empty tags"));
         }
-        let knowledge = self.deps.knowledge()?;
+        let knowledge = &self.deps.knowledge;
         respond(knowledge.add_note(&p.body, p.tags.as_deref(), p.source.as_deref()).await)
     }
 
@@ -214,7 +214,7 @@ impl McpTools {
         if p.query.is_empty() || p.limit.is_some_and(|l| !(1..=50).contains(&l)) {
             return Err(invalid_params("query must be non-empty; limit 1–50"));
         }
-        let knowledge = self.deps.knowledge()?;
+        let knowledge = &self.deps.knowledge;
         respond(
             async {
                 let notes = knowledge.find_notes(&p.query, p.limit.unwrap_or(10), p.tags.as_deref()).await?;

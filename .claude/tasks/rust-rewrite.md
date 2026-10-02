@@ -22,9 +22,13 @@ maps a toolset name to that router.
 
 So the switch is reversible by redeploying the previous image:
 
-- **sqlite** — the same `tokens.db` schema, created/migrated on open. Only
-  the mount point moves (`mcp-data` → `/app/crates/mcp/data`); the named
-  volume, and so the data, stays.
+- **State moved out of sqlite** into a Postgres database `mcp_state` beside
+  the news store (decided 2026-10-02). `import-sqlite-state` copies the
+  live tables once, keeping ids; the `mcp-data` volume with the old file is
+  kept, unmounted, for rollback. Consequence: rolling back to the TS server
+  after the switch means it resumes from the sqlite state as of the switch
+  (Telegram may replay up to 24 h of updates, Gmail may re-signal recent
+  mail).
 - **Postgres** — `pg.rs` re-implements drizzle's migrator: same journal
   table, same hashes, same `when` ordering. Verified both ways on a
   throwaway pgvector DB: the Rust migrator applies nothing after the real
@@ -73,7 +77,13 @@ So the switch is reversible by redeploying the previous image:
 - **Droplet**: a release build of the crate is heavy (hundreds of crates,
   aws-lc). If the droplet is small, build the image elsewhere or add swap
   before `docker compose up -d --build`.
-- **Rollback**: redeploy the previous commit; both servers read the same
-  sqlite rows, Postgres journal and userbot session.
+- **First deploy** (switch from TS): back up the sqlite file and Postgres,
+  stop `mcp` + `mcp-tunnel`, run
+  `docker compose run --rm -v agent-helper_mcp-data:/legacy:ro mcp import-sqlite-state --sqlite /legacy/tokens.db`,
+  then start the Rust services. Later deploys are plain `pnpm deploy`.
+- **Rollback**: retag the saved TS image as `mcp-tools-image:latest`, check
+  out the previous commit on the droplet, `docker compose up -d --no-build`.
+  The Postgres journal and the userbot session are shared; state written to
+  `mcp_state` after the switch is not visible to the TS server.
 - `glass_pumpkin` is pinned to `2.0.0-rc0` in Cargo.lock: `grammers-crypto`
   0.10 does not compile against rc1. Don't `cargo update` it away.

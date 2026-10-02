@@ -5,11 +5,12 @@ use mcp_tools::{cli, gmail::GmailModule};
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     cli::init();
-    let gmail = GmailModule::new(cli::open_db()?, reqwest::Client::new());
+    let gmail = GmailModule::new(cli::open_db().await?, reqwest::Client::new());
     let account = match cli::arg("account") {
         Some(a) => a,
         None => gmail
-            .resolve_account_key()?
+            .resolve_account_key()
+            .await?
             .ok_or_else(|| anyhow::anyhow!("No Gmail account in DB. Run `pnpm gmail:auth` first."))?,
     };
     let query = cli::arg("query").unwrap_or_else(|| "is:unread".into());

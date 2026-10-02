@@ -3,7 +3,8 @@
 
 use std::path::PathBuf;
 
-pub const DEFAULT_DB_PATH: &str = "crates/mcp/data/tokens.db";
+// The pre-Postgres sqlite file, read only by the one-shot importers.
+pub const LEGACY_SQLITE_PATH: &str = "packages/mcp/data/tokens.db";
 pub const EVAL_DIR: &str = "crates/mcp/eval";
 
 // `.env` like the server, plus `.env.mcp` — the CLIs run on a dev machine
@@ -28,19 +29,14 @@ pub fn arg(name: &str) -> Option<String> {
     args.iter().position(|a| *a == flag).and_then(|i| args.get(i + 1)).cloned()
 }
 
-pub fn db_path() -> PathBuf {
-    std::env::var("MCP_DB_PATH")
-        .ok()
-        .filter(|v| !v.is_empty())
-        .map_or_else(|| PathBuf::from(DEFAULT_DB_PATH), PathBuf::from)
+pub fn legacy_sqlite_path() -> PathBuf {
+    arg("sqlite").map_or_else(|| PathBuf::from(LEGACY_SQLITE_PATH), PathBuf::from)
 }
 
-pub fn open_db() -> anyhow::Result<crate::db::Db> {
-    let path = db_path();
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    crate::db::Db::open(&path)
+// The state database (`mcp_state`, next to the news store) — created and
+// migrated on open, like the server does.
+pub async fn open_db() -> anyhow::Result<crate::db::Db> {
+    crate::db::Db::connect(&crate::pg::database_url()?).await
 }
 
 pub fn prompt(message: &str) -> anyhow::Result<String> {

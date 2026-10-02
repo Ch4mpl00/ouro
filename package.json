@@ -31,6 +31,7 @@
     "db:generate:agent": "pnpm --filter @mcp-tools/agent exec drizzle-kit generate",
     "db:migrate:channel-posts": "cargo run -q --release -p mcp-tools --bin migrate-channel-posts --",
     "memory:import-notes": "cargo run -q --release -p mcp-tools --bin memory-import-notes --",
+    "import:sqlite-state": "cargo run -q --release -p mcp-tools --bin import-sqlite-state --",
     "embed:backfill": "cargo run -q --release -p mcp-tools --bin embed-backfill --",
     "eval:snapshot": "cargo run -q --release -p mcp-tools --bin eval-snapshot --",
     "eval:rag": "cargo run -q --release -p mcp-tools --bin eval-rag --",

@@ -7,7 +7,7 @@ use mcp_tools::userbot::{Prompts, Userbot, login};
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     cli::init();
-    let userbot = Userbot::new(cli::open_db()?);
+    let userbot = Userbot::new(cli::open_db().await?);
     println!("Starting Telegram userbot login (MTProto)...");
     let (account, username) = login(
         &userbot,

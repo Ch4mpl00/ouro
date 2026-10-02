@@ -9,14 +9,16 @@
 //   3. tools       — `signals` toolset (get_next_signal),
 //                    `dreaming` toolset (list_signals)
 
+use chrono::{DateTime, Utc};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::{schemars, tool, tool_router};
-use rusqlite::{OptionalExtension, params_from_iter};
 use serde::{Deserialize, Serialize};
 
-use crate::db::Db;
+use crate::db::{Db, sql_time};
+use crate::pg::{Query, where_clause};
 use crate::server::{McpTools, ToolResult, invalid_params, json_result};
 use crate::telegram::TelegramConfig;
+use crate::time::require_js_date;
 
 // ── 1. queue ─────────────────────────────────────────────────────────────────
 
@@ -25,6 +27,8 @@ pub struct Signals {
     db: Db,
 }
 
+// Timestamps go out as "YYYY-MM-DD HH:MM:SS" UTC, the shape the agent has
+// always been handed.
 #[derive(Debug, Serialize, PartialEq)]
 pub struct PendingSignal {
     pub id: i64,
@@ -45,7 +49,7 @@ pub struct SignalRow {
 #[derive(Default)]
 pub struct ListSignals {
     // Exclusive lower bound on created_at.
-    pub since: Option<String>,
+    pub since: Option<DateTime<Utc>>,
     pub source: Option<String>,
     pub limit: Option<u32>,
 }
@@ -57,62 +61,76 @@ impl Signals {
         Self { db }
     }
 
-    pub fn record(&self, source: &str, content: &str) -> rusqlite::Result<i64> {
-        let conn = self.db.conn();
-        conn.execute("INSERT INTO signals (source, content) VALUES (?1, ?2)", [source, content])?;
-        Ok(conn.last_insert_rowid())
+    pub async fn record(&self, source: &str, content: &str) -> anyhow::Result<i64> {
+        let row = self
+            .db
+            .client()
+            .await?
+            .query_one("INSERT INTO signals (source, content) VALUES ($1, $2) RETURNING id", &[&source, &content])
+            .await?;
+        Ok(row.get(0))
     }
 
-    // Atomically pops the oldest pending signal: one UPDATE … RETURNING, so a
-    // concurrent caller can never be handed the same row.
-    pub fn pop_next(&self) -> rusqlite::Result<Option<PendingSignal>> {
-        self.db
-            .conn()
-            .query_row(
-                "UPDATE signals
-                    SET consumed_at = datetime('now')
-                  WHERE id = (SELECT id FROM signals WHERE consumed_at IS NULL ORDER BY id ASC LIMIT 1)
+    // Atomically pops the oldest pending signal. SKIP LOCKED: a concurrent
+    // popper takes the next row instead of waiting, never the same one.
+    pub async fn pop_next(&self) -> anyhow::Result<Option<PendingSignal>> {
+        let row = self
+            .db
+            .client()
+            .await?
+            .query_opt(
+                "UPDATE signals SET consumed_at = now()
+                  WHERE id = (SELECT id FROM signals WHERE consumed_at IS NULL
+                               ORDER BY id ASC LIMIT 1 FOR UPDATE SKIP LOCKED)
                   RETURNING id, source, content, created_at",
-                [],
-                |r| Ok(PendingSignal { id: r.get(0)?, source: r.get(1)?, content: r.get(2)?, created_at: r.get(3)? }),
+                &[],
             )
-            .optional()
+            .await?;
+        Ok(row.map(|r| PendingSignal {
+            id: r.get(0),
+            source: r.get(1),
+            content: r.get(2),
+            created_at: sql_time(r.get(3)),
+        }))
     }
 
-    pub fn count_pending(&self) -> rusqlite::Result<i64> {
-        self.db.conn().query_row("SELECT COUNT(*) FROM signals WHERE consumed_at IS NULL", [], |r| r.get(0))
+    pub async fn count_pending(&self) -> anyhow::Result<i64> {
+        Ok(self
+            .db
+            .client()
+            .await?
+            .query_one("SELECT count(*) FROM signals WHERE consumed_at IS NULL", &[])
+            .await?
+            .get(0))
     }
 
     // Read-only view; never pops. The dreaming session reviews what happened
     // since its previous fire with this.
-    pub fn list(&self, filter: &ListSignals) -> rusqlite::Result<Vec<SignalRow>> {
-        let mut clauses = Vec::new();
-        let mut args: Vec<rusqlite::types::Value> = Vec::new();
-        if let Some(since) = &filter.since {
-            clauses.push("created_at > ?");
-            args.push(since.clone().into());
+    pub async fn list(&self, filter: &ListSignals) -> anyhow::Result<Vec<SignalRow>> {
+        let mut q = Query::default();
+        let mut filters = Vec::new();
+        if let Some(since) = filter.since {
+            filters.push(format!("created_at > {}", q.bind(since)));
         }
         if let Some(source) = &filter.source {
-            clauses.push("source = ?");
-            args.push(source.clone().into());
+            filters.push(format!("source = {}", q.bind(source.clone())));
         }
-        let filter_sql = if clauses.is_empty() { String::new() } else { format!("WHERE {}", clauses.join(" AND ")) };
-        args.push(i64::from(filter.limit.unwrap_or(DEFAULT_LIST_LIMIT)).into());
-
-        let conn = self.db.conn();
-        let mut stmt = conn.prepare(&format!(
-            "SELECT id, source, content, created_at, consumed_at FROM signals {filter_sql} ORDER BY id ASC LIMIT ?"
-        ))?;
-        let rows = stmt.query_map(params_from_iter(args), |r| {
-            Ok(SignalRow {
-                id: r.get(0)?,
-                source: r.get(1)?,
-                content: r.get(2)?,
-                created_at: r.get(3)?,
-                consumed_at: r.get(4)?,
+        let limit = q.bind(i64::from(filter.limit.unwrap_or(DEFAULT_LIST_LIMIT)));
+        let sql = format!(
+            "SELECT id, source, content, created_at, consumed_at FROM signals {} ORDER BY id ASC LIMIT {limit}",
+            where_clause(&filters)
+        );
+        let rows = self.db.client().await?.query(&sql, &q.params()).await?;
+        Ok(rows
+            .iter()
+            .map(|r| SignalRow {
+                id: r.get(0),
+                source: r.get(1),
+                content: r.get(2),
+                created_at: sql_time(r.get(3)),
+                consumed_at: r.get::<_, Option<DateTime<Utc>>>(4).map(sql_time),
             })
-        })?;
-        rows.collect()
+            .collect())
     }
 }
 
@@ -177,12 +195,12 @@ impl McpTools {
     )]
     async fn get_next_signal(&self) -> ToolResult {
         let signals = &self.deps.signals;
-        let Some(signal) = crate::try_tool!(signals.pop_next()) else {
+        let Some(signal) = crate::try_tool!(signals.pop_next().await) else {
             return json_result(&NextSignalResult { signal: None, pending_after: 0 });
         };
         json_result(&NextSignalResult {
             signal: Some(NextSignal { signal, env_context: env_context(&self.deps.telegram.config) }),
-            pending_after: crate::try_tool!(signals.count_pending()),
+            pending_after: crate::try_tool!(signals.count_pending().await),
         })
     }
 }
@@ -223,7 +241,10 @@ impl McpTools {
         if limit.is_some_and(|l| !(1..=2000).contains(&l)) {
             return Err(invalid_params("limit must be between 1 and 2000"));
         }
-        let signals = crate::try_tool!(self.deps.signals.list(&ListSignals { since, source, limit }));
+        // "YYYY-MM-DD HH:MM:SS" and full ISO both parse, so a `since` copied
+        // from a signal or from a "Previous fire:" header both work.
+        let since = crate::try_tool!(since.map(|s| require_js_date("since", &s)).transpose());
+        let signals = crate::try_tool!(self.deps.signals.list(&ListSignals { since, source, limit }).await);
         json_result(&ListSignalsResult { count: signals.len(), signals })
     }
 }
@@ -232,32 +253,50 @@ impl McpTools {
 mod tests {
     use super::*;
 
-    fn signals() -> Signals {
-        Signals::new(Db::open_in_memory().unwrap())
+    #[tokio::test]
+    async fn pops_in_fifo_order_exactly_once_even_concurrently() {
+        let Some(db) = Db::test().await else { return };
+        let s = Signals::new(db);
+        let a = s.record("telegram", "hi").await.unwrap();
+        let b = s.record("scheduler", "tick").await.unwrap();
+        assert_eq!(s.count_pending().await.unwrap(), 2);
+        let (x, y) = tokio::join!(s.pop_next(), s.pop_next());
+        let mut got = vec![x.unwrap().unwrap().id, y.unwrap().unwrap().id];
+        got.sort();
+        assert_eq!(got, [a, b]);
+        assert_eq!(s.pop_next().await.unwrap(), None);
+        assert_eq!(s.count_pending().await.unwrap(), 0);
     }
 
-    #[test]
-    fn pops_in_fifo_order_exactly_once() {
-        let s = signals();
-        let a = s.record("telegram", "hi").unwrap();
-        let b = s.record("scheduler", "tick").unwrap();
-        assert_eq!(s.count_pending().unwrap(), 2);
-        assert_eq!(s.pop_next().unwrap().map(|p| p.id), Some(a));
-        assert_eq!(s.pop_next().unwrap().map(|p| p.id), Some(b));
-        assert_eq!(s.pop_next().unwrap(), None);
-        assert_eq!(s.count_pending().unwrap(), 0);
-    }
-
-    #[test]
-    fn list_filters_without_consuming() {
-        let s = signals();
-        s.record("telegram", "a").unwrap();
-        s.record("gmail", "b").unwrap();
-        s.record("telegram", "c").unwrap();
-        let only_tg = s.list(&ListSignals { source: Some("telegram".into()), ..Default::default() }).unwrap();
+    #[tokio::test]
+    async fn list_filters_by_time_and_source_without_consuming() {
+        let Some(db) = Db::test().await else { return };
+        let s = Signals::new(db.clone());
+        s.record("telegram", "a").await.unwrap();
+        s.record("gmail", "b").await.unwrap();
+        s.record("telegram", "c").await.unwrap();
+        db.client()
+            .await
+            .unwrap()
+            .execute("UPDATE signals SET created_at = '2026-10-01 10:00:00+00' WHERE content = 'a'", &[])
+            .await
+            .unwrap();
+        let only_tg = s.list(&ListSignals { source: Some("telegram".into()), ..Default::default() }).await.unwrap();
         assert_eq!(only_tg.iter().map(|r| r.content.as_str()).collect::<Vec<_>>(), ["a", "c"]);
-        assert_eq!(s.list(&ListSignals { limit: Some(1), ..Default::default() }).unwrap().len(), 1);
-        assert_eq!(s.count_pending().unwrap(), 3);
+        assert_eq!(only_tg[0].created_at, "2026-10-01 10:00:00");
+        // A real time comparison: same-day ISO no longer loses to the sqlite
+        // text format the way string comparison did.
+        let since = require_js_date("since", "2026-10-01T10:00:00.000Z").unwrap();
+        let after: Vec<String> = s
+            .list(&ListSignals { since: Some(since), ..Default::default() })
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| r.content)
+            .collect();
+        assert_eq!(after, ["b", "c"]);
+        assert_eq!(s.list(&ListSignals { limit: Some(1), ..Default::default() }).await.unwrap().len(), 1);
+        assert_eq!(s.count_pending().await.unwrap(), 3);
     }
 
     #[test]

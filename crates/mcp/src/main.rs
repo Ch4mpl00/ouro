@@ -25,32 +25,11 @@ use mcp_tools::{fetch, news, pg, scheduler, telegram, toolsets};
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
 
-const DEFAULT_DB_PATH: &str = "crates/mcp/data/tokens.db";
 const DEFAULT_GATEWAY_CONFIG: &str = "crates/mcp/gateway.config.json";
 const DEFAULT_ALLOWED_HOSTS: &str = "localhost,127.0.0.1,::1";
 
 fn env(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|v| !v.trim().is_empty())
-}
-
-struct PgModules {
-    pool: pg::PgPool,
-    news: NewsRepository,
-    knowledge: KnowledgeRepository,
-    memory: MemoryService,
-}
-
-async fn connect_pg(http: &reqwest::Client) -> anyhow::Result<PgModules> {
-    // Postgres must be up and migrated before any handler or poller touches it.
-    let pool = pg::connect(&pg::database_url()?)?;
-    pg::migrate(&pool).await.context("applying pg migrations")?;
-    let embedder: SharedEmbedder = Arc::new(OpenAiEmbedder::from_env(http.clone())?);
-    Ok(PgModules {
-        news: NewsRepository::new(pool.clone(), embedder.clone()),
-        knowledge: KnowledgeRepository::new(pool.clone(), embedder.clone()),
-        memory: MemoryService::new(Arc::new(PgMemoryStore::new(pool.clone())), embedder),
-        pool,
-    })
 }
 
 #[tokio::main]
@@ -76,22 +55,20 @@ async fn main() -> anyhow::Result<()> {
     let pollers_enabled = env("MCP_NO_POLLERS").as_deref() != Some("1");
 
     let http = reqwest::Client::builder().build()?;
-    let db_path = env("MCP_DB_PATH").map_or_else(|| PathBuf::from(DEFAULT_DB_PATH), PathBuf::from);
-    if let Some(dir) = db_path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    let db = Db::open(&db_path).with_context(|| format!("opening {}", db_path.display()))?;
+    // Both databases must be up and migrated before any handler or poller
+    // touches them: the news / memory store, and `mcp_state` beside it.
+    let database_url = pg::database_url()?;
+    let pool = pg::connect(&database_url)?;
+    pg::migrate(&pool).await.context("applying pg migrations")?;
+    let db = Db::connect(&database_url).await.context("opening the state database")?;
+    let embedder: SharedEmbedder = Arc::new(OpenAiEmbedder::from_env(http.clone())?);
+    let news_repo = NewsRepository::new(pool.clone(), embedder.clone());
     let settings = Settings::new(db.clone());
     let signals = Signals::new(db.clone());
     let scheduler = Scheduler::new(db.clone(), settings.clone());
     let telegram = TelegramModule::new(TelegramConfig::from_env(), http.clone(), db.clone());
     let gmail = GmailModule::new(db.clone(), http.clone());
     let userbot = Userbot::new(db.clone());
-
-    // The news poller and three toolsets live on Postgres; an instance that
-    // needs none of them runs without it.
-    let needs_pg = pollers_enabled || selection.names.iter().any(|t| t.needs_postgres());
-    let pg = if needs_pg { Some(connect_pg(&http).await?) } else { None };
 
     // Who this instance writes to shared memory as — a property of the
     // instance, not something a client declares.
@@ -124,9 +101,9 @@ async fn main() -> anyhow::Result<()> {
         skills: SkillCatalog::new(PathBuf::from("skills"), PathBuf::from("skills.default")),
         fetcher: fetch::guarded_client(),
         storage_dir: env("STORAGE_DIR").map_or_else(|| PathBuf::from("./storage"), PathBuf::from),
-        news: pg.as_ref().map(|p| p.news.clone()),
-        knowledge: pg.as_ref().map(|p| p.knowledge.clone()),
-        memory: pg.as_ref().map(|p| p.memory.clone()),
+        news: news_repo.clone(),
+        knowledge: KnowledgeRepository::new(pool.clone(), embedder.clone()),
+        memory: MemoryService::new(Arc::new(PgMemoryStore::new(pool.clone())), embedder),
         memory_actor,
         gateway,
     });
@@ -157,14 +134,12 @@ async fn main() -> anyhow::Result<()> {
         ));
         background.spawn(gmail.run_poller(signals.clone(), cancel.clone()));
         background.spawn(scheduler::run_poller(scheduler, signals, cancel.clone()));
-        if let Some(pg) = &pg {
-            let providers: Vec<Box<dyn NewsProvider>> = vec![
-                Box::new(HackerNews::new(http.clone())),
-                Box::new(Habr::new(http.clone())),
-                Box::new(TelegramChannels::new(userbot, pg.pool.clone())),
-            ];
-            background.spawn(news::run_poller(providers, pg.news.clone(), cancel.clone()));
-        }
+        let providers: Vec<Box<dyn NewsProvider>> = vec![
+            Box::new(HackerNews::new(http.clone())),
+            Box::new(Habr::new(http.clone())),
+            Box::new(TelegramChannels::new(userbot, pool.clone())),
+        ];
+        background.spawn(news::run_poller(providers, news_repo, cancel.clone()));
     } else {
         tracing::info!("MCP_NO_POLLERS=1 — tools only, pollers disabled");
     }

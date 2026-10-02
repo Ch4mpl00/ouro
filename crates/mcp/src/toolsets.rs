@@ -152,12 +152,6 @@ pub fn parse_toolsets(raw: Option<&str>) -> Result<ToolsetSelection, UnknownTool
 // ── 3. routers ───────────────────────────────────────────────────────────────
 
 impl Toolset {
-    // The Postgres-backed groups. An instance without DATABASE_URL can still
-    // serve the rest; selecting one of these there is a boot error.
-    pub fn needs_postgres(self) -> bool {
-        matches!(self, Toolset::NewsRead | Toolset::Knowledge | Toolset::Memory)
-    }
-
     fn router(self) -> ToolRouter<McpTools> {
         match self {
             Toolset::Gmail => McpTools::gmail_tools(),

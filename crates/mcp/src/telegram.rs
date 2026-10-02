@@ -16,12 +16,11 @@ use std::time::{Duration, Instant};
 
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::{ErrorData, schemars, tool, tool_router};
-use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
-use crate::db::Db;
+use crate::db::{Db, sql_time};
 use crate::server::{McpTools, ToolResult, invalid_params, json_result, respond};
 use crate::signals::Signals;
 use crate::time::iso_from_unix;
@@ -288,68 +287,91 @@ impl ChatLog {
         Self { db }
     }
 
-    pub fn record(
+    pub async fn record(
         &self,
         chat_id: i64,
         tg_message_id: Option<i64>,
         thread_id: Option<i64>,
         role: Role,
         text: &str,
-    ) -> rusqlite::Result<i64> {
-        let conn = self.db.conn();
-        conn.execute(
-            "INSERT INTO telegram_messages (chat_id, tg_message_id, thread_id, role, text) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![chat_id, tg_message_id, thread_id, role.as_str(), text],
-        )?;
-        Ok(conn.last_insert_rowid())
+    ) -> anyhow::Result<i64> {
+        let row = self
+            .db
+            .client()
+            .await?
+            .query_one(
+                "INSERT INTO telegram_messages (chat_id, tg_message_id, thread_id, role, text)
+                 VALUES ($1, $2, $3, $4, $5) RETURNING id",
+                &[&chat_id, &tg_message_id, &thread_id, &role.as_str(), &text],
+            )
+            .await?;
+        Ok(row.get(0))
     }
 
     // Last `limit` messages, chronological. `thread_id` scopes to one forum
     // topic; None means every topic interleaved.
-    pub fn history(&self, chat_id: i64, limit: i64, thread_id: Option<i64>) -> rusqlite::Result<Vec<StoredMessage>> {
-        let conn = self.db.conn();
-        let row = |r: &rusqlite::Row<'_>| {
-            Ok(StoredMessage {
-                id: r.get("id")?,
-                chat_id: r.get("chat_id")?,
-                tg_message_id: r.get("tg_message_id")?,
-                thread_id: r.get("thread_id")?,
-                role: r.get("role")?,
-                text: r.get("text")?,
-                created_at: r.get("created_at")?,
+    pub async fn history(
+        &self,
+        chat_id: i64,
+        limit: i64,
+        thread_id: Option<i64>,
+    ) -> anyhow::Result<Vec<StoredMessage>> {
+        const COLUMNS: &str = "id, chat_id, tg_message_id, thread_id, role, text, created_at";
+        let client = self.db.client().await?;
+        let rows = match thread_id {
+            None => {
+                client
+                    .query(&format!("SELECT {COLUMNS} FROM telegram_messages WHERE chat_id = $1 ORDER BY id DESC LIMIT $2"), &[
+                        &chat_id, &limit,
+                    ])
+                    .await?
+            }
+            Some(thread) => {
+                client
+                    .query(
+                        &format!(
+                            "SELECT {COLUMNS} FROM telegram_messages WHERE chat_id = $1 AND thread_id = $2 ORDER BY id DESC LIMIT $3"
+                        ),
+                        &[&chat_id, &thread, &limit],
+                    )
+                    .await?
+            }
+        };
+        Ok(rows
+            .iter()
+            .rev()
+            .map(|r| StoredMessage {
+                id: r.get(0),
+                chat_id: r.get(1),
+                tg_message_id: r.get(2),
+                thread_id: r.get(3),
+                role: r.get(4),
+                text: r.get(5),
+                created_at: sql_time(r.get(6)),
             })
-        };
-        let mut rows: Vec<StoredMessage> = match thread_id {
-            None => conn
-                .prepare("SELECT * FROM telegram_messages WHERE chat_id = ?1 ORDER BY id DESC LIMIT ?2")?
-                .query_map(params![chat_id, limit], row)?
-                .collect::<Result<_, _>>()?,
-            Some(thread) => conn
-                .prepare(
-                    "SELECT * FROM telegram_messages WHERE chat_id = ?1 AND thread_id = ?2 ORDER BY id DESC LIMIT ?3",
-                )?
-                .query_map(params![chat_id, thread, limit], row)?
-                .collect::<Result<_, _>>()?,
-        };
-        rows.reverse();
-        Ok(rows)
+            .collect())
     }
 
-    fn last_update_id(&self) -> rusqlite::Result<Option<i64>> {
-        let value: Option<String> = self
+    async fn last_update_id(&self) -> anyhow::Result<Option<i64>> {
+        let row = self
             .db
-            .conn()
-            .query_row("SELECT value FROM telegram_kv WHERE key = 'last_update_id'", [], |r| r.get(0))
-            .optional()?;
-        Ok(value.and_then(|v| v.parse().ok()))
+            .client()
+            .await?
+            .query_opt("SELECT value FROM telegram_kv WHERE key = 'last_update_id'", &[])
+            .await?;
+        Ok(row.and_then(|r| r.get::<_, String>(0).parse().ok()))
     }
 
-    fn set_last_update_id(&self, id: i64) -> rusqlite::Result<()> {
-        self.db.conn().execute(
-            "INSERT INTO telegram_kv (key, value) VALUES ('last_update_id', ?1)
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            [id.to_string()],
-        )?;
+    async fn set_last_update_id(&self, id: i64) -> anyhow::Result<()> {
+        self.db
+            .client()
+            .await?
+            .execute(
+                "INSERT INTO telegram_kv (key, value) VALUES ('last_update_id', $1)
+                 ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+                &[&id.to_string()],
+            )
+            .await?;
         Ok(())
     }
 }
@@ -671,7 +693,7 @@ pub async fn run_poller(
     tracing::info!(chat = allowed_chat, timeout = LONG_POLL_TIMEOUT, "telegram poller started");
 
     loop {
-        let offset = match log.last_update_id() {
+        let offset = match log.last_update_id().await {
             Ok(last) => last.map(|id| id + 1),
             Err(err) => {
                 tracing::error!(%err, "telegram poller: reading cursor failed");
@@ -683,7 +705,7 @@ pub async fn run_poller(
             updates = bot.get_updates(offset, Some(LONG_POLL_TIMEOUT)) => updates,
         };
         let outcome = match updates {
-            Ok(updates) => ingest(&updates, allowed_chat, &log, &signals),
+            Ok(updates) => ingest(&updates, allowed_chat, &log, &signals).await,
             Err(err) => Err(err.into()),
         };
         if let Err(err) = outcome {
@@ -697,18 +719,18 @@ pub async fn run_poller(
     tracing::info!("telegram poller stopped");
 }
 
-fn ingest(updates: &[Update], allowed_chat: i64, log: &ChatLog, signals: &Signals) -> anyhow::Result<()> {
+async fn ingest(updates: &[Update], allowed_chat: i64, log: &ChatLog, signals: &Signals) -> anyhow::Result<()> {
     for update in updates {
         if let Some(msg) = update.message.as_ref().or(update.edited_message.as_ref()) {
             if msg.chat.id != allowed_chat {
                 tracing::warn!(chat = msg.chat.id, "ignoring message from a chat that is not the default one");
             } else if let Some(text) = msg.text.as_deref().filter(|t| !t.is_empty()) {
-                log.record(msg.chat.id, Some(msg.message_id), msg.message_thread_id, Role::User, text)?;
-                signals.record("telegram", &signal_content(msg.chat.id, msg.message_thread_id, text))?;
+                log.record(msg.chat.id, Some(msg.message_id), msg.message_thread_id, Role::User, text).await?;
+                signals.record("telegram", &signal_content(msg.chat.id, msg.message_thread_id, text)).await?;
                 tracing::info!(message = msg.message_id, thread = ?msg.message_thread_id, "stored message + signal queued");
             }
         }
-        log.set_last_update_id(update.update_id)?;
+        log.set_last_update_id(update.update_id).await?;
     }
     Ok(())
 }
@@ -788,7 +810,9 @@ impl McpTools {
                 // The outgoing message clears the indicator client-side; stop the
                 // keep-alive so it doesn't bleed into the next session.
                 tg.typing.stop(&target, p.message_thread_id);
-                tg.log.record(sent.chat.id, Some(sent.message_id), p.message_thread_id, Role::Assistant, &p.text)?;
+                tg.log
+                    .record(sent.chat.id, Some(sent.message_id), p.message_thread_id, Role::Assistant, &p.text)
+                    .await?;
                 Ok(json!({
                     "delivered": true,
                     "chatId": target,
@@ -958,13 +982,18 @@ impl McpTools {
             return Err(invalid_params("limit must be between 1 and 500"));
         }
         let tg = &self.deps.telegram;
-        respond((|| {
-            let chat_id = match p.chat_id {
-                ChatId::Number(n) => n,
-                ChatId::Text(s) => s.trim().parse().map_err(|_| anyhow::anyhow!("chatId must be numeric, got {s}"))?,
-            };
-            Ok(json!({ "messages": tg.log.history(chat_id, p.limit.unwrap_or(50), p.thread_id)? }))
-        })())
+        respond(
+            async {
+                let chat_id = match p.chat_id {
+                    ChatId::Number(n) => n,
+                    ChatId::Text(s) => {
+                        s.trim().parse().map_err(|_| anyhow::anyhow!("chatId must be numeric, got {s}"))?
+                    }
+                };
+                Ok(json!({ "messages": tg.log.history(chat_id, p.limit.unwrap_or(50), p.thread_id).await? }))
+            }
+            .await,
+        )
     }
 }
 
@@ -1025,9 +1054,9 @@ mod tests {
         assert_eq!(signal_content(5, None, "x"), "Telegram message in chat 5.\nText: \"x\"");
     }
 
-    #[test]
-    fn ingest_keeps_only_the_default_chat_and_advances_the_cursor() {
-        let db = Db::open_in_memory().unwrap();
+    #[tokio::test]
+    async fn ingest_keeps_only_the_default_chat_and_advances_the_cursor() {
+        let Some(db) = Db::test().await else { return };
         let (log, signals) = (ChatLog::new(db.clone()), Signals::new(db));
         let updates: Vec<Update> = serde_json::from_value(json!([
             { "update_id": 10, "message": { "message_id": 1, "chat": { "id": 7, "type": "private" }, "text": "hello" } },
@@ -1035,13 +1064,13 @@ mod tests {
             { "update_id": 12, "edited_message": { "message_id": 3, "chat": { "id": 7, "type": "supergroup" }, "text": "edited", "message_thread_id": 4 } },
         ]))
         .unwrap();
-        ingest(&updates, 7, &log, &signals).unwrap();
+        ingest(&updates, 7, &log, &signals).await.unwrap();
 
-        assert_eq!(log.last_update_id().unwrap(), Some(12));
-        let history = log.history(7, 50, None).unwrap();
+        assert_eq!(log.last_update_id().await.unwrap(), Some(12));
+        let history = log.history(7, 50, None).await.unwrap();
         assert_eq!(history.iter().map(|m| m.text.as_str()).collect::<Vec<_>>(), ["hello", "edited"]);
-        assert_eq!(log.history(7, 50, Some(4)).unwrap().len(), 1);
-        assert_eq!(signals.count_pending().unwrap(), 2);
+        assert_eq!(log.history(7, 50, Some(4)).await.unwrap().len(), 1);
+        assert_eq!(signals.count_pending().await.unwrap(), 2);
     }
 
     #[test]

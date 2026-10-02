@@ -57,36 +57,15 @@ pub struct Deps {
     pub fetcher: reqwest::Client,
     // Where downloaded attachments land (STORAGE_DIR, default ./storage).
     pub storage_dir: PathBuf,
-    // The Postgres-backed domains. None when the instance runs without
-    // DATABASE_URL; `toolsets.rs` refuses a toolset that would need one, so
-    // a handler that reaches for these always finds them.
-    pub news: Option<NewsRepository>,
-    pub knowledge: Option<KnowledgeRepository>,
-    pub memory: Option<MemoryService>,
+    pub news: NewsRepository,
+    pub knowledge: KnowledgeRepository,
+    pub memory: MemoryService,
     // Stamped onto every memory write: who the instance writes as. Audit
     // metadata, never access control (one shared space).
     pub memory_actor: String,
     // Third-party MCP upstreams, re-exposed namespaced. Only on an
     // unrestricted instance with upstreams configured.
     pub gateway: Option<Arc<Gateway>>,
-}
-
-fn not_configured(what: &str) -> ErrorData {
-    ErrorData::internal_error(format!("{what} is not configured on this instance (DATABASE_URL unset)"), None)
-}
-
-impl Deps {
-    pub fn news(&self) -> Result<&NewsRepository, ErrorData> {
-        self.news.as_ref().ok_or_else(|| not_configured("the news store"))
-    }
-
-    pub fn knowledge(&self) -> Result<&KnowledgeRepository, ErrorData> {
-        self.knowledge.as_ref().ok_or_else(|| not_configured("the knowledge base"))
-    }
-
-    pub fn memory(&self) -> Result<&MemoryService, ErrorData> {
-        self.memory.as_ref().ok_or_else(|| not_configured("unified memory"))
-    }
 }
 
 // ── 2. handler ───────────────────────────────────────────────────────────────

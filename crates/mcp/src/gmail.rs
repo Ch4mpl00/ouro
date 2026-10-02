@@ -21,7 +21,6 @@ use base64::engine::general_purpose::{GeneralPurpose, GeneralPurposeConfig};
 use chrono::Utc;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::{schemars, tool, tool_router};
-use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
@@ -127,7 +126,7 @@ impl GmailModule {
         let account = info
             .email
             .ok_or_else(|| anyhow::anyhow!("Could not resolve account email from Google userinfo response"))?;
-        self.persist_tokens(&account, &tokens)?;
+        self.persist_tokens(&account, &tokens).await?;
         Ok(account)
     }
 
@@ -142,69 +141,80 @@ impl GmailModule {
 
     // Overwrites a stored value only with a fresh non-null one: refresh
     // tokens are not always re-issued, and losing one means re-consenting.
-    fn persist_tokens(&self, account: &str, tokens: &TokenResponse) -> anyhow::Result<()> {
-        let existing = self.stored_tokens(account)?;
+    async fn persist_tokens(&self, account: &str, tokens: &TokenResponse) -> anyhow::Result<()> {
+        let existing = self.stored_tokens(account).await?;
         let access = tokens.access_token.clone().or(existing.as_ref().and_then(|e| e.access_token.clone()));
         let refresh = tokens.refresh_token.clone().or(existing.as_ref().and_then(|e| e.refresh_token.clone()));
         let expires_at = match tokens.expires_in {
             Some(secs) => iso_from_unix_ms(Utc::now().timestamp_millis() + secs * 1000),
             None => existing.and_then(|e| e.expires_at_ms).and_then(iso_from_unix_ms),
         };
-        self.db.conn().execute(
-            "INSERT INTO integration_account (provider, account_key, access_token, refresh_token, expires_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)
-             ON CONFLICT(provider, account_key) DO UPDATE SET
-               access_token = excluded.access_token,
-               refresh_token = excluded.refresh_token,
-               expires_at = excluded.expires_at,
-               updated_at = datetime('now')",
-            params![PROVIDER, account, access, refresh, expires_at],
-        )?;
+        self.db
+            .client()
+            .await?
+            .execute(
+                "INSERT INTO integration_account (provider, account_key, access_token, refresh_token, expires_at)
+                 VALUES ($1, $2, $3, $4, $5)
+                 ON CONFLICT (provider, account_key) DO UPDATE SET
+                   access_token = EXCLUDED.access_token,
+                   refresh_token = EXCLUDED.refresh_token,
+                   expires_at = EXCLUDED.expires_at,
+                   updated_at = now()",
+                &[&PROVIDER, &account, &access, &refresh, &expires_at],
+            )
+            .await?;
         Ok(())
     }
 
-    fn stored_tokens(&self, account: &str) -> rusqlite::Result<Option<StoredTokens>> {
-        self.db
-            .conn()
-            .query_row(
+    async fn stored_tokens(&self, account: &str) -> anyhow::Result<Option<StoredTokens>> {
+        let row = self
+            .db
+            .client()
+            .await?
+            .query_opt(
                 "SELECT access_token, refresh_token, expires_at FROM integration_account
-                 WHERE provider = ?1 AND account_key = ?2",
-                params![PROVIDER, account],
-                |r| {
-                    let expires_at: Option<String> = r.get(2)?;
-                    Ok(StoredTokens {
-                        access_token: r.get(0)?,
-                        refresh_token: r.get(1)?,
-                        expires_at_ms: expires_at.as_deref().and_then(parse_js_date).map(|t| t.timestamp_millis()),
-                    })
-                },
+                 WHERE provider = $1 AND account_key = $2",
+                &[&PROVIDER, &account],
             )
-            .optional()
+            .await?;
+        Ok(row.map(|r| StoredTokens {
+            access_token: r.get(0),
+            refresh_token: r.get(1),
+            expires_at_ms: r
+                .get::<_, Option<String>>(2)
+                .as_deref()
+                .and_then(parse_js_date)
+                .map(|t| t.timestamp_millis()),
+        }))
     }
 
     // GMAIL_ACCOUNT_KEY wins; otherwise the most recently authorised account.
-    pub fn resolve_account_key(&self) -> rusqlite::Result<Option<String>> {
+    pub async fn resolve_account_key(&self) -> anyhow::Result<Option<String>> {
         if let Some(key) = std::env::var("GMAIL_ACCOUNT_KEY").ok().filter(|k| !k.is_empty()) {
             return Ok(Some(key));
         }
-        self.db
-            .conn()
-            .query_row(
+        let row = self
+            .db
+            .client()
+            .await?
+            .query_opt(
                 "SELECT account_key FROM integration_account WHERE provider = 'gmail' ORDER BY created_at DESC LIMIT 1",
-                [],
-                |r| r.get(0),
+                &[],
             )
-            .optional()
+            .await?;
+        Ok(row.map(|r| r.get(0)))
     }
 
-    fn require_account_key(&self) -> anyhow::Result<String> {
-        self.resolve_account_key()?
+    async fn require_account_key(&self) -> anyhow::Result<String> {
+        self.resolve_account_key()
+            .await?
             .ok_or_else(|| anyhow::anyhow!("No authorized Gmail account; run `pnpm gmail:auth`."))
     }
 
     async fn access_token(&self, account: &str, force_refresh: bool) -> anyhow::Result<String> {
         let stored = self
-            .stored_tokens(account)?
+            .stored_tokens(account)
+            .await?
             .ok_or_else(|| anyhow::anyhow!("No Gmail account \"{account}\". Run `pnpm gmail:auth` to authorize."))?;
         let refresh = stored
             .refresh_token
@@ -226,7 +236,7 @@ impl GmailModule {
                 ("client_secret", &oauth.client_secret),
             ])
             .await?;
-        self.persist_tokens(account, &tokens)?;
+        self.persist_tokens(account, &tokens).await?;
         tokens.access_token.ok_or_else(|| anyhow::anyhow!("token refresh returned no access_token"))
     }
 
@@ -515,26 +525,33 @@ fn nashdom_content(m: &MessageSummary, attachments: &[AttachmentRef]) -> String 
 // ── 4. poller ────────────────────────────────────────────────────────────────
 
 impl GmailModule {
-    fn watermark(&self, sub: &Subscription) -> rusqlite::Result<Option<String>> {
-        self.db
-            .conn()
-            .query_row("SELECT value FROM gmail_kv WHERE key = ?1", [watermark_key(sub)], |r| r.get(0))
-            .optional()
+    async fn watermark(&self, sub: &Subscription) -> anyhow::Result<Option<String>> {
+        let row = self
+            .db
+            .client()
+            .await?
+            .query_opt("SELECT value FROM gmail_kv WHERE key = $1", &[&watermark_key(sub)])
+            .await?;
+        Ok(row.map(|r| r.get(0)))
     }
 
-    fn set_watermark(&self, sub: &Subscription, value: i64) -> rusqlite::Result<()> {
-        self.db.conn().execute(
-            "INSERT INTO gmail_kv (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            params![watermark_key(sub), value.to_string()],
-        )?;
+    async fn set_watermark(&self, sub: &Subscription, value: i64) -> anyhow::Result<()> {
+        self.db
+            .client()
+            .await?
+            .execute(
+                "INSERT INTO gmail_kv (key, value) VALUES ($1, $2) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+                &[&watermark_key(sub), &value.to_string()],
+            )
+            .await?;
         Ok(())
     }
 
     // First run on a fresh install sets the watermark to now and emits
     // nothing, rather than flooding the queue with years of old mail.
     async fn poll(&self, sub: &Subscription, account: &str, signals: &Signals) -> anyhow::Result<()> {
-        let Some(watermark) = self.watermark(sub)? else {
-            self.set_watermark(sub, Utc::now().timestamp_millis())?;
+        let Some(watermark) = self.watermark(sub).await? else {
+            self.set_watermark(sub, Utc::now().timestamp_millis()).await?;
             tracing::info!(subscription = sub.name, "bootstrapping gmail watermark, no emit");
             return Ok(());
         };
@@ -555,12 +572,12 @@ impl GmailModule {
             }
             // Attachment refs inline, so the signal is self-contained.
             let attachments = find_attachments(&self.raw_message(account, &m.id).await?);
-            signals.record(sub.signal_source, &(sub.build_content)(m, &attachments))?;
+            signals.record(sub.signal_source, &(sub.build_content)(m, &attachments)).await?;
             emitted += 1;
             newest = newest.max(at);
         }
         if newest != watermark_ms {
-            self.set_watermark(sub, newest)?;
+            self.set_watermark(sub, newest).await?;
         }
         tracing::info!(subscription = sub.name, emitted, "gmail poll done");
         Ok(())
@@ -577,7 +594,7 @@ impl GmailModule {
                         _ = cancel.cancelled() => return,
                         _ = interval.tick() => {}
                     }
-                    let account = match gmail.resolve_account_key() {
+                    let account = match gmail.resolve_account_key().await {
                         Ok(Some(account)) => account,
                         Ok(None) => {
                             tracing::warn!(subscription = sub.name, "no Gmail account authorized — skipping");
@@ -670,7 +687,7 @@ impl McpTools {
         let gmail = &self.deps.gmail;
         respond(
             async {
-                let account = gmail.require_account_key()?;
+                let account = gmail.require_account_key().await?;
                 let page = gmail
                     .list_messages(&account, NASHDOM_QUERY, p.limit.unwrap_or(25), p.page_token.as_deref())
                     .await?;
@@ -713,7 +730,7 @@ impl McpTools {
         let storage = &self.deps.storage_dir;
         respond(
             async {
-                let account = gmail.require_account_key()?;
+                let account = gmail.require_account_key().await?;
                 let bytes = gmail.attachment_data(&account, &p.message_id, &p.attachment_id).await?;
                 let path = attachment_path(storage, &account, &p.message_id, &p.attachment_id, p.filename.as_deref());
                 if let Some(dir) = path.parent() {

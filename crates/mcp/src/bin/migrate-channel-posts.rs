@@ -1,5 +1,6 @@
-// One-shot copy of the legacy sqlite `channel_posts` into the news store,
-// embedding inline. Idempotent (ON CONFLICT DO NOTHING).
+// One-shot copy of the legacy sqlite `channel_posts` (in the TS-era
+// tokens.db, --sqlite <path>) into the news store, embedding inline.
+// Idempotent (ON CONFLICT DO NOTHING).
 
 use std::sync::Arc;
 
@@ -14,9 +15,11 @@ const BATCH: usize = 100;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     cli::init();
-    let db = cli::open_db()?;
     let rows: Vec<NewsItem> = {
-        let conn = db.conn();
+        let conn = rusqlite::Connection::open_with_flags(
+            cli::legacy_sqlite_path(),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )?;
         let mut stmt = conn.prepare(
             "SELECT chat_id, chat_title, chat_username, tg_message_id, posted_at, text, views, forwards
                FROM channel_posts ORDER BY posted_at ASC",

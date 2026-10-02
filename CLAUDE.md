@@ -21,8 +21,8 @@ the other. Deployed as two containers (`docker-compose.yml`).
    Telegram bot getUpdates (long-poll), userbot channels (30 min),
    scheduler (30s, fires cron rows from `scheduled_tasks`).
 2. When it sees something new, it calls `Signals::record(source, content)`,
-   which inserts a row into the `signals` queue in
-   `crates/mcp/data/tokens.db`.
+   which inserts a row into the `signals` queue in the `mcp_state` Postgres
+   database.
 3. The supervisor (`packages/agent/src/supervisor/main.ts`) loops on
    `get_next_signal`. Routing is by source, decided in `supervisor/module.ts`:
    `scheduler` runs through the `workflow/` module (compile → execute), every
@@ -64,7 +64,6 @@ mcp-tools/
 ├── crates/
 │   └── mcp/                                 one domain, one file — each opens with a
 │       │                                      table of contents of its sections
-│       ├── data/tokens.db                   OAuth, watermarks, signals, scheduled_tasks (gitignored)
 │       ├── gateway.config.json              third-party MCP upstreams (git-tracked, secret-free)
 │       ├── migrations/pg/*.sql              Postgres migrations (drizzle-compatible journal)
 │       ├── eval/{configs,fixtures}/         RAG eval golden set
@@ -72,7 +71,7 @@ mcp-tools/
 │           ├── main.rs                      composition root: deps, pollers, transport
 │           ├── server.rs                    handler, results, sessions, stdio/HTTP
 │           ├── toolsets.rs                  named tool groups (MCP_TOOLSETS scoping)
-│           ├── db.rs, pg.rs                 sqlite schema · Postgres pool + migrator
+│           ├── db.rs, pg.rs                 mcp_state database · news/memory pool + migrator
 │           ├── signals.rs, scheduler.rs, settings.rs, telegram.rs, gmail.rs,
 │           │   monobank.rs, userbot.rs, news.rs, knowledge.rs, memory.rs,
 │           │   skills.rs, gateway.rs, fetch.rs, pdf.rs, fs.rs, embeddings.rs
@@ -122,10 +121,14 @@ Agent (`packages/agent`, TypeScript):
 
 ## Three databases — split by ownership
 
-- **`crates/mcp/data/tokens.db`** (sqlite, `MCP_DB_PATH`) — MCP's private state. OAuth
-  tokens, Gmail watermarks, Telegram poll cursors, the `signals` queue,
-  the `scheduled_tasks` table, userbot channel watermarks. Don't read or
-  write this from agent code — go through MCP tools.
+- **`mcp_state`** (Postgres database next to the news store; `db.rs`) —
+  MCP's private state: OAuth tokens and the userbot session, Gmail
+  watermarks, the Telegram cursor and chat log, the `signals` queue,
+  `scheduled_tasks`, settings. The server derives it from `DATABASE_URL`
+  (same server, database name `mcp_state`; `STATE_DATABASE_URL` overrides)
+  and creates + migrates it on boot. It replaced the TS-era sqlite
+  `tokens.db`; `import-sqlite-state` copied that over once. Don't read or
+  write it from agent code — go through MCP tools.
 - **`packages/agent/data/agent.db`** (sqlite) — agent's domain state:
   `memory` (freeform KV, e.g. `news_digest.last_read_at`) plus the local
   trace mirror (`traces` + per-node `judgements`). Schema lives in code at
@@ -147,7 +150,7 @@ Agent (`packages/agent`, TypeScript):
   drizzle-kit and must stay byte-identical; add a migration as a new file +
   a row in `pg.rs`'s `MIGRATIONS` list.
 
-Schemas: `crates/mcp/src/db.rs` (mcp sqlite, created on open),
+Schemas: `crates/mcp/src/db.rs` (`mcp_state`, versioned migrations inline),
 `packages/agent/src/db/schema.ts` (agent sqlite, Drizzle),
 `crates/mcp/migrations/pg/` (PG). Everything applies automatically on boot;
 `pnpm db:init` does it without starting the servers.
@@ -157,6 +160,7 @@ For ad-hoc queries during development:
 ```bash
 sqlite3 -json packages/agent/data/agent.db "SELECT * FROM memory"
 sqlite3      packages/agent/data/agent.db "UPDATE memory SET value=? WHERE key=?"
+docker compose exec postgres psql -U mcp -d mcp_state -c "SELECT * FROM signals ORDER BY id DESC LIMIT 5"
 ```
 
 For multi-line / quote-heavy SQL, use a heredoc. Always single-quote
@@ -418,13 +422,17 @@ Every `pnpm` script that touches the MCP side is a thin `cargo run --release`
 of a binary in `crates/mcp`; inside the container the same binaries are on
 `PATH` (`docker compose exec mcp embed-backfill`).
 
-- `pnpm db:init` — apply both schemas (mcp/tokens.db + agent/agent.db).
+- `pnpm db:init` — create/migrate `mcp_state` + apply agent/agent.db
+  (both also happen on boot).
 - `pnpm mcp:serve` — start the MCP server. **Do not run locally if the
   droplet is also running it** — Telegram getUpdates is exclusive and the
   second poller causes 409 Conflict.
 - `pnpm agent:start` — start the supervisor (long-running loop).
-- `pnpm gmail:auth` — one-time OAuth bootstrap. Writes to
-  `crates/mcp/data/tokens.db`.
+- `pnpm gmail:auth` — one-time OAuth bootstrap. Writes to `mcp_state`
+  (needs `DATABASE_URL`).
+- `pnpm import:sqlite-state -- --sqlite <tokens.db>` — one-time copy of a
+  TS-era sqlite state file into a fresh `mcp_state`; refuses if it already
+  holds data.
 - `pnpm gmail:list-unread` — debug helper.
 - `pnpm telegram:get-chat-id` — discover your chat id (after sending any
   message to your bot).

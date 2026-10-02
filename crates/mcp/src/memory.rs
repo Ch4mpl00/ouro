@@ -1898,7 +1898,7 @@ impl McpTools {
         {
             return Err(invalid_params("query must be non-empty, limit 1–50, tags non-empty"));
         }
-        let memory = self.deps.memory()?;
+        let memory = &self.deps.memory;
         run(memory
             .recall(&p.query, p.limit, None, p.tags.as_deref(), Utc::now())
             .await
@@ -1919,7 +1919,7 @@ impl McpTools {
         if p.body.is_empty() || !nonempty_tags(p.tags.as_ref(), 12) {
             return Err(invalid_params("body must be non-empty; at most 12 non-empty tags"));
         }
-        let memory = self.deps.memory()?;
+        let memory = &self.deps.memory;
         run(memory.remember(&p.body, p.tags.as_deref(), p.source.as_deref()).await.map(|fact| json!({ "fact": fact })))
     }
 
@@ -1932,7 +1932,7 @@ impl McpTools {
         if p.id < 1 {
             return Err(invalid_params("id must be a positive integer"));
         }
-        let memory = self.deps.memory()?;
+        let memory = &self.deps.memory;
         run(memory.get_fact(p.id).await.map(|fact| json!({ "fact": fact })))
     }
 
@@ -1947,7 +1947,7 @@ impl McpTools {
         if p.id < 1 || p.body.as_deref().is_some_and(str::is_empty) || !nonempty_tags(p.tags.as_ref(), 12) {
             return Err(invalid_params("id must be positive; body non-empty; at most 12 non-empty tags"));
         }
-        let memory = self.deps.memory()?;
+        let memory = &self.deps.memory;
         run(memory
             .update_fact(p.id, p.body.as_deref(), p.tags.as_deref(), p.state)
             .await
@@ -1964,7 +1964,7 @@ impl McpTools {
             nobody knows which one is current."
     )]
     async fn list_memory(&self, Parameters(p): Parameters<ListMemoryParams>) -> ToolResult {
-        let memory = self.deps.memory()?;
+        let memory = &self.deps.memory;
         match p.project {
             None => run(memory.list_projects().await.map(|projects| json!({ "projects": projects }))),
             Some(project) => run(memory.list_docs(&project).await),
@@ -1982,7 +1982,7 @@ impl McpTools {
         if p.slug.is_empty() || p.title.is_empty() {
             return Err(invalid_params("slug and title must be non-empty"));
         }
-        let memory = self.deps.memory()?;
+        let memory = &self.deps.memory;
         run(memory.create_project(&p.slug, &p.title).await.map(|project| json!({ "project": project })))
     }
 
@@ -1994,7 +1994,7 @@ impl McpTools {
             `old` strings won't match. Read immediately before writing."
     )]
     async fn read_doc(&self, Parameters(p): Parameters<ReadDocParams>) -> ToolResult {
-        let memory = self.deps.memory()?;
+        let memory = &self.deps.memory;
         run(memory.read_doc(&p.project, &p.doc).await.map(|doc| json!({ "doc": doc })))
     }
 
@@ -2011,7 +2011,7 @@ impl McpTools {
         if p.text.is_empty() {
             return Err(invalid_params("text must be non-empty"));
         }
-        let memory = self.deps.memory()?;
+        let memory = &self.deps.memory;
         let actor = &self.deps.memory_actor;
         run(memory
             .append_doc(&p.project, &p.doc, &p.text, p.under_heading.as_deref(), actor, p.rationale.as_deref())
@@ -2032,7 +2032,7 @@ impl McpTools {
         if p.expected_version < 1 || p.edits.is_empty() || p.edits.iter().any(|e| e.old.is_empty()) {
             return Err(invalid_params("expected_version must be ≥1; edits non-empty, each with a non-empty `old`"));
         }
-        let memory = self.deps.memory()?;
+        let memory = &self.deps.memory;
         let actor = &self.deps.memory_actor;
         run(memory.patch_doc(&p.project, &p.doc, p.expected_version, p.edits, actor, p.rationale.as_deref()).await)
     }
@@ -2052,7 +2052,7 @@ impl McpTools {
         if p.expected_version.is_some_and(|v| v < 0) {
             return Err(invalid_params("expected_version must be ≥0"));
         }
-        let memory = self.deps.memory()?;
+        let memory = &self.deps.memory;
         run(memory
             .write_doc(WriteDoc {
                 project: &p.project,
@@ -2077,7 +2077,7 @@ impl McpTools {
         if p.limit.is_some_and(|l| !(1..=100).contains(&l)) {
             return Err(invalid_params("limit must be 1–100"));
         }
-        let memory = self.deps.memory()?;
+        let memory = &self.deps.memory;
         run(memory
             .history(&p.project, &p.doc, p.limit.unwrap_or(20))
             .await
@@ -2100,7 +2100,7 @@ impl McpTools {
         if p.patch_id.is_empty() {
             return Err(invalid_params("patch_id must be non-empty"));
         }
-        let memory = self.deps.memory()?;
+        let memory = &self.deps.memory;
         run(memory.revert(&p.project, &p.doc, &p.patch_id, p.rollback == Some(true), &self.deps.memory_actor).await)
     }
 }

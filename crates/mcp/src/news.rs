@@ -419,7 +419,7 @@ impl NewsProvider for TelegramChannels {
     }
 
     async fn fetch(&self) -> anyhow::Result<Vec<NewsItem>> {
-        if !self.userbot.has_session() {
+        if !self.userbot.has_session().await {
             tracing::warn!("no saved userbot session — run `pnpm userbot:auth`. Skipping channels tick.");
             return Ok(Vec::new());
         }
@@ -974,7 +974,7 @@ impl McpTools {
         {
             return Err(invalid_params("query must be non-empty, queries 1–8 non-empty strings, k 1–50, chunks 2–8"));
         }
-        let news = self.deps.news()?;
+        let news = &self.deps.news;
         let queries = match (p.query, p.queries) {
             (Some(q), None) => (vec![q], false),
             (None, Some(qs)) => (qs, true),
@@ -1011,7 +1011,7 @@ impl McpTools {
         if p.limit.is_some_and(|l| !(1..=2000).contains(&l)) || !chunks_in_range(p.chunks) {
             return Err(invalid_params("limit must be 1–2000, chunks 2–8"));
         }
-        let news = self.deps.news()?;
+        let news = &self.deps.news;
         respond(
             async {
                 let filter = build_filter(
@@ -1050,7 +1050,7 @@ impl McpTools {
         if url::Url::parse(&p.url).is_err() {
             return Err(invalid_params("url must be a valid URL"));
         }
-        let news = self.deps.news()?;
+        let news = &self.deps.news;
         let fetcher = ArticleFetcher::new(self.deps.fetcher.clone());
         respond(
             async {
