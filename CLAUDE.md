@@ -446,9 +446,15 @@ of a binary in `crates/mcp`; inside the container the same binaries are on
 - `pnpm eval:rag` / `eval:inspect` / `eval:snapshot` — the RAG eval harness
   over `crates/mcp/eval/` (see its `fixtures/README.md`).
 
-Deploy: see `docker-compose.yml`. `docker compose up -d --build` on the
-droplet; named volumes (`mcp-data`, `mcp-storage`, `agent-data`,
-`agent-skills`, `pg-data`) persist state across rebuilds. First boot
+Deploy: `pnpm deploy [service…]` (`scripts/deploy.sh`) from the laptop. The
+droplet (1 vCPU / 2 GB, x86_64) cannot compile the Rust crate, so it never
+builds: the script builds a `linux/amd64` image locally (the Rust stage
+cross-compiles natively; cargo's registry and `target/` sit in BuildKit
+cache mounts, so a code-only rebuild is ~35 s), streams it over SSH with
+`docker save | ssh … docker load`, checks out the same commit on the droplet
+(detached) and runs `docker compose up -d --no-build`. It refuses to run
+with uncommitted or unpushed changes. Named volumes (`mcp-data`,
+`mcp-storage`, `agent-data`, `agent-skills`, `pg-data`) persist state. First boot
 needs `.env.postgres` (POSTGRES_USER / PASSWORD / DB) and
 `OPENAI_API_KEY` in `.env.mcp`.
 

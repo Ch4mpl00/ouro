@@ -37,6 +37,7 @@
     "eval:inspect": "cargo run -q --release -p mcp-tools --bin eval-inspect --",
     "test": "vitest run",
     "test:mcp": "cargo test -p mcp-tools",
+    "deploy": "scripts/deploy.sh",
     "test:watch": "vitest"
   },
   "devDependencies": {
