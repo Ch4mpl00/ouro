@@ -1,0 +1,5 @@
+out/
+.bsp/
+.metals/
+.bloop/
+.idea/

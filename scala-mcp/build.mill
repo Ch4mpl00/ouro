@@ -1,0 +1,57 @@
+//| mill-version: 1.1.10
+//| mill-jvm-version: 25
+//| mvnDeps:
+//| - com.goyeau::mill-scalafix::0.6.2
+package build
+
+import mill.*, scalalib.*, scalafmt.*
+import com.goyeau.mill.scalafix.ScalafixModule
+
+// The MCP server, in Scala 3 on ZIO. A port of crates/mcp (the Rust server)
+// with the same rule: one domain, one file (src/mcp/*.scala).
+object `package` extends ScalaModule, ScalafmtModule, ScalafixModule {
+  def scalaVersion = "3.9.0"
+
+  def mainClass = Some("mcp.Main")
+
+  // ServiceLoader registrations from several jars (Flyway's database plugins,
+  // OpenTelemetry's SPI) must be concatenated, not overwritten.
+  def assemblyRules = super.assemblyRules ++ Seq(Assembly.Rule.AppendPattern("META-INF/services/.*", "\n"))
+
+  def scalacOptions = Seq("-deprecation", "-feature", "-Wunused:all", "-Wvalue-discard", "-Xmax-inlines:128")
+
+  def mvnDeps = Seq(
+    mvn"dev.zio::zio:2.1.26",
+    mvn"dev.zio::zio-streams:2.1.26",
+    mvn"dev.zio::zio-http:3.11.6",
+    mvn"dev.zio::zio-json:1.1.0",
+    mvn"dev.zio::zio-logging:2.5.3",
+    mvn"dev.zio::zio-opentelemetry:3.1.20",
+    mvn"com.softwaremill.sttp.tapir::tapir-zio-http-server:1.13.32",
+    mvn"io.getquill::quill-jdbc-zio:4.8.6",
+    mvn"org.postgresql:postgresql:42.7.13",
+    mvn"com.zaxxer:HikariCP:7.1.0",
+    mvn"org.flywaydb:flyway-core:13.9.0",
+    mvn"org.flywaydb:flyway-database-postgresql:13.9.0",
+    mvn"io.opentelemetry:opentelemetry-sdk:1.66.0",
+    mvn"io.opentelemetry:opentelemetry-exporter-otlp:1.66.0",
+    mvn"io.opentelemetry:opentelemetry-sdk-extension-autoconfigure:1.66.0",
+    mvn"org.slf4j:slf4j-simple:2.0.17",
+    mvn"org.apache.pdfbox:pdfbox:3.0.8",
+    mvn"net.dankito.readability4j:readability4j:1.0.8",
+    mvn"com.rometools:rome:2.1.0",
+    mvn"com.cronutils:cron-utils:9.2.1",
+    mvn"org.jsoup:jsoup:1.23.2",
+  )
+
+  // Postgres migrations, shared with the Rust crate byte for byte.
+  def resources = Task.Sources(moduleDir / "resources")
+
+  object test extends ScalaTests, TestModule.ZioTest {
+    def mvnDeps = Seq(
+      mvn"dev.zio::zio-test:2.1.26",
+      mvn"dev.zio::zio-test-sbt:2.1.26",
+      mvn"com.dimafeng::testcontainers-scala-postgresql:0.44.1",
+    )
+  }
+}
