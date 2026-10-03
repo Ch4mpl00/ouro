@@ -444,7 +444,17 @@ of a binary in `crates/mcp`; inside the container the same binaries are on
   Testcontainers Postgres (needs Docker). **The `.feature` files are the
   user's**: never edit one to make a failing run pass — fix the code, or ask.
   New behaviour gets a scenario there first. See `crates/mcp/specs/README.md`.
-- `pnpm test:mcp` — `cargo test -p mcp-tools`. With
+- `pnpm spec:model` — the reference model of memory documents:
+  `crates/mcp/model/` (Lean 4) says what write/append/patch/revert mean
+  (`Model.lean`, ~200 lines, no database) and proves properties of it
+  (`Theorems.lean`). `tests/model.rs` sends random call sequences, then
+  overlapping calls from several sessions, to both the model and the real
+  server; answers must match and every concurrent history must be
+  linearizable. Needs Docker and the Lean toolchain (elan). **Same ownership
+  as the `.feature` files**: when the server and the model disagree, fix the
+  code or ask — a rule change starts in `Model.lean`, and its theorems must
+  still prove. See `crates/mcp/model/README.md`.
+- `pnpm test:mcp` — `cargo test -p mcp-tools`, the two above included. With
   `TEST_DATABASE_URL=postgres://…` the Postgres integration tests run too
   (point it at a throwaway pgvector database, never prod).
 - `pnpm db:generate:agent` — same for the agent sqlite schema

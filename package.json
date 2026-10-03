@@ -40,7 +40,8 @@
     "test:mcp": "cargo test -p mcp-tools",
     "deploy": "scripts/deploy.sh",
     "test:watch": "vitest",
-    "spec": "cargo test -p mcp-tools --test specs"
+    "spec": "cargo test -p mcp-tools --test specs",
+    "spec:model": "cargo test -p mcp-tools --test model"
   },
   "devDependencies": {
     "@types/node": "^22.9.0",

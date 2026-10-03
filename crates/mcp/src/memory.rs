@@ -306,8 +306,10 @@ pub struct EditFailure {
     pub suggestions: Vec<String>,
 }
 
+// Overlapping matches count: in "   " the quote "  " could mean either pair,
+// so it is ambiguous, not "the first one".
 fn count_occurrences(haystack: &str, needle: &str) -> usize {
-    haystack.match_indices(needle).count()
+    haystack.char_indices().filter(|&(at, _)| haystack[at..].starts_with(needle)).count()
 }
 
 // Atomic: all edits apply or none do. Applied in order to a working copy, so
@@ -634,9 +636,10 @@ pub fn rank_hits(hits: Vec<IndexHit>, now: DateTime<Utc>, opts: RankOpts) -> Vec
 
 // ── 5. store ─────────────────────────────────────────────────────────────────
 
+// The patch a write records. The store writes it in the same transaction as
+// the body it describes, so a document is never ahead of its history.
 pub struct NewPatch {
     pub pid: String,
-    pub doc_id: i64,
     pub kind: PatchKind,
     pub edits: Vec<Edit>,
     pub body_before: String,
@@ -662,19 +665,30 @@ pub trait MemoryStore: Send + Sync {
 
     async fn list_docs(&self, project_id: i64) -> anyhow::Result<Vec<DocSummary>>;
     async fn get_doc(&self, project_id: i64, name: &str) -> anyhow::Result<Option<Doc>>;
-    async fn create_doc(&self, project_id: i64, name: &str, summary: Option<&str>, body: &str) -> anyhow::Result<Doc>;
-    // None when `expected_version` no longer matches — the whole concurrency
-    // story for several agents on one document (D1). `summary: None` keeps it.
+    // The document and its first patch, atomically. None when another writer
+    // created the same name first.
+    async fn create_doc(
+        &self,
+        project_id: i64,
+        name: &str,
+        summary: Option<&str>,
+        body: &str,
+        patch: NewPatch,
+    ) -> anyhow::Result<Option<(Doc, DocPatch)>>;
+    // The new body and its patch, atomically. None when `expected_version` no
+    // longer matches — the whole concurrency story for several agents on one
+    // document (D1). `summary: None` keeps it.
     async fn update_doc(
         &self,
         doc_id: i64,
         expected_version: i32,
         body: &str,
         summary: Option<Option<&str>>,
-    ) -> anyhow::Result<Option<Doc>>;
+        patch: NewPatch,
+    ) -> anyhow::Result<Option<(Doc, DocPatch)>>;
 
-    async fn insert_patch(&self, patch: NewPatch) -> anyhow::Result<DocPatch>;
-    // Newest first.
+    // Newest first: by the version each patch produced, which is the order
+    // the writes won their compare-and-swap in.
     async fn list_patches(&self, doc_id: i64, limit: i64) -> anyhow::Result<Vec<DocPatch>>;
     async fn get_patch(&self, doc_id: i64, pid: &str) -> anyhow::Result<Option<DocPatch>>;
 
@@ -759,6 +773,27 @@ fn fact_of(r: &tokio_postgres::Row) -> Fact {
     }
 }
 
+async fn insert_patch(tx: &deadpool_postgres::Transaction<'_>, doc_id: i64, p: &NewPatch) -> anyhow::Result<DocPatch> {
+    let row = tx
+        .query_one(
+            "INSERT INTO memory_doc_patches (doc_id, pid, kind, edits, body_before, version_before, version_after, actor, rationale)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING *",
+            &[
+                &doc_id,
+                &p.pid,
+                &p.kind.as_str(),
+                &serde_json::to_value(&p.edits)?,
+                &p.body_before,
+                &p.version_before,
+                &p.version_after,
+                &p.actor,
+                &p.rationale,
+            ],
+        )
+        .await?;
+    Ok(patch_of(&row))
+}
+
 #[async_trait]
 impl MemoryStore for PgMemoryStore {
     async fn create_project(&self, slug: &str, title: &str) -> anyhow::Result<Project> {
@@ -805,17 +840,30 @@ impl MemoryStore for PgMemoryStore {
         Ok(row.as_ref().map(doc_of))
     }
 
-    async fn create_doc(&self, project_id: i64, name: &str, summary: Option<&str>, body: &str) -> anyhow::Result<Doc> {
-        let row = self
-            .pool
-            .get()
-            .await?
-            .query_one(
-                "INSERT INTO memory_project_docs (project_id, name, summary, body_md) VALUES ($1, $2, $3, $4) RETURNING *",
+    async fn create_doc(
+        &self,
+        project_id: i64,
+        name: &str,
+        summary: Option<&str>,
+        body: &str,
+        patch: NewPatch,
+    ) -> anyhow::Result<Option<(Doc, DocPatch)>> {
+        let mut client = self.pool.get().await?;
+        let tx = client.transaction().await?;
+        let Some(row) = tx
+            .query_opt(
+                "INSERT INTO memory_project_docs (project_id, name, summary, body_md) VALUES ($1, $2, $3, $4)
+                 ON CONFLICT DO NOTHING RETURNING *",
                 &[&project_id, &name, &summary, &body],
             )
-            .await?;
-        Ok(doc_of(&row))
+            .await?
+        else {
+            return Ok(None);
+        };
+        let doc = doc_of(&row);
+        let patch = insert_patch(&tx, doc.id, &patch).await?;
+        tx.commit().await?;
+        Ok(Some((doc, patch)))
     }
 
     async fn update_doc(
@@ -824,14 +872,16 @@ impl MemoryStore for PgMemoryStore {
         expected_version: i32,
         body: &str,
         summary: Option<Option<&str>>,
-    ) -> anyhow::Result<Option<Doc>> {
+        patch: NewPatch,
+    ) -> anyhow::Result<Option<(Doc, DocPatch)>> {
         // The version in the WHERE clause matches no row once another agent
         // has moved on; the caller reports a conflict instead of overwriting.
-        let client = self.pool.get().await?;
+        let mut client = self.pool.get().await?;
+        let tx = client.transaction().await?;
         let row =
             match summary {
                 None => {
-                    client
+                    tx
                         .query_opt(
                             "UPDATE memory_project_docs SET body_md = $1, version = $2, updated_at = now()
                           WHERE id = $3 AND version = $4 RETURNING *",
@@ -839,7 +889,7 @@ impl MemoryStore for PgMemoryStore {
                         )
                         .await?
                 }
-                Some(summary) => client
+                Some(summary) => tx
                     .query_opt(
                         "UPDATE memory_project_docs SET body_md = $1, summary = $2, version = $3, updated_at = now()
                           WHERE id = $4 AND version = $5 RETURNING *",
@@ -847,31 +897,10 @@ impl MemoryStore for PgMemoryStore {
                     )
                     .await?,
             };
-        Ok(row.as_ref().map(doc_of))
-    }
-
-    async fn insert_patch(&self, p: NewPatch) -> anyhow::Result<DocPatch> {
-        let row = self
-            .pool
-            .get()
-            .await?
-            .query_one(
-                "INSERT INTO memory_doc_patches (doc_id, pid, kind, edits, body_before, version_before, version_after, actor, rationale)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING *",
-                &[
-                    &p.doc_id,
-                    &p.pid,
-                    &p.kind.as_str(),
-                    &serde_json::to_value(&p.edits)?,
-                    &p.body_before,
-                    &p.version_before,
-                    &p.version_after,
-                    &p.actor,
-                    &p.rationale,
-                ],
-            )
-            .await?;
-        Ok(patch_of(&row))
+        let Some(row) = row else { return Ok(None) };
+        let patch = insert_patch(&tx, doc_id, &patch).await?;
+        tx.commit().await?;
+        Ok(Some((doc_of(&row), patch)))
     }
 
     async fn list_patches(&self, doc_id: i64, limit: i64) -> anyhow::Result<Vec<DocPatch>> {
@@ -880,7 +909,7 @@ impl MemoryStore for PgMemoryStore {
             .get()
             .await?
             .query(
-                "SELECT * FROM memory_doc_patches WHERE doc_id = $1 ORDER BY created_at DESC, id DESC LIMIT $2",
+                "SELECT * FROM memory_doc_patches WHERE doc_id = $1 ORDER BY version_after DESC, id DESC LIMIT $2",
                 &[&doc_id, &limit],
             )
             .await?;
@@ -1291,23 +1320,21 @@ impl MemoryService {
     // The shared tail of every mutating op: swap the body under a version
     // check, record the patch, re-index. None when the CAS lost.
     async fn commit(&self, project: &Project, doc: &Doc, change: Change<'_>) -> anyhow::Result<Option<WriteResult>> {
-        let Some(updated) = self.store.update_doc(doc.id, doc.version, change.body, change.summary).await? else {
+        let patch = NewPatch {
+            pid: (self.new_patch_id)(),
+            kind: change.kind,
+            edits: change.edits,
+            body_before: doc.body.clone(),
+            version_before: doc.version,
+            version_after: doc.version + 1,
+            actor: change.actor.to_owned(),
+            rationale: change.rationale,
+        };
+        let Some((updated, patch)) =
+            self.store.update_doc(doc.id, doc.version, change.body, change.summary, patch).await?
+        else {
             return Ok(None);
         };
-        let patch = self
-            .store
-            .insert_patch(NewPatch {
-                pid: (self.new_patch_id)(),
-                doc_id: doc.id,
-                kind: change.kind,
-                edits: change.edits,
-                body_before: doc.body.clone(),
-                version_before: doc.version,
-                version_after: updated.version,
-                actor: change.actor.to_owned(),
-                rationale: change.rationale,
-            })
-            .await?;
         self.reindex_doc(project, &updated).await;
         Ok(Some(write_result(project, &updated, patch.pid)))
     }
@@ -1340,34 +1367,47 @@ impl MemoryService {
         self.require_doc(&project, name).await
     }
 
+    // The creating half of write_doc. `Err(theirs)` when another writer
+    // created the same name between our read and our insert.
+    async fn create_doc(&self, project: &Project, input: &WriteDoc<'_>) -> anyhow::Result<Result<WriteResult, Doc>> {
+        if input.expected_version.is_some_and(|v| v != 0) {
+            return Err(memory_error(
+                "version_conflict",
+                format!("Document \"{}\" does not exist yet; expected_version must be omitted or 0.", input.doc),
+                json!({ "project": project.slug, "doc": input.doc, "currentVersion": 0 }),
+            ));
+        }
+        let patch = NewPatch {
+            pid: (self.new_patch_id)(),
+            kind: PatchKind::Write,
+            edits: Vec::new(),
+            body_before: String::new(),
+            version_before: 0,
+            version_after: 1,
+            actor: input.actor.to_owned(),
+            rationale: input.rationale.map(str::to_owned),
+        };
+        let Some((created, patch)) =
+            self.store.create_doc(project.id, input.doc, input.summary, input.body, patch).await?
+        else {
+            let theirs = self.store.get_doc(project.id, input.doc).await?;
+            return Ok(Err(theirs.ok_or_else(|| raced(&project.slug, input.doc))?));
+        };
+        self.reindex_doc(project, &created).await;
+        Ok(Ok(write_result(project, &created, patch.pid)))
+    }
+
     pub async fn write_doc(&self, input: WriteDoc<'_>) -> anyhow::Result<WriteResult> {
         let project = self.require_project(input.project).await?;
         assert_doc_name(input.doc)?;
-        let Some(existing) = self.store.get_doc(project.id, input.doc).await? else {
-            if input.expected_version.is_some_and(|v| v != 0) {
-                return Err(memory_error(
-                    "version_conflict",
-                    format!("Document \"{}\" does not exist yet; expected_version must be omitted or 0.", input.doc),
-                    json!({ "project": project.slug, "doc": input.doc, "currentVersion": 0 }),
-                ));
-            }
-            let created = self.store.create_doc(project.id, input.doc, input.summary, input.body).await?;
-            let patch = self
-                .store
-                .insert_patch(NewPatch {
-                    pid: (self.new_patch_id)(),
-                    doc_id: created.id,
-                    kind: PatchKind::Write,
-                    edits: Vec::new(),
-                    body_before: String::new(),
-                    version_before: 0,
-                    version_after: created.version,
-                    actor: input.actor.to_owned(),
-                    rationale: input.rationale.map(str::to_owned),
-                })
-                .await?;
-            self.reindex_doc(&project, &created).await;
-            return Ok(write_result(&project, &created, patch.pid));
+        let existing = match self.store.get_doc(project.id, input.doc).await? {
+            Some(doc) => doc,
+            None => match self.create_doc(&project, &input).await? {
+                Ok(result) => return Ok(result),
+                // Created by someone else in the meantime: this call is now an
+                // overwrite of their document, judged as one.
+                Err(theirs) => theirs,
+            },
         };
 
         // write_doc is the only op that can lose content: never blind.
@@ -1514,7 +1554,9 @@ impl MemoryService {
                 json!({ "project": project.slug, "doc": name, "knownPatchIds": known }),
             ));
         };
-        let is_newest = self.store.list_patches(doc.id, 1).await?.first().is_some_and(|newest| newest.pid == patch.pid);
+        // Newest = it produced the version the document is at. Judged from the
+        // document already read, so the commit's CAS makes it stick.
+        let is_newest = patch.version_after == doc.version;
 
         let body = if rollback || is_newest {
             // Exact by construction: every patch stored the body it replaced.
@@ -2147,6 +2189,23 @@ pub mod testing {
         state.seq
     }
 
+    fn record(state: &mut State, doc_id: i64, p: NewPatch) -> DocPatch {
+        let patch = DocPatch {
+            pid: p.pid,
+            doc_id,
+            kind: p.kind,
+            edits: p.edits,
+            body_before: p.body_before,
+            version_before: p.version_before,
+            version_after: p.version_after,
+            actor: p.actor,
+            rationale: p.rationale,
+            created_at: Utc::now(),
+        };
+        state.patches.push(patch.clone());
+        patch
+    }
+
     fn cosine(a: &[f32], b: &[f32]) -> f64 {
         let dot: f64 = a.iter().zip(b).map(|(x, y)| f64::from(*x) * f64::from(*y)).sum();
         let na: f64 = a.iter().map(|x| f64::from(*x).powi(2)).sum::<f64>().sqrt();
@@ -2193,12 +2252,12 @@ pub mod testing {
             name: &str,
             summary: Option<&str>,
             body: &str,
-        ) -> anyhow::Result<Doc> {
+            patch: NewPatch,
+        ) -> anyhow::Result<Option<(Doc, DocPatch)>> {
             let mut s = self.lock();
-            anyhow::ensure!(
-                !s.docs.iter().any(|d| d.project_id == project_id && d.name == name),
-                "document {name} already exists"
-            );
+            if s.docs.iter().any(|d| d.project_id == project_id && d.name == name) {
+                return Ok(None);
+            }
             let doc = Doc {
                 id: next(&mut s),
                 project_id,
@@ -2210,7 +2269,8 @@ pub mod testing {
                 updated_at: Utc::now(),
             };
             s.docs.push(doc.clone());
-            Ok(doc)
+            let patch = record(&mut s, doc.id, patch);
+            Ok(Some((doc, patch)))
         }
 
         async fn update_doc(
@@ -2219,7 +2279,8 @@ pub mod testing {
             expected_version: i32,
             body: &str,
             summary: Option<Option<&str>>,
-        ) -> anyhow::Result<Option<Doc>> {
+            patch: NewPatch,
+        ) -> anyhow::Result<Option<(Doc, DocPatch)>> {
             let hook = self.before_update.lock().unwrap().as_ref().map(|h| h(doc_id));
             if let Some(hook) = hook {
                 hook.await;
@@ -2236,28 +2297,16 @@ pub mod testing {
             doc.version += 1;
             doc.size_bytes = doc.body.len();
             doc.updated_at = Utc::now();
-            Ok(Some(doc.clone()))
-        }
-
-        async fn insert_patch(&self, p: NewPatch) -> anyhow::Result<DocPatch> {
-            let patch = DocPatch {
-                pid: p.pid,
-                doc_id: p.doc_id,
-                kind: p.kind,
-                edits: p.edits,
-                body_before: p.body_before,
-                version_before: p.version_before,
-                version_after: p.version_after,
-                actor: p.actor,
-                rationale: p.rationale,
-                created_at: Utc::now(),
-            };
-            self.lock().patches.push(patch.clone());
-            Ok(patch)
+            let doc = doc.clone();
+            let patch = record(&mut s, doc_id, patch);
+            Ok(Some((doc, patch)))
         }
 
         async fn list_patches(&self, doc_id: i64, limit: i64) -> anyhow::Result<Vec<DocPatch>> {
-            Ok(self.lock().patches.iter().rev().filter(|p| p.doc_id == doc_id).take(limit as usize).cloned().collect())
+            let mut out: Vec<DocPatch> = self.lock().patches.iter().filter(|p| p.doc_id == doc_id).cloned().collect();
+            out.sort_by_key(|p| std::cmp::Reverse(p.version_after));
+            out.truncate(limit as usize);
+            Ok(out)
         }
 
         async fn get_patch(&self, doc_id: i64, pid: &str) -> anyhow::Result<Option<DocPatch>> {
@@ -2414,6 +2463,9 @@ mod tests {
         assert!(apply_edits(ROADMAP, &[]).is_err());
         let both = apply_edits(ROADMAP, &[edit("nope one", "x"), edit("nope two", "y")]).unwrap_err();
         assert_eq!(both.iter().map(|f| f.index).collect::<Vec<_>>(), [0, 1]);
+        // Overlapping matches count: "  " could be either pair of "   ".
+        // Found by the reference model (tests/model.rs).
+        assert_eq!(apply_edits("a   b", &[edit("  ", " ")]).unwrap_err()[0].occurrences, 2);
     }
 
     #[test]
@@ -2726,10 +2778,18 @@ mod tests {
                 }
                 let current = store.get_doc(1, "log.md").await.unwrap().unwrap();
                 *store.before_update.lock().unwrap() = None;
-                store
-                    .update_doc(doc_id, current.version, &format!("{}\nfrom other agent\n", current.body), None)
-                    .await
-                    .unwrap();
+                let theirs = NewPatch {
+                    pid: "pa:other".into(),
+                    kind: PatchKind::Append,
+                    edits: Vec::new(),
+                    body_before: current.body.clone(),
+                    version_before: current.version,
+                    version_after: current.version + 1,
+                    actor: "other".into(),
+                    rationale: None,
+                };
+                let body = format!("{}\nfrom other agent\n", current.body);
+                store.update_doc(doc_id, current.version, &body, None, theirs).await.unwrap();
             })
         }));
         h.service.append_doc("p", "log.md", "mine", None, ACTOR, None).await.unwrap();

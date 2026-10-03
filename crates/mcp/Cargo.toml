@@ -38,10 +38,18 @@ url = "2.5.8"
 
 [dev-dependencies]
 cucumber = "0.23"
+proptest = "1"
 testcontainers-modules = { version = "0.15", features = ["postgres"] }
 
 # The executable specification: specs/*.feature, run against the real server.
 #   cargo test --test specs
 [[test]]
 name = "specs"
+harness = false
+
+# The reference model (model/, Lean) against the real server: random call
+# sequences, then concurrent histories checked for linearizability.
+#   cargo test --test model
+[[test]]
+name = "model"
 harness = false
