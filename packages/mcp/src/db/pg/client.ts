@@ -14,6 +14,12 @@ export interface PgClient {
 
 const MIGRATIONS_DIR = path.resolve(import.meta.dirname, "./migrations");
 
+// `mcp` and `mcp-tunnel` boot against one cluster at the same moment;
+// unserialised they race through the same DDL. The second instance waits
+// on this lock, then finds nothing left to apply. "mcp_mig" — the key the
+// Rust server takes too.
+const MIGRATION_LOCK = "30790106749954407";
+
 function databaseUrl(): string {
   const url = process.env.DATABASE_URL;
   if (!url) {
@@ -32,10 +38,22 @@ export function createPgClient(): PgClient {
   const ensureReady = (): Promise<void> => {
     if (!ready) {
       ready = (async () => {
-        // Run outside the migration files so they don't have to assume
-        // CREATE EXTENSION privileges (e.g. when applied by managed PG).
-        await pool.query("CREATE EXTENSION IF NOT EXISTS vector");
-        await migrate(db, { migrationsFolder: MIGRATIONS_DIR });
+        // A session-level lock lives on one connection, so the migrator runs
+        // on that same connection.
+        const client = await pool.connect();
+        try {
+          await client.query("SELECT pg_advisory_lock($1)", [MIGRATION_LOCK]);
+          try {
+            // Run outside the migration files so they don't have to assume
+            // CREATE EXTENSION privileges (e.g. when applied by managed PG).
+            await client.query("CREATE EXTENSION IF NOT EXISTS vector");
+            await migrate(drizzle(client, { schema }), { migrationsFolder: MIGRATIONS_DIR });
+          } finally {
+            await client.query("SELECT pg_advisory_unlock($1)", [MIGRATION_LOCK]);
+          }
+        } finally {
+          client.release();
+        }
         console.log("[mcp-pg] migrations applied, news store ready");
       })();
     }

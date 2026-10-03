@@ -43,6 +43,10 @@ export const newsItems = pgTable(
     unique("news_items_source_external_uniq").on(t.source, t.externalId),
     index("news_items_posted_at").on(t.postedAt.desc()),
     index("news_items_source_posted").on(t.source, t.postedAt.desc()),
+    // Bare DESC orders nulls first, so list queries (`ORDER BY posted_at
+    // DESC`) need these; the two above stay for NULLS LAST queries.
+    index("news_items_posted_at_order").on(t.postedAt.desc().nullsFirst()),
+    index("news_items_source_posted_order").on(t.source, t.postedAt.desc().nullsFirst()),
   ],
 );
 

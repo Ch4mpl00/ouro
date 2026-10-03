@@ -29,6 +29,13 @@
       "when": 1787496077308,
       "tag": "0003_lazy_puppet_master",
       "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1790957842163,
+      "tag": "0004_news_chronological_indexes",
+      "breakpoints": true
     }
   ]
 }
