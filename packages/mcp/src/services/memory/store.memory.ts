@@ -7,11 +7,13 @@
 
 import type { Doc, DocPatch, DocSummary, Fact, IndexHit, Project } from "./types";
 import type {
+  CommittedDoc,
   CreateDocInput,
   CreateFactInput,
   CreateProjectInput,
   IndexUpsert,
   MemoryStore,
+  NewPatch,
   SearchIndexOpts,
   UpdateDocInput,
   UpdateFactInput,
@@ -45,6 +47,12 @@ export function createInMemoryStore(opts: InMemoryStoreOpts = {}): MemoryStore {
     updatedAt: doc.updatedAt,
   });
 
+  const record = (docId: number, patch: NewPatch): DocPatch => {
+    const row: DocPatch = { ...patch, docId, createdAt: stamp() };
+    patches.push(row);
+    return { ...row };
+  };
+
   return {
     createProject: async (input: CreateProjectInput) => {
       if (projects.some((p) => p.slug === input.slug)) {
@@ -76,10 +84,8 @@ export function createInMemoryStore(opts: InMemoryStoreOpts = {}): MemoryStore {
       return doc ? { ...doc, sizeBytes: Buffer.byteLength(doc.body, "utf-8") } : null;
     },
 
-    createDoc: async (input: CreateDocInput) => {
-      if (docs.some((d) => d.projectId === input.projectId && d.name === input.name)) {
-        throw new Error(`document ${input.name} already exists`);
-      }
+    createDoc: async (input: CreateDocInput): Promise<CommittedDoc | null> => {
+      if (docs.some((d) => d.projectId === input.projectId && d.name === input.name)) return null;
       const doc: DocRow = {
         id: nextId(),
         projectId: input.projectId,
@@ -91,10 +97,10 @@ export function createInMemoryStore(opts: InMemoryStoreOpts = {}): MemoryStore {
         updatedAt: stamp(),
       };
       docs.push(doc);
-      return { ...doc };
+      return { doc: { ...doc }, patch: record(doc.id, input.patch) };
     },
 
-    updateDoc: async (input: UpdateDocInput) => {
+    updateDoc: async (input: UpdateDocInput): Promise<CommittedDoc | null> => {
       await opts.onBeforeUpdateDoc?.(input.docId);
       const doc = docs.find((d) => d.id === input.docId);
       if (!doc) return null;
@@ -104,20 +110,13 @@ export function createInMemoryStore(opts: InMemoryStoreOpts = {}): MemoryStore {
       doc.version += 1;
       doc.sizeBytes = Buffer.byteLength(doc.body, "utf-8");
       doc.updatedAt = stamp();
-      return { ...doc };
-    },
-
-    insertPatch: async (input) => {
-      const patch: DocPatch = { ...input, createdAt: stamp() };
-      patches.push(patch);
-      return patch;
+      return { doc: { ...doc }, patch: record(doc.id, input.patch) };
     },
 
     listPatches: async (docId, limit) =>
       patches
         .filter((p) => p.docId === docId)
-        .slice()
-        .reverse()
+        .sort((a, b) => b.versionAfter - a.versionAfter)
         .slice(0, limit),
 
     getPatch: async (docId, pid) => patches.find((p) => p.docId === docId && p.pid === pid) ?? null,

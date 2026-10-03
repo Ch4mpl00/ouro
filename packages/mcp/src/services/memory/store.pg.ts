@@ -1,6 +1,7 @@
 // Postgres implementation of MemoryStore. Deliberately thin: no rules live
 // here, only the SQL that the service's rules are expressed in terms of. The
-// one piece of real logic is the compare-and-swap in updateDoc.
+// one piece of real logic is the compare-and-swap in updateDoc, committed in
+// one transaction with the patch it records.
 
 import { and, arrayOverlaps, cosineDistance, desc, eq, inArray, isNotNull, isNull } from "drizzle-orm";
 import type { Database } from "../../db/pg/client";
@@ -11,6 +12,7 @@ import type {
   CreateProjectInput,
   IndexUpsert,
   MemoryStore,
+  NewPatch,
   SearchIndexOpts,
   UpdateDocInput,
   UpdateFactInput,
@@ -20,6 +22,8 @@ import type { Doc, DocPatch, Edit, Fact, IndexHit, MemoryState, Project } from "
 export interface PgMemoryStoreDeps {
   db: Database;
 }
+
+type Tx = Parameters<Parameters<Database["transaction"]>[0]>[0];
 
 export function createPgMemoryStore(deps: PgMemoryStoreDeps): MemoryStore {
   const { db } = deps;
@@ -66,6 +70,25 @@ export function createPgMemoryStore(deps: PgMemoryStoreDeps): MemoryStore {
     updatedAt: row.updatedAt.toISOString(),
   });
 
+  const insertPatch = async (tx: Tx, docId: number, patch: NewPatch): Promise<DocPatch> => {
+    const [row] = await tx
+      .insert(docPatches)
+      .values({
+        docId,
+        pid: patch.pid,
+        kind: patch.kind,
+        edits: patch.edits,
+        bodyBefore: patch.bodyBefore,
+        versionBefore: patch.versionBefore,
+        versionAfter: patch.versionAfter,
+        actor: patch.actor,
+        rationale: patch.rationale,
+      })
+      .returning();
+    if (!row) throw new Error("insertPatch inserted no row");
+    return toPatch(row);
+  };
+
   return {
     createProject: async (input: CreateProjectInput) => {
       const [row] = await db.insert(projects).values(input).returning();
@@ -104,62 +127,52 @@ export function createPgMemoryStore(deps: PgMemoryStoreDeps): MemoryStore {
       return row ? toDoc(row) : null;
     },
 
-    createDoc: async (input: CreateDocInput) => {
-      const [row] = await db
-        .insert(projectDocs)
-        .values({
-          projectId: input.projectId,
-          name: input.name,
-          summary: input.summary,
-          bodyMd: input.body,
-        })
-        .returning();
-      if (!row) throw new Error("createDoc inserted no row");
-      return toDoc(row);
-    },
+    createDoc: async (input: CreateDocInput) =>
+      db.transaction(async (tx) => {
+        // ON CONFLICT: another writer created the name between our read and
+        // this insert. That is a lost race, not a database error.
+        const [row] = await tx
+          .insert(projectDocs)
+          .values({
+            projectId: input.projectId,
+            name: input.name,
+            summary: input.summary,
+            bodyMd: input.body,
+          })
+          .onConflictDoNothing()
+          .returning();
+        if (!row) return null;
+        const doc = toDoc(row);
+        return { doc, patch: await insertPatch(tx, doc.id, input.patch) };
+      }),
 
-    updateDoc: async (input: UpdateDocInput) => {
-      // The version in the WHERE clause is the whole concurrency story: the
-      // UPDATE matches no row when another agent has already moved on, and
-      // the caller turns that into a conflict instead of overwriting.
-      const [row] = await db
-        .update(projectDocs)
-        .set({
-          bodyMd: input.body,
-          ...(input.summary === undefined ? {} : { summary: input.summary }),
-          version: input.expectedVersion + 1,
-          updatedAt: new Date(),
-        })
-        .where(and(eq(projectDocs.id, input.docId), eq(projectDocs.version, input.expectedVersion)))
-        .returning();
-      return row ? toDoc(row) : null;
-    },
-
-    insertPatch: async (input) => {
-      const [row] = await db
-        .insert(docPatches)
-        .values({
-          docId: input.docId,
-          pid: input.pid,
-          kind: input.kind,
-          edits: input.edits,
-          bodyBefore: input.bodyBefore,
-          versionBefore: input.versionBefore,
-          versionAfter: input.versionAfter,
-          actor: input.actor,
-          rationale: input.rationale,
-        })
-        .returning();
-      if (!row) throw new Error("insertPatch inserted no row");
-      return toPatch(row);
-    },
+    updateDoc: async (input: UpdateDocInput) =>
+      db.transaction(async (tx) => {
+        // The version in the WHERE clause is the whole concurrency story: the
+        // UPDATE matches no row when another agent has already moved on, and
+        // the caller turns that into a conflict instead of overwriting. The
+        // patch commits in the same transaction, so history can never miss or
+        // reorder a version.
+        const [row] = await tx
+          .update(projectDocs)
+          .set({
+            bodyMd: input.body,
+            ...(input.summary === undefined ? {} : { summary: input.summary }),
+            version: input.expectedVersion + 1,
+            updatedAt: new Date(),
+          })
+          .where(and(eq(projectDocs.id, input.docId), eq(projectDocs.version, input.expectedVersion)))
+          .returning();
+        if (!row) return null;
+        return { doc: toDoc(row), patch: await insertPatch(tx, input.docId, input.patch) };
+      }),
 
     listPatches: async (docId, limit) => {
       const rows = await db
         .select()
         .from(docPatches)
         .where(eq(docPatches.docId, docId))
-        .orderBy(desc(docPatches.createdAt), desc(docPatches.id))
+        .orderBy(desc(docPatches.versionAfter), desc(docPatches.id))
         .limit(limit);
       return rows.map(toPatch);
     },

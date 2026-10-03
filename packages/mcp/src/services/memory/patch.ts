@@ -86,6 +86,8 @@ export function invertEdits(edits: Edit[]): Edit[] | null {
   return inverted;
 }
 
+// Overlapping matches count: "  " occurs twice in "   ", so it is not a
+// unique quote, whichever of the two the agent meant.
 function countOccurrences(haystack: string, needle: string): number {
   let count = 0;
   let from = 0;
@@ -93,7 +95,7 @@ function countOccurrences(haystack: string, needle: string): number {
     const at = haystack.indexOf(needle, from);
     if (at === -1) return count;
     count++;
-    from = at + needle.length;
+    from = at + 1;
   }
 }
 

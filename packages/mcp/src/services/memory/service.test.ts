@@ -329,6 +329,16 @@ describe("concurrent writers", () => {
             docId,
             expectedVersion: current.version,
             body: `${current.body}\nfrom other agent\n`,
+            patch: {
+              pid: "pa:other",
+              kind: "append",
+              edits: [],
+              bodyBefore: current.body,
+              versionBefore: current.version,
+              versionAfter: current.version + 1,
+              actor: "other",
+              rationale: null,
+            },
           });
         }
       },
@@ -342,6 +352,50 @@ describe("concurrent writers", () => {
     const body = (await h.service.readDoc("p", "log.md")).body;
     expect(body).toContain("from other agent");
     expect(body).toContain("mine");
+  });
+
+  // Found by the reference model: two agents create the same document at
+  // once. The loser must get the answer an overwrite would get, not a raw
+  // unique-violation from the database.
+  it("write_doc that loses a creation race is judged as an overwrite", async () => {
+    const inner = createInMemoryStore();
+    let raced = false;
+    const store: MemoryStore = {
+      ...inner,
+      getDoc: async (projectId, name) => {
+        if (!raced) {
+          raced = true;
+          // Between our read (nothing there) and our insert, another agent
+          // creates the document.
+          await inner.createDoc({
+            projectId,
+            name,
+            summary: null,
+            body: "theirs\n",
+            patch: {
+              pid: "pa:theirs",
+              kind: "write",
+              edits: [],
+              bodyBefore: "",
+              versionBefore: 0,
+              versionAfter: 1,
+              actor: "other",
+              rationale: null,
+            },
+          });
+          return null;
+        }
+        return inner.getDoc(projectId, name);
+      },
+    };
+    const h = harness({}, store);
+    await h.service.createProject({ slug: "p", title: "P" });
+
+    const err = await expectMemoryError(h.service.writeDoc({ project: "p", doc: "notes.md", body: "mine\n", actor: ACTOR }));
+
+    expect(err.code).toBe("version_required");
+    expect(err.details).toMatchObject({ currentVersion: 1 });
+    expect((await h.service.readDoc("p", "notes.md")).body).toBe("theirs\n");
   });
 });
 
@@ -400,6 +454,44 @@ describe("history and revert", () => {
     // Reverting is itself a patch — history is never rewritten.
     expect(doc.version).toBe(3);
     expect((await h.service.history("p", "roadmap.md"))[0]).toMatchObject({ kind: "revert" });
+  });
+
+  // Found by the reference model: under racing writers, history ordered by
+  // time could put an older patch first, and revert then restored its whole
+  // bodyBefore, discarding later writes. "Newest" now means the patch that
+  // produced the current version, whatever order history comes back in.
+  it("decides which patch is newest by version, not by history order", async () => {
+    const store = createInMemoryStore();
+    // Racing writers committed v2→3 a moment before v1→2, so by time the two
+    // newest patches come back swapped.
+    const reordered: MemoryStore = {
+      ...store,
+      listPatches: async (docId, limit) => {
+        const [a, b, ...rest] = await store.listPatches(docId, Number.MAX_SAFE_INTEGER);
+        return [b, a, ...rest].filter((p) => p !== undefined).slice(0, limit);
+      },
+    };
+    const r = harness({}, reordered);
+    await r.service.createProject({ slug: "p", title: "P" });
+    await r.service.writeDoc({ project: "p", doc: "roadmap.md", body: "- [ ] BFS\n- [ ] Dijkstra\n", actor: ACTOR });
+    const first = await r.service.patchDoc({
+      project: "p",
+      doc: "roadmap.md",
+      expectedVersion: 1,
+      edits: [{ old: "- [ ] BFS", new: "- [x] BFS" }],
+      actor: ACTOR,
+    });
+    await r.service.patchDoc({
+      project: "p",
+      doc: "roadmap.md",
+      expectedVersion: 2,
+      edits: [{ old: "- [ ] Dijkstra", new: "- [x] Dijkstra" }],
+      actor: ACTOR,
+    });
+
+    await r.service.revert({ project: "p", doc: "roadmap.md", patchId: first.patchId, actor: ACTOR });
+
+    expect((await r.service.readDoc("p", "roadmap.md")).body).toBe("- [ ] BFS\n- [x] Dijkstra\n");
   });
 
   it("reverts a mid-stack patch whose text later patches did not touch", async () => {

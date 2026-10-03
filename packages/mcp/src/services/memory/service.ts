@@ -171,12 +171,6 @@ export function createMemoryService(deps: MemoryServiceDeps): MemoryService {
     }
   }
 
-  async function record(
-    input: Omit<DocPatch, "createdAt" | "pid"> & { pid?: string },
-  ): Promise<DocPatch> {
-    return store.insertPatch({ ...input, pid: input.pid ?? newPatchId() });
-  }
-
   const result = (project: Project, doc: Doc, patchId: string): WriteResult => ({
     project: project.slug,
     doc: doc.name,
@@ -185,8 +179,8 @@ export function createMemoryService(deps: MemoryServiceDeps): MemoryService {
     sizeBytes: doc.sizeBytes,
   });
 
-  // Shared tail of every mutating op: swap the body under a version check,
-  // record the patch, re-index.
+  // Shared tail of every mutating op: swap the body under a version check
+  // together with its patch, re-index. Null when the compare-and-swap lost.
   async function commit(input: {
     project: Project;
     doc: Doc;
@@ -197,25 +191,63 @@ export function createMemoryService(deps: MemoryServiceDeps): MemoryService {
     actor: string;
     rationale: string | null;
   }): Promise<WriteResult | null> {
-    const updated = await store.updateDoc({
+    const committed = await store.updateDoc({
       docId: input.doc.id,
       expectedVersion: input.doc.version,
       body: input.body,
       summary: input.summary,
+      patch: {
+        pid: newPatchId(),
+        kind: input.kind,
+        edits: input.edits,
+        bodyBefore: input.doc.body,
+        versionBefore: input.doc.version,
+        versionAfter: input.doc.version + 1,
+        actor: input.actor,
+        rationale: input.rationale,
+      },
     });
-    if (!updated) return null;
-    const patch = await record({
-      docId: input.doc.id,
-      kind: input.kind,
-      edits: input.edits,
-      bodyBefore: input.doc.body,
-      versionBefore: input.doc.version,
-      versionAfter: updated.version,
-      actor: input.actor,
-      rationale: input.rationale,
+    if (!committed) return null;
+    await reindexDoc(input.project, committed.doc);
+    return result(input.project, committed.doc, committed.patch.pid);
+  }
+
+  // The creating half of write_doc. `{ theirs }` when another writer created
+  // the same name between our read and our insert.
+  async function createDoc(
+    project: Project,
+    input: WriteDocInput,
+  ): Promise<{ created: WriteResult } | { theirs: Doc }> {
+    if (input.expectedVersion !== undefined && input.expectedVersion !== 0) {
+      throw new MemoryError(
+        "version_conflict",
+        `Document "${input.doc}" does not exist yet; expected_version must be omitted or 0.`,
+        { project: project.slug, doc: input.doc, currentVersion: 0 },
+      );
+    }
+    const committed = await store.createDoc({
+      projectId: project.id,
+      name: input.doc,
+      summary: input.summary ?? null,
+      body: input.body,
+      patch: {
+        pid: newPatchId(),
+        kind: "write",
+        edits: [],
+        bodyBefore: "",
+        versionBefore: 0,
+        versionAfter: 1,
+        actor: input.actor,
+        rationale: input.rationale ?? null,
+      },
     });
-    await reindexDoc(input.project, updated);
-    return result(input.project, updated, patch.pid);
+    if (!committed) {
+      const theirs = await store.getDoc(project.id, input.doc);
+      if (!theirs) throw raced(project.slug, input.doc);
+      return { theirs };
+    }
+    await reindexDoc(project, committed.doc);
+    return { created: result(project, committed.doc, committed.patch.pid) };
   }
 
   return {
@@ -246,34 +278,13 @@ export function createMemoryService(deps: MemoryServiceDeps): MemoryService {
     writeDoc: async (input) => {
       const project = await requireProject(input.project);
       assertDocName(input.doc);
-      const existing = await store.getDoc(project.id, input.doc);
-
+      let existing = await store.getDoc(project.id, input.doc);
       if (!existing) {
-        if (input.expectedVersion !== undefined && input.expectedVersion !== 0) {
-          throw new MemoryError(
-            "version_conflict",
-            `Document "${input.doc}" does not exist yet; expected_version must be omitted or 0.`,
-            { project: project.slug, doc: input.doc, currentVersion: 0 },
-          );
-        }
-        const created = await store.createDoc({
-          projectId: project.id,
-          name: input.doc,
-          summary: input.summary ?? null,
-          body: input.body,
-        });
-        const patch = await record({
-          docId: created.id,
-          kind: "write",
-          edits: [],
-          bodyBefore: "",
-          versionBefore: 0,
-          versionAfter: created.version,
-          actor: input.actor,
-          rationale: input.rationale ?? null,
-        });
-        await reindexDoc(project, created);
-        return result(project, created, patch.pid);
+        const outcome = await createDoc(project, input);
+        if ("created" in outcome) return outcome.created;
+        // Created by someone else in the meantime: this call is now an
+        // overwrite of their document, judged as one.
+        existing = outcome.theirs;
       }
 
       // write_doc is the only op that can lose content, so it never runs blind.
@@ -390,8 +401,9 @@ export function createMemoryService(deps: MemoryServiceDeps): MemoryService {
         });
       }
 
-      const [newest] = await store.listPatches(doc.id, 1);
-      const isNewest = newest?.pid === patch.pid;
+      // The patch that produced the current version. Decided by version, not
+      // by position in history, so it holds however writers interleaved.
+      const isNewest = patch.versionAfter === doc.version;
 
       let body: string;
       if (input.rollback === true || isNewest) {

@@ -35,6 +35,16 @@ describe("applyEdits", () => {
     ]);
   });
 
+  // Found by the reference model: "  " matches "   " twice (at 0 and at 1),
+  // so it does not say which spaces the agent meant.
+  it("counts overlapping matches as ambiguous", () => {
+    const result = applyEdits("a   b", [{ old: "  ", new: " " }]);
+
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("expected failure");
+    expect(result.failures[0]).toMatchObject({ reason: "ambiguous", occurrences: 2 });
+  });
+
   it("applies nothing at all when a later edit fails", () => {
     const result = applyEdits(ROADMAP, [
       { old: "- [ ] BFS", new: "- [x] BFS" },

@@ -12,11 +12,15 @@ export interface CreateProjectInput {
   title: string;
 }
 
+// A patch on its way in, written together with the body it describes.
+export type NewPatch = Omit<DocPatch, "createdAt" | "docId">;
+
 export interface CreateDocInput {
   projectId: number;
   name: string;
   summary: string | null;
   body: string;
+  patch: NewPatch;
 }
 
 export interface UpdateDocInput {
@@ -26,6 +30,14 @@ export interface UpdateDocInput {
   expectedVersion: number;
   body: string;
   summary?: string | null;
+  patch: NewPatch;
+}
+
+// A document and the patch that produced its current version, committed in
+// one transaction: history can never disagree with the body it records.
+export interface CommittedDoc {
+  doc: Doc;
+  patch: DocPatch;
 }
 
 export interface CreateFactInput {
@@ -63,12 +75,13 @@ export interface MemoryStore {
 
   listDocs(projectId: number): Promise<DocSummary[]>;
   getDoc(projectId: number, name: string): Promise<Doc | null>;
-  createDoc(input: CreateDocInput): Promise<Doc>;
+  // Resolves to null when another writer created the name first.
+  createDoc(input: CreateDocInput): Promise<CommittedDoc | null>;
   // Resolves to null when `expectedVersion` no longer matches. Callers turn
   // that into a conflict the agent can act on, never a silent overwrite.
-  updateDoc(input: UpdateDocInput): Promise<Doc | null>;
+  updateDoc(input: UpdateDocInput): Promise<CommittedDoc | null>;
 
-  insertPatch(input: Omit<DocPatch, "createdAt">): Promise<DocPatch>;
+  // Newest first, by version: the order the body went through them.
   listPatches(docId: number, limit: number): Promise<DocPatch[]>;
   getPatch(docId: number, pid: string): Promise<DocPatch | null>;
 
