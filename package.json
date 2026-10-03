@@ -36,6 +36,7 @@
     "eval:snapshot": "tsx packages/mcp/src/scripts/eval-snapshot.ts",
     "eval:rag": "tsx packages/mcp/src/scripts/eval-rag.ts",
     "eval:inspect": "tsx packages/mcp/src/scripts/eval-inspect.ts",
+    "spec": "pnpm --filter @mcp-tools/mcp spec",
     "test": "vitest run",
     "test:watch": "vitest"
   },

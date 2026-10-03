@@ -389,6 +389,15 @@ nobody runs. `module.test.ts` pins the expected output as a literal.
   message to your bot).
 - `pnpm userbot:auth` — one-time MTProto login (phone + code).
 - `pnpm typecheck` — typecheck both packages.
+- `pnpm spec` — the executable specification: `packages/mcp/specs/*.feature`,
+  plain-English scenarios run by cucumber-js against the real server over MCP
+  with a Testcontainers Postgres (needs Docker; `TEST_DATABASE_URL` uses a
+  throwaway server instead). **The `.feature` files are the user's**: never
+  edit one to make a failing run pass — fix the code, or ask. New behaviour
+  gets a scenario there first. They are byte-identical to the Rust port's.
+  See `packages/mcp/specs/README.md`.
+- `pnpm test` — vitest. With `TEST_DATABASE_URL=postgres://…` the Postgres
+  tests run too (point it at a throwaway pgvector server, never prod).
 - `pnpm db:generate:pg` — regenerate Drizzle migrations after editing
   `packages/mcp/src/db/pg/schema.ts`. The new `*.sql` file lands in
   `packages/mcp/src/db/pg/migrations/` and is applied on next mcp boot.
