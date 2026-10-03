@@ -37,6 +37,7 @@
     "eval:rag": "tsx packages/mcp/src/scripts/eval-rag.ts",
     "eval:inspect": "tsx packages/mcp/src/scripts/eval-inspect.ts",
     "spec": "pnpm --filter @mcp-tools/mcp spec",
+    "spec:model": "vitest run --config vitest.model.config.ts",
     "test": "vitest run",
     "test:watch": "vitest"
   },

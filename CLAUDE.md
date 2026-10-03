@@ -396,6 +396,17 @@ nobody runs. `module.test.ts` pins the expected output as a literal.
   edit one to make a failing run pass — fix the code, or ask. New behaviour
   gets a scenario there first. They are byte-identical to the Rust port's.
   See `packages/mcp/specs/README.md`.
+- `pnpm spec:model` — the reference model of memory documents:
+  `packages/mcp/model/model.ts` says what write/append/patch/revert mean
+  (~200 lines, no database) and `properties.test.ts` checks its properties
+  with fast-check (part of `pnpm test`). `server.check.ts` sends random call
+  sequences, then overlapping calls from several sessions, to both the model
+  and the real server; answers must match and every concurrent history must
+  be linearizable. Needs Docker (or `TEST_DATABASE_URL`); `MODEL_CASES`
+  raises the case count. **Same ownership as the `.feature` files**: when the
+  server and the model disagree, fix the code or ask — a rule change starts
+  in `model.ts`, and its properties must still pass. See
+  `packages/mcp/model/README.md`.
 - `pnpm test` — vitest. With `TEST_DATABASE_URL=postgres://…` the Postgres
   tests run too (point it at a throwaway pgvector server, never prod).
 - `pnpm db:generate:pg` — regenerate Drizzle migrations after editing

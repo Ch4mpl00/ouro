@@ -29,6 +29,7 @@ import { createSignals, type Signals } from "../../src/services/signals";
 import { createSkillsModule } from "../../src/services/skills";
 import { createTelegramLog } from "../../src/services/telegram";
 import { createUserbot, createUserbotSessions } from "../../src/services/telegram/userbot";
+import type { ToolsetName } from "../../src/toolsets";
 
 // ── 1. database ──────────────────────────────────────────────────────────────
 
@@ -71,7 +72,9 @@ export interface Server {
   stop(): Promise<void>;
 }
 
-export async function startServer(databaseUrl: string): Promise<Server> {
+// `toolsets`: the MCP_TOOLSETS selection (omitted = every group). A restricted
+// instance is multi-session, as in production.
+export async function startServer(databaseUrl: string, toolsets?: readonly ToolsetName[]): Promise<Server> {
   // Nothing may leave the box: no chat to send to, no bot, no OpenAI key.
   for (const name of ["TELEGRAM_DEFAULT_CHAT_ID", "TELEGRAM_BOT_TOKEN", "OPENAI_API_KEY", "GMAIL_ACCOUNT_KEY"]) {
     delete process.env[name];
@@ -100,11 +103,10 @@ export async function startServer(databaseUrl: string): Promise<Server> {
     fetcher: createGuardedFetch(),
   };
 
-  // The full instance: one session, newest wins — as in production.
   const transport: RunningHttpTransport = await runHttpTransport({
     port: 0,
-    createEndpoint: async () => createServer(deps),
-    multiSession: false,
+    createEndpoint: async () => createServer({ ...deps, toolsets }),
+    multiSession: toolsets !== undefined,
   });
 
   return {
