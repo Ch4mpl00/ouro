@@ -33,19 +33,25 @@ services:
       retries: 10
     restart: unless-stopped
 
+  # The Rust MCP server (crates/mcp). All its state lives in Postgres: the
+  # news / memory store in $POSTGRES_DB, and the signal queue, tokens,
+  # scheduled tasks and chat log in a sibling database `mcp_state`, which
+  # it creates and migrates itself on boot — no setup step.
   mcp:
     build: .
     image: mcp-tools-image
-    command: sh -c "pnpm setup:mcp && pnpm mcp:serve"
+    command: mcp-tools
     env_file:
       - .env.mcp
     environment:
       MCP_TRANSPORT: http
       MCP_PORT: "3000"
+      # rmcp validates the Host header (DNS-rebinding guard); the agent dials
+      # mcp:3000, the healthcheck-style probes use loopback.
+      MCP_ALLOWED_HOSTS: mcp,mcp:3000,localhost,127.0.0.1
       MCP_MEMORY_ACTOR: supervisor
       DATABASE_URL: postgres://${POSTGRES_USER:-mcp}:${POSTGRES_PASSWORD:-mcp}@postgres:5432/${POSTGRES_DB:-mcp}
     volumes:
-      - mcp-data:/app/packages/mcp/data        # tokens.db, OAuth, signals, watermarks
       - mcp-storage:/app/storage               # Gmail attachments
     expose:
       - "3000"
@@ -67,20 +73,23 @@ services:
   # MCP_NO_POLLERS=1 is mandatory: Telegram getUpdates is exclusive, and a
   # second poller against the same bot 409s the `mcp` service.
   #
-  # It DOES mount mcp-data: send_telegram_message writes every outgoing
-  # message into the `telegram_messages` table in tokens.db, so without the
-  # shared volume the chat log the agent reads would silently miss anything
-  # ChatGPT sent. mcp-storage (Gmail attachments) is deliberately NOT
-  # mounted — nothing in the restricted surface touches it.
+  # send_telegram_message writes every outgoing message into the chat log in
+  # `mcp_state`, the same Postgres database `mcp` uses, so the log the agent
+  # reads includes whatever ChatGPT sent. mcp-storage (Gmail attachments) is
+  # deliberately NOT mounted — nothing in the restricted surface touches it.
   mcp-tunnel:
     build: .
     image: mcp-tools-image
-    command: sh -c "pnpm setup:mcp && pnpm mcp:serve"
+    command: mcp-tools
     env_file:
       - .env.mcp
     environment:
       MCP_TRANSPORT: http
       MCP_PORT: "3001"
+      # Host validation off: tunnel-client forwards requests whose Host header
+      # isn't ours to predict, and this port is only reachable inside the
+      # compose network (`expose`, never `ports`).
+      MCP_ALLOWED_HOSTS: "*"
       MCP_NO_POLLERS: "1"
       MCP_TOOLSETS: news-read,telegram-send,skills,memory
       # Signs ChatGPT's writes to shared memory, so doc_history says who did
@@ -88,7 +97,6 @@ services:
       MCP_MEMORY_ACTOR: chatgpt
       DATABASE_URL: postgres://${POSTGRES_USER:-mcp}:${POSTGRES_PASSWORD:-mcp}@postgres:5432/${POSTGRES_DB:-mcp}
     volumes:
-      - mcp-data:/app/packages/mcp/data        # telegram_messages chat log (shared with mcp)
       - agent-skills:/app/skills:ro            # live skills overlay exported to ChatGPT
     # Memory lives in the shared Postgres above, so ChatGPT reads and writes
     # the SAME projects and facts as the supervisor — that is the point of the
@@ -115,9 +123,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-      # Not a correctness guarantee, only ordering: let `mcp` apply schema.sql
-      # to the shared sqlite first so the two `pnpm setup:mcp` runs are less
-      # likely to collide. `restart: unless-stopped` covers the residual race.
+      # Ordering only: let `mcp` create the shared sqlite schema first. The
+      # Postgres migrations are serialised by an advisory lock either way.
       mcp:
         condition: service_started
     restart: unless-stopped
@@ -260,6 +267,8 @@ services:
     restart: unless-stopped
 
 volumes:
+  # The TS-era sqlite tokens.db. Nothing mounts it any more; it is kept for
+  # rollback and as the source of the one-time import-sqlite-state.
   mcp-data:
   mcp-storage:
   agent-data:

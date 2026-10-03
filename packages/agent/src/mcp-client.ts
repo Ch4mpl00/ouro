@@ -10,7 +10,7 @@ import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import type { ChatCompletionTool } from "openai/resources/chat/completions";
 
 // Connects to the MCP server. Two transports:
-//   - stdio (default, MCP_TRANSPORT=stdio): spawns packages/mcp as a child
+//   - stdio (default, MCP_TRANSPORT=stdio): spawns the MCP server (crates/mcp) as a child
 //     process — used for local dev and Claude Code's .mcp.json
 //   - http (MCP_TRANSPORT=http, MCP_URL=...): connects to a remote MCP server
 //     over Streamable HTTP — used for containerized deployment where the

@@ -29,12 +29,12 @@ them one at a time, loads a matching markdown *skill*, and runs a single LLM
 session whose every side effect — a Telegram reply, a scheduled task, a DB
 write — is an MCP tool call.
 
-Two independent processes in one pnpm workspace, deployed as two containers:
+Two independent processes in one repo, deployed as two containers:
 
 | Package | Role | Knows about |
 | --- | --- | --- |
-| **`packages/mcp`** | Stateless MCP server. Wraps Gmail / Telegram / Monobank / news as primitive tools; runs the pollers that turn external events into signals. | Nothing about the agent. |
-| **`packages/agent`** | Agent supervisor. Pulls one signal and runs a primary AgentLoop with shared working memory and focused sub-agents. | Nothing about MCP internals — only the tools the protocol exposes. |
+| **`crates/mcp`** (Rust) | Stateless MCP server. Wraps Gmail / Telegram / Monobank / news as primitive tools; runs the pollers that turn external events into signals. | Nothing about the agent. |
+| **`packages/agent`** (TypeScript) | Agent supervisor. Pulls one signal and runs a primary AgentLoop with shared working memory and focused sub-agents. | Nothing about MCP internals — only the tools the protocol exposes. |
 
 Neither imports code from the other. The boundary *is* the protocol.
 
@@ -102,7 +102,7 @@ and a failed fetch never blocks the reply.
 
 ```mermaid
 flowchart LR
-    subgraph mcp [packages/mcp]
+    subgraph mcp [crates/mcp]
         P1[Gmail poller<br/>1 min] --> Q
         P2[Telegram bot<br/>long-poll] --> Q
         P3[Userbot channels<br/>30 min] --> Q
@@ -156,7 +156,7 @@ loaded on the primary), `orchestrator`, `worker`, `recovery`, `planner`
 
 ## MCP tools
 
-Defined in `packages/mcp/src/tools/`. The agent calls them over StreamableHTTP;
+Defined at the end of each domain file in `crates/mcp/src/`. The agent calls them over StreamableHTTP;
 locally they're also registered with Claude Code via `.mcp.json`. Grouped by
 integration:
 
@@ -208,16 +208,19 @@ layer and must not replay tool side effects. See `agent-loop.ts` and
 
 ## Stack
 
-TypeScript (ESM) · [`@modelcontextprotocol/sdk`](https://github.com/modelcontextprotocol/typescript-sdk) ·
-Effect 4 (`effect@4.0.0-rc.113`, pinned) ·
-`better-sqlite3` · Drizzle + pgvector · `googleapis` (Gmail) ·
-gramjs (MTProto userbot) · `cron-parser` · `openai` SDK pointed at DeepSeek ·
-Langfuse tracing · Vitest.
+**MCP server** — Rust · [`rmcp`](https://github.com/modelcontextprotocol/rust-sdk) ·
+tokio · `rusqlite` · `tokio-postgres` + pgvector · `reqwest` (Gmail, Telegram
+Bot API, Monobank, OpenAI embeddings as plain REST) · `grammers` (MTProto
+userbot) · `croner` · `pdf-extract` · `dom_smoothie` (Readability).
+
+**Agent** — TypeScript (ESM) · [`@modelcontextprotocol/sdk`](https://github.com/modelcontextprotocol/typescript-sdk) ·
+Effect 4 (`effect@4.0.0-rc.113`, pinned) · `better-sqlite3` · Drizzle ·
+`openai` SDK pointed at DeepSeek · Langfuse tracing · Vitest.
 
 ## Getting started
 
 ```bash
-pnpm install
+pnpm install          # agent deps; the MCP server needs a Rust toolchain (cargo)
 pnpm db:init          # apply both sqlite schemas (idempotent)
 
 # one-time credentials
@@ -242,12 +245,12 @@ Examples are checked in as `*.example`.
 
 | Command                                            | What it does                                             |
 | -------------------------------------------------- | -------------------------------------------------------- |
-| `pnpm typecheck`                                   | Typecheck both packages                                  |
-| `pnpm test`                                        | Vitest suite                                             |
+| `pnpm typecheck`                                   | Typecheck the TS packages                                |
+| `pnpm test`                                        | Vitest suite (agent)                                     |
+| `pnpm test:mcp`                                    | `cargo test` for the MCP server (+ PG tests with `TEST_DATABASE_URL`) |
 | `pnpm trace` / `pnpm judge`                        | Inspect Langfuse traces / run the LLM-as-judge over them |
 | `pnpm eval:snapshot` · `eval:rag` · `eval:inspect` | RAG evaluation harness                                   |
-| `pnpm embed:backfill`                              | Re-embed `news_items` rows left without embeddings       |
-| `pnpm db:generate:pg`                              | Regenerate Drizzle migrations after schema edits         |
+| `pnpm embed:backfill`                              | Re-embed rows left without embeddings (news, notes, memory) |
 
 ## Deploy
 

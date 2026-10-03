@@ -1,0 +1,7 @@
+[workspace]
+resolver = "3"
+members = ["crates/mcp"]
+
+# Symbols stripped: the binaries ship to the droplet on every Rust change.
+[profile.release]
+strip = true

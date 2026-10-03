@@ -5,8 +5,8 @@ import type { Observation } from "../trace-model";
 // Drizzle schema for the agent's sqlite state (agent.db). The query layer
 // (db/memory.ts, db/trace-store.ts) builds on this; migrations are generated
 // from it with `pnpm db:generate:agent` and applied on boot in db/client.ts.
-// Mirrors the MCP-side Drizzle setup (packages/mcp/src/db/pg/schema.ts), only
-// for sqlite. The legacy `bills` table is intentionally dropped — it was a
+// Mirrors the Drizzle setup the TS MCP server used for Postgres, only for
+// sqlite. The legacy `bills` table is intentionally dropped — it was a
 // no-longer-populated leftover (see CLAUDE.md).
 
 // A `datetime('now')` default expressed once so every table reads the same.

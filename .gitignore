@@ -34,3 +34,9 @@ packages/*/data/*.db-shm
 # but not lock files / session state).
 .claude/scheduled_tasks.lock
 .claude/projects/
+
+# Rust build output
+/target/
+
+# Rust MCP sqlite state (MCP_DB_PATH default)
+crates/*/data/
