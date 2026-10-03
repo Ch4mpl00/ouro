@@ -55,8 +55,8 @@ Knowledge, Skills, Gateway and Main compiled on the first attempt.**
 
 | Bug | Found by |
 |---|---|
-| Quill's `lift(opt).forall(...)` binds an untyped `? IS NULL`; Postgres refuses to plan it | Testcontainers test |
-| Quill wraps a raw `UPDATE … RETURNING` in `SELECT … FROM (…)` | compile-time SQL log |
+| My use of Quill: the static `lift(opt).forall(...)` filter emits `? IS NULL`; for a `None` timestamp pgjdbc sends that NULL untyped (by design — it can't tell timestamp from timestamptz) and Postgres can't plan it. Not a Quill bug: the idiomatic form is a dynamic query with `filterOpt`, which leaves an unset filter out of the SQL. I first "fixed" it by dropping to raw JDBC — wrong call, reverted | Testcontainers test; root cause by reading Quill's encoders and pgjdbc's `setNull` |
+| My use of Quill: a raw `sql"UPDATE … RETURNING".as[Query]` is treated as a query and wrapped in `SELECT … FROM (…)`. The native form is `.update(…).returningMany(…)` with the `FOR UPDATE SKIP LOCKED` subquery as an `sql` fragment | compile-time SQL log |
 | Fat jar overwrote `META-INF/services` → Flyway "unsupported database" | first smoke run |
 | MTProto `msg_id` computed with silent `Long` overflow | reasoning while debugging the live handshake |
 | TL `string` decoded as UTF-8 corrupted binary fields (pq, DH prime) | live handshake against DC 2 |
@@ -64,7 +64,10 @@ Knowledge, Skills, Gateway and Main compiled on the first attempt.**
 | `PBEKeySpec` re-encodes a binary password as UTF-8 chars | reading the JDK docs before trusting it |
 | Rust: `dotenvy` walking up to a parent `.env` with real credentials | a smoke test that touched the real Telegram account |
 
-Neither type system caught protocol or data-semantics bugs. **Tests that
+Two of these were mine, not the library's: the first explanation an LLM
+reaches for ("the ORM generates bad SQL") was wrong, and only reading the
+encoder and driver sources showed the real interaction. Neither type system
+caught protocol or data-semantics bugs. **Tests that
 exercise the real thing did** — Testcontainers Postgres, a live anonymous
 MTProto handshake, a fingerprint check against a known constant.
 

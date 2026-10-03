@@ -12,6 +12,7 @@ package mcp
 //                    `dreaming` toolset (list_signals)
 
 import io.getquill.*
+import io.getquill.extras.*
 import sttp.tapir.Schema
 import sttp.tapir.Schema.annotations.description
 import sttp.tapir.Schema.annotations.validate
@@ -21,7 +22,6 @@ import zio.json.*
 
 import java.time.Instant
 
-import Rows.*
 
 // ── 1. queue ─────────────────────────────────────────────────────────────────
 
@@ -59,42 +59,31 @@ final class Signals(db: Db):
   // Atomically pops the oldest pending signal. SKIP LOCKED: a concurrent
   // popper takes the next row instead of waiting, never the same one.
   def popNext: Task[Option[PendingSignal]] =
-    db.pool
-      .query(
-        """UPDATE signals SET consumed_at = now()
-            WHERE id = (SELECT id FROM signals WHERE consumed_at IS NULL
-                         ORDER BY id ASC LIMIT 1 FOR UPDATE SKIP LOCKED)
-        RETURNING id, source, content, created_at"""
-      )(rs =>
-        PendingSignal(
-          rs.getLong("id"),
-          rs.getString("source"),
-          rs.getString("content"),
-          Time.sqlTime(rs.instant("created_at"))
+    run(
+      signals
+        .filter(s =>
+          s.id == sql"""(SELECT id FROM signals WHERE consumed_at IS NULL
+                          ORDER BY id ASC LIMIT 1 FOR UPDATE SKIP LOCKED)""".as[Long]
         )
-      )
-      .map(_.headOption)
+        .update(_.consumedAt -> sql"now()".as[Option[Instant]])
+        .returningMany(s => (s.id, s.source, s.content, s.createdAt))
+    ).map(_.headOption.map((id, source, content, created) => PendingSignal(id, source, content, Time.sqlTime(created))))
 
   def countPending: Task[Long] = run(signals.filter(_.consumedAt.isEmpty).size)
 
   // Read-only view; never pops. The dreaming session reviews what happened
-  // since its previous fire with this. The WHERE clause is built per filter:
-  // Quill's `Option.forall` form binds an untyped `? IS NULL` that Postgres
-  // refuses to plan.
+  // since its previous fire with this. A dynamic query, so an unset filter is
+  // left out of the SQL: the static `lift(opt).forall(...)` form binds a NULL
+  // timestamptz for `? IS NULL`, which pgjdbc sends untyped and Postgres can't
+  // plan.
   def list(filter: ListSignals): Task[List[SignalRow]] =
-    val filters = List(filter.since.map("created_at > ?" -> _), filter.source.map("source = ?" -> _)).flatten
-    val sql =
-      s"""SELECT id, source, content, created_at, consumed_at FROM signals
-          ${NewsRepository.whereClause(filters.map(_._1))} ORDER BY id ASC LIMIT ?"""
-    db.pool.query(sql, (filters.map(_._2) :+ filter.limit.getOrElse(Signals.DefaultListLimit))*) { rs =>
-      SignalRow(
-        rs.getLong("id"),
-        rs.getString("source"),
-        rs.getString("content"),
-        Time.sqlTime(rs.instant("created_at")),
-        rs.optInstant("consumed_at").map(Time.sqlTime)
-      )
-    }
+    run(
+      signals.dynamic
+        .filterOpt(filter.since)((s, since) => quote(s.createdAt > since))
+        .filterOpt(filter.source)((s, source) => quote(s.source == unquote(source)))
+        .sortBy(_.id)
+        .take(filter.limit.getOrElse(Signals.DefaultListLimit))
+    ).map(_.map(r => SignalRow(r.id, r.source, r.content, Time.sqlTime(r.createdAt), r.consumedAt.map(Time.sqlTime))))
 
 object Signals:
   val DefaultListLimit = 200

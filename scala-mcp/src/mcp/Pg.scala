@@ -90,8 +90,7 @@ final class PgPool(val ds: HikariDataSource):
   val quill: Quill.Postgres[SnakeCase] = new Quill.Postgres(SnakeCase, ds)
 
   // A plain JDBC connection for the few things Quill has no word for: DDL,
-  // `UPDATE … RETURNING` (Quill wraps an infix query in a SELECT), pgvector
-  // operators in dynamic SQL.
+  // advisory locks, pgvector operators (`<=>` over a `::vector` cast).
   def withConnection[A](f: Connection => A): Task[A] =
     ZIO.scoped(ZIO.fromAutoCloseable(ZIO.attemptBlocking(ds.getConnection)).flatMap(c => ZIO.attemptBlocking(f(c))))
 
