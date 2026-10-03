@@ -439,6 +439,11 @@ of a binary in `crates/mcp`; inside the container the same binaries are on
 - `pnpm userbot:auth` — one-time MTProto login (phone + code). The session
   is stored in gramjs `StringSession` format, which the Rust server imports.
 - `pnpm typecheck` — typecheck the TS packages.
+- `pnpm spec` — the executable specification: `crates/mcp/specs/*.feature`,
+  plain-English scenarios run against the real server over MCP with a
+  Testcontainers Postgres (needs Docker). **The `.feature` files are the
+  user's**: never edit one to make a failing run pass — fix the code, or ask.
+  New behaviour gets a scenario there first. See `crates/mcp/specs/README.md`.
 - `pnpm test:mcp` — `cargo test -p mcp-tools`. With
   `TEST_DATABASE_URL=postgres://…` the Postgres integration tests run too
   (point it at a throwaway pgvector database, never prod).

@@ -35,3 +35,13 @@ tokio-util = "0.7.19"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 url = "2.5.8"
+
+[dev-dependencies]
+cucumber = "0.23"
+testcontainers-modules = { version = "0.15", features = ["postgres"] }
+
+# The executable specification: specs/*.feature, run against the real server.
+#   cargo test --test specs
+[[test]]
+name = "specs"
+harness = false
