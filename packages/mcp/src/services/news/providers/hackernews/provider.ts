@@ -1,4 +1,5 @@
 import { fetchArticleWithRetry, type ExtractedArticle } from "../../core/article";
+import type { GuardedFetch } from "../../../fetch";
 import type { NewsProvider } from "../../core/provider";
 import type { NewsItem } from "../../core/types";
 import { fetchHackerNewsHeadlines, type HnHeadline } from "./api";
@@ -20,10 +21,10 @@ export interface HackerNewsProviderOpts {
   cadenceMs?: number;
 }
 
-export function defaultHackerNewsDeps(): HackerNewsProviderDeps {
+export function defaultHackerNewsDeps(fetcher: GuardedFetch): HackerNewsProviderDeps {
   return {
     fetchHeadlines: fetchHackerNewsHeadlines,
-    fetchArticle: fetchArticleWithRetry,
+    fetchArticle: (url) => fetchArticleWithRetry(fetcher, url),
   };
 }
 

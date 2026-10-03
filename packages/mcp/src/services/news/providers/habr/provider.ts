@@ -1,4 +1,5 @@
 import { fetchArticleWithRetry, type ExtractedArticle } from "../../core/article";
+import type { GuardedFetch } from "../../../fetch";
 import type { NewsProvider } from "../../core/provider";
 import type { NewsItem } from "../../core/types";
 import { fetchHabrHeadlines, type HabrHeadline } from "./api";
@@ -20,10 +21,10 @@ export interface HabrProviderOpts {
   cadenceMs?: number;
 }
 
-export function defaultHabrDeps(): HabrProviderDeps {
+export function defaultHabrDeps(fetcher: GuardedFetch): HabrProviderDeps {
   return {
     fetchHeadlines: fetchHabrHeadlines,
-    fetchArticle: fetchArticleWithRetry,
+    fetchArticle: (url) => fetchArticleWithRetry(fetcher, url),
   };
 }
 

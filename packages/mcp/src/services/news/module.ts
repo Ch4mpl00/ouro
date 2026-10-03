@@ -17,6 +17,7 @@ import {
 import { startNewsPoller } from "./poller";
 import type { Userbot } from "../telegram/userbot";
 import type { EmbeddingProvider } from "../embeddings/provider";
+import { createGuardedFetch, type GuardedFetch } from "../fetch";
 
 // Composition root for the news domain. Wires embeddings + embedder
 // into a NewsRepository, instantiates the default providers with their
@@ -35,6 +36,8 @@ export interface NewsModuleDeps {
   userbot?: Userbot;
   // Defaults to OpenAI; tests pass a deterministic one.
   embeddingProvider?: EmbeddingProvider;
+  // Article pages go through the SSRF guard.
+  fetcher?: GuardedFetch;
 }
 
 export function createNewsModule(deps: NewsModuleDeps): NewsModule {
@@ -47,9 +50,10 @@ export function createNewsModule(deps: NewsModuleDeps): NewsModule {
   const embedder = createNewsEmbedder({ db, embeddings });
   const repository = createNewsRepository({ db, embeddings, embedder });
 
+  const fetcher = deps.fetcher ?? createGuardedFetch();
   const providers: NewsProvider[] = [
-    createHackerNewsProvider(defaultHackerNewsDeps()),
-    createHabrProvider(defaultHabrDeps()),
+    createHackerNewsProvider(defaultHackerNewsDeps(fetcher)),
+    createHabrProvider(defaultHabrDeps(fetcher)),
     ...(deps.userbot ? [createTelegramChannelsProvider(defaultTelegramChannelsDeps(db, deps.userbot))] : []),
   ];
 

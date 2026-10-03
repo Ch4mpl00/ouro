@@ -1,6 +1,7 @@
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { fetchArticle } from "../services/news";
+import type { GuardedFetch } from "../services/fetch";
 import type { NewsItem, NewsRepository } from "../services/news";
 import { jsonResult } from "../result";
 
@@ -32,7 +33,7 @@ const CHUNKS_DESCRIPTION =
   "reference ${bind.chunks.0}, ${bind.chunks.1}, … statically; trailing " +
   "chunks may be empty when there are few items.";
 
-export function registerNewsTools(server: McpServer, news: NewsRepository): void {
+export function registerNewsTools(server: McpServer, news: NewsRepository, fetcher: GuardedFetch): void {
   server.registerTool(
     "search_news",
     {
@@ -216,7 +217,7 @@ export function registerNewsTools(server: McpServer, news: NewsRepository): void
         });
       }
 
-      const article = await fetchArticle(url);
+      const article = await fetchArticle(fetcher, url);
       const source = sourceForUrl(url);
       const item: NewsItem = {
         source,

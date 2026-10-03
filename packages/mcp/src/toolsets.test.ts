@@ -67,6 +67,7 @@ function stubDeps(): ToolsetDeps {
       client: unused,
     },
     userbot: { hasSession: unused, client: unused, disconnect: unused },
+    fetcher: unused,
   };
 }
 

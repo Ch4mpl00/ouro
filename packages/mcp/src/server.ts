@@ -10,6 +10,7 @@ import { createGmailModule, startGmailPoller } from "./services/gmail";
 import { createScheduledTasks, startSchedulerPoller } from "./services/scheduler";
 import { createSignals } from "./services/signals";
 import { createSettings } from "./services/settings";
+import { createGuardedFetch } from "./services/fetch";
 import { createPgClient, databaseUrl } from "./db/pg/client";
 import { connectStateDb } from "./db/state";
 import { createNewsModule, startNewsModule } from "./services/news";
@@ -32,8 +33,9 @@ async function main(): Promise<void> {
   const telegramLog = createTelegramLog(state);
   const gmail = createGmailModule({ db: state });
   const userbot = createUserbot(createUserbotSessions(state));
+  const fetcher = createGuardedFetch();
 
-  const newsModule = createNewsModule({ db: pg.db, userbot });
+  const newsModule = createNewsModule({ db: pg.db, userbot, fetcher });
   const knowledgeModule = createKnowledgeModule({ db: pg.db });
   const memoryModule = createMemoryModule({ db: pg.db });
   const skillsModule = createSkillsModule({
@@ -77,6 +79,7 @@ async function main(): Promise<void> {
       telegramLog,
       gmail,
       userbot,
+      fetcher,
       toolsets: toolsets.names,
     });
     if (upstreams.length === 0) return ownServer;

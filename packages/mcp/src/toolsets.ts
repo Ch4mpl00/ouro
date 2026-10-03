@@ -23,6 +23,7 @@ import type { ScheduledTasks } from "./services/scheduler";
 import type { TelegramLog } from "./services/telegram";
 import type { GmailModule } from "./services/gmail";
 import type { Userbot } from "./services/telegram/userbot";
+import type { GuardedFetch } from "./services/fetch";
 
 // Named tool groups a server instance can register. One MCP process serves one
 // audience: the droplet supervisor gets everything, a third-party client (e.g.
@@ -46,6 +47,8 @@ export interface ToolsetDeps {
   telegramLog: TelegramLog;
   gmail: GmailModule;
   userbot: Userbot;
+  // Every outbound page fetch (fetch_url, fetch_article) goes through this.
+  fetcher: GuardedFetch;
 }
 
 type ToolsetRegistrar = (server: McpServer, deps: ToolsetDeps) => void;
@@ -65,12 +68,12 @@ const TOOLSETS = {
   fs: (server) => registerFsTools(server),
   // fetch_url — arbitrary page fetch behind an SSRF guard. Deliberately NOT
   // handed to third-party clients: it turns our server into their proxy.
-  fetch: (server) => registerFetchTools(server),
+  fetch: (server, deps) => registerFetchTools(server, deps.fetcher),
   signals: (server, deps) => registerSignalsTools(server, deps.signals),
   // search_news, list_news, fetch_article — the whole of tools/news.ts. It
   // reads the store (fetch_article also caches what it downloaded) and touches
   // no personal account, which is why it is the one group safe to hand out.
-  "news-read": (server, deps) => registerNewsTools(server, deps.news),
+  "news-read": (server, deps) => registerNewsTools(server, deps.news, deps.fetcher),
   knowledge: (server, deps) => registerKnowledgeTools(server, deps.knowledge),
   dreaming: (server, deps) => registerDreamingTools(server, deps.signals),
   userbot: (server, deps) => registerUserbotTools(server, deps.userbot),

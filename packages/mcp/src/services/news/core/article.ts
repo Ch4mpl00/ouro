@@ -1,4 +1,5 @@
-import { extract } from "@extractus/article-extractor";
+import { extractFromHtml } from "@extractus/article-extractor";
+import type { GuardedFetch } from "../../fetch";
 
 export interface ExtractedArticle {
   url: string;
@@ -12,12 +13,23 @@ export interface ExtractedArticle {
   author?: string;
 }
 
-// Returns a cleaned plaintext rendition of an article. Uses Mozilla
-// Readability via @extractus/article-extractor under the hood. We strip
-// any residual HTML the extractor may leave behind so the LLM gets a
+const TIMEOUT_MS = 20_000;
+
+// Returns a cleaned plaintext rendition of an article. The page is fetched
+// through the SSRF guard (article URLs come from the model and from feeds),
+// then Mozilla Readability via @extractus/article-extractor extracts it. We
+// strip any residual HTML the extractor may leave behind so the LLM gets a
 // compact text blob.
-export async function fetchArticle(url: string): Promise<ExtractedArticle> {
-  const article = await extract(url);
+export async function fetchArticle(fetcher: GuardedFetch, url: string): Promise<ExtractedArticle> {
+  const { url: finalUrl, response } = await fetcher(url, {
+    signal: AbortSignal.timeout(TIMEOUT_MS),
+    headers: { accept: "text/html,application/xhtml+xml" },
+  });
+  if (!response.ok) {
+    await response.body?.cancel();
+    throw new Error(`fetching ${url} failed: HTTP ${response.status}`);
+  }
+  const article = await extractFromHtml(await response.text(), finalUrl);
   if (!article) throw new Error(`No article extracted from ${url}`);
   return {
     url,
@@ -38,13 +50,14 @@ function parseDate(input: string | null | undefined): Date | null {
 // Two retries on top of the initial attempt (3 total). Returns null on
 // terminal failure so the caller can drop the item.
 export async function fetchArticleWithRetry(
+  fetcher: GuardedFetch,
   url: string,
   attempts = 3,
 ): Promise<ExtractedArticle | null> {
   let lastErr: unknown;
   for (let i = 0; i < attempts; i++) {
     try {
-      return await fetchArticle(url);
+      return await fetchArticle(fetcher, url);
     } catch (err) {
       lastErr = err;
       if (i < attempts - 1) {
