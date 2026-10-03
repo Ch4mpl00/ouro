@@ -1,5 +1,4 @@
 import type { gmail_v1 } from "googleapis";
-import { getGmailClient } from "./client";
 
 export interface AttachmentRef {
   attachmentId: string;
@@ -31,11 +30,10 @@ export function findAttachments(message: gmail_v1.Schema$Message): AttachmentRef
 }
 
 export async function fetchAttachmentData(
-  accountKey: string,
+  gmail: gmail_v1.Gmail,
   messageId: string,
   attachmentId: string,
 ): Promise<Buffer> {
-  const gmail = await getGmailClient(accountKey);
   const { data } = await gmail.users.messages.attachments.get({
     userId: "me",
     messageId,

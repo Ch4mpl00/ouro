@@ -1,5 +1,4 @@
-import { getSavedSession } from "../../../telegram/userbot";
-import { getUserbotClient } from "../../../telegram/userbot";
+import type { Userbot } from "../../../telegram/userbot";
 import type {
   ChannelHandle,
   ChannelMessage,
@@ -22,12 +21,12 @@ interface RawMessage {
   forwards?: number;
 }
 
-export function createGramjsUserbotAdapter(): UserbotChannelsAdapter {
+export function createGramjsUserbotAdapter(userbot: Userbot): UserbotChannelsAdapter {
   return {
-    hasSession: () => getSavedSession() !== null,
+    hasSession: () => userbot.hasSession(),
 
     listChannels: async (): Promise<ChannelHandle[]> => {
-      const client = await getUserbotClient();
+      const client = await userbot.client();
       const dialogs = await client.getDialogs({ limit: 500 });
       const out: ChannelHandle[] = [];
       for (const d of dialogs) {
@@ -45,7 +44,7 @@ export function createGramjsUserbotAdapter(): UserbotChannelsAdapter {
     },
 
     fetchMessages: async (channel, opts): Promise<ChannelMessage[]> => {
-      const client = await getUserbotClient();
+      const client = await userbot.client();
       const raw = (await client.getMessages(channel.ref as Parameters<typeof client.getMessages>[0], {
         limit: opts.limit,
         minId: opts.sinceMessageId ?? undefined,

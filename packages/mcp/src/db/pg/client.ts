@@ -20,7 +20,7 @@ const MIGRATIONS_DIR = path.resolve(import.meta.dirname, "./migrations");
 // Rust server takes too.
 const MIGRATION_LOCK = "30790106749954407";
 
-function databaseUrl(): string {
+export function databaseUrl(): string {
   const url = process.env.DATABASE_URL;
   if (!url) {
     throw new Error(

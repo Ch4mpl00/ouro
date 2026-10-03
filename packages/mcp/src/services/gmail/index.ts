@@ -1,11 +1,7 @@
 export { GMAIL_READ_SCOPES } from "./scopes";
-export {
-  createOAuth2Client,
-  getAuthUrl,
-  exchangeCodeAndPersist,
-  persistTokens,
-} from "./auth";
-export { getOAuth2ClientForAccount, getGmailClient } from "./client";
+export { createOAuth2Client, getAuthUrl, exchangeCodeAndPersist } from "./auth";
+export { createGmailModule, type GmailModule } from "./client";
+export { createGmailStore, type GmailStore, type GmailAccount } from "./storage";
 export {
   listMessages,
   searchMessages,
@@ -21,4 +17,4 @@ export {
   fetchAttachmentData,
   type AttachmentRef,
 } from "./attachments";
-export { startGmailPoller } from "./poller";
+export { startGmailPoller, type GmailPollerDeps } from "./poller";

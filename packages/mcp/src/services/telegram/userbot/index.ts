@@ -1,5 +1,5 @@
-export { getUserbotClient, disconnectUserbot, getApiCredentials } from "./client";
-export { getSavedSession, saveSession } from "./auth";
+export { createUserbot, getApiCredentials, type Userbot } from "./client";
+export { createUserbotSessions, type UserbotSessions, type SavedSession } from "./auth";
 export {
   fetchChannelMessages,
   listDialogs,

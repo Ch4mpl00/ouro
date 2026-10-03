@@ -1,9 +1,9 @@
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { listDialogs } from "../services/telegram/userbot";
+import { listDialogs, type Userbot } from "../services/telegram/userbot";
 import { jsonResult } from "../result";
 
-export function registerUserbotTools(server: McpServer): void {
+export function registerUserbotTools(server: McpServer, userbot: Userbot): void {
   server.registerTool(
     "list_userbot_dialogs",
     {
@@ -33,7 +33,7 @@ export function registerUserbotTools(server: McpServer): void {
       },
     },
     async ({ type, limit }) => {
-      const dialogs = await listDialogs(limit);
+      const dialogs = await listDialogs(userbot, limit);
       const filtered = type && type !== "all" ? dialogs.filter((d) => d.type === type) : dialogs;
       return jsonResult({ count: filtered.length, dialogs: filtered });
     },

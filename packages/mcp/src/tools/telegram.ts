@@ -5,11 +5,10 @@ import {
   editMessageText,
   sendChatAction,
   getDefaultChatId,
-  recordMessage,
-  getChatHistory,
   startTyping,
   stopTyping,
   sendStatus,
+  type TelegramLog,
 } from "../services/telegram";
 import { jsonResult } from "../result";
 
@@ -32,7 +31,7 @@ const chatIdAsNumber = z
 // can register it without also handing out chat history, edits, or the
 // typing/status machinery. `registerTelegramTools` calls this first, so the
 // full surface is unchanged.
-export function registerTelegramSendTools(server: McpServer): void {
+export function registerTelegramSendTools(server: McpServer, log: TelegramLog): void {
   server.registerTool(
     "send_telegram_message",
     {
@@ -72,7 +71,7 @@ export function registerTelegramSendTools(server: McpServer): void {
       // Outgoing message clears the bot's typing indicator client-side;
       // also stop our keep-alive so it doesn't bleed into the next session.
       stopTyping(target, messageThreadId);
-      recordMessage({
+      await log.record({
         chatId: sent.chat.id,
         tgMessageId: sent.message_id,
         threadId: messageThreadId ?? null,
@@ -90,8 +89,8 @@ export function registerTelegramSendTools(server: McpServer): void {
   );
 }
 
-export function registerTelegramTools(server: McpServer): void {
-  registerTelegramSendTools(server);
+export function registerTelegramTools(server: McpServer, log: TelegramLog): void {
+  registerTelegramSendTools(server, log);
 
   server.registerTool(
     "edit_telegram_message",
@@ -265,7 +264,7 @@ export function registerTelegramTools(server: McpServer): void {
       },
     },
     async ({ chatId, limit, threadId }) => {
-      const messages = getChatHistory(chatId, limit, threadId);
+      const messages = await log.history(chatId, limit, threadId);
       return jsonResult({ messages });
     },
   );

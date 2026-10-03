@@ -21,7 +21,7 @@ export interface ChannelMessage {
 }
 
 export interface UserbotChannelsAdapter {
-  hasSession(): boolean;
+  hasSession(): Promise<boolean>;
   listChannels(): Promise<ChannelHandle[]>;
   // sinceMessageId is exclusive (gramjs minId semantics).
   fetchMessages(

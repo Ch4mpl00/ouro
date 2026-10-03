@@ -1,5 +1,4 @@
 import type { gmail_v1 } from "googleapis";
-import { getGmailClient } from "./client";
 
 export interface ListMessagesOptions {
   query?: string;
@@ -30,10 +29,9 @@ export interface PageResult<T> {
 }
 
 export async function listMessages(
-  accountKey: string,
+  gmail: gmail_v1.Gmail,
   opts: ListMessagesOptions = {},
 ): Promise<PageResult<MessageSummary>> {
-  const gmail = await getGmailClient(accountKey);
   const { data } = await gmail.users.messages.list({
     userId: "me",
     q: opts.query,
@@ -52,15 +50,14 @@ export async function listMessages(
 }
 
 export async function searchMessages(
-  accountKey: string,
+  gmail: gmail_v1.Gmail,
   query: string,
   maxResults = 25,
 ): Promise<PageResult<MessageSummary>> {
-  return listMessages(accountKey, { query, maxResults });
+  return listMessages(gmail, { query, maxResults });
 }
 
-export async function getMessage(accountKey: string, id: string): Promise<MessageDetail> {
-  const gmail = await getGmailClient(accountKey);
+export async function getMessage(gmail: gmail_v1.Gmail, id: string): Promise<MessageDetail> {
   const { data } = await gmail.users.messages.get({
     userId: "me",
     id,
@@ -72,10 +69,9 @@ export async function getMessage(accountKey: string, id: string): Promise<Messag
 // Returns the raw Gmail payload — needed when callers want to walk the MIME
 // tree directly (e.g. attachment extraction).
 export async function getRawMessage(
-  accountKey: string,
+  gmail: gmail_v1.Gmail,
   id: string,
 ): Promise<gmail_v1.Schema$Message> {
-  const gmail = await getGmailClient(accountKey);
   const { data } = await gmail.users.messages.get({ userId: "me", id, format: "full" });
   return data;
 }

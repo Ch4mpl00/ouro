@@ -1,13 +1,16 @@
 import "dotenv/config";
-import { getDb, closeDb } from "../db/client";
+import path from "node:path";
+import Database from "better-sqlite3";
 import { createPgClient } from "../db/pg/client";
 import { createNewsModule, type NewsItem } from "../services/news";
 
 // One-shot migration of legacy sqlite `channel_posts` rows into the
-// news store, with inline embedding. Idempotent. Run inside the mcp
-// container:
+// news store, with inline embedding. Idempotent. Reads the TS-era
+// `tokens.db` (MCP_DB_PATH, or packages/mcp/data/tokens.db) read-only:
 //
-//   docker compose exec -w /app mcp pnpm db:migrate:channel-posts
+//   pnpm db:migrate:channel-posts
+
+const LEGACY_DB = process.env.MCP_DB_PATH ?? path.resolve(import.meta.dirname, "../../data/tokens.db");
 
 interface OldRow {
   chat_id: string;
@@ -48,7 +51,7 @@ async function main(): Promise<void> {
   await pg.ensureReady();
   const { repository: news } = createNewsModule({ db: pg.db });
 
-  const sqlite = getDb();
+  const sqlite = new Database(LEGACY_DB, { readonly: true, fileMustExist: true });
   try {
     const exists = sqlite
       .prepare(`SELECT 1 FROM sqlite_master WHERE type='table' AND name='channel_posts'`)
@@ -85,7 +88,7 @@ async function main(): Promise<void> {
       `[migrate] done: saved=${saved}, embedded=${embeddedTotal}, embed-failed=${failedTotal}`,
     );
   } finally {
-    closeDb();
+    sqlite.close();
     await pg.close();
   }
 }

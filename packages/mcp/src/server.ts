@@ -1,50 +1,39 @@
 import "dotenv/config";
 import "./openai-native-fetch";
 import path from "node:path";
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { runHttpTransport, type ConnectableServer } from "./http-transport";
-import { startTelegramPoller } from "./services/telegram";
-import { startGmailPoller } from "./services/gmail";
-import { startSchedulerPoller } from "./services/scheduler";
-import { createPgClient } from "./db/pg/client";
+import { createServer } from "./mcp-server";
+import { createTelegramLog, startTelegramPoller } from "./services/telegram";
+import { createUserbot, createUserbotSessions } from "./services/telegram/userbot";
+import { createGmailModule, startGmailPoller } from "./services/gmail";
+import { createScheduledTasks, startSchedulerPoller } from "./services/scheduler";
+import { createSignals } from "./services/signals";
+import { createSettings } from "./services/settings";
+import { createPgClient, databaseUrl } from "./db/pg/client";
+import { connectStateDb } from "./db/state";
 import { createNewsModule, startNewsModule } from "./services/news";
 import { createKnowledgeModule } from "./services/knowledge";
 import { createMemoryModule } from "./services/memory";
 import { createSkillsModule } from "./services/skills";
 import { createGatewayModule, loadGatewayConfig } from "./services/gateway";
-import {
-  DEFAULT_TOOLSETS,
-  parseToolsets,
-  registerToolsets,
-  type ToolsetDeps,
-  type ToolsetName,
-} from "./toolsets";
-
-export interface ServerDeps extends ToolsetDeps {
-  // Which tool groups this instance exposes. Omitted → DEFAULT_TOOLSETS, the
-  // full surface (unchanged pre-scoping behaviour). See toolsets.ts.
-  toolsets?: readonly ToolsetName[];
-}
-
-export function createServer(deps: ServerDeps): McpServer {
-  const server = new McpServer({
-    name: "mcp-tools",
-    version: "0.1.0",
-  });
-
-  registerToolsets(server, deps, deps.toolsets ?? DEFAULT_TOOLSETS);
-
-  return server;
-}
+import { parseToolsets } from "./toolsets";
 
 async function main(): Promise<void> {
   // Postgres must be up and migrated before any tool handler or poller
-  // touches news_items.
+  // touches news_items or the MCP state.
   const pg = createPgClient();
   await pg.ensureReady();
+  const state = await connectStateDb(databaseUrl());
 
-  const newsModule = createNewsModule({ db: pg.db });
+  const signals = createSignals(state);
+  const settings = createSettings(state);
+  const scheduler = createScheduledTasks(state);
+  const telegramLog = createTelegramLog(state);
+  const gmail = createGmailModule({ db: state });
+  const userbot = createUserbot(createUserbotSessions(state));
+
+  const newsModule = createNewsModule({ db: pg.db, userbot });
   const knowledgeModule = createKnowledgeModule({ db: pg.db });
   const memoryModule = createMemoryModule({ db: pg.db });
   const skillsModule = createSkillsModule({
@@ -82,6 +71,12 @@ async function main(): Promise<void> {
       skills: skillsModule.catalog,
       memory: memoryModule.service,
       memoryActor,
+      signals,
+      settings,
+      scheduler,
+      telegramLog,
+      gmail,
+      userbot,
       toolsets: toolsets.names,
     });
     if (upstreams.length === 0) return ownServer;
@@ -109,9 +104,9 @@ async function main(): Promise<void> {
     return;
   }
 
-  startTelegramPoller();
-  startGmailPoller();
-  startSchedulerPoller();
+  startTelegramPoller({ log: telegramLog, signals });
+  startGmailPoller({ gmail, signals });
+  startSchedulerPoller({ tasks: scheduler, settings, signals });
   startNewsModule(newsModule);
 }
 

@@ -107,7 +107,7 @@ flowchart LR
         P2[Telegram bot<br/>long-poll] --> Q
         P3[Userbot channels<br/>30 min] --> Q
         P4[Scheduler<br/>cron, 30 s] --> Q
-        Q[(signals queue<br/>tokens.db)]
+        Q[(signals queue<br/>mcp_state)]
         T[MCP tools<br/>gmail / telegram / news / …]
     end
 
@@ -221,7 +221,7 @@ pnpm install
 pnpm db:init          # apply both sqlite schemas (idempotent)
 
 # one-time credentials
-pnpm gmail:auth       # Gmail OAuth → tokens.db
+pnpm gmail:auth       # Gmail OAuth → mcp_state
 pnpm userbot:auth     # MTProto login (phone + code)
 pnpm telegram:get-chat-id
 

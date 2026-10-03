@@ -1,5 +1,7 @@
 import "dotenv/config";
-import { closeDb, getDb } from "../../db/client";
+import { databaseUrl } from "../../db/pg/client";
+import { connectStateDb, type StateDb } from "../../db/state";
+import { createGmailModule } from "./client";
 import { listMessages } from "./messages";
 
 function readArg(name: string): string | undefined {
@@ -9,26 +11,17 @@ function readArg(name: string): string | undefined {
   return process.argv[idx + 1];
 }
 
-async function main(): Promise<void> {
-  let accountKey = readArg("account");
+async function main(db: StateDb): Promise<void> {
+  const gmail = createGmailModule({ db });
+  const accountKey = readArg("account") ?? (await gmail.resolveAccountKey());
   if (!accountKey) {
-    const row = getDb()
-      .prepare(
-        `SELECT account_key FROM integration_account
-         WHERE provider = 'gmail'
-         ORDER BY created_at DESC LIMIT 1`,
-      )
-      .get() as { account_key: string } | undefined;
-    if (!row) {
-      throw new Error("No Gmail account in DB. Run `pnpm gmail:auth` first.");
-    }
-    accountKey = row.account_key;
+    throw new Error("No Gmail account in DB. Run `pnpm gmail:auth` first.");
   }
 
   const query = readArg("query") ?? "is:unread";
   const limit = Number(readArg("limit") ?? "10");
 
-  const { messages } = await listMessages(accountKey, { query, maxResults: limit });
+  const { messages } = await listMessages(await gmail.client(accountKey), { query, maxResults: limit });
 
   console.log(`\n${accountKey} — query=\`${query}\` — ${messages.length} match(es)\n`);
   for (const m of messages) {
@@ -40,11 +33,10 @@ async function main(): Promise<void> {
   }
 }
 
-main()
+const db = await connectStateDb(databaseUrl());
+main(db)
   .catch((err: unknown) => {
     console.error(err);
     process.exitCode = 1;
   })
-  .finally(() => {
-    closeDb();
-  });
+  .finally(() => db.close());

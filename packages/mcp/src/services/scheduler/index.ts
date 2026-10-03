@@ -1,8 +1,2 @@
-export { startSchedulerPoller } from "./poller";
-export {
-  insertScheduledTask,
-  listActiveTasks,
-  getScheduledTask,
-  deleteScheduledTask,
-  type ScheduledTaskRow,
-} from "./storage";
+export { startSchedulerPoller, tick, type SchedulerDeps } from "./poller";
+export { createScheduledTasks, type ScheduledTasks, type ScheduledTaskRow } from "./storage";

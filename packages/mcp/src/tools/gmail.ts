@@ -2,13 +2,13 @@ import path from "node:path";
 import fs from "node:fs/promises";
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { getDb } from "../db/client";
 import {
   listMessages,
   getRawMessage,
   findAttachments,
   fetchAttachmentData,
   type AttachmentRef,
+  type GmailModule,
 } from "../services/gmail";
 import { jsonResult } from "../result";
 
@@ -36,21 +36,13 @@ function storageRoot(): string {
   return process.env.STORAGE_DIR ?? "./storage";
 }
 
-function resolveAccountKey(): string {
-  const fromEnv = process.env.GMAIL_ACCOUNT_KEY;
-  if (fromEnv) return fromEnv;
-  const row = getDb()
-    .prepare(
-      `SELECT account_key FROM integration_account
-       WHERE provider = 'gmail'
-       ORDER BY created_at DESC LIMIT 1`,
-    )
-    .get() as { account_key: string } | undefined;
-  if (!row) throw new Error("No authorized Gmail account; run `pnpm gmail:auth`.");
-  return row.account_key;
+async function requireAccountKey(gmail: GmailModule): Promise<string> {
+  const accountKey = await gmail.resolveAccountKey();
+  if (!accountKey) throw new Error("No authorized Gmail account; run `pnpm gmail:auth`.");
+  return accountKey;
 }
 
-export function registerGmailTools(server: McpServer): void {
+export function registerGmailTools(server: McpServer, gmail: GmailModule): void {
   server.registerTool(
     "list_nashdom_mails",
     {
@@ -78,8 +70,9 @@ export function registerGmailTools(server: McpServer): void {
       },
     },
     async ({ limit, pageToken }) => {
-      const accountKey = resolveAccountKey();
-      const { messages, nextPageToken } = await listMessages(accountKey, {
+      const accountKey = await requireAccountKey(gmail);
+      const client = await gmail.client(accountKey);
+      const { messages, nextPageToken } = await listMessages(client, {
         query: NASHDOM_QUERY,
         maxResults: limit ?? 25,
         pageToken,
@@ -87,7 +80,7 @@ export function registerGmailTools(server: McpServer): void {
 
       const out = await Promise.all(
         messages.map(async (m) => {
-          const full = await getRawMessage(accountKey, m.id);
+          const full = await getRawMessage(client, m.id);
           const pdfs = findAttachments(full).filter(isPdf);
           return {
             messageId: m.id,
@@ -133,8 +126,8 @@ export function registerGmailTools(server: McpServer): void {
       },
     },
     async ({ messageId, attachmentId, filename }) => {
-      const accountKey = resolveAccountKey();
-      const buffer = await fetchAttachmentData(accountKey, messageId, attachmentId);
+      const accountKey = await requireAccountKey(gmail);
+      const buffer = await fetchAttachmentData(await gmail.client(accountKey), messageId, attachmentId);
       const dir = path.join(storageRoot(), "gmail", sanitize(accountKey), messageId);
       await fs.mkdir(dir, { recursive: true });
       const aidPrefix = attachmentId.replace(/[^A-Za-z0-9]/g, "").slice(0, 12);

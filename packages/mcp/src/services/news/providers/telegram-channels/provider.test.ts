@@ -11,7 +11,7 @@ import type {
 
 function makeAdapter(overrides: Partial<UserbotChannelsAdapter> = {}): UserbotChannelsAdapter {
   return {
-    hasSession: () => true,
+    hasSession: async () => true,
     listChannels: async () => [],
     fetchMessages: async () => [],
     ...overrides,
@@ -43,7 +43,7 @@ describe("telegram-channels provider", () => {
   it("returns [] when the userbot has no session", async () => {
     const listChannels = vi.fn();
     const provider = createTelegramChannelsProvider(
-      makeDeps({ userbot: makeAdapter({ hasSession: () => false, listChannels }) }),
+      makeDeps({ userbot: makeAdapter({ hasSession: async () => false, listChannels }) }),
       { interChannelDelayMs: 0 },
     );
     const items = await provider.fetch();

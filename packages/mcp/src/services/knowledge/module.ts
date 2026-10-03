@@ -1,6 +1,6 @@
 import type { Database } from "../../db/pg/client";
 import { truncateChunker } from "../embeddings/chunker";
-import { getDefaultOpenAIProvider } from "../embeddings/provider";
+import { getDefaultOpenAIProvider, type EmbeddingProvider } from "../embeddings/provider";
 import { createEmbeddingService } from "../embeddings/service";
 import {
   createKnowledgeRepository,
@@ -18,6 +18,8 @@ export interface KnowledgeModule {
 
 export interface KnowledgeModuleDeps {
   db: Database;
+  // Defaults to OpenAI; tests pass a deterministic one.
+  embeddingProvider?: EmbeddingProvider;
 }
 
 export function createKnowledgeModule(
@@ -26,7 +28,7 @@ export function createKnowledgeModule(
   const { db } = deps;
 
   const embeddings = createEmbeddingService({
-    provider: getDefaultOpenAIProvider(),
+    provider: deps.embeddingProvider ?? getDefaultOpenAIProvider(),
     chunker: truncateChunker(),
   });
   const repository = createKnowledgeRepository({ db, embeddings });

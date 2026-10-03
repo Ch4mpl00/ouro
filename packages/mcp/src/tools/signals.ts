@@ -1,5 +1,5 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { popNextSignal, countPendingSignals } from "../services/signals";
+import type { Signals } from "../services/signals";
 import { getDefaultChatId, getTopicMap } from "../services/telegram";
 import { jsonResult } from "../result";
 
@@ -33,7 +33,7 @@ function buildEnvContext(): string | null {
   return ["", "## Environment", ...lines].join("\n");
 }
 
-export function registerSignalsTools(server: McpServer): void {
+export function registerSignalsTools(server: McpServer, signals: Signals): void {
   server.registerTool(
     "get_next_signal",
     {
@@ -51,13 +51,13 @@ export function registerSignalsTools(server: McpServer): void {
       inputSchema: {},
     },
     async () => {
-      const signal = popNextSignal();
+      const signal = await signals.popNext();
       if (!signal) {
         return jsonResult({ signal: null, pendingAfter: 0 });
       }
       return jsonResult({
         signal: { ...signal, envContext: buildEnvContext() },
-        pendingAfter: countPendingSignals(),
+        pendingAfter: await signals.countPending(),
       });
     },
   );

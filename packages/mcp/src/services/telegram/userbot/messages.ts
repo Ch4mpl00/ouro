@@ -1,5 +1,5 @@
 import { Api } from "telegram";
-import { getUserbotClient } from "./client";
+import type { Userbot } from "./client";
 import { normalizeHandle } from "./channels";
 
 export interface UserbotMessage {
@@ -28,12 +28,12 @@ export interface UserbotDialog {
 // is set, only messages with id > sinceMessageId are returned (gramjs uses
 // `minId` semantics which exclude the boundary). Without it, returns the
 // last `limit` messages.
-export async function fetchChannelMessages(opts: {
+export async function fetchChannelMessages(userbot: Userbot, opts: {
   channel: string;
   sinceMessageId?: number;
   limit?: number;
 }): Promise<{ channel: UserbotChannelInfo; messages: UserbotMessage[] }> {
-  const client = await getUserbotClient();
+  const client = await userbot.client();
   const handle = normalizeHandle(opts.channel);
   const entity = await client.getEntity(handle);
 
@@ -60,8 +60,8 @@ export async function fetchChannelMessages(opts: {
   return { channel: entityToChannelInfo(entity), messages };
 }
 
-export async function listDialogs(limit = 100): Promise<UserbotDialog[]> {
-  const client = await getUserbotClient();
+export async function listDialogs(userbot: Userbot, limit = 100): Promise<UserbotDialog[]> {
+  const client = await userbot.client();
   const dialogs = await client.getDialogs({ limit });
   const out: UserbotDialog[] = [];
   for (const d of dialogs) {

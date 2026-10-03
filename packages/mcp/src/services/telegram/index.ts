@@ -18,13 +18,7 @@ export {
   type ChatAction,
 } from "./client";
 
-export {
-  recordMessage,
-  listChatMessages,
-  getChatHistory,
-  type StoredMessage,
-  type Role,
-} from "./storage";
+export { createTelegramLog, type TelegramLog, type StoredMessage, type Role } from "./storage";
 
 export { startTyping, stopTyping } from "./typing";
 
@@ -34,4 +28,4 @@ export {
   type SendStatusResult,
 } from "./status";
 
-export { startTelegramPoller } from "./poller";
+export { startTelegramPoller, type TelegramPollerDeps } from "./poller";

@@ -2,7 +2,9 @@ import "dotenv/config";
 import { TelegramClient } from "telegram";
 import { StringSession } from "telegram/sessions/index.js";
 import input from "input";
-import { saveSession } from "./auth";
+import { databaseUrl } from "../../../db/pg/client";
+import { connectStateDb } from "../../../db/state";
+import { createUserbotSessions } from "./auth";
 import { getApiCredentials } from "./client";
 
 // One-time interactive auth flow. Asks for phone number → sends code →
@@ -34,11 +36,16 @@ async function main(): Promise<void> {
   const me = (await client.getMe()) as MeResponse;
   const session = (client.session as StringSession).save();
   const accountKey = String(me.id);
-  saveSession(accountKey, session, {
-    username: me.username,
-    firstName: me.firstName,
-    phone: me.phone,
-  });
+  const db = await connectStateDb(databaseUrl());
+  try {
+    await createUserbotSessions(db).save(accountKey, session, {
+      username: me.username,
+      firstName: me.firstName,
+      phone: me.phone,
+    });
+  } finally {
+    await db.close();
+  }
   console.log(
     `\n✓ Saved session for account ${accountKey}` +
       (me.username ? ` (@${me.username})` : ""),

@@ -1,13 +1,13 @@
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { listSignals } from "../services/signals";
+import type { Signals } from "../services/signals";
 import { jsonResult } from "../result";
 
 // "dreaming tools" is a historical name — only `list_signals` lives here
 // now. The previous fire timestamp the dreaming skill needs is delivered
 // directly in the signal content (header `Previous fire: …`), so no
 // separate watermark KV / tool is required.
-export function registerDreamingTools(server: McpServer): void {
+export function registerDreamingTools(server: McpServer, signals: Signals): void {
   server.registerTool(
     "list_signals",
     {
@@ -28,8 +28,20 @@ export function registerDreamingTools(server: McpServer): void {
       },
     },
     async ({ since, source, limit }) => {
-      const rows = listSignals({ since, source, limit });
+      // "YYYY-MM-DD HH:MM:SS" and full ISO both parse, so a `since` copied
+      // from a signal or from a "Previous fire:" header both work; the
+      // comparison is on real timestamps.
+      const sinceDate = since === undefined ? undefined : parseSince(since);
+      const rows = await signals.list({ since: sinceDate, source, limit });
       return jsonResult({ count: rows.length, signals: rows });
     },
   );
+}
+
+// A signal's created_at ("2026-10-02 09:00:00") is UTC without a zone.
+function parseSince(since: string): Date {
+  const text = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(since) ? `${since.replace(" ", "T")}Z` : since;
+  const date = new Date(text);
+  if (Number.isNaN(date.getTime())) throw new Error(`since: not a date: ${JSON.stringify(since)}`);
+  return date;
 }

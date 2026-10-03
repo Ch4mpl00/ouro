@@ -1,4 +1,4 @@
-import { getDb } from "../../db/client";
+import type { StateDb } from "../../db/state";
 
 // MCP-side user settings KV. Currently:
 //   - `timezone` — IANA name (e.g. "Europe/Kiev"). Drives cron evaluation
@@ -10,51 +10,48 @@ import { getDb } from "../../db/client";
 
 const TIMEZONE_KEY = "timezone";
 
-export function getSetting(key: string): string | null {
-  const row = getDb()
-    .prepare(`SELECT value FROM settings WHERE key = ?`)
-    .get(key) as { value: string } | undefined;
-  return row?.value ?? null;
+export interface Settings {
+  get(key: string): Promise<string | null>;
+  set(key: string, value: string): Promise<void>;
+  // Configured timezone (IANA). Defaults to UTC when unset. Never throws —
+  // callers can rely on a usable Intl.DateTimeFormat input.
+  timezone(): Promise<string>;
+  // Rejects names Intl does not know, so an unusable value is never stored.
+  setTimezone(tz: string): Promise<void>;
 }
 
-export function setSetting(key: string, value: string): void {
-  getDb()
-    .prepare(
-      `INSERT INTO settings (key, value) VALUES (?, ?)
-       ON CONFLICT(key) DO UPDATE SET
-         value = excluded.value,
-         updated_at = datetime('now')`,
-    )
-    .run(key, value);
+export function createSettings(db: StateDb): Settings {
+  const get = async (key: string): Promise<string | null> => {
+    const { rows } = await db.pool.query<{ value: string }>("SELECT value FROM settings WHERE key = $1", [key]);
+    return rows[0]?.value ?? null;
+  };
+
+  const set = async (key: string, value: string): Promise<void> => {
+    await db.pool.query(
+      `INSERT INTO settings (key, value) VALUES ($1, $2)
+       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`,
+      [key, value],
+    );
+  };
+
+  return {
+    get,
+    set,
+    timezone: async () => (await get(TIMEZONE_KEY)) ?? "UTC",
+    setTimezone: async (tz) => {
+      // Bogus names throw RangeError here.
+      new Intl.DateTimeFormat("en-CA", { timeZone: tz }).format(new Date());
+      await set(TIMEZONE_KEY, tz);
+    },
+  };
 }
 
-export function deleteSetting(key: string): void {
-  getDb().prepare(`DELETE FROM settings WHERE key = ?`).run(key);
-}
-
-// Configured timezone (IANA). Defaults to UTC when unset. Never throws —
-// callers can rely on this returning a usable Intl.DateTimeFormat input.
-export function getTimezone(): string {
-  return getSetting(TIMEZONE_KEY) ?? "UTC";
-}
-
-export function setTimezone(tz: string): void {
-  // Validate by attempting to format a Date with it; bogus strings throw
-  // RangeError. Cheap and avoids storing unusable values.
-  new Intl.DateTimeFormat("en-CA", { timeZone: tz }).format(new Date());
-  setSetting(TIMEZONE_KEY, tz);
-}
-
-// "What time is it for the user" — returns YYYY-MM-DD, hour (0-23), minute
-// in the configured timezone. Used by daily-digest pollers that need to
-// know "is it past 9:00 in user's local time" / "is this a new day yet".
-export function localTime(date: Date = new Date()): {
-  date: string;
-  hour: number;
-  minute: number;
-  tz: string;
-} {
-  const tz = getTimezone();
+// "What time is it for the user" — YYYY-MM-DD, hour (0-23) and minute on the
+// wall clock of `tz`.
+export function localTime(
+  tz: string,
+  date: Date = new Date(),
+): { date: string; hour: number; minute: number; tz: string } {
   const parts = new Intl.DateTimeFormat("en-CA", {
     timeZone: tz,
     year: "numeric",

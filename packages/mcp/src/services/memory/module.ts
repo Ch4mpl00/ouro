@@ -3,7 +3,7 @@
 
 import type { Database } from "../../db/pg/client";
 import { truncateChunker } from "../embeddings/chunker";
-import { getDefaultOpenAIProvider } from "../embeddings/provider";
+import { getDefaultOpenAIProvider, type EmbeddingProvider } from "../embeddings/provider";
 import { createEmbeddingService } from "../embeddings/service";
 import { createIndexer, type Indexer } from "./indexer";
 import { createMemoryService, type MemoryService } from "./service";
@@ -17,6 +17,8 @@ export interface MemoryModule {
 
 export interface MemoryModuleDeps {
   db: Database;
+  // Defaults to OpenAI; tests pass a deterministic one.
+  embeddingProvider?: EmbeddingProvider;
 }
 
 export function createMemoryModule(deps: MemoryModuleDeps): MemoryModule {
@@ -24,7 +26,7 @@ export function createMemoryModule(deps: MemoryModuleDeps): MemoryModule {
   // The chunker here only guards the embedder's token limit — `chunkMarkdown`
   // in projection.ts already decided the granularity.
   const embeddings = createEmbeddingService({
-    provider: getDefaultOpenAIProvider(),
+    provider: deps.embeddingProvider ?? getDefaultOpenAIProvider(),
     chunker: truncateChunker(),
   });
   const indexer = createIndexer({ store, embeddings });

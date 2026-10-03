@@ -17,6 +17,12 @@ import type { NewsRepository } from "./services/news";
 import type { KnowledgeRepository } from "./services/knowledge";
 import type { SkillCatalog } from "./services/skills";
 import type { MemoryService } from "./services/memory";
+import type { Signals } from "./services/signals";
+import type { Settings } from "./services/settings";
+import type { ScheduledTasks } from "./services/scheduler";
+import type { TelegramLog } from "./services/telegram";
+import type { GmailModule } from "./services/gmail";
+import type { Userbot } from "./services/telegram/userbot";
 
 // Named tool groups a server instance can register. One MCP process serves one
 // audience: the droplet supervisor gets everything, a third-party client (e.g.
@@ -33,6 +39,13 @@ export interface ToolsetDeps {
   // Stamped onto every memory write so history says who did it (D6). One
   // shared space, many agents — this is audit metadata, never access control.
   memoryActor: string;
+  // MCP-owned state in `mcp_state` (db/state.ts).
+  signals: Signals;
+  settings: Settings;
+  scheduler: ScheduledTasks;
+  telegramLog: TelegramLog;
+  gmail: GmailModule;
+  userbot: Userbot;
 }
 
 type ToolsetRegistrar = (server: McpServer, deps: ToolsetDeps) => void;
@@ -43,25 +56,25 @@ type ToolsetRegistrar = (server: McpServer, deps: ToolsetDeps) => void;
 // here plus, if it belongs to the unrestricted surface, one name in
 // DEFAULT_TOOLSETS.
 const TOOLSETS = {
-  gmail: (server) => registerGmailTools(server),
-  telegram: (server) => registerTelegramTools(server),
+  gmail: (server, deps) => registerGmailTools(server, deps.gmail),
+  telegram: (server, deps) => registerTelegramTools(server, deps.telegramLog),
   // send_telegram_message only — no history, no edits, no chat actions.
-  "telegram-send": (server) => registerTelegramSendTools(server),
+  "telegram-send": (server, deps) => registerTelegramSendTools(server, deps.telegramLog),
   monobank: (server) => registerMonobankTools(server),
   pdf: (server) => registerPdfTools(server),
   fs: (server) => registerFsTools(server),
   // fetch_url — arbitrary page fetch behind an SSRF guard. Deliberately NOT
   // handed to third-party clients: it turns our server into their proxy.
   fetch: (server) => registerFetchTools(server),
-  signals: (server) => registerSignalsTools(server),
+  signals: (server, deps) => registerSignalsTools(server, deps.signals),
   // search_news, list_news, fetch_article — the whole of tools/news.ts. It
   // reads the store (fetch_article also caches what it downloaded) and touches
   // no personal account, which is why it is the one group safe to hand out.
   "news-read": (server, deps) => registerNewsTools(server, deps.news),
   knowledge: (server, deps) => registerKnowledgeTools(server, deps.knowledge),
-  dreaming: (server) => registerDreamingTools(server),
-  userbot: (server) => registerUserbotTools(server),
-  scheduler: (server) => registerSchedulerTools(server),
+  dreaming: (server, deps) => registerDreamingTools(server, deps.signals),
+  userbot: (server, deps) => registerUserbotTools(server, deps.userbot),
+  scheduler: (server, deps) => registerSchedulerTools(server, { tasks: deps.scheduler, settings: deps.settings }),
   skills: (server, deps) => registerSkillsTools(server, deps.skills),
   // Unified memory — projects, documents and facts shared by every agent
   // (.claude/tasks/unified-memory.md). Safe to hand to a third-party client:

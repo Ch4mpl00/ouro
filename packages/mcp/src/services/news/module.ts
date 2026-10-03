@@ -15,6 +15,8 @@ import {
   defaultTelegramChannelsDeps,
 } from "./providers/telegram-channels/provider";
 import { startNewsPoller } from "./poller";
+import type { Userbot } from "../telegram/userbot";
+import type { EmbeddingProvider } from "../embeddings/provider";
 
 // Composition root for the news domain. Wires embeddings + embedder
 // into a NewsRepository, instantiates the default providers with their
@@ -28,13 +30,18 @@ export interface NewsModule {
 
 export interface NewsModuleDeps {
   db: Database;
+  // Harvests subscribed Telegram channels. Absent in CLIs that only need
+  // the repository: no channel provider then.
+  userbot?: Userbot;
+  // Defaults to OpenAI; tests pass a deterministic one.
+  embeddingProvider?: EmbeddingProvider;
 }
 
 export function createNewsModule(deps: NewsModuleDeps): NewsModule {
   const { db } = deps;
 
   const embeddings = createEmbeddingService({
-    provider: getDefaultOpenAIProvider(),
+    provider: deps.embeddingProvider ?? getDefaultOpenAIProvider(),
     chunker: truncateChunker(),
   });
   const embedder = createNewsEmbedder({ db, embeddings });
@@ -43,7 +50,7 @@ export function createNewsModule(deps: NewsModuleDeps): NewsModule {
   const providers: NewsProvider[] = [
     createHackerNewsProvider(defaultHackerNewsDeps()),
     createHabrProvider(defaultHabrDeps()),
-    createTelegramChannelsProvider(defaultTelegramChannelsDeps(db)),
+    ...(deps.userbot ? [createTelegramChannelsProvider(defaultTelegramChannelsDeps(db, deps.userbot))] : []),
   ];
 
   return { repository, providers };

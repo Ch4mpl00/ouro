@@ -1,8 +1,10 @@
 import "dotenv/config";
 import { createInterface } from "node:readline/promises";
 import { stdin, stdout } from "node:process";
-import { closeDb } from "../../db/client";
+import { databaseUrl } from "../../db/pg/client";
+import { connectStateDb } from "../../db/state";
 import { createOAuth2Client, exchangeCodeAndPersist, getAuthUrl } from "./auth";
+import { createGmailStore } from "./storage";
 
 async function main(): Promise<void> {
   const client = createOAuth2Client();
@@ -21,15 +23,16 @@ async function main(): Promise<void> {
 
   if (!code) throw new Error("No code provided");
 
-  const { accountKey } = await exchangeCodeAndPersist(code);
-  console.log(`\nGmail authorized for ${accountKey}`);
+  const db = await connectStateDb(databaseUrl());
+  try {
+    const { accountKey } = await exchangeCodeAndPersist(createGmailStore(db), code);
+    console.log(`\nGmail authorized for ${accountKey}`);
+  } finally {
+    await db.close();
+  }
 }
 
-main()
-  .catch((err: unknown) => {
-    console.error("Gmail auth failed:", err);
-    process.exitCode = 1;
-  })
-  .finally(() => {
-    closeDb();
-  });
+main().catch((err: unknown) => {
+  console.error("Gmail auth failed:", err);
+  process.exitCode = 1;
+});

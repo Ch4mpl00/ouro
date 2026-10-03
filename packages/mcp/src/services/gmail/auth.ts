@@ -1,9 +1,7 @@
 import { google } from "googleapis";
 import type { Credentials, OAuth2Client } from "google-auth-library";
-import { getDb } from "../../db/client";
 import { GMAIL_READ_SCOPES } from "./scopes";
-
-const PROVIDER = "gmail";
+import type { GmailStore } from "./storage";
 
 function requireEnv(name: string): string {
   const value = process.env[name];
@@ -27,7 +25,7 @@ export function getAuthUrl(client: OAuth2Client = createOAuth2Client()): string 
   });
 }
 
-export async function exchangeCodeAndPersist(code: string): Promise<{ accountKey: string }> {
+export async function exchangeCodeAndPersist(store: GmailStore, code: string): Promise<{ accountKey: string }> {
   const client = createOAuth2Client();
   const { tokens } = await client.getToken(code);
   client.setCredentials(tokens);
@@ -39,37 +37,6 @@ export async function exchangeCodeAndPersist(code: string): Promise<{ accountKey
     throw new Error("Could not resolve account email from Google userinfo response");
   }
 
-  persistTokens(accountKey, tokens);
+  await store.persistTokens(accountKey, tokens);
   return { accountKey };
-}
-
-export function persistTokens(accountKey: string, tokens: Credentials): void {
-  const db = getDb();
-  const existing = db
-    .prepare(
-      `SELECT access_token, refresh_token, expires_at FROM integration_account
-       WHERE provider = ? AND account_key = ?`,
-    )
-    .get(PROVIDER, accountKey) as
-    | { access_token: string | null; refresh_token: string | null; expires_at: string | null }
-    | undefined;
-
-  // Only overwrite a non-null with a fresh non-null. Refresh tokens in
-  // particular are not always re-issued — preserve the previously persisted
-  // value when the new credentials only carry an access token.
-  const accessToken = tokens.access_token ?? existing?.access_token ?? null;
-  const refreshToken = tokens.refresh_token ?? existing?.refresh_token ?? null;
-  const expiresAt = tokens.expiry_date
-    ? new Date(tokens.expiry_date).toISOString()
-    : (existing?.expires_at ?? null);
-
-  db.prepare(
-    `INSERT INTO integration_account (provider, account_key, access_token, refresh_token, expires_at)
-     VALUES (?, ?, ?, ?, ?)
-     ON CONFLICT(provider, account_key) DO UPDATE SET
-       access_token = excluded.access_token,
-       refresh_token = excluded.refresh_token,
-       expires_at = excluded.expires_at,
-       updated_at = datetime('now')`,
-  ).run(PROVIDER, accountKey, accessToken, refreshToken, expiresAt);
 }

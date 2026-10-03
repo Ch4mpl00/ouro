@@ -18,7 +18,7 @@
     "improve:worker": "tsx packages/agent/src/scripts/improve-worker.ts",
     "bench:gaia": "tsx packages/agent/src/eval/benchmarks/gaia/run.ts",
     "db:init": "pnpm db:init:mcp && pnpm db:init:agent",
-    "db:init:mcp": "mkdir -p packages/mcp/data && sqlite3 packages/mcp/data/tokens.db < packages/mcp/data/schema.sql",
+    "db:init:mcp": "pnpm setup:mcp",
     "db:init:agent": "pnpm setup:agent",
     "setup": "pnpm setup:mcp && pnpm setup:agent",
     "setup:mcp": "tsx packages/mcp/src/scripts/setup.ts",

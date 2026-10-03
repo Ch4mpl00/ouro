@@ -5,6 +5,7 @@ import type { NewsProvider } from "../../core/provider";
 import type { NewsItem } from "../../core/types";
 import type { UserbotChannelsAdapter } from "./adapter";
 import { createGramjsUserbotAdapter } from "./userbot-adapter";
+import type { Userbot } from "../../../telegram/userbot";
 
 // Telegram channel provider: walks every channel dialog the userbot is
 // subscribed to and emits new posts as NewsItems with source='channel'.
@@ -53,9 +54,10 @@ export function createPgWatermarkReader(db: Database): WatermarkReader {
 
 export function defaultTelegramChannelsDeps(
   db: Database,
+  userbot: Userbot,
 ): TelegramChannelsProviderDeps {
   return {
-    userbot: createGramjsUserbotAdapter(),
+    userbot: createGramjsUserbotAdapter(userbot),
     getWatermark: createPgWatermarkReader(db),
   };
 }
@@ -78,7 +80,7 @@ export function createTelegramChannelsProvider(
     source: SOURCE,
     cadenceMs,
     fetch: async (): Promise<NewsItem[]> => {
-      if (!userbot.hasSession()) {
+      if (!(await userbot.hasSession())) {
         console.warn(
           "[news/telegram-channels] no saved userbot session — run `pnpm userbot:auth`. Skipping tick.",
         );

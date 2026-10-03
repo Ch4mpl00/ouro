@@ -51,6 +51,22 @@ function stubDeps(): ToolsetDeps {
       recall: unused,
     },
     memoryActor: "test",
+    signals: { record: unused, popNext: unused, countPending: unused, list: unused },
+    settings: { get: unused, set: unused, timezone: unused, setTimezone: unused },
+    scheduler: { insert: unused, listActive: unused, markFired: unused, delete: unused },
+    telegramLog: { record: unused, history: unused, lastUpdateId: unused, setLastUpdateId: unused },
+    gmail: {
+      store: {
+        getKv: unused,
+        setKv: unused,
+        account: unused,
+        latestAccountKey: unused,
+        persistTokens: unused,
+      },
+      resolveAccountKey: unused,
+      client: unused,
+    },
+    userbot: { hasSession: unused, client: unused, disconnect: unused },
   };
 }
 

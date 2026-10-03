@@ -1,26 +1,23 @@
 import { z } from "zod";
 import { CronExpressionParser } from "cron-parser";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import {
-  insertScheduledTask,
-  listActiveTasks,
-  deleteScheduledTask,
-} from "../services/scheduler";
-import {
-  getTimezone,
-  setTimezone,
-  localTime,
-} from "../services/settings";
+import type { ScheduledTasks } from "../services/scheduler";
+import { localTime, type Settings } from "../services/settings";
 import { jsonResult } from "../result";
 
-function previewNextFires(cronExpr: string, count: number): string[] {
-  const it = CronExpressionParser.parse(cronExpr, { tz: getTimezone() });
+function previewNextFires(cronExpr: string, tz: string, count: number): string[] {
+  const it = CronExpressionParser.parse(cronExpr, { tz });
   const out: string[] = [];
   for (let i = 0; i < count; i++) out.push(it.next().toDate().toISOString());
   return out;
 }
 
-export function registerSchedulerTools(server: McpServer): void {
+export function registerSchedulerTools(
+  server: McpServer,
+  deps: { tasks: ScheduledTasks; settings: Settings },
+): void {
+  const { tasks, settings } = deps;
+
   server.registerTool(
     "schedule_task",
     {
@@ -54,20 +51,21 @@ export function registerSchedulerTools(server: McpServer): void {
       },
     },
     async ({ cron_expr, recurring, prompt }) => {
+      const tz = await settings.timezone();
       let upcoming: string[];
       try {
-        upcoming = previewNextFires(cron_expr, recurring ? 3 : 1);
+        upcoming = previewNextFires(cron_expr, tz, recurring ? 3 : 1);
       } catch (err) {
         return jsonResult({
           ok: false,
           error: `Invalid cron expression: ${(err as Error).message}`,
         });
       }
-      const row = insertScheduledTask({ cron_expr, recurring, prompt });
+      const row = await tasks.insert({ cron_expr, recurring, prompt });
       return jsonResult({
         ok: true,
         task: row,
-        timezone: getTimezone(),
+        timezone: tz,
         upcoming_fires: upcoming,
       });
     },
@@ -85,11 +83,11 @@ export function registerSchedulerTools(server: McpServer): void {
       inputSchema: {},
     },
     async () => {
-      const tz = getTimezone();
-      const tasks = listActiveTasks().map((t) => {
+      const tz = await settings.timezone();
+      const active = (await tasks.listActive()).map((t) => {
         let upcoming: string[] = [];
         try {
-          upcoming = previewNextFires(t.cron_expr, t.recurring ? 3 : 1);
+          upcoming = previewNextFires(t.cron_expr, tz, t.recurring ? 3 : 1);
         } catch {
           /* invalid cron — surface via empty upcoming */
         }
@@ -101,7 +99,7 @@ export function registerSchedulerTools(server: McpServer): void {
           upcoming_fires: upcoming,
         };
       });
-      return jsonResult({ timezone: tz, count: tasks.length, tasks });
+      return jsonResult({ timezone: tz, count: active.length, tasks: active });
     },
   );
 
@@ -118,7 +116,7 @@ export function registerSchedulerTools(server: McpServer): void {
       },
     },
     async ({ id }) => {
-      const removed = deleteScheduledTask(id);
+      const removed = await tasks.delete(id);
       return jsonResult({ ok: removed, id });
     },
   );
@@ -133,8 +131,8 @@ export function registerSchedulerTools(server: McpServer): void {
       inputSchema: {},
     },
     async () => {
-      const tz = getTimezone();
-      const now = localTime();
+      const tz = await settings.timezone();
+      const now = localTime(tz);
       return jsonResult({
         timezone: tz,
         local_now: `${now.date} ${String(now.hour).padStart(2, "0")}:${String(now.minute).padStart(2, "0")}`,
@@ -161,14 +159,14 @@ export function registerSchedulerTools(server: McpServer): void {
     },
     async ({ tz }) => {
       try {
-        setTimezone(tz);
+        await settings.setTimezone(tz);
       } catch (err) {
         return jsonResult({
           ok: false,
           error: `Invalid timezone '${tz}': ${(err as Error).message}`,
         });
       }
-      const now = localTime();
+      const now = localTime(tz);
       return jsonResult({
         ok: true,
         timezone: tz,

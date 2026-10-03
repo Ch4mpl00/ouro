@@ -1,4 +1,4 @@
-import { getDb } from "../../db/client";
+import { sqlTime, type StateDb } from "../../db/state";
 
 // Persistence layer for the agent-managed task scheduler. Cron expression
 // is the only time spec; for one-shot reminders the agent encodes a
@@ -8,67 +8,56 @@ import { getDb } from "../../db/client";
 export interface ScheduledTaskRow {
   id: number;
   cron_expr: string;
-  recurring: number; // 0 | 1
+  // 0 | 1 — schedule_task has always returned the raw sqlite row.
+  recurring: number;
   prompt: string;
   source: string | null; // null → signal source 'scheduler' (user-created)
+  // Unix seconds of the slot last fired for.
   last_run_at: number | null;
+  // "YYYY-MM-DD HH:MM:SS", UTC.
   created_at: string;
 }
 
-export function insertScheduledTask(input: {
-  cron_expr: string;
-  recurring: boolean;
-  prompt: string;
-  source?: string | null;
-}): ScheduledTaskRow {
-  const stmt = getDb().prepare(
-    `INSERT INTO scheduled_tasks (cron_expr, recurring, prompt, source)
-     VALUES (?, ?, ?, ?)
-     RETURNING id, cron_expr, recurring, prompt, source, last_run_at, created_at`,
-  );
-  return stmt.get(
-    input.cron_expr,
-    input.recurring ? 1 : 0,
-    input.prompt,
-    input.source ?? null,
-  ) as ScheduledTaskRow;
+export interface ScheduledTasks {
+  insert(input: { cron_expr: string; recurring: boolean; prompt: string; source?: string | null }): Promise<ScheduledTaskRow>;
+  // Tasks that may still fire — recurring (always) or one-shots that haven't
+  // fired yet. Used by both the poller and list_scheduled_tasks.
+  listActive(): Promise<ScheduledTaskRow[]>;
+  // Stamps the slot fired for. For a one-shot this also retires it.
+  markFired(id: number, slotUnix: number): Promise<void>;
+  delete(id: number): Promise<boolean>;
 }
 
-// Tasks that may still fire — recurring (always) or one-shots that haven't
-// yet been marked. Used by both the poller (to check what's due) and the
-// list_scheduled_tasks tool (to show the user what's queued).
-export function listActiveTasks(): ScheduledTaskRow[] {
-  return getDb()
-    .prepare(
-      `SELECT id, cron_expr, recurring, prompt, source, last_run_at, created_at
-         FROM scheduled_tasks
-        WHERE recurring = 1 OR last_run_at IS NULL
-        ORDER BY id ASC`,
-    )
-    .all() as ScheduledTaskRow[];
-}
+const COLUMNS = `id, cron_expr, recurring::int AS recurring, prompt, source, last_run_at,
+                 ${sqlTime("created_at")} AS created_at`;
 
-export function getScheduledTask(id: number): ScheduledTaskRow | null {
-  const row = getDb()
-    .prepare(
-      `SELECT id, cron_expr, recurring, prompt, source, last_run_at, created_at
-         FROM scheduled_tasks WHERE id = ?`,
-    )
-    .get(id) as ScheduledTaskRow | undefined;
-  return row ?? null;
-}
+export function createScheduledTasks(db: StateDb): ScheduledTasks {
+  return {
+    insert: async ({ cron_expr, recurring, prompt, source }) => {
+      const { rows } = await db.pool.query<ScheduledTaskRow>(
+        `INSERT INTO scheduled_tasks (cron_expr, recurring, prompt, source)
+         VALUES ($1, $2, $3, $4) RETURNING ${COLUMNS}`,
+        [cron_expr, recurring, prompt, source ?? null],
+      );
+      return rows[0]!;
+    },
 
-// Stamp the fire timestamp. For one-shot tasks this also takes them out
-// of `listActiveTasks` (the WHERE clause filters them by `last_run_at IS
-// NULL`). For recurring tasks it just records when they last fired so the
-// poller knows what cron-slot to compute "next" from.
-export function markTaskFired(id: number, firedAt: number): void {
-  getDb()
-    .prepare(`UPDATE scheduled_tasks SET last_run_at = ? WHERE id = ?`)
-    .run(firedAt, id);
-}
+    listActive: async () => {
+      const { rows } = await db.pool.query<ScheduledTaskRow>(
+        `SELECT ${COLUMNS} FROM scheduled_tasks
+          WHERE recurring OR last_run_at IS NULL
+          ORDER BY id ASC`,
+      );
+      return rows;
+    },
 
-export function deleteScheduledTask(id: number): boolean {
-  const info = getDb().prepare(`DELETE FROM scheduled_tasks WHERE id = ?`).run(id);
-  return info.changes > 0;
+    markFired: async (id, slotUnix) => {
+      await db.pool.query("UPDATE scheduled_tasks SET last_run_at = $1 WHERE id = $2", [slotUnix, id]);
+    },
+
+    delete: async (id) => {
+      const { rowCount } = await db.pool.query("DELETE FROM scheduled_tasks WHERE id = $1", [id]);
+      return (rowCount ?? 0) > 0;
+    },
+  };
 }
