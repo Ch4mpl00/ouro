@@ -15,17 +15,20 @@ package mcp
 // no ZIO-native MCP library, and the server side of it is small — three
 // methods, JSON-RPC framing, a session header.
 
-import java.nio.file.Path
-
 import sttp.model.StatusCode
-import sttp.tapir.{Schema, SchemaType, Validator}
-import sttp.tapir.ztapir.*
+import sttp.tapir.Schema
+import sttp.tapir.SchemaType
+import sttp.tapir.Validator
 import sttp.tapir.server.ziohttp.ZioHttpInterpreter
+import sttp.tapir.ztapir.*
 import zio.*
 import zio.json.*
 import zio.json.ast.Json
-import zio.stream.{ZPipeline, ZStream}
+import zio.stream.ZPipeline
+import zio.stream.ZStream
 import zio.telemetry.opentelemetry.tracing.Tracing
+
+import java.nio.file.Path
 
 // Optional fields serialize as `null`, like serde did; the agent and the
 // skills read `signal: null` and friends.
@@ -53,7 +56,7 @@ final case class Deps(
     memory: MemoryService,
     // Stamped onto every memory write: who the instance writes as. Audit
     // metadata, never access control (one shared space).
-    memoryActor: String,
+    memoryActor: String
 )
 
 // ── 2. tools ─────────────────────────────────────────────────────────────────
@@ -66,13 +69,13 @@ final case class ToolDef(
     title: String,
     description: String,
     inputSchema: Json.Obj,
-    run: (Deps, Json) => Task[Json],
+    run: (Deps, Json) => Task[Json]
 ):
   def listing: Json = Json.Obj(
     "name" -> Json.Str(name),
     "title" -> Json.Str(title),
     "description" -> Json.Str(description),
-    "inputSchema" -> inputSchema,
+    "inputSchema" -> inputSchema
   )
 
 // Bad arguments: a JSON-RPC error (-32602), not a tool failure — the client
@@ -102,7 +105,7 @@ object Tools:
           .fromEither(raw.as[A])
           .mapError(err => InvalidParams(s"failed to deserialize parameters: $err"))
           .flatMap(args => run(deps, args))
-          .flatMap(out => ZIO.fromEither(out.toJsonAST).mapError(err => RuntimeException(err))),
+          .flatMap(out => ZIO.fromEither(out.toJsonAST).mapError(err => RuntimeException(err)))
     )
 
   def fail(message: String): IO[ToolFailure, Nothing] = ZIO.fail(ToolFailure(message))
@@ -117,47 +120,47 @@ object Tools:
 object InputSchema:
   def of[A](using schema: Schema[A]): Json.Obj = render(schema) match
     case obj: Json.Obj => obj
-    case _ => Json.Obj("type" -> Json.Str("object"))
+    case _             => Json.Obj("type" -> Json.Str("object"))
 
   private def render(schema: Schema[?]): Json =
     val base: List[(String, Json)] = schema.schemaType match
-      case SchemaType.SString() => List("type" -> Json.Str("string"))
-      case SchemaType.SInteger() => List("type" -> Json.Str("integer"))
-      case SchemaType.SNumber() => List("type" -> Json.Str("number"))
-      case SchemaType.SBoolean() => List("type" -> Json.Str("boolean"))
+      case SchemaType.SString()      => List("type" -> Json.Str("string"))
+      case SchemaType.SInteger()     => List("type" -> Json.Str("integer"))
+      case SchemaType.SNumber()      => List("type" -> Json.Str("number"))
+      case SchemaType.SBoolean()     => List("type" -> Json.Str("boolean"))
       case SchemaType.SOption(inner) => fields(render(inner))
-      case SchemaType.SArray(inner) => List("type" -> Json.Str("array"), "items" -> render(inner))
+      case SchemaType.SArray(inner)  => List("type" -> Json.Str("array"), "items" -> render(inner))
       case p: SchemaType.SProduct[?] =>
         val props = p.fields.map(f => f.name.encodedName -> render(f.schema))
         val required = p.fields.filterNot(_.schema.isOptional).map(f => Json.Str(f.name.encodedName))
         List("type" -> Json.Str("object"), "properties" -> Json.Obj(props*)) ++
           (if required.isEmpty then Nil else List("required" -> Json.Arr(required*)))
       case SchemaType.SOpenProduct(_, _) => List("type" -> Json.Str("object"))
-      case c: SchemaType.SCoproduct[?] => List("anyOf" -> Json.Arr(c.subtypes.map(render)*))
-      case _ => Nil
+      case c: SchemaType.SCoproduct[?]   => List("anyOf" -> Json.Arr(c.subtypes.map(render)*))
+      case _                             => Nil
     val doc = schema.description.map(d => "description" -> Json.Str(d)).toList
     Json.Obj((base ++ doc ++ constraints(schema.validator))*)
 
   private def fields(json: Json): List[(String, Json)] = json match
     case Json.Obj(fs) => fs.toList
-    case _ => Nil
+    case _            => Nil
 
   private def constraints(v: Validator[?]): List[(String, Json)] = v match
-    case Validator.All(vs) => vs.toList.flatMap(constraints)
-    case Validator.Min(value, _) => List("minimum" -> number(value))
-    case Validator.Max(value, _) => List("maximum" -> number(value))
-    case Validator.MinLength(n, _) => List("minLength" -> Json.Num(n))
-    case Validator.MaxLength(n, _) => List("maxLength" -> Json.Num(n))
-    case Validator.MinSize(n) => List("minItems" -> Json.Num(n))
-    case Validator.MaxSize(n) => List("maxItems" -> Json.Num(n))
+    case Validator.All(vs)           => vs.toList.flatMap(constraints)
+    case Validator.Min(value, _)     => List("minimum" -> number(value))
+    case Validator.Max(value, _)     => List("maximum" -> number(value))
+    case Validator.MinLength(n, _)   => List("minLength" -> Json.Num(n))
+    case Validator.MaxLength(n, _)   => List("maxLength" -> Json.Num(n))
+    case Validator.MinSize(n)        => List("minItems" -> Json.Num(n))
+    case Validator.MaxSize(n)        => List("maxItems" -> Json.Num(n))
     case e: Validator.Enumeration[?] => List("enum" -> Json.Arr(e.possibleValues.map(x => Json.Str(x.toString))*))
-    case _ => Nil
+    case _                           => Nil
 
   private def number(value: Any): Json = value match
-    case n: Int => Json.Num(n)
-    case n: Long => Json.Num(n)
+    case n: Int    => Json.Num(n)
+    case n: Long   => Json.Num(n)
     case n: Double => Json.Num(n)
-    case other => Json.Str(other.toString)
+    case other     => Json.Str(other.toString)
 
 // ── 3. results ───────────────────────────────────────────────────────────────
 
@@ -175,7 +178,7 @@ object Results:
 
   private def result(text: String, isError: Boolean): Json = Json.Obj(
     "content" -> Json.Arr(Json.Obj("type" -> Json.Str("text"), "text" -> Json.Str(text))),
-    "isError" -> Json.Bool(isError),
+    "isError" -> Json.Bool(isError)
   )
 
   // "outer: cause: root" — the whole chain, like anyhow's `{:#}`.
@@ -216,18 +219,18 @@ final class McpHandler(deps: Deps, tools: List[ToolDef], gateway: Option[Gateway
       val params = obj.get("params").getOrElse(Json.Obj())
       (id, method) match
         case (Some(id), Some(m)) => dispatch(m, params).either.map(reply => Some(McpHandler.response(id, reply)))
-        case (None, Some(_)) => ZIO.none
-        case (Some(_), None) => ZIO.none
-        case (None, None) =>
+        case (None, Some(_))     => ZIO.none
+        case (Some(_), None)     => ZIO.none
+        case (None, None)        =>
           ZIO.some(McpHandler.response(Json.Null, Left(RpcError(RpcError.InvalidRequest, "invalid request"))))
     case _ => ZIO.some(McpHandler.response(Json.Null, Left(RpcError(RpcError.InvalidRequest, "invalid request"))))
 
   private def dispatch(method: String, params: Json): IO[RpcError, Json] = method match
     case "initialize" => ZIO.succeed(McpHandler.initializeResult(params))
-    case "ping" => ZIO.succeed(Json.Obj())
+    case "ping"       => ZIO.succeed(Json.Obj())
     case "tools/list" => ZIO.succeed(Json.Obj("tools" -> Json.Arr((ownListings ++ gatewayListings)*)))
     case "tools/call" => call(params)
-    case other => ZIO.fail(RpcError(RpcError.MethodNotFound, s"method not found: $other"))
+    case other        => ZIO.fail(RpcError(RpcError.MethodNotFound, s"method not found: $other"))
 
   private val ownListings: List[Json] = tools.map(_.listing)
   private def gatewayListings: List[Json] = gateway.toList.flatMap(_.tools)
@@ -237,10 +240,10 @@ final class McpHandler(deps: Deps, tools: List[ToolDef], gateway: Option[Gateway
     val args = params.get("arguments").filterNot(_ == Json.Null).getOrElse(Json.Obj())
     byName.get(name) match
       case Some(tool) => runOwn(tool, args)
-      case None =>
+      case None       =>
         gateway.filter(_.hasTool(name)) match
           case Some(gw) => gw.call(name, args)
-          case None => ZIO.fail(RpcError(RpcError.InvalidParamsCode, "tool not found"))
+          case None     => ZIO.fail(RpcError(RpcError.InvalidParamsCode, "tool not found"))
 
   private def runOwn(tool: ToolDef, args: Json): IO[RpcError, Json] =
     tracing
@@ -248,7 +251,7 @@ final class McpHandler(deps: Deps, tools: List[ToolDef], gateway: Option[Gateway
       .map(Results.success)
       .catchAll {
         case err: InvalidParams => ZIO.fail(RpcError(RpcError.InvalidParamsCode, err.getMessage))
-        case err =>
+        case err                =>
           val text = Results.describe(err)
           ZIO.logWarning(s"tool ${tool.name} failed: $text").as(Results.failure(text))
       }
@@ -265,16 +268,16 @@ object McpHandler:
     Json.Obj(
       "protocolVersion" -> Json.Str(requested.filter(Supported.contains).getOrElse(Supported.head)),
       "capabilities" -> Json.Obj("tools" -> Json.Obj()),
-      "serverInfo" -> Json.Obj("name" -> Json.Str(ServerName), "version" -> Json.Str(ServerVersion)),
+      "serverInfo" -> Json.Obj("name" -> Json.Str(ServerName), "version" -> Json.Str(ServerVersion))
     )
 
   def response(id: Json, reply: Either[RpcError, Json]): Json = reply match
     case Right(result) => Json.Obj("jsonrpc" -> Json.Str("2.0"), "id" -> id, "result" -> result)
-    case Left(err) =>
+    case Left(err)     =>
       Json.Obj(
         "jsonrpc" -> Json.Str("2.0"),
         "id" -> id,
-        "error" -> Json.Obj("code" -> Json.Num(err.code), "message" -> Json.Str(err.message)),
+        "error" -> Json.Obj("code" -> Json.Num(err.code), "message" -> Json.Str(err.message))
       )
 
   def isInitialize(message: Json): Boolean = message.get("method").flatMap(_.asString).contains("initialize")
@@ -283,7 +286,7 @@ extension (json: Json)
   // Field lookup on an object; None for anything else.
   def get(key: String): Option[Json] = json match
     case Json.Obj(fields) => fields.collectFirst { case (k, v) if k == key => v }
-    case _ => None
+    case _                => None
 
 // ── 5. sessions ──────────────────────────────────────────────────────────────
 
@@ -338,7 +341,7 @@ object Transport:
       // Hosts (`host` or `host:port`) accepted in the Host header — the
       // DNS-rebinding guard. Empty = no validation.
       allowedHosts: List[String],
-      multiSession: Boolean,
+      multiSession: Boolean
   )
 
   private type Reply = (StatusCode, Option[String], String)
@@ -392,7 +395,7 @@ object Transport:
       options: HttpOptions,
       host: Option[String],
       sessionId: Option[String],
-      body: String,
+      body: String
   ): UIO[Reply] =
     if !hostAllowed(options.allowedHosts, host) then
       ZIO.succeed(rpcFailure(StatusCode.Forbidden, "Forbidden: Host header is not allowed"))
@@ -400,7 +403,11 @@ object Transport:
       body.fromJson[Json] match
         case Left(err) =>
           ZIO.succeed(
-            (StatusCode.BadRequest, None, McpHandler.response(Json.Null, Left(RpcError(RpcError.ParseError, err))).toJson)
+            (
+              StatusCode.BadRequest,
+              None,
+              McpHandler.response(Json.Null, Left(RpcError(RpcError.ParseError, err))).toJson
+            )
           )
         case Right(message) =>
           sessionId match
@@ -409,14 +416,15 @@ object Transport:
                 id <- sessions.create
                 reply <- handler.handle(message)
               yield (StatusCode.Ok, Some(id), reply.fold("")(_.toJson))
-            case None => ZIO.succeed(rpcFailure(StatusCode.BadRequest, "Bad Request: Mcp-Session-Id header is required"))
+            case None =>
+              ZIO.succeed(rpcFailure(StatusCode.BadRequest, "Bad Request: Mcp-Session-Id header is required"))
             case Some(id) =>
               sessions.exists(id).flatMap {
                 case false => ZIO.succeed(rpcFailure(StatusCode.NotFound, "Session not found"))
-                case true =>
+                case true  =>
                   handler.handle(message).map {
                     case Some(reply) => (StatusCode.Ok, Some(id), reply.toJson)
-                    case None => (StatusCode.Accepted, Some(id), "")
+                    case None        => (StatusCode.Accepted, Some(id), "")
                   }
               }
 

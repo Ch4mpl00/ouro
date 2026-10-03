@@ -5,7 +5,10 @@ package mcp
 
 import zio.*
 import zio.http.Client
-import zio.logging.{ConsoleLoggerConfig, LogFilter, LogFormat, consoleErrLogger}
+import zio.logging.ConsoleLoggerConfig
+import zio.logging.LogFilter
+import zio.logging.LogFormat
+import zio.logging.consoleErrLogger
 
 object Cli:
   val EvalDir = "crates/mcp/eval"
@@ -22,7 +25,7 @@ object Cli:
   def arg(args: Chunk[String], name: String): Option[String] =
     args.indexOf(s"--$name") match
       case -1 => None
-      case i => args.lift(i + 1)
+      case i  => args.lift(i + 1)
 
   def intArg(args: Chunk[String], name: String, default: Int): Task[Int] =
     arg(args, name).fold(ZIO.succeed(default))(raw =>

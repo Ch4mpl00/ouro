@@ -10,18 +10,21 @@ package mcp
 //   3. poller  — 30s tick that turns due tasks into signals
 //   4. tools   — `scheduler` toolset: schedule/list/cancel + get/set timezone
 
-import java.time.{Instant, ZoneId}
-
-import com.cronutils.model.{Cron, CronType}
+import com.cronutils.model.Cron
+import com.cronutils.model.CronType
 import com.cronutils.model.definition.CronDefinitionBuilder
 import com.cronutils.model.time.ExecutionTime
 import com.cronutils.parser.CronParser
-import sttp.tapir.Schema
-import sttp.tapir.Schema.annotations.{description, validate}
-import sttp.tapir.Validator
 import io.getquill.*
+import sttp.tapir.Schema
+import sttp.tapir.Schema.annotations.description
+import sttp.tapir.Schema.annotations.validate
+import sttp.tapir.Validator
 import zio.*
 import zio.json.*
+
+import java.time.Instant
+import java.time.ZoneId
 
 // ── 1. storage ───────────────────────────────────────────────────────────────
 
@@ -34,7 +37,7 @@ final case class ScheduledTask(
     source: Option[String],
     // Unix seconds of the slot last fired for.
     lastRunAt: Option[Long],
-    createdAt: Instant,
+    createdAt: Instant
 )
 
 // The row as schedule_task has always returned it: recurring as 0 | 1, the
@@ -46,7 +49,7 @@ final case class TaskRow(
     prompt: String,
     source: Option[String],
     last_run_at: Option[Long],
-    created_at: String,
+    created_at: String
 ) derives JsonEncoder
 
 object TaskRow:
@@ -66,7 +69,7 @@ final class ScheduledTasks(db: Db, val settings: Settings):
           _.cronExpr -> lift(cronExpr),
           _.recurring -> lift(recurring),
           _.prompt -> lift(prompt),
-          _.source -> lift(source),
+          _.source -> lift(source)
         )
         .returning(t => t)
     )
@@ -94,7 +97,11 @@ object Cron5:
 
   def parse(expr: String): Either[String, Cron] =
     val parser = if expr.trim.split("\\s+").length == 6 then withSeconds else unix
-    scala.util.Try(parser.parse(expr.trim).validate()).toEither.left.map(e => Option(e.getMessage).getOrElse(e.toString))
+    scala.util
+      .Try(parser.parse(expr.trim).validate())
+      .toEither
+      .left
+      .map(e => Option(e.getMessage).getOrElse(e.toString))
 
   // First slot strictly after `after`, evaluated on the wall clock of `tz`.
   def nextSlot(cron: Cron, tz: ZoneId, after: Instant): Option[Instant] =
@@ -126,10 +133,10 @@ object SchedulerPoller:
       active <- scheduler.listActive
       fired <- ZIO.foreach(active) { task =>
         Cron5.parse(task.cronExpr) match
-          case Left(err) => ZIO.logWarning(s"task ${task.id}: invalid cron ${task.cronExpr} ($err), skipping").as(0)
+          case Left(err)   => ZIO.logWarning(s"task ${task.id}: invalid cron ${task.cronExpr} ($err), skipping").as(0)
           case Right(cron) =>
             Cron5.nextSlot(cron, tz, anchor(task)).filterNot(_.isAfter(now)) match
-              case None => ZIO.succeed(0)
+              case None       => ZIO.succeed(0)
               case Some(slot) =>
                 // Snapshot before stamping, so skills (dreaming) can scope
                 // `since=<previous fire>` from the signal header.
@@ -155,11 +162,12 @@ object SchedulerPoller:
       s"Previous fire: ${previous.getOrElse("never (this is the first run)")}",
       s"Recurring: ${if task.recurring then "yes" else "no (one-shot)"}",
       "",
-      task.prompt,
+      task.prompt
     ).mkString("\n")
 
   def run(scheduler: ScheduledTasks, signals: Signals): UIO[Nothing] =
-    val once = Clock.instant.flatMap(tick(scheduler, signals, _)).catchAll(e => ZIO.logError(s"scheduler tick failed: $e"))
+    val once =
+      Clock.instant.flatMap(tick(scheduler, signals, _)).catchAll(e => ZIO.logError(s"scheduler tick failed: $e"))
     scheduler.settings.timezone.flatMap(tz => ZIO.logInfo(s"scheduler poller started (every 30s, $tz)")) *>
       once.repeat(Schedule.spaced(30.seconds)) *> ZIO.never
 
@@ -174,17 +182,22 @@ object SchedulerTools:
       @description(
         "Free-text instruction delivered to the agent when the task fires. The agent interprets it under the " +
           "`scheduler` skill (e.g. 'remind me to take pills')."
-      ) prompt: String,
-  ) derives JsonDecoder, Schema
+      ) prompt: String
+  ) derives JsonDecoder,
+        Schema
 
-  final case class CancelTaskParams(@description("Task id from list_scheduled_tasks.") @validate(Validator.min(1L)) id: Long)
-      derives JsonDecoder, Schema
+  final case class CancelTaskParams(
+      @description("Task id from list_scheduled_tasks.") @validate(Validator.min(1L)) id: Long
+  ) derives JsonDecoder,
+        Schema
 
   final case class SetTimezoneParams(@description("IANA timezone name, e.g. 'Europe/Kiev'.") tz: String)
-      derives JsonDecoder, Schema
+      derives JsonDecoder,
+        Schema
 
   final case class Failure(ok: Boolean, error: String) derives JsonEncoder
-  final case class Scheduled(ok: Boolean, task: TaskRow, timezone: String, upcoming_fires: List[String]) derives JsonEncoder
+  final case class Scheduled(ok: Boolean, task: TaskRow, timezone: String, upcoming_fires: List[String])
+      derives JsonEncoder
   final case class ListedTask(
       id: Long,
       cron_expr: String,
@@ -194,7 +207,7 @@ object SchedulerTools:
       last_run_at: Option[Long],
       created_at: String,
       last_run_at_iso: Option[String],
-      upcoming_fires: List[String],
+      upcoming_fires: List[String]
   ) derives JsonEncoder
   final case class Listed(timezone: String, count: Int, tasks: List[ListedTask]) derives JsonEncoder
   final case class Cancelled(ok: Boolean, id: Long) derives JsonEncoder
@@ -215,26 +228,25 @@ object SchedulerTools:
         "day-of-month month day-of-week) evaluated in the user's configured timezone. For one-shot reminders set " +
         "`recurring: false` and use a specific cron like '30 14 12 5 *' (14:30 on May 12); the task auto-deactivates " +
         "after the first fire. For repeating tasks use a generic cron like '0 9 * * *' (every day 9:00). The agent is " +
-        "responsible for converting natural-language times into cron syntax before calling this tool.",
+        "responsible for converting natural-language times into cron syntax before calling this tool."
     ) { (deps, p: ScheduleTaskParams) =>
       ZIO.when(p.cron_expr.isEmpty || p.prompt.isEmpty)(invalid("cron_expr and prompt must be non-empty")) *>
         (Cron5.parse(p.cron_expr) match
-          case Left(err) => ZIO.succeed(failure(s"Invalid cron expression: $err"))
+          case Left(err)   => ZIO.succeed(failure(s"Invalid cron expression: $err"))
           case Right(cron) =>
             for
               tz <- deps.settings.timezone
               now <- Clock.instant
               task <- deps.scheduler.insert(p.cron_expr, p.recurring, p.prompt, None)
               upcoming = Cron5.previewNextFires(cron, tz, upcomingCount(p.recurring), now)
-            yield Scheduled(ok = true, TaskRow.of(task), tz.getId, upcoming).toJsonAST.toOption.get
-        )
+            yield Scheduled(ok = true, TaskRow.of(task), tz.getId, upcoming).toJsonAST.toOption.get)
     },
     tool(
       "list_scheduled_tasks",
       "List scheduled tasks",
       "Show every task that may still fire — recurring tasks (always) and one-shots that haven't been triggered yet. " +
         "Each row includes the cron expression, prompt, last fire time, and the next 1-3 upcoming fire timestamps in " +
-        "the user's timezone for sanity-checking.",
+        "the user's timezone for sanity-checking."
     ) { (deps, _: NoArgs) =>
       for
         tz <- deps.settings.timezone
@@ -243,7 +255,8 @@ object SchedulerTools:
       yield
         val rows = active.map { t =>
           // An invalid cron surfaces as an empty `upcoming_fires`.
-          val upcoming = Cron5.parse(t.cronExpr).fold(_ => Nil, Cron5.previewNextFires(_, tz, upcomingCount(t.recurring), now))
+          val upcoming =
+            Cron5.parse(t.cronExpr).fold(_ => Nil, Cron5.previewNextFires(_, tz, upcomingCount(t.recurring), now))
           ListedTask(
             t.id,
             t.cronExpr,
@@ -253,7 +266,7 @@ object SchedulerTools:
             t.lastRunAt,
             Time.sqlTime(t.createdAt),
             t.lastRunAt.map(Time.isoFromUnix),
-            upcoming,
+            upcoming
           )
         }
         Listed(tz.getId, rows.size, rows)
@@ -262,7 +275,7 @@ object SchedulerTools:
       "cancel_scheduled_task",
       "Cancel a scheduled task",
       "Permanently remove a task by id. Use this when the user says 'forget about that reminder' or 'stop the daily " +
-        "X'. Returns { ok: true, removed: <id> } on success, { ok: false } if no such task.",
+        "X'. Returns { ok: true, removed: <id> } on success, { ok: false } if no such task."
     ) { (deps, p: CancelTaskParams) =>
       ZIO.when(p.id < 1)(invalid("id must be a positive integer")) *>
         deps.scheduler.delete(p.id).map(Cancelled(_, p.id))
@@ -270,7 +283,7 @@ object SchedulerTools:
     tool(
       "get_timezone",
       "Get configured timezone",
-      "Return the IANA timezone driving cron evaluation and digest schedule decisions. Defaults to UTC when unset.",
+      "Return the IANA timezone driving cron evaluation and digest schedule decisions. Defaults to UTC when unset."
     ) { (deps, _: NoArgs) =>
       Clock.instant.flatMap(deps.settings.localTime).map(now => TimezoneInfo(now.tz.getId, now.display))
     },
@@ -279,16 +292,15 @@ object SchedulerTools:
       "Set the configured timezone",
       "Update the IANA timezone (e.g. 'Europe/Kiev', 'America/New_York', 'UTC'). Takes effect immediately — the next " +
         "scheduler tick, daily digest check, and any new schedule_task call all use the new value. Existing tasks keep " +
-        "their cron string as-is, so their next-fire wall-clock time shifts. Invalid IANA names are rejected.",
+        "their cron string as-is, so their next-fire wall-clock time shifts. Invalid IANA names are rejected."
     ) { (deps, p: SetTimezoneParams) =>
       ZIO.when(p.tz.isEmpty)(invalid("tz must be non-empty")) *>
         (Settings.parseTimezone(p.tz) match
-          case Left(err) => ZIO.succeed(failure(s"Invalid timezone '${p.tz}': $err"))
+          case Left(err)   => ZIO.succeed(failure(s"Invalid timezone '${p.tz}': $err"))
           case Right(zone) =>
             for
               _ <- deps.settings.setTimezone(zone)
               now <- Clock.instant
-            yield TimezoneSet(ok = true, p.tz, Settings.localTime(zone, now).display).toJsonAST.toOption.get
-        )
-    },
+            yield TimezoneSet(ok = true, p.tz, Settings.localTime(zone, now).display).toJsonAST.toOption.get)
+    }
   )

@@ -7,14 +7,15 @@ package mcp
 //   1. extract — file → { text, numPages }
 //   2. tools   — `pdf` toolset: read_pdf
 
-import java.nio.file.{Files, Path}
-
 import org.apache.pdfbox.Loader
 import org.apache.pdfbox.text.PDFTextStripper
 import sttp.tapir.Schema
 import sttp.tapir.Schema.annotations.description
 import zio.*
 import zio.json.*
+
+import java.nio.file.Files
+import java.nio.file.Path
 
 // ── 1. extract ───────────────────────────────────────────────────────────────
 
@@ -43,7 +44,8 @@ object PdfTools:
   import Tools.*
 
   final case class ReadPdfParams(@description("Absolute path to the PDF file.") filePath: String)
-      derives JsonDecoder, Schema
+      derives JsonDecoder,
+        Schema
 
   val tools: List[ToolDef] = List(
     tool(
@@ -51,6 +53,6 @@ object PdfTools:
       "Read PDF",
       "Extract plain text from a PDF file at the given absolute path. Returns the full text (pages separated by a " +
         "blank line) and total page count. Use after download_gmail_attachment to inspect the contents of a " +
-        "downloaded bill.",
+        "downloaded bill."
     ) { (_, p: ReadPdfParams) => Pdf.read(Path.of(p.filePath)) }
   )

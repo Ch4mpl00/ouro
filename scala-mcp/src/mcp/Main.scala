@@ -5,11 +5,11 @@ package mcp
 // handler and the pollers, and owns shutdown: everything long-running is a
 // fiber in the app's scope, interrupted on SIGTERM.
 
-import java.nio.file.Path
-
 import zio.*
 import zio.http.Client
 import zio.telemetry.opentelemetry.tracing.Tracing
+
+import java.nio.file.Path
 
 object Main extends ZIOAppDefault:
   private val DefaultGatewayConfig = "crates/mcp/gateway.config.json"
@@ -27,7 +27,9 @@ object Main extends ZIOAppDefault:
       // MCP_TOOLSETS narrows the surface for an instance serving one audience
       // (the ChatGPT tunnel). Unset → everything.
       selection <- ZIO.fromEither(ToolsetSelection.parse(Env.get("MCP_TOOLSETS"))).mapError(RuntimeException(_))
-      _ <- ZIO.when(selection.restricted)(ZIO.logInfo(s"restricted tool surface: ${selection.names.map(_.name).mkString(",")}"))
+      _ <- ZIO.when(selection.restricted)(
+        ZIO.logInfo(s"restricted tool surface: ${selection.names.map(_.name).mkString(",")}")
+      )
       // MCP_NO_POLLERS: tools only. The Telegram getUpdates poll is exclusive
       // per bot, so a second poller against the same bot would 409 the droplet.
       pollers = !Env.get("MCP_NO_POLLERS").contains("1")
@@ -64,7 +66,7 @@ object Main extends ZIOAppDefault:
         memory = MemoryService.make(PgMemoryStore(pool), embedder),
         // Who this instance writes to shared memory as — a property of the
         // instance, not something a client declares.
-        memoryActor = Env.get("MCP_MEMORY_ACTOR").getOrElse("mcp"),
+        memoryActor = Env.get("MCP_MEMORY_ACTOR").getOrElse("mcp")
       )
       tools = Toolset.compose(selection.names)
       // A restricted instance never fronts upstreams: their tools arrive
@@ -75,7 +77,8 @@ object Main extends ZIOAppDefault:
           GatewayConfig
             .load(Path.of(Env.get("GATEWAY_CONFIG").getOrElse(DefaultGatewayConfig)), Env.get)
             .flatMap(upstreams =>
-              if upstreams.isEmpty then ZIO.none else Gateway.connect(upstreams, tools.map(_.name).toSet, http).map(Some(_))
+              if upstreams.isEmpty then ZIO.none
+              else Gateway.connect(upstreams, tools.map(_.name).toSet, http).map(Some(_))
             )
       tracing <- ZIO.service[Tracing]
       handler = McpHandler(deps, tools, gateway, tracing)

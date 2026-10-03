@@ -13,16 +13,17 @@ package mcp
 // two packages may not share code, so `appendPatch` here re-implements it
 // byte for byte; a test pins the composed output as a literal.
 
-import java.nio.charset.StandardCharsets.UTF_8
-import java.nio.file.{Files, NoSuchFileException, Path}
-
-import scala.jdk.CollectionConverters.*
-
 import sttp.tapir.Schema
 import sttp.tapir.Schema.annotations.description
 import zio.*
 import zio.json.*
 import zio.json.ast.Json
+
+import java.nio.charset.StandardCharsets.UTF_8
+import java.nio.file.Files
+import java.nio.file.NoSuchFileException
+import java.nio.file.Path
+import scala.jdk.CollectionConverters.*
 
 // ── 1. catalog ───────────────────────────────────────────────────────────────
 
@@ -36,7 +37,7 @@ enum SkillTools:
 
 object SkillTools:
   given JsonEncoder[SkillTools] = JsonEncoder[Json].contramap {
-    case All => Json.Str("*")
+    case All         => Json.Str("*")
     case Only(names) => Json.Arr(names.map(Json.Str(_))*)
   }
 
@@ -51,7 +52,7 @@ final case class SkillSummary(
     sizeBytes: Int,
     modifiedAt: String,
     // Whether an improver patch is in force.
-    patched: Boolean,
+    patched: Boolean
 )
 
 object SkillSummary:
@@ -65,7 +66,7 @@ final case class SkillDocument(
     // The exact bytes of the overlay, or None.
     patch: Option[String],
     // What the agent runs: body without frontmatter + patch.
-    effectiveInstructions: String,
+    effectiveInstructions: String
 )
 
 final class SkillCatalog(liveDir: Path, defaultsDir: Path):
@@ -120,17 +121,18 @@ final class SkillCatalog(liveDir: Path, defaultsDir: Path):
         file.source,
         content.getBytes(UTF_8).length,
         Time.iso(modified),
-        patch.exists(_.trim.nonEmpty),
+        patch.exists(_.trim.nonEmpty)
       )
       SkillDocument(summary, content, patch, appendPatch(bodyWithoutFrontmatter(content), patch.getOrElse("")))
 
   def listSkills: Task[List[SkillSummary]] =
-    activeFiles.flatMap(files => ZIO.foreach(files.values.toList)(readRef)).map(_.map(_.summary).sortBy(_.name.toLowerCase))
+    activeFiles
+      .flatMap(files => ZIO.foreach(files.values.toList)(readRef))
+      .map(_.map(_.summary).sortBy(_.name.toLowerCase))
 
   def readSkill(fileName: String): Task[Option[SkillDocument]] =
     val valid = fileName.endsWith(".md") && nameOk(fileName.stripSuffix(".md"))
-    if !valid then
-      Tools.fail(s"""Invalid skill filename "$fileName". Use an exact fileName returned by list_skills.""")
+    if !valid then Tools.fail(s"""Invalid skill filename "$fileName". Use an exact fileName returned by list_skills.""")
     else activeFiles.flatMap(files => ZIO.foreach(files.get(fileName))(readRef))
 
 object SkillCatalog:
@@ -154,7 +156,11 @@ object SkillCatalog:
     name.split("[-_]+").filter(_.nonEmpty).map(p => p.take(1).toUpperCase + p.drop(1)).mkString(" ")
 
   def extractTitle(name: String, raw: String): String =
-    HeadingRe.findFirstMatchIn(bodyWithoutFrontmatter(raw)).map(_.group(1).trim).filter(_.nonEmpty).getOrElse(fallbackTitle(name))
+    HeadingRe
+      .findFirstMatchIn(bodyWithoutFrontmatter(raw))
+      .map(_.group(1).trim)
+      .filter(_.nonEmpty)
+      .getOrElse(fallbackTitle(name))
 
   private def cleanMarkdown(text: String): String =
     text
@@ -194,7 +200,8 @@ object SkillsTools:
 
   final case class ReadSkillParams(
       @description("Exact skill fileName returned by list_skills, for example telegram.md.") fileName: String
-  ) derives JsonDecoder, Schema
+  ) derives JsonDecoder,
+        Schema
 
   final case class Listed(count: Int, skills: List[SkillSummary]) derives JsonEncoder
 
@@ -205,7 +212,7 @@ object SkillsTools:
       "Return the catalog of all available skills. Each entry includes the exact fileName, human-readable title, " +
         "short description, declared tool access, active source layer, size, modification time, and `patched` — " +
         "whether an improver patch is currently appended to that skill's instructions. Use this first to choose a " +
-        "skill, then pass its exact fileName to read_skill.",
+        "skill, then pass its exact fileName to read_skill."
     ) { (deps, _: NoArgs) => deps.skills.listSkills.map(skills => Listed(skills.size, skills)) },
     tool(
       "read_skill",
@@ -215,7 +222,7 @@ object SkillsTools:
         "`content` is the editable source file; `patch` is the improver's append-only overlay (null when there is " +
         "none); and `effectiveInstructions` is what the agent actually runs — the body with the frontmatter stripped " +
         "and the patch appended. When `patch` is non-null, judge the skill's behaviour by effectiveInstructions, not " +
-        "by content alone.",
+        "by content alone."
     ) { (deps, p: ReadSkillParams) =>
       deps.skills.readSkill(p.fileName).map {
         case None => Json.Obj("found" -> Json.Bool(false), "fileName" -> Json.Str(p.fileName), "content" -> Json.Null)
@@ -226,8 +233,8 @@ object SkillsTools:
             "content" -> Json.Str(skill.content),
             "patch" -> skill.patch.fold(Json.Null)(Json.Str(_)),
             "effectiveInstructions" -> Json.Str(skill.effectiveInstructions),
-            "metadata" -> skill.summary.toJsonAST.getOrElse(Json.Null),
+            "metadata" -> skill.summary.toJsonAST.getOrElse(Json.Null)
           )
       }
-    },
+    }
   )

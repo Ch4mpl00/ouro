@@ -23,16 +23,17 @@ package mcp
 // The rules live in the service and the store underneath is dumb, so the
 // whole contract is tested against an in-memory store without a Postgres.
 
-import java.sql.ResultSet
-import java.time.Instant
-import java.util.Locale
-
 import sttp.tapir.Schema
-import sttp.tapir.Schema.annotations.{description, validate}
+import sttp.tapir.Schema.annotations.description
+import sttp.tapir.Schema.annotations.validate
 import sttp.tapir.Validator
 import zio.*
 import zio.json.*
 import zio.json.ast.Json
+
+import java.sql.ResultSet
+import java.time.Instant
+import java.util.Locale
 
 import Rows.*
 
@@ -63,7 +64,7 @@ final case class Doc(
     body: String,
     version: Int,
     sizeBytes: Int,
-    updatedAt: Instant,
+    updatedAt: Instant
 ) derives JsonEncoder:
   def summaryView: DocSummary = DocSummary(name, summary, version, sizeBytes, updatedAt)
 
@@ -74,7 +75,7 @@ final case class Fact(
     source: Option[String],
     state: MemoryState,
     createdAt: Instant,
-    updatedAt: Instant,
+    updatedAt: Instant
 ) derives JsonEncoder
 
 enum PatchKind derives JsonEncoder:
@@ -85,8 +86,10 @@ object PatchKind:
 
 final case class Edit(
     @description("Exact text to find, unique in the document.") old: String,
-    @description("Replacement. Empty string deletes.") `new`: String,
-) derives JsonEncoder, JsonDecoder, Schema
+    @description("Replacement. Empty string deletes.") `new`: String
+) derives JsonEncoder,
+      JsonDecoder,
+      Schema
 
 // One row per write. `bodyBefore` is the whole previous document: it makes
 // "roll roadmap.md back to v7" answerable and is what a failed mid-stack
@@ -102,7 +105,7 @@ final case class DocPatch(
     versionAfter: Int,
     actor: String,
     rationale: Option[String],
-    createdAt: Instant,
+    createdAt: Instant
 )
 
 // A row on its way into the search projection. `sourceRef` is the owning
@@ -116,7 +119,7 @@ final case class IndexUpsert(
     actor: Option[String],
     state: MemoryState,
     ts: Instant,
-    embedding: Option[Vector[Float]],
+    embedding: Option[Vector[Float]]
 )
 
 final case class IndexHit(
@@ -127,7 +130,7 @@ final case class IndexHit(
     actor: Option[String],
     state: MemoryState,
     ts: Instant,
-    distance: Double,
+    distance: Double
 )
 
 // ── 2. refs ──────────────────────────────────────────────────────────────────
@@ -149,16 +152,22 @@ object Refs:
   def docNameOk(name: String): Boolean = DocName.matches(name)
 
   def assertProjectSlug(slug: String): IO[ToolFailure, Unit] =
-    ZIO.unless(slugOk(slug))(
-      Tools.fail(s"""Invalid project slug "$slug". Use lowercase letters, digits and hyphens, e.g. "leetcode-graphs".""")
-    ).unit
+    ZIO
+      .unless(slugOk(slug))(
+        Tools.fail(
+          s"""Invalid project slug "$slug". Use lowercase letters, digits and hyphens, e.g. "leetcode-graphs"."""
+        )
+      )
+      .unit
 
   def assertDocName(name: String): IO[ToolFailure, Unit] =
-    ZIO.unless(docNameOk(name))(
-      Tools.fail(
-        s"""Invalid document name "$name". Use a lowercase markdown filename with no directories, e.g. "roadmap.md"."""
+    ZIO
+      .unless(docNameOk(name))(
+        Tools.fail(
+          s"""Invalid document name "$name". Use a lowercase markdown filename with no directories, e.g. "roadmap.md"."""
+        )
       )
-    ).unit
+      .unit
 
   def docRef(project: String, doc: String, chunk: Option[Int]): String =
     chunk.fold(s"doc:$project/$doc")(c => s"doc:$project/$doc#$c")
@@ -192,7 +201,7 @@ final case class EditFailure(
     occurrences: Int,
     // Literal text that *nearly* matched. Suggested, never applied:
     // fuzzy-applying is how an agent silently edits the wrong sentence.
-    suggestions: List[String],
+    suggestions: List[String]
 ) derives JsonEncoder
 
 final case class Heading(level: Int, text: String, line: Int)
@@ -332,13 +341,13 @@ object Patching:
   def appendToBody(body: String, text: String, underHeading: Option[String]): Either[List[String], String] =
     val addition = text.trim
     underHeading.filter(_.trim.nonEmpty) match
-      case None => Right(joinBlocks(body, addition))
+      case None          => Right(joinBlocks(body, addition))
       case Some(heading) =>
         val headings = listHeadings(body)
         // "Progress" as readily as "## Progress".
         val wanted = normalise(codePoints(heading.dropWhile(_ == '#').stripLeading)).text
         headings.find(h => normalise(codePoints(h.text)).text == wanted) match
-          case None => Left(headings.map(h => s"${"#" * h.level} ${h.text}"))
+          case None         => Left(headings.map(h => s"${"#" * h.level} ${h.text}"))
           case Some(target) =>
             val lines = body.split("\n", -1).toList
             // The section runs to the next heading of the same or higher
@@ -353,9 +362,9 @@ object Patching:
   def joinBlocks(existing: String, addition: String): String =
     val base = existing.stripTrailing
     (base.isEmpty, addition.isEmpty) match
-      case (true, true) => ""
-      case (false, true) => s"$base\n"
-      case (true, false) => s"$addition\n"
+      case (true, true)   => ""
+      case (false, true)  => s"$base\n"
+      case (true, false)  => s"$addition\n"
       case (false, false) => s"$base\n\n$addition\n"
 
 // ── 4. projection ────────────────────────────────────────────────────────────
@@ -364,7 +373,7 @@ final case class MarkdownChunk(
     text: String,
     // Breadcrumb of enclosing headings ("Progress > Notes"); empty before the
     // first heading.
-    headingPath: String,
+    headingPath: String
 )
 
 final case class RankOpts(
@@ -373,7 +382,7 @@ final case class RankOpts(
     // How much a brand-new row may improve its distance. Small on purpose:
     // recency breaks ties, it must not float an irrelevant note over a
     // relevant one (D7).
-    recencyWeight: Double,
+    recencyWeight: Double
 )
 
 object Projection:
@@ -391,7 +400,7 @@ object Projection:
         chunks: Vector[MarkdownChunk] = Vector.empty,
         stack: List[(Int, String)] = Nil,
         buffer: Vector[String] = Vector.empty,
-        bufferPath: String = "",
+        bufferPath: String = ""
     ):
       def path: String = stack.reverse.map(_._2).mkString(" > ")
       def flush: State =
@@ -449,7 +458,7 @@ final case class NewPatch(
     versionBefore: Int,
     versionAfter: Int,
     actor: String,
-    rationale: Option[String],
+    rationale: Option[String]
 )
 
 final case class FactUpdate(body: Option[String], tags: Option[List[String]], state: Option[MemoryState])
@@ -482,8 +491,12 @@ trait MemoryStore:
   // Replaces every row owned by `sourceRef`, so a shrunken document leaves no
   // orphaned chunks answering recalls.
   def replaceIndex(sourceRef: String, entries: List[IndexUpsert]): Task[Unit]
-  def searchIndex(embedding: Vector[Float], limit: Int, states: List[MemoryState], tags: List[String])
-      : Task[List[IndexHit]]
+  def searchIndex(
+      embedding: Vector[Float],
+      limit: Int,
+      states: List[MemoryState],
+      tags: List[String]
+  ): Task[List[IndexHit]]
   def listUnembedded(limit: Int): Task[List[(Long, String)]]
   def setEmbedding(id: Long, embedding: Vector[Float]): Task[Unit]
 
@@ -502,7 +515,9 @@ final class PgMemoryStore(pool: PgPool) extends MemoryStore:
     pool.query("SELECT * FROM memory_project_docs WHERE project_id = ? ORDER BY name", projectId)(doc(_).summaryView)
 
   def getDoc(projectId: Long, name: String): Task[Option[Doc]] =
-    pool.query("SELECT * FROM memory_project_docs WHERE project_id = ? AND name = ? LIMIT 1", projectId, name)(doc).map(_.headOption)
+    pool
+      .query("SELECT * FROM memory_project_docs WHERE project_id = ? AND name = ? LIMIT 1", projectId, name)(doc)
+      .map(_.headOption)
 
   def createDoc(projectId: Long, name: String, summary: Option[String], body: String): Task[Doc] =
     pool
@@ -511,7 +526,7 @@ final class PgMemoryStore(pool: PgPool) extends MemoryStore:
         projectId,
         name,
         summary,
-        body,
+        body
       )(doc)
       .map(_.head)
 
@@ -526,7 +541,7 @@ final class PgMemoryStore(pool: PgPool) extends MemoryStore:
           body,
           expectedVersion + 1,
           docId,
-          expectedVersion,
+          expectedVersion
         )(doc)
       case Some(s) =>
         pool.query(
@@ -536,7 +551,7 @@ final class PgMemoryStore(pool: PgPool) extends MemoryStore:
           s,
           expectedVersion + 1,
           docId,
-          expectedVersion,
+          expectedVersion
         )(doc)
     rows.map(_.headOption)
 
@@ -553,18 +568,26 @@ final class PgMemoryStore(pool: PgPool) extends MemoryStore:
         p.versionBefore,
         p.versionAfter,
         p.actor,
-        p.rationale,
+        p.rationale
       )(patch)
       .map(_.head)
 
   def listPatches(docId: Long, limit: Int): Task[List[DocPatch]] =
-    pool.query("SELECT * FROM memory_doc_patches WHERE doc_id = ? ORDER BY created_at DESC, id DESC LIMIT ?", docId, limit)(patch)
+    pool.query(
+      "SELECT * FROM memory_doc_patches WHERE doc_id = ? ORDER BY created_at DESC, id DESC LIMIT ?",
+      docId,
+      limit
+    )(patch)
 
   def getPatch(docId: Long, pid: String): Task[Option[DocPatch]] =
-    pool.query("SELECT * FROM memory_doc_patches WHERE doc_id = ? AND pid = ? LIMIT 1", docId, pid)(patch).map(_.headOption)
+    pool
+      .query("SELECT * FROM memory_doc_patches WHERE doc_id = ? AND pid = ? LIMIT 1", docId, pid)(patch)
+      .map(_.headOption)
 
   def createFact(body: String, tags: List[String], source: Option[String]): Task[Fact] =
-    pool.query("INSERT INTO memory_facts (body, tags, source) VALUES (?, ?, ?) RETURNING *", body, tags, source)(fact).map(_.head)
+    pool
+      .query("INSERT INTO memory_facts (body, tags, source) VALUES (?, ?, ?) RETURNING *", body, tags, source)(fact)
+      .map(_.head)
 
   def getFact(id: Long): Task[Option[Fact]] =
     pool.query("SELECT * FROM memory_facts WHERE id = ? LIMIT 1", id)(fact).map(_.headOption)
@@ -581,7 +604,7 @@ final class PgMemoryStore(pool: PgPool) extends MemoryStore:
         update.body,
         update.tags,
         update.state.map(_.toString),
-        id,
+        id
       )(fact)
       .map(_.headOption)
 
@@ -604,13 +627,17 @@ final class PgMemoryStore(pool: PgPool) extends MemoryStore:
           e.state.toString,
           e.ts,
           embedding,
-          embedding,
+          embedding
         )
       }
     }
 
-  def searchIndex(embedding: Vector[Float], limit: Int, states: List[MemoryState], tags: List[String])
-      : Task[List[IndexHit]] =
+  def searchIndex(
+      embedding: Vector[Float],
+      limit: Int,
+      states: List[MemoryState],
+      tags: List[String]
+  ): Task[List[IndexHit]] =
     pool.query(
       """SELECT id, ref, text, tags, actor, state, ts, (embedding <=> ?::text::vector) AS distance
            FROM memory_index
@@ -620,7 +647,7 @@ final class PgMemoryStore(pool: PgPool) extends MemoryStore:
       states.map(_.toString),
       tags.filter(_.nonEmpty),
       tags.filter(_.nonEmpty),
-      limit,
+      limit
     )(rs =>
       IndexHit(
         rs.getLong("id"),
@@ -630,19 +657,33 @@ final class PgMemoryStore(pool: PgPool) extends MemoryStore:
         rs.optString("actor"),
         MemoryState.parse(rs.getString("state")),
         rs.instant("ts"),
-        rs.getDouble("distance"),
+        rs.getDouble("distance")
       )
     )
 
   def listUnembedded(limit: Int): Task[List[(Long, String)]] =
-    pool.query("SELECT id, text FROM memory_index WHERE embedding IS NULL LIMIT ?", limit)(rs => rs.getLong("id") -> rs.getString("text"))
+    pool.query("SELECT id, text FROM memory_index WHERE embedding IS NULL LIMIT ?", limit)(rs =>
+      rs.getLong("id") -> rs.getString("text")
+    )
 
   def setEmbedding(id: Long, embedding: Vector[Float]): Task[Unit] =
-    pool.update("UPDATE memory_index SET embedding = ?::text::vector, embedded_at = now() WHERE id = ?", Vectors.literal(embedding), id).unit
+    pool
+      .update(
+        "UPDATE memory_index SET embedding = ?::text::vector, embedded_at = now() WHERE id = ?",
+        Vectors.literal(embedding),
+        id
+      )
+      .unit
 
 object PgMemoryStore:
   private def project(rs: ResultSet) =
-    Project(rs.getLong("id"), rs.getString("slug"), rs.getString("title"), rs.instant("created_at"), rs.instant("updated_at"))
+    Project(
+      rs.getLong("id"),
+      rs.getString("slug"),
+      rs.getString("title"),
+      rs.instant("created_at"),
+      rs.instant("updated_at")
+    )
 
   private def doc(rs: ResultSet) =
     val body = rs.getString("body_md")
@@ -654,7 +695,7 @@ object PgMemoryStore:
       body,
       rs.getInt("version"),
       body.getBytes(java.nio.charset.StandardCharsets.UTF_8).length,
-      rs.instant("updated_at"),
+      rs.instant("updated_at")
     )
 
   private def patch(rs: ResultSet) = DocPatch(
@@ -667,7 +708,7 @@ object PgMemoryStore:
     rs.getInt("version_after"),
     rs.getString("actor"),
     rs.optString("rationale"),
-    rs.instant("created_at"),
+    rs.instant("created_at")
   )
 
   private def fact(rs: ResultSet) = Fact(
@@ -677,7 +718,7 @@ object PgMemoryStore:
     rs.optString("source"),
     MemoryState.parse(rs.getString("state")),
     rs.instant("created_at"),
-    rs.instant("updated_at"),
+    rs.instant("updated_at")
   )
 
 // ── 6. indexer ───────────────────────────────────────────────────────────────
@@ -691,8 +732,10 @@ final class Indexer(store: MemoryStore, embedder: Embedder, chunkChars: Int = Pr
     else
       embedder.embedBatch(texts).either.flatMap {
         case Right(vectors) => ZIO.succeed(texts.indices.toList.map(vectors.lift))
-        case Left(err) =>
-          ZIO.logError(s"memory index embed failed for ${texts.size} chunks: ${Results.describe(err)}").as(texts.map(_ => None))
+        case Left(err)      =>
+          ZIO
+            .logError(s"memory index embed failed for ${texts.size} chunks: ${Results.describe(err)}")
+            .as(texts.map(_ => None))
       }
 
   def indexDoc(project: Project, doc: Doc): Task[Unit] =
@@ -702,7 +745,16 @@ final class Indexer(store: MemoryStore, embedder: Embedder, chunkChars: Int = Pr
     embedTexts(texts).flatMap { vectors =>
       val entries = texts.zip(vectors).zipWithIndex.map { case ((text, embedding), i) =>
         // Documents have no lifecycle of their own.
-        IndexUpsert(owner, Refs.docRef(project.slug, doc.name, Some(i)), text, Nil, None, MemoryState.active, doc.updatedAt, embedding)
+        IndexUpsert(
+          owner,
+          Refs.docRef(project.slug, doc.name, Some(i)),
+          text,
+          Nil,
+          None,
+          MemoryState.active,
+          doc.updatedAt,
+          embedding
+        )
       }
       // Always replace, even with nothing: an emptied document must stop
       // answering from its old chunks.
@@ -713,7 +765,10 @@ final class Indexer(store: MemoryStore, embedder: Embedder, chunkChars: Int = Pr
     val owner = Refs.factRef(fact.id)
     embedTexts(List(fact.body)).flatMap { vectors =>
       // Archiving drops a fact from default recall, deleting nothing.
-      store.replaceIndex(owner, List(IndexUpsert(owner, owner, fact.body, fact.tags, fact.source, fact.state, fact.updatedAt, vectors.head)))
+      store.replaceIndex(
+        owner,
+        List(IndexUpsert(owner, owner, fact.body, fact.tags, fact.source, fact.state, fact.updatedAt, vectors.head))
+      )
     }
 
   // Rows a failed inline embed left NULL. 0/0 when drained.
@@ -725,7 +780,7 @@ final class Indexer(store: MemoryStore, embedder: Embedder, chunkChars: Int = Pr
           ZIO
             .foreach(rows.zip(vectors)) {
               case ((id, _), Some(v)) => store.setEmbedding(id, v).as(1)
-              case (_, None) => ZIO.succeed(0)
+              case (_, None)          => ZIO.succeed(0)
             }
             .map(done => EmbedResult(done.sum, rows.size - done.sum))
         }
@@ -752,7 +807,7 @@ final case class HistoryEntry(
     versionBefore: Int,
     versionAfter: Int,
     editCount: Int,
-    createdAt: Instant,
+    createdAt: Instant
 ) derives JsonEncoder
 
 final case class RecallHit(
@@ -762,7 +817,7 @@ final case class RecallHit(
     distance: Double,
     state: MemoryState,
     actor: Option[String],
-    ts: Instant,
+    ts: Instant
 ) derives JsonEncoder
 
 final case class DocList(project: Project, docs: List[DocSummary]) derives JsonEncoder
@@ -776,7 +831,7 @@ final case class WriteDoc(
     // Required once the document exists; absent or 0 when creating it.
     expectedVersion: Option[Int] = None,
     actor: String,
-    rationale: Option[String] = None,
+    rationale: Option[String] = None
 )
 
 final class MemoryService(val store: MemoryStore, val indexer: Indexer, newPatchId: UIO[String]):
@@ -785,16 +840,18 @@ final class MemoryService(val store: MemoryStore, val indexer: Indexer, newPatch
   private def requireProject(slug: String): Task[Project] =
     Refs.assertProjectSlug(slug) *> store.getProject(slug).flatMap {
       case Some(p) => ZIO.succeed(p)
-      case None =>
+      case None    =>
         store.listProjects.flatMap(ps =>
-          ZIO.fail(MemoryError("project_not_found", s"""No project "$slug".""", Json.Obj("projects" -> strs(ps.map(_.slug)))))
+          ZIO.fail(
+            MemoryError("project_not_found", s"""No project "$slug".""", Json.Obj("projects" -> strs(ps.map(_.slug))))
+          )
         )
     }
 
   private def requireDoc(project: Project, name: String): Task[Doc] =
     Refs.assertDocName(name) *> store.getDoc(project.id, name).flatMap {
       case Some(d) => ZIO.succeed(d)
-      case None =>
+      case None    =>
         // Listing what does exist is the cheapest defence against notes.md /
         // notes2.md multiplying (D5).
         store.listDocs(project.id).flatMap { docs =>
@@ -802,7 +859,7 @@ final class MemoryService(val store: MemoryStore, val indexer: Indexer, newPatch
             MemoryError(
               "doc_not_found",
               s"""No document "$name" in project "${project.slug}".""",
-              Json.Obj("project" -> Json.Str(project.slug), "docs" -> strs(docs.map(_.name))),
+              Json.Obj("project" -> Json.Str(project.slug), "docs" -> strs(docs.map(_.name)))
             )
           )
         }
@@ -812,21 +869,35 @@ final class MemoryService(val store: MemoryStore, val indexer: Indexer, newPatch
   private def reindexDoc(project: Project, doc: Doc): UIO[Unit] =
     indexer
       .indexDoc(project, doc)
-      .catchAll(err => ZIO.logError(s"memory indexing failed for ${project.slug}/${doc.name}: ${Results.describe(err)}"))
+      .catchAll(err =>
+        ZIO.logError(s"memory indexing failed for ${project.slug}/${doc.name}: ${Results.describe(err)}")
+      )
 
   private[mcp] def indexFactQuietly(fact: Fact): UIO[Unit] =
-    indexer.indexFact(fact).catchAll(err => ZIO.logError(s"memory fact ${fact.id} indexing failed: ${Results.describe(err)}"))
+    indexer
+      .indexFact(fact)
+      .catchAll(err => ZIO.logError(s"memory fact ${fact.id} indexing failed: ${Results.describe(err)}"))
 
   // The shared tail of every mutating op: swap the body under a version
   // check, record the patch, re-index. None when the CAS lost.
   private def commit(project: Project, doc: Doc, change: Change): Task[Option[WriteResult]] =
     store.updateDoc(doc.id, doc.version, change.body, change.summary).flatMap {
-      case None => ZIO.none
+      case None          => ZIO.none
       case Some(updated) =>
         for
           pid <- newPatchId
           patch <- store.insertPatch(
-            NewPatch(pid, doc.id, change.kind, change.edits, doc.body, doc.version, updated.version, change.actor, change.rationale)
+            NewPatch(
+              pid,
+              doc.id,
+              change.kind,
+              change.edits,
+              doc.body,
+              doc.version,
+              updated.version,
+              change.actor,
+              change.rationale
+            )
           )
           _ <- reindexDoc(project, updated)
         yield Some(writeResult(project, updated, patch.pid))
@@ -839,7 +910,7 @@ final class MemoryService(val store: MemoryStore, val indexer: Indexer, newPatch
           MemoryError(
             "project_exists",
             s"""Project "$slug" already exists.""",
-            Json.Obj("project" -> Json.Str(existing.slug), "title" -> Json.Str(existing.title)),
+            Json.Obj("project" -> Json.Str(existing.slug), "title" -> Json.Str(existing.title))
           )
         )
       case None => store.createProject(slug, if title.trim.isEmpty then slug else title.trim)
@@ -858,7 +929,7 @@ final class MemoryService(val store: MemoryStore, val indexer: Indexer, newPatch
       _ <- Refs.assertDocName(input.doc)
       existing <- store.getDoc(project.id, input.doc)
       result <- existing match
-        case None => create(project, input)
+        case None      => create(project, input)
         case Some(doc) =>
           // write_doc is the only op that can lose content: never blind.
           input.expectedVersion match
@@ -870,14 +941,18 @@ final class MemoryService(val store: MemoryStore, val indexer: Indexer, newPatch
                   Json.Obj(
                     "project" -> Json.Str(project.slug),
                     "doc" -> Json.Str(input.doc),
-                    "currentVersion" -> Json.Num(doc.version),
-                  ),
+                    "currentVersion" -> Json.Num(doc.version)
+                  )
                 )
               )
             case Some(expected) if expected != doc.version =>
               ZIO.fail(versionConflict(project.slug, input.doc, doc.version, expected))
             case Some(_) =>
-              commit(project, doc, Change(input.body, input.summary.map(Some(_)), PatchKind.write, Nil, input.actor, input.rationale))
+              commit(
+                project,
+                doc,
+                Change(input.body, input.summary.map(Some(_)), PatchKind.write, Nil, input.actor, input.rationale)
+              )
                 .someOrFail(raced(project.slug, input.doc))
     yield result
 
@@ -887,14 +962,16 @@ final class MemoryService(val store: MemoryStore, val indexer: Indexer, newPatch
         MemoryError(
           "version_conflict",
           s"""Document "${input.doc}" does not exist yet; expected_version must be omitted or 0.""",
-          Json.Obj("project" -> Json.Str(project.slug), "doc" -> Json.Str(input.doc), "currentVersion" -> Json.Num(0)),
+          Json.Obj("project" -> Json.Str(project.slug), "doc" -> Json.Str(input.doc), "currentVersion" -> Json.Num(0))
         )
       )
     else
       for
         created <- store.createDoc(project.id, input.doc, input.summary, input.body)
         pid <- newPatchId
-        patch <- store.insertPatch(NewPatch(pid, created.id, PatchKind.write, Nil, "", 0, created.version, input.actor, input.rationale))
+        patch <- store.insertPatch(
+          NewPatch(pid, created.id, PatchKind.write, Nil, "", 0, created.version, input.actor, input.rationale)
+        )
         _ <- reindexDoc(project, created)
       yield writeResult(project, created, patch.pid)
 
@@ -906,7 +983,7 @@ final class MemoryService(val store: MemoryStore, val indexer: Indexer, newPatch
       text: String,
       underHeading: Option[String],
       actor: String,
-      rationale: Option[String],
+      rationale: Option[String]
   ): Task[WriteResult] =
     requireProject(slug).flatMap { project =>
       val attempt = for
@@ -915,7 +992,7 @@ final class MemoryService(val store: MemoryStore, val indexer: Indexer, newPatch
           MemoryError(
             "heading_not_found",
             s"""No heading "${underHeading.getOrElse("")}" in "$name".""",
-            Json.Obj("project" -> Json.Str(project.slug), "doc" -> Json.Str(name), "headings" -> strs(headings)),
+            Json.Obj("project" -> Json.Str(project.slug), "doc" -> Json.Str(name), "headings" -> strs(headings))
           )
         }
         result <- commit(project, doc, Change(body, None, PatchKind.append, Nil, actor, rationale))
@@ -932,14 +1009,17 @@ final class MemoryService(val store: MemoryStore, val indexer: Indexer, newPatch
       expectedVersion: Int,
       edits: List[Edit],
       actor: String,
-      rationale: Option[String],
+      rationale: Option[String]
   ): Task[WriteResult] =
     for
       project <- requireProject(slug)
       doc <- requireDoc(project, name)
-      _ <- ZIO.when(doc.version != expectedVersion)(ZIO.fail(versionConflict(project.slug, name, doc.version, expectedVersion)))
+      _ <- ZIO.when(doc.version != expectedVersion)(
+        ZIO.fail(versionConflict(project.slug, name, doc.version, expectedVersion))
+      )
       body <- ZIO.fromEither(Patching.applyEdits(doc.body, edits)).mapError(editFailure(project.slug, name, _))
-      result <- commit(project, doc, Change(body, None, PatchKind.patch, edits, actor, rationale)).someOrFail(raced(project.slug, name))
+      result <- commit(project, doc, Change(body, None, PatchKind.patch, edits, actor, rationale))
+        .someOrFail(raced(project.slug, name))
     yield result
 
   def history(slug: String, name: String, limit: Int): Task[List[HistoryEntry]] =
@@ -947,7 +1027,9 @@ final class MemoryService(val store: MemoryStore, val indexer: Indexer, newPatch
       project <- requireProject(slug)
       doc <- requireDoc(project, name)
       patches <- store.listPatches(doc.id, limit)
-    yield patches.map(p => HistoryEntry(p.pid, p.kind, p.actor, p.rationale, p.versionBefore, p.versionAfter, p.edits.size, p.createdAt))
+    yield patches.map(p =>
+      HistoryEntry(p.pid, p.kind, p.actor, p.rationale, p.versionBefore, p.versionAfter, p.edits.size, p.createdAt)
+    )
 
   def revert(slug: String, name: String, patchId: String, rollback: Boolean, actor: String): Task[WriteResult] =
     for
@@ -961,7 +1043,11 @@ final class MemoryService(val store: MemoryStore, val indexer: Indexer, newPatch
             MemoryError(
               "patch_not_found",
               s"""No patch "$patchId" on "$name".""",
-              Json.Obj("project" -> Json.Str(project.slug), "doc" -> Json.Str(name), "knownPatchIds" -> strs(known.map(_.pid))),
+              Json.Obj(
+                "project" -> Json.Str(project.slug),
+                "doc" -> Json.Str(name),
+                "knownPatchIds" -> strs(known.map(_.pid))
+              )
             )
           )
         }
@@ -973,20 +1059,22 @@ final class MemoryService(val store: MemoryStore, val indexer: Indexer, newPatch
           ZIO.succeed(patch.bodyBefore)
         else
           Option.when(patch.edits.nonEmpty)(patch.edits).flatMap(Patching.invertEdits) match
-            case None => ZIO.fail(revertConflict(project.slug, name, patch, Nil))
+            case None          => ZIO.fail(revertConflict(project.slug, name, patch, Nil))
             case Some(inverse) =>
-              ZIO.fromEither(Patching.applyEdits(doc.body, inverse)).mapError(revertConflict(project.slug, name, patch, _))
+              ZIO
+                .fromEither(Patching.applyEdits(doc.body, inverse))
+                .mapError(revertConflict(project.slug, name, patch, _))
       rationale =
         if rollback && !isNewest then s"rollback to v${patch.versionBefore} (discards patches after ${patch.pid})"
         else s"revert ${patch.pid}"
-      result <- commit(project, doc, Change(body, None, PatchKind.revert, Nil, actor, Some(rationale))).someOrFail(raced(project.slug, name))
+      result <- commit(project, doc, Change(body, None, PatchKind.revert, Nil, actor, Some(rationale)))
+        .someOrFail(raced(project.slug, name))
     yield result
 
   def remember(body: String, tags: Option[List[String]], source: Option[String]): Task[Fact] =
     val trimmed = body.trim
     if trimmed.isEmpty then ZIO.fail(MemoryError("empty_body", "A fact needs a body."))
-    else
-      store.createFact(trimmed, KnowledgeRepository.normalizeTags(tags), source).tap(indexFactQuietly)
+    else store.createFact(trimmed, KnowledgeRepository.normalizeTags(tags), source).tap(indexFactQuietly)
 
   def getFact(id: Long): Task[Fact] =
     store.getFact(id).someOrFail(MemoryError("fact_not_found", s"No fact $id.", Json.Obj("id" -> Json.Num(id))))
@@ -1002,7 +1090,7 @@ final class MemoryService(val store: MemoryStore, val indexer: Indexer, newPatch
       limit: Option[Int],
       states: Option[List[MemoryState]],
       tags: Option[List[String]],
-      now: Instant,
+      now: Instant
   ): Task[List[RecallHit]] =
     val n = limit.getOrElse(10).max(1).min(50)
     indexer.embedQuery(query).flatMap {
@@ -1012,7 +1100,7 @@ final class MemoryService(val store: MemoryStore, val indexer: Indexer, newPatch
         ZIO.fail(
           MemoryError(
             "search_unavailable",
-            "Recall needs the embedding provider, which is currently unreachable. Documents still read and patch.",
+            "Recall needs the embedding provider, which is currently unreachable. Documents still read and patch."
           )
         )
       case Some(embedding) =>
@@ -1038,12 +1126,13 @@ object MemoryService:
       kind: PatchKind,
       edits: List[Edit],
       actor: String,
-      rationale: Option[String],
+      rationale: Option[String]
   )
 
   def randomPatchId: UIO[String] = Random.nextIntBounded(0x1000000).map(n => f"pa:$n%06x")
 
-  def make(store: MemoryStore, embedder: Embedder): MemoryService = MemoryService(store, Indexer(store, embedder), randomPatchId)
+  def make(store: MemoryStore, embedder: Embedder): MemoryService =
+    MemoryService(store, Indexer(store, embedder), randomPatchId)
 
   private def strs(xs: List[String]): Json = Json.Arr(xs.map(Json.Str(_))*)
 
@@ -1054,22 +1143,23 @@ object MemoryService:
     MemoryError(
       "version_conflict",
       s"""Document "$doc" is at version $current, not $expected. Re-read it and retry.""",
-      Json.Obj("project" -> Json.Str(project), "doc" -> Json.Str(doc), "currentVersion" -> Json.Num(current)),
+      Json.Obj("project" -> Json.Str(project), "doc" -> Json.Str(doc), "currentVersion" -> Json.Num(current))
     )
 
   private def raced(project: String, doc: String) =
     MemoryError(
       "version_conflict",
       s"""Document "$doc" changed while this write was in flight. Re-read it and retry.""",
-      Json.Obj("project" -> Json.Str(project), "doc" -> Json.Str(doc)),
+      Json.Obj("project" -> Json.Str(project), "doc" -> Json.Str(doc))
     )
 
   private def summariseFailures(failures: List[EditFailure]): String =
     failures
       .map { f =>
         f.reason match
-          case EditFailureReason.empty => s"edit ${f.index}: `old` is empty; use append_doc to add text"
-          case EditFailureReason.ambiguous => s"edit ${f.index}: `old` matches ${f.occurrences} times; quote more context"
+          case EditFailureReason.empty     => s"edit ${f.index}: `old` is empty; use append_doc to add text"
+          case EditFailureReason.ambiguous =>
+            s"edit ${f.index}: `old` matches ${f.occurrences} times; quote more context"
           case EditFailureReason.not_found =>
             val hint = f.suggestions.headOption.fold("")(s => s"; did you mean: ${Json.Str(s).toJson}")
             s"edit ${f.index}: `old` not found$hint"
@@ -1085,8 +1175,8 @@ object MemoryService:
         "project" -> Json.Str(project),
         "doc" -> Json.Str(doc),
         "applied" -> Json.Bool(false),
-        "failures" -> failures.toJsonAST.getOrElse(Json.Arr()),
-      ),
+        "failures" -> failures.toJsonAST.getOrElse(Json.Arr())
+      )
     )
 
   private def revertConflict(project: String, doc: String, patch: DocPatch, failures: List[EditFailure]) =
@@ -1099,8 +1189,8 @@ object MemoryService:
         "doc" -> Json.Str(doc),
         "patchId" -> Json.Str(patch.pid),
         "rollbackToVersion" -> Json.Num(patch.versionBefore),
-        "failures" -> failures.toJsonAST.getOrElse(Json.Arr()),
-      ),
+        "failures" -> failures.toJsonAST.getOrElse(Json.Arr())
+      )
     )
 
   // ── 8. import ──────────────────────────────────────────────────────────────
@@ -1118,9 +1208,10 @@ object MemoryService:
         val provenance = legacyNoteSource(note.id)
         val body = note.body.trim
         service.store.getFactBySource(provenance).flatMap {
-          case Some(_) => ZIO.succeed(false)
+          case Some(_)              => ZIO.succeed(false)
           case None if body.isEmpty => ZIO.succeed(false)
-          case None => service.store.createFact(body, note.tags, Some(provenance)).tap(service.indexFactQuietly).as(true)
+          case None                 =>
+            service.store.createFact(body, note.tags, Some(provenance)).tap(service.indexFactQuietly).as(true)
         }
       }
       .map(done => (done.count(identity), done.count(!_)))
@@ -1139,7 +1230,11 @@ object MemoryTools:
         case e: MemoryError =>
           ZIO.succeed(
             Json.Obj(
-              (List("ok" -> Json.Bool(false), "error" -> Json.Str(e.code), "message" -> Json.Str(e.message)) ++ e.details.fields)*
+              (List(
+                "ok" -> Json.Bool(false),
+                "error" -> Json.Str(e.code),
+                "message" -> Json.Str(e.message)
+              ) ++ e.details.fields)*
             )
           )
         case other => ZIO.fail(other)
@@ -1147,8 +1242,8 @@ object MemoryTools:
       value =>
         ZIO.fromEither(value.toJsonAST).mapError(RuntimeException(_)).map {
           case Json.Obj(fields) => Json.Obj((("ok" -> Json.Bool(true)) +: fields)*)
-          case other => Json.Obj("ok" -> Json.Bool(true), "value" -> other)
-        },
+          case other            => Json.Obj("ok" -> Json.Bool(true), "value" -> other)
+        }
     )
 
   private def tagsOk(tags: Option[List[String]], max: Int) = tags.forall(t => t.size <= max && t.forall(_.nonEmpty))
@@ -1156,51 +1251,63 @@ object MemoryTools:
   final case class RecallParams(
       @description("What to look for, in natural language.") query: String,
       @description("Max hits (default 10).") @validate(Validator.inRange(1, 50)) limit: Option[Int],
-      @description("Keep only hits carrying one of these tags.") tags: Option[List[String]],
-  ) derives JsonDecoder, Schema
+      @description("Keep only hits carrying one of these tags.") tags: Option[List[String]]
+  ) derives JsonDecoder,
+        Schema
 
   final case class RememberParams(
       @description("The fact, as a self-contained sentence including its subject.") body: String,
       @description("3–6 short lowercase topical tags.") tags: Option[List[String]],
-      @description("Optional provenance, e.g. \"telegram\".") source: Option[String],
-  ) derives JsonDecoder, Schema
+      @description("Optional provenance, e.g. \"telegram\".") source: Option[String]
+  ) derives JsonDecoder,
+        Schema
 
-  final case class GetFactParams(@description("Fact id, the number in a fact:<id> ref.") @validate(Validator.min(1L)) id: Long)
-      derives JsonDecoder, Schema
+  final case class GetFactParams(
+      @description("Fact id, the number in a fact:<id> ref.") @validate(Validator.min(1L)) id: Long
+  ) derives JsonDecoder,
+        Schema
 
   final case class UpdateFactParams(
       @validate(Validator.min(1L)) id: Long,
       @description("Replacement text.") body: Option[String],
       @description("Replacement tags (not merged).") tags: Option[List[String]],
-      @description("active = current, done = finished, archived = out of the way.") state: Option[MemoryState],
-  ) derives JsonDecoder, Schema
+      @description("active = current, done = finished, archived = out of the way.") state: Option[MemoryState]
+  ) derives JsonDecoder,
+        Schema
 
   final case class ListMemoryParams(@description("Project slug. Omit to list all projects.") project: Option[String])
-      derives JsonDecoder, Schema
+      derives JsonDecoder,
+        Schema
 
   final case class CreateProjectParams(
       @description("Lowercase id, hyphens only, e.g. \"leetcode-graphs\".") slug: String,
-      @description("Human-readable name.") title: String,
-  ) derives JsonDecoder, Schema
+      @description("Human-readable name.") title: String
+  ) derives JsonDecoder,
+        Schema
 
   final case class ReadDocParams(project: String, @description("Document filename, e.g. \"roadmap.md\".") doc: String)
-      derives JsonDecoder, Schema
+      derives JsonDecoder,
+        Schema
 
   final case class AppendDocParams(
       project: String,
       doc: String,
       @description("Markdown to append. One blank line is inserted before it.") text: String,
-      @description("Append at the end of this section instead of the file, e.g. \"Прогресс\".") under_heading: Option[String],
-      @description("The user's own words that prompted this write.") rationale: Option[String],
-  ) derives JsonDecoder, Schema
+      @description("Append at the end of this section instead of the file, e.g. \"Прогресс\".") under_heading: Option[
+        String
+      ],
+      @description("The user's own words that prompted this write.") rationale: Option[String]
+  ) derives JsonDecoder,
+        Schema
 
   final case class PatchDocParams(
       project: String,
       doc: String,
       @description("Version from the read_doc you just did.") @validate(Validator.min(1)) expected_version: Int,
       edits: List[Edit],
-      @description("The user's own words that prompted this change.") rationale: Option[String],
-  ) derives JsonDecoder, Schema
+      @description("The user's own words that prompted this change.") rationale: Option[String]
+  ) derives JsonDecoder,
+        Schema
 
   final case class WriteDocParams(
       project: String,
@@ -1209,21 +1316,26 @@ object MemoryTools:
       @description("One line describing what this document is for.") summary: Option[String],
       @description("Required when the document already exists. Omit when creating.") @validate(Validator.min(0))
       expected_version: Option[Int],
-      rationale: Option[String],
-  ) derives JsonDecoder, Schema
+      rationale: Option[String]
+  ) derives JsonDecoder,
+        Schema
 
   final case class DocHistoryParams(
       project: String,
       doc: String,
-      @description("Default 20.") @validate(Validator.inRange(1, 100)) limit: Option[Int],
-  ) derives JsonDecoder, Schema
+      @description("Default 20.") @validate(Validator.inRange(1, 100)) limit: Option[Int]
+  ) derives JsonDecoder,
+        Schema
 
   final case class RevertParams(
       project: String,
       doc: String,
       @description("Patch id from doc_history, e.g. pa:4f2a1c.") patch_id: String,
-      @description("Discard everything after this patch and restore the document as it was before it.") rollback: Option[Boolean],
-  ) derives JsonDecoder, Schema
+      @description(
+        "Discard everything after this patch and restore the document as it was before it."
+      ) rollback: Option[Boolean]
+  ) derives JsonDecoder,
+        Schema
 
   final case class Hits(hits: List[RecallHit]) derives JsonEncoder
   final case class OneFact(fact: Fact) derives JsonEncoder
@@ -1243,7 +1355,7 @@ object MemoryTools:
         "user refers to something from the past (\"что там у нас было по X\", \"напомни про Y\") and before starting " +
         "work that might already have a project. Archived facts are intentionally excluded from this ordinary recall " +
         "path.\n\nReturns REFS, not full content: `doc:<project>/<file>#<chunk>` or `fact:<id>`. Follow the " +
-        "interesting ones with read_doc / get_fact — the snippet is for choosing, the document is for answering.",
+        "interesting ones with read_doc / get_fact — the snippet is for choosing, the document is for answering."
     ) { (deps, p: RecallParams) =>
       ZIO.when(p.query.isEmpty || p.limit.exists(l => l < 1 || l > 50) || !tagsOk(p.tags, Int.MaxValue))(
         invalid("query must be non-empty, limit 1–50, tags non-empty")
@@ -1255,7 +1367,7 @@ object MemoryTools:
       "Persist a freeform fact the user asked you to remember (\"запомни, что …\"). For anything with ongoing progress " +
         "use a project document instead — a fact is a single self-contained statement, not a running log.\n\nYOU " +
         "generate the tags: 3–6 short lowercase topical words. Recall runs over the TEXT, so write a body that names " +
-        "its own subject (\"Лёша платит за интернет 1-го числа\", not \"платит 1-го\").",
+        "its own subject (\"Лёша платит за интернет 1-го числа\", not \"платит 1-го\")."
     ) { (deps, p: RememberParams) =>
       ZIO.when(p.body.isEmpty || !tagsOk(p.tags, 12))(invalid("body must be non-empty; at most 12 non-empty tags")) *>
         envelope(deps.memory.remember(p.body, p.tags, p.source).map(OneFact(_)))
@@ -1263,15 +1375,17 @@ object MemoryTools:
     tool(
       "get_fact",
       "Read one fact in full",
-      "Load a fact by id — the read half of a `fact:<id>` ref returned by recall.",
+      "Load a fact by id — the read half of a `fact:<id>` ref returned by recall."
     ) { (deps, p: GetFactParams) =>
-      ZIO.when(p.id < 1)(invalid("id must be a positive integer")) *> envelope(deps.memory.getFact(p.id).map(OneFact(_)))
+      ZIO.when(p.id < 1)(invalid("id must be a positive integer")) *> envelope(
+        deps.memory.getFact(p.id).map(OneFact(_))
+      )
     },
     tool(
       "update_fact",
       "Correct a fact or retire it",
       "Change a fact's text, tags or lifecycle state. Nothing is ever deleted: mark a finished or obsolete item `done` " +
-        "/ `archived` and it drops out of the default recall while staying findable on request.",
+        "/ `archived` and it drops out of the default recall while staying findable on request."
     ) { (deps, p: UpdateFactParams) =>
       ZIO.when(p.id < 1 || p.body.exists(_.isEmpty) || !tagsOk(p.tags, 12))(
         invalid("id must be positive; body non-empty; at most 12 non-empty tags")
@@ -1282,17 +1396,17 @@ object MemoryTools:
       "List projects, or the documents in one",
       "Without `project`: every project. With it: that project's documents, each with a one-line summary, version and " +
         "size.\n\nALWAYS call this before creating a document. It is what keeps a project from growing notes.md, " +
-        "notes2.md and progress-new.md until nobody knows which one is current.",
+        "notes2.md and progress-new.md until nobody knows which one is current."
     ) { (deps, p: ListMemoryParams) =>
       p.project match
-        case None => envelope(deps.memory.listProjects.map(Projects(_)))
+        case None       => envelope(deps.memory.listProjects.map(Projects(_)))
         case Some(slug) => envelope(deps.memory.listDocs(slug))
     },
     tool(
       "create_project",
       "Start a new project",
       "Create an empty project — a folder of markdown documents with progress, e.g. preparing for an interview on a " +
-        "topic. Check list_memory first; reusing an existing project is almost always right.",
+        "topic. Check list_memory first; reusing an existing project is almost always right."
     ) { (deps, p: CreateProjectParams) =>
       ZIO.when(p.slug.isEmpty || p.title.isEmpty)(invalid("slug and title must be non-empty")) *>
         envelope(deps.memory.createProject(p.slug, p.title).map(OneProject(_)))
@@ -1301,14 +1415,14 @@ object MemoryTools:
       "read_doc",
       "Read a project document",
       "Return a document's full markdown plus its `version`. You need that version to patch it, and the text has to be " +
-        "fresh or your quoted `old` strings won't match. Read immediately before writing.",
+        "fresh or your quoted `old` strings won't match. Read immediately before writing."
     ) { (deps, p: ReadDocParams) => envelope(deps.memory.readDoc(p.project, p.doc).map(OneDoc(_))) },
     tool(
       "append_doc",
       "Add text to the end of a document (safe default)",
       "Append to a document, or to one section of it. THE PREFERRED WRITE: it cannot destroy existing text and needs no " +
         "prior read or version.\n\nUse it for anything that is a record of what happened — progress entries, notes, " +
-        "mistakes. Progress is history: correct an old entry by appending a correction, never by editing the past.",
+        "mistakes. Progress is history: correct an old entry by appending a correction, never by editing the past."
     ) { (deps, p: AppendDocParams) =>
       ZIO.when(p.text.isEmpty)(invalid("text must be non-empty")) *>
         envelope(deps.memory.appendDoc(p.project, p.doc, p.text, p.under_heading, deps.memoryActor, p.rationale))
@@ -1319,7 +1433,7 @@ object MemoryTools:
       "Apply search/replace edits. Each `old` must appear EXACTLY ONCE — copy it verbatim from a fresh read_doc, " +
         "including punctuation, dashes and ё. `new: \"\"` deletes. All edits apply or none do.\n\nFailures come back " +
         "with what you need to fix them: `version_conflict` gives the current version, an ambiguous quote gives the " +
-        "match count, and a miss gives the literal from the document that nearly matched.",
+        "match count, and a miss gives the literal from the document that nearly matched."
     ) { (deps, p: PatchDocParams) =>
       ZIO.when(p.expected_version < 1 || p.edits.isEmpty || p.edits.exists(_.old.isEmpty))(
         invalid("expected_version must be ≥1; edits non-empty, each with a non-empty `old`")
@@ -1331,7 +1445,7 @@ object MemoryTools:
       "Create a new document, or overwrite an existing one entirely. THE ONLY OP THAT CAN LOSE CONTENT — prefer " +
         "append_doc for additions and patch_doc for changes; use this to create, or when the user explicitly asks to " +
         "rewrite from scratch.\n\nCreating: omit expected_version. Overwriting: read_doc first and pass its version. " +
-        "Always give a `summary` — it is the line other agents see in list_memory.",
+        "Always give a `summary` — it is the line other agents see in list_memory."
     ) { (deps, p: WriteDocParams) =>
       ZIO.when(p.expected_version.exists(_ < 0))(invalid("expected_version must be ≥0")) *>
         envelope(
@@ -1344,7 +1458,7 @@ object MemoryTools:
       "doc_history",
       "Who changed a document, when and why",
       "List a document's patches, newest first: patch id, kind, actor, the rationale recorded at the time, and the " +
-        "versions it moved between. Patch ids come from here — never invent one.",
+        "versions it moved between. Patch ids come from here — never invent one."
     ) { (deps, p: DocHistoryParams) =>
       ZIO.when(p.limit.exists(l => l < 1 || l > 100))(invalid("limit must be 1–100")) *>
         envelope(deps.memory.history(p.project, p.doc, p.limit.getOrElse(20)).map(History(_)))
@@ -1356,9 +1470,9 @@ object MemoryTools:
         "later patches left its text alone; when they didn't, the call fails and tells you which version a rollback " +
         "would restore.\n\n`rollback: true` then restores the whole document to the state before that patch, " +
         "DISCARDING everything written after it — only do that when the user asked for it. Reverting is itself " +
-        "recorded; history is never rewritten.",
+        "recorded; history is never rewritten."
     ) { (deps, p: RevertParams) =>
       ZIO.when(p.patch_id.isEmpty)(invalid("patch_id must be non-empty")) *>
         envelope(deps.memory.revert(p.project, p.doc, p.patch_id, p.rollback.contains(true), deps.memoryActor))
-    },
+    }
   )

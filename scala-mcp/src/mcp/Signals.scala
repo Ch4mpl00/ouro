@@ -11,20 +11,27 @@ package mcp
 //   3. tools       — `signals` toolset (get_next_signal),
 //                    `dreaming` toolset (list_signals)
 
-import java.time.Instant
-
 import io.getquill.*
 import sttp.tapir.Schema
-import sttp.tapir.Schema.annotations.{description, validate}
+import sttp.tapir.Schema.annotations.description
+import sttp.tapir.Schema.annotations.validate
 import sttp.tapir.Validator
 import zio.*
 import zio.json.*
+
+import java.time.Instant
 
 import Rows.*
 
 // ── 1. queue ─────────────────────────────────────────────────────────────────
 
-final case class SignalRecord(id: Long, source: String, content: String, createdAt: Instant, consumedAt: Option[Instant])
+final case class SignalRecord(
+    id: Long,
+    source: String,
+    content: String,
+    createdAt: Instant,
+    consumedAt: Option[Instant]
+)
 
 // Timestamps go out as "YYYY-MM-DD HH:MM:SS" UTC, the shape the agent has
 // always been handed.
@@ -37,7 +44,7 @@ final case class ListSignals(
     // Exclusive lower bound on created_at.
     since: Option[Instant] = None,
     source: Option[String] = None,
-    limit: Option[Int] = None,
+    limit: Option[Int] = None
 )
 
 final class Signals(db: Db):
@@ -58,7 +65,14 @@ final class Signals(db: Db):
             WHERE id = (SELECT id FROM signals WHERE consumed_at IS NULL
                          ORDER BY id ASC LIMIT 1 FOR UPDATE SKIP LOCKED)
         RETURNING id, source, content, created_at"""
-      )(rs => PendingSignal(rs.getLong("id"), rs.getString("source"), rs.getString("content"), Time.sqlTime(rs.instant("created_at"))))
+      )(rs =>
+        PendingSignal(
+          rs.getLong("id"),
+          rs.getString("source"),
+          rs.getString("content"),
+          Time.sqlTime(rs.instant("created_at"))
+        )
+      )
       .map(_.headOption)
 
   def countPending: Task[Long] = run(signals.filter(_.consumedAt.isEmpty).size)
@@ -78,7 +92,7 @@ final class Signals(db: Db):
         rs.getString("source"),
         rs.getString("content"),
         Time.sqlTime(rs.instant("created_at")),
-        rs.optInstant("consumed_at").map(Time.sqlTime),
+        rs.optInstant("consumed_at").map(Time.sqlTime)
       )
     }
 
@@ -122,10 +136,10 @@ object SignalTools:
         "carries `content` (the user-message payload for the agent) and `envContext` (a short note describing the " +
         "default Telegram chat id and the configured forum topics — agent prepends this to the system prompt). Skill " +
         "instructions are NOT attached; the agent loads `skills/<source>.md` itself. Returns `signal: null` when the " +
-        "queue is empty. This is the agent's only way to learn about external events.",
+        "queue is empty. This is the agent's only way to learn about external events."
     ) { (deps, _: NoArgs) =>
       deps.signals.popNext.flatMap {
-        case None => ZIO.succeed(NextSignalResult(None, 0))
+        case None    => ZIO.succeed(NextSignalResult(None, 0))
         case Some(s) =>
           val env = Signals.envContext(deps.telegram.config)
           deps.signals.countPending.map(n =>
@@ -138,8 +152,9 @@ object SignalTools:
   final case class ListSignalsParams(
       @description("ISO timestamp. Only signals with created_at > since are returned.") since: Option[String],
       @description("Restrict to a single signal source.") source: Option[String],
-      @description("Max rows. Default 200.") @validate(Validator.inRange(1, 2000)) limit: Option[Int],
-  ) derives JsonDecoder, Schema
+      @description("Max rows. Default 200.") @validate(Validator.inRange(1, 2000)) limit: Option[Int]
+  ) derives JsonDecoder,
+        Schema
 
   final case class ListSignalsResult(count: Int, signals: List[SignalRow]) derives JsonEncoder
 
@@ -150,7 +165,7 @@ object SignalTools:
       "List past signals",
       "Read-only view of past signals (does not pop or mutate the queue). Optional filters: `since` (ISO timestamp, " +
         "returns signals created after this), `source` (e.g. 'telegram', 'nashdom-bill'). Default limit 200. Used by " +
-        "the dreaming skill to review what happened since the previous reflection.",
+        "the dreaming skill to review what happened since the previous reflection."
     ) { (deps, p: ListSignalsParams) =>
       for
         _ <- ZIO.when(p.limit.exists(l => l < 1 || l > 2000))(invalid("limit must be between 1 and 2000"))

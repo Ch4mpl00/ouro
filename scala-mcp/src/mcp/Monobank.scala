@@ -8,15 +8,17 @@ package mcp
 //   1. client — statement fetch + normalisation to major units
 //   2. tools  — `monobank` toolset: list_monobank_transactions
 
-import java.time.Instant
-
 import sttp.tapir.Schema
-import sttp.tapir.Schema.annotations.{description, validate}
+import sttp.tapir.Schema.annotations.description
+import sttp.tapir.Schema.annotations.validate
 import sttp.tapir.Validator
 import zio.*
-import zio.http.{Header, Headers}
+import zio.http.Header
+import zio.http.Headers
 import zio.json.*
 import zio.json.ast.Json
+
+import java.time.Instant
 
 // ── 1. client ────────────────────────────────────────────────────────────────
 
@@ -34,7 +36,7 @@ final case class RawItem(
     invoiceId: Option[String] = None,
     counterEdrpou: Option[String] = None,
     counterIban: Option[String] = None,
-    counterName: Option[String] = None,
+    counterName: Option[String] = None
 ) derives JsonDecoder
 
 // Minor units (kopecks/cents) shown in major units. Every currency we expect
@@ -61,7 +63,7 @@ final case class Transaction(
     invoiceId: Option[String],
     counterIban: Option[String],
     counterName: Option[String],
-    counterEdrpou: Option[String],
+    counterEdrpou: Option[String]
 ) derives JsonEncoder
 
 object Transaction:
@@ -79,7 +81,7 @@ object Transaction:
     raw.invoiceId,
     raw.counterIban,
     raw.counterName,
-    raw.counterEdrpou,
+    raw.counterEdrpou
   )
 
 final case class Statement(
@@ -88,7 +90,7 @@ final case class Statement(
     to: String,
     days: Int,
     count: Int,
-    transactions: List[Transaction],
+    transactions: List[Transaction]
 ) derives JsonEncoder
 
 final class Monobank(http: HttpClient, apiKey: Option[String]):
@@ -121,16 +123,16 @@ object Monobank:
   def fromEnv(http: HttpClient): Monobank = Monobank(http, Env.get("MONOBANK_API_KEY"))
 
   def isoCurrency(code: Long): String = code match
-    case 980 => "UAH"
-    case 840 => "USD"
-    case 978 => "EUR"
-    case 826 => "GBP"
-    case 985 => "PLN"
-    case 124 => "CAD"
-    case 756 => "CHF"
-    case 392 => "JPY"
-    case 156 => "CNY"
-    case 643 => "RUB"
+    case 980   => "UAH"
+    case 840   => "USD"
+    case 978   => "EUR"
+    case 826   => "GBP"
+    case 985   => "PLN"
+    case 124   => "CAD"
+    case 756   => "CHF"
+    case 392   => "JPY"
+    case 156   => "CNY"
+    case 643   => "RUB"
     case other => other.toString
 
   def urlencode(segment: String): String =
@@ -143,8 +145,9 @@ object MonobankTools:
 
   final case class ListParams(
       @description("Monobank account id, or '0' for default UAH. Defaults to '0'.") accountId: Option[String],
-      @description("Lookback window in days (default 7, max 31).") @validate(Validator.inRange(1, 31)) days: Option[Int],
-  ) derives JsonDecoder, Schema
+      @description("Lookback window in days (default 7, max 31).") @validate(Validator.inRange(1, 31)) days: Option[Int]
+  ) derives JsonDecoder,
+        Schema
 
   val tools: List[ToolDef] = List(
     tool(
@@ -152,7 +155,7 @@ object MonobankTools:
       "List Monobank transactions",
       "Fetch recent transactions for a Monobank account. accountId can be a specific account.id or '0' for the " +
         "default UAH account. days is the lookback window (default 7, max 31). Rate limit: 1 request per 60s per " +
-        "account — surface 429s rather than retrying.",
+        "account — surface 429s rather than retrying."
     ) { (deps, p: ListParams) =>
       ZIO.when(p.days.exists(d => d < 1 || d > 31))(invalid("days must be between 1 and 31")) *>
         deps.monobank.recent(p.accountId.getOrElse("0"), p.days.getOrElse(7))

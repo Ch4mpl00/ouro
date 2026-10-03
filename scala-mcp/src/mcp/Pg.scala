@@ -14,18 +14,24 @@ package mcp
 // Flyway's history; Flyway adopts it with a baseline at the journal's length,
 // so nothing already applied runs twice.
 
-import java.net.URI
-import java.net.URLDecoder
-import java.nio.charset.StandardCharsets.UTF_8
-import java.sql.{Connection, PreparedStatement, ResultSet, Types}
-import java.time.{Instant, OffsetDateTime, ZoneOffset}
-import javax.sql.DataSource
-
-import com.zaxxer.hikari.{HikariConfig, HikariDataSource}
+import com.zaxxer.hikari.HikariConfig
+import com.zaxxer.hikari.HikariDataSource
 import io.getquill.SnakeCase
 import io.getquill.jdbczio.Quill
 import org.flywaydb.core.Flyway
 import zio.*
+
+import java.net.URI
+import java.net.URLDecoder
+import java.nio.charset.StandardCharsets.UTF_8
+import java.sql.Connection
+import java.sql.PreparedStatement
+import java.sql.ResultSet
+import java.sql.Types
+import java.time.Instant
+import java.time.OffsetDateTime
+import java.time.ZoneOffset
+import javax.sql.DataSource
 
 // ── 1. urls ──────────────────────────────────────────────────────────────────
 
@@ -36,7 +42,7 @@ final case class PgUrl(
     user: Option[String],
     password: Option[String],
     // Extra JDBC properties (currentSchema for tests).
-    options: Map[String, String] = Map.empty,
+    options: Map[String, String] = Map.empty
 ):
   def jdbcUrl: String =
     val query = options.map((k, v) => s"$k=$v").mkString("&")
@@ -63,7 +69,7 @@ object PgUrl:
               port = if uri.getPort > 0 then uri.getPort else 5432,
               database = Option(uri.getPath).map(_.stripPrefix("/")).filter(_.nonEmpty).getOrElse("postgres"),
               user = userInfo.flatMap(_.headOption),
-              password = userInfo.flatMap(_.lift(1)),
+              password = userInfo.flatMap(_.lift(1))
             )
           )
       }
@@ -132,18 +138,21 @@ object Sql:
 
   private def bind(c: Connection, st: PreparedStatement, i: Int, value: Any): Unit = value match
     case None | null => st.setNull(i, Types.NULL)
-    case Some(v) => bind(c, st, i, v)
-    case t: Instant => st.setObject(i, t.atOffset(ZoneOffset.UTC))
-    case xs: Seq[?] => st.setArray(i, c.createArrayOf("text", xs.map(_.toString).toArray[AnyRef]))
-    case v => st.setObject(i, v)
+    case Some(v)     => bind(c, st, i, v)
+    case t: Instant  => st.setObject(i, t.atOffset(ZoneOffset.UTC))
+    case xs: Seq[?]  => st.setArray(i, c.createArrayOf("text", xs.map(_.toString).toArray[AnyRef]))
+    case v           => st.setObject(i, v)
 
 // Nullable column readers for raw-SQL rows: `import Rows.*`.
 object Rows:
   extension (rs: ResultSet)
     def optString(col: String): Option[String] = Option(rs.getString(col))
-    def optLong(col: String): Option[Long] = { val v = rs.getLong(col); if rs.wasNull() then None else Some(v) }
-    def optInt(col: String): Option[Int] = { val v = rs.getInt(col); if rs.wasNull() then None else Some(v) }
-    def optDouble(col: String): Option[Double] = { val v = rs.getDouble(col); if rs.wasNull() then None else Some(v) }
+    def optLong(col: String): Option[Long] =
+      val v = rs.getLong(col); if rs.wasNull() then None else Some(v)
+    def optInt(col: String): Option[Int] =
+      val v = rs.getInt(col); if rs.wasNull() then None else Some(v)
+    def optDouble(col: String): Option[Double] =
+      val v = rs.getDouble(col); if rs.wasNull() then None else Some(v)
     def instant(col: String): Instant = rs.getObject(col, classOf[OffsetDateTime]).toInstant
     def optInstant(col: String): Option[Instant] = Option(rs.getObject(col, classOf[OffsetDateTime])).map(_.toInstant)
 

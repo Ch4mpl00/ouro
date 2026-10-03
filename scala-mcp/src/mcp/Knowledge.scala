@@ -9,13 +9,14 @@ package mcp
 //   1. repository — add (store + inline embed), find (vector search), backfill
 //   2. tools      — `knowledge` toolset: add_note, find_notes
 
-import java.sql.ResultSet
-
 import sttp.tapir.Schema
-import sttp.tapir.Schema.annotations.{description, validate}
+import sttp.tapir.Schema.annotations.description
+import sttp.tapir.Schema.annotations.validate
 import sttp.tapir.Validator
 import zio.*
 import zio.json.*
+
+import java.sql.ResultSet
 
 import Rows.*
 
@@ -28,7 +29,7 @@ final case class NoteHit(
     source: Option[String],
     createdAt: String,
     updatedAt: String,
-    distance: Double,
+    distance: Double
 ) derives JsonEncoder
 
 final case class NoteAdded(id: Long, embedded: Boolean, tags: List[String]) derives JsonEncoder
@@ -43,7 +44,9 @@ final class KnowledgeRepository(pool: PgPool, embedder: Embedder):
     else
       embedder.embedBatch(rows.map(_._2.trim)).either.flatMap {
         case Left(err) =>
-          ZIO.logError(s"knowledge embed failed for ${rows.size} notes: ${Results.describe(err)}").as(EmbedResult(0, rows.size))
+          ZIO
+            .logError(s"knowledge embed failed for ${rows.size} notes: ${Results.describe(err)}")
+            .as(EmbedResult(0, rows.size))
         case Right(vectors) =>
           pool
             .withConnection { c =>
@@ -52,7 +55,7 @@ final class KnowledgeRepository(pool: PgPool, embedder: Embedder):
                   c,
                   "UPDATE knowledge_base_notes SET embedding = ?::text::vector, embedded_at = now() WHERE id = ?",
                   Vectors.literal(v),
-                  id,
+                  id
                 )
               }
             }
@@ -62,9 +65,12 @@ final class KnowledgeRepository(pool: PgPool, embedder: Embedder):
   def addNote(body: String, tags: Option[List[String]], source: Option[String]): Task[NoteAdded] =
     val clean = KnowledgeRepository.normalizeTags(tags)
     for
-      rows <- pool.query("INSERT INTO knowledge_base_notes (body, tags, source) VALUES (?, ?, ?) RETURNING id, body", body, clean, source)(
-        rs => (rs.getLong("id"), rs.getString("body"))
-      )
+      rows <- pool.query(
+        "INSERT INTO knowledge_base_notes (body, tags, source) VALUES (?, ?, ?) RETURNING id, body",
+        body,
+        clean,
+        source
+      )(rs => (rs.getLong("id"), rs.getString("body")))
       row = rows.head
       result <- embedRows(List(row))
     yield NoteAdded(row._1, result.embedded > 0, clean)
@@ -92,12 +98,18 @@ final class KnowledgeRepository(pool: PgPool, embedder: Embedder):
   // Every note, for the one-shot import into memory facts.
   def allNotes: Task[List[StoredNote]] =
     pool.query("SELECT id, body, tags, source FROM knowledge_base_notes")(rs =>
-      StoredNote(rs.getLong("id"), rs.getString("body"), KnowledgeRepository.textArray(rs, "tags"), rs.optString("source"))
+      StoredNote(
+        rs.getLong("id"),
+        rs.getString("body"),
+        KnowledgeRepository.textArray(rs, "tags"),
+        rs.optString("source")
+      )
     )
 
 object KnowledgeRepository:
   // Trim, drop empties, de-duplicate — keeping the model's own wording.
-  def normalizeTags(tags: Option[List[String]]): List[String] = tags.getOrElse(Nil).map(_.trim).filter(_.nonEmpty).distinct
+  def normalizeTags(tags: Option[List[String]]): List[String] =
+    tags.getOrElse(Nil).map(_.trim).filter(_.nonEmpty).distinct
 
   def textArray(rs: ResultSet, col: String): List[String] =
     Option(rs.getArray(col)).map(_.getArray.asInstanceOf[Array[String]].toList).getOrElse(Nil)
@@ -109,7 +121,7 @@ object KnowledgeRepository:
     rs.optString("source"),
     Time.iso(rs.instant("created_at")),
     Time.iso(rs.instant("updated_at")),
-    rs.getDouble("distance"),
+    rs.getDouble("distance")
   )
 
 // ── 2. tools ─────────────────────────────────────────────────────────────────
@@ -124,16 +136,18 @@ object KnowledgeTools:
       @description(
         "3–6 short lowercase topical tags you generate for this note. Used for the optional overlap filter in find_notes, not for semantic recall."
       ) tags: Option[List[String]],
-      @description("Optional provenance, e.g. \"telegram\".") source: Option[String],
-  ) derives JsonDecoder, Schema
+      @description("Optional provenance, e.g. \"telegram\".") source: Option[String]
+  ) derives JsonDecoder,
+        Schema
 
   final case class FindNotesParams(
       @description("Natural-language description of what to recall.") query: String,
       @description("Max notes to return. Default 10.") @validate(Validator.inRange(1, 50)) limit: Option[Int],
       @description(
         "Restrict to notes sharing at least one of these tags (array overlap). Lowercase to match how tags are stored."
-      ) tags: Option[List[String]],
-  ) derives JsonDecoder, Schema
+      ) tags: Option[List[String]]
+  ) derives JsonDecoder,
+        Schema
 
   final case class Found(count: Int, notes: List[NoteHit]) derives JsonEncoder
 
@@ -146,7 +160,7 @@ object KnowledgeTools:
         "lowercase topical tags на свой вкус — the things you'd later search this note by (people, topics, objects), " +
         "e.g. [\"роутер\", \"пароль\", \"wifi\"]. Tags are metadata only: they help filtering and scanning, but recall " +
         "runs over the note TEXT, so write a self-contained `body` that names its subject explicitly (\"Лёша платит за " +
-        "интернет 1-го числа\", not \"платит 1-го\"). Returns the new note id.",
+        "интернет 1-го числа\", not \"платит 1-го\"). Returns the new note id."
     ) { (deps, p: AddNoteParams) =>
       val badTags = p.tags.exists(t => t.size > 12 || t.exists(_.isEmpty))
       ZIO.when(p.body.isEmpty || badTags)(invalid("body must be non-empty; at most 12 non-empty tags")) *>
@@ -159,9 +173,11 @@ object KnowledgeTools:
         "платит за интернет?\", \"напомни пароль от роутера\"). Returns the closest notes by semantic similarity to " +
         "`query`, each with body, tags, source, created_at and distance (lower = closer). Optionally pass `tags` to " +
         "additionally restrict to notes sharing at least one tag. This is the ONLY way to read the knowledge base — " +
-        "use it whenever the user asks what you know/remember about something personal.",
+        "use it whenever the user asks what you know/remember about something personal."
     ) { (deps, p: FindNotesParams) =>
-      ZIO.when(p.query.isEmpty || p.limit.exists(l => l < 1 || l > 50))(invalid("query must be non-empty; limit 1–50")) *>
+      ZIO.when(p.query.isEmpty || p.limit.exists(l => l < 1 || l > 50))(
+        invalid("query must be non-empty; limit 1–50")
+      ) *>
         deps.knowledge.findNotes(p.query, p.limit.getOrElse(10), p.tags).map(notes => Found(notes.size, notes))
-    },
+    }
   )

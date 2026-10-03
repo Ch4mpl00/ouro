@@ -21,10 +21,13 @@ object EmbedBackfill extends CliApp:
           val sum = total + r
           Console.printLine(
             s"[embed-backfill:$label] batch: embedded=${r.embedded}, failed=${r.failed} (running totals: ${sum.embedded}/${sum.failed})"
-          ) *> (if r.failed > 0 then Console.printLineError(s"[embed-backfill:$label] giving up after batch failure").as(sum)
+          ) *> (if r.failed > 0 then
+                  Console.printLineError(s"[embed-backfill:$label] giving up after batch failure").as(sum)
                 else loop(sum))
       }
-    loop(EmbedResult()).flatMap(t => Console.printLine(s"[embed-backfill:$label] done: embedded=${t.embedded}, failed=${t.failed}"))
+    loop(EmbedResult()).flatMap(t =>
+      Console.printLine(s"[embed-backfill:$label] done: embedded=${t.embedded}, failed=${t.failed}")
+    )
 
   def program(args: Chunk[String]) =
     for

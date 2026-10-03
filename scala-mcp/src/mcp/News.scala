@@ -12,23 +12,25 @@ package mcp
 //   6. poller     — one cadence loop over every provider
 //   7. tools      — `news-read` toolset: search_news, list_news, fetch_article
 
+import com.rometools.rome.io.SyndFeedInput
+import com.rometools.rome.io.XmlReader
+import net.dankito.readability4j.Readability4J
+import org.jsoup.Jsoup
+import sttp.tapir.Schema
+import sttp.tapir.Schema.annotations.description
+import sttp.tapir.Schema.annotations.validate
+import sttp.tapir.Validator
+import zio.*
+import zio.http.Header
+import zio.http.Headers
+import zio.json.*
+import zio.json.ast.Json
+
 import java.io.ByteArrayInputStream
 import java.net.URI
 import java.sql.ResultSet
 import java.time.Instant
-
 import scala.jdk.CollectionConverters.*
-
-import com.rometools.rome.io.{SyndFeedInput, XmlReader}
-import net.dankito.readability4j.Readability4J
-import org.jsoup.Jsoup
-import sttp.tapir.Schema
-import sttp.tapir.Schema.annotations.{description, validate}
-import sttp.tapir.Validator
-import zio.*
-import zio.http.{Header, Headers}
-import zio.json.*
-import zio.json.ast.Json
 
 import Rows.*
 
@@ -43,7 +45,7 @@ final case class NewsItem(
     url: Option[String],
     body: String,
     metadata: Json.Obj,
-    postedAt: Option[Instant],
+    postedAt: Option[Instant]
 ):
   def toJson: Json = Json.Obj(
     "source" -> Json.Str(source),
@@ -52,7 +54,7 @@ final case class NewsItem(
     "url" -> url.fold(Json.Null)(Json.Str(_)),
     "body" -> Json.Str(body),
     "metadata" -> metadata,
-    "postedAt" -> postedAt.fold(Json.Null)(t => Json.Str(Time.iso(t))),
+    "postedAt" -> postedAt.fold(Json.Null)(t => Json.Str(Time.iso(t)))
   )
 
 final case class SaveResult(saved: Int = 0, embedded: Int = 0, failed: Int = 0) derives JsonEncoder
@@ -66,7 +68,7 @@ final case class NewsFilter(
     // bounds posted_at.
     asOf: Option[Instant] = None,
     // Channel posts only: metadata.chat_username OR chat_id.
-    channel: Option[String] = None,
+    channel: Option[String] = None
 )
 
 final case class SearchResult(
@@ -79,7 +81,7 @@ final case class SearchResult(
     distance: Double,
     metadata: Json.Obj,
     // Batch path only: indices of the queries that surfaced this item.
-    matchedQueries: Option[List[Int]],
+    matchedQueries: Option[List[Int]]
 )
 
 object SearchResult:
@@ -92,7 +94,7 @@ object SearchResult:
       "snippet" -> Json.Str(r.snippet),
       "postedAt" -> r.postedAt.fold(Json.Null)(Json.Str(_)),
       "distance" -> Json.Num(r.distance),
-      "metadata" -> r.metadata,
+      "metadata" -> r.metadata
     ) ++ r.matchedQueries.map(qs => "matchedQueries" -> Json.Arr(qs.map(Json.Num(_))*))
     Json.Obj(fields*)
   }
@@ -106,7 +108,7 @@ final case class Article(
     site: Option[String],
     // Unparseable dates are dropped rather than poisoning the row.
     publishedAt: Option[Instant],
-    author: Option[String],
+    author: Option[String]
 )
 
 final class ArticleFetcher(http: HttpClient):
@@ -122,19 +124,24 @@ final class ArticleFetcher(http: HttpClient):
   def fetchWithRetry(url: String): UIO[Option[Article]] =
     fetch(url)
       .retry(Schedule.recurs(2) && Schedule.linear(500.millis))
-      .foldZIO(err => ZIO.logWarning(s"article fetch failed after 3 attempts: $url: ${Results.describe(err)}").as(None), a => ZIO.some(a))
+      .foldZIO(
+        err => ZIO.logWarning(s"article fetch failed after 3 attempts: $url: ${Results.describe(err)}").as(None),
+        a => ZIO.some(a)
+      )
 
 object News:
   def extractArticle(url: String, html: String): Either[String, Article] =
     val parsed = Readability4J(url, html).parse()
     Option(parsed.getContent).filter(_.trim.nonEmpty) match
-      case None => Left(s"No article extracted from $url")
+      case None          => Left(s"No article extracted from $url")
       case Some(content) =>
         // Readability4J has no site/date extraction; the meta tags it would
         // read are one jsoup query away.
         val doc = Jsoup.parse(html)
         def meta(property: String) =
-          Option(doc.selectFirst(s"meta[property=$property], meta[name=$property]")).map(_.attr("content").trim).filter(_.nonEmpty)
+          Option(doc.selectFirst(s"meta[property=$property], meta[name=$property]"))
+            .map(_.attr("content").trim)
+            .filter(_.nonEmpty)
         val host = scala.util.Try(URI(url).getHost).toOption.flatMap(Option(_)).map(_.stripPrefix("www."))
         Right(
           Article(
@@ -143,7 +150,7 @@ object News:
             stripHtml(content),
             meta("og:site_name").orElse(host),
             meta("article:published_time").flatMap(Time.parseJsDate),
-            Option(parsed.getByline).map(_.trim).filter(_.nonEmpty),
+            Option(parsed.getByline).map(_.trim).filter(_.nonEmpty)
           )
         )
 
@@ -170,7 +177,7 @@ object News:
       author: Option[String],
       postedAt: Option[Instant],
       // Source-specific extras, written into metadata ahead of author/site.
-      extra: List[(String, Json)] = Nil,
+      extra: List[(String, Json)] = Nil
   )
 
   // The shared article mapping. Keys whose value is absent are omitted, as
@@ -187,7 +194,7 @@ object News:
         Some(headline.url),
         a.text,
         Json.Obj(metadata*),
-        a.publishedAt.orElse(headline.postedAt),
+        a.publishedAt.orElse(headline.postedAt)
       )
     }
 
@@ -215,9 +222,9 @@ object News:
         "chat_username" -> opt(username)(Json.Str(_)),
         "tg_message_id" -> Json.Num(m.id),
         "views" -> opt(m.views)(Json.Num(_)),
-        "forwards" -> opt(m.forwards)(Json.Num(_)),
+        "forwards" -> opt(m.forwards)(Json.Num(_))
       ),
-      Some(m.date),
+      Some(m.date)
     )
 
   // ── 5. ranking ─────────────────────────────────────────────────────────────
@@ -231,7 +238,7 @@ object News:
       metadata: Json.Obj,
       postedAt: Option[Instant],
       distance: Double,
-      embedding: Option[Vector[Float]],
+      embedding: Option[Vector[Float]]
   )
 
   val SnippetChars = 400
@@ -249,7 +256,7 @@ object News:
       .foldLeft(Vector.empty[(PoolRow, List[Int])]) { case (acc, (row, qi)) =>
         acc.indexWhere(_._1.id == row.id) match
           case -1 => acc :+ (row -> List(qi))
-          case i =>
+          case i  =>
             val (best, matched) = acc(i)
             acc.updated(i, (if row.distance < best.distance then row else best) -> (matched :+ qi))
       }
@@ -268,7 +275,7 @@ object News:
           row.postedAt.map(Time.iso),
           row.distance,
           row.metadata,
-          Option.when(annotate)(matched),
+          Option.when(annotate)(matched)
         )
       }
 
@@ -306,7 +313,7 @@ final class HackerNews(http: HttpClient) extends NewsProvider:
       score: Option[Long],
       descendants: Option[Long],
       by: Option[String],
-      time: Option[Long],
+      time: Option[Long]
   ) derives JsonDecoder
 
   private def headline(id: Long): UIO[Option[News.Headline]] =
@@ -322,7 +329,7 @@ final class HackerNews(http: HttpClient) extends NewsProvider:
             item.by,
             item.time.map(Instant.ofEpochSecond),
             List("hn_id" -> Json.Num(id)) ++ item.score.map(s => "score" -> Json.Num(s)) ++
-              item.descendants.map(c => "comments" -> Json.Num(c)),
+              item.descendants.map(c => "comments" -> Json.Num(c))
           )
         }
       })
@@ -353,7 +360,7 @@ final class Habr(http: HttpClient) extends NewsProvider:
         title,
         url,
         Option(entry.getAuthor).filter(_.nonEmpty),
-        Option(entry.getPublishedDate).orElse(Option(entry.getUpdatedDate)).map(_.toInstant),
+        Option(entry.getPublishedDate).orElse(Option(entry.getUpdatedDate)).map(_.toInstant)
       )
     }
 
@@ -388,7 +395,11 @@ final class TelegramChannels(userbot: Userbot, repository: NewsRepository) exten
                   .fetchMessages(channel, watermark, limit)
                   .map(_.map(News.channelItem(channel.chatId, channel.title, channel.username, _)))
                   .catchAll(err =>
-                    ZIO.logWarning(s"channel fetch failed: ${channel.title.getOrElse(channel.chatId)}: ${Results.describe(err)}").as(Nil)
+                    ZIO
+                      .logWarning(
+                        s"channel fetch failed: ${channel.title.getOrElse(channel.chatId)}: ${Results.describe(err)}"
+                      )
+                      .as(Nil)
                   )
                 _ <- ZIO.sleep(200.millis)
               yield items
@@ -409,12 +420,19 @@ final class NewsRepository(pool: PgPool, embedder: Embedder):
     else
       embedder.embedBatch(rows.map(_.text)).either.flatMap {
         case Left(err) =>
-          ZIO.logError(s"news embed failed for ${rows.size} rows: ${Results.describe(err)}").as(EmbedResult(0, rows.size))
+          ZIO
+            .logError(s"news embed failed for ${rows.size} rows: ${Results.describe(err)}")
+            .as(EmbedResult(0, rows.size))
         case Right(vectors) =>
           pool
             .withConnection { c =>
               rows.zip(vectors).foreach { (row, v) =>
-                Sql.update(c, "UPDATE news_items SET embedding = ?::text::vector, embedded_at = now() WHERE id = ?", Vectors.literal(v), row.id)
+                Sql.update(
+                  c,
+                  "UPDATE news_items SET embedding = ?::text::vector, embedded_at = now() WHERE id = ?",
+                  Vectors.literal(v),
+                  row.id
+                )
               }
             }
             .as(EmbedResult(rows.size, 0))
@@ -424,7 +442,8 @@ final class NewsRepository(pool: PgPool, embedder: Embedder):
     if items.isEmpty then ZIO.succeed(SaveResult())
     else
       val values = items.map(_ => "(?, ?, ?, ?, ?, ?::jsonb, ?)").mkString(", ")
-      val params = items.flatMap(i => List(i.source, i.externalId, i.title, i.url, i.body, i.metadata.toJson, i.postedAt))
+      val params =
+        items.flatMap(i => List(i.source, i.externalId, i.title, i.url, i.body, i.metadata.toJson, i.postedAt))
       val sql =
         s"""INSERT INTO news_items (source, external_id, title, url, body, metadata, posted_at) VALUES $values
             ON CONFLICT (source, external_id) DO NOTHING RETURNING id, title, body"""
@@ -450,13 +469,15 @@ final class NewsRepository(pool: PgPool, embedder: Embedder):
         item.url,
         item.body,
         item.metadata.toJson,
-        item.postedAt,
+        item.postedAt
       )(embedRow)
       .flatMap(rows => embed(rows).map(r => SaveResult(1, r.embedded, r.failed)))
 
   def findByExternalId(source: String, externalId: String): Task[Option[NewsItem]] =
     pool
-      .query(s"SELECT $ItemColumns FROM news_items WHERE source = ? AND external_id = ? LIMIT 1", source, externalId)(item)
+      .query(s"SELECT $ItemColumns FROM news_items WHERE source = ? AND external_id = ? LIMIT 1", source, externalId)(
+        item
+      )
       .map(_.headOption)
 
   // The highest tg_message_id already stored for a channel.
@@ -466,7 +487,7 @@ final class NewsRepository(pool: PgPool, embedder: Embedder):
         """SELECT max((metadata ->> 'tg_message_id')::int)::bigint AS m FROM news_items
             WHERE source = ? AND metadata ->> 'chat_id' = ?""",
         News.ChannelSource,
-        chatId,
+        chatId
       )(_.optLong("m"))
       .map(_.headOption.flatten)
 
@@ -479,7 +500,8 @@ final class NewsRepository(pool: PgPool, embedder: Embedder):
     val fetchLimit = if dedup then (limit * 2).min(2000) else limit
     val (where, params) = filters(filter, "fetched_at")
     val order = if filter.since.isDefined then "ASC" else "DESC"
-    val sql = s"SELECT $ItemColumns, embedding::text AS embedding FROM news_items ${whereClause(where)} ORDER BY posted_at $order LIMIT ?"
+    val sql =
+      s"SELECT $ItemColumns, embedding::text AS embedding FROM news_items ${whereClause(where)} ORDER BY posted_at $order LIMIT ?"
     pool
       .query(sql, (params :+ fetchLimit)*)(rs => item(rs) -> rs.optString("embedding").flatMap(Vectors.parse))
       .map(rows => Retrieval.dedupByPairwiseCosine(rows, _._2, dedupThreshold, keepNull = true).take(limit).map(_._1))
@@ -517,7 +539,7 @@ object NewsRepository:
   def metadataOf(rs: ResultSet): Json.Obj =
     rs.optString("metadata").flatMap(_.fromJson[Json].toOption) match
       case Some(obj: Json.Obj) => obj
-      case _ => Json.Obj()
+      case _                   => Json.Obj()
 
   private def item(rs: ResultSet) = NewsItem(
     rs.getString("source"),
@@ -526,7 +548,7 @@ object NewsRepository:
     rs.optString("url"),
     rs.getString("body"),
     metadataOf(rs),
-    rs.optInstant("posted_at"),
+    rs.optInstant("posted_at")
   )
 
   private def poolRow(rs: ResultSet) = News.PoolRow(
@@ -538,10 +560,11 @@ object NewsRepository:
     metadataOf(rs),
     rs.optInstant("posted_at"),
     rs.getDouble("distance"),
-    rs.optString("embedding").flatMap(Vectors.parse),
+    rs.optString("embedding").flatMap(Vectors.parse)
   )
 
-  def whereClause(filters: List[String]): String = if filters.isEmpty then "" else filters.mkString("WHERE ", " AND ", "")
+  def whereClause(filters: List[String]): String =
+    if filters.isEmpty then "" else filters.mkString("WHERE ", " AND ", "")
 
   private def filters(f: NewsFilter, asOfColumn: String): (List[String], List[Any]) =
     val parts = List(
@@ -549,7 +572,7 @@ object NewsRepository:
       f.since.map(t => "posted_at > ?" -> List(t)),
       f.until.map(t => "posted_at <= ?" -> List(t)),
       f.asOf.map(t => s"$asOfColumn <= ?" -> List(t)),
-      f.channel.map(c => "(metadata ->> 'chat_username' = ? OR metadata ->> 'chat_id' = ?)" -> List(c, c)),
+      f.channel.map(c => "(metadata ->> 'chat_username' = ? OR metadata ->> 'chat_id' = ?)" -> List(c, c))
     ).flatten
     (parts.map(_._1), parts.flatMap(_._2))
 
@@ -568,7 +591,9 @@ object NewsPoller:
             repository
               .save(items)
               .flatMap(r =>
-                ZIO.logInfo(s"news tick ${p.source}: fetched ${items.size}, saved ${r.saved}, embedded ${r.embedded}, failed ${r.failed}")
+                ZIO.logInfo(
+                  s"news tick ${p.source}: fetched ${items.size}, saved ${r.saved}, embedded ${r.embedded}, failed ${r.failed}"
+                )
               )
           )
         }
@@ -579,10 +604,12 @@ object NewsPoller:
       last <- Ref.make(Map.empty[String, Instant])
       tick = Clock.instant.flatMap { now =>
         ZIO.foreachDiscard(providers) { p =>
-          last.get.map(_.get(p.source).exists(at => java.time.Duration.between(at, now).compareTo(p.cadence) < 0)).flatMap {
-            case true => ZIO.unit
-            case false => last.update(_ + (p.source -> now)) *> tickOne(p)
-          }
+          last.get
+            .map(_.get(p.source).exists(at => java.time.Duration.between(at, now).compareTo(p.cadence) < 0))
+            .flatMap {
+              case true  => ZIO.unit
+              case false => last.update(_ + (p.source -> now)) *> tickOne(p)
+            }
         }
       }
       _ <- tick.repeat(Schedule.spaced(30.seconds))
@@ -619,8 +646,9 @@ object NewsTools:
       ) asOfISO: Option[String],
       @description("For source='channel' only: restrict to one Telegram channel by chat_username or chat_id.")
       channel: Option[String],
-      @description(ChunksDoc) @validate(Validator.inRange(2, 8)) chunks: Option[Int],
-  ) derives JsonDecoder, Schema
+      @description(ChunksDoc) @validate(Validator.inRange(2, 8)) chunks: Option[Int]
+  ) derives JsonDecoder,
+        Schema
 
   final case class ListParams(
       @description("Restrict to one source.") source: Option[KnownSource],
@@ -635,22 +663,24 @@ object NewsTools:
       @description("For source='channel' only: restrict to one Telegram channel by chat_username or chat_id.")
       channel: Option[String],
       @description("Max rows. Default 500.") @validate(Validator.inRange(1, 2000)) limit: Option[Int],
-      @description(ChunksDoc) @validate(Validator.inRange(2, 8)) chunks: Option[Int],
-  ) derives JsonDecoder, Schema
+      @description(ChunksDoc) @validate(Validator.inRange(2, 8)) chunks: Option[Int]
+  ) derives JsonDecoder,
+        Schema
 
   final case class FetchArticleParams(@description("Article URL to fetch and extract.") url: String)
-      derives JsonDecoder, Schema
+      derives JsonDecoder,
+        Schema
 
   def buildFilter(
       source: Option[KnownSource],
       since: Option[String],
       until: Option[String],
       asOf: Option[String],
-      channel: Option[String],
+      channel: Option[String]
   ): Either[String, NewsFilter] =
     def date(field: String, v: Option[String]) = v match
       case Some(raw) => Time.requireJsDate(field, raw).map(Some(_))
-      case None => Right(None)
+      case None      => Right(None)
     for
       s <- date("sinceISO", since)
       u <- date("untilISO", until)
@@ -661,14 +691,17 @@ object NewsTools:
 
   def sourceForUrl(url: String): String =
     scala.util.Try(URI(url).getHost).toOption.flatMap(Option(_)) match
-      case Some(host) if host.endsWith("habr.com") => "habr"
+      case Some(host) if host.endsWith("habr.com")        => "habr"
       case Some(host) if host.endsWith("ycombinator.com") => "hackernews"
-      case _ => "external"
+      case _                                              => "external"
 
   private def counted(items: List[Json], key: String, chunks: Option[Int]): Json =
     chunks match
       case Some(n) =>
-        Json.Obj("count" -> Json.Num(items.size), "chunks" -> Json.Arr(News.splitChunks(items, n).map(c => Json.Arr(c*))*))
+        Json.Obj(
+          "count" -> Json.Num(items.size),
+          "chunks" -> Json.Arr(News.splitChunks(items, n).map(c => Json.Arr(c*))*)
+        )
       case None => Json.Obj("count" -> Json.Num(items.size), key -> Json.Arr(items*))
 
   val tools: List[ToolDef] = List(
@@ -683,15 +716,15 @@ object NewsTools:
         "`queries: [...]` — one entry per facet — instead of calling this tool N times or blurring everything into one " +
         "`query`. Each query is searched independently; results are merged and already de-duplicated across the batch " +
         "(an item's `distance` is its best match across the facets, `matchedQueries` lists which facets surfaced it), " +
-        "so do NOT re-query per facet or re-dedup. Pass exactly one of `query` or `queries`.",
+        "so do NOT re-query per facet or re-dedup. Pass exactly one of `query` or `queries`."
     ) { (deps, p: SearchParams) =>
       val bad = p.query.exists(_.isEmpty) || p.queries.exists(q => q.isEmpty || q.size > 8 || q.exists(_.isEmpty)) ||
         p.k.exists(k => k < 1 || k > 50) || !chunksOk(p.chunks)
       ZIO.when(bad)(invalid("query must be non-empty, queries 1–8 non-empty strings, k 1–50, chunks 2–8")) *>
         ((p.query, p.queries) match
-          case (Some(q), None) => ZIO.succeed(Some(List(q) -> false))
+          case (Some(q), None)  => ZIO.succeed(Some(List(q) -> false))
           case (None, Some(qs)) => ZIO.succeed(Some(qs -> true))
-          case _ => ZIO.none
+          case _                => ZIO.none
         ).flatMap {
           case None => ZIO.succeed(Json.Obj("error" -> Json.Str("Pass exactly one of `query` or `queries`.")))
           case Some((queries, annotate)) =>
@@ -705,10 +738,12 @@ object NewsTools:
       "list_news",
       "List news items chronologically",
       "Read items from the news store ordered by posted_at. Use when you need everything in a time window (e.g. a 24h " +
-        "channel digest) rather than a topical match. Ascending when sinceISO is provided, descending otherwise.",
+        "channel digest) rather than a topical match. Ascending when sinceISO is provided, descending otherwise."
     ) { (deps, p: ListParams) =>
       for
-        _ <- ZIO.when(p.limit.exists(l => l < 1 || l > 2000) || !chunksOk(p.chunks))(invalid("limit must be 1–2000, chunks 2–8"))
+        _ <- ZIO.when(p.limit.exists(l => l < 1 || l > 2000) || !chunksOk(p.chunks))(
+          invalid("limit must be 1–2000, chunks 2–8")
+        )
         filter <- orFail(buildFilter(p.source, p.sinceISO, p.untilISO, p.asOfISO, p.channel))
         items <- deps.news.list(filter, p.limit.getOrElse(500), Retrieval.DefaultDedupThreshold)
       yield counted(items.map(_.toJson), "items", p.chunks)
@@ -719,7 +754,7 @@ object NewsTools:
       "Download a web article (Mozilla Readability) and save it to the news store so it becomes searchable. Manual " +
         "override — the HN and Habr pollers already cover their feeds. Use this for ad-hoc URLs the user shares. " +
         "Returns clean plaintext (title + body). If the URL is already cached, returns the cached row without " +
-        "re-fetching.",
+        "re-fetching."
     ) { (deps, p: FetchArticleParams) =>
       val valid = scala.util.Try(URI(p.url)).toOption.exists(u => u.isAbsolute && u.getScheme != null)
       ZIO.when(!valid)(invalid("url must be a valid URL")) *>
@@ -736,13 +771,13 @@ object NewsTools:
                     "text" -> Json.Str(cached.body),
                     "source" -> Json.Str(cached.source),
                     "sizeChars" -> Json.Num(cached.body.length),
-                    "cached" -> Json.Bool(true),
+                    "cached" -> Json.Bool(true)
                   ) ++ cached.postedAt.map(t => "publishedAt" -> Json.Str(Time.iso(t))))*
                 )
               )
             case None => fetchAndStore(deps, p.url)
           }
-    },
+    }
   )
 
   private def fetchAndStore(deps: Deps, url: String): Task[Json] =
@@ -752,8 +787,18 @@ object NewsTools:
       metadata = Json.Obj(
         (article.author.map(a => "author" -> Json.Str(a)).toList ++ article.site.map(s => "site" -> Json.Str(s)))*
       )
-      item = NewsItem(source, url, Some(article.title).filter(_.nonEmpty), Some(url), article.text, metadata, article.publishedAt)
-      _ <- deps.news.upsert(item).catchAll(err => ZIO.logError(s"fetch_article: save step failed: ${Results.describe(err)}"))
+      item = NewsItem(
+        source,
+        url,
+        Some(article.title).filter(_.nonEmpty),
+        Some(url),
+        article.text,
+        metadata,
+        article.publishedAt
+      )
+      _ <- deps.news
+        .upsert(item)
+        .catchAll(err => ZIO.logError(s"fetch_article: save step failed: ${Results.describe(err)}"))
     yield Json.Obj(
       (List("url" -> Json.Str(article.url), "title" -> Json.Str(article.title), "text" -> Json.Str(article.text)) ++
         article.site.map(s => "site" -> Json.Str(s)) ++

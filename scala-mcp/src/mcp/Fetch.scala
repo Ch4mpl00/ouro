@@ -14,15 +14,20 @@ package mcp
 // including each redirect hop and a DNS answer that changed since validation —
 // is checked, not just the URL the model typed.
 
-import java.net.{Inet4Address, Inet6Address, InetAddress, URI, UnknownHostException}
-
 import sttp.tapir.Schema
-import sttp.tapir.Schema.annotations.{description, validate}
+import sttp.tapir.Schema.annotations.description
+import sttp.tapir.Schema.annotations.validate
 import sttp.tapir.Validator
 import zio.*
 import zio.http.*
 import zio.http.netty.NettyConfig
 import zio.json.*
+
+import java.net.Inet4Address
+import java.net.Inet6Address
+import java.net.InetAddress
+import java.net.URI
+import java.net.UnknownHostException
 
 // ── 1. ssrf guard ────────────────────────────────────────────────────────────
 
@@ -53,12 +58,16 @@ object Ssrf:
         .filterOrFail(u => u.isAbsolute && u.getHost != null || u.getScheme != null)(())
         .orElseFail(ToolFailure(s"invalid URL: $raw"))
       scheme = Option(uri.getScheme).getOrElse("").toLowerCase
-      _ <- ZIO.when(scheme != "http" && scheme != "https")(ZIO.fail(ToolFailure(s"""unsupported scheme "$scheme:" — only http/https""")))
+      _ <- ZIO.when(scheme != "http" && scheme != "https")(
+        ZIO.fail(ToolFailure(s"""unsupported scheme "$scheme:" — only http/https"""))
+      )
       host <- ZIO.fromOption(Option(uri.getHost)).orElseFail(ToolFailure(s"invalid URL: $raw"))
       addrs <- literalIp(host) match
         case Some(ip) => ZIO.succeed(List(ip))
-        case None =>
-          ZIO.attemptBlocking(InetAddress.getAllByName(host).toList).orElseFail(ToolFailure(s"""could not resolve host "$host""""))
+        case None     =>
+          ZIO
+            .attemptBlocking(InetAddress.getAllByName(host).toList)
+            .orElseFail(ToolFailure(s"""could not resolve host "$host""""))
       _ <- ZIO.foreachDiscard(addrs.find(isPrivate))(ip =>
         ZIO.fail(ToolFailure(s"refusing to fetch private/loopback address ($host → ${ip.getHostAddress})"))
       )
@@ -73,7 +82,9 @@ object Ssrf:
         .flatMap { addrs =>
           addrs.find(isPrivate) match
             case Some(bad) =>
-              ZIO.fail(UnknownHostException(s"refusing to fetch private/loopback address ($host → ${bad.getHostAddress})"))
+              ZIO.fail(
+                UnknownHostException(s"refusing to fetch private/loopback address ($host → ${bad.getHostAddress})")
+              )
             case None => ZIO.succeed(addrs)
         }
 
@@ -87,7 +98,7 @@ final case class Fetched(
     truncated: Option[Boolean] = None,
     content: Option[String] = None,
     binary: Option[Boolean] = None,
-    note: Option[String] = None,
+    note: Option[String] = None
 )
 
 object Fetched:
@@ -97,11 +108,11 @@ object Fetched:
     val base = List("url" -> Json.Str(f.url), "status" -> Json.Num(f.status), "contentType" -> Json.Str(f.contentType))
     val rest = f.binary match
       case Some(_) => List("binary" -> Json.Bool(true), "note" -> Json.Str(f.note.getOrElse("")))
-      case None =>
+      case None    =>
         List(
           "bytes" -> Json.Num(f.bytes.getOrElse(0L)),
           "truncated" -> Json.Bool(f.truncated.getOrElse(false)),
-          "content" -> Json.Str(f.content.getOrElse("")),
+          "content" -> Json.Str(f.content.getOrElse(""))
         )
     Json.Obj((base ++ rest)*)
   }
@@ -114,19 +125,26 @@ final class Fetcher(client: Client):
   val http: HttpClient = HttpClient.following(client)
 
   def fetch(raw: String, cap: Int): Task[Fetched] =
-    Ssrf.assertPublicUrl(raw).flatMap(uri => hop(uri.toString, cap, redirects = 0)).timeoutFail(
-      ToolFailure(s"fetch failed: timed out after ${Timeout.toMillis}ms")
-    )(Timeout)
+    Ssrf
+      .assertPublicUrl(raw)
+      .flatMap(uri => hop(uri.toString, cap, redirects = 0))
+      .timeoutFail(
+        ToolFailure(s"fetch failed: timed out after ${Timeout.toMillis}ms")
+      )(Timeout)
 
   // Redirects by hand, so each hop's scheme and address are vetted too.
   private def hop(url: String, cap: Int, redirects: Int): Task[Fetched] =
     ZIO.scoped {
       for
         target <- HttpClient.url(url)
-        request = Request.get(target).addHeader(Header.Accept(MediaType.any)).addHeader(Header.Custom("User-Agent", BrowserUa))
-        res <- ZClient.streaming(request).provideSomeEnvironment[Scope](_.add(client)).mapError(err =>
-          ToolFailure(s"fetch failed: ${Results.describe(err)}")
-        )
+        request = Request
+          .get(target)
+          .addHeader(Header.Accept(MediaType.any))
+          .addHeader(Header.Custom("User-Agent", BrowserUa))
+        res <- ZClient
+          .streaming(request)
+          .provideSomeEnvironment[Scope](_.add(client))
+          .mapError(err => ToolFailure(s"fetch failed: ${Results.describe(err)}"))
         out <- res.header(Header.Location) match
           case Some(location) if res.status.isRedirection =>
             if redirects >= 10 then Tools.fail("fetch failed: too many redirects")
@@ -142,7 +160,13 @@ final class Fetcher(client: Client):
     val contentType = res.header(Header.ContentType).map(_.renderedValue).getOrElse("")
     if isBinary(contentType) then
       ZIO.succeed(
-        Fetched(url, res.status.code, contentType, binary = Some(true), note = Some("binary content not returned; for a PDF use read_pdf"))
+        Fetched(
+          url,
+          res.status.code,
+          contentType,
+          binary = Some(true),
+          note = Some("binary content not returned; for a PDF use read_pdf")
+        )
       )
     else
       res.body.asStream.take(cap.toLong + 1).runCollect.map { bytes =>
@@ -153,7 +177,7 @@ final class Fetcher(client: Client):
           contentType,
           bytes = Some(bytes.size.toLong),
           truncated = Some(bytes.size > cap),
-          content = Some(String(kept.toArray, java.nio.charset.StandardCharsets.UTF_8)),
+          content = Some(String(kept.toArray, java.nio.charset.StandardCharsets.UTF_8))
         )
       }
 
@@ -182,8 +206,11 @@ object FetchTools:
 
   final case class FetchParams(
       @description("Absolute http(s) URL.") url: String,
-      @description("Cap on bytes returned (default 2000000).") @validate(Validator.inRange(1, 8_000_000)) maxBytes: Option[Int],
-  ) derives JsonDecoder, Schema
+      @description("Cap on bytes returned (default 2000000).") @validate(
+        Validator.inRange(1, 8_000_000)
+      ) maxBytes: Option[Int]
+  ) derives JsonDecoder,
+        Schema
 
   val tools: List[ToolDef] = List(
     tool(
@@ -192,9 +219,11 @@ object FetchTools:
       "GET a URL and return its RAW body (HTML / JSON / text). Use when you already have a link and need the raw " +
         "content — e.g. the raw HTML to parse a <table> in a code_agent step, or a page the search/extract provider " +
         "can't retrieve. Complements tavily_extract (which returns cleaned prose). Follows redirects; binary content " +
-        "(PDF/image/zip) is not returned — use read_pdf for PDFs.",
+        "(PDF/image/zip) is not returned — use read_pdf for PDFs."
     ) { (deps, p: FetchParams) =>
-      ZIO.when(p.maxBytes.exists(m => m < 1 || m > Fetcher.HardMaxBytes))(invalid("maxBytes must be between 1 and 8000000")) *>
+      ZIO.when(p.maxBytes.exists(m => m < 1 || m > Fetcher.HardMaxBytes))(
+        invalid("maxBytes must be between 1 and 8000000")
+      ) *>
         deps.fetcher.fetch(p.url, p.maxBytes.getOrElse(Fetcher.DefaultMaxBytes).min(Fetcher.HardMaxBytes))
     }
   )

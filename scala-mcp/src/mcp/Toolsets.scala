@@ -43,20 +43,20 @@ enum Toolset(val name: String):
   def tools: List[ToolDef] = this match
     case Gmail => GmailTools.tools
     // The full telegram surface includes the send slice.
-    case Telegram => TelegramTools.send ++ TelegramTools.full
+    case Telegram     => TelegramTools.send ++ TelegramTools.full
     case TelegramSend => TelegramTools.send
-    case Monobank => MonobankTools.tools
-    case Pdf => PdfTools.tools
-    case Fs => FsTools.tools
-    case Fetch => FetchTools.tools
-    case Signals => SignalTools.signals
-    case NewsRead => NewsTools.tools
-    case Knowledge => KnowledgeTools.tools
-    case Dreaming => SignalTools.dreaming
-    case Userbot => UserbotTools.tools
-    case Scheduler => SchedulerTools.tools
-    case Skills => SkillsTools.tools
-    case Memory => MemoryTools.tools
+    case Monobank     => MonobankTools.tools
+    case Pdf          => PdfTools.tools
+    case Fs           => FsTools.tools
+    case Fetch        => FetchTools.tools
+    case Signals      => SignalTools.signals
+    case NewsRead     => NewsTools.tools
+    case Knowledge    => KnowledgeTools.tools
+    case Dreaming     => SignalTools.dreaming
+    case Userbot      => UserbotTools.tools
+    case Scheduler    => SchedulerTools.tools
+    case Skills       => SkillsTools.tools
+    case Memory       => MemoryTools.tools
 
 object Toolset:
   // The unrestricted surface, in the TS registration order. `telegram-send` is
@@ -77,7 +77,7 @@ final case class ToolsetSelection(
     // True when MCP_TOOLSETS narrowed the surface. Decides things outside the
     // tool list: a restricted instance never attaches the gateway (namespaced
     // upstream tools can't be allow-listed) and allows several sessions.
-    restricted: Boolean,
+    restricted: Boolean
 )
 
 object ToolsetSelection:
@@ -89,7 +89,7 @@ object ToolsetSelection:
     if requested.isEmpty then Right(ToolsetSelection(Toolset.Default, restricted = false))
     else
       requested.filter(Toolset.fromName(_).isEmpty) match
-        case Nil => Right(ToolsetSelection(requested.flatMap(Toolset.fromName).distinct, restricted = true))
+        case Nil     => Right(ToolsetSelection(requested.flatMap(Toolset.fromName).distinct, restricted = true))
         case unknown =>
           val known = Toolset.values.map(_.name).sorted.mkString(", ")
           Left(s"MCP_TOOLSETS: unknown toolset(s) ${unknown.mkString(", ")}. Known: $known")

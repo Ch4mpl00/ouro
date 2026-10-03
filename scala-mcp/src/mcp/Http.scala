@@ -26,8 +26,12 @@ final class HttpClient(client: Client):
   def get(url: String, headers: Headers = Headers.empty, timeout: Duration = 30.seconds): Task[HttpReply] =
     HttpClient.url(url).flatMap(u => send(Request.get(u).addHeaders(headers), timeout))
 
-  def postJson(url: String, body: Json, headers: Headers = Headers.empty, timeout: Duration = 30.seconds)
-      : Task[HttpReply] =
+  def postJson(
+      url: String,
+      body: Json,
+      headers: Headers = Headers.empty,
+      timeout: Duration = 30.seconds
+  ): Task[HttpReply] =
     HttpClient.url(url).flatMap { u =>
       val request = Request
         .post(u, Body.fromString(body.toJson))
@@ -43,7 +47,8 @@ final class HttpClient(client: Client):
     }
 
 object HttpClient:
-  def url(raw: String): Task[URL] = ZIO.fromEither(URL.decode(raw)).mapError(e => RuntimeException(s"invalid URL $raw: $e"))
+  def url(raw: String): Task[URL] =
+    ZIO.fromEither(URL.decode(raw)).mapError(e => RuntimeException(s"invalid URL $raw: $e"))
 
   // Redirects followed like reqwest/fetch do by default (up to 10 hops).
   def following(client: Client): HttpClient =

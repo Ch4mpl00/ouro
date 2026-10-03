@@ -17,9 +17,10 @@ package mcp
 // migration and seed, as Flyway files. The Rust server recorded its version in
 // `state_migrations`; a database that has it is baselined at V2.
 
-import java.sql.{DriverManager, SQLException}
-
 import zio.*
+
+import java.sql.DriverManager
+import java.sql.SQLException
 
 // ── 1. handle ────────────────────────────────────────────────────────────────
 
@@ -53,7 +54,7 @@ object Db:
   def stateUrl(newsUrl: PgUrl): Task[PgUrl] =
     Env.get("STATE_DATABASE_URL") match
       case Some(raw) => ZIO.fromEither(PgUrl.parse(raw)).mapError(err => RuntimeException(s"STATE_DATABASE_URL: $err"))
-      case None => ZIO.succeed(newsUrl.withDatabase(DefaultName))
+      case None      => ZIO.succeed(newsUrl.withDatabase(DefaultName))
 
   // CREATE DATABASE through the news database's connection. Both MCP
   // instances may try at once; the loser's duplicate_database is success.

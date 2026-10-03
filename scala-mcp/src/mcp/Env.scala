@@ -6,11 +6,11 @@ package mcp
 // only the named files in the current directory are read — never a parent's,
 // which on a dev machine can hold some other checkout's real credentials.
 
-import java.nio.file.{Files, Path}
-
-import scala.jdk.CollectionConverters.*
-
 import zio.*
+
+import java.nio.file.Files
+import java.nio.file.Path
+import scala.jdk.CollectionConverters.*
 
 object Env:
   @volatile private var fromFiles: Map[String, String] = Map.empty
@@ -33,11 +33,12 @@ object Env:
       val body = line.stripPrefix("export ").trim
       body.indexOf('=') match
         case -1 => None
-        case i =>
+        case i  =>
           val key = body.take(i).trim
           val raw = body.drop(i + 1).trim
           val value =
-            if raw.length >= 2 && (raw.startsWith("\"") && raw.endsWith("\"") || raw.startsWith("'") && raw.endsWith("'"))
+            if raw.length >= 2 && (raw.startsWith("\"") && raw.endsWith("\"") || raw
+                .startsWith("'") && raw.endsWith("'"))
             then raw.drop(1).dropRight(1)
             else raw.takeWhile(_ != '#').trim
           Option.when(key.nonEmpty)(key -> value)

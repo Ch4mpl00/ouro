@@ -13,12 +13,16 @@ package mcp
 // The handler in Server.scala asks this module only for the tools it doesn't
 // own, so own tools keep their names and always win a collision.
 
-import java.nio.file.{Files, NoSuchFileException, Path}
-
 import zio.*
-import zio.http.{Header, Headers, MediaType}
+import zio.http.Header
+import zio.http.Headers
+import zio.http.MediaType
 import zio.json.*
 import zio.json.ast.Json
+
+import java.nio.file.Files
+import java.nio.file.NoSuchFileException
+import java.nio.file.Path
 
 // ── 1. config ────────────────────────────────────────────────────────────────
 
@@ -33,7 +37,7 @@ object GatewayConfig:
       url: String,
       prefix: Option[String] = None,
       headers: Map[String, String] = Map.empty,
-      enabled: Boolean = true,
+      enabled: Boolean = true
   ) derives JsonDecoder
 
   final private case class ConfigFile(upstreams: List[UpstreamConfig] = Nil) derives JsonDecoder
@@ -56,7 +60,7 @@ object GatewayConfig:
       .attemptBlocking(Some(Files.readString(path)))
       .catchSome { case _: NoSuchFileException => ZIO.none }
       .flatMap {
-        case None => ZIO.succeed(Nil)
+        case None      => ZIO.succeed(Nil)
         case Some(raw) =>
           for
             file <- ZIO.fromEither(raw.fromJson[ConfigFile]).mapError(e => RuntimeException(s"gateway config: $e"))
@@ -66,7 +70,9 @@ object GatewayConfig:
 
   private def resolve(u: UpstreamConfig, env: String => Option[String]): Task[Option[Upstream]] =
     for
-      _ <- ZIO.unless(identOk(u.name))(ZIO.fail(RuntimeException(s"gateway: name must be [a-zA-Z0-9_-], got \"${u.name}\"")))
+      _ <- ZIO.unless(identOk(u.name))(
+        ZIO.fail(RuntimeException(s"gateway: name must be [a-zA-Z0-9_-], got \"${u.name}\""))
+      )
       _ <- ZIO.unless(u.prefix.forall(identOk))(ZIO.fail(RuntimeException("gateway: prefix must be [a-zA-Z0-9_-]")))
       _ <- ZIO.unless(u.transport == "http")(
         ZIO.fail(RuntimeException(s"gateway: upstream ${u.name} has unsupported transport \"${u.transport}\""))
@@ -78,7 +84,9 @@ object GatewayConfig:
           val headers = u.headers.toList.map((k, v) => k -> interpolate(v, env))
           val missing = (missingUrl ++ headers.flatMap(_._2._2)).distinct.sorted
           if missing.nonEmpty then
-            ZIO.logWarning(s"skipping gateway upstream ${u.name}: unresolved env var(s) ${missing.mkString(", ")}").as(None)
+            ZIO
+              .logWarning(s"skipping gateway upstream ${u.name}: unresolved env var(s) ${missing.mkString(", ")}")
+              .as(None)
           else ZIO.some(Upstream(u.name, url, u.prefix.getOrElse(u.name), headers.map((k, v) => k -> v._1)))
     yield resolved
 
@@ -99,22 +107,26 @@ final class RemoteClient(val upstream: Upstream, http: HttpClient, session: Ref.
   // One JSON-RPC request; the reply may come as JSON or as an SSE stream
   // carrying it.
   private def request(s: Session, method: String, params: Json): Task[Json] =
-    val body = Json.Obj("jsonrpc" -> Json.Str("2.0"), "id" -> Json.Num(1), "method" -> Json.Str(method), "params" -> params)
+    val body =
+      Json.Obj("jsonrpc" -> Json.Str("2.0"), "id" -> Json.Num(1), "method" -> Json.Str(method), "params" -> params)
     http.postJson(upstream.url, body, headers(s), CallTimeout).flatMap { reply =>
       if !reply.ok then ZIO.fail(RuntimeException(s"HTTP ${reply.status}: ${reply.body.take(300)}"))
-      else
-        ZIO.fromEither(rpcResult(reply)).mapError(RuntimeException(_))
+      else ZIO.fromEither(rpcResult(reply)).mapError(RuntimeException(_))
     }
 
   def listTools: Task[List[Json.Obj]] =
     def page(cursor: Option[String], acc: List[Json.Obj]): Task[List[Json.Obj]] =
-      session.get.flatMap(s => request(s, "tools/list", cursor.fold(Json.Obj())(c => Json.Obj("cursor" -> Json.Str(c))))).flatMap {
-        result =>
-          val tools = result.get("tools").collect { case Json.Arr(ts) => ts.toList.collect { case o: Json.Obj => o } }.getOrElse(Nil)
+      session.get
+        .flatMap(s => request(s, "tools/list", cursor.fold(Json.Obj())(c => Json.Obj("cursor" -> Json.Str(c)))))
+        .flatMap { result =>
+          val tools = result
+            .get("tools")
+            .collect { case Json.Arr(ts) => ts.toList.collect { case o: Json.Obj => o } }
+            .getOrElse(Nil)
           result.get("nextCursor").flatMap(_.asString) match
             case Some(next) if acc.size < 1000 => page(Some(next), acc ++ tools)
-            case _ => ZIO.succeed(acc ++ tools)
-      }
+            case _                             => ZIO.succeed(acc ++ tools)
+        }
     page(None, Nil)
 
   def call(name: String, args: Json): Task[Json] =
@@ -140,7 +152,9 @@ object RemoteClient:
 
   def connect(upstream: Upstream, http: HttpClient): Task[RemoteClient] =
     open(upstream, http)
-      .timeoutFail(RuntimeException(s"upstream '${upstream.name}' connect timed out after ${ConnectTimeout.toSeconds}s"))(
+      .timeoutFail(
+        RuntimeException(s"upstream '${upstream.name}' connect timed out after ${ConnectTimeout.toSeconds}s")
+      )(
         ConnectTimeout
       )
       .flatMap(Ref.Synchronized.make(_))
@@ -157,12 +171,17 @@ object RemoteClient:
       "params" -> Json.Obj(
         "protocolVersion" -> Json.Str("2025-06-18"),
         "capabilities" -> Json.Obj(),
-        "clientInfo" -> Json.Obj("name" -> Json.Str(McpHandler.ServerName), "version" -> Json.Str(McpHandler.ServerVersion)),
-      ),
+        "clientInfo" -> Json.Obj(
+          "name" -> Json.Str(McpHandler.ServerName),
+          "version" -> Json.Str(McpHandler.ServerVersion)
+        )
+      )
     )
     for
       reply <- http.postJson(upstream.url, init, custom ++ accept, CallTimeout)
-      _ <- ZIO.unless(reply.ok)(ZIO.fail(RuntimeException(s"initialize: HTTP ${reply.status}: ${reply.body.take(300)}")))
+      _ <- ZIO.unless(reply.ok)(
+        ZIO.fail(RuntimeException(s"initialize: HTTP ${reply.status}: ${reply.body.take(300)}"))
+      )
       result <- ZIO.fromEither(rpcResult(reply)).mapError(RuntimeException(_))
       id = reply.headers.get("mcp-session-id")
       version = result.get("protocolVersion").flatMap(_.asString)
@@ -178,17 +197,30 @@ object RemoteClient:
   def rpcResult(reply: HttpReply): Either[String, Json] =
     val messages: List[Json] =
       if reply.headers.get("content-type").exists(_.contains("text/event-stream")) then
-        reply.body.split("\r?\n").toList.filter(_.startsWith("data:")).map(_.drop(5).trim).flatMap(_.fromJson[Json].toOption)
+        reply.body
+          .split("\r?\n")
+          .toList
+          .filter(_.startsWith("data:"))
+          .map(_.drop(5).trim)
+          .flatMap(_.fromJson[Json].toOption)
       else reply.json.toOption.toList
     messages.find(m => m.get("result").isDefined || m.get("error").isDefined) match
-      case None => Left(s"no JSON-RPC response in reply: ${reply.body.take(300)}")
+      case None    => Left(s"no JSON-RPC response in reply: ${reply.body.take(300)}")
       case Some(m) =>
         m.get("result") match
           case Some(result) => Right(result)
           case None => Left(m.get("error").flatMap(_.get("message")).flatMap(_.asString).getOrElse("upstream error"))
 
   def connectionLost(err: String): Boolean =
-    List("No valid session id", "Session not found", "HTTP 404", "Not connected", "terminated", "onnection refused", "closed")
+    List(
+      "No valid session id",
+      "Session not found",
+      "HTTP 404",
+      "Not connected",
+      "terminated",
+      "onnection refused",
+      "closed"
+    )
       .exists(err.contains)
 
 // ── 3. gateway ───────────────────────────────────────────────────────────────
@@ -199,12 +231,16 @@ final class Gateway(clients: Vector[RemoteClient], val tools: List[Json], routes
   // An upstream failure is a tool error for that call; the gateway stays up.
   def call(name: String, args: Json): IO[RpcError, Json] =
     routes.get(name) match
-      case None => ZIO.succeed(Results.failure(s"[gateway] unknown tool: $name"))
+      case None                    => ZIO.succeed(Results.failure(s"[gateway] unknown tool: $name"))
       case Some((index, original)) =>
         val client = clients(index)
         client
           .call(original, args)
-          .catchAll(err => ZIO.succeed(Results.failure(s"[gateway] upstream '${client.upstream.name}' failed: ${Results.describe(err)}")))
+          .catchAll(err =>
+            ZIO.succeed(
+              Results.failure(s"[gateway] upstream '${client.upstream.name}' failed: ${Results.describe(err)}")
+            )
+          )
 
 object Gateway:
   val Separator = "__"
@@ -222,7 +258,9 @@ object Gateway:
         RemoteClient
           .connect(u, http)
           .flatMap(c => c.listTools.map(ts => Some(c -> ts)))
-          .catchAll(err => ZIO.logWarning(s"gateway upstream ${u.name} unavailable, skipping: ${Results.describe(err)}").as(None))
+          .catchAll(err =>
+            ZIO.logWarning(s"gateway upstream ${u.name} unavailable, skipping: ${Results.describe(err)}").as(None)
+          )
       }
       reachable = connected.flatten
       (tools, routes) <- ZIO.foldLeft(reachable.zipWithIndex)((List.empty[Json], Map.empty[String, (Int, String)])) {
@@ -230,7 +268,8 @@ object Gateway:
           ZIO.foldLeft(listed)((tools, routes)) { case ((ts, rs), tool) =>
             val original = tool.get("name").flatMap(_.asString).getOrElse("")
             val exposed = s"${client.upstream.prefix}$Separator$original"
-            if !exposedNameOk(exposed) then ZIO.logWarning(s"dropping gateway tool $original: invalid exposed name $exposed").as((ts, rs))
+            if !exposedNameOk(exposed) then
+              ZIO.logWarning(s"dropping gateway tool $original: invalid exposed name $exposed").as((ts, rs))
             else if rs.contains(exposed) || ownTools.contains(exposed) then
               ZIO.logWarning(s"dropping gateway tool $exposed: name already taken").as((ts, rs))
             else
@@ -238,5 +277,7 @@ object Gateway:
               ZIO.succeed((ts :+ renamed, rs + (exposed -> (index, original))))
           }
       }
-      _ <- ZIO.logInfo(s"gateway aggregated ${tools.size} upstream tools from ${reachable.map(_._1.upstream.name).mkString(", ")}")
+      _ <- ZIO.logInfo(
+        s"gateway aggregated ${tools.size} upstream tools from ${reachable.map(_._1.upstream.name).mkString(", ")}"
+      )
     yield Gateway(reachable.map(_._1).toVector, tools, routes)

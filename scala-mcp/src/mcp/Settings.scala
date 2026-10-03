@@ -9,11 +9,12 @@ package mcp
 //   1. store    — raw get/set
 //   2. timezone — validated IANA zone + the user's local wall clock
 
-import java.time.format.DateTimeFormatter
-import java.time.{Instant, ZoneId}
-
 import io.getquill.*
 import zio.*
+
+import java.time.Instant
+import java.time.ZoneId
+import java.time.format.DateTimeFormatter
 
 final case class SettingRow(key: String, value: String, updatedAt: Instant)
 
@@ -44,12 +45,12 @@ final class Settings(db: Db):
     get(Settings.TimezoneKey).foldZIO(
       err => ZIO.logWarning(s"reading timezone failed, using UTC: $err").as(Settings.Utc),
       {
-        case None => ZIO.succeed(Settings.Utc)
+        case None       => ZIO.succeed(Settings.Utc)
         case Some(name) =>
           ZIO
             .fromEither(Settings.parseTimezone(name))
             .orElse(ZIO.logWarning(s"stored timezone $name is not a valid IANA name, using UTC").as(Settings.Utc))
-      },
+      }
     )
 
   def setTimezone(tz: ZoneId): Task[Unit] = set(Settings.TimezoneKey, tz.getId)
@@ -68,14 +69,18 @@ object Settings:
 
   def localTime(tz: ZoneId, at: Instant): LocalTime =
     val local = at.atZone(tz)
-    LocalTime(local.format(DateTimeFormatter.ofPattern("yyyy-MM-dd")), local.format(DateTimeFormatter.ofPattern("HH:mm")), tz)
+    LocalTime(
+      local.format(DateTimeFormatter.ofPattern("yyyy-MM-dd")),
+      local.format(DateTimeFormatter.ofPattern("HH:mm")),
+      tz
+    )
 
 final case class LocalTime(
     // YYYY-MM-DD in the user's zone.
     date: String,
     // HH:MM, 24h.
     hm: String,
-    tz: ZoneId,
+    tz: ZoneId
 ):
   // The `local_now` shape the timezone tools return: "2026-10-02 09:05".
   def display: String = s"$date $hm"

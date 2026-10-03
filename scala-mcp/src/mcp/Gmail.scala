@@ -14,16 +14,19 @@ package mcp
 // exactly as googleapis stored them (expires_at as an ISO string), so every
 // server generation shares one authorised account.
 
-import java.nio.file.{Files, Path}
-import java.time.Instant
-
 import io.getquill.*
 import sttp.tapir.Schema
-import sttp.tapir.Schema.annotations.{description, validate}
+import sttp.tapir.Schema.annotations.description
+import sttp.tapir.Schema.annotations.validate
 import sttp.tapir.Validator
 import zio.*
-import zio.http.{Header, Headers}
+import zio.http.Header
+import zio.http.Headers
 import zio.json.*
+
+import java.nio.file.Files
+import java.nio.file.Path
+import java.time.Instant
 
 // ── 1. oauth ─────────────────────────────────────────────────────────────────
 
@@ -35,7 +38,7 @@ final case class IntegrationAccount(
     expiresAt: Option[String],
     metadata: Option[String],
     createdAt: Instant,
-    updatedAt: Instant,
+    updatedAt: Instant
 )
 
 final case class TokenResponse(access_token: Option[String], refresh_token: Option[String], expires_in: Option[Long])
@@ -69,7 +72,7 @@ final class GmailModule(db: Db, http: HttpClient):
       "scope" -> Scopes.mkString(" "),
       "response_type" -> "code",
       "client_id" -> oauth.clientId,
-      "redirect_uri" -> oauth.redirectUri,
+      "redirect_uri" -> oauth.redirectUri
     )
   }
 
@@ -83,7 +86,7 @@ final class GmailModule(db: Db, http: HttpClient):
         "code" -> code,
         "client_id" -> oauth.clientId,
         "client_secret" -> oauth.clientSecret,
-        "redirect_uri" -> oauth.redirectUri,
+        "redirect_uri" -> oauth.redirectUri
       )
       access <- ZIO.fromOption(tokens.access_token).orElseFail(ToolFailure("token response had no access_token"))
       reply <- http.get("https://www.googleapis.com/oauth2/v2/userinfo", Headers(Header.Authorization.Bearer(access)))
@@ -110,7 +113,7 @@ final class GmailModule(db: Db, http: HttpClient):
       now <- Clock.instant
       expiresAt = tokens.expires_in match
         case Some(secs) => Some(Time.iso(now.plusSeconds(secs)))
-        case None => existing.flatMap(_.expiresAt)
+        case None       => existing.flatMap(_.expiresAt)
       row = IntegrationAccount(
         Provider,
         account,
@@ -119,7 +122,7 @@ final class GmailModule(db: Db, http: HttpClient):
         expiresAt,
         None,
         now,
-        now,
+        now
       )
       _ <- run(
         accounts
@@ -128,7 +131,7 @@ final class GmailModule(db: Db, http: HttpClient):
             (t, e) => t.accessToken -> e.accessToken,
             (t, e) => t.refreshToken -> e.refreshToken,
             (t, e) => t.expiresAt -> e.expiresAt,
-            (t, e) => t.updatedAt -> e.updatedAt,
+            (t, e) => t.updatedAt -> e.updatedAt
           )
       )
     yield ()
@@ -140,7 +143,7 @@ final class GmailModule(db: Db, http: HttpClient):
   def resolveAccountKey: Task[Option[String]] =
     Env.get("GMAIL_ACCOUNT_KEY") match
       case Some(key) => ZIO.some(key)
-      case None =>
+      case None      =>
         run(accounts.filter(_.provider == "gmail").sortBy(_.createdAt)(using Ord.desc).map(_.accountKey).take(1))
           .map(_.headOption)
 
@@ -159,17 +162,19 @@ final class GmailModule(db: Db, http: HttpClient):
       fresh = stored.expiresAt.flatMap(Time.parseJsDate).exists(_.minusMillis(EagerRefreshMs).isAfter(now))
       token <- stored.accessToken.filter(_ => fresh && !forceRefresh) match
         case Some(access) => ZIO.succeed(access)
-        case None =>
+        case None         =>
           for
             oauth <- OAuthClient.fromEnv
             tokens <- tokenRequest(
               "grant_type" -> "refresh_token",
               "refresh_token" -> refresh,
               "client_id" -> oauth.clientId,
-              "client_secret" -> oauth.clientSecret,
+              "client_secret" -> oauth.clientSecret
             )
             _ <- persistTokens(account, tokens)
-            access <- ZIO.fromOption(tokens.access_token).orElseFail(ToolFailure("token refresh returned no access_token"))
+            access <- ZIO
+              .fromOption(tokens.access_token)
+              .orElseFail(ToolFailure("token refresh returned no access_token"))
           yield access
     yield token
 
@@ -182,7 +187,7 @@ final class GmailModule(db: Db, http: HttpClient):
         reply <- http.get(
           s"$Api$path${HttpClient.query(query*)}",
           Headers(Header.Authorization.Bearer(token)),
-          timeout = 60.seconds,
+          timeout = 60.seconds
         )
         out <-
           // A revoked/rotated access token: refresh once and retry.
@@ -193,7 +198,8 @@ final class GmailModule(db: Db, http: HttpClient):
     attempt(forceRefresh = false)
 
   final private case class IdOnly(id: Option[String]) derives JsonDecoder
-  final private case class ListResponse(messages: Option[List[IdOnly]], nextPageToken: Option[String]) derives JsonDecoder
+  final private case class ListResponse(messages: Option[List[IdOnly]], nextPageToken: Option[String])
+      derives JsonDecoder
 
   def listMessages(account: String, query: String, maxResults: Int, pageToken: Option[String]): Task[Page] =
     for
@@ -214,11 +220,12 @@ final class GmailModule(db: Db, http: HttpClient):
       "metadataHeaders" -> "From",
       "metadataHeaders" -> "To",
       "metadataHeaders" -> "Subject",
-      "metadataHeaders" -> "Date",
+      "metadataHeaders" -> "Date"
     ).flatMap(raw => Tools.orFail(raw.summary))
 
   // The full MIME tree — what attachment discovery walks.
-  def rawMessage(account: String, id: String): Task[RawMessage] = get[RawMessage](account, s"/messages/$id", "format" -> "full")
+  def rawMessage(account: String, id: String): Task[RawMessage] =
+    get[RawMessage](account, s"/messages/$id", "format" -> "full")
 
   final private case class AttachmentBody(data: Option[String]) derives JsonDecoder
 
@@ -237,7 +244,10 @@ final class GmailModule(db: Db, http: HttpClient):
     run(kv.filter(_.key == lift(watermarkKey(sub))).map(_.value)).map(_.headOption)
 
   private def setWatermark(sub: Subscription, value: Long): Task[Unit] =
-    run(kv.insertValue(lift(TelegramKv(watermarkKey(sub), value.toString))).onConflictUpdate(_.key)((t, e) => t.value -> e.value)).unit
+    run(
+      kv.insertValue(lift(TelegramKv(watermarkKey(sub), value.toString)))
+        .onConflictUpdate(_.key)((t, e) => t.value -> e.value)
+    ).unit
 
   // First run on a fresh install sets the watermark to now and emits
   // nothing, rather than flooding the queue with years of old mail.
@@ -270,7 +280,7 @@ final class GmailModule(db: Db, http: HttpClient):
     ZIO
       .foreachParDiscard(Subscriptions) { sub =>
         val once = resolveAccountKey.flatMap {
-          case None => ZIO.logWarning(s"no Gmail account authorized — skipping ${sub.name}")
+          case None          => ZIO.logWarning(s"no Gmail account authorized — skipping ${sub.name}")
           case Some(account) => poll(sub, account, signals)
         }
         ZIO.logInfo(s"gmail poller started: ${sub.name} every ${sub.interval.toSeconds}s as ${sub.signalSource}") *>
@@ -299,7 +309,7 @@ object GmailModule:
       // signal.source → skills/<signalSource>.md
       signalSource: String,
       interval: Duration,
-      buildContent: (MessageSummary, List[AttachmentRef]) => String,
+      buildContent: (MessageSummary, List[AttachmentRef]) => String
   )
 
   // All NashDom mail, by sender or subject. Real bills come from
@@ -318,23 +328,23 @@ object GmailModule:
       s"Subject: ${m.subject.getOrElse("(без темы)")}",
       s"From: ${m.from.getOrElse("(неизвестно)")}",
       s"Date: ${m.date.orElse(m.internalDate).getOrElse("(неизвестно)")}",
-      s"messageId: ${m.id}",
+      s"messageId: ${m.id}"
     )
     val pdfs = attachments.filter(isPdf)
     val lines =
       if pdfs.isEmpty then
         List(
           "Пришло новое письмо от NashDom без вложений — перешли пользователю в Telegram subject и краткое содержание.",
-          "",
+          ""
         ) ++ meta ++ List(s"Snippet: ${m.snippet}", "", "Шаг: send_telegram_message(text).")
       else
         List(
           "Пришла новая квитанция NashDom. Скачай PDF, прочитай его и отправь пользователю в Telegram короткую сводку " +
             "(тип квитанции, период, 2–5 ключевых позиций, итого).",
-          "",
+          ""
         ) ++ meta ++ ("Attachments:" :: pdfs.map(formatAttachment)) ++ List(
           "",
-          "Шаги: download_gmail_attachment(messageId, attachmentId) → read_pdf(filePath) → send_telegram_message(text).",
+          "Шаги: download_gmail_attachment(messageId, attachmentId) → read_pdf(filePath) → send_telegram_message(text)."
         )
     lines.mkString("\n")
 
@@ -346,7 +356,7 @@ object GmailModule:
           id,
           part.filename.filter(_.nonEmpty).getOrElse("untitled"),
           part.mimeType.filter(_.nonEmpty).getOrElse("application/octet-stream"),
-          part.body.flatMap(_.size).getOrElse(0L),
+          part.body.flatMap(_.size).getOrElse(0L)
         )
       }
       own.toList ++ part.parts.getOrElse(Nil).flatMap(walk)
@@ -358,8 +368,13 @@ object GmailModule:
     val cleaned = name.replaceAll("[/\\\\\u0000\n\r]+", "_").trim
     if cleaned.isEmpty then "untitled" else cleaned
 
-  def attachmentPath(storage: Path, account: String, messageId: String, attachmentId: String, filename: Option[String])
-      : Path =
+  def attachmentPath(
+      storage: Path,
+      account: String,
+      messageId: String,
+      attachmentId: String,
+      filename: Option[String]
+  ): Path =
     val prefix = attachmentId.filter(c => c.isLetterOrDigit && c < 128).take(12)
     val name = sanitize(filename.getOrElse("attachment.pdf"))
     storage.resolve("gmail").resolve(sanitize(account)).resolve(messageId).resolve(s"${prefix}_$name")
@@ -373,7 +388,7 @@ final case class MessagePart(
     filename: Option[String] = None,
     headers: Option[List[GmailHeader]] = None,
     body: Option[PartBody] = None,
-    parts: Option[List[MessagePart]] = None,
+    parts: Option[List[MessagePart]] = None
 ) derives JsonDecoder
 
 final case class RawMessage(
@@ -382,7 +397,7 @@ final case class RawMessage(
     snippet: Option[String],
     internalDate: Option[String],
     labelIds: Option[List[String]],
-    payload: Option[MessagePart],
+    payload: Option[MessagePart]
 ) derives JsonDecoder:
   def header(name: String): Option[String] =
     payload.flatMap(_.headers).getOrElse(Nil).find(_.name.exists(_.equalsIgnoreCase(name))).flatMap(_.value)
@@ -399,7 +414,7 @@ final case class RawMessage(
           header("Subject"),
           header("Date"),
           internalDate,
-          labelIds.getOrElse(Nil),
+          labelIds.getOrElse(Nil)
         )
       )
     case _ => Left("Gmail returned a message without id/threadId")
@@ -413,7 +428,7 @@ final case class MessageSummary(
     subject: Option[String],
     date: Option[String],
     internalDate: Option[String],
-    labelIds: List[String],
+    labelIds: List[String]
 ) derives JsonEncoder
 
 final case class Page(messages: List[MessageSummary], nextPageToken: Option[String])
@@ -432,14 +447,16 @@ object GmailTools:
 
   final case class ListParams(
       @validate(Validator.inRange(1, 100)) limit: Option[Int],
-      @description("Continuation token from a previous call's nextPageToken.") pageToken: Option[String],
-  ) derives JsonDecoder, Schema
+      @description("Continuation token from a previous call's nextPageToken.") pageToken: Option[String]
+  ) derives JsonDecoder,
+        Schema
 
   final case class DownloadParams(
       messageId: String,
       attachmentId: String,
-      @description("Suggested filename for the saved file. Defaults to 'attachment.pdf'.") filename: Option[String],
-  ) derives JsonDecoder, Schema
+      @description("Suggested filename for the saved file. Defaults to 'attachment.pdf'.") filename: Option[String]
+  ) derives JsonDecoder,
+        Schema
 
   final case class Mail(
       messageId: String,
@@ -447,7 +464,7 @@ object GmailTools:
       from: Option[String],
       date: Option[String],
       snippet: String,
-      attachments: List[AttachmentRef],
+      attachments: List[AttachmentRef]
   ) derives JsonEncoder
 
   final case class Mails(
@@ -455,7 +472,7 @@ object GmailTools:
       query: String,
       paymentTrackingSince: String,
       messages: List[Mail],
-      nextPageToken: Option[String],
+      nextPageToken: Option[String]
   ) derives JsonEncoder
 
   final case class Saved(filePath: String, sizeBytes: Int) derives JsonEncoder
@@ -470,7 +487,7 @@ object GmailTools:
         "period is in the subject (Ukrainian) and `date` field; deduce from there which bill is which. No side " +
         "effects — call download_gmail_attachment to fetch a specific PDF. IMPORTANT: payment tracking started " +
         "2026-05; bills with an earlier billing period are considered already settled — do NOT suggest the user pay " +
-        "them. Pagination: pass `pageToken` from a previous response's `nextPageToken` to get the next page.",
+        "them. Pagination: pass `pageToken` from a previous response's `nextPageToken` to get the next page."
     ) { (deps, p: ListParams) =>
       val gmail = deps.gmail
       for
@@ -488,7 +505,7 @@ object GmailTools:
       "download_gmail_attachment",
       "Download a Gmail attachment",
       "Save a Gmail attachment to local storage and return the absolute filePath. Use after list_nashdom_mails to " +
-        "fetch a specific PDF, then read it with the Read tool to extract bill fields.",
+        "fetch a specific PDF, then read it with the Read tool to extract bill fields."
     ) { (deps, p: DownloadParams) =>
       for
         account <- deps.gmail.requireAccountKey
@@ -499,5 +516,5 @@ object GmailTools:
           Files.write(path, bytes)
         }
       yield Saved(path.toAbsolutePath.normalize.toString, bytes.length)
-    },
+    }
   )

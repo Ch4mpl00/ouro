@@ -10,7 +10,8 @@ package mcp
 // knowledge, memory) compose the text they embed and store the vectors.
 
 import zio.*
-import zio.http.{Header, Headers}
+import zio.http.Header
+import zio.http.Headers
 import zio.json.*
 import zio.json.ast.Json
 
@@ -34,7 +35,7 @@ final class OpenAiEmbedder(
     apiKey: String,
     model: String = "text-embedding-3-small",
     dimensions: Int = 1536,
-    maxChars: Int = OpenAiEmbedder.DefaultMaxChars,
+    maxChars: Int = OpenAiEmbedder.DefaultMaxChars
 ) extends Embedder:
   import OpenAiEmbedder.*
 
@@ -47,7 +48,7 @@ final class OpenAiEmbedder(
     val body = Json.Obj(
       "model" -> Json.Str(model),
       "input" -> Json.Arr(input.map(Json.Str(_))*),
-      "dimensions" -> Json.Num(dimensions),
+      "dimensions" -> Json.Num(dimensions)
     )
     val once = http
       .postJson(Url, body, Headers(Header.Authorization.Bearer(apiKey)), timeout = 60.seconds)
@@ -61,7 +62,11 @@ final class OpenAiEmbedder(
     // The openai SDK's default: two retries on 429 / 5xx / connection errors,
     // 1s then 2s apart.
     once
-      .retry(Schedule.recurWhile[Throwable](_.isInstanceOf[Retryable]) && Schedule.exponential(1.second) && Schedule.recurs(MaxRetries))
+      .retry(
+        Schedule.recurWhile[Throwable](_.isInstanceOf[Retryable]) && Schedule.exponential(1.second) && Schedule.recurs(
+          MaxRetries
+        )
+      )
       .map(_.data.sortBy(_.index).map(_.embedding))
 
   def embedBatch(texts: List[String]): Task[List[Vector[Float]]] =
@@ -88,7 +93,8 @@ object OpenAiEmbedder:
 
 // On characters (code points), not UTF-16 units: a cut never splits one.
 def truncateChars(text: String, maxChars: Int): String =
-  if text.codePointCount(0, text.length) <= maxChars then text else text.substring(0, text.offsetByCodePoints(0, maxChars))
+  if text.codePointCount(0, text.length) <= maxChars then text
+  else text.substring(0, text.offsetByCodePoints(0, maxChars))
 
 // ── 2. retrieval ─────────────────────────────────────────────────────────────
 
@@ -107,8 +113,12 @@ object Retrieval:
   // Walks items in input order (callers sort by ascending distance first) and
   // keeps one only if it is at least `threshold` away from everything kept.
   // Items without a vector are dropped, or kept in place with `keepNull`.
-  def dedupByPairwiseCosine[T](items: List[T], vector: T => Option[Seq[Float]], threshold: Double, keepNull: Boolean)
-      : List[T] =
+  def dedupByPairwiseCosine[T](
+      items: List[T],
+      vector: T => Option[Seq[Float]],
+      threshold: Double,
+      keepNull: Boolean
+  ): List[T] =
     if threshold <= 0 then items
     else
       items
@@ -116,7 +126,7 @@ object Retrieval:
           vector(item) match
             case None => (keptVectors, if keepNull then item :: kept else kept)
             case Some(v) if keptVectors.forall(cosineDistance(v, _) >= threshold) => (v :: keptVectors, item :: kept)
-            case Some(_) => (keptVectors, kept)
+            case Some(_)                                                          => (keptVectors, kept)
         }
         ._2
         .reverse

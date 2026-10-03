@@ -1,0 +1,17 @@
+# Runs the Scala port (scala-mcp/) in place of the Rust MCP server. Same
+# command names, env, ports and databases; only the image differs.
+#
+#   docker buildx build --platform linux/amd64 -f scala-mcp/Dockerfile -t mcp-scala:latest --load scala-mcp
+#   docker compose -f docker-compose.yml -f docker-compose.scala.yml up -d --no-build mcp mcp-tunnel
+#
+# The Scala server keeps its migration history in Flyway's table; on a
+# database the Rust/TS servers migrated it baselines (adopts) instead of
+# re-running DDL. Going back to Rust after Scala applied a NEW migration is
+# not supported — today the two schemas are identical.
+services:
+  mcp:
+    image: mcp-scala:latest
+    command: mcp-tools
+  mcp-tunnel:
+    image: mcp-scala:latest
+    command: mcp-tools

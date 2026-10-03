@@ -11,7 +11,8 @@ object GmailListUnread extends CliApp:
       gmail <- Cli.openDb.zip(Cli.http).map(GmailModule(_, _))
       account <- Cli.arg(args, "account") match
         case Some(a) => ZIO.succeed(a)
-        case None => gmail.resolveAccountKey.someOrFail(RuntimeException("No Gmail account in DB. Run `pnpm gmail:auth` first."))
+        case None    =>
+          gmail.resolveAccountKey.someOrFail(RuntimeException("No Gmail account in DB. Run `pnpm gmail:auth` first."))
       query = Cli.arg(args, "query").getOrElse("is:unread")
       limit <- Cli.intArg(args, "limit", 10)
       page <- gmail.listMessages(account, query, limit, None)
