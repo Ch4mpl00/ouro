@@ -1,6 +1,6 @@
 # Rewrite in Rust — the MCP server first, then the agent
 
-**Status:** in-progress (MCP done on `feat/rust-rewrite`, not yet deployed; agent next)
+**Status:** in-progress (MCP deployed on 2026-10-02 at `577ecb5`; day-long observation and agent port remain)
 **Priority:** P2
 **Area:** whole repo; `crates/mcp` done, `packages/agent` next
 **Created:** 2026-10-02
@@ -64,10 +64,12 @@ So the switch is reversible by redeploying the previous image:
 - [x] Unit tests + Postgres integration tests (`TEST_DATABASE_URL`).
 - [x] End-to-end HTTP smoke of the full surface against a copy of a real
       `tokens.db` and a test Postgres.
-- [ ] Image builds (`docker compose build`) — not run in the porting
-      session.
-- [ ] Deployed on the droplet; one day of signals processed normally
-      (Telegram replies, a NashDom bill, the 08:00/09:00 digests, dreaming).
+- [x] Release image built locally for linux/amd64 and deployed from a clean
+      archive of `577ecb5`; binary SHA-256 values matched on the droplet.
+- [x] Deployed on the droplet; MCP protocol checks passed on both endpoints,
+      agent and tunnel reconnected, first HN/Habr/channel harvests succeeded.
+- [ ] One day of signals processed normally (Telegram replies, a NashDom bill,
+      the 08:00/09:00 digests, dreaming); Gmail currently requires OAuth renewal.
 - [ ] Agent port: `packages/agent` → `crates/agent`.
 
 ## Deploy notes
@@ -87,3 +89,39 @@ So the switch is reversible by redeploying the previous image:
   `mcp_state` after the switch is not visible to the TS server.
 - `glass_pumpkin` is pinned to `2.0.0-rc0` in Cargo.lock: `grammers-crypto`
   0.10 does not compile against rc1. Don't `cargo update` it away.
+
+
+## Production switch — 2026-10-02
+
+- Droplet checkout: detached `577ecb5`; Rust replaced `mcp` and `mcp-tunnel`.
+  The existing TS agent and codex containers continue to run.
+- State imported into `mcp_state`. Verified counts before enabling pollers:
+  2 integration accounts, 769 Telegram messages, 1 Telegram cursor, 1 Gmail
+  watermark, 2 settings, 13 scheduled tasks, 635 signals; 0 pending signals.
+- Backups and measurements: `/root/backups/rust-mcp-577ecb5-caGhks6K/`.
+  Includes a fully read-verified Postgres dump, final tokens/agent SQLite
+  snapshots, previous compose and commit, import report and MCP checks.
+  Old images retained as `mcp-tools-image:ts-backup-<service>-577ecb5`.
+- SQLite snapshot procedure: stop every process sharing the state volume,
+  copy the DB and WAL to a writable staging directory, use SQLite's backup
+  API, then set the snapshot to `PRAGMA journal_mode=DELETE`. Mount that
+  portable snapshot read-only for `import-sqlite-state`; a WAL-mode file
+  without writable sidecar files can fail to open on a read-only mount.
+- The auxiliary, no-poller TS `bench-mcp` also mounted the retired SQLite
+  volume; it was stopped during cutover and remains stopped.
+- MCP checks: 42 tools including 5 Tavily gateway tools on the full endpoint;
+  18 tools and no gateway on the restricted endpoint. State/news/memory reads
+  passed, supervisor skill validation passed, tunnel initialized. No restarts.
+- Early Docker memory samples (MiB): primary MCP 296.3 → 171.2,
+  tunnel MCP 137.4 → 6.1; combined 433.7 → 177.3 (about 59% less).
+  Postgres rose from 134.3 to about 300; agent after restart about 206 versus
+  95.9 before. The final sample settled to primary 119.2, tunnel 5.7, combined
+  124.9 MiB (about 71% below the original combined sample); Postgres 204.7.
+  These are early resident-memory samples, not a controlled load comparison.
+  Host available RAM rose from 576 to about 780 MiB.
+- Gmail returns `invalid_grant`. Migrated credentials byte-match the original
+  snapshot, and the original TS Google SDK also fails to refresh that token
+  with `invalid_grant`: renew Google authorization. No credentials were printed.
+- `list_news(limit=1)` took 25–28 seconds; resolved by migration 0004; see
+  `done/news-list-index-order.md` (MCP response now 28 ms).
+  Habr extraction also emits many html5ever namespace warnings.

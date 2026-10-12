@@ -64,6 +64,28 @@ makes the bench run through any vendor with zero new code.
   (cache-hit tokens > 0 on the planner), (b) does the DeepSeek leak stay at 0.
   Promote a route to a prod default ONLY if both hold and latency is fine.
 
+## Update 2026-09-20 — a concrete trigger
+
+[[jev-system-one]] (TypeSafe's System One model, released 2026-09-15) is
+waitlisted direct but announced in **beta on OpenRouter**, so OpenRouter may
+simply be the fastest way to get our hands on it. That does not change the
+conclusion above — opt-in, prod defaults untouched — but it turns this from
+"someday" into "the next time we want to try a model we cannot otherwise
+reach".
+
+Two caveats specific to Jev:
+
+- It is **not in OpenRouter's public catalogue** yet: `GET /api/v1/models`
+  returns 446 models with zero `typesafe`/`jev` entries (checked 2026-09-20),
+  and the model pages 404 anonymously. Beta access is gated.
+- Jev may not be a `/chat/completions` model at all (typed questions in,
+  calibrated probabilities out). If so it does not ride the `ChatProvider`
+  seam this task adds, and OpenRouter buys us only a key and a bill. Check the
+  wire shape before assuming this task covers it.
+
+The prompt-cache risk that dominates this task does **not** apply to Jev —
+there is no cache economics to lose at $0.042/M with free output.
+
 ## Notes
 
 - Per-provider quirks we already model (DeepSeek `thinking` + non-standard

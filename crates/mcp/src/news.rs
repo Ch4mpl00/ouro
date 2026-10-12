@@ -5,10 +5,11 @@
 //   1. items      — the unified item and the shapes the tools return
 //   2. article    — URL → readable plain text (Readability)
 //   3. providers  — Hacker News, Habr, Telegram channels
-//   4. repository — save / upsert / list / vector search over Postgres
-//   5. ranking    — merging per-query pools: min distance, then dedup
+//   4. ranking    — merging per-query pools: min distance, then dedup
+//   5. repository — save / upsert / list / vector search over Postgres
 //   6. poller     — one cadence loop over every provider
 //   7. tools      — `news-read` toolset: search_news, list_news, fetch_article
+//   8. tests      — ranking, extraction, tool responses and Postgres
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -25,7 +26,7 @@ use tokio_util::sync::CancellationToken;
 use crate::embeddings::{DEFAULT_DEDUP_THRESHOLD, SharedEmbedder, dedup_by_pairwise_cosine};
 use crate::fetch::BROWSER_UA;
 use crate::pg::{PgPool, Query, parse_vector, vector_literal, where_clause};
-use crate::server::{McpTools, ToolResult, invalid_params, json_result, respond};
+use crate::server::{McpTools, ToolResult, invalid_params, respond};
 use crate::time::{iso, parse_js_date, require_js_date};
 use crate::userbot::Userbot;
 
@@ -98,6 +99,19 @@ pub struct SearchResult {
     // Batch path only: indices of the queries that surfaced this item.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub matched_queries: Option<Vec<usize>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PoolRow {
+    pub id: i64,
+    pub source: String,
+    pub title: Option<String>,
+    pub url: Option<String>,
+    pub body: String,
+    pub metadata: Map<String, Value>,
+    pub posted_at: Option<DateTime<Utc>>,
+    pub distance: f64,
+    pub embedding: Option<Vec<f32>>,
 }
 
 // ── 2. article ───────────────────────────────────────────────────────────────
@@ -444,9 +458,73 @@ impl NewsProvider for TelegramChannels {
     }
 }
 
-// ── 4. repository ────────────────────────────────────────────────────────────
+// ── 4. ranking ───────────────────────────────────────────────────────────────
 
 const SNIPPET_CHARS: usize = 400;
+
+fn snippet(body: &str) -> String {
+    match body.char_indices().nth(SNIPPET_CHARS) {
+        Some((at, _)) => format!("{}…", &body[..at]),
+        None => body.to_owned(),
+    }
+}
+
+struct QueryMatch {
+    best: PoolRow,
+    matched_queries: Vec<usize>,
+}
+
+impl QueryMatch {
+    fn into_result(self, annotate_matches: bool) -> SearchResult {
+        let row = self.best;
+        SearchResult {
+            id: row.id,
+            snippet: snippet(&row.body),
+            source: row.source,
+            title: row.title,
+            url: row.url,
+            posted_at: row.posted_at.map(iso),
+            distance: row.distance,
+            metadata: row.metadata,
+            matched_queries: annotate_matches.then_some(self.matched_queries),
+        }
+    }
+}
+
+// Each pool is one query's rows, ascending by distance. An item several
+// queries found is kept once at its best distance; `matched_queries` says
+// which facets surfaced it. Pure, so the ranking contract is testable
+// without a database.
+pub fn merge_ranked_pools(pools: Vec<Vec<PoolRow>>, k: usize, threshold: f64, annotate: bool) -> Vec<SearchResult> {
+    let mut first_seen_ids = Vec::new();
+    let mut matches_by_id: HashMap<i64, QueryMatch> = HashMap::new();
+
+    for (query_index, rows) in pools.into_iter().enumerate() {
+        for row in rows {
+            match matches_by_id.get_mut(&row.id) {
+                Some(found) => {
+                    found.matched_queries.push(query_index);
+                    if row.distance < found.best.distance {
+                        found.best = row;
+                    }
+                }
+                None => {
+                    first_seen_ids.push(row.id);
+                    matches_by_id.insert(row.id, QueryMatch { best: row, matched_queries: vec![query_index] });
+                }
+            }
+        }
+    }
+
+    // A stable sort preserves discovery order when distances are equal.
+    let mut ranked: Vec<QueryMatch> = first_seen_ids.into_iter().filter_map(|id| matches_by_id.remove(&id)).collect();
+    ranked.sort_by(|a, b| a.best.distance.total_cmp(&b.best.distance));
+    let distinct = dedup_by_pairwise_cosine(ranked, |found| found.best.embedding.as_deref(), threshold, false);
+    distinct.into_iter().take(k).map(|found| found.into_result(annotate)).collect()
+}
+
+// ── 5. repository ────────────────────────────────────────────────────────────
+
 const ITEM_COLUMNS: &str = "id, source, external_id, title, url, body, metadata, posted_at";
 
 #[derive(Clone)]
@@ -461,12 +539,32 @@ struct EmbedRow {
     body: String,
 }
 
-fn embed_text(row: &EmbedRow) -> String {
-    [row.title.as_deref().unwrap_or("").trim(), row.body.trim()]
-        .into_iter()
-        .filter(|s| !s.is_empty())
-        .collect::<Vec<_>>()
-        .join("\n\n")
+impl EmbedRow {
+    fn from_row(row: &Row) -> Self {
+        Self { id: row.get("id"), title: row.get("title"), body: row.get("body") }
+    }
+
+    fn text(&self) -> String {
+        let title = self.title.as_deref().unwrap_or("").trim();
+        let body = self.body.trim();
+        if title.is_empty() {
+            return body.to_owned();
+        }
+        if body.is_empty() {
+            return title.to_owned();
+        }
+        format!("{title}\n\n{body}")
+    }
+}
+
+struct StoredItem {
+    item: NewsItem,
+    embedding: Option<Vec<f32>>,
+}
+
+fn embedding_of(row: &Row) -> Option<Vec<f32>> {
+    let vector: Option<String> = row.get("embedding");
+    vector.as_deref().and_then(parse_vector)
 }
 
 fn metadata_of(row: &Row, column: &str) -> Map<String, Value> {
@@ -488,6 +586,31 @@ fn item_of(row: &Row) -> NewsItem {
     }
 }
 
+fn pool_row(row: &Row) -> PoolRow {
+    PoolRow {
+        id: row.get("id"),
+        source: row.get("source"),
+        title: row.get("title"),
+        url: row.get("url"),
+        body: row.get("body"),
+        metadata: metadata_of(row, "metadata"),
+        posted_at: row.get("posted_at"),
+        distance: row.get("distance"),
+        embedding: embedding_of(row),
+    }
+}
+
+fn bind_item(query: &mut Query, item: &NewsItem) -> String {
+    let source = query.bind(item.source.clone());
+    let external_id = query.bind(item.external_id.clone());
+    let title = query.bind(item.title.clone());
+    let url = query.bind(item.url.clone());
+    let body = query.bind(item.body.clone());
+    let metadata = query.bind(Value::Object(item.metadata.clone()));
+    let posted_at = query.bind(item.posted_at);
+    format!("({source}, {external_id}, {title}, {url}, {body}, {metadata}, {posted_at})")
+}
+
 impl NewsRepository {
     pub fn new(pool: PgPool, embedder: SharedEmbedder) -> Self {
         Self { pool, embedder }
@@ -499,7 +622,7 @@ impl NewsRepository {
         if rows.is_empty() {
             return Ok(EmbedResult::default());
         }
-        let texts: Vec<String> = rows.iter().map(embed_text).collect();
+        let texts: Vec<String> = rows.iter().map(EmbedRow::text).collect();
         let vectors = match self.embedder.embed_batch(&texts).await {
             Ok(vectors) => vectors,
             Err(err) => {
@@ -525,30 +648,18 @@ impl NewsRepository {
         if items.is_empty() {
             return Ok(SaveResult::default());
         }
-        let mut q = Query::default();
-        let values: Vec<String> = items
-            .iter()
-            .map(|i| {
-                format!(
-                    "({}, {}, {}, {}, {}, {}, {})",
-                    q.bind(i.source.clone()),
-                    q.bind(i.external_id.clone()),
-                    q.bind(i.title.clone()),
-                    q.bind(i.url.clone()),
-                    q.bind(i.body.clone()),
-                    q.bind(Value::Object(i.metadata.clone())),
-                    q.bind(i.posted_at),
-                )
-            })
-            .collect();
+        let mut query = Query::default();
+        let values: Vec<String> = items.iter().map(|item| bind_item(&mut query, item)).collect();
         let sql = format!(
             "INSERT INTO news_items (source, external_id, title, url, body, metadata, posted_at) VALUES {}
              ON CONFLICT (source, external_id) DO NOTHING RETURNING id, title, body",
             values.join(", ")
         );
-        let rows = self.pool.get().await?.query(&sql, &q.params()).await?;
-        let inserted: Vec<EmbedRow> =
-            rows.iter().map(|r| EmbedRow { id: r.get(0), title: r.get(1), body: r.get(2) }).collect();
+        let rows = {
+            let client = self.pool.get().await?;
+            client.query(&sql, &query.params()).await?
+        };
+        let inserted: Vec<EmbedRow> = rows.iter().map(EmbedRow::from_row).collect();
         if inserted.is_empty() {
             return Ok(SaveResult::default());
         }
@@ -559,88 +670,77 @@ impl NewsRepository {
     // Insert-or-replace by (source, external_id); a replaced body is
     // re-embedded, so the old vector is cleared first.
     pub async fn upsert(&self, item: &NewsItem) -> anyhow::Result<SaveResult> {
-        let row = self
-            .pool
-            .get()
-            .await?
-            .query_one(
-                "INSERT INTO news_items (source, external_id, title, url, body, metadata, posted_at)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7)
-                 ON CONFLICT (source, external_id) DO UPDATE SET
-                   title = EXCLUDED.title, body = EXCLUDED.body, metadata = EXCLUDED.metadata,
-                   embedding = NULL, embedded_at = NULL
-                 RETURNING id, title, body",
-                &[
-                    &item.source,
-                    &item.external_id,
-                    &item.title,
-                    &item.url,
-                    &item.body,
-                    &Value::Object(item.metadata.clone()),
-                    &item.posted_at,
-                ],
-            )
-            .await?;
-        let result = self.embed(&[EmbedRow { id: row.get(0), title: row.get(1), body: row.get(2) }]).await?;
+        let sql = "INSERT INTO news_items (source, external_id, title, url, body, metadata, posted_at)
+                   VALUES ($1, $2, $3, $4, $5, $6, $7)
+                   ON CONFLICT (source, external_id) DO UPDATE SET
+                     title = EXCLUDED.title, body = EXCLUDED.body, metadata = EXCLUDED.metadata,
+                     embedding = NULL, embedded_at = NULL
+                   RETURNING id, title, body";
+        let metadata = Value::Object(item.metadata.clone());
+        let row = {
+            let client = self.pool.get().await?;
+            client
+                .query_one(
+                    sql,
+                    &[&item.source, &item.external_id, &item.title, &item.url, &item.body, &metadata, &item.posted_at],
+                )
+                .await?
+        };
+        let result = self.embed(&[EmbedRow::from_row(&row)]).await?;
         Ok(SaveResult { saved: 1, embedded: result.embedded, failed: result.failed })
     }
 
     pub async fn find_by_external_id(&self, source: &str, external_id: &str) -> anyhow::Result<Option<NewsItem>> {
-        let row = self
-            .pool
-            .get()
-            .await?
-            .query_opt(
-                &format!("SELECT {ITEM_COLUMNS} FROM news_items WHERE source = $1 AND external_id = $2 LIMIT 1"),
-                &[&source, &external_id],
-            )
-            .await?;
+        let sql = format!("SELECT {ITEM_COLUMNS} FROM news_items WHERE source = $1 AND external_id = $2 LIMIT 1");
+        let client = self.pool.get().await?;
+        let row = client.query_opt(&sql, &[&source, &external_id]).await?;
         Ok(row.as_ref().map(item_of))
     }
 
-    fn filters(q: &mut Query, filter: &Filter, as_of_column: &str) -> Vec<String> {
-        let mut out = Vec::new();
+    fn filters(query: &mut Query, filter: &Filter, as_of_column: &str) -> Vec<String> {
+        let mut conditions = Vec::new();
         if let Some(source) = &filter.source {
-            out.push(format!("source = {}", q.bind(source.clone())));
+            conditions.push(format!("source = {}", query.bind(source.clone())));
         }
         if let Some(since) = filter.since {
-            out.push(format!("posted_at > {}", q.bind(since)));
+            conditions.push(format!("posted_at > {}", query.bind(since)));
         }
         if let Some(until) = filter.until {
-            out.push(format!("posted_at <= {}", q.bind(until)));
+            conditions.push(format!("posted_at <= {}", query.bind(until)));
         }
         if let Some(as_of) = filter.as_of {
-            out.push(format!("{as_of_column} <= {}", q.bind(as_of)));
+            conditions.push(format!("{as_of_column} <= {}", query.bind(as_of)));
         }
         if let Some(channel) = &filter.channel {
-            let p = q.bind(channel.clone());
-            out.push(format!("(metadata ->> 'chat_username' = {p} OR metadata ->> 'chat_id' = {p})"));
+            let channel_param = query.bind(channel.clone());
+            conditions.push(format!(
+                "(metadata ->> 'chat_username' = {channel_param} OR metadata ->> 'chat_id' = {channel_param})"
+            ));
         }
-        out
+        conditions
     }
 
     // Chronological: ascending when `since` is set, descending otherwise.
     // as_of bounds fetched_at here — list needs no embedding, so "was it in
     // the store" is the visibility question.
     pub async fn list(&self, filter: &Filter, limit: usize, dedup_threshold: f64) -> anyhow::Result<Vec<NewsItem>> {
-        let dedup = dedup_threshold > 0.0;
         // A 2× pool leaves room for near-duplicates to drop out.
-        let fetch_limit = if dedup { (limit * 2).min(2000) } else { limit };
-        let mut q = Query::default();
-        let filters = Self::filters(&mut q, filter, "fetched_at");
+        let fetch_limit = if dedup_threshold > 0.0 { (limit * 2).min(2000) } else { limit };
+        let mut query = Query::default();
+        let conditions = Self::filters(&mut query, filter, "fetched_at");
+        let where_sql = where_clause(&conditions);
         let order = if filter.since.is_some() { "ASC" } else { "DESC" };
+        let limit_param = query.bind(fetch_limit as i64);
         let sql = format!(
-            "SELECT {ITEM_COLUMNS}, embedding::text AS embedding FROM news_items {} ORDER BY posted_at {order} LIMIT {}",
-            where_clause(&filters),
-            q.bind(fetch_limit as i64)
+            "SELECT {ITEM_COLUMNS}, embedding::text AS embedding FROM news_items
+             {where_sql} ORDER BY posted_at {order} LIMIT {limit_param}"
         );
-        let rows = self.pool.get().await?.query(&sql, &q.params()).await?;
-        let items: Vec<(NewsItem, Option<Vec<f32>>)> = rows
-            .iter()
-            .map(|r| (item_of(r), r.get::<_, Option<String>>("embedding").as_deref().and_then(parse_vector)))
-            .collect();
-        let kept = dedup_by_pairwise_cosine(items, |(_, v)| v.as_deref(), dedup_threshold, true);
-        Ok(kept.into_iter().take(limit).map(|(item, _)| item).collect())
+        let client = self.pool.get().await?;
+        let rows = client.query(&sql, &query.params()).await?;
+        let stored: Vec<StoredItem> =
+            rows.iter().map(|row| StoredItem { item: item_of(row), embedding: embedding_of(row) }).collect();
+        let distinct = dedup_by_pairwise_cosine(stored, |row| row.embedding.as_deref(), dedup_threshold, true);
+        Ok(distinct.into_iter().take(limit).map(|row| row.item).collect())
     }
 
     // One batch embed for every query, then one vector search per query
@@ -653,125 +753,63 @@ impl NewsRepository {
         filter: &Filter,
         annotate: bool,
     ) -> anyhow::Result<Vec<SearchResult>> {
-        let threshold = DEFAULT_DEDUP_THRESHOLD;
         let pool_size = (k * 2).max(30);
         let vectors = self.embedder.embed_batch(queries).await?;
-        let pools = futures::future::try_join_all(vectors.iter().map(|vector| async move {
-            let mut q = Query::default();
-            let v = q.bind(vector_literal(vector));
-            let mut filters = vec!["embedding IS NOT NULL".to_owned()];
-            // as_of bounds embedded_at here: a row embedded later wasn't
-            // retrievable then, whenever it was posted.
-            filters.extend(Self::filters(&mut q, filter, "embedded_at"));
-            let sql = format!(
-                "SELECT id, source, title, url, body, metadata, posted_at,
-                        (embedding <=> {v}::text::vector) AS distance, embedding::text AS embedding
-                   FROM news_items {} ORDER BY distance LIMIT {}",
-                where_clause(&filters),
-                q.bind(pool_size as i64)
-            );
-            let rows = self.pool.get().await?.query(&sql, &q.params()).await?;
-            anyhow::Ok(rows.iter().map(pool_row).collect::<Vec<_>>())
-        }))
-        .await?;
-        Ok(merge_ranked_pools(pools, k, threshold, annotate))
+        let searches = vectors.iter().map(|vector| self.search_vector(vector, pool_size, filter));
+        let pools = futures::future::try_join_all(searches).await?;
+        Ok(merge_ranked_pools(pools, k, DEFAULT_DEDUP_THRESHOLD, annotate))
+    }
+
+    async fn search_vector(&self, vector: &[f32], pool_size: usize, filter: &Filter) -> anyhow::Result<Vec<PoolRow>> {
+        let mut query = Query::default();
+        let vector_param = query.bind(vector_literal(vector));
+        let mut conditions = vec!["embedding IS NOT NULL".to_owned()];
+        // A row embedded after as_of wasn't searchable then, whenever it was posted.
+        conditions.extend(Self::filters(&mut query, filter, "embedded_at"));
+        let where_sql = where_clause(&conditions);
+        let limit_param = query.bind(pool_size as i64);
+        let sql = format!(
+            "SELECT id, source, title, url, body, metadata, posted_at,
+                    (embedding <=> {vector_param}::text::vector) AS distance, embedding::text AS embedding
+             FROM news_items {where_sql} ORDER BY distance LIMIT {limit_param}"
+        );
+        let client = self.pool.get().await?;
+        let rows = client.query(&sql, &query.params()).await?;
+        Ok(rows.iter().map(pool_row).collect())
     }
 
     pub async fn embed_missing_batch(&self, batch: i64) -> anyhow::Result<EmbedResult> {
-        let rows = self
-            .pool
-            .get()
-            .await?
-            .query("SELECT id, title, body FROM news_items WHERE embedding IS NULL LIMIT $1", &[&batch])
-            .await?;
-        let rows: Vec<EmbedRow> =
-            rows.iter().map(|r| EmbedRow { id: r.get(0), title: r.get(1), body: r.get(2) }).collect();
-        self.embed(&rows).await
+        let sql = "SELECT id, title, body FROM news_items WHERE embedding IS NULL LIMIT $1";
+        let rows = {
+            let client = self.pool.get().await?;
+            client.query(sql, &[&batch]).await?
+        };
+        let pending: Vec<EmbedRow> = rows.iter().map(EmbedRow::from_row).collect();
+        self.embed(&pending).await
     }
-}
-
-// ── 5. ranking ───────────────────────────────────────────────────────────────
-
-#[derive(Debug, Clone)]
-pub struct PoolRow {
-    pub id: i64,
-    pub source: String,
-    pub title: Option<String>,
-    pub url: Option<String>,
-    pub body: String,
-    pub metadata: Map<String, Value>,
-    pub posted_at: Option<DateTime<Utc>>,
-    pub distance: f64,
-    pub embedding: Option<Vec<f32>>,
-}
-
-fn pool_row(r: &Row) -> PoolRow {
-    PoolRow {
-        id: r.get("id"),
-        source: r.get("source"),
-        title: r.get("title"),
-        url: r.get("url"),
-        body: r.get("body"),
-        metadata: metadata_of(r, "metadata"),
-        posted_at: r.get("posted_at"),
-        distance: r.get("distance"),
-        embedding: r.get::<_, Option<String>>("embedding").as_deref().and_then(parse_vector),
-    }
-}
-
-fn snippet(body: &str) -> String {
-    match body.char_indices().nth(SNIPPET_CHARS) {
-        Some((at, _)) => format!("{}…", &body[..at]),
-        None => body.to_owned(),
-    }
-}
-
-// Each pool is one query's rows, ascending by distance. An item several
-// queries found is kept once at its best distance; `matched_queries` says
-// which facets surfaced it. Pure, so the ranking contract is testable
-// without a database.
-pub fn merge_ranked_pools(pools: Vec<Vec<PoolRow>>, k: usize, threshold: f64, annotate: bool) -> Vec<SearchResult> {
-    let mut order: Vec<i64> = Vec::new();
-    let mut by_id: HashMap<i64, (PoolRow, Vec<usize>)> = HashMap::new();
-    for (qi, rows) in pools.into_iter().enumerate() {
-        for row in rows {
-            match by_id.get_mut(&row.id) {
-                Some((best, matched)) => {
-                    matched.push(qi);
-                    if row.distance < best.distance {
-                        *best = row;
-                    }
-                }
-                None => {
-                    order.push(row.id);
-                    by_id.insert(row.id, (row, vec![qi]));
-                }
-            }
-        }
-    }
-    let mut merged: Vec<(PoolRow, Vec<usize>)> = order.into_iter().filter_map(|id| by_id.remove(&id)).collect();
-    merged.sort_by(|a, b| a.0.distance.total_cmp(&b.0.distance));
-    let kept = dedup_by_pairwise_cosine(merged, |(row, _)| row.embedding.as_deref(), threshold, false);
-    kept.into_iter()
-        .take(k)
-        .map(|(row, matched)| SearchResult {
-            id: row.id,
-            snippet: snippet(&row.body),
-            source: row.source,
-            title: row.title,
-            url: row.url,
-            posted_at: row.posted_at.map(iso),
-            distance: row.distance,
-            metadata: row.metadata,
-            matched_queries: annotate.then_some(matched),
-        })
-        .collect()
 }
 
 // ── 6. poller ────────────────────────────────────────────────────────────────
 
 const POLL_TICK: Duration = Duration::from_secs(30);
 const BOOT_DELAY: Duration = Duration::from_secs(10);
+
+async fn poll_provider(provider: &dyn NewsProvider, repository: &NewsRepository) -> anyhow::Result<()> {
+    let items = provider.fetch().await?;
+    if items.is_empty() {
+        return Ok(());
+    }
+    let result = repository.save(&items).await?;
+    tracing::info!(
+        source = provider.source(),
+        fetched = items.len(),
+        saved = result.saved,
+        embedded = result.embedded,
+        failed = result.failed,
+        "news tick"
+    );
+    Ok(())
+}
 
 // One loop; each tick fires every provider whose cadence has elapsed. One
 // provider failing never stops the others. Starts after a boot delay so
@@ -784,7 +822,7 @@ pub async fn run_poller(providers: Vec<Box<dyn NewsProvider>>, repository: NewsR
         _ = cancel.cancelled() => return,
         _ = tokio::time::sleep(BOOT_DELAY) => {}
     }
-    let mut last: HashMap<&'static str, tokio::time::Instant> = HashMap::new();
+    let mut last_polled: HashMap<&'static str, tokio::time::Instant> = HashMap::new();
     let mut interval = tokio::time::interval(POLL_TICK);
     loop {
         tokio::select! {
@@ -793,28 +831,11 @@ pub async fn run_poller(providers: Vec<Box<dyn NewsProvider>>, repository: NewsR
         }
         for provider in &providers {
             let now = tokio::time::Instant::now();
-            if last.get(provider.source()).is_some_and(|at| now.duration_since(*at) < provider.cadence()) {
+            if last_polled.get(provider.source()).is_some_and(|at| now.duration_since(*at) < provider.cadence()) {
                 continue;
             }
-            last.insert(provider.source(), now);
-            let outcome = async {
-                let items = provider.fetch().await?;
-                if items.is_empty() {
-                    return anyhow::Ok(());
-                }
-                let r = repository.save(&items).await?;
-                tracing::info!(
-                    source = provider.source(),
-                    fetched = items.len(),
-                    saved = r.saved,
-                    embedded = r.embedded,
-                    failed = r.failed,
-                    "news tick"
-                );
-                Ok(())
-            }
-            .await;
-            if let Err(err) = outcome {
+            last_polled.insert(provider.source(), now);
+            if let Err(err) = poll_provider(provider.as_ref(), &repository).await {
                 tracing::error!(source = provider.source(), error = %format!("{err:#}"), "news tick failed");
             }
         }
@@ -923,7 +944,7 @@ fn build_filter(
     as_of: Option<&str>,
     channel: Option<String>,
 ) -> anyhow::Result<Filter> {
-    let date = |field, v: Option<&str>| v.map(|v| require_js_date(field, v)).transpose();
+    let date = |field, value: Option<&str>| value.map(|value| require_js_date(field, value)).transpose();
     Ok(Filter {
         source: source.map(|s| s.name().to_owned()),
         since: date("sinceISO", since)?,
@@ -943,6 +964,107 @@ fn source_for_url(url: &str) -> &'static str {
         Some(host) if host.ends_with("ycombinator.com") => "hackernews",
         _ => "external",
     }
+}
+
+async fn search_news_response(news: &NewsRepository, params: SearchParams) -> anyhow::Result<Value> {
+    let (queries, annotate_matches) = match (params.query, params.queries) {
+        (Some(query), None) => (vec![query], false),
+        (None, Some(queries)) => (queries, true),
+        _ => return Ok(json!({ "error": "Pass exactly one of `query` or `queries`." })),
+    };
+    let filter = build_filter(
+        params.source,
+        params.since_iso.as_deref(),
+        params.until_iso.as_deref(),
+        params.as_of_iso.as_deref(),
+        params.channel,
+    )?;
+    let results = news.search(&queries, params.k.unwrap_or(10), &filter, annotate_matches).await?;
+    Ok(match params.chunks {
+        Some(count) => json!({ "count": results.len(), "chunks": split_chunks(&results, count) }),
+        None => json!({ "count": results.len(), "results": results }),
+    })
+}
+
+async fn list_news_response(news: &NewsRepository, params: ListParams) -> anyhow::Result<Value> {
+    let filter = build_filter(
+        params.source,
+        params.since_iso.as_deref(),
+        params.until_iso.as_deref(),
+        params.as_of_iso.as_deref(),
+        params.channel,
+    )?;
+    let items = news.list(&filter, params.limit.unwrap_or(500), DEFAULT_DEDUP_THRESHOLD).await?;
+    let items: Vec<Value> = items.iter().map(NewsItem::to_json).collect();
+    Ok(match params.chunks {
+        Some(count) => json!({ "count": items.len(), "chunks": split_chunks(&items, count) }),
+        None => json!({ "count": items.len(), "items": items }),
+    })
+}
+
+fn cached_article_json(item: &NewsItem, url: &str) -> Value {
+    let mut response = json!({
+        "url": url,
+        "title": item.title.as_deref().unwrap_or_default(),
+        "text": item.body,
+        "source": item.source,
+        "sizeChars": item.body.encode_utf16().count(),
+        "cached": true,
+    });
+    if let Some(at) = item.posted_at {
+        response["publishedAt"] = iso(at).into();
+    }
+    response
+}
+
+fn fetched_article_json(article: &Article, source: &str) -> Value {
+    let mut response = json!({ "url": article.url, "title": article.title, "text": article.text });
+    if let Some(site) = &article.site {
+        response["site"] = site.clone().into();
+    }
+    if let Some(at) = article.published_at {
+        response["publishedAt"] = iso(at).into();
+    }
+    if let Some(author) = &article.author {
+        response["author"] = author.clone().into();
+    }
+    response["source"] = source.into();
+    response["sizeChars"] = article.text.encode_utf16().count().into();
+    response["cached"] = false.into();
+    response
+}
+
+async fn fetch_article_response(news: &NewsRepository, fetcher: &ArticleFetcher, url: &str) -> anyhow::Result<Value> {
+    for source in ["hackernews", "habr", "external"] {
+        if let Some(cached) = news.find_by_external_id(source, url).await?
+            && !cached.body.trim().is_empty()
+        {
+            return Ok(cached_article_json(&cached, url));
+        }
+    }
+
+    let article = fetcher.fetch(url).await?;
+    let source = source_for_url(url);
+    let mut metadata = Map::new();
+    if let Some(author) = &article.author {
+        metadata.insert("author".into(), author.clone().into());
+    }
+    if let Some(site) = &article.site {
+        metadata.insert("site".into(), site.clone().into());
+    }
+    let item = NewsItem {
+        source: source.into(),
+        external_id: url.to_owned(),
+        title: Some(article.title.clone()).filter(|title| !title.is_empty()),
+        url: Some(url.to_owned()),
+        body: article.text.clone(),
+        metadata,
+        posted_at: article.published_at,
+    };
+    if let Err(err) = news.upsert(&item).await {
+        tracing::error!(error = %format!("{err:#}"), "fetch_article: save step failed");
+    }
+    Ok(fetched_article_json(&article, source))
 }
 
 #[tool_router(router = news_tools, vis = "pub(crate)")]
@@ -966,37 +1088,17 @@ impl McpTools {
             facets surfaced it), so do NOT re-query per facet or re-dedup. \
             Pass exactly one of `query` or `queries`."
     )]
-    async fn search_news(&self, Parameters(p): Parameters<SearchParams>) -> ToolResult {
-        if p.query.as_deref().is_some_and(str::is_empty)
-            || p.queries.as_ref().is_some_and(|q| q.is_empty() || q.len() > 8 || q.iter().any(String::is_empty))
-            || p.k.is_some_and(|k| !(1..=50).contains(&k))
-            || !chunks_in_range(p.chunks)
-        {
+    async fn search_news(&self, Parameters(params): Parameters<SearchParams>) -> ToolResult {
+        let invalid_query = params.query.as_deref().is_some_and(str::is_empty);
+        let invalid_batch = params
+            .queries
+            .as_ref()
+            .is_some_and(|queries| queries.is_empty() || queries.len() > 8 || queries.iter().any(String::is_empty));
+        let invalid_k = params.k.is_some_and(|k| !(1..=50).contains(&k));
+        if invalid_query || invalid_batch || invalid_k || !chunks_in_range(params.chunks) {
             return Err(invalid_params("query must be non-empty, queries 1–8 non-empty strings, k 1–50, chunks 2–8"));
         }
-        let news = &self.deps.news;
-        let queries = match (p.query, p.queries) {
-            (Some(q), None) => (vec![q], false),
-            (None, Some(qs)) => (qs, true),
-            _ => return json_result(&json!({ "error": "Pass exactly one of `query` or `queries`." })),
-        };
-        respond(
-            async {
-                let filter = build_filter(
-                    p.source,
-                    p.since_iso.as_deref(),
-                    p.until_iso.as_deref(),
-                    p.as_of_iso.as_deref(),
-                    p.channel,
-                )?;
-                let results = news.search(&queries.0, p.k.unwrap_or(10), &filter, queries.1).await?;
-                Ok(match p.chunks {
-                    Some(n) => json!({ "count": results.len(), "chunks": split_chunks(&results, n) }),
-                    None => json!({ "count": results.len(), "results": results }),
-                })
-            }
-            .await,
-        )
+        respond(search_news_response(&self.deps.news, params).await)
     }
 
     #[tool(
@@ -1007,33 +1109,11 @@ impl McpTools {
             rather than a topical match. Ascending when sinceISO is provided, \
             descending otherwise."
     )]
-    async fn list_news(&self, Parameters(p): Parameters<ListParams>) -> ToolResult {
-        if p.limit.is_some_and(|l| !(1..=2000).contains(&l)) || !chunks_in_range(p.chunks) {
+    async fn list_news(&self, Parameters(params): Parameters<ListParams>) -> ToolResult {
+        if params.limit.is_some_and(|l| !(1..=2000).contains(&l)) || !chunks_in_range(params.chunks) {
             return Err(invalid_params("limit must be 1–2000, chunks 2–8"));
         }
-        let news = &self.deps.news;
-        respond(
-            async {
-                let filter = build_filter(
-                    p.source,
-                    p.since_iso.as_deref(),
-                    p.until_iso.as_deref(),
-                    p.as_of_iso.as_deref(),
-                    p.channel,
-                )?;
-                let items: Vec<Value> = news
-                    .list(&filter, p.limit.unwrap_or(500), DEFAULT_DEDUP_THRESHOLD)
-                    .await?
-                    .iter()
-                    .map(NewsItem::to_json)
-                    .collect();
-                Ok(match p.chunks {
-                    Some(n) => json!({ "count": items.len(), "chunks": split_chunks(&items, n) }),
-                    None => json!({ "count": items.len(), "items": items }),
-                })
-            }
-            .await,
-        )
+        respond(list_news_response(&self.deps.news, params).await)
     }
 
     #[tool(
@@ -1046,73 +1126,16 @@ impl McpTools {
             If the URL is already cached, returns the cached row without \
             re-fetching."
     )]
-    async fn fetch_article(&self, Parameters(p): Parameters<FetchArticleParams>) -> ToolResult {
-        if url::Url::parse(&p.url).is_err() {
+    async fn fetch_article(&self, Parameters(params): Parameters<FetchArticleParams>) -> ToolResult {
+        if url::Url::parse(&params.url).is_err() {
             return Err(invalid_params("url must be a valid URL"));
         }
-        let news = &self.deps.news;
         let fetcher = ArticleFetcher::new(self.deps.fetcher.clone());
-        respond(
-            async {
-                for source in ["hackernews", "habr", "external"] {
-                    if let Some(cached) = news.find_by_external_id(source, &p.url).await?
-                        && !cached.body.trim().is_empty()
-                    {
-                        let mut out = json!({
-                            "url": p.url,
-                            "title": cached.title.clone().unwrap_or_default(),
-                            "text": cached.body,
-                            "source": cached.source,
-                            "sizeChars": cached.body.encode_utf16().count(),
-                            "cached": true,
-                        });
-                        if let Some(at) = cached.posted_at {
-                            out["publishedAt"] = iso(at).into();
-                        }
-                        return Ok(out);
-                    }
-                }
-
-                let article = fetcher.fetch(&p.url).await?;
-                let source = source_for_url(&p.url);
-                let mut metadata = Map::new();
-                if let Some(author) = &article.author {
-                    metadata.insert("author".into(), author.clone().into());
-                }
-                if let Some(site) = &article.site {
-                    metadata.insert("site".into(), site.clone().into());
-                }
-                let item = NewsItem {
-                    source: source.into(),
-                    external_id: p.url.clone(),
-                    title: Some(article.title.clone()).filter(|t| !t.is_empty()),
-                    url: Some(p.url.clone()),
-                    body: article.text.clone(),
-                    metadata,
-                    posted_at: article.published_at,
-                };
-                if let Err(err) = news.upsert(&item).await {
-                    tracing::error!(error = %format!("{err:#}"), "fetch_article: save step failed");
-                }
-                let mut out = json!({ "url": article.url, "title": article.title, "text": article.text });
-                if let Some(site) = &article.site {
-                    out["site"] = site.clone().into();
-                }
-                if let Some(at) = article.published_at {
-                    out["publishedAt"] = iso(at).into();
-                }
-                if let Some(author) = &article.author {
-                    out["author"] = author.clone().into();
-                }
-                out["source"] = source.into();
-                out["sizeChars"] = article.text.encode_utf16().count().into();
-                out["cached"] = false.into();
-                Ok(out)
-            }
-            .await,
-        )
+        respond(fetch_article_response(&self.deps.news, &fetcher, &params.url).await)
     }
 }
+
+// ── 8. tests ─────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -1194,6 +1217,22 @@ mod tests {
             merge_ranked_pools(vec![vec![row(1, 0.3, unit(&[1., 0.])), row(2, 0.1, unit(&[0., 1.]))]], 10, 0.03, false);
         assert_eq!(ids(&single), [2, 1]);
         assert!(serde_json::to_value(&single[0]).unwrap().get("matchedQueries").is_none());
+    }
+
+    #[test]
+    fn equal_distances_preserve_discovery_order_and_first_match() {
+        let first = row(2, 0.1, unit(&[1., 0.]));
+        let mut later = first.clone();
+        later.title = Some("later title".into());
+        let results = merge_ranked_pools(
+            vec![vec![first, row(1, 0.1, unit(&[0., 1.]))], vec![later]],
+            10,
+            DEFAULT_DEDUP_THRESHOLD,
+            true,
+        );
+        assert_eq!(ids(&results), [2, 1]);
+        assert_eq!(results[0].title.as_deref(), Some("t2"));
+        assert_eq!(results[0].matched_queries, Some(vec![0, 1]));
     }
 
     #[test]
@@ -1299,6 +1338,43 @@ mod tests {
         assert_eq!(article.published_at, parse_js_date("2026-01-02T00:00:00Z"));
     }
 
+    #[test]
+    fn cached_article_response_preserves_legacy_shape_and_utf16_length() {
+        let mut cached = item("external", "cached", "ignored", "я😀", "invalid date");
+        cached.title = None;
+        cached.metadata = json!({ "site": "example.com", "author": "alice" }).as_object().unwrap().clone();
+        assert_eq!(
+            cached_article_json(&cached, "https://example.com/a"),
+            json!({
+                "url": "https://example.com/a", "title": "", "text": "я😀",
+                "source": "external", "sizeChars": 3, "cached": true,
+            })
+        );
+        cached.posted_at = parse_js_date("2026-01-02T00:00:00Z");
+        assert_eq!(cached_article_json(&cached, "url")["publishedAt"], "2026-01-02T00:00:00.000Z");
+    }
+
+    #[test]
+    fn fetched_article_response_includes_only_present_metadata() {
+        let extracted = article("title", "я😀");
+        assert_eq!(
+            fetched_article_json(&extracted, "external"),
+            json!({
+                "url": "https://example.com/a", "title": "title", "text": "я😀",
+                "site": "example.com", "publishedAt": "2026-01-02T00:00:00.000Z", "author": "bob",
+                "source": "external", "sizeChars": 3, "cached": false,
+            })
+        );
+        let no_metadata = Article { site: None, published_at: None, author: None, ..extracted };
+        assert_eq!(
+            fetched_article_json(&no_metadata, "external"),
+            json!({
+                "url": "https://example.com/a", "title": "title", "text": "я😀",
+                "source": "external", "sizeChars": 3, "cached": false,
+            })
+        );
+    }
+
     // ── against Postgres (TEST_DATABASE_URL) ────────────────────────────────
 
     fn item(source: &str, id: &str, title: &str, body: &str, posted: &str) -> NewsItem {
@@ -1386,6 +1462,27 @@ mod tests {
         assert_eq!(channel_watermark(&pool, &chat).await.unwrap(), Some(12));
         let by_chat = Filter { source: Some("channel".into()), channel: Some(chat.clone()), ..Filter::default() };
         assert_eq!(repo.list(&by_chat, 10, 0.0).await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn writes_release_the_connection_before_embedding() {
+        let Some(pool) = crate::pg::test_pool().await else { return };
+        pool.resize(1);
+        let embedder = crate::embeddings::testing::FakeEmbedder::with_dims(1536);
+        let repo = NewsRepository::new(pool, embedder.clone());
+        let source = format!("test-single-connection-{}", rand::random::<u32>());
+        let news = item(&source, "a", "title", "body", "2026-01-01T00:00:00Z");
+        tokio::time::timeout(Duration::from_secs(10), async {
+            assert_eq!(repo.save(std::slice::from_ref(&news)).await.unwrap().embedded, 1);
+            assert_eq!(repo.upsert(&news).await.unwrap().embedded, 1);
+            embedder.set_down(true);
+            let unembedded = NewsItem { external_id: "b".into(), ..news };
+            assert_eq!(repo.save(&[unembedded]).await.unwrap().failed, 1);
+            embedder.set_down(false);
+            assert!(repo.embed_missing_batch(1000).await.unwrap().embedded >= 1);
+        })
+        .await
+        .expect("save, upsert and backfill must work with a single pooled connection");
     }
 
     #[test]
