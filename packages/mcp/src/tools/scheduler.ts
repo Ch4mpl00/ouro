@@ -5,6 +5,16 @@ import type { ScheduledTasks } from "../services/scheduler";
 import { localTime, type Settings } from "../services/settings";
 import { jsonResult } from "../result";
 
+// cron-parser also reads 4- and 6-field expressions — as ones with a seconds
+// field — so a malformed or "with seconds" cron would silently fire every
+// second (one slot per tick, forever behind). Only the documented 5 fields.
+function fieldCountError(cronExpr: string): string | null {
+  const fields = cronExpr.trim().split(/\s+/).length;
+  return fields === 5
+    ? null
+    : `expected 5 fields (minute hour day-of-month month day-of-week), got ${fields}`;
+}
+
 function previewNextFires(cronExpr: string, tz: string, count: number): string[] {
   const it = CronExpressionParser.parse(cronExpr, { tz });
   const out: string[] = [];
@@ -51,6 +61,10 @@ export function registerSchedulerTools(
       },
     },
     async ({ cron_expr, recurring, prompt }) => {
+      const fieldError = fieldCountError(cron_expr);
+      if (fieldError) {
+        return jsonResult({ ok: false, error: `Invalid cron expression: ${fieldError}` });
+      }
       const tz = await settings.timezone();
       let upcoming: string[];
       try {
