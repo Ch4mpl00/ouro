@@ -78,7 +78,7 @@ export function createIndexer(deps: IndexerDeps): Indexer {
       }));
       // Always replace, even with zero entries: a document emptied of content
       // must not keep answering recalls from its old chunks.
-      await store.replaceIndex(docRef(project.slug, doc.name), entries);
+      await store.replaceIndex(docRef(project.slug, doc.name), entries, { kind: "doc", docId: doc.id, version: doc.version });
     },
 
     indexFact: async (fact) => {
@@ -96,7 +96,7 @@ export function createIndexer(deps: IndexerDeps): Indexer {
           ts: fact.updatedAt,
           embedding: vector ?? null,
         },
-      ]);
+      ], { kind: "fact", id: fact.id, body: fact.body, tags: fact.tags, state: fact.state });
     },
 
     embedMissingBatch: async (batchSize = 100) => {

@@ -167,11 +167,24 @@ export function createInMemoryStore(opts: InMemoryStoreOpts = {}): MemoryStore {
       return { ...fact };
     },
 
-    replaceIndex: async (sourceRef, entries) => {
+    replaceIndex: async (sourceRef, entries, basis) => {
+      if (basis.kind === "fact") {
+        const fact = facts.find((f) => f.id === basis.id);
+        const same =
+          fact !== undefined &&
+          fact.body === basis.body &&
+          fact.state === basis.state &&
+          fact.tags.length === basis.tags.length &&
+          fact.tags.every((t, i) => t === basis.tags[i]);
+        if (!same) return false;
+      } else if (docs.find((d) => d.id === basis.docId)?.version !== basis.version) {
+        return false;
+      }
       for (let i = index.length - 1; i >= 0; i--) {
         if (index[i]!.sourceRef === sourceRef) index.splice(i, 1);
       }
       for (const entry of entries) index.push({ ...entry, id: nextId() });
+      return true;
     },
 
     searchIndex: async (opts_: SearchIndexOpts): Promise<IndexHit[]> => {

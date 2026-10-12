@@ -238,16 +238,39 @@ export function createPgMemoryStore(deps: PgMemoryStoreDeps): MemoryStore {
       return row ? toFact(row) : null;
     },
 
-    replaceIndex: async (sourceRef, entries) => {
+    replaceIndex: async (sourceRef, entries, basis) =>
       // Delete-then-insert rather than upsert: a re-indexed document can have
       // fewer chunks than before, and the leftovers would keep answering
-      // recalls with text that is no longer in the document.
-      await db.transaction(async (tx) => {
+      // recalls with text that is no longer in the document. The source row
+      // is locked first, so re-indexes of one source can't interleave their
+      // delete and insert (which doubled the rows), and the check sees the
+      // source's latest committed state.
+      db.transaction(async (tx) => {
+        if (basis.kind === "fact") {
+          const [row] = await tx
+            .select({ body: facts.body, tags: facts.tags, state: facts.state })
+            .from(facts)
+            .where(eq(facts.id, basis.id))
+            .for("update");
+          const same =
+            row !== undefined &&
+            row.body === basis.body &&
+            row.state === basis.state &&
+            row.tags.length === basis.tags.length &&
+            row.tags.every((t, i) => t === basis.tags[i]);
+          if (!same) return false;
+        } else {
+          const [row] = await tx
+            .select({ version: projectDocs.version })
+            .from(projectDocs)
+            .where(eq(projectDocs.id, basis.docId))
+            .for("update");
+          if (row?.version !== basis.version) return false;
+        }
         await tx.delete(memoryIndex).where(eq(memoryIndex.sourceRef, sourceRef));
-        if (entries.length === 0) return;
-        await tx.insert(memoryIndex).values(entries.map(toIndexRow));
-      });
-    },
+        if (entries.length > 0) await tx.insert(memoryIndex).values(entries.map(toIndexRow));
+        return true;
+      }),
 
     searchIndex: async (opts: SearchIndexOpts): Promise<IndexHit[]> => {
       const distance = cosineDistance(memoryIndex.embedding, opts.embedding);

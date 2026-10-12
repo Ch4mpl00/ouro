@@ -95,6 +95,10 @@ export interface AppendedEntry {
   stream: JournalStream;
 }
 
+export type IndexBasis =
+  | { kind: "fact"; id: number; body: string; tags: string[]; state: MemoryState }
+  | { kind: "doc"; docId: number; version: number };
+
 export interface MemoryStore {
   createProject(input: CreateProjectInput): Promise<Project>;
   getProject(slug: string): Promise<Project | null>;
@@ -120,8 +124,13 @@ export interface MemoryStore {
   updateFact(input: UpdateFactInput): Promise<Fact | null>;
 
   // Replaces every index row owned by `sourceRef` with `entries`, so a
-  // re-index of a shrunken document cannot leave orphaned chunks behind.
-  replaceIndex(sourceRef: string, entries: IndexUpsert[]): Promise<void>;
+  // re-index of a shrunken document cannot leave orphaned chunks behind —
+  // but only while the source still looks like `basis` (what the entries
+  // were built from). Two writes racing on one source finish embedding in
+  // either order; the stale one finds the source moved on and writes
+  // nothing, leaving the rows to the later write's re-index. Re-indexes of
+  // one source run one at a time. Returns whether the rows were written.
+  replaceIndex(sourceRef: string, entries: IndexUpsert[], basis: IndexBasis): Promise<boolean>;
   searchIndex(opts: SearchIndexOpts): Promise<IndexHit[]>;
   // Rows whose inline embed failed (provider down). Drained by the backfill.
   listUnembedded(limit: number): Promise<{ id: number; text: string }[]>;
