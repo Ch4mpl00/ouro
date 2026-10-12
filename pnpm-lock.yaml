@@ -96,8 +96,8 @@ importers:
         specifier: ^12.9.0
         version: 12.9.0
       cron-parser:
-        specifier: ^5.5.0
-        version: 5.5.0
+        specifier: ^5.10.2
+        version: 5.10.2
       dotenv:
         specifier: ^17.4.2
         version: 17.4.2
@@ -1428,8 +1428,8 @@ packages:
     resolution: {integrity: sha512-piICUB6ei4IlTv1+653yq5+KoqfBYmj9bw6LqXoOneTMDXk5nM1qt12mFW1caG3LlJXEKW1Bp0WggEmIfQB34g==}
     engines: {node: '>= 14'}
 
-  cron-parser@5.5.0:
-    resolution: {integrity: sha512-oML4lKUXxizYswqmxuOCpgFS8BNUJpIu6k/2HVHyaL8Ynnf3wdf9tkns0yRdJLSIjkJ+b0DXHMZEHGpMwjnPww==}
+  cron-parser@5.10.2:
+    resolution: {integrity: sha512-JfAYMY0LZaWQTuict8PhtF/ksSnq8xefSDmQUnnoqvkPYkU/y3UP0DTWzJKFBz0P1IXsDG8q0vY3zHkoFZOhvw==}
     engines: {node: '>=18'}
 
   cross-spawn@7.0.6:
@@ -4352,7 +4352,7 @@ snapshots:
       crc-32: 1.2.2
       readable-stream: 4.7.0
 
-  cron-parser@5.5.0:
+  cron-parser@5.10.2:
     dependencies:
       luxon: 3.7.2
 
