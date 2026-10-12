@@ -155,7 +155,10 @@ Distilled from `~/Code/tickets-booking/AGENTS.md` and `test/properties/`
    record it under Findings with the counterexample and leave the failing
    check out (or `it.skip` pointing at the finding).
 4. `pnpm typecheck` and the full `pnpm test` green — never commit red or
-   flaky.
+   flaky. Check the exit code (`pnpm test > log; echo $?`): piping into
+   `grep` hides a failure. Run each new property a few times with a raised
+   `PROPERTY_RUNS` before committing — rare counterexamples surface later
+   otherwise (Lord Howe did, after the scheduler suite was committed).
 5. Commit (`test(<area>): …`), then update this file: move the item to Done
    with what is covered, add follow-ups to Backlog, add a Log line.
 
@@ -345,10 +348,16 @@ the real system, `[U]` unit property for complex logic.
 - **F4 cron-parser refuses "day that doesn't exist OR weekday"**, e.g.
   `0 9 31 11 6` (Nov 31 or any Saturday in November): classic cron fires on
   the Saturdays. Harmless in practice; the property accepts either answer.
-- **F5 cron-parser skips a day for a time inside a 30-minute DST gap**
-  (Australia/Lord_Howe, `15 2 * * *` on 2026-10-04) while it shifts times in
-  whole-hour gaps (Kyiv 03:30 → 04:30). Upstream inconsistency, irrelevant
-  zone; pinned by an `it.skip` in `scheduler.test.ts`.
+- **F5 cron-parser mishandles 30-minute DST shifts** (Australia/Lord_Howe,
+  the only such zone). Spring forward: `15 2 * * *` skips 2026-10-04
+  instead of shifting past the gap as it does for whole-hour gaps (Kyiv
+  03:30 → 04:30). Fall back: `0 9 * * *` from 2026-04-04T10:00Z *throws*
+  "loop limit exceeded" (5.10.2) — the poller logs it as an invalid cron and
+  skips the task on every tick, so it never fires again. Irrelevant zone
+  for this deployment; Lord Howe is out of the property's zones, the
+  spring case is pinned by an `it.skip`. Worth reporting upstream; the
+  poller treating an evaluation error as "invalid cron, skip forever" is the
+  part we own.
 - **F6 `fetch_url` treats every `application/x-*` as binary**, so
   `application/x-ndjson`, `x-yaml`, `x-javascript`, `x-www-form-urlencoded`
   come back as "binary content not returned". Which x- types are text is a
@@ -387,4 +396,6 @@ the real system, `[U]` unit property for complex logic.
 - 2026-10-12 claude — workflow runtime part 1; 2 bugs fixed (static binding
   check in the compiler).
 - 2026-10-12 claude — workflow runtime part 2 (executor faults, replan
-  loop); no bugs.
+  loop); no bugs. A full run then caught a rare scheduler counterexample:
+  cron-parser throws on Lord Howe's fall-back (F5) — zone dropped from the
+  property.
