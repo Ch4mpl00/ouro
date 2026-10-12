@@ -1,0 +1,217 @@
+# Test coverage loop: behavioural coverage that finds real bugs
+
+**Status:** in-progress
+**Priority:** P1
+**Area:** tests (both packages)
+**Created:** 2026-10-12
+
+## Context
+
+An open-ended improvement loop, one unit of work per iteration, run by
+Claude Code (`/loop`) and, when Claude is out of quota, by Codex with the
+same instructions. Nobody remembers anything between iterations: this file
+and `git log` are the whole state. Branch: `test/coverage-loop`.
+
+The goal is not line coverage. It is: **every important behaviour of the
+system is pinned by a test that would fail if the behaviour broke, and the
+act of writing those tests finds the bugs that are already there.**
+
+## Goals
+
+1. **Integration first.** Drive the system through its real boundaries: the
+   MCP protocol (SDK client → in-process server → real Postgres via
+   Testcontainers), module factories wired the way `server.ts main()` /
+   `supervisor/main.ts` wire them, sqlite on a temp file. Fakes only at the
+   edge of the box: Telegram Bot API, Gmail, Monobank, OpenAI / DeepSeek /
+   OpenRouter, Langfuse, the clock.
+2. **Property tests are integration tests too.** Generate sequences of
+   operations against the real system and judge observed before/after
+   states — not a pure function in isolation.
+3. **Thin unit tests only for genuinely complex logic** — the workflow DSL /
+   compiler / executor, variable substitution, patch application, message
+   splitting, cron evaluation and similar. Do not write a unit test per
+   function.
+4. **Tests survive refactoring.** Test behaviour, invariants and states
+   through public surfaces (MCP tools, module interfaces). No assertions on
+   internal call order, private helpers, SQL text or log lines; no mocking
+   of our own modules.
+5. **Find bugs.** Each iteration should look hardest where bugs live:
+   concurrency, time boundaries, retries and duplicate delivery, crash /
+   restart (cursors, watermarks), partial failure, unicode and size limits,
+   scoping and isolation.
+
+## Testing model
+
+Distilled from `~/Code/tickets-booking/AGENTS.md` and `test/properties/`
+(read them when designing a new property suite):
+
+- **Specification, not a second implementation.** Express independently
+  applicable rules over observed transitions. Never write a reducer or
+  simulator that builds the expected next state; restating the requirement
+  is fine, restating the algorithm is not. (Exception: the user-owned
+  reference model `packages/mcp/model/model.ts`, which already exists.)
+- **Three kinds of rule per operation.** *Outcome requirements* decided
+  from the request and pre-state only (which outcome is legal); *effect
+  properties* on the actual reply and actual changes; *frame conditions* —
+  what must not change, including on refusal. Every applicable rule is
+  checked and reported by name. Require positive progress where an
+  operation is eligible, so an always-refusing implementation cannot pass.
+- **Observe, don't assume.** Read responses and persisted facts back; never
+  substitute the expected value for the stored one. Observe redundant
+  representations (e.g. a document body and its index rows, a signal row and
+  its delivery state) separately and assert they agree.
+- **Fail loudly on the unknown.** Normalise only known domain failures.
+  Unexpected exceptions, malformed replies, unknown states → test failure.
+- **Generate situations, not noise.** Vary sequences and initial-world
+  parameters; include boundaries, invalid input, isolation between
+  sessions/chats/projects, retries, conflicts. Build important rare
+  scenarios directly and keep **witnesses** — counters proving the
+  interesting cases actually occurred in a run.
+- **Time from one controlled clock.** Just before, exactly at, just after
+  every deadline. Inject the clock the DI way if the module lacks a seam.
+- **Idempotency is its own behaviour.** Same identity + payload, same
+  identity + changed payload, retry after state change, concurrent retries;
+  count durable effects.
+- **Concurrency.** A concurrent result must admit a legal sequential history
+  respecting real-time order (`packages/mcp/model/linearizable.ts` exists).
+  Use controlled synchronisation for critical races.
+- **Safety vs progress.** Durable intent is not delivery. Test duplicate
+  delivery, crashes between steps, recovery.
+- **Prove the checks bite.** For each important property, confirm locally
+  that a planted bug (mutation, fault injection) makes it fail, then revert.
+  Keep minimised counterexamples as regression cases.
+- **Seeds and budget.** Support seed replay; keep each suite inside a
+  practical runtime budget (the default `pnpm test` should stay usable;
+  heavy profiles go behind an env var like `MODEL_CASES`).
+
+## Infrastructure already present
+
+- `packages/mcp/specs/support/environment.ts` — Testcontainers pgvector (or
+  `TEST_DATABASE_URL`), the real server wired like `main()` with nothing
+  external, a word-hash embedder so `recall` works offline, an MCP client.
+  Reuse it (or extract a shared helper the DI way) rather than writing a
+  second harness.
+- `packages/mcp/model/` — reference model of memory documents,
+  linearizability checker, differential `server.check.ts`.
+- `vitest.config.ts` includes only `packages/*/src/**/*.test.ts` and
+  `packages/mcp/model/**/*.test.ts`; extend it if integration suites live
+  elsewhere (e.g. `packages/<pkg>/test/`).
+- Docker is available locally; tests needing it must skip cleanly without
+  it, like the existing Postgres tests.
+
+## Iteration procedure
+
+0. `git status`. Untracked `.agents/ .codex/ AGENTS.md
+   packages/agent/eval-fixtures/` belong to the user: never add, commit or
+   delete them. Other uncommitted changes mean the previous iteration was
+   cut off: finish and commit them, or `git checkout -- <files>` / remove
+   only the files that iteration created.
+1. Read this file and `git log --oneline -15`. Pick the top unfinished
+   Backlog item (or a sub-slice of it) — one reviewable commit's worth.
+2. Read the code under test enough to know its contract, then write the
+   rules down first (in the test file), then the generators and harness.
+3. Run new tests; confirm planted bugs make them fail. Real bug found →
+   small, unambiguous fix in a separate `fix(<area>): …` commit; otherwise
+   record it under Findings with the counterexample and leave the failing
+   check out (or `it.skip` pointing at the finding).
+4. `pnpm typecheck` and the full `pnpm test` green — never commit red or
+   flaky.
+5. Commit (`test(<area>): …`), then update this file: move the item to Done
+   with what is covered, add follow-ups to Backlog, add a Log line.
+
+When the Backlog is empty: deepening pass — mutation checks on existing
+suites, stronger generators, scenarios from `.claude/tasks/*.md` and
+`packages/mcp/specs/*.feature` without automated coverage.
+
+## Hard rules
+
+- Never edit `packages/mcp/specs/*.feature` or `packages/mcp/model/model.ts`
+  (user-owned). Never change an applied migration file.
+- Never weaken, skip or delete an existing test to make a run pass.
+- No type escape hatches: no `as any`, `as unknown as`, `@ts-ignore`,
+  `@ts-expect-error`, or `!` to dodge a real possibility.
+- Don't run build/dev/serve scripts or `docker compose up`; no ssh; no real
+  third-party API calls; don't read `.env*`; `TEST_DATABASE_URL` only for a
+  throwaway container.
+- Git: commit only on `test/coverage-loop`. No push, no branch switching,
+  no rewriting existing commits.
+- Strings in `.ts` are English; match the surrounding code's style.
+
+## Backlog
+
+Ordered by expected bug yield. `[I]` integration, `[P]` property suite over
+the real system, `[U]` unit property for complex logic.
+
+1. **Signal queue** `[I][P]` — `signals.record` → `get_next_signal` →
+   `list_signals` over MCP + PG. Rules: each recorded signal is delivered
+   at most once (and at least once while a consumer polls), delivery order,
+   `envContext` round-trips, concurrent consumers on separate sessions never
+   receive the same signal, restart of the server loses nothing.
+2. **Scheduler** `[I][P]` — `schedule_task` / `list_scheduled_tasks` /
+   `cancel_scheduled_task` + the scheduler tick turning due cron rows into
+   signals. Controlled clock: before/at/after a due time, no double fire
+   across ticks or concurrent tickers, cancelled never fires, timezone and
+   DST edges (`set_timezone`), invalid cron refused without side effects.
+3. **Guarded fetch** `[I][P]` — `services/fetch` + `tools/fetch.ts`: no
+   request ever reaches a private / loopback / link-local address, including
+   via redirects, DNS answers and odd IP spellings; size / timeout limits.
+4. **Telegram transport** `[I]` — fake Bot API over HTTP:
+   `send_telegram_message` (splitting, the chat log in `mcp_state`),
+   `edit_telegram_message`, `get_telegram_chat_history`; the getUpdates
+   poller: cursor advances only after signals are durable, restart neither
+   loses nor duplicates updates, 409 handling.
+5. **Supervisor end to end** `[I]` — real MCP server (in-process) + scripted
+   ChatProvider: routing by source (`scheduler` → workflow, others →
+   AgentLoop), compile failure degrades to AgentLoop in the same trace,
+   execute failure goes to recovery and is not retried, every signal is
+   handled exactly once, telegram history preload.
+6. **Workflow runtime** `[U][P]` — `workflow/dsl.ts`, `variables.ts`,
+   `execute.ts`, `compile.ts`: generated valid workflows execute
+   step-by-step with observable effects only through tool calls; failures
+   stop at the failing step; no tool side effect is replayed on retry;
+   `${path}` substitution never leaks unresolved placeholders; parse ∘
+   print round-trips. (Existing example tests are large — complement them,
+   don't duplicate.)
+7. **AgentLoop + providers + retry** `[I]` — scripted provider over the
+   real loop: tool results threaded back, turn limits, sub-agent
+   delegation, transient vs permanent errors, abort propagation, no
+   automatic replay of tool calls.
+8. **Memory facts and projects over MCP** `[I][P]` — `remember` /
+   `get_fact` / `update_fact` / `recall` / `list_memory` / `create_project`
+   / `doc_history`: lifecycle states, `recall` refs always resolve via
+   `read_doc` / `get_fact`, index rows agree with stored bodies, indexing
+   failure never fails a write (embedder down), `MCP_MEMORY_ACTOR` stamped.
+   Documents themselves are covered by the reference model — look for gaps
+   only.
+9. **Gmail poller** `[I]` — fake Gmail API: watermark monotonic, no lost or
+   duplicated mail across restarts and partial failures, attachment
+   download path safety.
+10. **News store** `[I][P]` — `list_news` / `fetch_article` / `search_news`
+    with fake providers + word embedder: upsert idempotency, dedup, `k`
+    bounds, filters, NULL-embedding rows still listable, backfill drains.
+11. **Tool scoping and transport** `[I][P]` — any `MCP_TOOLSETS` subset →
+    `tools/list` is exactly the union of those groups; unknown name is a
+    boot error; multi-session isolation in `http-transport`.
+12. **Skills** `[I]` — agent two-layer loader (live → default, patch
+    overlay) and the MCP `read_skill` export agree on the composed
+    instructions for generated bodies/patches (the two `appendPatch`
+    copies must not drift).
+13. **Gateway** `[I]` — fake upstream MCP server: namespacing, upstream
+    failure isolated from own tools, reconnect.
+14. **Agent sqlite state** `[I]` — memory KV + trace mirror
+    (`db/trace-store.ts`): migrations on boot idempotent, trace/judgement
+    invariants.
+15. **`mcp_state` boot** `[I]` — migrations idempotent, two servers booting
+    at once (advisory lock).
+16. **Monobank, PDF, files tools** `[I]` — fake HTTP; `read_file` path
+    confinement.
+17. **Evals (`judging/`, `eval/`), `packages/codex`** — P3, services are
+    off; only if everything above is done.
+
+## Done
+
+## Findings
+
+## Log
+
+- 2026-10-12 claude — loop set up: goals, testing model, backlog.
