@@ -227,6 +227,37 @@ describe("plan validation — happy path per step kind", () => {
   });
 });
 
+describe("plan validation — decide step", () => {
+  const { WorkflowSchema } = makeSchema();
+  const decide = (extra: Record<string, unknown>) => ({
+    version: 1,
+    steps: [
+      { kind: "decide", preset: "filter", items: "${posts.items}", prompt: "rules", bind: "kept", ...extra },
+      { kind: "terminal" },
+    ],
+  });
+
+  it("accepts a filter step, with or without a threshold, also inside parallel", () => {
+    expect(WorkflowSchema.safeParse(decide({})).success).toBe(true);
+    expect(WorkflowSchema.safeParse(decide({ threshold: 0.4 })).success).toBe(true);
+    const step = { kind: "decide", preset: "filter", items: "${a}", prompt: "r", bind: "x" };
+    expect(
+      WorkflowSchema.safeParse({
+        version: 1,
+        steps: [{ kind: "parallel", steps: [step, { ...step, items: "${b}", bind: "y" }] }, { kind: "terminal" }],
+      }).success,
+    ).toBe(true);
+  });
+
+  it("rejects an unknown preset, a threshold outside (0, 1), a missing prompt and a skill", () => {
+    expect(WorkflowSchema.safeParse(decide({ preset: "classify" })).success).toBe(false);
+    expect(WorkflowSchema.safeParse(decide({ threshold: 1 })).success).toBe(false);
+    expect(WorkflowSchema.safeParse(decide({ threshold: 0 })).success).toBe(false);
+    expect(WorkflowSchema.safeParse(decide({ prompt: undefined })).success).toBe(false);
+    expect(WorkflowSchema.safeParse(decide({ skill: "news-digest" })).success).toBe(false);
+  });
+});
+
 describe("plan validation — rejections", () => {
   const { WorkflowSchema } = makeSchema();
 

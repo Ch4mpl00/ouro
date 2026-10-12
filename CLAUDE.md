@@ -81,6 +81,11 @@ mcp-tools/
             │   ├── dsl.ts                     Workflow step schema + parse
             │   └── variables.ts               ${path} substitution + variable store
             ├── engine.ts, agent-loop.ts     LLM runner (ReAct loop)
+            ├── providers/                   ChatProviders: openai, gemini, deepseek,
+            │                                 openrouter (opt-in, "openrouter/…" models)
+            ├── decisions.ts                 typed classification (Jev via OpenRouter's
+            │                                 decisions API) + presets (filter); the
+            │                                 workflow `decide` step runs them
             ├── synthetic-tools.ts           agent-side tools (set_memory, …)
             ├── mcp-client.ts                StreamableHTTP client
             ├── session-context.ts           markdown context block builder
@@ -98,7 +103,7 @@ mcp-tools/
 - `googleapis` + `google-auth-library` (Gmail)
 - `telegram` (gramjs / MTProto) for userbot channel reading
 - `cron-parser` v5 for scheduled tasks
-- `openai` SDK pointed at DeepSeek (OpenAI-compatible)
+- `openai` SDK pointed at DeepSeek / Gemini / OpenRouter (OpenAI-compatible)
 
 ## Three databases — split by ownership
 

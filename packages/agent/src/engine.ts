@@ -1,6 +1,7 @@
 import type { McpHandle } from "./mcp-client";
 import type { ModelPreset, PresetName } from "./models";
-import type { ChatProvider } from "./providers";
+import { isOpenRouterModel, type ChatProvider } from "./providers";
+import type { DecisionClient } from "./decisions";
 import { createAgentLoop, type AgentLoop, type AgentLoopOpts } from "./agent-loop";
 import type { CodexClient } from "./codex-client";
 import type { MemoryStore } from "./db/memory";
@@ -8,9 +9,10 @@ import type { SkillStore } from "./skills";
 import type { Tracer } from "./tracing";
 
 // Process-level hub for shared, expensive resources:
-//   - three ChatProviders (Gemini for thinking-mode sessions, OpenAI for
-//     non-thinking, DeepSeek kept as an opt-in route via AGENT_*_MODEL —
-//     each on its own API key + rate-limit bucket)
+//   - the ChatProviders (Gemini for thinking-mode sessions, OpenAI for
+//     non-thinking, DeepSeek and OpenRouter kept as opt-in routes via
+//     AGENT_*_MODEL — each on its own API key + rate-limit bucket)
+//   - the typed-decision client (Jev via OpenRouter), when configured
 //   - one MCP connection
 //   - one Tracer (observability backend)
 //   - the skill store and the agent-side memory KV
@@ -42,6 +44,9 @@ export interface Engine {
   // (via the `code_agent` synthetic tool) and the workflow executor reach the
   // same connection.
   readonly codex: CodexClient;
+  // Typed classification (see ./decisions). null when OpenRouter isn't
+  // configured — every consumer must keep an LLM fallback anyway.
+  readonly decisions: DecisionClient | null;
   // Pick the provider wrapper based on the model name. The model name is
   // the source of truth — a loop resolves a preset name to a concrete
   // model at construction time; this method only routes that model to
@@ -59,6 +64,9 @@ export interface EngineDeps {
     deepseek: ChatProvider;
     openai: ChatProvider;
     gemini: ChatProvider;
+    // Optional: built only when an OpenRouter key is configured. Reached only
+    // by an explicit "openrouter/…" model string.
+    openrouter?: ChatProvider;
   };
   mcp: McpHandle;
   presets: Record<PresetName, ModelPreset>;
@@ -76,6 +84,7 @@ export interface EngineDeps {
   memory: MemoryStore;
   tracer: Tracer;
   codex: CodexClient;
+  decisions?: DecisionClient;
 }
 
 export function createEngine(deps: EngineDeps): Engine {
@@ -97,9 +106,18 @@ export function createEngine(deps: EngineDeps): Engine {
     skillStore,
     memory,
     codex,
+    decisions: deps.decisions ?? null,
     log,
 
     resolveProvider(model) {
+      // Explicit prefix first: "openrouter/deepseek/…" must not fall into the
+      // direct DeepSeek branch below.
+      if (isOpenRouterModel(model)) {
+        if (!providers.openrouter) {
+          throw new Error(`model "${model}" routes to OpenRouter, but no OpenRouter provider is configured`);
+        }
+        return providers.openrouter;
+      }
       if (model.startsWith("deepseek")) return providers.deepseek;
       if (model.startsWith("gemini")) return providers.gemini;
       return providers.openai;

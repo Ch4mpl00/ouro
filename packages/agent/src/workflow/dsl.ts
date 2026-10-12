@@ -4,7 +4,7 @@ import { PRESET_NAMES } from "../models";
 
 // Workflow DSL — the language the compiler LLM emits and the executor runs.
 //
-// Seven step kinds, no control flow primitives beyond `parallel`:
+// Eight step kinds, no control flow primitives beyond `parallel`:
 //
 //   tool         — runtime → MCP tool with literal args, result bound
 //   llm_compose  — LLM with no tools, structured output, result bound
@@ -12,6 +12,9 @@ import { PRESET_NAMES } from "../models";
 //                  internal ReAct loop, final text bound
 //   code_agent   — delegate a computational/coding task to the Codex sandbox
 //                  (writes + runs code), result bound
+//   decide       — a typed-decision preset over a bound array (Jev, not a
+//                  chat model): `filter` keeps the items a prompt lets
+//                  through, kept array bound
 //   parallel     — flat list of independent leaf steps, run concurrently
 //   terminal     — explicit end of workflow
 //   replan       — terminator that bounces back to the compiler with the
@@ -42,6 +45,8 @@ import { PRESET_NAMES } from "../models";
 // will likely use `json_object` mode + Zod retry-loop instead.
 
 const PRESET_ENUM = z.enum(PRESET_NAMES as readonly [string, ...string[]]);
+
+export const DECIDE_PRESETS = ["filter"] as const;
 
 export interface WorkflowSchemaDeps {
   // Names from MCP tool registry, resolved at engine boot. The schema
@@ -125,6 +130,20 @@ export function createWorkflowSchema(deps: WorkflowSchemaDeps): WorkflowSchemaBu
     })
     .strict();
 
+  // `decide` runs a decisions preset (../decisions.ts) — classification on a
+  // System One model, no text generated. `items` is a `${binding}` that
+  // resolves to an array; `prompt` holds every rule (it may embed `${}`).
+  const DecideStepSchema = z
+    .object({
+      kind: z.literal("decide"),
+      preset: z.enum(DECIDE_PRESETS),
+      items: z.string().min(1),
+      prompt: z.string().min(1),
+      threshold: z.number().gt(0).lt(1).optional(),
+      bind: z.string().min(1),
+    })
+    .strict();
+
   const TerminalStepSchema = z
     .object({
       kind: z.literal("terminal"),
@@ -159,6 +178,7 @@ export function createWorkflowSchema(deps: WorkflowSchemaDeps): WorkflowSchemaBu
     LlmComposeStepSchema,
     LlmAgentStepSchema,
     CodeAgentStepSchema,
+    DecideStepSchema,
   ]);
 
   const ParallelStepSchema = z
@@ -173,6 +193,7 @@ export function createWorkflowSchema(deps: WorkflowSchemaDeps): WorkflowSchemaBu
     LlmComposeStepSchema,
     LlmAgentStepSchema,
     CodeAgentStepSchema,
+    DecideStepSchema,
     TerminalStepSchema,
     ParallelStepSchema,
     ReplanStepSchema,
@@ -237,6 +258,15 @@ export interface CodeAgentStep {
   bind: string;
 }
 
+export interface DecideStep {
+  kind: "decide";
+  preset: (typeof DECIDE_PRESETS)[number];
+  items: string;
+  prompt: string;
+  threshold?: number;
+  bind: string;
+}
+
 export interface ParallelStep {
   kind: "parallel";
   steps: LeafStep[];
@@ -252,7 +282,7 @@ export interface ReplanStep {
   note?: string;
 }
 
-export type LeafStep = ToolStep | LlmComposeStep | LlmAgentStep | CodeAgentStep;
+export type LeafStep = ToolStep | LlmComposeStep | LlmAgentStep | CodeAgentStep | DecideStep;
 export type Step = LeafStep | TerminalStep | ParallelStep | ReplanStep;
 
 export interface Workflow {

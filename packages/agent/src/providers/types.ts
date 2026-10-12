@@ -23,9 +23,10 @@ import type { TokenUsage, TraceContext } from "../tracing";
 // "deepseek")` branches. New provider → new factory, no call-site edits.
 //
 // Gemini joins via its OpenAI-compatible endpoint: same wire shape as OpenAI,
-// with its own reasoning_effort handling (see providers/gemini.ts).
+// with its own reasoning_effort handling (see providers/gemini.ts). OpenRouter
+// is the opt-in route to any other vendor (see providers/openrouter.ts).
 
-export type ProviderKind = "deepseek" | "openai" | "gemini";
+export type ProviderKind = "deepseek" | "openai" | "gemini" | "openrouter";
 
 export interface CompletionParams {
   signal?: AbortSignal;

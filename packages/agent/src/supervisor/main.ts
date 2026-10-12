@@ -3,15 +3,18 @@ import "../openai-native-fetch";
 import OpenAI from "openai";
 import { createCodexClient } from "../codex-client";
 import { createAgentDb } from "../db/client";
+import { createDecisionClient } from "../decisions";
 import { createMemoryStore } from "../db/memory";
 import { createTraceStore } from "../db/trace-store";
 import { createEngine } from "../engine";
 import { connectMcp, RETRY_UNTIL_UP } from "../mcp-client";
-import { DEFAULT_PRESETS } from "../models";
+import { DEFAULT_DECISION_MODEL, DEFAULT_PRESETS } from "../models";
 import {
   createDeepseekProvider,
   createGeminiProvider,
   createOpenAiProvider,
+  createOpenRouterClient,
+  createOpenRouterProvider,
   withRetry,
   DEEPSEEK_BASE_URL,
   GEMINI_BASE_URL,
@@ -73,6 +76,13 @@ async function main(): Promise<void> {
     compiler: withEnvModel("compiler", "AGENT_COMPILER_MODEL"),
   };
 
+  // OpenRouter carries the typed-decision client (Jev), which the news digest's
+  // `decide` filter step runs on — so it is required, like the other keys. It
+  // also unlocks "openrouter/…" model overrides.
+  const openRouterApiKey = process.env.OPEN_ROUTER_API_KEY;
+  if (!openRouterApiKey) throw new Error("OPEN_ROUTER_API_KEY is not set in .env (decide steps)");
+  const openRouter = createOpenRouterClient(openRouterApiKey);
+
   // Provider retries appear as WARNING events in the active AgentLoop scope.
   const providers = {
     deepseek: withRetry(
@@ -86,7 +96,13 @@ async function main(): Promise<void> {
         new OpenAI({ apiKey: geminiApiKey, baseURL: GEMINI_BASE_URL }),
       ),
     ),
+    openrouter: withRetry(createOpenRouterProvider(openRouter)),
   };
+  const decisions = createDecisionClient({
+    client: openRouter,
+    model: process.env.AGENT_DECISION_MODEL ?? DEFAULT_DECISION_MODEL,
+  });
+  console.log(`[supervisor] decisions model=${decisions.model}`);
 
   const db = createAgentDb();
   const memory = createMemoryStore(db);
@@ -150,6 +166,7 @@ async function main(): Promise<void> {
     memory,
     tracer,
     codex,
+    decisions,
   });
 
   console.log(`[supervisor] mcp tools: ${mcp.tools.map((t) => t.function.name).join(", ")}`);

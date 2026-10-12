@@ -747,3 +747,36 @@ describe("primary AgentLoop and tracing", () => {
     }
   });
 });
+
+describe("engine provider routing", () => {
+  const stub = (kind: ChatProvider["kind"]): ChatProvider => ({
+    kind,
+    complete: async () => { throw new Error("Unexpected LLM call"); },
+  });
+  const engineWith = (openrouter?: ChatProvider) => createEngine({
+    providers: { openai: stub("openai"), gemini: stub("gemini"), deepseek: stub("deepseek"), openrouter },
+    mcp: { tools: [], callTool: async () => "", close: async () => {} },
+    presets: DEFAULT_PRESETS,
+    tracer: nullTracer,
+    memory: { get: () => null, set: () => {} },
+    codex: { run: async () => { throw new Error("Unexpected code_agent call"); } },
+    skillStore: harness([]).engine.skillStore,
+  });
+
+  it("routes only an explicit openrouter/ prefix to OpenRouter, ahead of the vendor prefixes", () => {
+    const engine = engineWith(stub("openrouter"));
+    expect(engine.resolveProvider("openrouter/deepseek/deepseek-v4-pro").kind).toBe("openrouter");
+    expect(engine.resolveProvider("openrouter/anthropic/claude-sonnet-5.5").kind).toBe("openrouter");
+    expect(engine.resolveProvider("deepseek-v4-pro").kind).toBe("deepseek");
+    expect(engine.resolveProvider("gemini-3.7-flash").kind).toBe("gemini");
+    expect(engine.resolveProvider("gpt-5.4").kind).toBe("openai");
+  });
+
+  it("fails loudly when an openrouter/ model has no provider configured", () => {
+    expect(() => engineWith().resolveProvider("openrouter/qwen/qwen3")).toThrow(/no OpenRouter provider/);
+  });
+
+  it("exposes no decision client unless one is configured", () => {
+    expect(engineWith().decisions).toBeNull();
+  });
+});

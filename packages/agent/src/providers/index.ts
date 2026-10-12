@@ -7,6 +7,13 @@ export type {
 export { createOpenAiProvider } from "./openai";
 export { createDeepseekProvider } from "./deepseek";
 export { createGeminiProvider } from "./gemini";
+export {
+  createOpenRouterClient,
+  createOpenRouterProvider,
+  isOpenRouterModel,
+  OPENROUTER_BASE_URL,
+  OPENROUTER_MODEL_PREFIX,
+} from "./openrouter";
 export { retryOnTransient, withRetry, type RetryInfo, type RetryOpts } from "./retry";
 
 // OpenAI-compatible endpoints of the non-OpenAI providers. One definition

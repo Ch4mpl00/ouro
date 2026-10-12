@@ -6,9 +6,10 @@
 // read as intent ("base reply", "smart digest") rather than
 // implementation knobs.
 //
-// Provider routing (DeepSeek vs Gemini vs OpenAI endpoint) is derived from
-// the model name in `engine.resolveProvider` — a "deepseek-*" name routes
-// through DeepSeek, a "gemini-*" name through Gemini's OpenAI-compatible
+// Provider routing (DeepSeek vs Gemini vs OpenRouter vs OpenAI endpoint) is
+// derived from the model name in `engine.resolveProvider` — an
+// "openrouter/<vendor>/<model>" name routes through OpenRouter, a "deepseek-*"
+// name through DeepSeek, a "gemini-*" name through Gemini's OpenAI-compatible
 // endpoint, any other prefix through OpenAI.
 
 // "low" exists for the Gemini compiler: on Gemini-3 the default (omitted)
@@ -67,3 +68,11 @@ export const PRESET_NAMES: readonly PresetName[] = ["base", "smart", "smartest"]
 export function isPresetName(value: unknown): value is PresetName {
   return typeof value === "string" && (PRESET_NAMES as readonly string[]).includes(value);
 }
+
+// Model for typed decisions (./decisions) — classification answered as
+// calibrated probabilities over a declared schema, not a chat turn. Not a
+// preset: it has no reasoning effort and cannot run an AgentLoop. An
+// OpenRouter model id (no "openrouter/" prefix — the decisions API is
+// OpenRouter-only). Override with AGENT_DECISION_MODEL; "~typesafe/jev-latest"
+// floats to the newest Jev.
+export const DEFAULT_DECISION_MODEL = "typesafe/jev-1.13";

@@ -15,6 +15,8 @@ import {
 import { createStore } from "./variables";
 import { PATCH_MARKER } from "../skills";
 import type { CodexClient } from "../codex-client";
+import { z } from "zod";
+import type { DecisionClient } from "../decisions";
 
 // ─── shared mocks ────────────────────────────────────────────────────
 
@@ -515,6 +517,111 @@ describe("executor.execute — code_agent step (Codex delegation)", () => {
 
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.reason).toBe("step_failed");
+  });
+});
+
+// Answers each filter question from the item, through the question's own
+// parser. Records the rules each request carried.
+function fakeDecisions(pOf: (item: unknown) => number, fail?: Error): DecisionClient & { rules: string[] } {
+  const rules: string[] = [];
+  const FilterState = z.object({ rules: z.string(), items: z.array(z.object({ n: z.number(), item: z.unknown() })) });
+  return {
+    model: "fake",
+    rules,
+    async decide(req) {
+      if (fail) throw fail;
+      const state = FilterState.parse(req.state);
+      rules.push(state.rules);
+      return {
+        model: "fake",
+        answer: (key) => {
+          const item = state.items.find((i) => `item_${i.n}` === key)?.item;
+          return req.questions[key].parse({ type: "noul", noul: pOf(item) });
+        },
+      };
+    },
+  };
+}
+
+describe("executor.execute — decide step", () => {
+  const posts = [
+    { id: 1, body: "ФОП: новая ставка ЕСВ" },
+    { id: 2, body: "Доброе утро!" },
+    { id: 3, body: "Бронирование: новые правила" },
+  ];
+  const plan = (extra: Record<string, unknown> = {}): Workflow => ({
+    version: 1,
+    steps: [
+      { kind: "decide", preset: "filter", items: "${posts.items}", prompt: "Правила для ${env.chatId}", bind: "kept", ...extra },
+      { kind: "terminal" },
+    ],
+  });
+  const ctxWithPosts = () => {
+    const ctx = baseCtx();
+    ctx.store.set("posts", { count: posts.length, items: posts });
+    return ctx;
+  };
+
+  it("filters the bound array with the substituted prompt and binds the kept items", async () => {
+    const decisions = fakeDecisions((item) => (JSON.stringify(item).includes("Доброе") ? 0.05 : 0.8));
+    const executor = createExecutor({ engine: { ...makeMockEngine(), decisions }, readSkill: nullReadSkill(), setMemory: () => {} });
+    const ctx = ctxWithPosts();
+
+    const r = await executor.execute(plan(), ctx);
+
+    expect(r.ok).toBe(true);
+    expect(ctx.store.get("kept")).toEqual([posts[0], posts[2]]);
+    expect(decisions.rules).toEqual(["Правила для 42"]);
+  });
+
+  it("passes the step's threshold to the preset", async () => {
+    const decisions = fakeDecisions(() => 0.5);
+    const executor = createExecutor({ engine: { ...makeMockEngine(), decisions }, readSkill: nullReadSkill(), setMemory: () => {} });
+    const ctx = ctxWithPosts();
+
+    await executor.execute(plan({ threshold: 0.6 }), ctx);
+
+    expect(ctx.store.get("kept")).toEqual([]);
+  });
+
+  it("fails as decision_error when the decision model fails — nothing passes through", async () => {
+    const decisions = fakeDecisions(() => 1, new Error("openrouter 503"));
+    const executor = createExecutor({ engine: { ...makeMockEngine(), decisions }, readSkill: nullReadSkill(), setMemory: () => {} });
+    const ctx = ctxWithPosts();
+
+    const r = await executor.execute(plan(), ctx);
+
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.reason).toBe("decision_error");
+      expect(r.error.message).toMatch(/openrouter 503/);
+    }
+    expect(ctx.store.has("kept")).toBe(false);
+  });
+
+  it("fails as decision_error when no decision model is configured", async () => {
+    const executor = createExecutor({ engine: makeMockEngine(), readSkill: nullReadSkill(), setMemory: () => {} });
+
+    const r = await executor.execute(plan(), ctxWithPosts());
+
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.reason).toBe("decision_error");
+  });
+
+  it("fails as decision_error when items do not resolve to an array", async () => {
+    const executor = createExecutor({
+      engine: { ...makeMockEngine(), decisions: fakeDecisions(() => 1) },
+      readSkill: nullReadSkill(),
+      setMemory: () => {},
+    });
+
+    const r = await executor.execute(plan({ items: "${posts}" }), ctxWithPosts());
+
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.reason).toBe("decision_error");
+      expect(r.error.message).toMatch(/must resolve to an array, got object/);
+    }
   });
 });
 
