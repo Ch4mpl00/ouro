@@ -26,7 +26,8 @@ import { langfuseTracerFromEnv } from "../tracing/langfuse";
 import { createLocalRecorderTracer } from "../tracing/local-recorder";
 import { teeTracer } from "../tracing/tee";
 import { createWorkflowRunner } from "../workflow";
-import { createSupervisorModule, type PendingSignal } from "./module";
+import { runSupervisorLoop } from "./loop";
+import { createSupervisorModule } from "./module";
 
 // Long-running supervisor — and the composition root: every long-lived
 // resource (sqlite handle, providers, MCP connection, tracer, skill store)
@@ -43,17 +44,6 @@ import { createSupervisorModule, type PendingSignal } from "./module";
 //                   ↳ crash → recovery report within the same trace
 //
 // The per-signal context, trace and recovery lifecycle live in ./module.
-
-const POLL_INTERVAL_MS = 2_000;
-
-interface NextSignalResult {
-  signal: PendingSignal | null;
-  pendingAfter: number;
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((r) => setTimeout(r, ms));
-}
 
 async function main(): Promise<void> {
   const deepseekApiKey = process.env.DEEPSEEK_API_KEY;
@@ -209,26 +199,7 @@ async function main(): Promise<void> {
   process.on("SIGTERM", () => void stop("SIGTERM"));
 
   console.log("[supervisor] entering main loop (scheduler → workflow, other sources → agent-loop)");
-  while (!stopping) {
-    try {
-      const raw = await mcp.callTool("get_next_signal", {});
-      const result = JSON.parse(raw) as NextSignalResult;
-
-      if (!result.signal) {
-        await sleep(POLL_INTERVAL_MS);
-        continue;
-      }
-
-      console.log(
-        `[supervisor] signal #${result.signal.id} source=${result.signal.source} (${result.pendingAfter} pending after)`,
-      );
-      await supervisor.runSignal(result.signal);
-    } catch (err) {
-      if (stopping) break;
-      console.error("[supervisor] loop error:", err);
-      await sleep(POLL_INTERVAL_MS);
-    }
-  }
+  await runSupervisorLoop({ mcp, supervisor, stopping: () => stopping });
 }
 
 main().catch((err: unknown) => {

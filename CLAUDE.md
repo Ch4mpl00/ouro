@@ -72,7 +72,7 @@ mcp-tools/
         ├── data/agent.db                    agent-side state (memory KV + trace mirror)
         └── src/
             ├── db/{client,memory,trace-store,schema}.ts + migrations/  Drizzle (sqlite)
-            ├── supervisor/{main,module,telegram-context}.ts  poll loop,
+            ├── supervisor/{main,loop,module,telegram-context}.ts  poll loop,
             │                                     per-signal routing, tg history
             ├── workflow/                      dynamic-workflow module (compile + execute)
             │   ├── index.ts                   createWorkflowRunner facade (runForSignal)
