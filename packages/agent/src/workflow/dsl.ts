@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { zodToJsonSchema } from "zod-to-json-schema";
 import { PRESET_NAMES } from "../models";
+import { placeholderPaths } from "./variables";
 
 // Workflow DSL — the language the compiler LLM emits and the executor runs.
 //
@@ -304,16 +305,27 @@ export interface WorkflowParseFailure {
 
 export type WorkflowParseResult = WorkflowParseSuccess | WorkflowParseFailure;
 
+export interface ParseWorkflowOptions {
+  // Names the runtime seeds the variable store with (env, signal, and
+  // context after a replan). Given → every `${}` must name one of them or an
+  // earlier step's bind, and binds must be unique (checkBindings).
+  seeds?: readonly string[];
+}
+
 export function parseWorkflow(
   input: unknown,
   schema: z.ZodTypeAny,
+  options: ParseWorkflowOptions = {},
 ): WorkflowParseResult {
   const result = schema.safeParse(input);
   if (!result.success) {
     return { ok: false, errors: formatWorkflowErrors(result.error) };
   }
   const workflow = result.data as Workflow;
-  const semanticErrors = postCheckWorkflow(workflow);
+  const semanticErrors = [
+    ...postCheckWorkflow(workflow),
+    ...(options.seeds ? checkBindings(workflow, options.seeds) : []),
+  ];
   if (semanticErrors.length > 0) {
     return { ok: false, errors: semanticErrors };
   }
@@ -339,6 +351,68 @@ function postCheckWorkflow(workflow: Workflow): string[] {
     }
   };
   workflow.steps.forEach((s, i) => visit(s, `steps[${i}]`));
+  return errors;
+}
+
+// The texts a step resolves `${}` in at run time.
+function resolvedTexts(step: LeafStep): unknown[] {
+  switch (step.kind) {
+    case "tool":
+      return [step.args];
+    case "llm_compose":
+      return [step.input, step.prompt];
+    case "llm_agent":
+      return [step.prompt];
+    case "code_agent":
+      return [step.task, step.data];
+    case "decide":
+      return [step.items, step.prompt];
+  }
+}
+
+// Every `${name…}` must name a binding that exists when its step runs — a
+// seed, or the bind of an earlier step — and a name is bound once. Inside
+// `parallel` the children run at once, so a child can't read a sibling's
+// bind. The executor would hit each of these only at run time, possibly
+// after an earlier step already sent something (and an execute failure is
+// not retried); here the compiler gets them back and fixes the plan.
+// Checking stops at the first terminal / replan, where the pass ends.
+function checkBindings(workflow: Workflow, seeds: readonly string[]): string[] {
+  const errors: string[] = [];
+  const bound = new Set(seeds);
+  const reads = (step: LeafStep, path: string, visible: ReadonlySet<string>, siblings: ReadonlySet<string>): void => {
+    for (const ref of placeholderPaths(resolvedTexts(step))) {
+      const root = ref.split(".")[0] ?? "";
+      if (visible.has(root)) continue;
+      errors.push(
+        siblings.has(root)
+          ? `at ${path}: \${${ref}} reads "${root}", which another step of the same parallel binds — they run at once; bind it in an earlier step`
+          : `at ${path}: \${${ref}} reads "${root}", which no earlier step binds (available: ${[...visible].join(", ")})`,
+      );
+    }
+  };
+  const binds = (step: LeafStep, path: string): void => {
+    if (step.bind === undefined) return;
+    if (bound.has(step.bind)) {
+      errors.push(
+        `at ${path}: bind "${step.bind}" is already ${seeds.includes(step.bind) ? "a reserved name" : "bound by an earlier step"}; choose another name`,
+      );
+    }
+    bound.add(step.bind);
+  };
+  for (const [i, step] of workflow.steps.entries()) {
+    const path = `steps[${i}]`;
+    if (step.kind === "terminal" || step.kind === "replan") break;
+    if (step.kind === "parallel") {
+      const before = new Set(bound);
+      const siblings = new Set(step.steps.flatMap((s) => (s.bind === undefined ? [] : [s.bind])));
+      step.steps.forEach((child, j) => reads(child, `${path}.steps[${j}]`, before, siblings));
+      step.steps.forEach((child, j) => binds(child, `${path}.steps[${j}]`));
+    } else {
+      reads(step, path, bound, new Set());
+      binds(step, path);
+    }
+  }
   return errors;
 }
 

@@ -109,3 +109,12 @@ function substituteString(s: string, store: VariableStore): unknown {
     return JSON.stringify(v);
   });
 }
+
+// Every `${path}` a value would resolve, in the order `substitute` meets
+// them — what a static check needs to know which bindings a step reads.
+export function placeholderPaths(value: unknown): string[] {
+  if (typeof value === "string") return [...value.matchAll(PARTIAL_PLACEHOLDER)].map((m) => m[1] ?? "");
+  if (Array.isArray(value)) return value.flatMap(placeholderPaths);
+  if (value && typeof value === "object") return Object.values(value).flatMap(placeholderPaths);
+  return [];
+}
