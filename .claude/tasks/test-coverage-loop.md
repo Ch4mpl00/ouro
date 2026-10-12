@@ -108,6 +108,11 @@ Distilled from `~/Code/tickets-booking/AGENTS.md` and `test/properties/`
 - A full-toolset server is **single-session**; for several MCP sessions
   start a second, scoped instance on the same database
   (`startServer(url, ["signals"])`).
+- `packages/mcp/test/support/wall-cron.ts` — an independent oracle for
+  5-field crons on a wall clock (minute scan via Intl, DST repeats and gaps),
+  so scheduler checks don't trust cron-parser.
+- Controlled synchronisation for races: wrap one injected dependency with a
+  gate (see the cancel-during-tick test in `scheduler.test.ts`).
 - fast-check gotcha: `fc.array(..., { maxLength })` still generates short
   arrays unless `size: "max"` is given — sequences silently stay trivial.
 
@@ -154,67 +159,62 @@ suites, stronger generators, scenarios from `.claude/tasks/*.md` and
 Ordered by expected bug yield. `[I]` integration, `[P]` property suite over
 the real system, `[U]` unit property for complex logic.
 
-1. **Scheduler** `[I][P]` — `schedule_task` / `list_scheduled_tasks` /
-   `cancel_scheduled_task` + the scheduler tick turning due cron rows into
-   signals. Controlled clock: before/at/after a due time, no double fire
-   across ticks or concurrent tickers, cancelled never fires, timezone and
-   DST edges (`set_timezone`), invalid cron refused without side effects.
-2. **Guarded fetch** `[I][P]` — `services/fetch` + `tools/fetch.ts`: no
+1. **Guarded fetch** `[I][P]` — `services/fetch` + `tools/fetch.ts`: no
    request ever reaches a private / loopback / link-local address, including
    via redirects, DNS answers and odd IP spellings; size / timeout limits.
-3. **Telegram transport** `[I]` — fake Bot API over HTTP:
+2. **Telegram transport** `[I]` — fake Bot API over HTTP:
    `send_telegram_message` (splitting, the chat log in `mcp_state`),
    `edit_telegram_message`, `get_telegram_chat_history`; the getUpdates
    poller: cursor advances only after signals are durable, restart neither
    loses nor duplicates updates, 409 handling. Probe text Postgres can't
    store (`\u0000`, lone surrogates): `signals.record` will throw — does the
    poller stall its cursor forever, skip, or lose the update? Same for Gmail.
-4. **Supervisor end to end** `[I]` — real MCP server (in-process) + scripted
+3. **Supervisor end to end** `[I]` — real MCP server (in-process) + scripted
    ChatProvider: routing by source (`scheduler` → workflow, others →
    AgentLoop), compile failure degrades to AgentLoop in the same trace,
    execute failure goes to recovery and is not retried, every signal is
    handled exactly once, telegram history preload.
-5. **Workflow runtime** `[U][P]` — `workflow/dsl.ts`, `variables.ts`,
+4. **Workflow runtime** `[U][P]` — `workflow/dsl.ts`, `variables.ts`,
    `execute.ts`, `compile.ts`: generated valid workflows execute
    step-by-step with observable effects only through tool calls; failures
    stop at the failing step; no tool side effect is replayed on retry;
    `${path}` substitution never leaks unresolved placeholders; parse ∘
    print round-trips. (Existing example tests are large — complement them,
    don't duplicate.)
-6. **AgentLoop + providers + retry** `[I]` — scripted provider over the
+5. **AgentLoop + providers + retry** `[I]` — scripted provider over the
    real loop: tool results threaded back, turn limits, sub-agent
    delegation, transient vs permanent errors, abort propagation, no
    automatic replay of tool calls.
-7. **Memory facts and projects over MCP** `[I][P]` — `remember` /
+6. **Memory facts and projects over MCP** `[I][P]` — `remember` /
    `get_fact` / `update_fact` / `recall` / `list_memory` / `create_project`
    / `doc_history`: lifecycle states, `recall` refs always resolve via
    `read_doc` / `get_fact`, index rows agree with stored bodies, indexing
    failure never fails a write (embedder down), `MCP_MEMORY_ACTOR` stamped.
    Documents themselves are covered by the reference model — look for gaps
    only.
-8. **Gmail poller** `[I]` — fake Gmail API: watermark monotonic, no lost or
+7. **Gmail poller** `[I]` — fake Gmail API: watermark monotonic, no lost or
    duplicated mail across restarts and partial failures, attachment
    download path safety.
-9. **News store** `[I][P]` — `list_news` / `fetch_article` / `search_news`
+8. **News store** `[I][P]` — `list_news` / `fetch_article` / `search_news`
     with fake providers + word embedder: upsert idempotency, dedup, `k`
     bounds, filters, NULL-embedding rows still listable, backfill drains.
-10. **Tool scoping and transport** `[I][P]` — any `MCP_TOOLSETS` subset →
+9. **Tool scoping and transport** `[I][P]` — any `MCP_TOOLSETS` subset →
     `tools/list` is exactly the union of those groups; unknown name is a
     boot error; multi-session isolation in `http-transport`.
-11. **Skills** `[I]` — agent two-layer loader (live → default, patch
+10. **Skills** `[I]` — agent two-layer loader (live → default, patch
     overlay) and the MCP `read_skill` export agree on the composed
     instructions for generated bodies/patches (the two `appendPatch`
     copies must not drift).
-12. **Gateway** `[I]` — fake upstream MCP server: namespacing, upstream
+11. **Gateway** `[I]` — fake upstream MCP server: namespacing, upstream
     failure isolated from own tools, reconnect.
-13. **Agent sqlite state** `[I]` — memory KV + trace mirror
+12. **Agent sqlite state** `[I]` — memory KV + trace mirror
     (`db/trace-store.ts`): migrations on boot idempotent, trace/judgement
     invariants.
-14. **`mcp_state` boot** `[I]` — migrations idempotent, two servers booting
+13. **`mcp_state` boot** `[I]` — migrations idempotent, two servers booting
     at once (advisory lock).
-15. **Monobank, PDF, files tools** `[I]` — fake HTTP; `read_file` path
+14. **Monobank, PDF, files tools** `[I]` — fake HTTP; `read_file` path
     confinement.
-16. **Evals (`judging/`, `eval/`), `packages/codex`** — P3, services are
+15. **Evals (`judging/`, `eval/`), `packages/codex`** — P3, services are
     off; only if everything above is done.
 
 ## Done
@@ -229,6 +229,20 @@ the real system, `[U]` unit property for complex logic.
   loops over two MCP instances → exactly once + no overtaking. Mutation
   check: pop newest, pop not consuming, no row lock, inverted source
   filter, limit +1 — all caught.
+- **Scheduler** (2026-10-12, `packages/mcp/test/scheduler.test.ts`) —
+  generated schedule / seed / cancel / set_timezone / list / advance / tick
+  sequences on a controlled clock starting near DST transitions in five
+  zones; fires judged against the wall-clock oracle (never early, legitimate
+  slot, no owed fire skipped, progress, header fields, last_run_at), list /
+  upcoming fires, refusals and frames. Directed: one fire per local day
+  across DST (Kyiv, New York), overlapping ticks, cancel during a tick,
+  failed signal record. **Bugs fixed:** overlapping ticks fired a slot up
+  to 3× (`aef22e5`), a cancel during a tick still fired, a failed record
+  lost the slot forever (same commit, CAS claim + give-back); 4/6-field
+  crons accepted as every-second tasks (`679b67b`); cron-parser 5.5 skipped
+  the spring-forward day for daily tasks — Kyiv lost a digest a year
+  (`c9aa584`). Mutation check: exact-slot `>=`, previous-fire off by 1s —
+  caught. The Rust/Scala ports were not checked for the same bugs.
 
 ## Findings
 
@@ -240,6 +254,19 @@ the real system, `[U]` unit property for complex logic.
   instead *lose* later same-second signals, so the real fix is a contract
   change — an id cursor (`after_id`) or sub-second timestamps. Pinned by the
   skipped test at the end of `signal-queue.test.ts`. Needs a decision.
+- **F3 a crash between claiming a slot and recording its signal loses
+  the slot** (scheduler). Errors are handled now (the claim is given back),
+  but a process kill in between still loses it: the claim and the signal are
+  two statements on one database. Fix would be one transaction across
+  `scheduled_tasks` and `signals` (both in `mcp_state`), which needs a
+  transactional seam between the two modules. Same at-most-once shape as F2.
+- **F4 cron-parser refuses "day that doesn't exist OR weekday"**, e.g.
+  `0 9 31 11 6` (Nov 31 or any Saturday in November): classic cron fires on
+  the Saturdays. Harmless in practice; the property accepts either answer.
+- **F5 cron-parser skips a day for a time inside a 30-minute DST gap**
+  (Australia/Lord_Howe, `15 2 * * *` on 2026-10-04) while it shifts times in
+  whole-hour gaps (Kyiv 03:30 → 04:30). Upstream inconsistency, irrelevant
+  zone; pinned by an `it.skip` in `scheduler.test.ts`.
 - **F2 delivery is at-most-once.** `get_next_signal` marks the signal
   consumed when it pops it, so a supervisor that crashes after the pop and
   before handling loses the signal for good (no lease / ack). Possibly
@@ -249,3 +276,5 @@ the real system, `[U]` unit property for complex logic.
 
 - 2026-10-12 claude — loop set up: goals, testing model, backlog.
 - 2026-10-12 claude — signal queue suite + test DB helper; F1, F2.
+- 2026-10-12 claude — scheduler suite + wall-clock cron oracle; 5 bugs fixed
+  (3 commits); F3–F5.
