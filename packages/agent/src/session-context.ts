@@ -24,6 +24,7 @@ export interface EnvData {
   timezone: string;
   userEmail: string | null;
   newsLastReadAt: string | null;
+  techLastReadAt: string | null;
 }
 
 // A caller-supplied label. The store neither parses nor validates JSON.
@@ -133,6 +134,7 @@ export async function gatherEnvData(deps: EnvDataDeps, signal?: AbortSignal): Pr
     timezone: tz,
     userEmail: deps.userEmail,
     newsLastReadAt: deps.memory.get(MEMORY_KEYS.newsLastReadAt),
+    techLastReadAt: deps.memory.get(MEMORY_KEYS.techLastReadAt),
   };
 }
 
@@ -145,6 +147,7 @@ export function renderContext(env: EnvData): string {
   if (env.userEmail) lines.push(`- User email: ${env.userEmail}`);
   lines.push(
     `- News last read at: ${env.newsLastReadAt ?? "never (bootstrap with now - 24h)"}`,
+    `- Tech last read at: ${env.techLastReadAt ?? "never (bootstrap with now - 24h)"}`,
   );
   return lines.join("\n");
 }

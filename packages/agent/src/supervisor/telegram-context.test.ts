@@ -22,7 +22,7 @@ function message(id: number, text: string, overrides: Record<string, unknown> = 
 function setup(messages: unknown[] = []) {
   const context = createSessionContext({
     id: "telegram:1",
-    env: { now: new Date("2026-09-06T12:00:00Z"), timezone: "UTC", userEmail: null, newsLastReadAt: null },
+    env: { now: new Date("2026-09-06T12:00:00Z"), timezone: "UTC", userEmail: null, newsLastReadAt: null, techLastReadAt: null },
   });
   const mcp = { callTool: vi.fn(async () => JSON.stringify({ messages })) };
   const trace = nullTracer.trace({ id: "test", name: "test" });

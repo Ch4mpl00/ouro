@@ -337,6 +337,7 @@ function renderSignalPrompt(req: CompileRequest): string {
   }
   lines.push(
     `News last read at: ${req.envData.newsLastReadAt ?? "never (bootstrap with now - 24h)"}`,
+    `Tech last read at: ${req.envData.techLastReadAt ?? "never (bootstrap with now - 24h)"}`,
   );
   lines.push("</env>");
   lines.push("");

@@ -133,6 +133,7 @@ function makeReq(): CompileRequest {
       timezone: "Europe/Kiev",
       userEmail: "user@example.com",
       newsLastReadAt: "2026-06-02T18:00:00Z",
+      techLastReadAt: "2026-06-02T05:00:00Z",
     },
     parentTrace: recordingTrace() as TraceContext,
     signalLabel: "telegram:1",
@@ -244,6 +245,10 @@ describe("compiler.compile — happy path", () => {
     expect(userText).toContain("что нового");
     expect(userText).toContain("<env>");
     expect(userText).toContain("Europe/Kiev");
+    // Each digest reads from its own watermark — the tech digest used to see
+    // only the news one and skipped everything between the two runs.
+    expect(userText).toContain("News last read at: 2026-06-02T18:00:00Z");
+    expect(userText).toContain("Tech last read at: 2026-06-02T05:00:00Z");
     expect(userText).toContain("<envContext>");
     expect(userText).toContain("285083560");
     expect(userText).not.toContain("<tools>");

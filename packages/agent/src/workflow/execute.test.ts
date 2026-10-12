@@ -220,7 +220,7 @@ function fixedReadSkill(map: Record<string, string>): (
 
 const testSessionContext = () => createSessionContext({
   id: "test:1",
-  env: { now: new Date("2026-09-06T12:00:00Z"), timezone: "UTC", userEmail: null, newsLastReadAt: null },
+  env: { now: new Date("2026-09-06T12:00:00Z"), timezone: "UTC", userEmail: null, newsLastReadAt: null, techLastReadAt: null },
 });
 
 const baseCtx = () => ({

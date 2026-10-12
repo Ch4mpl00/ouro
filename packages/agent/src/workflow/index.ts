@@ -168,6 +168,7 @@ export function createWorkflowRunner(deps: WorkflowRunnerDeps): WorkflowRunner {
             timezone: envData.timezone,
             now: envData.now.toISOString(),
             newsLastReadAt: envData.newsLastReadAt,
+            techLastReadAt: envData.techLastReadAt,
             userEmail: envData.userEmail,
           },
           signal: {

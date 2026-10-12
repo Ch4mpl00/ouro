@@ -5,7 +5,7 @@ import { storeToolResult, TOOL_RESULT_INLINE_MAX_BYTES, TOOL_RESULT_PREVIEW_MAX_
 function memory() {
   return createSessionContext({
     id: "test",
-    env: { now: new Date(), timezone: "UTC", userEmail: null, newsLastReadAt: null },
+    env: { now: new Date(), timezone: "UTC", userEmail: null, newsLastReadAt: null, techLastReadAt: null },
   }).memory;
 }
 

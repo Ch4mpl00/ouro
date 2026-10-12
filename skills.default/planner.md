@@ -246,8 +246,9 @@ pipeline is wired lives in the SHAPES below; this is just the routing:
 - `news-digest` — the full multi-category sweep: ANY generic news ask
   with no named subject — «новости / какие новости (за сегодня) / что
   нового / что происходит / дайджест / сводка / что важного».
-- `tech-digest` — IT/tech digest (YOU search the curated IT topics, the
-  skill filters + formats — see its shape).
+- `tech-digest` — IT/tech digest (YOU search the curated IT topics, a
+  `decide` filter keeps the relevant ones, the skill formats — see its
+  shape).
 - `news-query` — a question about a SPECIFIC topic / subject / region /
   person / event (the grounding rule above). Compose-only: YOU run
   `search_news` first, the skill judges relevance and writes the reply.
@@ -301,12 +302,14 @@ Fill args by reasoning + tool signatures. Notation: `→` sequence, `‖`
 independent (one `parallel`), `[compose:skill]` = `llm_compose` with that
 skill. Inline caps (NO source, stamp) are the easy-to-forget bits.
 
-- **IT digest** (scheduler/tech-digest):
-  `[chat history] ‖ [search_news: IT topics, NO source, k≤50] → [compose:tech-digest] → [send] ‖ [stamp tech_digest.last_read_at]`
-  (ONE `search_news` with IT-topic `queries`, NO `source` — never
-  per-source `list_news`/`search_news` fetches. `[chat history]` =
-  `get_telegram_chat_history(chatId=<lit>)`, required — the composer
-  dedups against the previous digests in it.)
+- **IT digest** (scheduler/tech-digest) — exactly this shape (full anchor
+  below):
+  `[search_news: the anchor's queries, NO source, k=50] ‖ [journal_tail tech-digest] → [decide preset=filter ← the anchor's rules] → [compose:tech-digest ← kept + previous digests] → [send] ‖ [stamp tech_digest.last_read_at] ‖ [journal_append tech-digest]`
+  (Copy the `queries`, the filter `prompt` and the compose `prompt` from
+  the anchor verbatim. ONE `search_news`, NO `source` — never per-source
+  fetches. sinceISO: COPY the env **Tech** last-read watermark verbatim —
+  never the News one. `search_news` answers `{count, results}`, so the
+  filter takes `${hits.results}` — not `.items`, which is `list_news`'s.)
 - **News digest** (scheduler/news-digest tick AND a telegram sweep ask) —
   exactly this shape (full anchor below):
   `[list_news(source="channel")] ‖ [journal_tail news-digest] → [decide preset=filter ← the anchor's rules] → [compose:news-digest ← kept posts + previous digests] → [send] ‖ [stamp news_digest.last_read_at] ‖ [journal_append news-digest]`
@@ -391,6 +394,26 @@ profile, the compose prompt assigns the step its role:
 {"kind":"terminal"}
 ```
 
+### Format anchor — IT digest
+
+Same structure as the news digest; copy the `queries` and both `prompt`
+strings character for character:
+```
+{"kind":"parallel","steps":[
+ {"kind":"tool","tool":"search_news","args":{"queries":["AI model releases and benchmarks from Anthropic, OpenAI, Google DeepMind, DeepSeek, Mistral, xAI, Meta — релиз новой модели","LLM agents: tool use, planning, multi-agent systems, MCP — ИИ-агенты","LLM training and inference: fine-tuning, distillation, RLHF, MoE, quantization, KV cache, speculative decoding","open-weights models, evals and benchmarks of language models","AI coding tools: Cursor, Claude Code, Copilot, Cline, Aider, Codex — ИИ для разработчиков","RAG, vector databases, embeddings, agent frameworks — infrastructure for AI","TypeScript, Node.js and PHP: framework releases, notable libraries","React and Vue: major front-end framework news"],"k":50,"sinceISO":"<tech watermark>"},"bind":"hits"},
+ {"kind":"tool","tool":"journal_tail","args":{"stream":"tech-digest","n":2},"bind":"sent"}]}
+{"kind":"decide","preset":"filter","items":"${hits.results}","bind":"kept",
+ "prompt":"items — IT news candidates from a coarse semantic search over Hacker News, Habr and Telegram IT channels; most of them are off-topic. Pass only items that genuinely fit the reader's interests. AI and LLMs: frontier labs (Anthropic, OpenAI, DeepSeek, Google DeepMind, Mistral, xAI, Meta AI), model releases and benchmarks, agentic patterns (tool use, planning, multi-agent), training (MoE, distillation, fine-tuning, RLHF/DPO), inference (KV cache, speculative decoding, quantization), the open-weights ecosystem, evals, prompt engineering at scale, AI developer tooling (Cursor, Claude Code, Copilot, Cline, Aider), AI-native infrastructure (RAG, vector databases, agent frameworks, MCP). Frameworks: major updates or new frameworks in the TypeScript/Node.js or PHP ecosystems, notable libraries, major Vue or React news. SKIP: vague AI hype and opinion pieces, business-only stories with no technical content (funding, IPOs, executives' statements, regulation), basic tutorials and listicles, personal side projects of no wider interest, programming topics outside these interests. Each item is judged on its own; duplicates do not matter."}
+{"kind":"llm_compose","skill":"tech-digest","preset":"smart",
+ "prompt":"input.candidates already passed a relevance filter — every item fits the reader's interests, none is noise to re-screen. input.history is the previous IT digests already sent, newest first: drop every item they covered. Pick the strongest 5–10, group them by theme and compose the digest message. Fewer than 3 left → a short quiet-day message.",
+ "input":{"candidates":"${kept}","history":"${sent.entries}","now":"${env.now}"},"bind":"digest"}
+{"kind":"parallel","steps":[
+ {"kind":"tool","tool":"send_telegram_message","args":{"chatId":<lit>,"text":"${digest}"}},
+ {"kind":"tool","tool":"set_memory","args":{"key":"tech_digest.last_read_at","value":"${env.now}"}},
+ {"kind":"tool","tool":"journal_append","args":{"stream":"tech-digest","body":"${digest}"}}]}
+{"kind":"terminal"}
+```
+
 ### Reformulating a news search
 
 `search_news` matches *meaning*, so don't echo the user's words and don't
@@ -428,6 +451,9 @@ A genuinely single, narrow topic → a plain `query` string is fine.
   `compose:news-digest` → send ‖ stamp ‖ `journal_append`, both prompts
   copied verbatim from its anchor. No `chunks`, no map steps, no chat
   history.
+- IT digest: the same shape over `search_news` (the anchor's queries,
+  sinceISO = the Tech watermark, filter on `${hits.results}`), stream
+  `tech-digest`.
 - `search_news`: no `source`, ≤8 queries, `k` ≤ 50, one step per ask.
 - `llm_compose` with a `skill`: data via `input`, no duplicated prompt.
 - Don't pre-fetch fat data into args — fetch via a `tool` step, bind,

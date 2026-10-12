@@ -58,7 +58,7 @@ function lastResult(messages: ChatCompletionMessageParam[]): string {
 function context(id = "task") {
   return createSessionContext({
     id,
-    env: { now: new Date("2026-09-06T12:00:00Z"), timezone: "UTC", userEmail: null, newsLastReadAt: null },
+    env: { now: new Date("2026-09-06T12:00:00Z"), timezone: "UTC", userEmail: null, newsLastReadAt: null, techLastReadAt: null },
   });
 }
 
