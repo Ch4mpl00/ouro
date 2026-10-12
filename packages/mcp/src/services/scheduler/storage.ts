@@ -23,8 +23,13 @@ export interface ScheduledTasks {
   // Tasks that may still fire — recurring (always) or one-shots that haven't
   // fired yet. Used by both the poller and list_scheduled_tasks.
   listActive(): Promise<ScheduledTaskRow[]>;
-  // Stamps the slot fired for. For a one-shot this also retires it.
-  markFired(id: number, slotUnix: number): Promise<void>;
+  // Compare-and-set of the slot last fired for: moves last_run_at from
+  // `expected` to `next` only while it still is `expected` and the task still
+  // exists. The poller claims a slot with it (previous → slot), so
+  // overlapping ticks or a cancel in between can't fire it as well, and
+  // gives a claim back (slot → previous) when the signal couldn't be
+  // recorded. Stamping a slot on a one-shot also retires it.
+  swapLastRun(id: number, expected: number | null, next: number | null): Promise<boolean>;
   delete(id: number): Promise<boolean>;
 }
 
@@ -51,8 +56,12 @@ export function createScheduledTasks(db: StateDb): ScheduledTasks {
       return rows;
     },
 
-    markFired: async (id, slotUnix) => {
-      await db.pool.query("UPDATE scheduled_tasks SET last_run_at = $1 WHERE id = $2", [slotUnix, id]);
+    swapLastRun: async (id, expected, next) => {
+      const { rowCount } = await db.pool.query(
+        "UPDATE scheduled_tasks SET last_run_at = $1 WHERE id = $2 AND last_run_at IS NOT DISTINCT FROM $3",
+        [next, id, expected],
+      );
+      return (rowCount ?? 0) > 0;
     },
 
     delete: async (id) => {

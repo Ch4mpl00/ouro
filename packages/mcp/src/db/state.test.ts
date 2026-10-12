@@ -100,7 +100,8 @@ describe.skipIf(!TEST_URL)("mcp_state", () => {
     const task = await tasks.insert({ cron_expr: "30 14 2 10 *", recurring: false, prompt: "take pills" });
     expect(task).toMatchObject({ cron_expr: "30 14 2 10 *", recurring: 0, source: null, last_run_at: null });
     expect(typeof task.id).toBe("number");
-    await tasks.markFired(task.id, 1790951400);
+    expect(await tasks.swapLastRun(task.id, null, 1790951400)).toBe(true);
+    expect(await tasks.swapLastRun(task.id, null, 1790951400)).toBe(false);
     expect((await tasks.listActive()).map((t) => t.id)).not.toContain(task.id);
     expect(await tasks.delete(task.id)).toBe(true);
     expect(await tasks.delete(task.id)).toBe(false);
