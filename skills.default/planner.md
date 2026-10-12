@@ -304,7 +304,7 @@ skill. Inline caps (NO source, stamp) are the easy-to-forget bits.
 
 - **IT digest** (scheduler/tech-digest) — exactly this shape (full anchor
   below):
-  `[search_news: the anchor's queries, NO source, k=150] ‖ [journal_tail tech-digest] → [decide preset=filter ← the anchor's rules] → [compose:tech-digest ← kept + previous digests] → [send] ‖ [stamp tech_digest.last_read_at] ‖ [journal_append tech-digest]`
+  `[search_news: the anchor's queries, NO source, k=150] ‖ [journal_tail tech-digest] → [decide preset=filter ← the anchor's rules] → [compose:tech-digest ← kept + previous digests] → [send] → [stamp tech_digest.last_read_at] ‖ [journal_append tech-digest]`
   (Copy the `queries`, the filter `prompt` and the compose `prompt` from
   the anchor verbatim. ONE `search_news`, NO `source` — never per-source
   fetches. sinceISO: COPY the env **Tech** last-read watermark verbatim —
@@ -312,7 +312,7 @@ skill. Inline caps (NO source, stamp) are the easy-to-forget bits.
   filter takes `${hits.results}` — not `.items`, which is `list_news`'s.)
 - **News digest** (scheduler/news-digest tick AND a telegram sweep ask) —
   exactly this shape (full anchor below):
-  `[list_news(source="channel")] ‖ [journal_tail news-digest] → [decide preset=filter ← the anchor's rules] → [compose:news-digest ← kept posts + previous digests] → [send] ‖ [stamp news_digest.last_read_at] ‖ [journal_append news-digest]`
+  `[list_news(source="channel")] ‖ [journal_tail news-digest] → [decide preset=filter ← the anchor's rules] → [compose:news-digest ← kept posts + previous digests] → [send] → [stamp news_digest.last_read_at] ‖ [journal_append news-digest]`
   (Copy the filter `prompt` and the compose `prompt` from the anchor
   verbatim. Compose on `smart`. sinceISO: an explicit period («за сегодня /
   за день») → the literal boundary per the time-words rule; otherwise COPY
@@ -358,8 +358,10 @@ skill. Inline caps (NO source, stamp) are the easy-to-forget bits.
   `[fetch what's needed] → [replan: carry it]`  → next pass plans the action
 
 **Digests stamp their watermark in the same workflow**: `set_memory`
-(`…_digest.last_read_at`, value `${env.now}`), in `parallel` with the send.
-An ad-hoc `news-query` does NOT stamp.
+(`…_digest.last_read_at`, value `${env.now}`) and the `journal_append`,
+together in one `parallel` step AFTER the send — never alongside it. A
+send that fails must leave both untouched, or the next digest skips posts
+the user never got. An ad-hoc `news-query` does NOT stamp.
 
 ### Format anchor — the bill, fully written
 
@@ -387,8 +389,8 @@ profile, the compose prompt assigns the step its role:
 {"kind":"llm_compose","skill":"news-digest","preset":"smart",
  "prompt":"input.posts already passed a relevance filter — every post is worth considering, none is noise to re-screen. input.history is the previous digests already sent, newest first: drop every event they covered unless a post adds a substantive new development, and then report only that development. Apply the skill's categories, significance bar and consolidation (merge posts about the same event into one bullet), then compose the digest message. No posts left → a short quiet-day message.",
  "input":{"posts":"${kept}","history":"${sent.entries}","now":"${env.now}"},"bind":"digest"}
+{"kind":"tool","tool":"send_telegram_message","args":{"chatId":<lit>,"text":"${digest}"}}
 {"kind":"parallel","steps":[
- {"kind":"tool","tool":"send_telegram_message","args":{"chatId":<lit>,"text":"${digest}"}},
  {"kind":"tool","tool":"set_memory","args":{"key":"news_digest.last_read_at","value":"${env.now}"}},
  {"kind":"tool","tool":"journal_append","args":{"stream":"news-digest","body":"${digest}"}}]}
 {"kind":"terminal"}
@@ -407,8 +409,8 @@ strings character for character:
 {"kind":"llm_compose","skill":"tech-digest","preset":"smart",
  "prompt":"input.candidates already passed a relevance filter — every item fits the reader's interests, none is noise to re-screen. input.history is the previous IT digests already sent, newest first: drop every item they covered. Pick the strongest 5–10, group them by theme and compose the digest message. Fewer than 3 left → a short quiet-day message.",
  "input":{"candidates":"${kept}","history":"${sent.entries}","now":"${env.now}"},"bind":"digest"}
+{"kind":"tool","tool":"send_telegram_message","args":{"chatId":<lit>,"text":"${digest}"}}
 {"kind":"parallel","steps":[
- {"kind":"tool","tool":"send_telegram_message","args":{"chatId":<lit>,"text":"${digest}"}},
  {"kind":"tool","tool":"set_memory","args":{"key":"tech_digest.last_read_at","value":"${env.now}"}},
  {"kind":"tool","tool":"journal_append","args":{"stream":"tech-digest","body":"${digest}"}}]}
 {"kind":"terminal"}
@@ -448,9 +450,9 @@ A genuinely single, narrow topic → a plain `query` string is fine.
   `llm_agent`.
 - Delivery is your explicit `send` step (an agent sends only when it owns
   the whole conversational turn).
-- Digest workflows stamp their watermark; ad-hoc queries don't.
+- Digest workflows stamp their watermark (and journal) AFTER the send, never in parallel with it; ad-hoc queries don't stamp.
 - News digest: `list_news` ‖ `journal_tail` → `decide:filter` → ONE
-  `compose:news-digest` → send ‖ stamp ‖ `journal_append`, both prompts
+  `compose:news-digest` → send → stamp ‖ `journal_append`, both prompts
   copied verbatim from its anchor. No `chunks`, no map steps, no chat
   history.
 - IT digest: the same shape over `search_news` (the anchor's queries,

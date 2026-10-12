@@ -173,7 +173,9 @@ When unsure "consolidate or skip" → prefer skip.
 - **Ruthless filtering > completeness.** A clean 4-item digest beats a
   20-item digest with filler. Quiet day → short "тихий день" message
   with 1–2 things.
-- **One message.** If > 4000 chars, drop lowest-priority items.
+- **Aim for one message (~4000 chars).** A longer digest is delivered as
+  several consecutive messages, so never drop a significant item just to fit
+  — trim filler and low-priority items instead.
 - **Date format**: `9 мая`, `28 сентября`, `1 января`. Never ISO or DMY.
 - **Don't fabricate.** Don't infer scale / casualties / motives not
   stated.

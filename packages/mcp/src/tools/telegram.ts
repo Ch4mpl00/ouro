@@ -1,15 +1,23 @@
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import {
-  sendMessage,
   editMessageText,
   sendChatAction,
   getDefaultChatId,
   startTyping,
   stopTyping,
   sendStatus,
+  PartialSendError,
+  TELEGRAM_TEXT_LIMIT,
+  sendLongMessage,
+  type SentMessage,
   type TelegramLog,
 } from "../services/telegram";
+
+// The longest text send_telegram_message takes. Anything over Telegram's 4096
+// goes out as several messages; the cap only stops a runaway text from
+// becoming a flood.
+const MAX_SEND_CHARS = 4 * TELEGRAM_TEXT_LIMIT;
 import { jsonResult } from "../result";
 
 // Telegram chat ids are numbers, but the model sometimes emits them as
@@ -45,9 +53,12 @@ export function registerTelegramSendTools(server: McpServer, log: TelegramLog): 
         "returned messageId can be persisted and passed to edit_telegram_message " +
         "later (e.g. to mark a bill as paid). The outgoing message is also " +
         "recorded in the local Telegram chat log so the conversation history " +
-        "stays in sync.",
+        "stays in sync.\n\n" +
+        "A text over Telegram's 4096-character limit is sent as several " +
+        "consecutive messages, split at blank lines where possible; " +
+        "`messageIds` lists them all and `messageId` is the first.",
       inputSchema: {
-        text: z.string().min(1).max(4096),
+        text: z.string().min(1).max(MAX_SEND_CHARS),
         chatId: chatIdAsString
           .optional()
           .describe("Telegram chat id. Falls back to TELEGRAM_DEFAULT_CHAT_ID if omitted."),
@@ -67,23 +78,42 @@ export function registerTelegramSendTools(server: McpServer, log: TelegramLog): 
           "No chat target. Pass chatId, or set TELEGRAM_DEFAULT_CHAT_ID in .env (find your id with `pnpm telegram:get-chat-id`).",
         );
       }
-      const sent = await sendMessage({ chatId: target, text, messageThreadId });
+      // One log row per Telegram message, so the chat history matches what
+      // the user actually sees — including the parts of a send that failed
+      // partway, which are in the chat all the same.
+      const record = async (messages: SentMessage[], parts: string[]) => {
+        for (const [i, message] of messages.entries()) {
+          await log.record({
+            chatId: message.chat.id,
+            tgMessageId: message.message_id,
+            threadId: messageThreadId ?? null,
+            role: "assistant",
+            text: parts[i] ?? "",
+          });
+        }
+      };
+      let result: Awaited<ReturnType<typeof sendLongMessage>>;
+      try {
+        result = await sendLongMessage({ chatId: target, text, messageThreadId });
+      } catch (err) {
+        if (err instanceof PartialSendError) await record(err.delivered, err.parts);
+        throw err;
+      }
+      const { parts, sent } = result;
+      const first = sent[0];
+      if (!first) throw new Error("Nothing to send: the text is only whitespace.");
       // Outgoing message clears the bot's typing indicator client-side;
       // also stop our keep-alive so it doesn't bleed into the next session.
       stopTyping(target, messageThreadId);
-      await log.record({
-        chatId: sent.chat.id,
-        tgMessageId: sent.message_id,
-        threadId: messageThreadId ?? null,
-        role: "assistant",
-        text,
-      });
+      await record(sent, parts);
       return jsonResult({
         delivered: true,
         chatId: target,
-        messageId: sent.message_id,
+        messageId: first.message_id,
+        messageIds: sent.map((m) => m.message_id),
+        parts: sent.length,
         messageThreadId: messageThreadId ?? null,
-        date: new Date(sent.date * 1000).toISOString(),
+        date: new Date(first.date * 1000).toISOString(),
       });
     },
   );

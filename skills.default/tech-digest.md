@@ -81,7 +81,9 @@ basic tutorials.
 ## Rules
 
 - **< 3 matches → return a short "тихий день" message and stop.**
-- **One Telegram-sized message.** If > 4000 chars, drop lowest priority.
+- **Aim for one message (~4000 chars).** A longer digest is delivered as
+  several consecutive messages, so never drop a significant item just to fit
+  — trim filler and low-priority items instead.
 - **Russian, terse.** Each TL;DR ≤ 2 sentences.
 - **Don't fabricate.** Unclear / missing body → say so or skip.
 - **Don't quote prices / dates / version numbers** unless present in the
