@@ -484,9 +484,11 @@ export function createMemoryService(deps: MemoryServiceDeps): MemoryService {
     },
 
     updateFact: async (input) => {
+      const body = input.body?.trim();
+      if (body === "") throw new MemoryError("empty_body", "A fact needs a body.");
       const updated = await store.updateFact({
         id: input.id,
-        body: input.body?.trim(),
+        body,
         tags: input.tags === undefined ? undefined : normalizeTags(input.tags),
         state: input.state,
       });
