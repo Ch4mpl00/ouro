@@ -98,6 +98,18 @@ Distilled from `~/Code/tickets-booking/AGENTS.md` and `test/properties/`
   elsewhere (e.g. `packages/<pkg>/test/`).
 - Docker is available locally; tests needing it must skip cleanly without
   it, like the existing Postgres tests.
+- **Integration suites live in `packages/<pkg>/test/`** (in vitest's and
+  tsconfig's include). `packages/mcp/test/support/database.ts` gives a suite
+  its own Postgres (`testDatabase()`: Testcontainers, or fresh databases in
+  `TEST_DATABASE_URL` incl. a private `mcp_state`) and `databaseAvailable()`
+  for `describe.skipIf`. `packages/mcp/test/signal-queue.test.ts` is the
+  reference shape: observation → strict reply schemas → typed ops →
+  named outcome/effect/frame rules → witnesses.
+- A full-toolset server is **single-session**; for several MCP sessions
+  start a second, scoped instance on the same database
+  (`startServer(url, ["signals"])`).
+- fast-check gotcha: `fc.array(..., { maxLength })` still generates short
+  arrays unless `size: "max"` is given — sequences silently stay trivial.
 
 ## Iteration procedure
 
@@ -142,76 +154,98 @@ suites, stronger generators, scenarios from `.claude/tasks/*.md` and
 Ordered by expected bug yield. `[I]` integration, `[P]` property suite over
 the real system, `[U]` unit property for complex logic.
 
-1. **Signal queue** `[I][P]` — `signals.record` → `get_next_signal` →
-   `list_signals` over MCP + PG. Rules: each recorded signal is delivered
-   at most once (and at least once while a consumer polls), delivery order,
-   `envContext` round-trips, concurrent consumers on separate sessions never
-   receive the same signal, restart of the server loses nothing.
-2. **Scheduler** `[I][P]` — `schedule_task` / `list_scheduled_tasks` /
+1. **Scheduler** `[I][P]` — `schedule_task` / `list_scheduled_tasks` /
    `cancel_scheduled_task` + the scheduler tick turning due cron rows into
    signals. Controlled clock: before/at/after a due time, no double fire
    across ticks or concurrent tickers, cancelled never fires, timezone and
    DST edges (`set_timezone`), invalid cron refused without side effects.
-3. **Guarded fetch** `[I][P]` — `services/fetch` + `tools/fetch.ts`: no
+2. **Guarded fetch** `[I][P]` — `services/fetch` + `tools/fetch.ts`: no
    request ever reaches a private / loopback / link-local address, including
    via redirects, DNS answers and odd IP spellings; size / timeout limits.
-4. **Telegram transport** `[I]` — fake Bot API over HTTP:
+3. **Telegram transport** `[I]` — fake Bot API over HTTP:
    `send_telegram_message` (splitting, the chat log in `mcp_state`),
    `edit_telegram_message`, `get_telegram_chat_history`; the getUpdates
    poller: cursor advances only after signals are durable, restart neither
-   loses nor duplicates updates, 409 handling.
-5. **Supervisor end to end** `[I]` — real MCP server (in-process) + scripted
+   loses nor duplicates updates, 409 handling. Probe text Postgres can't
+   store (`\u0000`, lone surrogates): `signals.record` will throw — does the
+   poller stall its cursor forever, skip, or lose the update? Same for Gmail.
+4. **Supervisor end to end** `[I]` — real MCP server (in-process) + scripted
    ChatProvider: routing by source (`scheduler` → workflow, others →
    AgentLoop), compile failure degrades to AgentLoop in the same trace,
    execute failure goes to recovery and is not retried, every signal is
    handled exactly once, telegram history preload.
-6. **Workflow runtime** `[U][P]` — `workflow/dsl.ts`, `variables.ts`,
+5. **Workflow runtime** `[U][P]` — `workflow/dsl.ts`, `variables.ts`,
    `execute.ts`, `compile.ts`: generated valid workflows execute
    step-by-step with observable effects only through tool calls; failures
    stop at the failing step; no tool side effect is replayed on retry;
    `${path}` substitution never leaks unresolved placeholders; parse ∘
    print round-trips. (Existing example tests are large — complement them,
    don't duplicate.)
-7. **AgentLoop + providers + retry** `[I]` — scripted provider over the
+6. **AgentLoop + providers + retry** `[I]` — scripted provider over the
    real loop: tool results threaded back, turn limits, sub-agent
    delegation, transient vs permanent errors, abort propagation, no
    automatic replay of tool calls.
-8. **Memory facts and projects over MCP** `[I][P]` — `remember` /
+7. **Memory facts and projects over MCP** `[I][P]` — `remember` /
    `get_fact` / `update_fact` / `recall` / `list_memory` / `create_project`
    / `doc_history`: lifecycle states, `recall` refs always resolve via
    `read_doc` / `get_fact`, index rows agree with stored bodies, indexing
    failure never fails a write (embedder down), `MCP_MEMORY_ACTOR` stamped.
    Documents themselves are covered by the reference model — look for gaps
    only.
-9. **Gmail poller** `[I]` — fake Gmail API: watermark monotonic, no lost or
+8. **Gmail poller** `[I]` — fake Gmail API: watermark monotonic, no lost or
    duplicated mail across restarts and partial failures, attachment
    download path safety.
-10. **News store** `[I][P]` — `list_news` / `fetch_article` / `search_news`
+9. **News store** `[I][P]` — `list_news` / `fetch_article` / `search_news`
     with fake providers + word embedder: upsert idempotency, dedup, `k`
     bounds, filters, NULL-embedding rows still listable, backfill drains.
-11. **Tool scoping and transport** `[I][P]` — any `MCP_TOOLSETS` subset →
+10. **Tool scoping and transport** `[I][P]` — any `MCP_TOOLSETS` subset →
     `tools/list` is exactly the union of those groups; unknown name is a
     boot error; multi-session isolation in `http-transport`.
-12. **Skills** `[I]` — agent two-layer loader (live → default, patch
+11. **Skills** `[I]` — agent two-layer loader (live → default, patch
     overlay) and the MCP `read_skill` export agree on the composed
     instructions for generated bodies/patches (the two `appendPatch`
     copies must not drift).
-13. **Gateway** `[I]` — fake upstream MCP server: namespacing, upstream
+12. **Gateway** `[I]` — fake upstream MCP server: namespacing, upstream
     failure isolated from own tools, reconnect.
-14. **Agent sqlite state** `[I]` — memory KV + trace mirror
+13. **Agent sqlite state** `[I]` — memory KV + trace mirror
     (`db/trace-store.ts`): migrations on boot idempotent, trace/judgement
     invariants.
-15. **`mcp_state` boot** `[I]` — migrations idempotent, two servers booting
+14. **`mcp_state` boot** `[I]` — migrations idempotent, two servers booting
     at once (advisory lock).
-16. **Monobank, PDF, files tools** `[I]` — fake HTTP; `read_file` path
+15. **Monobank, PDF, files tools** `[I]` — fake HTTP; `read_file` path
     confinement.
-17. **Evals (`judging/`, `eval/`), `packages/codex`** — P3, services are
+16. **Evals (`judging/`, `eval/`), `packages/codex`** — P3, services are
     off; only if everything above is done.
 
 ## Done
 
+- **Signal queue** (2026-10-12, `packages/mcp/test/signal-queue.test.ts`) —
+  generated record / `get_next_signal` / `list_signals` sequences over MCP
+  against Postgres, judged on observed rows: oldest-first delivery with
+  progress, exact round-trip (unicode, 20k chars, empty), wire time format,
+  `pendingAfter`, consumed flag, list filters / limit / completeness /
+  ordering, invalid `limit` / `since` refused, frames on every op incl.
+  refusals; witnesses for the rare cases. Race: 3 producers × 6 consumer
+  loops over two MCP instances → exactly once + no overtaking. Mutation
+  check: pop newest, pop not consuming, no row lock, inverted source
+  filter, limit +1 — all caught.
+
 ## Findings
+
+- **F1 `list_signals(since)` and the second-precision wire format.**
+  `created_at` goes out truncated to seconds, but `since` is compared at
+  microsecond precision. Copying a listed signal's `created_at` into
+  `since` (which the tool's own comment advertises) returns that signal
+  again plus its same-second siblings. Truncating the comparison would
+  instead *lose* later same-second signals, so the real fix is a contract
+  change — an id cursor (`after_id`) or sub-second timestamps. Pinned by the
+  skipped test at the end of `signal-queue.test.ts`. Needs a decision.
+- **F2 delivery is at-most-once.** `get_next_signal` marks the signal
+  consumed when it pops it, so a supervisor that crashes after the pop and
+  before handling loses the signal for good (no lease / ack). Possibly
+  intended; check how the supervisor copes in the supervisor-e2e item.
 
 ## Log
 
 - 2026-10-12 claude — loop set up: goals, testing model, backlog.
+- 2026-10-12 claude — signal queue suite + test DB helper; F1, F2.
