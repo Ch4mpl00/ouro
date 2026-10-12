@@ -75,15 +75,21 @@ async function pollSubscription(deps: GmailPollerDeps, sub: GmailSubscription, a
   console.log(`${logPrefix()} ${sub.name}: emitted ${emitted} signal(s)`);
 }
 
+// One poll of one subscription, as the interval runs it. Throws what the
+// poll throws; the interval logs it and tries again next time.
+export async function pollSubscriptionOnce(deps: GmailPollerDeps, sub: GmailSubscription): Promise<void> {
+  const accountKey = await deps.gmail.resolveAccountKey();
+  if (!accountKey) {
+    console.warn(`${logPrefix()} ${sub.name}: no Gmail account authorized — skipping`);
+    return;
+  }
+  await pollSubscription(deps, sub, accountKey);
+}
+
 function startSubscription(deps: GmailPollerDeps, sub: GmailSubscription): void {
   const tick = async (): Promise<void> => {
     try {
-      const accountKey = await deps.gmail.resolveAccountKey();
-      if (!accountKey) {
-        console.warn(`${logPrefix()} ${sub.name}: no Gmail account authorized — skipping`);
-        return;
-      }
-      await pollSubscription(deps, sub, accountKey);
+      await pollSubscriptionOnce(deps, sub);
     } catch (err) {
       console.error(`${logPrefix()} ${sub.name}: poll failed:`, err instanceof Error ? err.message : err);
     }

@@ -14,7 +14,14 @@ export interface GmailModule {
   client(accountKey: string): Promise<gmail_v1.Gmail>;
 }
 
-export function createGmailModule(deps: { db: StateDb }): GmailModule {
+export interface GmailModuleDeps {
+  db: StateDb;
+  // Where the Gmail API lives. Tests point it at a local fake; production
+  // leaves it to googleapis' default (https://gmail.googleapis.com/).
+  apiRootUrl?: string;
+}
+
+export function createGmailModule(deps: GmailModuleDeps): GmailModule {
   const store = createGmailStore(deps.db);
 
   return {
@@ -42,7 +49,7 @@ export function createGmailModule(deps: { db: StateDb }): GmailModule {
           console.error(`[gmail] persisting refreshed tokens failed:`, err instanceof Error ? err.message : err);
         });
       });
-      return google.gmail({ version: "v1", auth });
+      return google.gmail({ version: "v1", auth, ...(deps.apiRootUrl ? { rootUrl: deps.apiRootUrl } : {}) });
     },
   };
 }

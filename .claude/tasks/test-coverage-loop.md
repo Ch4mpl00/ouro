@@ -185,7 +185,21 @@ suites, stronger generators, scenarios from `.claude/tasks/*.md` and
 Ordered by expected bug yield. `[I]` integration, `[P]` property suite over
 the real system, `[U]` unit property for complex logic.
 
-1. **Gmail poller** `[I]` — fake Gmail API: watermark monotonic, no lost or
+1. **Gmail poller** `[I]` — IN PROGRESS (2026-10-12): seams committed
+   (`createGmailModule({ db, apiRootUrl })` points googleapis at a local
+   fake; `pollSubscriptionOnce(deps, sub)` exported). googleapis/gaxios 6
+   uses node-fetch, NOT global fetch — undici MockAgent does not intercept
+   it (a probe reached the real Google); use a local HTTP fake Gmail server
+   via `apiRootUrl` (+ GOOGLE_CLIENT_ID/SECRET/REDIRECT_URI env, an
+   `integration_account` row with a valid access_token/expiry). Two bugs
+   found by reading, to confirm with the test then fix: (a) the watermark is
+   saved only after the whole batch, so a failure midway re-emits the
+   already-signalled mails next tick (advance it per message); (b)
+   `listMessages(maxResults: 50)` with no pagination — more than 50 new
+   mails since the watermark (e.g. after an outage) keeps the newest 50 and
+   loses the rest for good (page through nextPageToken). Also worth a
+   finding: a mail indexed by Gmail search after a newer one was processed
+   is skipped forever (watermark by internalDate). — fake Gmail API: watermark monotonic, no lost or
    duplicated mail across restarts and partial failures, attachment
    download path safety.
 2. **News store** `[I][P]` — `list_news` / `fetch_article` / `search_news`
@@ -432,3 +446,4 @@ the real system, `[U]` unit property for complex logic.
 - 2026-10-12 claude — AgentLoop protocol + retry properties; no bugs.
 - 2026-10-12 claude — memory facts + index suite; 3 bugs fixed (2 commits);
   F9.
+- 2026-10-12 claude — Gmail poller started (seams only; usage limit hit).
