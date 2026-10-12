@@ -35,6 +35,7 @@ beforeEach(async () => {
       return logged.length;
     },
     history: async () => [],
+    edited: async () => {},
     lastUpdateId: async () => null,
     setLastUpdateId: async () => {},
   };

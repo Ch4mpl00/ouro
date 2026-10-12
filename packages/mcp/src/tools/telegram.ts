@@ -96,7 +96,9 @@ export function registerTelegramSendTools(server: McpServer, log: TelegramLog): 
       try {
         result = await sendLongMessage({ chatId: target, text, messageThreadId });
       } catch (err) {
-        if (err instanceof PartialSendError) await record(err.delivered, err.parts);
+        // The partial send is the story the model needs; a log failure on
+        // top of it must not replace it.
+        if (err instanceof PartialSendError) await record(err.delivered, err.parts).catch(() => undefined);
         throw err;
       }
       const { parts, sent } = result;
@@ -105,9 +107,18 @@ export function registerTelegramSendTools(server: McpServer, log: TelegramLog): 
       // Outgoing message clears the bot's typing indicator client-side;
       // also stop our keep-alive so it doesn't bleed into the next session.
       stopTyping(target, messageThreadId);
-      await record(sent, parts);
+      // The message is in the chat now. A failed log write must not turn that
+      // into a failure: the model would send it again.
+      let logError: string | undefined;
+      try {
+        await record(sent, parts);
+      } catch (err) {
+        logError = `delivered, but not recorded in the chat log: ${err instanceof Error ? err.message : String(err)}`;
+        console.error(`[send_telegram_message] ${logError}`);
+      }
       return jsonResult({
         delivered: true,
+        ...(logError ? { logError } : {}),
         chatId: target,
         messageId: first.message_id,
         messageIds: sent.map((m) => m.message_id),
@@ -138,7 +149,15 @@ export function registerTelegramTools(server: McpServer, log: TelegramLog): void
     },
     async ({ chatId, messageId, text }) => {
       const edited = await editMessageText({ chatId, messageId, text });
+      // The history the agent reads back should show what the user sees.
+      let logError: string | undefined;
+      try {
+        await log.edited(Number(chatId), messageId, text);
+      } catch (err) {
+        logError = `edited, but not updated in the chat log: ${err instanceof Error ? err.message : String(err)}`;
+      }
       return jsonResult({
+        ...(logError ? { logError } : {}),
         edited: true,
         chatId,
         messageId: edited.message_id,

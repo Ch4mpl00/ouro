@@ -57,7 +57,7 @@ function stubDeps(): ToolsetDeps {
     signals: { record: unused, popNext: unused, countPending: unused, list: unused },
     settings: { get: unused, set: unused, timezone: unused, setTimezone: unused },
     scheduler: { insert: unused, listActive: unused, swapLastRun: unused, delete: unused },
-    telegramLog: { record: unused, history: unused, lastUpdateId: unused, setLastUpdateId: unused },
+    telegramLog: { record: unused, history: unused, edited: unused, lastUpdateId: unused, setLastUpdateId: unused },
     gmail: {
       store: {
         getKv: unused,

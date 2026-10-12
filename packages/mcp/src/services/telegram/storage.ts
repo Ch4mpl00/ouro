@@ -21,6 +21,8 @@ export interface TelegramLog {
   // Last `limit` messages for a chat, chronologically. `threadId` undefined =
   // every topic; null = only the General / non-topic messages.
   history(chatId: number, limit?: number, threadId?: number | null): Promise<StoredMessage[]>;
+  // The bot edited one of its messages: the log shows what the chat shows.
+  edited(chatId: number, tgMessageId: number, text: string): Promise<void>;
   lastUpdateId(): Promise<number | null>;
   setLastUpdateId(id: number): Promise<void>;
 }
@@ -49,6 +51,14 @@ export function createTelegramLog(db: StateDb): TelegramLog {
         params,
       );
       return rows.reverse();
+    },
+
+    edited: async (chatId, tgMessageId, text) => {
+      await db.pool.query(
+        `UPDATE telegram_messages SET text = $3
+          WHERE chat_id = $1 AND tg_message_id = $2 AND role = 'assistant'`,
+        [chatId, tgMessageId, text],
+      );
     },
 
     lastUpdateId: async () => {
