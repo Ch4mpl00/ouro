@@ -185,36 +185,29 @@ suites, stronger generators, scenarios from `.claude/tasks/*.md` and
 Ordered by expected bug yield. `[I]` integration, `[P]` property suite over
 the real system, `[U]` unit property for complex logic.
 
-1. **Memory facts and projects over MCP** `[I][P]` — `remember` /
-   `get_fact` / `update_fact` / `recall` / `list_memory` / `create_project`
-   / `doc_history`: lifecycle states, `recall` refs always resolve via
-   `read_doc` / `get_fact`, index rows agree with stored bodies, indexing
-   failure never fails a write (embedder down), `MCP_MEMORY_ACTOR` stamped.
-   Documents themselves are covered by the reference model — look for gaps
-   only.
-2. **Gmail poller** `[I]` — fake Gmail API: watermark monotonic, no lost or
+1. **Gmail poller** `[I]` — fake Gmail API: watermark monotonic, no lost or
    duplicated mail across restarts and partial failures, attachment
    download path safety.
-3. **News store** `[I][P]` — `list_news` / `fetch_article` / `search_news`
+2. **News store** `[I][P]` — `list_news` / `fetch_article` / `search_news`
     with fake providers + word embedder: upsert idempotency, dedup, `k`
     bounds, filters, NULL-embedding rows still listable, backfill drains.
-4. **Tool scoping and transport** `[I][P]` — any `MCP_TOOLSETS` subset →
+3. **Tool scoping and transport** `[I][P]` — any `MCP_TOOLSETS` subset →
     `tools/list` is exactly the union of those groups; unknown name is a
     boot error; multi-session isolation in `http-transport`.
-5. **Skills** `[I]` — agent two-layer loader (live → default, patch
+4. **Skills** `[I]` — agent two-layer loader (live → default, patch
     overlay) and the MCP `read_skill` export agree on the composed
     instructions for generated bodies/patches (the two `appendPatch`
     copies must not drift).
-6. **Gateway** `[I]` — fake upstream MCP server: namespacing, upstream
+5. **Gateway** `[I]` — fake upstream MCP server: namespacing, upstream
     failure isolated from own tools, reconnect.
-7. **Agent sqlite state** `[I]` — memory KV + trace mirror
+6. **Agent sqlite state** `[I]` — memory KV + trace mirror
     (`db/trace-store.ts`): migrations on boot idempotent, trace/judgement
     invariants.
-8. **`mcp_state` boot** `[I]` — migrations idempotent, two servers booting
+7. **`mcp_state` boot** `[I]` — migrations idempotent, two servers booting
     at once (advisory lock).
-9. **Monobank, PDF, files tools** `[I]` — fake HTTP; `read_file` path
+8. **Monobank, PDF, files tools** `[I]` — fake HTTP; `read_file` path
     confinement.
-10. **Evals (`judging/`, `eval/`), `packages/codex`** — P3, services are
+9. **Evals (`judging/`, `eval/`), `packages/codex`** — P3, services are
     off; only if everything above is done.
 - **Provider tool-call ids** (P3, needs a live API) — the AgentLoop answers
   tool calls by `id`; no provider normalises ids. Check what Gemini's and
@@ -342,6 +335,21 @@ the real system, `[U]` unit property for complex logic.
   No bugs found. Mutation check: 408 not transient, 4xx transient, one retry
   too many, whitelist not enforced, a tool reply dropped, empty arguments
   rejected — all caught.
+- **Memory facts and the search index** (2026-10-12, `packages/mcp/test/memory-index.test.ts`)
+  — over MCP: generated remember / update_fact / get_fact / recall
+  sequences; stored exactly as asked (trim, tag normalisation), blank bodies
+  refused, partial updates change exactly their fields, after every step
+  the index is one row per fact mirroring body / tags / state, recall hits
+  resolve via get_fact with the same text, respect state / tags / limit,
+  and a fact asked for word for word is found. Through the module with a
+  random-latency embedder: racing fact updates and document appends leave
+  the index describing the last write; concurrent re-indexes of one source
+  leave one set of rows. **Bugs fixed:** update_fact stored a blank body
+  (`0e96479`); racing writes left the index on an older version (old body
+  found, archived fact still recalled) and concurrent re-indexes doubled
+  rows (`87d7985`). Mutation check: no source lock, fact / doc basis
+  ignored, blank update allowed, index ignoring archiving — all caught.
+  `pnpm spec` and `pnpm spec:model` green after the change.
 
 ## Findings
 
@@ -390,6 +398,14 @@ the real system, `[U]` unit property for complex logic.
   `edited_message` as a new row and queues a new signal, so the agent
   answers the edit as a fresh request and history shows both versions.
   Possibly intended (re-ask by editing); worth a decision.
+- **F9 `append_doc` can answer "raced" under contention.** It retries a
+  lost compare-and-swap only `APPEND_CAS_ATTEMPTS` = 3 times, so with 4+
+  appends to one document at once (one model turn issuing parallel
+  `append_doc` calls is enough) some fail, though the code comment says
+  append "absorbs the race instead of pushing it onto the caller". The
+  reference model allows a raced write, so this is a contract question:
+  retry until it lands (each lost round means another append won), or keep
+  the bound and say so in the tool description.
 - **F2 delivery is at-most-once.** `get_next_signal` marks the signal
   consumed when it pops it, so a supervisor that crashes after the pop and
   before handling loses the signal for good (no lease / ack). Possibly
@@ -414,3 +430,5 @@ the real system, `[U]` unit property for complex logic.
   cron-parser throws on Lord Howe's fall-back (F5) — zone dropped from the
   property.
 - 2026-10-12 claude — AgentLoop protocol + retry properties; no bugs.
+- 2026-10-12 claude — memory facts + index suite; 3 bugs fixed (2 commits);
+  F9.
