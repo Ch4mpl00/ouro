@@ -364,9 +364,9 @@ export async function filter<T>(decisions: DecisionClient, req: FilterRequest<T>
   const decideBatch = async (batch: number[], signal: AbortSignal): Promise<Array<[number, number]>> => {
     const questions: Record<string, Question<NoulAnswer>> = {};
     batch.forEach((_, k) => {
-      questions[`item_${k + 1}`] = noul(`Элемент №${k + 1} из items проходит правила из rules.`, {
-        true: "Проходит",
-        false: "Не проходит",
+      questions[`item_${k + 1}`] = noul(`Item ${k + 1} of items passes the rules in rules.`, {
+        true: "Passes",
+        false: "Does not pass",
       });
     });
     const decision = await decisions.decide({
