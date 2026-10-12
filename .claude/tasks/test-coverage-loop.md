@@ -113,6 +113,9 @@ Distilled from `~/Code/tickets-booking/AGENTS.md` and `test/properties/`
   so scheduler checks don't trust cron-parser.
 - Controlled synchronisation for races: wrap one injected dependency with a
   gate (see the cancel-during-tick test in `scheduler.test.ts`).
+- `startServer(url, toolsets, fetcher)` takes the guarded fetch, so a test
+  can let a local HTTP server play the public internet
+  (`createGuardedFetch({ isPrivate: (ip) => ip !== "127.0.0.1" })`).
 - fast-check gotcha: `fc.array(..., { maxLength })` still generates short
   arrays unless `size: "max"` is given — sequences silently stay trivial.
 
@@ -159,62 +162,59 @@ suites, stronger generators, scenarios from `.claude/tasks/*.md` and
 Ordered by expected bug yield. `[I]` integration, `[P]` property suite over
 the real system, `[U]` unit property for complex logic.
 
-1. **Guarded fetch** `[I][P]` — `services/fetch` + `tools/fetch.ts`: no
-   request ever reaches a private / loopback / link-local address, including
-   via redirects, DNS answers and odd IP spellings; size / timeout limits.
-2. **Telegram transport** `[I]` — fake Bot API over HTTP:
+1. **Telegram transport** `[I]` — fake Bot API over HTTP:
    `send_telegram_message` (splitting, the chat log in `mcp_state`),
    `edit_telegram_message`, `get_telegram_chat_history`; the getUpdates
    poller: cursor advances only after signals are durable, restart neither
    loses nor duplicates updates, 409 handling. Probe text Postgres can't
    store (`\u0000`, lone surrogates): `signals.record` will throw — does the
    poller stall its cursor forever, skip, or lose the update? Same for Gmail.
-3. **Supervisor end to end** `[I]` — real MCP server (in-process) + scripted
+2. **Supervisor end to end** `[I]` — real MCP server (in-process) + scripted
    ChatProvider: routing by source (`scheduler` → workflow, others →
    AgentLoop), compile failure degrades to AgentLoop in the same trace,
    execute failure goes to recovery and is not retried, every signal is
    handled exactly once, telegram history preload.
-4. **Workflow runtime** `[U][P]` — `workflow/dsl.ts`, `variables.ts`,
+3. **Workflow runtime** `[U][P]` — `workflow/dsl.ts`, `variables.ts`,
    `execute.ts`, `compile.ts`: generated valid workflows execute
    step-by-step with observable effects only through tool calls; failures
    stop at the failing step; no tool side effect is replayed on retry;
    `${path}` substitution never leaks unresolved placeholders; parse ∘
    print round-trips. (Existing example tests are large — complement them,
    don't duplicate.)
-5. **AgentLoop + providers + retry** `[I]` — scripted provider over the
+4. **AgentLoop + providers + retry** `[I]` — scripted provider over the
    real loop: tool results threaded back, turn limits, sub-agent
    delegation, transient vs permanent errors, abort propagation, no
    automatic replay of tool calls.
-6. **Memory facts and projects over MCP** `[I][P]` — `remember` /
+5. **Memory facts and projects over MCP** `[I][P]` — `remember` /
    `get_fact` / `update_fact` / `recall` / `list_memory` / `create_project`
    / `doc_history`: lifecycle states, `recall` refs always resolve via
    `read_doc` / `get_fact`, index rows agree with stored bodies, indexing
    failure never fails a write (embedder down), `MCP_MEMORY_ACTOR` stamped.
    Documents themselves are covered by the reference model — look for gaps
    only.
-7. **Gmail poller** `[I]` — fake Gmail API: watermark monotonic, no lost or
+6. **Gmail poller** `[I]` — fake Gmail API: watermark monotonic, no lost or
    duplicated mail across restarts and partial failures, attachment
    download path safety.
-8. **News store** `[I][P]` — `list_news` / `fetch_article` / `search_news`
+7. **News store** `[I][P]` — `list_news` / `fetch_article` / `search_news`
     with fake providers + word embedder: upsert idempotency, dedup, `k`
     bounds, filters, NULL-embedding rows still listable, backfill drains.
-9. **Tool scoping and transport** `[I][P]` — any `MCP_TOOLSETS` subset →
+8. **Tool scoping and transport** `[I][P]` — any `MCP_TOOLSETS` subset →
     `tools/list` is exactly the union of those groups; unknown name is a
     boot error; multi-session isolation in `http-transport`.
-10. **Skills** `[I]` — agent two-layer loader (live → default, patch
+9. **Skills** `[I]` — agent two-layer loader (live → default, patch
     overlay) and the MCP `read_skill` export agree on the composed
     instructions for generated bodies/patches (the two `appendPatch`
     copies must not drift).
-11. **Gateway** `[I]` — fake upstream MCP server: namespacing, upstream
+10. **Gateway** `[I]` — fake upstream MCP server: namespacing, upstream
     failure isolated from own tools, reconnect.
-12. **Agent sqlite state** `[I]` — memory KV + trace mirror
+11. **Agent sqlite state** `[I]` — memory KV + trace mirror
     (`db/trace-store.ts`): migrations on boot idempotent, trace/judgement
     invariants.
-13. **`mcp_state` boot** `[I]` — migrations idempotent, two servers booting
+12. **`mcp_state` boot** `[I]` — migrations idempotent, two servers booting
     at once (advisory lock).
-14. **Monobank, PDF, files tools** `[I]` — fake HTTP; `read_file` path
+13. **Monobank, PDF, files tools** `[I]` — fake HTTP; `read_file` path
     confinement.
-15. **Evals (`judging/`, `eval/`), `packages/codex`** — P3, services are
+14. **Evals (`judging/`, `eval/`), `packages/codex`** — P3, services are
     off; only if everything above is done.
 
 ## Done
@@ -243,6 +243,20 @@ the real system, `[U]` unit property for complex logic.
   the spring-forward day for daily tasks — Kyiv lost a digest a year
   (`c9aa584`). Mutation check: exact-slot `>=`, previous-fire off by 1s —
   caught. The Rust/Scala ports were not checked for the same bugs.
+- **Guarded fetch / fetch_url** (2026-10-12, `packages/mcp/test/fetch-guard.test.ts`)
+  — an independent 128-bit oracle (must refuse / either / must allow) over
+  every URL spelling of an address (dotted, decimal, hex, short, octal,
+  mapped dotted/hex, expanded, upper-case, NAT64): `assertPublicUrl` must
+  agree. Over MCP with the production guard: no loopback spelling reaches a
+  dual-stack local server. With a permissive guard: whole body or longest
+  whole-character prefix within `maxBytes` (also with a chunk boundary at
+  the cap), text vs binary types. **Bugs fixed:** SSRF bypass via
+  IPv4-mapped IPv6 — `http://[::ffff:127.0.0.1]/` fetched the local service
+  and `[::ffff:a9fe:a9fe]` reaches cloud metadata; CGNAT, NAT64 and most of
+  fe80::/10 also passed (`f6b8281`); exact-cap bodies flagged truncated and
+  a cut mid-character left U+FFFD (`d11e15a`). Mutation check: CGNAT / NAT64
+  dropped, fe80 narrowed, cap `>=`, byte cut — all caught. Rust port not
+  checked (it likely shares the string-prefix guard).
 
 ## Findings
 
@@ -267,6 +281,10 @@ the real system, `[U]` unit property for complex logic.
   (Australia/Lord_Howe, `15 2 * * *` on 2026-10-04) while it shifts times in
   whole-hour gaps (Kyiv 03:30 → 04:30). Upstream inconsistency, irrelevant
   zone; pinned by an `it.skip` in `scheduler.test.ts`.
+- **F6 `fetch_url` treats every `application/x-*` as binary**, so
+  `application/x-ndjson`, `x-yaml`, `x-javascript`, `x-www-form-urlencoded`
+  come back as "binary content not returned". Which x- types are text is a
+  judgement call (or sniff the bytes); not changed.
 - **F2 delivery is at-most-once.** `get_next_signal` marks the signal
   consumed when it pops it, so a supervisor that crashes after the pop and
   before handling loses the signal for good (no lease / ack). Possibly
@@ -278,3 +296,5 @@ the real system, `[U]` unit property for complex logic.
 - 2026-10-12 claude — signal queue suite + test DB helper; F1, F2.
 - 2026-10-12 claude — scheduler suite + wall-clock cron oracle; 5 bugs fixed
   (3 commits); F3–F5.
+- 2026-10-12 claude — fetch guard suite; SSRF bypass + fetch_url cap fixed;
+  F6.
