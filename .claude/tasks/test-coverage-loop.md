@@ -123,6 +123,16 @@ Distilled from `~/Code/tickets-booking/AGENTS.md` and `test/properties/`
   Set `TELEGRAM_ASSISTANT_BOT_TOKEN` / `TELEGRAM_DEFAULT_CHAT_ID` after
   `startServer` (it clears them). The same trick fakes any HTTP API the code
   calls with global fetch (Gmail, Monobank, OpenAI…).
+- Agent-side integration (`packages/agent/test/supervisor.test.ts`): the
+  agent may not import packages/mcp, so MCP is an in-process SDK
+  `McpServer` with fake tools reached through the real `connectMcp`
+  (`createTransport` → `InMemoryTransport.createLinkedPair()`); the LLM is a
+  scripted `ChatProvider` that reads the signal tag and its role (compiler
+  by preset model, recovery by its first message, else primary) and derives
+  the turn from the assistant messages so far — no per-signal state. Real
+  engine, workflow runner, skills.default, sqlite trace mirror on a temp
+  file. A standalone `startAgentLoop` records its own trace under its id —
+  read traces back before probing loop ids.
 - fast-check gotcha: `fc.array(..., { maxLength })` still generates short
   arrays unless `size: "max"` is given — sequences silently stay trivial.
 
@@ -169,52 +179,47 @@ suites, stronger generators, scenarios from `.claude/tasks/*.md` and
 Ordered by expected bug yield. `[I]` integration, `[P]` property suite over
 the real system, `[U]` unit property for complex logic.
 
-1. **Supervisor end to end** `[I]` — real MCP server (in-process) + scripted
-   ChatProvider: routing by source (`scheduler` → workflow, others →
-   AgentLoop), compile failure degrades to AgentLoop in the same trace,
-   execute failure goes to recovery and is not retried, every signal is
-   handled exactly once, telegram history preload.
-2. **Workflow runtime** `[U][P]` — `workflow/dsl.ts`, `variables.ts`,
+1. **Workflow runtime** `[U][P]` — `workflow/dsl.ts`, `variables.ts`,
    `execute.ts`, `compile.ts`: generated valid workflows execute
    step-by-step with observable effects only through tool calls; failures
    stop at the failing step; no tool side effect is replayed on retry;
    `${path}` substitution never leaks unresolved placeholders; parse ∘
    print round-trips. (Existing example tests are large — complement them,
    don't duplicate.)
-3. **AgentLoop + providers + retry** `[I]` — scripted provider over the
+2. **AgentLoop + providers + retry** `[I]` — scripted provider over the
    real loop: tool results threaded back, turn limits, sub-agent
    delegation, transient vs permanent errors, abort propagation, no
    automatic replay of tool calls.
-4. **Memory facts and projects over MCP** `[I][P]` — `remember` /
+3. **Memory facts and projects over MCP** `[I][P]` — `remember` /
    `get_fact` / `update_fact` / `recall` / `list_memory` / `create_project`
    / `doc_history`: lifecycle states, `recall` refs always resolve via
    `read_doc` / `get_fact`, index rows agree with stored bodies, indexing
    failure never fails a write (embedder down), `MCP_MEMORY_ACTOR` stamped.
    Documents themselves are covered by the reference model — look for gaps
    only.
-5. **Gmail poller** `[I]` — fake Gmail API: watermark monotonic, no lost or
+4. **Gmail poller** `[I]` — fake Gmail API: watermark monotonic, no lost or
    duplicated mail across restarts and partial failures, attachment
    download path safety.
-6. **News store** `[I][P]` — `list_news` / `fetch_article` / `search_news`
+5. **News store** `[I][P]` — `list_news` / `fetch_article` / `search_news`
     with fake providers + word embedder: upsert idempotency, dedup, `k`
     bounds, filters, NULL-embedding rows still listable, backfill drains.
-7. **Tool scoping and transport** `[I][P]` — any `MCP_TOOLSETS` subset →
+6. **Tool scoping and transport** `[I][P]` — any `MCP_TOOLSETS` subset →
     `tools/list` is exactly the union of those groups; unknown name is a
     boot error; multi-session isolation in `http-transport`.
-8. **Skills** `[I]` — agent two-layer loader (live → default, patch
+7. **Skills** `[I]` — agent two-layer loader (live → default, patch
     overlay) and the MCP `read_skill` export agree on the composed
     instructions for generated bodies/patches (the two `appendPatch`
     copies must not drift).
-9. **Gateway** `[I]` — fake upstream MCP server: namespacing, upstream
+8. **Gateway** `[I]` — fake upstream MCP server: namespacing, upstream
     failure isolated from own tools, reconnect.
-10. **Agent sqlite state** `[I]` — memory KV + trace mirror
+9. **Agent sqlite state** `[I]` — memory KV + trace mirror
     (`db/trace-store.ts`): migrations on boot idempotent, trace/judgement
     invariants.
-11. **`mcp_state` boot** `[I]` — migrations idempotent, two servers booting
+10. **`mcp_state` boot** `[I]` — migrations idempotent, two servers booting
     at once (advisory lock).
-12. **Monobank, PDF, files tools** `[I]` — fake HTTP; `read_file` path
+11. **Monobank, PDF, files tools** `[I]` — fake HTTP; `read_file` path
     confinement.
-13. **Evals (`judging/`, `eval/`), `packages/codex`** — P3, services are
+12. **Evals (`judging/`, `eval/`), `packages/codex`** — P3, services are
     off; only if everything above is done.
 
 ## Done
@@ -276,6 +281,22 @@ the real system, `[U]` unit property for complex logic.
   real token exported could have messaged the real chat from a test run.
   Mutation check: unconfirmed no-message update, whitespace parts sent,
   history keeping the oldest, topic dropped from signal / log — all caught.
+- **Supervisor end to end** (2026-10-12, `packages/agent/test/supervisor.test.ts`)
+  — the poll loop (now `supervisor/loop.ts`, reply parsed with zod instead
+  of a cast) + module + engine + workflow runner + skills + trace mirror,
+  over the MCP client protocol; generated queues of 1–6 signals each with a
+  plan (sends the tool accepts or rejects, answer, crash; scheduler: a
+  compiled workflow with a failing step or not, or an uncompilable plan).
+  Per signal, from the plan alone: exactly the planned messages reach the
+  chat in order (+ one recovery report iff it failed), compile iff
+  scheduler, primary loop iff needed and never after an execute failure,
+  history preloaded once and first only for telegram (also when another
+  source's content mimics a Telegram header), non-Telegram content reaches
+  the model verbatim, one trace per signal, no agent loop left open, each
+  signal popped once in order and the loop survives failures. No bugs found
+  here. Mutation check: execute failure falling back to the loop, recovery
+  skipped, loop stopping on a failed signal, history for every source — all
+  caught.
 
 ## Findings
 
@@ -333,3 +354,5 @@ the real system, `[U]` unit property for complex logic.
   F6.
 - 2026-10-12 claude — Telegram transport suite + fake Bot API; 3 bugs fixed;
   F7, F8.
+- 2026-10-12 claude — supervisor e2e suite + `runSupervisorLoop` seam; no
+  bugs.
