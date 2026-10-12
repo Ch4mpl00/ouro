@@ -182,46 +182,40 @@ suites, stronger generators, scenarios from `.claude/tasks/*.md` and
 Ordered by expected bug yield. `[I]` integration, `[P]` property suite over
 the real system, `[U]` unit property for complex logic.
 
-1. **Workflow runtime, part 2** `[U][P]` — executor semantics beyond
-   bindings: replan passes (carried context, `lastPass`, exhaustion),
-   parallel fail-fast and abort (siblings interrupted, spans closed,
-   nothing after the failing step runs), `llm_compose` JSON-vs-text binding,
-   compile retry loop (errors fed back, attempt budget). Part 1 (store,
-   substitution, static binding check) is done.
-2. **AgentLoop + providers + retry** `[I]` — scripted provider over the
+1. **AgentLoop + providers + retry** `[I]` — scripted provider over the
    real loop: tool results threaded back, turn limits, sub-agent
    delegation, transient vs permanent errors, abort propagation, no
    automatic replay of tool calls.
-3. **Memory facts and projects over MCP** `[I][P]` — `remember` /
+2. **Memory facts and projects over MCP** `[I][P]` — `remember` /
    `get_fact` / `update_fact` / `recall` / `list_memory` / `create_project`
    / `doc_history`: lifecycle states, `recall` refs always resolve via
    `read_doc` / `get_fact`, index rows agree with stored bodies, indexing
    failure never fails a write (embedder down), `MCP_MEMORY_ACTOR` stamped.
    Documents themselves are covered by the reference model — look for gaps
    only.
-4. **Gmail poller** `[I]` — fake Gmail API: watermark monotonic, no lost or
+3. **Gmail poller** `[I]` — fake Gmail API: watermark monotonic, no lost or
    duplicated mail across restarts and partial failures, attachment
    download path safety.
-5. **News store** `[I][P]` — `list_news` / `fetch_article` / `search_news`
+4. **News store** `[I][P]` — `list_news` / `fetch_article` / `search_news`
     with fake providers + word embedder: upsert idempotency, dedup, `k`
     bounds, filters, NULL-embedding rows still listable, backfill drains.
-6. **Tool scoping and transport** `[I][P]` — any `MCP_TOOLSETS` subset →
+5. **Tool scoping and transport** `[I][P]` — any `MCP_TOOLSETS` subset →
     `tools/list` is exactly the union of those groups; unknown name is a
     boot error; multi-session isolation in `http-transport`.
-7. **Skills** `[I]` — agent two-layer loader (live → default, patch
+6. **Skills** `[I]` — agent two-layer loader (live → default, patch
     overlay) and the MCP `read_skill` export agree on the composed
     instructions for generated bodies/patches (the two `appendPatch`
     copies must not drift).
-8. **Gateway** `[I]` — fake upstream MCP server: namespacing, upstream
+7. **Gateway** `[I]` — fake upstream MCP server: namespacing, upstream
     failure isolated from own tools, reconnect.
-9. **Agent sqlite state** `[I]` — memory KV + trace mirror
+8. **Agent sqlite state** `[I]` — memory KV + trace mirror
     (`db/trace-store.ts`): migrations on boot idempotent, trace/judgement
     invariants.
-10. **`mcp_state` boot** `[I]` — migrations idempotent, two servers booting
+9. **`mcp_state` boot** `[I]` — migrations idempotent, two servers booting
     at once (advisory lock).
-11. **Monobank, PDF, files tools** `[I]` — fake HTTP; `read_file` path
+10. **Monobank, PDF, files tools** `[I]` — fake HTTP; `read_file` path
     confinement.
-12. **Evals (`judging/`, `eval/`), `packages/codex`** — P3, services are
+11. **Evals (`judging/`, `eval/`), `packages/codex`** — P3, services are
     off; only if everything above is done.
 
 ## Done
@@ -313,6 +307,24 @@ the real system, `[U]` unit property for complex logic.
   time and fed back to the compiler (`9a41d03`). Mutation check: no
   duplicate check, siblings visible, checking past a terminal, code_agent
   data / decide items unchecked, inherited lookup — all caught.
+- **Workflow runtime, part 2** (2026-10-12, `packages/agent/test/workflow-execute.test.ts`,
+  `workflow-replan.test.ts`) — the executor under generated plans (every
+  step kind, parallel up to 5, terminal, replan) where each call is
+  scripted to succeed or fail after a delay, honouring abort or not:
+  only reachable calls run and each once, steps strictly sequential,
+  parallel children concurrent (≤4), first failing step and its reason
+  reported, replan carries exactly the bound names, the store holds exactly
+  the binds, and nothing outlives execute (no late store write, no
+  abort-honouring call still running, every agent loop ended). The
+  plan → act → replan loop with the real compiler: ending (ok / compile /
+  execute / replan_exhausted), planner call count incl. retries, each pass
+  told about the previous one only when it is a replan pass, gathered data
+  carried and seeded as `context.*`, unbound names dropped, note carried,
+  LAST-pass instruction exactly on the last pass. No bugs found. Mutation
+  check: tool write after abort, parallel not waiting for agents, going on
+  after a failure, replan carrying unbound names, terminal not stopping,
+  serial parallel, last pass off by one, context not seeded, one pass too
+  many, note dropped — all caught.
 
 ## Findings
 
@@ -374,3 +386,5 @@ the real system, `[U]` unit property for complex logic.
   bugs.
 - 2026-10-12 claude — workflow runtime part 1; 2 bugs fixed (static binding
   check in the compiler).
+- 2026-10-12 claude — workflow runtime part 2 (executor faults, replan
+  loop); no bugs.
