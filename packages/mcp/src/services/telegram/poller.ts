@@ -27,6 +27,60 @@ export interface TelegramPollerDeps {
   signals: Signals;
 }
 
+// One getUpdates round from the stored cursor: each text message from the
+// allowed chat goes into the chat log and becomes a signal, and the cursor
+// moves past every update, kept or not. Returns how many updates came back.
+export async function pollOnce(deps: TelegramPollerDeps, allowedChatId: number, timeout = LONG_POLL_TIMEOUT): Promise<number> {
+  const lastId = await deps.log.lastUpdateId();
+  const offset = lastId !== null ? lastId + 1 : undefined;
+  const updates = await getUpdates({
+    offset,
+    timeout,
+    allowed_updates: ["message", "edited_message"],
+  });
+
+  for (const u of updates) {
+    const msg = pickMessage(u);
+    // Nothing to keep, but the cursor must still move past it: an update
+    // left unconfirmed comes back on every getUpdates and stalls the cursor
+    // there for good.
+    if (!msg) {
+      await deps.log.setLastUpdateId(u.update_id);
+      continue;
+    }
+    if (msg.chat.id !== allowedChatId) {
+      console.warn(`${logPrefix()} ignoring message from chat=${msg.chat.id} (not allowed chat)`);
+    } else if (msg.text && msg.text.length > 0) {
+      const threadId = msg.message_thread_id ?? null;
+      await deps.log.record({
+        chatId: msg.chat.id,
+        tgMessageId: msg.message_id,
+        threadId,
+        role: "user",
+        text: msg.text,
+      });
+      // Signal content is DATA, not agent instructions. It used to
+      // carry "Reply by calling send_telegram_message(...)" — useful
+      // for the old agentic loop, but poison for the workflow path:
+      // a non-tool `llm_compose` step fed this text would dutifully
+      // emit a send_telegram_message tool-call as plain text, which
+      // then got delivered verbatim. The planner already knows how to
+      // reply (send step + chatId from envContext); reply/thread
+      // conventions live in planner.md.
+      const content = [
+        `Telegram message in chat ${msg.chat.id}${threadId !== null ? ` (forum topic thread_id=${threadId})` : ""}.`,
+        `Text: ${JSON.stringify(msg.text)}`,
+      ].join("\n");
+      await deps.signals.record({ source: "telegram", content });
+      console.log(
+        `${logPrefix()} stored msg ${msg.message_id}${threadId !== null ? ` (thread=${threadId})` : ""} + signal queued`,
+      );
+    }
+    await deps.log.setLastUpdateId(u.update_id);
+  }
+  return updates.length;
+}
+
 export function startTelegramPoller(deps: TelegramPollerDeps): void {
   const allowedChatRaw = getDefaultChatId();
   if (!allowedChatRaw) {
@@ -51,47 +105,7 @@ export function startTelegramPoller(deps: TelegramPollerDeps): void {
   void (async () => {
     while (!stopping) {
       try {
-        const lastId = await deps.log.lastUpdateId();
-        const offset = lastId !== null ? lastId + 1 : undefined;
-        const updates = await getUpdates({
-          offset,
-          timeout: LONG_POLL_TIMEOUT,
-          allowed_updates: ["message", "edited_message"],
-        });
-
-        for (const u of updates) {
-          const msg = pickMessage(u);
-          if (!msg) continue;
-          if (msg.chat.id !== allowedChatId) {
-            console.warn(`${logPrefix()} ignoring message from chat=${msg.chat.id} (not allowed chat)`);
-          } else if (msg.text && msg.text.length > 0) {
-            const threadId = msg.message_thread_id ?? null;
-            await deps.log.record({
-              chatId: msg.chat.id,
-              tgMessageId: msg.message_id,
-              threadId,
-              role: "user",
-              text: msg.text,
-            });
-            // Signal content is DATA, not agent instructions. It used to
-            // carry "Reply by calling send_telegram_message(...)" — useful
-            // for the old agentic loop, but poison for the workflow path:
-            // a non-tool `llm_compose` step fed this text would dutifully
-            // emit a send_telegram_message tool-call as plain text, which
-            // then got delivered verbatim. The planner already knows how to
-            // reply (send step + chatId from envContext); reply/thread
-            // conventions live in planner.md.
-            const content = [
-              `Telegram message in chat ${msg.chat.id}${threadId !== null ? ` (forum topic thread_id=${threadId})` : ""}.`,
-              `Text: ${JSON.stringify(msg.text)}`,
-            ].join("\n");
-            await deps.signals.record({ source: "telegram", content });
-            console.log(
-              `${logPrefix()} stored msg ${msg.message_id}${threadId !== null ? ` (thread=${threadId})` : ""} + signal queued`,
-            );
-          }
-          await deps.log.setLastUpdateId(u.update_id);
-        }
+        await pollOnce(deps, allowedChatId);
       } catch (err) {
         console.error(`${logPrefix()} poll error:`, err instanceof Error ? err.message : err);
         await new Promise((r) => setTimeout(r, ERROR_BACKOFF_MS));
