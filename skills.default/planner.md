@@ -304,7 +304,7 @@ skill. Inline caps (NO source, stamp) are the easy-to-forget bits.
 
 - **IT digest** (scheduler/tech-digest) — exactly this shape (full anchor
   below):
-  `[search_news: the anchor's queries, NO source, k=50] ‖ [journal_tail tech-digest] → [decide preset=filter ← the anchor's rules] → [compose:tech-digest ← kept + previous digests] → [send] ‖ [stamp tech_digest.last_read_at] ‖ [journal_append tech-digest]`
+  `[search_news: the anchor's queries, NO source, k=150] ‖ [journal_tail tech-digest] → [decide preset=filter ← the anchor's rules] → [compose:tech-digest ← kept + previous digests] → [send] ‖ [stamp tech_digest.last_read_at] ‖ [journal_append tech-digest]`
   (Copy the `queries`, the filter `prompt` and the compose `prompt` from
   the anchor verbatim. ONE `search_news`, NO `source` — never per-source
   fetches. sinceISO: COPY the env **Tech** last-read watermark verbatim —
@@ -400,7 +400,7 @@ Same structure as the news digest; copy the `queries` and both `prompt`
 strings character for character:
 ```
 {"kind":"parallel","steps":[
- {"kind":"tool","tool":"search_news","args":{"queries":["AI model releases and benchmarks from Anthropic, OpenAI, Google DeepMind, DeepSeek, Mistral, xAI, Meta — релиз новой модели","LLM agents: tool use, planning, multi-agent systems, MCP — ИИ-агенты","LLM training and inference: fine-tuning, distillation, RLHF, MoE, quantization, KV cache, speculative decoding","open-weights models, evals and benchmarks of language models","AI coding tools: Cursor, Claude Code, Copilot, Cline, Aider, Codex — ИИ для разработчиков","RAG, vector databases, embeddings, agent frameworks — infrastructure for AI","TypeScript, Node.js and PHP: framework releases, notable libraries","React and Vue: major front-end framework news"],"k":50,"sinceISO":"<tech watermark>"},"bind":"hits"},
+ {"kind":"tool","tool":"search_news","args":{"queries":["AI model releases and benchmarks from Anthropic, OpenAI, Google DeepMind, DeepSeek, Mistral, xAI, Meta — релиз новой модели","LLM agents: tool use, planning, multi-agent systems, MCP — ИИ-агенты","LLM training and inference: fine-tuning, distillation, RLHF, MoE, quantization, KV cache, speculative decoding","open-weights models, evals and benchmarks of language models","AI coding tools: Cursor, Claude Code, Copilot, Cline, Aider, Codex — ИИ для разработчиков","RAG, vector databases, embeddings, agent frameworks — infrastructure for AI","TypeScript, Node.js and PHP: framework releases, notable libraries","React and Vue: major front-end framework news"],"k":150,"sinceISO":"<tech watermark>"},"bind":"hits"},
  {"kind":"tool","tool":"journal_tail","args":{"stream":"tech-digest","n":2},"bind":"sent"}]}
 {"kind":"decide","preset":"filter","items":"${hits.results}","bind":"kept",
  "prompt":"items — IT news candidates from a coarse semantic search over Hacker News, Habr and Telegram IT channels; most of them are off-topic. Pass only items that genuinely fit the reader's interests. AI and LLMs: frontier labs (Anthropic, OpenAI, DeepSeek, Google DeepMind, Mistral, xAI, Meta AI), model releases and benchmarks, agentic patterns (tool use, planning, multi-agent), training (MoE, distillation, fine-tuning, RLHF/DPO), inference (KV cache, speculative decoding, quantization), the open-weights ecosystem, evals, prompt engineering at scale, AI developer tooling (Cursor, Claude Code, Copilot, Cline, Aider), AI-native infrastructure (RAG, vector databases, agent frameworks, MCP). Frameworks: major updates or new frameworks in the TypeScript/Node.js or PHP ecosystems, notable libraries, major Vue or React news. SKIP: vague AI hype and opinion pieces, business-only stories with no technical content (funding, IPOs, executives' statements, regulation), basic tutorials and listicles, personal side projects of no wider interest, programming topics outside these interests. Each item is judged on its own; duplicates do not matter."}
@@ -423,7 +423,9 @@ queries**, each aimed at one angle, as a literal `queries: [...]` array
 (Russian + transliteration if Western), (b) the events it generates, (c)
 related actors / places — spread across angles, and consolidate rather
 than exceed the cap: **≤8 `queries` per call, `k` ≤ 50, ONE `search_news`
-step per ask** (never split into several steps to dodge the cap).
+step per ask** (never split into several steps to dodge the cap). The
+one exception is a `decide` filter reading the hits before any LLM does —
+the IT digest anchor — where `k` goes up to 150.
 
 **Never set `source`** — search all sources, channels included — unless
 the user explicitly names a publication (`channel="FT"`). (This rule is
@@ -454,7 +456,8 @@ A genuinely single, narrow topic → a plain `query` string is fine.
 - IT digest: the same shape over `search_news` (the anchor's queries,
   sinceISO = the Tech watermark, filter on `${hits.results}`), stream
   `tech-digest`.
-- `search_news`: no `source`, ≤8 queries, `k` ≤ 50, one step per ask.
+- `search_news`: no `source`, ≤8 queries, `k` ≤ 50 (150 only in front of
+  a `decide` filter), one step per ask.
 - `llm_compose` with a `skill`: data via `input`, no duplicated prompt.
 - Don't pre-fetch fat data into args — fetch via a `tool` step, bind,
   reference with `${name}`.
