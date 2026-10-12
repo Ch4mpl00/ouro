@@ -133,6 +133,9 @@ Distilled from `~/Code/tickets-booking/AGENTS.md` and `test/properties/`
   engine, workflow runner, skills.default, sqlite trace mirror on a temp
   file. A standalone `startAgentLoop` records its own trace under its id —
   read traces back before probing loop ids.
+- `packages/agent/test/workflow.test.ts` — validator-vs-executor
+  differential: generated plans parsed with `{ seeds }` and executed on an
+  always-succeeding fake engine (every call returns `[]`).
 - fast-check gotcha: `fc.array(..., { maxLength })` still generates short
   arrays unless `size: "max"` is given — sequences silently stay trivial.
 
@@ -179,13 +182,12 @@ suites, stronger generators, scenarios from `.claude/tasks/*.md` and
 Ordered by expected bug yield. `[I]` integration, `[P]` property suite over
 the real system, `[U]` unit property for complex logic.
 
-1. **Workflow runtime** `[U][P]` — `workflow/dsl.ts`, `variables.ts`,
-   `execute.ts`, `compile.ts`: generated valid workflows execute
-   step-by-step with observable effects only through tool calls; failures
-   stop at the failing step; no tool side effect is replayed on retry;
-   `${path}` substitution never leaks unresolved placeholders; parse ∘
-   print round-trips. (Existing example tests are large — complement them,
-   don't duplicate.)
+1. **Workflow runtime, part 2** `[U][P]` — executor semantics beyond
+   bindings: replan passes (carried context, `lastPass`, exhaustion),
+   parallel fail-fast and abort (siblings interrupted, spans closed,
+   nothing after the failing step runs), `llm_compose` JSON-vs-text binding,
+   compile retry loop (errors fed back, attempt budget). Part 1 (store,
+   substitution, static binding check) is done.
 2. **AgentLoop + providers + retry** `[I]` — scripted provider over the
    real loop: tool results threaded back, turn limits, sub-agent
    delegation, transient vs permanent errors, abort propagation, no
@@ -297,6 +299,20 @@ the real system, `[U]` unit property for complex logic.
   here. Mutation check: execute failure falling back to the loop, recovery
   skipped, loop stopping on a failed signal, history for every source — all
   caught.
+- **Workflow runtime, part 1** (2026-10-12, `packages/agent/test/workflow.test.ts`)
+  — the variable store against plain JSON (own-property paths, inherited
+  names, misses), `${}` interpolation against its documented contract (no
+  re-expansion, whole placeholder keeps the type), and the plan validator
+  against the executor: generated plans (tool / compose / agent / code /
+  decide / parallel / terminal, seeds with and without `context`) are
+  accepted iff running them can't fail with missing / duplicate binding.
+  **Bugs fixed:** `${post.constructor}` / `${list.map}` resolved through the
+  prototype chain (`6d5b89e`); plans referencing an unbound name, reusing a
+  bind or reading a parallel sibling's bind passed validation and failed at
+  run time, possibly after a send, with no retry — now rejected at compile
+  time and fed back to the compiler (`9a41d03`). Mutation check: no
+  duplicate check, siblings visible, checking past a terminal, code_agent
+  data / decide items unchecked, inherited lookup — all caught.
 
 ## Findings
 
@@ -356,3 +372,5 @@ the real system, `[U]` unit property for complex logic.
   F7, F8.
 - 2026-10-12 claude — supervisor e2e suite + `runSupervisorLoop` seam; no
   bugs.
+- 2026-10-12 claude — workflow runtime part 1; 2 bugs fixed (static binding
+  check in the compiler).
