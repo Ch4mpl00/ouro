@@ -5,7 +5,18 @@
 // criteria in .claude/tasks/unified-memory.md be tested without a Postgres,
 // and it keeps the PG implementation small enough to read in one sitting.
 
-import type { Doc, DocPatch, DocSummary, Fact, IndexEntry, IndexHit, MemoryState, Project } from "./types";
+import type {
+  Doc,
+  DocPatch,
+  DocSummary,
+  Fact,
+  IndexEntry,
+  IndexHit,
+  JournalEntry,
+  JournalStream,
+  MemoryState,
+  Project,
+} from "./types";
 
 export interface CreateProjectInput {
   slug: string;
@@ -68,6 +79,22 @@ export interface SearchIndexOpts {
   tags?: string[];
 }
 
+export interface AppendEntryInput {
+  stream: string;
+  body: string;
+  actor: string;
+  // Stored on the stream when given; omitted keeps the stream's capacity, or
+  // `defaultCapacity` for a stream this append creates.
+  capacity?: number;
+  defaultCapacity: number;
+}
+
+// The entry and its stream after the trim.
+export interface AppendedEntry {
+  entry: JournalEntry;
+  stream: JournalStream;
+}
+
 export interface MemoryStore {
   createProject(input: CreateProjectInput): Promise<Project>;
   getProject(slug: string): Promise<Project | null>;
@@ -99,4 +126,14 @@ export interface MemoryStore {
   // Rows whose inline embed failed (provider down). Drained by the backfill.
   listUnembedded(limit: number): Promise<{ id: number; text: string }[]>;
   setEmbedding(id: number, embedding: number[]): Promise<void>;
+
+  // The journal. One append creates the stream if needed, stores the entry
+  // and drops the entries beyond the stream's capacity, oldest first — all in
+  // one transaction, serialised per stream, so no reader ever sees a stream
+  // over capacity and racing appends all land.
+  appendEntry(input: AppendEntryInput): Promise<AppendedEntry>;
+  // Newest first, by append order. Empty for a stream that does not exist.
+  tailEntries(stream: string, limit: number): Promise<JournalEntry[]>;
+  // By name.
+  listStreams(): Promise<JournalStream[]>;
 }

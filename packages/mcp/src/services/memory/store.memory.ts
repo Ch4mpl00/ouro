@@ -5,8 +5,9 @@
 // Kept deliberately literal: no shortcuts the PG implementation can't also
 // take, so a test passing here means the same thing there.
 
-import type { Doc, DocPatch, DocSummary, Fact, IndexHit, Project } from "./types";
+import type { Doc, DocPatch, DocSummary, Fact, IndexHit, JournalEntry, JournalStream, Project } from "./types";
 import type {
+  AppendEntryInput,
   CommittedDoc,
   CreateDocInput,
   CreateFactInput,
@@ -35,6 +36,7 @@ export function createInMemoryStore(opts: InMemoryStoreOpts = {}): MemoryStore {
   const patches: DocPatch[] = [];
   const facts: Fact[] = [];
   const index: (IndexUpsert & { id: number })[] = [];
+  const streams = new Map<string, { capacity: number; entries: JournalEntry[] }>();
   let seq = 0;
   const nextId = (): number => ++seq;
   const stamp = (): string => now().toISOString();
@@ -51,6 +53,16 @@ export function createInMemoryStore(opts: InMemoryStoreOpts = {}): MemoryStore {
     const row: DocPatch = { ...patch, docId, createdAt: stamp() };
     patches.push(row);
     return { ...row };
+  };
+
+  const describeStream = (name: string): JournalStream => {
+    const row = streams.get(name)!;
+    return {
+      name,
+      capacity: row.capacity,
+      size: row.entries.length,
+      lastAt: row.entries.at(-1)?.createdAt ?? null,
+    };
   };
 
   return {
@@ -193,6 +205,32 @@ export function createInMemoryStore(opts: InMemoryStoreOpts = {}): MemoryStore {
       const row = index.find((r) => r.id === id);
       if (row) row.embedding = embedding;
     },
+
+    // No await between the read and the trim, so an append is atomic here the
+    // way the per-stream row lock makes it atomic in Postgres.
+    appendEntry: async (input: AppendEntryInput) => {
+      const row = streams.get(input.stream) ?? { capacity: input.defaultCapacity, entries: [] };
+      if (input.capacity !== undefined) row.capacity = input.capacity;
+      const entry: JournalEntry = {
+        id: nextId(),
+        stream: input.stream,
+        body: input.body,
+        actor: input.actor,
+        createdAt: stamp(),
+      };
+      row.entries.push(entry);
+      row.entries = row.entries.slice(-row.capacity);
+      streams.set(input.stream, row);
+      return { entry: { ...entry }, stream: describeStream(input.stream) };
+    },
+
+    tailEntries: async (stream, limit) =>
+      (streams.get(stream)?.entries ?? [])
+        .slice(-limit)
+        .reverse()
+        .map((e) => ({ ...e })),
+
+    listStreams: async () => [...streams.keys()].sort().map(describeStream),
   };
 }
 

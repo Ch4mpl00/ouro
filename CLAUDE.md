@@ -272,7 +272,7 @@ also see them when running `claude` locally with `.mcp.json` registered.
 - **Unified memory** — shared by every agent, see the section below.
   `recall`, `remember`, `get_fact`, `update_fact`, `list_memory`,
   `create_project`, `read_doc`, `append_doc`, `patch_doc`, `write_doc`,
-  `doc_history`, `revert_patch`
+  `doc_history`, `revert_patch`, `journal_append`, `journal_tail`
 - **Signals queue** — `get_next_signal`, `list_signals`
 - **Scheduler** — `schedule_task`, `list_scheduled_tasks`,
   `cancel_scheduled_task`
@@ -311,14 +311,22 @@ anything on the far side of the ChatGPT tunnel. Lives in
 `packages/mcp/src/services/memory/`; design and rationale in
 `.claude/tasks/unified-memory.md`.
 
-Two read models, one search projection:
+Three read models, one search projection:
 
 - **Projects** are folders of markdown documents (`passport.md`, `roadmap.md`,
   `progress.md`, …), not a fixed schema. The agent reads and patches each
   document individually, which is the interface LLMs are best at.
 - **Facts** are flat freeform statements — what `knowledge_base_notes` held,
   plus a lifecycle state and an update path.
-- **`memory_index`** is the only table with embeddings. Both read models are
+- **The journal** is the third read model: operational records a workflow
+  appends and reads back by recency (`journal_tail`), e.g. the `news-digest`
+  stream the digest dedups against. Streams are named categories
+  (`digest/news`) with a stored capacity (default 100, oldest dropped
+  first). Entries are immutable, never indexed and keep no patch history —
+  records, not knowledge. Invariants: `services/memory/journal*.test.ts`
+  (fast-check against a reference model; the Postgres race tests need
+  `TEST_DATABASE_URL`).
+- **`memory_index`** is the only table with embeddings. Documents and facts are
   chunked into it with their subject denormalised into the indexed text, so a
   fragment matches even though the stored document stays clean.
 

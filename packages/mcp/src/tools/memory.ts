@@ -2,12 +2,19 @@ import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { MemoryError, type MemoryService } from "../services/memory";
 import { MEMORY_STATES } from "../services/memory/types";
+import {
+  JOURNAL_MAX_BODY_CHARS,
+  JOURNAL_MAX_CAPACITY,
+  JOURNAL_TAIL_DEFAULT,
+  JOURNAL_TAIL_MAX,
+} from "../services/memory/service";
 import { jsonResult } from "../result";
 
 // Unified memory, exposed to every agent (.claude/tasks/unified-memory.md).
 //
 // Two shapes behind one search: projects made of markdown documents, and flat
-// facts. The agent's flow is deliberately two-step — `recall` finds *where*
+// facts. A third, the journal, sits outside search: operational records that
+// a workflow appends and reads back by recency. The agent's flow is deliberately two-step — `recall` finds *where*
 // the answer lives and returns refs, then `read_doc` / `get_fact` loads the
 // whole thing. Snippets alone were what made the planner fail on GAIA.
 //
@@ -123,7 +130,8 @@ export function registerMemoryTools(server: McpServer, deps: MemoryToolDeps): vo
     {
       title: "List projects, or the documents in one",
       description:
-        "Without `project`: every project. With it: that project's documents, " +
+        "Without `project`: every project, plus every journal stream with its " +
+        "capacity and size. With it: that project's documents, " +
         "each with a one-line summary, version and size.\n\n" +
         "ALWAYS call this before creating a document. It is what keeps a " +
         "project from growing notes.md, notes2.md and progress-new.md until " +
@@ -135,7 +143,7 @@ export function registerMemoryTools(server: McpServer, deps: MemoryToolDeps): vo
     async ({ project }) =>
       run(async () =>
         project === undefined
-          ? { projects: await memory.listProjects() }
+          ? { projects: await memory.listProjects(), journals: await memory.listJournals() }
           : await memory.listDocs(project),
       ),
   );
@@ -302,6 +310,57 @@ export function registerMemoryTools(server: McpServer, deps: MemoryToolDeps): vo
     },
     async ({ project, doc, patch_id, rollback }) =>
       run(() => memory.revert({ project, doc, patchId: patch_id, rollback, actor })),
+  );
+
+  server.registerTool(
+    "journal_append",
+    {
+      title: "Add a record to a journal stream",
+      description:
+        "Append one immutable entry to a journal stream — operational records " +
+        "read back by recency, like the last digests sent or a run log. Not " +
+        "for knowledge: entries are never searched by recall, never edited and " +
+        "keep no history. Use a project document or a fact for anything worth " +
+        "finding by meaning.\n\n" +
+        "The stream is created by its first entry. It keeps at most its " +
+        "capacity (100 unless set), dropping the oldest entries first.",
+      inputSchema: {
+        stream: z
+          .string()
+          .min(1)
+          .describe('Stream name: lowercase segments joined by "/", e.g. "news-digest" or "digest/news".'),
+        body: z.string().min(1).max(JOURNAL_MAX_BODY_CHARS).describe("The record, stored exactly as given."),
+        capacity: z
+          .number()
+          .int()
+          .min(1)
+          .max(JOURNAL_MAX_CAPACITY)
+          .optional()
+          .describe("Set the stream's capacity (kept for later appends). Omit to keep the current one."),
+      },
+    },
+    async ({ stream, body, capacity }) => run(() => memory.journalAppend({ stream, body, actor, capacity })),
+  );
+
+  server.registerTool(
+    "journal_tail",
+    {
+      title: "Read the newest records of a journal stream",
+      description:
+        "Return the last `n` entries of a stream, newest first. A stream nobody " +
+        "has written to reads as an empty list, not an error.",
+      inputSchema: {
+        stream: z.string().min(1).describe('Stream name, e.g. "news-digest".'),
+        n: z
+          .number()
+          .int()
+          .min(1)
+          .max(JOURNAL_TAIL_MAX)
+          .optional()
+          .describe(`How many entries (default ${JOURNAL_TAIL_DEFAULT}).`),
+      },
+    },
+    async ({ stream, n }) => run(() => memory.journalTail({ stream, n })),
   );
 }
 

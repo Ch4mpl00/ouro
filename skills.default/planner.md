@@ -309,13 +309,15 @@ skill. Inline caps (NO source, stamp) are the easy-to-forget bits.
   dedups against the previous digests in it.)
 - **News digest** (scheduler/news-digest tick AND a telegram sweep ask) —
   exactly this shape (full anchor below):
-  `[list_news(source="channel")] → [decide preset=filter ← the anchor's rules] → [compose:news-digest ← kept posts] → [send] ‖ [stamp news_digest.last_read_at]`
+  `[list_news(source="channel")] ‖ [journal_tail news-digest] → [decide preset=filter ← the anchor's rules] → [compose:news-digest ← kept posts + previous digests] → [send] ‖ [stamp news_digest.last_read_at] ‖ [journal_append news-digest]`
   (Copy the filter `prompt` and the compose `prompt` from the anchor
   verbatim. Compose on `smart`. sinceISO: an explicit period («за сегодня /
   за день») → the literal boundary per the time-words rule; otherwise COPY
   the env watermark string verbatim — never re-convert its timezone. A
   telegram-sourced sweep opens with `start_typing` + the status bubble and
-  clears it after the send; scheduler ticks skip typing/status as usual.)
+  clears it after the send; scheduler ticks skip typing/status as usual.
+  The journal stream `news-digest` holds the digests already sent — the
+  composer drops what they covered, and every digest is appended back.)
 - **Topical question** (telegram, about curated news):
   `[start_typing] → [status "🔎 собираю новости"] → [search_news: reformulated topic, NO source] → [status "🧠 готовлю выборку"] → [compose:news-query] → [send: answer] → [status ""]`
   (`status` = `telegram_send_status(id="status:${signal.id}", …)`; same id
@@ -374,15 +376,18 @@ The steps in order (one JSON step per line). Copy both `prompt` strings
 character for character — the filter prompt IS the reader's interest
 profile, the compose prompt assigns the step its role:
 ```
-{"kind":"tool","tool":"list_news","args":{"source":"channel","sinceISO":"<watermark>"},"bind":"posts"}
+{"kind":"parallel","steps":[
+ {"kind":"tool","tool":"list_news","args":{"source":"channel","sinceISO":"<watermark>"},"bind":"posts"},
+ {"kind":"tool","tool":"journal_tail","args":{"stream":"news-digest","n":2},"bind":"sent"}]}
 {"kind":"decide","preset":"filter","items":"${posts.items}","bind":"kept",
  "prompt":"items — посты Telegram-каналов. Пропускать в дайджест только то, что влияет на решения, безопасность, деньги или свободу передвижения читателя (живёт в Одессе, ФОП) или на развивающуюся ситуацию вокруг него. Каждый пост оценивается сам по себе: дубли одного события не учитываются. БРАТЬ: ФОП — единый налог, ЕСВ, НДС, группы, лимиты, КВЭДы, отчётность, проверки и штрафы ДПС, законопроекты о ФОП даже в первом чтении. Мобилизация и уклонисты — санкции (счета, авто, выезд, права, ID), бронирование, Резерв+ / Дія, системные изменения ТЦК, штрафы за учёт, прецедентные решения судов. Одесса и Украина — прилёты с реальным ущербом, ограничения света, транспорта, перекрытия, крупные кадровые и законодательные решения. ПМР и Молдова — интеграция ПМР, путь Молдовы в ЕС, военная активность вокруг ПМР, крупные экономические сдвиги. Война РФ–Украина — переговоры и мирные инициативы, существенные изменения на фронте, удары по критической инфраструктуре, новые виды вооружений, санкции с реальным эффектом, важные заявления Зеленского, Путина, Трампа. Мир — решения мировых лидеров с последствиями, крупные геополитические события, эпидемии, научные прорывы (не релизы ИИ-моделей), стихийные бедствия мирового масштаба. ПРОПУСКАТЬ: единичные бытовые происшествия, ДТП, преступления, поодиночные случаи с ТЦК; тактические бои за сёла, «уничтожили N техники», «источники сообщают», «эксперт сказал»; предложения одного нардепа без продвижения, местный колорит; культуру, историю, спорт, развлечения, знаменитостей, курьёзы, погоду; корпоративные новости, IT и релизы ИИ; рекламу, розыгрыши, взаимопиар, филлер. Изолированный случай, который ничего не поменял для читателя, — пропустить."}
 {"kind":"llm_compose","skill":"news-digest","preset":"smart",
- "prompt":"input.posts already passed a relevance filter — every post is worth considering, none is noise to re-screen. Apply the skill's categories, significance bar and consolidation (merge posts about the same event into one bullet), then compose the digest message. No posts → a short quiet-day message.",
- "input":{"posts":"${kept}","now":"${env.now}"},"bind":"digest"}
+ "prompt":"input.posts already passed a relevance filter — every post is worth considering, none is noise to re-screen. input.history is the previous digests already sent, newest first: drop every event they covered unless a post adds a substantive new development, and then report only that development. Apply the skill's categories, significance bar and consolidation (merge posts about the same event into one bullet), then compose the digest message. No posts left → a short quiet-day message.",
+ "input":{"posts":"${kept}","history":"${sent.entries}","now":"${env.now}"},"bind":"digest"}
 {"kind":"parallel","steps":[
  {"kind":"tool","tool":"send_telegram_message","args":{"chatId":<lit>,"text":"${digest}"}},
- {"kind":"tool","tool":"set_memory","args":{"key":"news_digest.last_read_at","value":"${env.now}"}}]}
+ {"kind":"tool","tool":"set_memory","args":{"key":"news_digest.last_read_at","value":"${env.now}"}},
+ {"kind":"tool","tool":"journal_append","args":{"stream":"news-digest","body":"${digest}"}}]}
 {"kind":"terminal"}
 ```
 
@@ -419,8 +424,10 @@ A genuinely single, narrow topic → a plain `query` string is fine.
 - Delivery is your explicit `send` step (an agent sends only when it owns
   the whole conversational turn).
 - Digest workflows stamp their watermark; ad-hoc queries don't.
-- News digest: `list_news` → `decide:filter` → ONE `compose:news-digest`,
-  both prompts copied verbatim from its anchor. No `chunks`, no map steps.
+- News digest: `list_news` ‖ `journal_tail` → `decide:filter` → ONE
+  `compose:news-digest` → send ‖ stamp ‖ `journal_append`, both prompts
+  copied verbatim from its anchor. No `chunks`, no map steps, no chat
+  history.
 - `search_news`: no `source`, ≤8 queries, `k` ≤ 50, one step per ask.
 - `llm_compose` with a `skill`: data via `input`, no duplicated prompt.
 - Don't pre-fetch fat data into args — fetch via a `tool` step, bind,

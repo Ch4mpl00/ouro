@@ -27,13 +27,13 @@ The parent provides task framing and may supply data through `input_refs`:
 - **Date / locale / timezone.**
 - **`news_digest.last_read_at`** — ISO timestamp; the watermark to start
   reading from. May be `never (bootstrap with now − 24h)`.
-- **Recent chat history** — last ~30 messages from the user's chat.
-  Scan assistant messages that start with `📰 Новости`, `🧠 IT-дайджест`
-  for events already covered. Don't re-send them.
+- **Previous digests** (`input.history`) — the last digests already sent,
+  newest first, from the `news-digest` journal stream. Events they
+  covered are not re-sent.
 - **Mode** (if specified): Full / Category / Topic. Otherwise you infer
   from the user's prompt.
 
-You do **not** fetch chat history yourself. You do **not** call any
+You do **not** fetch previous digests yourself. You do **not** call any
 Telegram tool. You read channel posts and compose.
 
 ## Scope
@@ -118,9 +118,11 @@ weather, поодинокі ТЦК-випадки без тренду, курй�
    poller refreshes every ~30min so data is at most that stale; do
    not try to fetch live.
 
-2. **Drop already-covered events** by cross-referencing parent-provided
-   chat history. Semantic match, not literal: "Трамп продлил перемирие"
-   and "Перемир'я може бути продовжене" = same event.
+2. **Drop already-covered events** by cross-referencing the previous
+   digests. Semantic match, not literal: "Трамп продлил перемирие"
+   and "Перемир'я може бути продовжене" = same event. A substantive new
+   development of a covered event stays — report the development, not
+   the event again.
 
 3. **Score, filter, consolidate.** For each remaining post:
    - Fits a category? (be strict)

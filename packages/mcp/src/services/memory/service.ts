@@ -8,9 +8,9 @@ import { randomUUID } from "node:crypto";
 import type { Indexer } from "./indexer";
 import { appendToBody, applyEdits, invertEdits, type EditFailure } from "./patch";
 import { DEFAULT_RANK, rankHits, type RankedHit } from "./projection";
-import { assertDocName, assertProjectSlug } from "./refs";
-import type { MemoryStore } from "./store";
-import type { Doc, DocPatch, DocSummary, Edit, Fact, MemoryState, Project } from "./types";
+import { JOURNAL_STREAM_MAX_LENGTH, assertDocName, assertProjectSlug, isJournalStream } from "./refs";
+import type { AppendedEntry, MemoryStore } from "./store";
+import type { Doc, DocPatch, DocSummary, Edit, Fact, JournalEntry, JournalStream, MemoryState, Project } from "./types";
 
 // Expected failures are values, not stack traces: an agent that gets
 // `{ error: "version_conflict", currentVersion: 9 }` knows what to do next,
@@ -70,7 +70,28 @@ export interface MemoryService {
   getFact(id: number): Promise<Fact>;
   updateFact(input: { id: number; body?: string; tags?: string[]; state?: MemoryState }): Promise<Fact>;
   recall(input: RecallInput): Promise<RecallHit[]>;
+  journalAppend(input: JournalAppendInput): Promise<AppendedEntry>;
+  journalTail(input: { stream: string; n?: number }): Promise<{ stream: string; entries: JournalEntry[] }>;
+  listJournals(): Promise<JournalStream[]>;
 }
+
+export interface JournalAppendInput {
+  stream: string;
+  body: string;
+  actor: string;
+  // Stored on the stream; omitted keeps whatever the stream already has.
+  capacity?: number;
+}
+
+// The journal's bounds. Capacity is per stream (stored with it); these are
+// the defaults and the limits a caller may set within.
+export const JOURNAL_DEFAULT_CAPACITY = 100;
+export const JOURNAL_MAX_CAPACITY = 1000;
+export const JOURNAL_TAIL_DEFAULT = 5;
+export const JOURNAL_TAIL_MAX = 100;
+// A digest is ~5k characters; the cap keeps one runaway write from making
+// every later tail expensive.
+export const JOURNAL_MAX_BODY_CHARS = 32_000;
 
 export interface WriteDocInput {
   project: string;
@@ -248,6 +269,16 @@ export function createMemoryService(deps: MemoryServiceDeps): MemoryService {
     }
     await reindexDoc(project, committed.doc);
     return { created: result(project, committed.doc, committed.patch.pid) };
+  }
+
+  function requireStream(stream: string): void {
+    if (isJournalStream(stream)) return;
+    throw new MemoryError(
+      "invalid_stream",
+      `Invalid stream "${stream}". Use lowercase letters, digits and hyphens, segments joined by "/", ` +
+        `at most ${JOURNAL_STREAM_MAX_LENGTH} characters, e.g. "news-digest" or "digest/news".`,
+      { stream },
+    );
   }
 
   return {
@@ -486,6 +517,47 @@ export function createMemoryService(deps: MemoryServiceDeps): MemoryService {
         .slice(0, limit)
         .map(toRecallHit);
     },
+
+    // Never indexed, never patched: the journal is records, not knowledge.
+    journalAppend: async (input) => {
+      requireStream(input.stream);
+      if (input.body.trim().length === 0) throw new MemoryError("empty_body", "A journal entry needs a body.");
+      if (input.body.length > JOURNAL_MAX_BODY_CHARS) {
+        throw new MemoryError(
+          "body_too_large",
+          `A journal entry is at most ${JOURNAL_MAX_BODY_CHARS} characters; this one is ${input.body.length}.`,
+          { max: JOURNAL_MAX_BODY_CHARS, length: input.body.length },
+        );
+      }
+      const { capacity } = input;
+      if (capacity !== undefined && !(Number.isInteger(capacity) && capacity >= 1 && capacity <= JOURNAL_MAX_CAPACITY)) {
+        throw new MemoryError(
+          "invalid_capacity",
+          `Capacity is a whole number of entries from 1 to ${JOURNAL_MAX_CAPACITY}.`,
+          { capacity, max: JOURNAL_MAX_CAPACITY },
+        );
+      }
+      return store.appendEntry({
+        stream: input.stream,
+        body: input.body,
+        actor: input.actor,
+        capacity,
+        defaultCapacity: JOURNAL_DEFAULT_CAPACITY,
+      });
+    },
+
+    journalTail: async ({ stream, n = JOURNAL_TAIL_DEFAULT }) => {
+      requireStream(stream);
+      if (!(Number.isInteger(n) && n >= 1 && n <= JOURNAL_TAIL_MAX)) {
+        throw new MemoryError("invalid_n", `n is a whole number of entries from 1 to ${JOURNAL_TAIL_MAX}.`, {
+          n,
+          max: JOURNAL_TAIL_MAX,
+        });
+      }
+      return { stream, entries: await store.tailEntries(stream, n) };
+    },
+
+    listJournals: () => store.listStreams(),
   };
 }
 

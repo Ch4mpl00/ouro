@@ -3,10 +3,32 @@
 // one piece of real logic is the compare-and-swap in updateDoc, committed in
 // one transaction with the patch it records.
 
-import { and, arrayOverlaps, cosineDistance, desc, eq, inArray, isNotNull, isNull } from "drizzle-orm";
+import {
+  and,
+  arrayOverlaps,
+  cosineDistance,
+  count,
+  desc,
+  eq,
+  inArray,
+  isNotNull,
+  isNull,
+  max,
+  notInArray,
+  sql,
+} from "drizzle-orm";
 import type { Database } from "../../db/pg/client";
-import { docPatches, facts, memoryIndex, projectDocs, projects } from "../../db/pg/schema";
+import {
+  docPatches,
+  facts,
+  journalEntries,
+  journalStreams,
+  memoryIndex,
+  projectDocs,
+  projects,
+} from "../../db/pg/schema";
 import type {
+  AppendEntryInput,
   CreateDocInput,
   CreateFactInput,
   CreateProjectInput,
@@ -17,7 +39,7 @@ import type {
   UpdateDocInput,
   UpdateFactInput,
 } from "./store";
-import type { Doc, DocPatch, Edit, Fact, IndexHit, MemoryState, Project } from "./types";
+import type { Doc, DocPatch, Edit, Fact, IndexHit, JournalEntry, MemoryState, Project } from "./types";
 
 export interface PgMemoryStoreDeps {
   db: Database;
@@ -277,6 +299,94 @@ export function createPgMemoryStore(deps: PgMemoryStoreDeps): MemoryStore {
         .set({ embedding, embeddedAt: new Date() })
         .where(eq(memoryIndex.id, id));
     },
+
+    appendEntry: async (input: AppendEntryInput) =>
+      db.transaction(async (tx) => {
+        // The upsert always updates, even when the capacity stays, because
+        // the row lock it takes is the whole concurrency story: a second
+        // append to the stream waits here until the first commits, so its
+        // entry id is drawn later and its trim sees the first one's entry.
+        // A race to create the stream resolves the same way on the unique
+        // name.
+        const [stream] = await tx
+          .insert(journalStreams)
+          .values({ name: input.stream, capacity: input.capacity ?? input.defaultCapacity })
+          .onConflictDoUpdate({
+            target: journalStreams.name,
+            set: { capacity: input.capacity ?? sql`${journalStreams.capacity}` },
+          })
+          .returning();
+        if (!stream) throw new Error("appendEntry upserted no stream");
+
+        const [row] = await tx
+          .insert(journalEntries)
+          .values({ streamId: stream.id, body: input.body, actor: input.actor })
+          .returning();
+        if (!row) throw new Error("appendEntry inserted no entry");
+
+        const newest = tx
+          .select({ id: journalEntries.id })
+          .from(journalEntries)
+          .where(eq(journalEntries.streamId, stream.id))
+          .orderBy(desc(journalEntries.id))
+          .limit(stream.capacity);
+        await tx
+          .delete(journalEntries)
+          .where(and(eq(journalEntries.streamId, stream.id), notInArray(journalEntries.id, newest)));
+
+        const [stats] = await tx
+          .select({ size: count() })
+          .from(journalEntries)
+          .where(eq(journalEntries.streamId, stream.id));
+        const entry = toEntry(row, stream.name);
+        return {
+          entry,
+          stream: { name: stream.name, capacity: stream.capacity, size: stats?.size ?? 0, lastAt: entry.createdAt },
+        };
+      }),
+
+    tailEntries: async (stream, limit) => {
+      const rows = await db
+        .select({ entry: journalEntries })
+        .from(journalEntries)
+        .innerJoin(journalStreams, eq(journalEntries.streamId, journalStreams.id))
+        .where(eq(journalStreams.name, stream))
+        .orderBy(desc(journalEntries.id))
+        .limit(limit);
+      return rows.map((r) => toEntry(r.entry, stream));
+    },
+
+    listStreams: async () => {
+      const rows = await db
+        .select({
+          name: journalStreams.name,
+          capacity: journalStreams.capacity,
+          size: count(journalEntries.id),
+          lastAt: max(journalEntries.createdAt),
+        })
+        .from(journalStreams)
+        .leftJoin(journalEntries, eq(journalEntries.streamId, journalStreams.id))
+        .groupBy(journalStreams.id)
+        // Byte order, the same order the in-memory store's sort() gives —
+        // a locale collation would sort "digest/news" around "digest-x".
+        .orderBy(sql`${journalStreams.name} collate "C"`);
+      return rows.map((r) => ({
+        name: r.name,
+        capacity: r.capacity,
+        size: r.size,
+        lastAt: r.lastAt?.toISOString() ?? null,
+      }));
+    },
+  };
+}
+
+function toEntry(row: typeof journalEntries.$inferSelect, stream: string): JournalEntry {
+  return {
+    id: Number(row.id),
+    stream,
+    body: row.body,
+    actor: row.actor,
+    createdAt: row.createdAt.toISOString(),
   };
 }
 
