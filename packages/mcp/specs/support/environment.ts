@@ -83,7 +83,13 @@ export async function startServer(
   fetcher: GuardedFetch = createGuardedFetch(),
 ): Promise<Server> {
   // Nothing may leave the box: no chat to send to, no bot, no OpenAI key.
-  for (const name of ["TELEGRAM_DEFAULT_CHAT_ID", "TELEGRAM_BOT_TOKEN", "OPENAI_API_KEY", "GMAIL_ACCOUNT_KEY"]) {
+  for (const name of [
+    "TELEGRAM_DEFAULT_CHAT_ID",
+    "TELEGRAM_BOT_TOKEN",
+    "TELEGRAM_ASSISTANT_BOT_TOKEN",
+    "OPENAI_API_KEY",
+    "GMAIL_ACCOUNT_KEY",
+  ]) {
     delete process.env[name];
   }
   process.env.DATABASE_URL = databaseUrl;
