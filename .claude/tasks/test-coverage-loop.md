@@ -185,41 +185,41 @@ suites, stronger generators, scenarios from `.claude/tasks/*.md` and
 Ordered by expected bug yield. `[I]` integration, `[P]` property suite over
 the real system, `[U]` unit property for complex logic.
 
-1. **AgentLoop + providers + retry** `[I]` — scripted provider over the
-   real loop: tool results threaded back, turn limits, sub-agent
-   delegation, transient vs permanent errors, abort propagation, no
-   automatic replay of tool calls.
-2. **Memory facts and projects over MCP** `[I][P]` — `remember` /
+1. **Memory facts and projects over MCP** `[I][P]` — `remember` /
    `get_fact` / `update_fact` / `recall` / `list_memory` / `create_project`
    / `doc_history`: lifecycle states, `recall` refs always resolve via
    `read_doc` / `get_fact`, index rows agree with stored bodies, indexing
    failure never fails a write (embedder down), `MCP_MEMORY_ACTOR` stamped.
    Documents themselves are covered by the reference model — look for gaps
    only.
-3. **Gmail poller** `[I]` — fake Gmail API: watermark monotonic, no lost or
+2. **Gmail poller** `[I]` — fake Gmail API: watermark monotonic, no lost or
    duplicated mail across restarts and partial failures, attachment
    download path safety.
-4. **News store** `[I][P]` — `list_news` / `fetch_article` / `search_news`
+3. **News store** `[I][P]` — `list_news` / `fetch_article` / `search_news`
     with fake providers + word embedder: upsert idempotency, dedup, `k`
     bounds, filters, NULL-embedding rows still listable, backfill drains.
-5. **Tool scoping and transport** `[I][P]` — any `MCP_TOOLSETS` subset →
+4. **Tool scoping and transport** `[I][P]` — any `MCP_TOOLSETS` subset →
     `tools/list` is exactly the union of those groups; unknown name is a
     boot error; multi-session isolation in `http-transport`.
-6. **Skills** `[I]` — agent two-layer loader (live → default, patch
+5. **Skills** `[I]` — agent two-layer loader (live → default, patch
     overlay) and the MCP `read_skill` export agree on the composed
     instructions for generated bodies/patches (the two `appendPatch`
     copies must not drift).
-7. **Gateway** `[I]` — fake upstream MCP server: namespacing, upstream
+6. **Gateway** `[I]` — fake upstream MCP server: namespacing, upstream
     failure isolated from own tools, reconnect.
-8. **Agent sqlite state** `[I]` — memory KV + trace mirror
+7. **Agent sqlite state** `[I]` — memory KV + trace mirror
     (`db/trace-store.ts`): migrations on boot idempotent, trace/judgement
     invariants.
-9. **`mcp_state` boot** `[I]` — migrations idempotent, two servers booting
+8. **`mcp_state` boot** `[I]` — migrations idempotent, two servers booting
     at once (advisory lock).
-10. **Monobank, PDF, files tools** `[I]` — fake HTTP; `read_file` path
+9. **Monobank, PDF, files tools** `[I]` — fake HTTP; `read_file` path
     confinement.
-11. **Evals (`judging/`, `eval/`), `packages/codex`** — P3, services are
+10. **Evals (`judging/`, `eval/`), `packages/codex`** — P3, services are
     off; only if everything above is done.
+- **Provider tool-call ids** (P3, needs a live API) — the AgentLoop answers
+  tool calls by `id`; no provider normalises ids. Check what Gemini's and
+  OpenRouter's OpenAI-compatible endpoints return for parallel calls (empty
+  or repeated ids would make the next request ambiguous).
 
 ## Done
 
@@ -328,6 +328,20 @@ the real system, `[U]` unit property for complex logic.
   after a failure, replan carrying unbound names, terminal not stopping,
   serial parallel, last pass off by one, context not seeded, one pass too
   many, note dropped — all caught.
+- **AgentLoop + retry** (2026-10-12, `packages/agent/test/agent-loop.test.ts`)
+  — retry over generated outcome sequences (transient 408/429/5xx /
+  connection, permanent 4xx, non-API errors, success) and budgets: attempts,
+  result or the very last error, one retry note per retried attempt with
+  its status, capped exponential delays. AgentLoop over generated model
+  turns (calls that succeed, return a tool error, throw, carry broken / empty
+  / non-object arguments, name a tool outside the whitelist or no tool at
+  all; answers; budget): every request is a valid conversation (one reply
+  per call, same ids and order), history is append-only and the model's
+  message comes back as sent, MCP sees exactly the allowed calls with the
+  arguments sent, termination / maxIterations / model failure as scripted.
+  No bugs found. Mutation check: 408 not transient, 4xx transient, one retry
+  too many, whitelist not enforced, a tool reply dropped, empty arguments
+  rejected — all caught.
 
 ## Findings
 
@@ -399,3 +413,4 @@ the real system, `[U]` unit property for complex logic.
   loop); no bugs. A full run then caught a rare scheduler counterexample:
   cron-parser throws on Lord Howe's fall-back (F5) — zone dropped from the
   property.
+- 2026-10-12 claude — AgentLoop protocol + retry properties; no bugs.
