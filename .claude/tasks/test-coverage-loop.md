@@ -204,7 +204,18 @@ suites, stronger generators, scenarios from `.claude/tasks/*.md` and
 Ordered by expected bug yield. `[I]` integration, `[P]` property suite over
 the real system, `[U]` unit property for complex logic.
 
-1. **Evals (`judging/`, `eval/`)** — P3, the services are off (`evals`
+1. **Deepening: mutation sampling of the suites that predate the loop** —
+   memory `patch.ts` / `service.ts` (the model check covers documents; plant
+   bugs in facts / journal paths), `telegram/split.ts`, `workflow/compile.ts`
+   retry feedback, `session-context.ts`: plant a handful of bugs per module,
+   see which survive, add the property that kills them.
+2. **`download_gmail_attachment` path** — `messageId` from the model goes
+   into the storage path unsanitized; only the Gmail API rejecting a bogus
+   id first keeps `../` out. Sanitize it like the account key and pin it.
+3. **Feature coverage** — every scenario in `packages/mcp/specs/*.feature`
+   and every task in `.claude/tasks/*.md` with an Acceptance list: is there
+   an automated check? Gaps → backlog.
+4. **Evals (`judging/`, `eval/`)** — P3, the services are off (`evals`
    compose profile). `packages/codex` is done (it backs code_agent in prod).
 
 ## Done
@@ -496,6 +507,18 @@ the real system, `[U]` unit property for complex logic.
   the signal-queue suite failed once on Testcontainers ("port not bound
   after 120 s") — Docker, not the test. Witness counts per run can be
   printed by instrumenting `witnessed.add` (see the iteration's notes).
+- **write_skill** (2026-10-13, `packages/agent/test/write-skill.test.ts`) —
+  the real AgentLoop and skill store on temp dirs; generated write_skill
+  calls (valid / missing / broken frontmatter, unknown and invalid tool
+  names, path-like names) from dreaming / telegram / worker loops: offered
+  only to the dreaming flow, nothing written elsewhere, only skill files
+  land, and `validateAll` passes after any sequence — the agent can always
+  restart. **Bugs fixed** (`721c262`, security): every loop (incl. ones
+  reading mail and fetched pages) could rewrite any skill — persistent
+  prompt injection; a broken or unknown-tool skill write bricked that skill
+  and the next startup. Mutation check: offered to every loop, unknown
+  tools accepted, handler not parsing — caught; the store's own check is
+  redundant on this path (kept as defence in depth).
 
 ## Findings
 
@@ -607,6 +630,12 @@ the real system, `[U]` unit property for complex logic.
   copied the notes into facts. A model that picks `add_note` writes where
   recall never looks. Drop the toolset from the default surface (or the
   module).
+- **F18 the dreaming flow reads untrusted text and can rewrite skills.**
+  Even confined to dreaming, write_skill sits next to list_signals, whose
+  contents are mail bodies, channel posts and Telegram messages — an
+  instruction planted there can reach a skill at the next 04:00 run. A
+  human review step (dreaming proposes a patch, the user approves), or
+  writing only the improver-style append-only overlay, would close it.
 - **F2 delivery is at-most-once.** `get_next_signal` marks the signal
   consumed when it pops it, so a supervisor that crashes after the pop and
   before handling loses the signal for good (no lease / ack). Possibly
@@ -655,3 +684,5 @@ the real system, `[U]` unit property for complex logic.
   witness flaked once → generator biased; flake sweep added to backlog.
 - 2026-10-13 claude — flake sweep (scheduler generator strengthened);
   knowledge module → F17.
+- 2026-10-13 claude — write_skill confined + validated (security); F18;
+  gmail witness flaked once → fault aim fixed; deepening items planned.
