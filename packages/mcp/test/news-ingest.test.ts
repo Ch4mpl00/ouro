@@ -4,7 +4,9 @@
 // first; with `reverse`, oldest first from just after minId; never more than
 // `limit`). Posts arrive — sometimes hundreds between two ticks — and ticks
 // sometimes fail for a channel; once the poller has caught up, every text
-// post that arrived after the first tick is stored exactly once.
+// post that arrived after the first tick is stored exactly once — and
+// nothing from a group chat: Telegram reports a supergroup as a channel too
+// (isChannel, plus isGroup), and its messages are a private conversation.
 
 import fc from "fast-check";
 import pg from "pg";
@@ -23,11 +25,15 @@ interface Post {
 }
 
 // Telegram, as far as the harvester can tell.
+const GROUP = "900";
+
 function fakeTelegram(channels: Map<string, Post[]>, failing: Set<string>): ChannelsClient {
   return {
     getDialogs: async () => [
-      { isChannel: false, title: "a friend", entity: { id: 1 } },
-      ...[...channels.keys()].map((id) => ({ isChannel: true, title: `chan ${id}`, entity: { id, username: `u${id}` } })),
+      { isChannel: false, isGroup: false, title: "a friend", entity: { id: 1 } },
+      { isChannel: false, isGroup: true, title: "a basic group", entity: { id: 2 } },
+      { isChannel: true, isGroup: true, title: "a supergroup", entity: { id: GROUP } },
+      ...[...channels.keys()].filter((id) => id !== GROUP).map((id) => ({ isChannel: true, isGroup: false, title: `chan ${id}`, entity: { id, username: `u${id}` } })),
     ],
     getMessages: async (entity, { limit, minId, reverse }) => {
       const id = String(Reflect.get(Object(entity), "id"));
@@ -82,10 +88,10 @@ describe.skipIf(!available)("Telegram channel harvest into the news store", () =
     await fc.assert(
       fc.asyncProperty(fc.array(step, { minLength: 1, maxLength: 12, size: "max" }), async (steps) => {
         await pool.query("TRUNCATE news_items RESTART IDENTITY");
-        const channels = new Map<string, Post[]>([["100", []], ["200", []], ["300", []]]);
-        const ids = [...channels.keys()];
+        const channels = new Map<string, Post[]>([["100", []], ["200", []], ["300", []], [GROUP, []]]);
+        const ids = ["100", "200", "300"];
         const failing = new Set<string>();
-        const nextId = new Map(ids.map((c) => [c, 1]));
+        const nextId = new Map([...ids, GROUP].map((c) => [c, 1]));
         let clock = 1_790_000_000;
         const post = (channel: string, count: number, mediaEvery: number) => {
           const list = channels.get(channel)!;
@@ -98,6 +104,9 @@ describe.skipIf(!available)("Telegram channel harvest into the news store", () =
         // History before the harvester ever runs: only the newest 50 of it
         // is wanted (the bootstrap).
         for (const c of ids) post(c, 80, 0);
+        // The supergroup chats all along.
+        const chat = () => post(GROUP, 5, 0);
+        chat();
         const bootstrapCut = new Map(ids.map((c) => [c, nextId.get(c)! - 50]));
 
         const provider = createTelegramChannelsProvider(
@@ -114,6 +123,7 @@ describe.skipIf(!available)("Telegram channel harvest into the news store", () =
           if (s.kind === "posts") {
             if (s.count > 200) witnessed.add("a burst of more than one tick's worth");
             post(ids[s.channel]!, s.count, s.mediaEvery);
+            chat();
           } else {
             if (s.failChannel !== null) {
               failing.add(ids[s.failChannel]!);
@@ -127,6 +137,7 @@ describe.skipIf(!available)("Telegram channel harvest into the news store", () =
         const { rows } = await pool.query("SELECT external_id, body FROM news_items WHERE source = 'channel'");
         const stored = rows.map((r) => String(r.external_id));
         expect(new Set(stored).size, "no post stored twice").toBe(stored.length);
+        expect(stored.filter((id) => id.startsWith(`${GROUP}:`)), "nothing from a group chat").toEqual([]);
         for (const r of rows) expect(String(r.body).trim().length, "only text posts are stored").toBeGreaterThan(0);
         const want = ids.flatMap((c) =>
           channels

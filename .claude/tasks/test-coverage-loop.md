@@ -209,6 +209,22 @@ the real system, `[U]` unit property for complex logic.
 
 ## Done
 
+- **Userbot dialogs and the channel harvest** (2026-10-13,
+  `packages/mcp/test/userbot.test.ts`, `news-ingest.test.ts`) — Telegram
+  (gramjs) flags a supergroup `isChannel` *and* `isGroup`. The harvest
+  property now has a supergroup chatting all along beside the channels;
+  `list_userbot_dialogs` gets a property over MCP with users, basic groups,
+  supergroups and channels, type filters and limits. Rules: nothing from a
+  group chat is stored; each dialog is typed by what it is; a type filter
+  returns the first `limit` of that type in Telegram's order. **Bugs
+  fixed:** the harvester took every `isChannel` dialog, so supergroup
+  conversations were stored as channel posts — embedded, searchable, in
+  the digest, reachable from the ChatGPT tunnel; the tool typed a
+  supergroup as a channel and applied `limit` before the type filter
+  (asking for 100 channels could return a handful). `listDialogs` now
+  takes a narrow `DialogsClient` (no casts). Mutants caught: limit before
+  filter, harvesting supergroups. F22: the rows already stored.
+
 - **list_nashdom_mails** (2026-10-13, `gmail-attachments.test.ts`) — an
   uncalled-tool survey (tool names vs the tests that call them) left
   `list_nashdom_mails`, the userbot tools, `get_timezone` and the knowledge
@@ -822,6 +838,12 @@ the real system, `[U]` unit property for complex logic.
   articles by URL across sources (or looking up any source before
   inserting) would fix it; `sourceForUrl` also matches `evilhabr.com` as
   Habr.
+- **F22 group messages already in the news store.** Until the fix the
+  channel harvester stored every supergroup the userbot account is in as a
+  "channel": its messages sit in `news_items` (source `channel`), embedded
+  and searchable — from the ChatGPT tunnel too. Cleaning them up needs the
+  userbot's dialog list (which chat ids are supergroups) and a delete of
+  their rows; not done — your call.
 - **F19 a call whose MCP dies under it hangs for 60 s.** The server keeps
   no event store, so a POST's SSE stream has no resume point; when the
   process dies mid-call the SDK client only reports `SSE stream
@@ -905,3 +927,5 @@ the real system, `[U]` unit property for complex logic.
 - 2026-10-13 claude — fetch_article; 1 bug fixed (unbounded article reads,
   pollers included); F21.
 - 2026-10-13 claude — list_nashdom_mails paging + PDF selection; no bugs.
+- 2026-10-13 claude — userbot dialogs + harvest; 2 bugs fixed (supergroups
+  harvested as channels; limit before filter); F22.

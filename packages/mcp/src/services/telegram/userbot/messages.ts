@@ -60,19 +60,48 @@ export async function fetchChannelMessages(userbot: Userbot, opts: {
   return { channel: entityToChannelInfo(entity), messages };
 }
 
-export async function listDialogs(userbot: Userbot, limit = 100): Promise<UserbotDialog[]> {
-  const client = await userbot.client();
-  const dialogs = await client.getDialogs({ limit });
+// What listing dialogs needs from the client — the real TelegramClient
+// satisfies it structurally, and a test can hand in a stand-in.
+export interface DialogsClient {
+  getDialogs(params: { limit?: number }): Promise<Iterable<DialogEntry>>;
+}
+
+interface DialogEntry {
+  id?: unknown;
+  // Telegram reports a supergroup as a channel too: `isChannel` for every
+  // channel-type chat, `isGroup` for groups including supergroups.
+  isChannel: boolean;
+  isGroup: boolean;
+  isUser: boolean;
+  title?: string;
+  name?: string;
+  entity?: unknown;
+  unreadCount: number;
+}
+
+// The account's dialogs in Telegram's order (most recent first). With a
+// type, the first `limit` dialogs OF THAT TYPE — filtering after the limit
+// would hand back fewer than exist.
+export async function listDialogs(
+  source: { client(): Promise<DialogsClient> },
+  opts: { type?: UserbotDialog["type"]; limit?: number } = {},
+): Promise<UserbotDialog[]> {
+  const limit = opts.limit ?? 100;
+  const client = await source.client();
+  const dialogs = await client.getDialogs(opts.type ? {} : { limit });
   const out: UserbotDialog[] = [];
   for (const d of dialogs) {
-    const entity = d.entity as { username?: string } | undefined;
+    const type: UserbotDialog["type"] = d.isGroup ? "group" : d.isChannel ? "channel" : d.isUser ? "user" : "unknown";
+    if (opts.type && type !== opts.type) continue;
+    const username: unknown = typeof d.entity === "object" && d.entity !== null ? Reflect.get(d.entity, "username") : undefined;
     out.push({
       id: String(d.id),
-      type: d.isChannel ? "channel" : d.isGroup ? "group" : d.isUser ? "user" : "unknown",
+      type,
       title: d.title ?? d.name ?? "(untitled)",
-      username: entity?.username,
+      username: typeof username === "string" ? username : undefined,
       unreadCount: d.unreadCount,
     });
+    if (out.length === limit) break;
   }
   return out;
 }
