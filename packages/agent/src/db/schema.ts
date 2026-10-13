@@ -1,5 +1,5 @@
 import { sql } from "drizzle-orm";
-import { index, primaryKey, real, sqliteTable, text } from "drizzle-orm/sqlite-core";
+import { index, integer, primaryKey, real, sqliteTable, text } from "drizzle-orm/sqlite-core";
 import type { Observation } from "../trace-model";
 
 // Drizzle schema for the agent's sqlite state (agent.db). The query layer
@@ -48,7 +48,12 @@ export const traces = sqliteTable(
     startedAt: text("started_at").notNull(), // trace root start (ISO)
     createdAt: text("created_at").notNull().default(nowDefault),
   },
-  (t) => [index("traces_started").on(t.startedAt), index("traces_skill").on(t.skill)],
+  (t) => [
+    index("traces_started").on(t.startedAt),
+    index("traces_skill").on(t.skill),
+    // The activity-journal worker selects by insertion (= completion) time.
+    index("traces_created").on(t.createdAt),
+  ],
 );
 
 export type TraceRow = typeof traces.$inferSelect;
@@ -120,3 +125,28 @@ export const improverState = sqliteTable(
 );
 
 export type ImproverStateRow = typeof improverState.$inferSelect;
+
+// Activity-journal progress, one row per production trace the journal worker
+// has started on (../activity-journal.ts). No row = not yet attempted. A
+// generated note is kept as `draft` until its journal append is confirmed, so
+// a failed append retries without paying for a second generation. `done` is
+// permanent; `failed` means generation kept failing and the worker gave up.
+// Not a lock: one worker process guards in-flight traces in memory.
+export const activityProjections = sqliteTable(
+  "activity_projections",
+  {
+    traceId: text("trace_id")
+      .primaryKey()
+      .references(() => traces.id),
+    status: text("status").$type<"pending" | "done" | "failed">().notNull(),
+    attempts: integer("attempts").notNull().default(0),
+    nextAttemptAt: text("next_attempt_at"), // ISO; null = due now
+    error: text("error"),
+    draft: text("draft", { mode: "json" }).$type<{ body: string; metadata: Record<string, unknown> }>(),
+    entryId: integer("entry_id"), // the journal entry id, once appended
+    updatedAt: text("updated_at").notNull().default(nowDefault),
+  },
+  (t) => [index("activity_projections_status").on(t.status, t.nextAttemptAt)],
+);
+
+export type ActivityProjectionRow = typeof activityProjections.$inferSelect;

@@ -337,9 +337,17 @@ export function registerMemoryTools(server: McpServer, deps: MemoryToolDeps): vo
           .max(JOURNAL_MAX_CAPACITY)
           .optional()
           .describe("Set the stream's capacity (kept for later appends). Omit to keep the current one."),
+        metadata: z
+          .record(z.unknown())
+          .optional()
+          .describe(
+            "Provenance stored with the entry and returned by journal_tail, e.g. " +
+              '{ "trace_id": "…" }. Not an identity: appending the same metadata twice stores two entries.',
+          ),
       },
     },
-    async ({ stream, body, capacity }) => run(() => memory.journalAppend({ stream, body, actor, capacity })),
+    async ({ stream, body, capacity, metadata }) =>
+      run(() => memory.journalAppend({ stream, body, actor, capacity, metadata })),
   );
 
   server.registerTool(

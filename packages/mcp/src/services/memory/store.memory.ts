@@ -229,6 +229,7 @@ export function createInMemoryStore(opts: InMemoryStoreOpts = {}): MemoryStore {
         stream: input.stream,
         body: input.body,
         actor: input.actor,
+        metadata: input.metadata === null ? null : structuredClone(input.metadata),
         createdAt: stamp(),
       };
       row.entries.push(entry);

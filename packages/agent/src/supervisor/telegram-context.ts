@@ -3,6 +3,7 @@ import { z } from "zod";
 import type { McpHandle } from "../mcp-client";
 import type { SessionContext } from "../session-context";
 import { isToolError } from "../tool-results";
+import { TOOL_META } from "../trace-model";
 import type { TraceContext } from "../tracing";
 import type { PendingSignal } from "./module";
 
@@ -79,7 +80,12 @@ export async function prepareTelegramInput(
   const chatId = header[1]!;
   const threadId = header[2] === undefined ? null : Number(header[2]);
   const args = { chatId, limit: TELEGRAM_HISTORY_LIMIT, ...(threadId === null ? {} : { threadId }) };
-  const span = trace.span({ name: "get_telegram_chat_history", kind: "tool", input: args, metadata: { automatic: true } });
+  const span = trace.span({
+    name: "get_telegram_chat_history",
+    kind: "tool",
+    input: args,
+    metadata: { [TOOL_META]: "get_telegram_chat_history", automatic: true },
+  });
   try {
     const currentText = z.string().parse(JSON.parse(header[3]!));
     const signalTime = timestamp(signal.created_at);

@@ -24,6 +24,25 @@ Feature: The journal
       | entries.0.body | "Tuesday digest" |
       | entries.1.body | "Monday digest"  |
 
+  Scenario: Metadata is kept with the entry, and the same metadata twice is two entries
+    Given I call "journal_append" with:
+      """
+      { "stream": "ouro/activity", "body": "Sent the digest", "metadata": { "trace_id": "telegram:7" } }
+      """
+    And I call "journal_append" with:
+      """
+      { "stream": "ouro/activity", "body": "Sent the digest", "metadata": { "trace_id": "telegram:7" } }
+      """
+    When I call "journal_tail" with:
+      """
+      { "stream": "ouro/activity", "n": 10 }
+      """
+    Then the result is:
+      | field                       | value         |
+      | ok                          | true          |
+      | entries.0.metadata.trace_id | "telegram:7"  |
+      | entries.1.metadata.trace_id | "telegram:7"  |
+
   Scenario: A stream nobody wrote to reads as empty
     When I call "journal_tail" with:
       """

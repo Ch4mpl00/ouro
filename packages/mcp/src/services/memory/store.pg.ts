@@ -343,7 +343,7 @@ export function createPgMemoryStore(deps: PgMemoryStoreDeps): MemoryStore {
 
         const [row] = await tx
           .insert(journalEntries)
-          .values({ streamId: stream.id, body: input.body, actor: input.actor })
+          .values({ streamId: stream.id, body: input.body, actor: input.actor, metadata: input.metadata })
           .returning();
         if (!row) throw new Error("appendEntry inserted no entry");
 
@@ -409,6 +409,7 @@ function toEntry(row: typeof journalEntries.$inferSelect, stream: string): Journ
     stream,
     body: row.body,
     actor: row.actor,
+    metadata: row.metadata ?? null,
     createdAt: row.createdAt.toISOString(),
   };
 }

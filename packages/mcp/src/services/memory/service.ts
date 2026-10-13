@@ -79,6 +79,8 @@ export interface JournalAppendInput {
   stream: string;
   body: string;
   actor: string;
+  // Writer's provenance, stored with the entry and returned by the tail.
+  metadata?: Record<string, unknown> | null;
   // Stored on the stream; omitted keeps whatever the stream already has.
   capacity?: number;
 }
@@ -92,6 +94,8 @@ export const JOURNAL_TAIL_MAX = 100;
 // A digest is ~5k characters; the cap keeps one runaway write from making
 // every later tail expensive.
 export const JOURNAL_MAX_BODY_CHARS = 32_000;
+// Metadata is a provenance label (a trace id, a source), not a second body.
+export const JOURNAL_MAX_METADATA_CHARS = 2_000;
 
 export interface WriteDocInput {
   project: string;
@@ -539,10 +543,20 @@ export function createMemoryService(deps: MemoryServiceDeps): MemoryService {
           { capacity, max: JOURNAL_MAX_CAPACITY },
         );
       }
+      const metadata = input.metadata ?? null;
+      const metadataChars = metadata === null ? 0 : JSON.stringify(metadata).length;
+      if (metadataChars > JOURNAL_MAX_METADATA_CHARS) {
+        throw new MemoryError(
+          "metadata_too_large",
+          `Journal metadata is at most ${JOURNAL_MAX_METADATA_CHARS} characters of JSON; this one is ${metadataChars}.`,
+          { max: JOURNAL_MAX_METADATA_CHARS, length: metadataChars },
+        );
+      }
       return store.appendEntry({
         stream: input.stream,
         body: input.body,
         actor: input.actor,
+        metadata,
         capacity,
         defaultCapacity: JOURNAL_DEFAULT_CAPACITY,
       });

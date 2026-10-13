@@ -81,6 +81,8 @@ mcp-tools/
             │   ├── dsl.ts                     Workflow step schema + parse
             │   └── variables.ts               ${path} substitution + variable store
             ├── engine.ts, agent-loop.ts     LLM runner (ReAct loop)
+            ├── activity-journal.ts          traces → ouro/activity journal notes (background
+            │                                 loop inside the supervisor)
             ├── providers/                   ChatProviders: openai, gemini, deepseek,
             │                                 openrouter (opt-in, "openrouter/…" models)
             ├── decisions.ts                 typed classification (Jev via OpenRouter's

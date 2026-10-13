@@ -235,6 +235,9 @@ export const journalEntries = pgTable(
       .references(() => journalStreams.id, { onDelete: "cascade" }),
     body: text("body").notNull(),
     actor: text("actor").notNull(),
+    // Writer-supplied provenance (e.g. trace_id). Never unique, never used to
+    // deduplicate: an append always lands.
+    metadata: jsonb("metadata").$type<Record<string, unknown>>(),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   },
   // Order is by id, not created_at: ids are drawn under the stream lock, so

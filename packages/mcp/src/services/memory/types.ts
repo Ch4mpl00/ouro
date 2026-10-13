@@ -98,6 +98,9 @@ export interface JournalEntry {
   stream: string;
   body: string;
   actor: string;
+  // Provenance the writer attaches (e.g. the trace an activity note was
+  // derived from). Stored as given, never interpreted: no dedup, no lookup.
+  metadata: Record<string, unknown> | null;
   createdAt: string;
 }
 

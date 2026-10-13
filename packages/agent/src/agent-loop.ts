@@ -8,6 +8,7 @@ import { z } from "zod";
 import { Cause, Effect, Exit } from "effect";
 import { generationEffect } from "./generation";
 import { toError } from "./errors";
+import { TOOL_META } from "./trace-model";
 import {
   INVOKE_SUB_AGENT_TOOL_NAME,
   SYNTHETIC_TOOLS,
@@ -373,7 +374,7 @@ export function createAgentLoop(engine: Engine, opts: AgentLoopOpts): AgentLoop 
               kind:
                 call.function.name === INVOKE_SUB_AGENT_TOOL_NAME ? "agent" : "tool",
               input: { raw_arguments: call.function.arguments },
-              metadata: { ...observationMeta, tool_call_id: call.id },
+              metadata: { ...observationMeta, [TOOL_META]: call.function.name, tool_call_id: call.id },
             });
 
             const invoke = Effect.gen(function* () {

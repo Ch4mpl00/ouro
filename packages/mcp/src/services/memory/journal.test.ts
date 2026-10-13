@@ -5,6 +5,7 @@ import {
   JOURNAL_DEFAULT_CAPACITY,
   JOURNAL_MAX_BODY_CHARS,
   JOURNAL_MAX_CAPACITY,
+  JOURNAL_MAX_METADATA_CHARS,
   JOURNAL_TAIL_DEFAULT,
   JOURNAL_TAIL_MAX,
   MemoryError,
@@ -123,6 +124,22 @@ describe("journal — functional", () => {
     const { service } = harness();
     await service.journalAppend({ stream: "s", body: "x", actor: "chatgpt" });
     expect((await service.journalTail({ stream: "s" })).entries[0]?.actor).toBe("chatgpt");
+  });
+
+  it("F7 metadata is stored with the entry, never deduplicates, and is bounded", async () => {
+    const { service } = harness();
+    const metadata = { trace_id: "telegram:7", source: "telegram" };
+    await service.journalAppend({ stream: "s", body: "x", actor: ACTOR, metadata });
+    await service.journalAppend({ stream: "s", body: "x", actor: ACTOR, metadata });
+    await service.journalAppend({ stream: "s", body: "y", actor: ACTOR });
+    const { entries } = await service.journalTail({ stream: "s", n: 10 });
+    expect(entries.map((e) => e.metadata)).toEqual([null, metadata, metadata]);
+
+    const huge = { note: "x".repeat(JOURNAL_MAX_METADATA_CHARS) };
+    expect(await memoryError(service.journalAppend({ stream: "s", body: "z", actor: ACTOR, metadata: huge }))).toMatchObject({
+      code: "metadata_too_large",
+    });
+    expect((await service.journalTail({ stream: "s", n: 10 })).entries).toHaveLength(3);
   });
 });
 

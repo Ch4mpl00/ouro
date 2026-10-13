@@ -10,7 +10,7 @@ import { SET_MEMORY_TOOL_NAME, SetMemoryArgsSchema } from "../synthetic-tools";
 import { runCodeAgent } from "../code-agent";
 import { filter, type DecisionClient } from "../decisions";
 import type { CodexClient } from "../codex-client";
-import { JUDGE_NODE_META } from "../trace-model";
+import { JUDGE_NODE_META, TOOL_META } from "../trace-model";
 import { appendPatch } from "../skills";
 import type { Span, SpanKind, TraceContext } from "../tracing";
 import type {
@@ -286,7 +286,7 @@ function stepSpanKind(kind: Step["kind"]): SpanKind {
 function stepMetadata(step: Step): Record<string, unknown> {
   switch (step.kind) {
     case "tool":
-      return { tool: step.tool, bind: step.bind ?? null };
+      return { [TOOL_META]: step.tool, bind: step.bind ?? null };
     case "llm_compose":
       return {
         preset: step.preset,
@@ -302,7 +302,7 @@ function stepMetadata(step: Step): Record<string, unknown> {
         max_iterations: step.maxIterations,
       };
     case "code_agent":
-      return { bind: step.bind, has_data: step.data !== undefined };
+      return { [TOOL_META]: "code_agent", bind: step.bind, has_data: step.data !== undefined };
     case "decide":
       return { preset: step.preset, bind: step.bind, threshold: step.threshold ?? null };
     case "parallel":

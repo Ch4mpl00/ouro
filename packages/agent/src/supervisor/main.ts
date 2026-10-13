@@ -1,6 +1,13 @@
 import "dotenv/config";
 import "../openai-native-fetch";
 import OpenAI from "openai";
+import {
+  createActivityJournalWorker,
+  createActivityProgressStore,
+  createNoteGenerator,
+  DEFAULT_ACTIVITY_JOURNAL_OPTS,
+  type ActivityJournalOpts,
+} from "../activity-journal";
 import { createCodexClient } from "../codex-client";
 import { createAgentDb } from "../db/client";
 import { createDecisionClient } from "../decisions";
@@ -44,6 +51,25 @@ import { createSupervisorModule } from "./module";
 //                   ↳ crash → recovery report within the same trace
 //
 // The per-signal context, trace and recovery lifecycle live in ./module.
+
+function numberEnv(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw === "") return fallback;
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value <= 0) throw new Error(`${name} must be a positive number, got ${raw}`);
+  return value;
+}
+
+function activityJournalOptsFromEnv(): ActivityJournalOpts {
+  const d = DEFAULT_ACTIVITY_JOURNAL_OPTS;
+  return {
+    ...d,
+    pollIntervalMs: numberEnv("ACTIVITY_JOURNAL_POLL_INTERVAL_MS", d.pollIntervalMs),
+    batchSize: numberEnv("ACTIVITY_JOURNAL_BATCH_SIZE", d.batchSize),
+    maxGenerationAttempts: numberEnv("ACTIVITY_JOURNAL_MAX_ATTEMPTS", d.maxGenerationAttempts),
+    budget: { ...d.budget, totalChars: numberEnv("ACTIVITY_JOURNAL_MAX_INPUT_CHARS", d.budget.totalChars) },
+  };
+}
 
 async function main(): Promise<void> {
   const deepseekApiKey = process.env.DEEPSEEK_API_KEY;
@@ -186,11 +212,42 @@ async function main(): Promise<void> {
   });
   const supervisor = createSupervisorModule({ engine, env: envDeps, workflow });
 
+  // Activity journal: a background loop in this process that turns finished
+  // production traces into notes on the shared `ouro/activity` stream, over
+  // the same MCP connection (see ../activity-journal). Base preset unless
+  // ACTIVITY_JOURNAL_MODEL overrides; ACTIVITY_JOURNAL=off disables it.
+  const journalStop = new AbortController();
+  let journalRun: Promise<void> = Promise.resolve();
+  if (process.env.ACTIVITY_JOURNAL !== "off") {
+    const journalModel = process.env.ACTIVITY_JOURNAL_MODEL ?? presets.base.model;
+    const journal = createActivityJournalWorker(
+      {
+        traces: traceStore,
+        progress: createActivityProgressStore(db, memory),
+        notes: createNoteGenerator({
+          provider: engine.resolveProvider(journalModel),
+          model: journalModel,
+          reasoningEffort: presets.base.reasoningEffort,
+        }),
+        journal: mcp,
+      },
+      activityJournalOptsFromEnv(),
+    );
+    console.log(`[supervisor] activity journal on (model=${journalModel})`);
+    journalRun = journal.run(journalStop.signal).catch((err: unknown) => {
+      console.error("[supervisor] activity journal stopped:", err);
+    });
+  }
+
   let stopping = false;
   const stop = async (sig: string): Promise<void> => {
     if (stopping) return;
     stopping = true;
     console.log(`[supervisor] ${sig} — shutting down`);
+    // The journal loop uses the MCP connection and agent.db: stop it before
+    // the supervisor closes the one and this function the other.
+    journalStop.abort();
+    await journalRun;
     await supervisor.shutdown();
     db.$client.close();
     process.exit(0);

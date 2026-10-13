@@ -83,6 +83,7 @@ export interface AppendEntryInput {
   stream: string;
   body: string;
   actor: string;
+  metadata: Record<string, unknown> | null;
   // Stored on the stream when given; omitted keeps the stream's capacity, or
   // `defaultCapacity` for a stream this append creates.
   capacity?: number;
