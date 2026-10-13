@@ -200,14 +200,11 @@ suites, stronger generators, scenarios from `.claude/tasks/*.md` and
 Ordered by expected bug yield. `[I]` integration, `[P]` property suite over
 the real system, `[U]` unit property for complex logic.
 
-1. **Agent sqlite state** `[I]` — memory KV + trace mirror
-    (`db/trace-store.ts`): migrations on boot idempotent, trace/judgement
-    invariants.
-2. **`mcp_state` boot** `[I]` — migrations idempotent, two servers booting
+1. **`mcp_state` boot** `[I]` — migrations idempotent, two servers booting
     at once (advisory lock).
-3. **Monobank, PDF, files tools** `[I]` — fake HTTP; `read_file` path
+2. **Monobank, PDF, files tools** `[I]` — fake HTTP; `read_file` path
     confinement.
-4. **Evals (`judging/`, `eval/`), `packages/codex`** — P3, services are
+3. **Evals (`judging/`, `eval/`), `packages/codex`** — P3, services are
     off; only if everything above is done.
 - **Provider tool-call ids** (P3, needs a live API) — the AgentLoop answers
   tool calls by `id`; no provider normalises ids. Check what Gemini's and
@@ -413,6 +410,17 @@ the real system, `[U]` unit property for complex logic.
   tool errors. No bugs found. Mutation check: no reconnect, a later source
   overriding a taken name, no name validation, arguments dropped — all
   caught.
+- **Agent sqlite state** (2026-10-13, `packages/agent/test/agent-db.test.ts`)
+  — memory KV under generated set / get / close-and-reopen sequences (last
+  write wins across restarts); trace mirror and judgements under generated
+  writes, overwrites and queries (getTrace round-trips through JSON,
+  listRecent newest-first with the unjudged filter, listJudgements /
+  listJudgedSkills exact); migrating twice is a no-op; three processes
+  released at one instant on a fresh file all come up. **Bug fixed**
+  (`58f9508`): the WAL switch isn't covered by the busy handler and
+  drizzle reads applied migrations before BEGIN — concurrent booters failed
+  with "database is locked" / "already exists"; both retried now. Closes
+  `.claude/tasks/done/agent-migration-race.md`.
 
 ## Findings
 
@@ -545,3 +553,5 @@ the real system, `[U]` unit property for complex logic.
   F12, F13.
 - 2026-10-13 claude — skills contract (root test/); 1 bug fixed; F14.
 - 2026-10-13 claude — gateway over real HTTP upstreams; no bugs; F15.
+- 2026-10-13 claude — agent sqlite state; migration race reproduced and
+  fixed.

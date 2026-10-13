@@ -1,6 +1,8 @@
 # Agent sqlite migration race across concurrent booters
 
-**Status:** OPEN (latent; self-heals via restart)
+**Status:** done (2026-10-13, test/coverage-loop) — boot steps retry the two
+lost-race errors; reproduced and pinned by `packages/agent/test/agent-db.test.ts`
+(three processes released at one instant)
 **Priority:** P3
 **Area:** agent / db / deploy
 **Created:** 2026-06-18
