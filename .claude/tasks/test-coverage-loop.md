@@ -200,16 +200,14 @@ suites, stronger generators, scenarios from `.claude/tasks/*.md` and
 Ordered by expected bug yield. `[I]` integration, `[P]` property suite over
 the real system, `[U]` unit property for complex logic.
 
-1. **Gateway** `[I]` — fake upstream MCP server: namespacing, upstream
-    failure isolated from own tools, reconnect.
-2. **Agent sqlite state** `[I]` — memory KV + trace mirror
+1. **Agent sqlite state** `[I]` — memory KV + trace mirror
     (`db/trace-store.ts`): migrations on boot idempotent, trace/judgement
     invariants.
-3. **`mcp_state` boot** `[I]` — migrations idempotent, two servers booting
+2. **`mcp_state` boot** `[I]` — migrations idempotent, two servers booting
     at once (advisory lock).
-4. **Monobank, PDF, files tools** `[I]` — fake HTTP; `read_file` path
+3. **Monobank, PDF, files tools** `[I]` — fake HTTP; `read_file` path
     confinement.
-5. **Evals (`judging/`, `eval/`), `packages/codex`** — P3, services are
+4. **Evals (`judging/`, `eval/`), `packages/codex`** — P3, services are
     off; only if everything above is done.
 - **Provider tool-call ids** (P3, needs a live API) — the AgentLoop answers
   tool calls by `id`; no provider normalises ids. Check what Gemini's and
@@ -403,6 +401,18 @@ the real system, `[U]` unit property for complex logic.
   newline before the marker, MCP preferring defaults, agent accepting any
   tool name, strict wildcard spacing, padded tool names — all caught (CRLF
   regex and listing patch files in MCP are equivalent mutants).
+- **Gateway** (2026-10-13, `packages/mcp/test/gateway.test.ts`) — real
+  Streamable HTTP upstreams (in-process McpServers behind runHttpTransport,
+  single-session so a second client evicts the gateway's session), some
+  down at boot, generated tool names that clash across sources or are
+  invalid / too long once prefixed, tools that echo / return an error /
+  throw: the merged list is exactly own-first, prefix__name, invalid and
+  taken names dropped; every call reaches the right source with the
+  original name and its arguments, errors come back as tool errors, an
+  evicted upstream session is reconnected transparently, unknown names are
+  tool errors. No bugs found. Mutation check: no reconnect, a later source
+  overriding a taken name, no name validation, arguments dropped — all
+  caught.
 
 ## Findings
 
@@ -491,6 +501,17 @@ the real system, `[U]` unit property for complex logic.
   skills a sub-agent loads) run the bare body. A patch written for one of
   those shows up in the export and changes nothing at run time. Either the
   loop applies patches too, or the export says which skills it applies to.
+- **F15 an upstream down at MCP boot can keep the agent from starting.**
+  The gateway lists upstream tools once, at boot; an upstream that is
+  unreachable then (Tavily blip, DNS, the 15 s connect timeout during a
+  deploy) is skipped until MCP restarts. The agent's startup validateAll
+  checks every skill's `tools:` against MCP's list, and `gaia.md` declares
+  `tavily__tavily_search` / `tavily__tavily_extract` — so the supervisor
+  crashes on every restart until MCP is restarted. Options: the gateway
+  retries a failed upstream in the background (and serves its tools once
+  back), or the agent's validation treats missing gateway (`prefix__`)
+  tools as a warning. Also: a connect that loses the timeout race but later
+  succeeds leaves its client open.
 - **F2 delivery is at-most-once.** `get_next_signal` marks the signal
   consumed when it pops it, so a supervisor that crashes after the pop and
   before handling loses the signal for good (no lease / ack). Possibly
@@ -523,3 +544,4 @@ the real system, `[U]` unit property for complex logic.
 - 2026-10-13 claude — toolset combinations + transport sessions; 1 bug fixed;
   F12, F13.
 - 2026-10-13 claude — skills contract (root test/); 1 bug fixed; F14.
+- 2026-10-13 claude — gateway over real HTTP upstreams; no bugs; F15.
