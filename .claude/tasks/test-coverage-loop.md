@@ -204,17 +204,13 @@ suites, stronger generators, scenarios from `.claude/tasks/*.md` and
 Ordered by expected bug yield. `[I]` integration, `[P]` property suite over
 the real system, `[U]` unit property for complex logic.
 
-1. **News ingest** `[I][P]` — the HN / Habr providers and the Telegram
-   channel harvest (`services/news/providers/*`, pollers): ingest is
-   idempotent, a failed item doesn't stop the batch, watermarks / cursors
-   only move past what was stored, nothing re-ingested after a restart.
-2. **Telegram status bubble and typing** `[I]` — `telegram_send_status`
+1. **Telegram status bubble and typing** `[I]` — `telegram_send_status`
    (one bubble per id: send, edit, delete on empty; a deleted / edited-away
    message), `start_typing` keep-alive with its TTL and clean stop, on fake
    timers + the fake Bot API.
-3. **Knowledge module** `[I]` — `services/knowledge` (notes; superseded by
+2. **Knowledge module** `[I]` — `services/knowledge` (notes; superseded by
    memory facts?) — check whether anything still calls it before testing.
-4. **Evals (`judging/`, `eval/`)** — P3, the services are off (`evals`
+3. **Evals (`judging/`, `eval/`)** — P3, the services are off (`evals`
    compose profile). `packages/codex` is done (it backs code_agent in prod).
 
 ## Done
@@ -477,6 +473,18 @@ the real system, `[U]` unit property for complex logic.
   Mutation check: exclusive threshold, batch one item too big, no char
   budget, misaligned answers — caught; skipping the up-front answer check is
   equivalent at this level (answer() parses lazily).
+- **Channel harvest** (2026-10-13, `packages/mcp/test/news-ingest.test.ts`)
+  — the real provider, adapter (through a new `ChannelsClient` seam the
+  gramjs client satisfies), Postgres watermark and repository; Telegram is
+  a stand-in answering getMessages with the API's order rules. Generated
+  timelines of posts (bursts of 200–450, media posts without text) and
+  ticks (a channel failing now and then): after catching up, every text
+  post since the bootstrap is stored exactly once, nothing older, no media.
+  **Bug fixed** (`ab9bb69`): past a watermark the newest 200 were fetched,
+  so a channel posting more than 200 between ticks (or during an outage)
+  lost the rest for good; now the oldest 200 after the watermark. HN / Habr
+  providers read: per-article failures return null, the poller isolates
+  providers — no suite added.
 
 ## Findings
 
@@ -576,6 +584,11 @@ the real system, `[U]` unit property for complex logic.
   back), or the agent's validation treats missing gateway (`prefix__`)
   tools as a warning. Also: a connect that loses the timeout race but later
   succeeds leaves its client open.
+- **F16 a channel can stall on media posts.** The harvest watermark is the
+  highest *stored* message id, and posts without text aren't stored. 200
+  media-only posts in a row after the watermark come back every tick, store
+  nothing, and the channel never moves past them. Keeping a per-channel
+  fetched-up-to cursor (or storing media posts flagged) would fix it.
 - **F2 delivery is at-most-once.** `get_next_signal` marks the signal
   consumed when it pops it, so a supervisor that crashes after the pop and
   before handling loses the signal for good (no lease / ack). Possibly
@@ -619,3 +632,4 @@ the real system, `[U]` unit property for complex logic.
 - 2026-10-13 claude — codex service; 2 fix commits (timeout kill, sandbox
   restriction + validation).
 - 2026-10-13 claude — digest filter; 1 bug fixed (unbounded probabilities).
+- 2026-10-13 claude — channel harvest; 1 bug fixed (bursts lost); F16.
