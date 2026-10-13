@@ -142,10 +142,19 @@ export function parseToolsets(raw: string | undefined): ToolsetSelection {
   return { names: [...new Set(requested.filter(isToolsetName))], restricted: true };
 }
 
+// Groups that are a strict subset of another: selecting both would register
+// their tools twice, which the SDK refuses ("already registered") — an
+// instance with MCP_TOOLSETS=telegram,telegram-send failed to serve at all.
+const SUBSUMED_BY: Partial<Record<ToolsetName, ToolsetName>> = { "telegram-send": "telegram" };
+
 export function registerToolsets(
   server: McpServer,
   deps: ToolsetDeps,
   names: readonly ToolsetName[],
 ): void {
-  for (const name of names) TOOLSETS[name](server, deps);
+  for (const name of names) {
+    const wider = SUBSUMED_BY[name];
+    if (wider !== undefined && names.includes(wider)) continue;
+    TOOLSETS[name](server, deps);
+  }
 }
