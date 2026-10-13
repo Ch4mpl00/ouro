@@ -57,8 +57,14 @@ const DOT_CYCLE = 4;
 const statuses = new Map<string, StatusEntry>();
 let timer: NodeJS.Timeout | null = null;
 
+// Telegram's cap on a message. The animation dots only take the room left
+// under it: on a text at the cap they used to push every frame over, the
+// edits failed, and the bubble froze.
+const TELEGRAM_TEXT_LIMIT = 4096;
+
 function render(baseText: string, frame: number): string {
-  return baseText + ".".repeat(frame % DOT_CYCLE);
+  const room = Math.max(0, TELEGRAM_TEXT_LIMIT - baseText.length);
+  return baseText + ".".repeat(Math.min(frame % DOT_CYCLE, room));
 }
 
 function ensureTimer(): void {
@@ -122,7 +128,26 @@ export interface SendStatusResult {
   messageThreadId?: number | null;
 }
 
-export async function sendStatus(input: SendStatusInput): Promise<SendStatusResult> {
+// Calls for one id run one after another. An agent's tool calls run in
+// parallel, and two that both found no bubble each sent one — the first was
+// forgotten and stayed in the chat for good.
+const queues = new Map<string, Promise<unknown>>();
+
+export function sendStatus(input: SendStatusInput): Promise<SendStatusResult> {
+  const previous = queues.get(input.id) ?? Promise.resolve();
+  const run = previous.then(
+    () => sendStatusNow(input),
+    () => sendStatusNow(input),
+  );
+  queues.set(input.id, run);
+  const forget = () => {
+    if (queues.get(input.id) === run) queues.delete(input.id);
+  };
+  run.then(forget, forget);
+  return run;
+}
+
+async function sendStatusNow(input: SendStatusInput): Promise<SendStatusResult> {
   const { id } = input;
   const text = input.text.trim();
   const existing = statuses.get(id);
