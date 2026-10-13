@@ -12,6 +12,6 @@
     "resolveJsonModule": true,
     "noEmit": true
   },
-  "include": ["packages/*/src/**/*", "packages/*/test/**/*", "packages/mcp/specs/**/*", "packages/mcp/model/**/*"],
+  "include": ["packages/*/src/**/*", "packages/*/test/**/*", "test/**/*", "packages/mcp/specs/**/*", "packages/mcp/model/**/*"],
   "exclude": ["node_modules", "**/dist"]
 }

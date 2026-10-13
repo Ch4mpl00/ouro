@@ -141,6 +141,11 @@ Distilled from `~/Code/tickets-booking/AGENTS.md` and `test/properties/`
   (gaxios 6) uses node-fetch, so MockAgent does NOT intercept it — a probe
   reached the real Google. Needs GOOGLE_CLIENT_ID / SECRET / REDIRECT_URI
   and an `integration_account` row with an unexpired access token.
+- **Cross-package contract tests live in the repo-root `test/`** (in
+  vitest's and tsconfig's include; fast-check is a root devDependency).
+  Production code of the two packages never imports the other; a contract
+  test outside both may, to run the twin implementations side by side
+  (`test/skills-contract.test.ts`).
 - fast-check gotcha: `fc.array(..., { maxLength })` still generates short
   arrays unless `size: "max"` is given — sequences silently stay trivial.
 - fast-check gotcha 2: `fc.option(arb, { freq })` yields nil with
@@ -195,20 +200,16 @@ suites, stronger generators, scenarios from `.claude/tasks/*.md` and
 Ordered by expected bug yield. `[I]` integration, `[P]` property suite over
 the real system, `[U]` unit property for complex logic.
 
-1. **Skills** `[I]` — agent two-layer loader (live → default, patch
-    overlay) and the MCP `read_skill` export agree on the composed
-    instructions for generated bodies/patches (the two `appendPatch`
-    copies must not drift).
-2. **Gateway** `[I]` — fake upstream MCP server: namespacing, upstream
+1. **Gateway** `[I]` — fake upstream MCP server: namespacing, upstream
     failure isolated from own tools, reconnect.
-3. **Agent sqlite state** `[I]` — memory KV + trace mirror
+2. **Agent sqlite state** `[I]` — memory KV + trace mirror
     (`db/trace-store.ts`): migrations on boot idempotent, trace/judgement
     invariants.
-4. **`mcp_state` boot** `[I]` — migrations idempotent, two servers booting
+3. **`mcp_state` boot** `[I]` — migrations idempotent, two servers booting
     at once (advisory lock).
-5. **Monobank, PDF, files tools** `[I]` — fake HTTP; `read_file` path
+4. **Monobank, PDF, files tools** `[I]` — fake HTTP; `read_file` path
     confinement.
-6. **Evals (`judging/`, `eval/`), `packages/codex`** — P3, services are
+5. **Evals (`judging/`, `eval/`), `packages/codex`** — P3, services are
     off; only if everything above is done.
 - **Provider tool-call ids** (P3, needs a live API) — the AgentLoop answers
   tool calls by `id`; no provider normalises ids. Check what Gemini's and
@@ -389,6 +390,19 @@ the real system, `[U]` unit property for complex logic.
   send_telegram_message and the instance could not serve (`21ebc95`).
   Mutation check: no de-duplication, ended session keeping its server, no
   eviction, close leaving sessions open — all caught.
+- **Skills contract** (2026-10-13, `test/skills-contract.test.ts`) — the
+  agent's loader and the MCP export run on the same generated live /
+  default / patch directories (frontmatter variants incl. CRLF, spacing,
+  missing and invalid; bodies with `---`, trailing space; patches empty,
+  blank, CRLF): same skills from the same layer, never a patch file, a
+  skill the export reads as well-formed is one the agent loads, same tools,
+  same body + patch, same `patched` flag. **Bug fixed:** the agent listed
+  `<name>.patch.md` as a skill `<name>.patch`, so one improver patch on
+  disk failed validateAll and the supervisor's startup, and the compiler
+  was offered `<name>.patch` as a skill (`5cfdf23`). Mutation check: one
+  newline before the marker, MCP preferring defaults, agent accepting any
+  tool name, strict wildcard spacing, padded tool names — all caught (CRLF
+  regex and listing patch files in MCP are equivalent mutants).
 
 ## Findings
 
@@ -469,6 +483,14 @@ the real system, `[U]` unit property for complex logic.
   `Client.close()` doesn't, so every session a client drops keeps its
   `McpServer` and transport for the life of the process (the memory and
   tunnel instances). An idle TTL on sessions would bound it.
+- **F14 `read_skill` says a patch is in force where it isn't.** The export's
+  `effectiveInstructions` (and `patched: true`) glue the improver patch onto
+  every skill, but the agent applies patches only to `llm_compose` steps
+  and the planner (`execute.ts` / `compile.ts`); AgentLoop skills
+  (telegram, scheduler, orchestrator, routing, worker, recovery, domain
+  skills a sub-agent loads) run the bare body. A patch written for one of
+  those shows up in the export and changes nothing at run time. Either the
+  loop applies patches too, or the export says which skills it applies to.
 - **F2 delivery is at-most-once.** `get_next_signal` marks the signal
   consumed when it pops it, so a supervisor that crashes after the pop and
   before handling loses the signal for good (no lease / ack). Possibly
@@ -500,3 +522,4 @@ the real system, `[U]` unit property for complex logic.
 - 2026-10-13 claude — news store suite; no bugs; F11.
 - 2026-10-13 claude — toolset combinations + transport sessions; 1 bug fixed;
   F12, F13.
+- 2026-10-13 claude — skills contract (root test/); 1 bug fixed; F14.
