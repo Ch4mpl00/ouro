@@ -1,3 +1,4 @@
+import fc from "fast-check";
 import { describe, expect, it } from "vitest";
 import { appendToBody, applyEdits, findNearMatches, invertEdits, listHeadings } from "./patch";
 
@@ -234,5 +235,24 @@ describe("listHeadings", () => {
       { level: 1, text: "A", line: 0 },
       { level: 3, text: "B", line: 4 },
     ]);
+  });
+});
+
+// The replacement is literal: `$&`, `$1`, `$$`, `` $` `` in the new text are
+// characters, never String.replace patterns — a fact or a document can
+// quote a price or a shell snippet.
+describe("applyEdits, replacement text", () => {
+  it("lands verbatim, whatever it contains", () => {
+    const piece = fc.oneof(fc.string({ unit: "grapheme", maxLength: 8 }), fc.constantFrom("$&", "$1", "$$", "$`", "$'", "$<n>", "\\"));
+    const text = fc.array(piece, { maxLength: 6 }).map((ps) => ps.join(""));
+    fc.assert(
+      fc.property(text, text, text, (before, after, replacement) => {
+        const marker = "\u0001unique\u0001";
+        const body = `${before}${marker}${after}`;
+        const result = applyEdits(body, [{ old: marker, new: replacement }]);
+        expect(result).toEqual({ ok: true, body: `${before}${replacement}${after}` });
+      }),
+      { numRuns: 500 },
+    );
   });
 });

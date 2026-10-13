@@ -133,3 +133,40 @@ describe("sendLongMessage", () => {
     await expect(sendLongMessage({ chatId: 42, text: "hi" }, send)).rejects.toThrow(/Too Many Requests/);
   });
 });
+
+// A separator ends a part only where the part stays at least half full: a
+// separator early in the window is not worth a sliver of a message when
+// there is one further on.
+describe("splitTelegramText, half-full parts", () => {
+  it("never ends a part in the first half of its window when a separator sits in the second half", () => {
+    const chunk = fc.oneof(fc.string({ unit: "grapheme-ascii", minLength: 1, maxLength: 12 }), fc.constantFrom("\n\n", "\n", " "));
+    fc.assert(
+      fc.property(fc.array(chunk, { maxLength: 40 }).map((cs) => cs.join("")), fc.integer({ min: 4, max: 40 }), (text, limit) => {
+        let rest = text;
+        for (const part of splitTelegramText(text, limit)) {
+          const window = rest.slice(0, limit);
+          const lateSeparator = ["\n\n", "\n", " "].some((sep) => {
+            const at = window.lastIndexOf(sep);
+            return at >= 0 && at + sep.length >= Math.ceil(limit / 2);
+          });
+          if (rest.length > limit && lateSeparator) {
+            expect(part.length, JSON.stringify({ window, part })).toBeGreaterThanOrEqual(Math.ceil(limit / 2));
+          }
+          rest = rest.slice(part.length);
+        }
+      }),
+      { numRuns: 500 },
+    );
+  });
+});
+
+describe("sendLongMessage, a failure on the first part", () => {
+  it("is the original error — nothing was delivered, so it isn't a partial send", async () => {
+    const boom = new Error("Telegram sendMessage failed (403): bot was blocked");
+    await expect(
+      sendLongMessage({ chatId: 1, text: "a".repeat(5000) }, async () => {
+        throw boom;
+      }),
+    ).rejects.toBe(boom);
+  });
+});

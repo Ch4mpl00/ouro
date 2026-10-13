@@ -204,11 +204,10 @@ suites, stronger generators, scenarios from `.claude/tasks/*.md` and
 Ordered by expected bug yield. `[I]` integration, `[P]` property suite over
 the real system, `[U]` unit property for complex logic.
 
-1. **Deepening: mutation sampling of the suites that predate the loop** —
-   memory `patch.ts` / `service.ts` (the model check covers documents; plant
-   bugs in facts / journal paths), `telegram/split.ts`, `workflow/compile.ts`
-   retry feedback, `session-context.ts`: plant a handful of bugs per module,
-   see which survive, add the property that kills them.
+1. **Deepening: mutation sampling, memory `service.ts`** — the model check
+   covers documents; plant bugs in the facts / journal paths, see which
+   survive, add the property that kills them. (`patch.ts`, `split.ts`,
+   `compile.ts`, `session-context.ts` done — see Done.)
 2. **`download_gmail_attachment` path** — `messageId` from the model goes
    into the storage path unsanitized; only the Gmail API rejecting a bogus
    id first keeps `../` out. Sanitize it like the account key and pin it.
@@ -219,6 +218,23 @@ the real system, `[U]` unit property for complex logic.
    compose profile). `packages/codex` is done (it backs code_agent in prod).
 
 ## Done
+
+- **Mutation sampling: patch, split, compiler, improver patches**
+  (2026-10-13, `memory/patch.test.ts`, `telegram/split.test.ts`,
+  `packages/agent/test/workflow-patch.test.ts`) — planted bugs, kept the
+  survivors' killers. `patch.ts`: partial edit sets, inverted deletion,
+  unreversed inverse already caught; replacement text not landing verbatim
+  survived → property. `split.ts`: line break before a blank line and a cut
+  inside a surrogate pair caught; dropping the half-full preference and
+  wrapping a first-part failure as a partial send survived → a property and
+  an example. `compile.ts`: retry feedback without errors / last reply, an
+  extra attempt, the context seed, the failure reason, retrying an LLM error
+  — all caught; ignoring the planner's improver patch survived (only the
+  compose side had a test) → a property through the real runner and skill
+  store, patches written and removed via the store, killing both the
+  planner and the compose mutant. `session-context.ts`: working memory is
+  thoroughly covered; `renderContext` is thin and the timezone is validated
+  on write, so nothing added. No production bugs.
 
 - **Review follow-up: skill-write authorization and late file roots**
   (2026-10-13, `packages/agent/test/write-skill.test.ts`,
@@ -707,3 +723,5 @@ the real system, `[U]` unit property for complex logic.
 - 2026-10-13 codex — review follow-up: skill-write permission bound to the
   actual dreaming signal (delegation cannot create it); late-created file
   roots become readable without restart; regression tests for both fixes.
+- 2026-10-13 claude — mutation sampling (patch, split, compile,
+  session-context); 4 surviving mutants killed; no bugs.
