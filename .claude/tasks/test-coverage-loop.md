@@ -204,9 +204,7 @@ suites, stronger generators, scenarios from `.claude/tasks/*.md` and
 Ordered by expected bug yield. `[I]` integration, `[P]` property suite over
 the real system, `[U]` unit property for complex logic.
 
-1. **Monobank, PDF, files tools** `[I]` — fake HTTP; `read_file` path
-    confinement.
-2. **Evals (`judging/`, `eval/`), `packages/codex`** — P3, services are
+1. **Evals (`judging/`, `eval/`), `packages/codex`** — P3, services are
     off; only if everything above is done.
 - **Provider tool-call ids** (P3, needs a live API) — the AgentLoop answers
   tool calls by `id`; no provider normalises ids. Check what Gemini's and
@@ -432,6 +430,19 @@ the real system, `[U]` unit property for complex logic.
   failed its first boot on a fresh server. Mutation check: no advisory
   lock, only 42P04 accepted, seeding on every boot — all caught. Also: the
   previously skipped PG suites now run on a container by default.
+- **Files tools** (2026-10-13, `packages/mcp/test/files.test.ts`) — read_file
+  / read_pdf over MCP on a generated maze of paths (absolute / relative,
+  `..`, `.`, double slashes, symlinks in and out, a root given as a
+  symlink, a sibling `allowed-evil`, missing files): a file is read iff its
+  real path is under a readable root; everything else is refused before it
+  is opened and nothing outside leaks into the error. **Bug fixed**
+  (`dff8e34`, security): both tools opened any path — an injected
+  `read_file("/proc/self/environ")` gave the model every secret of the
+  process, with fetch_url / send_telegram_message to carry it out. New
+  `services/files` (DI, `MCP_READ_ROOTS` override; default storage, skill
+  dirs, eval fixtures). Mutation check: prefix check without a separator,
+  symlinks not resolved, no confinement — all caught. Monobank read by eye
+  (range validated, 429 handled): thin adapter, no suite.
 
 ## Findings
 
@@ -567,3 +578,7 @@ the real system, `[U]` unit property for complex logic.
 - 2026-10-13 claude — agent sqlite state; migration race reproduced and
   fixed.
 - 2026-10-13 claude — concurrent MCP boot; 1 bug fixed; PG suites un-skipped.
+- 2026-10-13 claude — files tools confined to readable roots (security fix).
+  Note to self: the fix commit went in while the new test's witness was
+  flaky (test file uncommitted, tree green) — gate commits on the exit code
+  in the same command.
