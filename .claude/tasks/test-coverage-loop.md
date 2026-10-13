@@ -195,23 +195,20 @@ suites, stronger generators, scenarios from `.claude/tasks/*.md` and
 Ordered by expected bug yield. `[I]` integration, `[P]` property suite over
 the real system, `[U]` unit property for complex logic.
 
-1. **Tool scoping and transport** `[I][P]` — any `MCP_TOOLSETS` subset →
-    `tools/list` is exactly the union of those groups; unknown name is a
-    boot error; multi-session isolation in `http-transport`.
-2. **Skills** `[I]` — agent two-layer loader (live → default, patch
+1. **Skills** `[I]` — agent two-layer loader (live → default, patch
     overlay) and the MCP `read_skill` export agree on the composed
     instructions for generated bodies/patches (the two `appendPatch`
     copies must not drift).
-3. **Gateway** `[I]` — fake upstream MCP server: namespacing, upstream
+2. **Gateway** `[I]` — fake upstream MCP server: namespacing, upstream
     failure isolated from own tools, reconnect.
-4. **Agent sqlite state** `[I]` — memory KV + trace mirror
+3. **Agent sqlite state** `[I]` — memory KV + trace mirror
     (`db/trace-store.ts`): migrations on boot idempotent, trace/judgement
     invariants.
-5. **`mcp_state` boot** `[I]` — migrations idempotent, two servers booting
+4. **`mcp_state` boot** `[I]` — migrations idempotent, two servers booting
     at once (advisory lock).
-6. **Monobank, PDF, files tools** `[I]` — fake HTTP; `read_file` path
+5. **Monobank, PDF, files tools** `[I]` — fake HTTP; `read_file` path
     confinement.
-7. **Evals (`judging/`, `eval/`), `packages/codex`** — P3, services are
+6. **Evals (`judging/`, `eval/`), `packages/codex`** — P3, services are
     off; only if everything above is done.
 - **Provider tool-call ids** (P3, needs a live API) — the AgentLoop answers
   tool calls by `id`; no provider normalises ids. Check what Gemini's and
@@ -379,6 +376,19 @@ the real system, `[U]` unit property for complex logic.
   distance, pool no bigger than k, extra items in the last chunks — all
   caught; dropping the "embedded only" filter is equivalent (dedup drops
   vector-less rows anyway).
+- **Tool scoping and transport** (2026-10-13, `packages/mcp/src/toolsets.test.ts`
+  property block, `packages/mcp/test/http-transport.test.ts`) — any
+  MCP_TOOLSETS value (subset, any order, repeats, padding) parses to each
+  group once in first-mention order and serves exactly the union of the
+  groups' own tools (the group list is read from parseToolsets' own error,
+  so new groups are covered). Transport: generated open / call / end /
+  abandon sequences in multi-session mode — open sessions keep working, an
+  ended one releases its server instance, closing the transport closes all;
+  single-session — the newest works, older are evicted, one instance.
+  **Bug fixed:** telegram + telegram-send double-registered
+  send_telegram_message and the instance could not serve (`21ebc95`).
+  Mutation check: no de-duplication, ended session keeping its server, no
+  eviction, close leaving sessions open — all caught.
 
 ## Findings
 
@@ -446,6 +456,19 @@ the real system, `[U]` unit property for complex logic.
   without a date (fetch_article on a page with none) come before every
   dated item and can push real news past the limit. `NULLS LAST` is
   probably what "newest first" means; not changed.
+- **F12 the ChatGPT tunnel can fetch and store arbitrary pages.**
+  `news-read` (pinned into the tunnel surface by `toolsets.test.ts`)
+  includes `fetch_article`: any URL, through the SSRF guard, returned as
+  extracted text and upserted into `news_items`. The `fetch` group's own
+  comment says a page fetcher "turns our server into their proxy" and keeps
+  it off third-party clients; and storing makes it a write path into the
+  corpus the digests read (prompt injection that persists). Either accept it
+  deliberately or move fetch_article to its own group.
+- **F13 abandoned multi-session sessions are never released.** A session
+  goes away only when its client sends DELETE (`terminateSession`);
+  `Client.close()` doesn't, so every session a client drops keeps its
+  `McpServer` and transport for the life of the process (the memory and
+  tunnel instances). An idle TTL on sessions would bound it.
 - **F2 delivery is at-most-once.** `get_next_signal` marks the signal
   consumed when it pops it, so a supervisor that crashes after the pop and
   before handling loses the signal for good (no lease / ack). Possibly
@@ -475,3 +498,5 @@ the real system, `[U]` unit property for complex logic.
 - 2026-10-12 claude — Gmail poller started (seams only; usage limit hit).
 - 2026-10-13 claude — Gmail poller suite + fake Gmail; 2 bugs fixed; F10.
 - 2026-10-13 claude — news store suite; no bugs; F11.
+- 2026-10-13 claude — toolset combinations + transport sessions; 1 bug fixed;
+  F12, F13.
