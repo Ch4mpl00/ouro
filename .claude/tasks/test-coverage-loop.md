@@ -209,6 +209,17 @@ the real system, `[U]` unit property for complex logic.
 
 ## Done
 
+- **list_nashdom_mails** (2026-10-13, `gmail-attachments.test.ts`) — an
+  uncalled-tool survey (tool names vs the tests that call them) left
+  `list_nashdom_mails`, the userbot tools, `get_timezone` and the knowledge
+  tools uncalled. This one: paging over MCP with `nextPageToken` against the
+  fake Gmail (now with attachments nested in their own multipart), mails
+  matching or not, attachments by PDF type, octet-stream with a `.pdf` /
+  `.PDF` name, images and documents. Rules: every matching mail once,
+  newest first, nothing else, each with exactly its PDFs wherever they sit
+  in the MIME tree, pages within `limit`. Mutants caught: PDF by type only,
+  top-level parts only, no next page. No bugs.
+
 - **fetch_article** (2026-10-13, `packages/mcp/test/fetch-article.test.ts`)
   — over MCP on a real server and Postgres, the web played by a stand-in
   fetcher serving HTML articles (small to ~20 MB of padding, with or
@@ -893,3 +904,4 @@ the real system, `[U]` unit property for complex logic.
   complete); F20.
 - 2026-10-13 claude — fetch_article; 1 bug fixed (unbounded article reads,
   pollers included); F21.
+- 2026-10-13 claude — list_nashdom_mails paging + PDF selection; no bugs.

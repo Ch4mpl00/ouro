@@ -22,7 +22,7 @@ import { registerFsTools } from "../src/tools/fs";
 import { registerGmailTools } from "../src/tools/gmail";
 import { call } from "../specs/support/environment";
 import { databaseAvailable, testDatabase, type TestDatabase } from "./support/database";
-import { attachmentBytes, startFakeGmail, type FakeGmail } from "./support/fake-gmail";
+import { attachmentBytes, startFakeGmail, type FakeGmail, type FakeMail } from "./support/fake-gmail";
 
 const ACCOUNT = "me@example.com";
 const MAILS = [
@@ -146,5 +146,68 @@ describe.skipIf(!available)("download_gmail_attachment", () => {
       { numRuns: 120 },
     );
     for (const w of ["a bad id refused", "a real attachment lands", "a lenient Gmail answers a bad id"]) expect(witnessed, w).toContain(w);
+  }, 300_000);
+  // Paging through list_nashdom_mails with nextPageToken: every matching
+  // mail exactly once, newest first, nothing else; each listing exactly its
+  // PDFs — by type or by a .pdf name in any case — wherever in the MIME tree
+  // they sit.
+  it("pages through every NashDom mail once, newest first, with exactly its PDFs", async () => {
+    const attachment = fc.record({
+      kind: fc.constantFrom("pdf", "octet-pdf-name", "upper-name", "image", "doc"),
+      nested: fc.boolean(),
+    });
+    const mail = fc.record({ matches: fc.oneof({ weight: 3, arbitrary: fc.constant(true) }, { weight: 1, arbitrary: fc.constant(false) }), attachments: fc.array(attachment, { maxLength: 3 }) });
+    const witnessed = new Set<string>();
+    await fc.assert(
+      fc.asyncProperty(fc.array(mail, { maxLength: 30 }), fc.integer({ min: 1, max: 12 }), async (mails, limit) => {
+        fake.mails.length = 0;
+        const t0 = 1_790_000_000_000;
+        const made: FakeMail[] = mails.map((m, i) => ({
+          id: `m${i.toString(16).padStart(4, "0")}`,
+          internalDate: t0 + i * 60_000,
+          subject: `Рахунок ${i}`,
+          matches: m.matches,
+          attachments: m.attachments.map((a, j) => {
+            const [filename, mimeType] =
+              a.kind === "pdf" ? [`bill-${i}-${j}.pdf`, "application/pdf"]
+              : a.kind === "octet-pdf-name" ? [`bill-${i}-${j}.pdf`, "application/octet-stream"]
+              : a.kind === "upper-name" ? [`BILL-${i}-${j}.PDF`, "application/octet-stream"]
+              : a.kind === "image" ? [`logo-${i}-${j}.png`, "image/png"]
+              : [`terms-${i}-${j}.docx`, "application/vnd.openxmlformats-officedocument.wordprocessingml.document"];
+            return { attachmentId: `ANGjdJ${i}x${j}`, filename, mimeType, size: 100, nested: a.nested };
+          }),
+        }));
+        fake.mails.push(...made);
+        const seen: { id: string; attachments: string[] }[] = [];
+        let token: string | undefined;
+        for (let page = 0; page < 100; page++) {
+          const out = await call(client, "list_nashdom_mails", { limit, ...(token ? { pageToken: token } : {}) });
+          if (out.kind !== "ok") throw new Error(JSON.stringify(out));
+          const value: unknown = out.value;
+          const messages = Reflect.get(Object(value), "messages");
+          if (!Array.isArray(messages)) throw new Error("no messages");
+          expect(messages.length, "a page holds at most `limit`").toBeLessThanOrEqual(limit);
+          for (const m of messages) {
+            const atts = Reflect.get(Object(m), "attachments");
+            seen.push({ id: String(Reflect.get(Object(m), "messageId")), attachments: (Array.isArray(atts) ? atts : []).map((a) => String(Reflect.get(Object(a), "attachmentId"))).sort() });
+          }
+          const next = Reflect.get(Object(value), "nextPageToken");
+          if (typeof next !== "string" || next === "") break;
+          token = next;
+          witnessed.add("more than one page");
+        }
+        const want = made
+          .filter((m) => m.matches)
+          .sort((a, b) => b.internalDate - a.internalDate)
+          .map((m) => ({
+            id: m.id,
+            attachments: m.attachments.filter((a) => a.mimeType === "application/pdf" || a.filename.toLowerCase().endsWith(".pdf")).map((a) => a.attachmentId).sort(),
+          }));
+        if (made.some((m) => m.attachments.some((a) => a.nested && a.filename.toLowerCase().endsWith(".pdf")))) witnessed.add("a nested PDF");
+        expect(seen, `${JSON.stringify(mails)} limit=${limit}`).toEqual(want);
+      }),
+      { numRuns: Number(process.env.PROPERTY_RUNS ?? 40) },
+    );
+    expect([...witnessed].sort()).toEqual(["a nested PDF", "more than one page"]);
   }, 300_000);
 });
