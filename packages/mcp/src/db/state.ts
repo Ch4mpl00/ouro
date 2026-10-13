@@ -59,7 +59,9 @@ export async function connectStateDb(databaseUrl: string, stateUrl = stateDataba
 }
 
 // CREATE DATABASE through the news database's connection. Both MCP instances
-// may try at once; the loser's duplicate_database is success.
+// may try at once; the loser's duplicate_database is success — and so is the
+// unique violation on pg_database's name index, which is what Postgres raises
+// instead when the two CREATEs overlap.
 async function ensureDatabase(adminUrl: string, stateUrl: string): Promise<void> {
   const name = decodeURIComponent(new URL(stateUrl).pathname.slice(1));
   if (!name) return;
@@ -72,7 +74,8 @@ async function ensureDatabase(adminUrl: string, stateUrl: string): Promise<void>
       await admin.query(`CREATE DATABASE "${name.replace(/"/g, '""')}"`);
       console.log(`[mcp-state] created database ${name}`);
     } catch (err) {
-      if ((err as { code?: string }).code !== "42P04") throw err;
+      const code = err instanceof Error && "code" in err ? err.code : undefined;
+      if (code !== "42P04" && code !== "23505") throw err;
     }
   } finally {
     await admin.end();
