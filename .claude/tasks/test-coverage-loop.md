@@ -204,7 +204,22 @@ suites, stronger generators, scenarios from `.claude/tasks/*.md` and
 Ordered by expected bug yield. `[I]` integration, `[P]` property suite over
 the real system, `[U]` unit property for complex logic.
 
-1. **Evals (`judging/`, `eval/`)** — P3, the services are off (`evals`
+1. **Decisions / the digest filter** `[I][P]` — `packages/agent/src/decisions.ts`
+   (Jev typed decisions, the `filter` preset the `decide` step runs):
+   batching, every item answered exactly once, threshold edges, malformed
+   or missing answers fail loudly, transient vs permanent errors, abort.
+   Fake the OpenRouter decisions API at the HTTP boundary.
+2. **News ingest** `[I][P]` — the HN / Habr providers and the Telegram
+   channel harvest (`services/news/providers/*`, pollers): ingest is
+   idempotent, a failed item doesn't stop the batch, watermarks / cursors
+   only move past what was stored, nothing re-ingested after a restart.
+3. **Telegram status bubble and typing** `[I]` — `telegram_send_status`
+   (one bubble per id: send, edit, delete on empty; a deleted / edited-away
+   message), `start_typing` keep-alive with its TTL and clean stop, on fake
+   timers + the fake Bot API.
+4. **Knowledge module** `[I]` — `services/knowledge` (notes; superseded by
+   memory facts?) — check whether anything still calls it before testing.
+5. **Evals (`judging/`, `eval/`)** — P3, the services are off (`evals`
    compose profile). `packages/codex` is done (it backs code_agent in prod).
 
 ## Done
