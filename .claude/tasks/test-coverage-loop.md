@@ -204,12 +204,7 @@ suites, stronger generators, scenarios from `.claude/tasks/*.md` and
 Ordered by expected bug yield. `[I]` integration, `[P]` property suite over
 the real system, `[U]` unit property for complex logic.
 
-1. **Flake sweep** — run every property suite 10× with a raised
-   `PROPERTY_RUNS`; any witness or rule that fails rarely gets a better
-   generator (never a weaker check). The signal-queue witness flaked once.
-2. **Knowledge module** `[I]` — `services/knowledge` (notes; superseded by
-   memory facts?) — check whether anything still calls it before testing.
-3. **Evals (`judging/`, `eval/`)** — P3, the services are off (`evals`
+1. **Evals (`judging/`, `eval/`)** — P3, the services are off (`evals`
    compose profile). `packages/codex` is done (it backs code_agent in prod).
 
 ## Done
@@ -494,6 +489,13 @@ the real system, `[U]` unit property for complex logic.
   **Bugs fixed** (`431ea11`): parallel calls for a new id left an orphan
   bubble animating forever; dots pushed a status at the cap over 4096 and
   froze it.
+- **Flake sweep** (2026-10-13) — all 21 property suites run 10× each: 19
+  never failed; the scheduler suite lost a witness once (rare ops: seeded
+  task firing, one-shot firing, cancel ~4/30 runs) → seed / cancel /
+  schedule weights raised and default runs 30 → 60 (10/10 since, 17 s);
+  the signal-queue suite failed once on Testcontainers ("port not bound
+  after 120 s") — Docker, not the test. Witness counts per run can be
+  printed by instrumenting `witnessed.add` (see the iteration's notes).
 
 ## Findings
 
@@ -598,6 +600,13 @@ the real system, `[U]` unit property for complex logic.
   media-only posts in a row after the watermark come back every tick, store
   nothing, and the channel never moves past them. Keeping a per-channel
   fetched-up-to cursor (or storing media posts flagged) would fix it.
+- **F17 two stores for the user's knowledge.** The `knowledge` toolset
+  (`add_note` / `find_notes`, `knowledge_base_notes`) is still in the
+  default surface, while the skills send "запомни" / "что помнишь" to
+  unified memory (`remember` / `recall`) and `memory:import-notes` already
+  copied the notes into facts. A model that picks `add_note` writes where
+  recall never looks. Drop the toolset from the default surface (or the
+  module).
 - **F2 delivery is at-most-once.** `get_next_signal` marks the signal
   consumed when it pops it, so a supervisor that crashes after the pop and
   before handling loses the signal for good (no lease / ack). Possibly
@@ -644,3 +653,5 @@ the real system, `[U]` unit property for complex logic.
 - 2026-10-13 claude — channel harvest; 1 bug fixed (bursts lost); F16.
 - 2026-10-13 claude — status bubble + typing; 2 bugs fixed. Signal-queue
   witness flaked once → generator biased; flake sweep added to backlog.
+- 2026-10-13 claude — flake sweep (scheduler generator strengthened);
+  knowledge module → F17.

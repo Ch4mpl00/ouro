@@ -19,7 +19,7 @@ import { call, connect, startServer, type Outcome, type Server } from "../specs/
 import { databaseAvailable, testDatabase, type TestDatabase } from "./support/database";
 import { daysExist, firstOwed, legitimateSlot, parseWallCron } from "./support/wall-cron";
 
-const RUNS = Number(process.env.PROPERTY_RUNS ?? 30);
+const RUNS = Number(process.env.PROPERTY_RUNS ?? 60);
 const MINUTE = 60_000;
 const HOUR = 60 * MINUTE;
 
@@ -221,7 +221,7 @@ type Op =
 const prompt = fc.string({ unit: "grapheme", minLength: 1, maxLength: 40 });
 const op: fc.Arbitrary<Op> = fc.oneof(
   {
-    weight: 3,
+    weight: 4,
     arbitrary: fc.record({
       kind: fc.constant("schedule" as const),
       cron: fc.oneof({ weight: 9, arbitrary: cron }, { weight: 1, arbitrary: badCron }),
@@ -230,7 +230,7 @@ const op: fc.Arbitrary<Op> = fc.oneof(
     }),
   },
   {
-    weight: 1,
+    weight: 3,
     arbitrary: fc.record({
       kind: fc.constant("seed" as const),
       cron,
@@ -238,7 +238,7 @@ const op: fc.Arbitrary<Op> = fc.oneof(
       prompt,
     }),
   },
-  { weight: 1, arbitrary: fc.record({ kind: fc.constant("cancel" as const), pick: fc.nat(), exists: fc.boolean() }) },
+  { weight: 2, arbitrary: fc.record({ kind: fc.constant("cancel" as const), pick: fc.nat(), exists: fc.boolean() }) },
   { weight: 1, arbitrary: fc.record({ kind: fc.constant("timezone" as const), tz: fc.constantFrom(...ZONES, ...BAD_ZONES) }) },
   { weight: 1, arbitrary: fc.constant<Op>({ kind: "list" }) },
   {
