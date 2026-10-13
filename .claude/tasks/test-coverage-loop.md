@@ -204,10 +204,32 @@ suites, stronger generators, scenarios from `.claude/tasks/*.md` and
 Ordered by expected bug yield. `[I]` integration, `[P]` property suite over
 the real system, `[U]` unit property for complex logic.
 
-1. **Evals (`judging/`, `eval/`)** — P3, the services are off (`evals`
+1. **[I] `pnpm embed:backfill` (`scripts/embed-backfill.ts` + each store's
+   `embedMissingBatch`)** — the prod repair path after an embedder outage,
+   reached by no test. Against Postgres with an embedder that fails some
+   texts permanently and some transiently: every NULL vector that can be
+   embedded ends up embedded, a row that always fails can't stall the rows
+   behind it (the drain gives up on the first batch with a failure — check
+   the order rows are picked in), re-running is a no-op, and the index
+   rows match their source.
+2. **Evals (`judging/`, `eval/`)** — P3, the services are off (`evals`
    compose profile). `packages/codex` is done (it backs code_agent in prod).
 
 ## Done
+
+- **Shipped skills vs prod's MCP surface** (2026-10-13,
+  `test/shipped-skills.test.ts`) — a reachability survey (static import
+  graph from every test) listed the source files no test reaches: one-shot
+  scripts, CLIs, the off evals, `supervisor/main.ts`. The risk in the
+  agent's composition root is its startup `validateAll`: a shipped skill
+  naming a tool the MCP doesn't serve keeps the agent from starting (a
+  crash loop on the droplet). The suite boots the real server process
+  (every toolset, as `mcp`), lists it through the agent's own client with
+  env transport, and runs the agent's `validateAll` over `skills.default`,
+  gateway tools allowed only under an enabled upstream's prefix in the
+  shipped `gateway.config.json`. Mutants caught: a skill naming a renamed
+  tool, MCP renaming a tool, the upstream disabled, broken frontmatter.
+  Follow-up queued: `embed:backfill` (Backlog 1). No production bugs.
 
 - **Agent MCP client across MCP restarts** (2026-10-13,
   `packages/agent/test/mcp-reconnect.test.ts`, server
@@ -803,3 +825,5 @@ the real system, `[U]` unit property for complex logic.
   scoping covered by a real-process suite; 1 gap queued; no bugs.
 - 2026-10-13 claude — agent MCP client across restarts; 1 bug fixed
   (parallel calls after a reconnect); F19.
+- 2026-10-13 claude — reachability survey; shipped skills validated against
+  the real MCP surface; embed:backfill queued; no bugs.
