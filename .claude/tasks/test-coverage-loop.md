@@ -204,18 +204,28 @@ suites, stronger generators, scenarios from `.claude/tasks/*.md` and
 Ordered by expected bug yield. `[I]` integration, `[P]` property suite over
 the real system, `[U]` unit property for complex logic.
 
-1. **[I] `pnpm embed:backfill` (`scripts/embed-backfill.ts` + each store's
-   `embedMissingBatch`)** — the prod repair path after an embedder outage,
-   reached by no test. Against Postgres with an embedder that fails some
-   texts permanently and some transiently: every NULL vector that can be
-   embedded ends up embedded, a row that always fails can't stall the rows
-   behind it (the drain gives up on the first batch with a failure — check
-   the order rows are picked in), re-running is a no-op, and the index
-   rows match their source.
-2. **Evals (`judging/`, `eval/`)** — P3, the services are off (`evals`
+1. **Evals (`judging/`, `eval/`)** — P3, the services are off (`evals`
    compose profile). `packages/codex` is done (it backs code_agent in prod).
 
 ## Done
+
+- **`embed:backfill`** (2026-10-13, `packages/mcp/test/embed-backfill.test.ts`)
+  — news, knowledge notes and the memory index, filled while the embedder
+  is down, then drained (`drainMissing`, now importable from
+  `services/embeddings/backfill.ts`; the script just calls it) against an
+  embedder that rejects some inputs for good — one rejected input fails
+  the whole request, as OpenAI's does — with an outage first now and then,
+  generated batch sizes, and rows moved on disk by no-op updates. Rules:
+  every accepted row ends with its own text's vector, rejected rows stay
+  NULL and hold up nothing, an outage changes nothing, a re-run changes
+  nothing. **Bug fixed:** one row the embedder rejects stalled the whole
+  repair for good — every batch picked the same unordered NULL rows first,
+  the request failed, and the drain gave up. Now each pass walks the
+  backlog once in id order past a cursor; a failed batch is told apart
+  from an outage by a probe and retried one row at a time; the drain stops
+  early only when the embedder is down. Mutants caught: no isolation,
+  cursor not advancing, stopping on any failure, unordered selection
+  (news, memory) — the last only once rows were moved on disk.
 
 - **Shipped skills vs prod's MCP surface** (2026-10-13,
   `test/shipped-skills.test.ts`) — a reachability survey (static import
@@ -827,3 +837,5 @@ the real system, `[U]` unit property for complex logic.
   (parallel calls after a reconnect); F19.
 - 2026-10-13 claude — reachability survey; shipped skills validated against
   the real MCP surface; embed:backfill queued; no bugs.
+- 2026-10-13 claude — embed:backfill; 1 bug fixed (a rejected row stalled
+  the repair for good).

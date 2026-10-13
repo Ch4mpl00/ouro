@@ -5,23 +5,19 @@
 // embedding provider is down — reads and patches must never depend on OpenAI
 // being up, only searchability may lag.
 
+import { backfillRows, type BackfillBatch } from "../embeddings/backfill";
 import type { EmbeddingService } from "../embeddings/service";
 import { buildIndexText, chunkMarkdown, DEFAULT_CHUNK_CHARS } from "./projection";
 import { docRef, factRef } from "./refs";
 import type { IndexUpsert, MemoryStore } from "./store";
 import type { Doc, Fact, Project } from "./types";
 
-export interface EmbedResult {
-  embedded: number;
-  failed: number;
-}
-
 export interface Indexer {
   indexDoc(project: Project, doc: Doc): Promise<void>;
   indexFact(fact: Fact): Promise<void>;
-  // Drains rows left with a NULL vector by a failed inline embed. Returns
-  // 0/0 when the backlog is empty so a caller can loop until drained.
-  embedMissingBatch(batchSize?: number): Promise<EmbedResult>;
+  // One batch of the rows a failed inline embed left with a NULL vector,
+  // past `afterId` in id order — see drainMissing.
+  embedMissingBatch(batchSize?: number, afterId?: number): Promise<BackfillBatch>;
   // null when the provider is unreachable — recall turns that into an
   // explicit "search unavailable" rather than an empty result set.
   embedQuery(query: string): Promise<number[] | null>;
@@ -99,19 +95,8 @@ export function createIndexer(deps: IndexerDeps): Indexer {
       ], { kind: "fact", id: fact.id, body: fact.body, tags: fact.tags, state: fact.state });
     },
 
-    embedMissingBatch: async (batchSize = 100) => {
-      const rows = await store.listUnembedded(batchSize);
-      if (rows.length === 0) return { embedded: 0, failed: 0 };
-      const vectors = await embedTexts(rows.map((r) => r.text));
-      let embedded = 0;
-      for (const [i, row] of rows.entries()) {
-        const vector = vectors[i];
-        if (!vector) continue;
-        await store.setEmbedding(row.id, vector);
-        embedded++;
-      }
-      return { embedded, failed: rows.length - embedded };
-    },
+    embedMissingBatch: async (batchSize = 100, afterId = 0) =>
+      backfillRows(embeddings, await store.listUnembedded(batchSize, afterId), (row) => row.text, (row, vector) => store.setEmbedding(row.id, vector)),
 
     embedQuery: async (query) => {
       const [vector] = await embedTexts([query]);

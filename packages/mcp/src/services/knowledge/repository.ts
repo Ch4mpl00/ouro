@@ -1,13 +1,16 @@
 import {
   and,
   arrayOverlaps,
+  asc,
   cosineDistance,
   eq,
+  gt,
   isNotNull,
   isNull,
 } from "drizzle-orm";
 import type { Database } from "../../db/pg/client";
 import { knowledgeBaseNotes } from "../../db/pg/schema";
+import { backfillRows, type BackfillBatch } from "../embeddings/backfill";
 import type { EmbeddingService } from "../embeddings/service";
 
 // The single facade over knowledge_base_notes. Notes go in (add) →
@@ -67,7 +70,7 @@ export interface KnowledgeRepository {
   // Picks up notes with embedding=NULL (left by a failed inline embed)
   // and embeds one batch. Returns 0/0 when the backlog is empty, so
   // callers can loop until drained (embed:backfill does).
-  embedMissingBatch(batchSize?: number): Promise<EmbedResult>;
+  embedMissingBatch(batchSize?: number, afterId?: number): Promise<BackfillBatch>;
 }
 
 export interface KnowledgeRepositoryDeps {
@@ -165,17 +168,24 @@ export function createKnowledgeRepository(
       }));
     },
 
-    embedMissingBatch: async (batchSize = 100) => {
+    embedMissingBatch: async (batchSize = 100, afterId = 0) => {
       const rows = await db
         .select({
           id: knowledgeBaseNotes.id,
           body: knowledgeBaseNotes.body,
         })
         .from(knowledgeBaseNotes)
-        .where(isNull(knowledgeBaseNotes.embedding))
+        .where(and(isNull(knowledgeBaseNotes.embedding), gt(knowledgeBaseNotes.id, afterId)))
+        .orderBy(asc(knowledgeBaseNotes.id))
         .limit(batchSize);
-      if (rows.length === 0) return { embedded: 0, failed: 0 };
-      return embedRows(rows.map((r) => ({ id: Number(r.id), body: r.body })));
+      return backfillRows(
+        embeddings,
+        rows.map((r) => ({ id: Number(r.id), body: r.body })),
+        (r) => r.body.trim(),
+        async (row, vector) => {
+          await db.update(knowledgeBaseNotes).set({ embedding: vector, embeddedAt: new Date() }).where(eq(knowledgeBaseNotes.id, row.id));
+        },
+      );
     },
   };
 }
