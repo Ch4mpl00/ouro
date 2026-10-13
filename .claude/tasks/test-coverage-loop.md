@@ -204,20 +204,29 @@ suites, stronger generators, scenarios from `.claude/tasks/*.md` and
 Ordered by expected bug yield. `[I]` integration, `[P]` property suite over
 the real system, `[U]` unit property for complex logic.
 
-1. **Deepening: mutation sampling, memory `service.ts`** — the model check
-   covers documents; plant bugs in the facts / journal paths, see which
-   survive, add the property that kills them. (`patch.ts`, `split.ts`,
-   `compile.ts`, `session-context.ts` done — see Done.)
-2. **`download_gmail_attachment` path** — `messageId` from the model goes
+1. **`download_gmail_attachment` path** — `messageId` from the model goes
    into the storage path unsanitized; only the Gmail API rejecting a bogus
    id first keeps `../` out. Sanitize it like the account key and pin it.
-3. **Feature coverage** — every scenario in `packages/mcp/specs/*.feature`
+2. **Feature coverage** — every scenario in `packages/mcp/specs/*.feature`
    and every task in `.claude/tasks/*.md` with an Acceptance list: is there
    an automated check? Gaps → backlog.
-4. **Evals (`judging/`, `eval/`)** — P3, the services are off (`evals`
+3. **Evals (`judging/`, `eval/`)** — P3, the services are off (`evals`
    compose profile). `packages/codex` is done (it backs code_agent in prod).
 
 ## Done
+
+- **Mutation sampling: memory facts and journal** (2026-10-13,
+  `memory/journal.test.ts`) — 13 bugs planted in `service.ts`'s facts,
+  recall and journal paths. Caught: untrimmed / blank fact bodies, raw
+  tags, omitted tags clearing a fact's tags, an update not reindexed,
+  recall over every state by default or without its limit, the body cap
+  off by one, n = 0, a blank journal body, an unchecked stream name.
+  Survived: the journal capacity range refusing 1000 (the test named the
+  range but only checked refusals) → both ends now accepted; recall's
+  service-side cap of 50 — equivalent at the tool surface, whose schema
+  caps `limit` at 50 too, so no test. No production bugs. The gate run
+  caught a witness flake in `supervisor.test.ts` ("compiled → ok" ~1% miss
+  over 25 runs) → workflow sends biased 3:1 towards accepted.
 
 - **Mutation sampling: patch, split, compiler, improver patches**
   (2026-10-13, `memory/patch.test.ts`, `telegram/split.test.ts`,
@@ -725,3 +734,5 @@ the real system, `[U]` unit property for complex logic.
   roots become readable without restart; regression tests for both fixes.
 - 2026-10-13 claude — mutation sampling (patch, split, compile,
   session-context); 4 surviving mutants killed; no bugs.
+- 2026-10-13 claude — mutation sampling, memory facts + journal; 1 surviving
+  mutant killed, 1 equivalent; no bugs.

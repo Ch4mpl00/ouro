@@ -68,7 +68,9 @@ const plan: fc.Arbitrary<Plan> = fc.oneof(
   fc.record({
     source: fc.constant("scheduler" as const),
     compile: fc.oneof(
-      fc.record({ kind: fc.constant("valid" as const), sends: fc.array(fc.boolean(), { minLength: 1, maxLength: 3 }) }),
+      // Mostly accepted sends, so a fully successful workflow is common
+      // enough to show up in every run.
+      fc.record({ kind: fc.constant("valid" as const), sends: fc.array(fc.oneof({ weight: 3, arbitrary: fc.constant(true) }, { weight: 1, arbitrary: fc.constant(false) }), { minLength: 1, maxLength: 3 }) }),
       fc.record({ kind: fc.constant("invalid" as const), loop: loopActs }),
     ),
   }),

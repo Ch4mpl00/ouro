@@ -101,6 +101,10 @@ describe("journal — functional", () => {
       expect(await memoryError(append(service, "s", "x", capacity))).toMatchObject({ code: "invalid_capacity" });
     }
     expect(await service.listJournals()).toEqual([]);
+    // Both ends of the range are capacities.
+    for (const capacity of [1, JOURNAL_MAX_CAPACITY]) {
+      expect((await append(service, `s/${capacity}`, "x", capacity)).stream.capacity).toBe(capacity);
+    }
   });
 
   it("F5 listJournals names every stream with its capacity, size and last write", async () => {
