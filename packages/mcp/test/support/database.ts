@@ -64,3 +64,15 @@ async function admin(serverUrl: string, sql: string): Promise<void> {
     await client.end();
   }
 }
+
+// The server URL for suites that create their own databases on it:
+// TEST_DATABASE_URL when named, otherwise a container started for this file
+// (Testcontainers' reaper removes it when the process exits). undefined
+// without either, so the suite skips.
+export async function testServerUrl(): Promise<string | undefined> {
+  const named = process.env.TEST_DATABASE_URL;
+  if (named) return named;
+  if (!(await databaseAvailable())) return undefined;
+  const container = await new PostgreSqlContainer("pgvector/pgvector:pg16").start();
+  return container.getConnectionUri();
+}

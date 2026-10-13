@@ -5,11 +5,13 @@ import { createSettings } from "../services/settings";
 import { createSignals } from "../services/signals";
 import { createTelegramLog } from "../services/telegram/storage";
 import { connectStateDb, stateDatabaseUrl, type StateDb } from "./state";
+import { testServerUrl } from "../../test/support/database";
 
-// Runs against a throwaway server named by TEST_DATABASE_URL (never prod);
-// skipped without one. Each test gets a fresh state database on it.
+// Runs against a throwaway server named by TEST_DATABASE_URL (never prod),
+// or a container; skipped without either. Each test gets a fresh state database on it.
 
-const TEST_URL = process.env.TEST_DATABASE_URL;
+// TEST_DATABASE_URL, or a container of our own when Docker is there.
+const TEST_URL = await testServerUrl();
 
 const open: StateDb[] = [];
 afterEach(async () => {

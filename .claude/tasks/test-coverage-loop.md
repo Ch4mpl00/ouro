@@ -146,6 +146,10 @@ Distilled from `~/Code/tickets-booking/AGENTS.md` and `test/properties/`
   Production code of the two packages never imports the other; a contract
   test outside both may, to run the twin implementations side by side
   (`test/skills-contract.test.ts`).
+- `testServerUrl()` (same helper file) gives suites that make their own
+  databases a server: TEST_DATABASE_URL or a container for the file. The
+  three PG suites in src/ that used to skip without TEST_DATABASE_URL now
+  run by default (state, pg client, journal races).
 - fast-check gotcha: `fc.array(..., { maxLength })` still generates short
   arrays unless `size: "max"` is given — sequences silently stay trivial.
 - fast-check gotcha 2: `fc.option(arb, { freq })` yields nil with
@@ -200,11 +204,9 @@ suites, stronger generators, scenarios from `.claude/tasks/*.md` and
 Ordered by expected bug yield. `[I]` integration, `[P]` property suite over
 the real system, `[U]` unit property for complex logic.
 
-1. **`mcp_state` boot** `[I]` — migrations idempotent, two servers booting
-    at once (advisory lock).
-2. **Monobank, PDF, files tools** `[I]` — fake HTTP; `read_file` path
+1. **Monobank, PDF, files tools** `[I]` — fake HTTP; `read_file` path
     confinement.
-3. **Evals (`judging/`, `eval/`), `packages/codex`** — P3, services are
+2. **Evals (`judging/`, `eval/`), `packages/codex`** — P3, services are
     off; only if everything above is done.
 - **Provider tool-call ids** (P3, needs a live API) — the AgentLoop answers
   tool calls by `id`; no provider normalises ids. Check what Gemini's and
@@ -421,6 +423,15 @@ the real system, `[U]` unit property for complex logic.
   drizzle reads applied migrations before BEGIN — concurrent booters failed
   with "database is locked" / "already exists"; both retried now. Closes
   `.claude/tasks/done/agent-migration-race.md`.
+- **Booting MCP instances at once** (2026-10-13, `packages/mcp/test/boot.test.ts`)
+  — 2–6 instances booting together on a fresh server: the state database
+  is created, migrated and seeded exactly once and every instance comes
+  up; a later boot changes nothing; the news store migrates once with 2–5
+  racing. **Bug fixed** (`0bad30f`): overlapping CREATE DATABASE raise
+  23505 on pg_database's name index, not 42P04 — one of mcp / mcp-tunnel
+  failed its first boot on a fresh server. Mutation check: no advisory
+  lock, only 42P04 accepted, seeding on every boot — all caught. Also: the
+  previously skipped PG suites now run on a container by default.
 
 ## Findings
 
@@ -555,3 +566,4 @@ the real system, `[U]` unit property for complex logic.
 - 2026-10-13 claude — gateway over real HTTP upstreams; no bugs; F15.
 - 2026-10-13 claude — agent sqlite state; migration race reproduced and
   fixed.
+- 2026-10-13 claude — concurrent MCP boot; 1 bug fixed; PG suites un-skipped.

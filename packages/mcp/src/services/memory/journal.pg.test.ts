@@ -6,14 +6,17 @@ import type { EmbeddingService } from "../embeddings/service";
 import { createIndexer } from "./indexer";
 import { createMemoryService, type MemoryService } from "./service";
 import { createPgMemoryStore } from "./store.pg";
+import { testServerUrl } from "../../../test/support/database";
 
 // The journal invariants only Postgres can break: append and trim are one
 // transaction (I4), and appends racing on one stream on separate connections
 // all land with the newest `capacity` surviving (I5). The in-memory store
 // can't interleave, so these run against a throwaway database named by
-// TEST_DATABASE_URL (never prod); skipped without one.
+// TEST_DATABASE_URL (never prod) or a container of our own; skipped without
+// either.
 
-const TEST_URL = process.env.TEST_DATABASE_URL;
+// TEST_DATABASE_URL, or a container of our own when Docker is there.
+const TEST_URL = await testServerUrl();
 const ACTOR = "supervisor";
 
 async function freshDatabase(): Promise<string> {
