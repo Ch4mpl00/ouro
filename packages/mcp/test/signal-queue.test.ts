@@ -158,6 +158,11 @@ const op: fc.Arbitrary<Op> = fc.oneof(
     arbitrary: fc.record({ kind: fc.constant("record" as const), source: fc.constantFrom(...SOURCES), content }),
   },
   { weight: 3, arbitrary: fc.constant<Op>({ kind: "next" }) },
+  // An unfiltered listing with a small limit, so a cut listing is common.
+  {
+    weight: 1,
+    arbitrary: fc.integer({ min: 1, max: 3 }).map((limit): Op => ({ kind: "list", source: undefined, since: undefined, limit })),
+  },
   {
     weight: 3,
     arbitrary: fc.record({
