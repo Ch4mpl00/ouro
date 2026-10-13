@@ -36,7 +36,7 @@ const step: fc.Arbitrary<Step> = fc.oneof(
     arbitrary: fc.oneof(
       { weight: 3, arbitrary: fc.constant<Step>({ kind: "tick", fault: { kind: "none" } }) },
       { weight: 1, arbitrary: fc.nat().map((pick): Step => ({ kind: "tick", fault: { kind: "get", pick } })) },
-      { weight: 1, arbitrary: fc.integer({ min: 1, max: 4 }).map((at): Step => ({ kind: "tick", fault: { kind: "record", at } })) },
+      { weight: 1, arbitrary: fc.constantFrom(1, 1, 2, 3).map((at): Step => ({ kind: "tick", fault: { kind: "record", at } })) },
     ),
   },
 );
@@ -123,8 +123,10 @@ describe.skipIf(!available)("Gmail poller against a fake Gmail and Postgres", ()
           }
           let deps = { gmail, signals };
           if (s.fault.kind === "get") {
+            // One of the newest matching mails: likely not signalled yet, so
+            // the poll really reaches it and fails there.
             const pending = fake.mails.filter((m) => m.matches);
-            const target = pending[s.fault.pick % Math.max(pending.length, 1)];
+            const target = pending[pending.length - 1 - (s.fault.pick % Math.min(3, Math.max(pending.length, 1)))];
             if (target) fake.failGet(target.id);
           }
           if (s.fault.kind === "record") deps = { gmail, signals: failingAt(signals, s.fault.at) };
