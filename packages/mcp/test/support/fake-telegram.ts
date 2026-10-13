@@ -8,7 +8,9 @@
 //   - sendMessage refuses empty / whitespace-only text and text over 4096
 //     UTF-16 units, and numbers messages per chat;
 //   - editMessageText needs a message this bot sent in that chat and refuses
-//     an edit that changes nothing ("message is not modified").
+//     an edit that changes nothing ("message is not modified");
+//   - deleteMessage removes it (a second delete: "message to delete not
+//     found").
 // `fail(method, times, after)` lets `after` more calls of a method succeed,
 // then fails the following `times` with a 500.
 
@@ -47,6 +49,8 @@ export interface FakeTelegram {
   readonly sent: Delivered[];
   // `offset` of every getUpdates call, in order.
   readonly offsets: (number | undefined)[];
+  // sendChatAction calls, in order.
+  readonly actions: { chatId: number; action: string; threadId: number | null }[];
   batch: number;
   push(update: FakeUpdate): void;
   fail(method: string, times?: number, after?: number): void;
@@ -65,6 +69,7 @@ export function installFakeTelegram(token = "test-token"): FakeTelegram {
   const chat = new Map<string, Delivered>();
   const sent: Delivered[] = [];
   const offsets: (number | undefined)[] = [];
+  const actions: { chatId: number; action: string; threadId: number | null }[] = [];
   const failures = new Map<string, { after: number; times: number }>();
   let nextMessageId = 1000;
 
@@ -80,6 +85,7 @@ export function installFakeTelegram(token = "test-token"): FakeTelegram {
     chat,
     sent,
     offsets,
+    actions,
     batch: 100,
     push: (update) => void pending.push(update),
     fail: (method, times = 1, after = 0) => void failures.set(method, { after, times }),
@@ -128,14 +134,20 @@ export function installFakeTelegram(token = "test-token"): FakeTelegram {
           const text = typeof body.text === "string" ? body.text : "";
           if (!message) return refuse(400, "Bad Request: message to edit not found");
           if (text.trim().length === 0) return refuse(400, "Bad Request: message text is empty");
+          if (text.length > LIMIT) return refuse(400, "Bad Request: MESSAGE_TOO_LONG");
           if (text === message.text) {
             return refuse(400, "Bad Request: message is not modified: specified new message content and reply markup are exactly the same");
           }
           message.text = text;
           return ok({ message_id: message.messageId, date: 1_790_000_100, chat: { id: message.chatId, type: "private" } });
         }
+        case "deleteMessage": {
+          const key = `${Number(body.chat_id)}:${Number(body.message_id)}`;
+          if (!chat.delete(key)) return refuse(400, "Bad Request: message to delete not found");
+          return ok(true);
+        }
         case "sendChatAction":
-        case "deleteMessage":
+          actions.push({ chatId: Number(body.chat_id), action: String(body.action), threadId: typeof body.message_thread_id === "number" ? body.message_thread_id : null });
           return ok(true);
         default:
           return refuse(404, `Not Found: method ${method}`);

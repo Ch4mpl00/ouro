@@ -204,10 +204,9 @@ suites, stronger generators, scenarios from `.claude/tasks/*.md` and
 Ordered by expected bug yield. `[I]` integration, `[P]` property suite over
 the real system, `[U]` unit property for complex logic.
 
-1. **Telegram status bubble and typing** `[I]` — `telegram_send_status`
-   (one bubble per id: send, edit, delete on empty; a deleted / edited-away
-   message), `start_typing` keep-alive with its TTL and clean stop, on fake
-   timers + the fake Bot API.
+1. **Flake sweep** — run every property suite 10× with a raised
+   `PROPERTY_RUNS`; any witness or rule that fails rarely gets a better
+   generator (never a weaker check). The signal-queue witness flaked once.
 2. **Knowledge module** `[I]` — `services/knowledge` (notes; superseded by
    memory facts?) — check whether anything still calls it before testing.
 3. **Evals (`judging/`, `eval/`)** — P3, the services are off (`evals`
@@ -485,6 +484,16 @@ the real system, `[U]` unit property for complex logic.
   lost the rest for good; now the oldest 200 after the watermark. HN / Habr
   providers read: per-article failures return null, the poller isolates
   providers — no suite added.
+- **Telegram status bubble and typing** (2026-10-13, `packages/mcp/test/telegram-status.test.ts`)
+  — generated telegram_send_status sequences over MCP (two ids, some calls
+  fired in parallel, empty / blank / 4096-char texts, pauses that let the
+  animation run) against the fake Bot API (which now really deletes and
+  refuses over-long edits): one bubble per live id, showing its latest text
+  plus up to three dots, never over the limit, nothing left after emptying.
+  start_typing refreshes until a message goes to that chat, then stops.
+  **Bugs fixed** (`431ea11`): parallel calls for a new id left an orphan
+  bubble animating forever; dots pushed a status at the cap over 4096 and
+  froze it.
 
 ## Findings
 
@@ -633,3 +642,5 @@ the real system, `[U]` unit property for complex logic.
   restriction + validation).
 - 2026-10-13 claude — digest filter; 1 bug fixed (unbounded probabilities).
 - 2026-10-13 claude — channel harvest; 1 bug fixed (bursts lost); F16.
+- 2026-10-13 claude — status bubble + typing; 2 bugs fixed. Signal-queue
+  witness flaked once → generator biased; flake sweep added to backlog.
