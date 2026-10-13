@@ -9,8 +9,9 @@ import { GMAIL_SUBSCRIPTIONS, type GmailSubscription } from "./subscriptions";
 //   1. read watermark (last seen internalDate, ms) from gmail_kv
 //   2. on first run with no watermark, set watermark = now() and emit nothing
 //      (avoid flooding the queue with old emails on a fresh install)
-//   3. otherwise: query with `after:` filter, take rows newer than watermark,
-//      enqueue one signal per row, advance watermark
+//   3. otherwise: query with `after:` filter (every page), take rows newer
+//      than the watermark, oldest first, and enqueue one signal per row,
+//      advancing the watermark past each one as it goes
 //
 // The poller is best-effort: errors log + retry on next interval. Polling
 // is paused if no Gmail account is authorized yet.
@@ -43,7 +44,16 @@ async function pollSubscription(deps: GmailPollerDeps, sub: GmailSubscription, a
   const query = `${sub.query} after:${watermarkSeconds}`;
 
   const gmail = await deps.gmail.client(accountKey);
-  const { messages } = await listMessages(gmail, { query, maxResults: 50 });
+  // Every page: Gmail lists newest first, so after an outage with more new
+  // mail than one page, stopping at the first page kept the newest, moved the
+  // watermark past them and lost the older ones for good.
+  const messages: MessageSummary[] = [];
+  let pageToken: string | undefined;
+  do {
+    const page = await listMessages(gmail, { query, maxResults: 50, pageToken });
+    messages.push(...page.messages);
+    pageToken = page.nextPageToken ?? undefined;
+  } while (pageToken);
   if (messages.length === 0) return;
 
   // Sort ascending by internalDate so we emit signals in chronological order
@@ -52,7 +62,6 @@ async function pollSubscription(deps: GmailPollerDeps, sub: GmailSubscription, a
     (a, b) => Number(a.internalDate ?? 0) - Number(b.internalDate ?? 0),
   );
 
-  let newWatermark = watermarkMs;
   let emitted = 0;
   for (const m of sorted) {
     const md = Number(m.internalDate ?? 0);
@@ -66,12 +75,11 @@ async function pollSubscription(deps: GmailPollerDeps, sub: GmailSubscription, a
 
     await deps.signals.record({ source: sub.signalSource, content: sub.buildContent(m, attachments) });
     emitted++;
-    if (md > newWatermark) newWatermark = md;
+    // Past each mail as soon as it is signalled: a failure further down the
+    // batch resumes after it next tick instead of signalling it again.
+    await store.setKv(watermarkKey(sub), String(md));
   }
 
-  if (newWatermark !== watermarkMs) {
-    await store.setKv(watermarkKey(sub), String(newWatermark));
-  }
   console.log(`${logPrefix()} ${sub.name}: emitted ${emitted} signal(s)`);
 }
 
