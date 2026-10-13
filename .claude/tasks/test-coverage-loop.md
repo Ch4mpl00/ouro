@@ -209,6 +209,22 @@ the real system, `[U]` unit property for complex logic.
 
 ## Done
 
+- **Monobank** (2026-10-13, `packages/mcp/test/monobank.test.ts`) —
+  `list_monobank_transactions` over MCP against a stand-in for the Personal
+  API behind the global fetch, playing its documented rules (31 days + 1 h
+  per statement, newest first, at most 500 per response, one request per
+  account per 60 s on a test-driven clock). Account histories from empty to
+  800 transactions over up to 45 days, generated windows, requests a minute
+  apart or right away. Rules: returned transactions are the account's own,
+  in the window, newest first, in major units with their currency; a list
+  marked complete is the whole window and a cut one is never marked
+  complete; a 429 is a tool error naming the rate limit. **Bug fixed:** a
+  window holding more than 500 transactions came back cut at 500 with
+  nothing saying so — a month's spending totalled from it would be short.
+  The result now carries `complete` / `oldestReturned`. F20: no way to page
+  past 500. Mutants caught: always complete, minor units, an unexplained
+  429, a wrong default window.
+
 - **`embed:backfill`** (2026-10-13, `packages/mcp/test/embed-backfill.test.ts`)
   — news, knowledge notes and the memory index, filled while the embedder
   is down, then drained (`drainMissing`, now importable from
@@ -761,6 +777,14 @@ the real system, `[U]` unit property for complex logic.
   instruction planted there can reach a skill at the next 04:00 run. A
   human review step (dreaming proposes a patch, the user approves), or
   writing only the improver-style append-only overlay, would close it.
+- **F20 `list_monobank_transactions` can't reach past 500.** Monobank
+  returns at most 500 transactions per statement, newest first; the tool
+  now says `complete: false` (and `oldestReturned`) instead of handing back
+  a silently cut list, but it has no way to ask for the older part — its
+  window always ends now, and a second request costs the 60 s rate limit.
+  Options: an optional `before` (end of the window) so the agent can page
+  over several calls a minute apart, or the tool paging itself with a
+  wait. Your call.
 - **F19 a call whose MCP dies under it hangs for 60 s.** The server keeps
   no event store, so a POST's SSE stream has no resume point; when the
   process dies mid-call the SDK client only reports `SSE stream
@@ -839,3 +863,5 @@ the real system, `[U]` unit property for complex logic.
   the real MCP surface; embed:backfill queued; no bugs.
 - 2026-10-13 claude — embed:backfill; 1 bug fixed (a rejected row stalled
   the repair for good).
+- 2026-10-13 claude — Monobank; 1 bug fixed (a cut statement looked
+  complete); F20.

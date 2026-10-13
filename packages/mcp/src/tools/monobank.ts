@@ -1,6 +1,6 @@
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { getStatement } from "../services/monobank";
+import { getStatement, STATEMENT_PAGE_LIMIT } from "../services/monobank";
 import { jsonResult } from "../result";
 
 export function registerMonobankTools(server: McpServer): void {
@@ -12,7 +12,9 @@ export function registerMonobankTools(server: McpServer): void {
         "Fetch recent transactions for a Monobank account. accountId can be a specific " +
         "account.id or '0' for the default UAH account. days is the lookback window " +
         "(default 7, max 31). Rate limit: 1 request per 60s per account — surface 429s " +
-        "rather than retrying.",
+        "rather than retrying. Monobank returns at most 500 transactions, newest first: " +
+        "`complete: false` means older ones in the window were left out (the list stops at " +
+        "`oldestReturned`), so don't total the window from it.",
       inputSchema: {
         accountId: z
           .string()
@@ -33,12 +35,16 @@ export function registerMonobankTools(server: McpServer): void {
       const to = new Date();
       const from = new Date(to.getTime() - window * 24 * 60 * 60 * 1000);
       const transactions = await getStatement(account, from, to);
+      // A full page means Monobank cut the list: there may be older ones.
+      const complete = transactions.length < STATEMENT_PAGE_LIMIT;
       return jsonResult({
         accountId: account,
         from: from.toISOString(),
         to: to.toISOString(),
         days: window,
         count: transactions.length,
+        complete,
+        ...(complete ? {} : { oldestReturned: transactions[transactions.length - 1]?.time ?? null }),
         transactions,
       });
     },

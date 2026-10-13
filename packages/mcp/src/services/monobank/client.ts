@@ -127,6 +127,10 @@ async function call<T>(path: string): Promise<T> {
 
 const MAX_RANGE_SECONDS = 31 * 24 * 60 * 60;
 
+// A statement holds at most this many transactions, newest first; when it is
+// full, older ones in the range need another request with an earlier `to`.
+export const STATEMENT_PAGE_LIMIT = 500;
+
 export async function getStatement(
   accountId: string,
   from: Date,
