@@ -10,7 +10,6 @@
 //    public internet: byte caps, truncation and binary detection.
 
 import http from "node:http";
-import type { AddressInfo } from "node:net";
 import type { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import fc from "fast-check";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -208,8 +207,9 @@ async function localServer(): Promise<Local> {
     res.end();
   });
   await new Promise<void>((resolve) => server.listen(0, "::", resolve));
-  const { port } = server.address() as AddressInfo;
-  return { port, hits, routes, close: () => new Promise((resolve) => server.close(() => resolve())) };
+  const address = server.address();
+  if (address === null || typeof address === "string") throw new Error("local server: no TCP address");
+  return { port: address.port, hits, routes, close: () => new Promise((resolve) => server.close(() => resolve())) };
 }
 
 const available = await databaseAvailable();

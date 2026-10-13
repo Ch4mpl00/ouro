@@ -136,6 +136,11 @@ Distilled from `~/Code/tickets-booking/AGENTS.md` and `test/properties/`
 - `packages/agent/test/workflow.test.ts` — validator-vs-executor
   differential: generated plans parsed with `{ seeds }` and executed on an
   always-succeeding fake engine (every call returns `[]`).
+- `packages/mcp/test/support/fake-gmail.ts` — Gmail API on a loopback port,
+  reached through `createGmailModule({ db, apiRootUrl })`. googleapis
+  (gaxios 6) uses node-fetch, so MockAgent does NOT intercept it — a probe
+  reached the real Google. Needs GOOGLE_CLIENT_ID / SECRET / REDIRECT_URI
+  and an `integration_account` row with an unexpired access token.
 - fast-check gotcha: `fc.array(..., { maxLength })` still generates short
   arrays unless `size: "max"` is given — sequences silently stay trivial.
 
@@ -185,43 +190,26 @@ suites, stronger generators, scenarios from `.claude/tasks/*.md` and
 Ordered by expected bug yield. `[I]` integration, `[P]` property suite over
 the real system, `[U]` unit property for complex logic.
 
-1. **Gmail poller** `[I]` — IN PROGRESS (2026-10-12): seams committed
-   (`createGmailModule({ db, apiRootUrl })` points googleapis at a local
-   fake; `pollSubscriptionOnce(deps, sub)` exported). googleapis/gaxios 6
-   uses node-fetch, NOT global fetch — undici MockAgent does not intercept
-   it (a probe reached the real Google); use a local HTTP fake Gmail server
-   via `apiRootUrl` (+ GOOGLE_CLIENT_ID/SECRET/REDIRECT_URI env, an
-   `integration_account` row with a valid access_token/expiry). Two bugs
-   found by reading, to confirm with the test then fix: (a) the watermark is
-   saved only after the whole batch, so a failure midway re-emits the
-   already-signalled mails next tick (advance it per message); (b)
-   `listMessages(maxResults: 50)` with no pagination — more than 50 new
-   mails since the watermark (e.g. after an outage) keeps the newest 50 and
-   loses the rest for good (page through nextPageToken). Also worth a
-   finding: a mail indexed by Gmail search after a newer one was processed
-   is skipped forever (watermark by internalDate). — fake Gmail API: watermark monotonic, no lost or
-   duplicated mail across restarts and partial failures, attachment
-   download path safety.
-2. **News store** `[I][P]` — `list_news` / `fetch_article` / `search_news`
+1. **News store** `[I][P]` — `list_news` / `fetch_article` / `search_news`
     with fake providers + word embedder: upsert idempotency, dedup, `k`
     bounds, filters, NULL-embedding rows still listable, backfill drains.
-3. **Tool scoping and transport** `[I][P]` — any `MCP_TOOLSETS` subset →
+2. **Tool scoping and transport** `[I][P]` — any `MCP_TOOLSETS` subset →
     `tools/list` is exactly the union of those groups; unknown name is a
     boot error; multi-session isolation in `http-transport`.
-4. **Skills** `[I]` — agent two-layer loader (live → default, patch
+3. **Skills** `[I]` — agent two-layer loader (live → default, patch
     overlay) and the MCP `read_skill` export agree on the composed
     instructions for generated bodies/patches (the two `appendPatch`
     copies must not drift).
-5. **Gateway** `[I]` — fake upstream MCP server: namespacing, upstream
+4. **Gateway** `[I]` — fake upstream MCP server: namespacing, upstream
     failure isolated from own tools, reconnect.
-6. **Agent sqlite state** `[I]` — memory KV + trace mirror
+5. **Agent sqlite state** `[I]` — memory KV + trace mirror
     (`db/trace-store.ts`): migrations on boot idempotent, trace/judgement
     invariants.
-7. **`mcp_state` boot** `[I]` — migrations idempotent, two servers booting
+6. **`mcp_state` boot** `[I]` — migrations idempotent, two servers booting
     at once (advisory lock).
-8. **Monobank, PDF, files tools** `[I]` — fake HTTP; `read_file` path
+7. **Monobank, PDF, files tools** `[I]` — fake HTTP; `read_file` path
     confinement.
-9. **Evals (`judging/`, `eval/`), `packages/codex`** — P3, services are
+8. **Evals (`judging/`, `eval/`), `packages/codex`** — P3, services are
     off; only if everything above is done.
 - **Provider tool-call ids** (P3, needs a live API) — the AgentLoop answers
   tool calls by `id`; no provider normalises ids. Check what Gemini's and
@@ -364,6 +352,16 @@ the real system, `[U]` unit property for complex logic.
   rows (`87d7985`). Mutation check: no source lock, fact / doc basis
   ignored, blank update allowed, index ignoring archiving — all caught.
   `pnpm spec` and `pnpm spec:model` green after the change.
+- **Gmail poller** (2026-10-13, `packages/mcp/test/gmail-poller.test.ts`) —
+  generated timelines of arriving mails (matching or not, PDFs and other
+  attachments, bursts past one page) and ticks, some failing midway (a mail
+  fetch 500s, a signal write fails); after catching up, every matching mail
+  since the bootstrap is exactly one signal, in arrival order, listing its
+  PDF attachments and nothing else. **Bugs fixed** (`889c519`): one page of
+  50 only — a burst after an outage lost the older mails for good; the
+  watermark was saved after the whole batch — a failure midway re-signalled
+  the earlier mails. Mutation check: first page only, watermark at the end
+  of the batch, the watermarked mail itself re-read — all caught.
 
 ## Findings
 
@@ -420,6 +418,12 @@ the real system, `[U]` unit property for complex logic.
   reference model allows a raced write, so this is a contract question:
   retry until it lands (each lost round means another append won), or keep
   the bound and say so in the tool description.
+- **F10 the Gmail watermark is a timestamp.** A mail Gmail's search
+  indexes only after a newer one was already signalled, or a second mail
+  with the very same `internalDate` that shows up a tick later, is behind
+  the watermark and skipped for good; a crash between the signal and the
+  watermark write signals a mail twice. Tracking seen message ids (bounded)
+  next to the watermark would close all three.
 - **F2 delivery is at-most-once.** `get_next_signal` marks the signal
   consumed when it pops it, so a supervisor that crashes after the pop and
   before handling loses the signal for good (no lease / ack). Possibly
@@ -447,3 +451,4 @@ the real system, `[U]` unit property for complex logic.
 - 2026-10-12 claude — memory facts + index suite; 3 bugs fixed (2 commits);
   F9.
 - 2026-10-12 claude — Gmail poller started (seams only; usage limit hit).
+- 2026-10-13 claude — Gmail poller suite + fake Gmail; 2 bugs fixed; F10.
