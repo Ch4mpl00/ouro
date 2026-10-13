@@ -204,12 +204,8 @@ suites, stronger generators, scenarios from `.claude/tasks/*.md` and
 Ordered by expected bug yield. `[I]` integration, `[P]` property suite over
 the real system, `[U]` unit property for complex logic.
 
-1. **Evals (`judging/`, `eval/`), `packages/codex`** — P3, services are
-    off; only if everything above is done.
-- **Provider tool-call ids** (P3, needs a live API) — the AgentLoop answers
-  tool calls by `id`; no provider normalises ids. Check what Gemini's and
-  OpenRouter's OpenAI-compatible endpoints return for parallel calls (empty
-  or repeated ids would make the next request ambiguous).
+1. **Evals (`judging/`, `eval/`)** — P3, the services are off (`evals`
+   compose profile). `packages/codex` is done (it backs code_agent in prod).
 
 ## Done
 
@@ -443,6 +439,20 @@ the real system, `[U]` unit property for complex logic.
   dirs, eval fixtures). Mutation check: prefix check without a separator,
   symlinks not resolved, no confinement — all caught. Monobank read by eye
   (range validated, 429 handled): thin adapter, no suite.
+- **Codex service** (2026-10-13, `packages/codex/test/runner.test.ts`) — the
+  real spawn against a stand-in `codex` first on PATH (answers JSONL, fails,
+  or ignores SIGTERM with a child of its own): generated requests reach the
+  CLI as asked (prompt last and verbatim, sandbox, model, input on stdin,
+  schema file written then removed, user config ignored) and the answer
+  comes back parsed; a failed run carries the CLI's error; a run past its
+  deadline returns soon after it with its children gone. HTTP front:
+  health / 404, a valid run, and refusals for malformed bodies, unknown
+  sandboxes / policies, bad timeouts, oversize bodies. **Bugs fixed:** a
+  CLI ignoring SIGTERM held the request forever and codex's children
+  outlived it (`9b85ddf`); any caller on the compose network could ask for
+  `danger-full-access`, requests were cast unchecked, oversize bodies got a
+  dropped connection (`57d978b`). Mutation check: no SIGKILL, killing codex
+  but not its group, full access allowed — all caught.
 
 ## Findings
 
@@ -582,3 +592,5 @@ the real system, `[U]` unit property for complex logic.
   Note to self: the fix commit went in while the new test's witness was
   flaky (test file uncommitted, tree green) — gate commits on the exit code
   in the same command.
+- 2026-10-13 claude — codex service; 2 fix commits (timeout kill, sandbox
+  restriction + validation).
