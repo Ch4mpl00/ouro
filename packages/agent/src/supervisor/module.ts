@@ -121,6 +121,7 @@ export function createSupervisorModule({ engine, env, workflow }: SupervisorModu
         signal: cancellation.signal,
         sessionContext: context,
         skills: transport ? [signal.source] : [],
+        allowSkillWrites: signal.source === "dreaming",
         systemPrompt: [
           renderContext(context.env),
           `Signal source: ${signal.source}`,

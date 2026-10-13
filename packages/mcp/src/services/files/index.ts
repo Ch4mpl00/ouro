@@ -38,10 +38,7 @@ export function defaultReadRoots(env: NodeJS.ProcessEnv, cwd: string): string[] 
 
 export function createFileAccess(deps: FileAccessDeps): FileAccess {
   const cwd = deps.cwd ?? process.cwd();
-  // Roots are compared by real path too, so a root that is itself a symlink
-  // (a mounted volume) still contains its files. A missing root contains
-  // nothing.
-  const realRoots = Promise.all(deps.roots.map((r) => realpath(path.resolve(cwd, r)).catch(() => null)));
+  const roots = deps.roots.map((r) => path.resolve(cwd, r));
 
   return {
     roots: deps.roots,
@@ -49,7 +46,12 @@ export function createFileAccess(deps: FileAccessDeps): FileAccess {
       const real = await realpath(path.resolve(cwd, input)).catch((err: unknown) => {
         throw new Error(`cannot read ${JSON.stringify(input)}: ${err instanceof Error ? err.message : String(err)}`);
       });
-      const inside = (await realRoots).some((root) => {
+      // Roots may appear after startup (the first attachment download), or
+      // be replaced. Compare their current real paths on every read rather
+      // than caching a missing root forever. Symlink confinement still uses
+      // real paths for both the requested file and the configured roots.
+      const realRoots = await Promise.all(roots.map((r) => realpath(r).catch(() => null)));
+      const inside = realRoots.some((root) => {
         if (root === null) return false;
         const rel = path.relative(root, real);
         return rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel));

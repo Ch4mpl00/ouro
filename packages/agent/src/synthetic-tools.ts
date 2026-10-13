@@ -38,6 +38,8 @@ export interface SyntheticToolContext {
   parentId?: string;
   // Trace-grouping session id, inherited by spawned sub-agents.
   sessionId?: string;
+  // Authorization from trusted signal routing, never from model arguments.
+  allowSkillWrites: boolean;
   // The skills this loop runs with, and the MCP tools that exist — what
   // write_skill needs to decide who may write and what a skill may declare.
   skills: readonly string[];
@@ -481,7 +483,7 @@ export const SYNTHETIC_TOOLS: SyntheticTool[] = [
     // flow revises skills; any other loop — one reading an email, a channel
     // post, a fetched page — offered this tool is one injected instruction
     // away from rewriting how the agent behaves for good.
-    visibleTo: (ctx) => ctx.skills.includes("dreaming"),
+    visibleTo: (ctx) => ctx.allowSkillWrites && ctx.skills.includes("dreaming"),
     handle: async (ctx, { name, content }) => {
       try {
         const tools = declaredTools(name, content);

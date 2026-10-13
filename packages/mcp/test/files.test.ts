@@ -96,6 +96,39 @@ const spelled = fc.record({
 });
 
 describe("read_file and read_pdf stay inside the readable roots", () => {
+  it("reads a root created after startup and still refuses escaping symlinks", async () => {
+    const dir = mkdtempSync(path.join(base, "late-"));
+    const root = path.join(dir, "storage");
+    const files = createFileAccess({ roots: [root], cwd: dir });
+    const server = new McpServer({ name: "late-files", version: "0" });
+    registerFsTools(server, files);
+    registerPdfTools(server, files);
+    const [ct, st] = InMemoryTransport.createLinkedPair();
+    await server.connect(st);
+    const lateClient = new Client({ name: "t", version: "0" });
+    await lateClient.connect(ct);
+    try {
+      expect((await call(lateClient, "read_file", { path: "storage/attachment.txt" })).kind).toBe("toolError");
+      mkdirSync(root);
+      writeFileSync(path.join(root, "attachment.txt"), "downloaded attachment");
+      const outcome = await call(lateClient, "read_file", { path: "storage/attachment.txt" });
+      expect(outcome).toMatchObject({ kind: "ok", value: { content: "downloaded attachment" } });
+      symlinkSync(path.join(base, "outside/secret.txt"), path.join(root, "escape"));
+      for (const [tool, arg] of [["read_file", "path"], ["read_pdf", "filePath"]] as const) {
+        expect((await call(lateClient, tool, { [arg]: "storage/escape" })).kind).toBe("toolError");
+      }
+      rmSync(root, { recursive: true });
+      expect((await call(lateClient, "read_file", { path: "storage/attachment.txt" })).kind).toBe("toolError");
+      mkdirSync(root);
+      writeFileSync(path.join(root, "attachment.txt"), "replacement attachment");
+      expect(await call(lateClient, "read_file", { path: "storage/attachment.txt" }))
+        .toMatchObject({ kind: "ok", value: { content: "replacement attachment" } });
+    } finally {
+      await lateClient.close();
+      await server.close();
+    }
+  });
+
   it("open exactly the files whose real location is under a root", async () => {
     const seen = new Set<string>();
     await fc.assert(

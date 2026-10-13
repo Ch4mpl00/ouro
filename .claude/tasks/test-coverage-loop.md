@@ -220,6 +220,24 @@ the real system, `[U]` unit property for complex logic.
 
 ## Done
 
+- **Review follow-up: skill-write authorization and late file roots**
+  (2026-10-13, `packages/agent/test/write-skill.test.ts`,
+  `packages/mcp/test/files.test.ts`) — regressions reproduced both gaps in
+  the earlier fixes before changing production code. A Telegram / scheduler
+  / news signal could delegate to `dreaming` and rewrite skills; permission
+  now comes from the supervisor's actual dreaming source and is passed only
+  to its dreaming worker, independently of model-selected skills or prompt
+  text. Tests exercise the real supervisor, engine and delegated loop with
+  forged prompt / env / tool-argument claims, verify other sources cannot
+  write, and verify the real dreaming flow still can. The write property
+  varies authorization independently of skills. A readable root missing at
+  MCP startup was cached as missing forever; roots now resolve on each read.
+  MCP tests cover late creation, deletion and recreation, plus refusal of
+  escaping symlinks for both file tools. F18 still applies to untrusted text
+  consumed inside an authorized dreaming run. Validation: typecheck, the
+  full suite on Node 22 (73 files, 655 passed, 3 existing skips), and the
+  updated write property with `PROPERTY_RUNS=360`.
+
 - **Signal queue** (2026-10-12, `packages/mcp/test/signal-queue.test.ts`) —
   generated record / `get_next_signal` / `list_signals` sequences over MCP
   against Postgres, judged on observed rows: oldest-first delivery with
@@ -686,3 +704,6 @@ the real system, `[U]` unit property for complex logic.
   knowledge module → F17.
 - 2026-10-13 claude — write_skill confined + validated (security); F18;
   gmail witness flaked once → fault aim fixed; deepening items planned.
+- 2026-10-13 codex — review follow-up: skill-write permission bound to the
+  actual dreaming signal (delegation cannot create it); late-created file
+  roots become readable without restart; regression tests for both fixes.
