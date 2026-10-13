@@ -19,6 +19,7 @@ import { runHttpTransport, type RunningHttpTransport } from "../../src/http-tran
 import { createServer } from "../../src/mcp-server";
 import type { EmbeddingProvider } from "../../src/services/embeddings/provider";
 import { createGuardedFetch, type GuardedFetch } from "../../src/services/fetch";
+import { createFileAccess, defaultReadRoots } from "../../src/services/files";
 import { createGmailModule } from "../../src/services/gmail";
 import { createKnowledgeModule } from "../../src/services/knowledge";
 import { createMemoryModule } from "../../src/services/memory";
@@ -114,6 +115,7 @@ export async function startServer(
     gmail: createGmailModule({ db: state }),
     userbot: createUserbot(createUserbotSessions(state)),
     fetcher,
+    files: createFileAccess({ roots: defaultReadRoots(process.env, process.cwd()) }),
   };
 
   const transport: RunningHttpTransport = await runHttpTransport({

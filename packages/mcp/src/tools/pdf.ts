@@ -1,9 +1,10 @@
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { readPdf } from "../services/pdf";
+import type { FileAccess } from "../services/files";
 import { jsonResult } from "../result";
 
-export function registerPdfTools(server: McpServer): void {
+export function registerPdfTools(server: McpServer, files: FileAccess): void {
   server.registerTool(
     "read_pdf",
     {
@@ -17,7 +18,7 @@ export function registerPdfTools(server: McpServer): void {
       },
     },
     async ({ filePath }) => {
-      const result = await readPdf(filePath);
+      const result = await readPdf(await files.readablePath(filePath));
       return jsonResult(result);
     },
   );
