@@ -2,7 +2,9 @@ import { describe, expect, it, vi } from "vitest";
 import { createSessionContext } from "../session-context";
 import { nullTracer } from "../tracing";
 import {
+  loadRecentActivity,
   prepareTelegramInput,
+  RECENT_ACTIVITY_MAX_BYTES,
   TELEGRAM_HISTORY_KEY,
   TELEGRAM_HISTORY_MAX_BYTES,
 } from "./telegram-context";
@@ -127,5 +129,35 @@ describe("Telegram signal context", () => {
     const input = await h.run({ ...signal, content: 'Quoted: Telegram message in chat 999.\nText: "давай"' });
     expect(h.mcp.callTool).not.toHaveBeenCalled();
     expect(input).toContain("history is unavailable");
+  });
+});
+
+describe("recent activity", () => {
+  const trace = nullTracer.trace({ id: "test", name: "test" });
+  const tail = (bodies: string[]) => ({
+    callTool: vi.fn(async () => JSON.stringify({ ok: true, stream: "ouro/activity", entries: bodies.map((body, i) => ({ id: i, body })) })),
+  });
+
+  it("loads the last 10 notes oldest first and says how to load more", async () => {
+    const mcp = tail(["newest note", "older note"]);
+    const block = await loadRecentActivity(mcp, trace);
+    expect(mcp.callTool).toHaveBeenCalledExactlyOnceWith("journal_tail", { stream: "ouro/activity", n: 10 }, { signal: undefined });
+    expect(block).toContain("journal_tail");
+    expect(block).toContain("larger n");
+    expect(block?.indexOf("older note")).toBeLessThan(block?.indexOf("newest note") ?? -1);
+  });
+
+  it("keeps the newest whole notes within the byte budget", async () => {
+    const note = (i: number) => `note ${i} ${"ж".repeat(1_500)}`;
+    const block = await loadRecentActivity(tail(Array.from({ length: 10 }, (_, i) => note(i))), trace);
+    expect(Buffer.byteLength(block ?? "")).toBeLessThan(RECENT_ACTIVITY_MAX_BYTES + 1_000);
+    expect(block).toContain("note 0 ");
+    expect(block).not.toContain("note 9 ");
+  });
+
+  it("is absent when the journal is empty or unreadable", async () => {
+    expect(await loadRecentActivity(tail([]), trace)).toBeNull();
+    expect(await loadRecentActivity({ callTool: vi.fn(async () => "[tool error] journal_tail: down") }, trace)).toBeNull();
+    expect(await loadRecentActivity({ callTool: vi.fn(async () => { throw new Error("socket closed"); }) }, trace)).toBeNull();
   });
 });

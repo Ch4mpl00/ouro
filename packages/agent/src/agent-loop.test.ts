@@ -546,7 +546,10 @@ describe("primary AgentLoop and tracing", () => {
     ] };
     const h = harness([
       ({ messages }) => {
-        expect(h.callTool).toHaveBeenCalledExactlyOnceWith("get_telegram_chat_history", { chatId: "42", limit: 20 }, { signal: expect.any(AbortSignal) });
+        expect(h.callTool.mock.calls).toEqual([
+          ["get_telegram_chat_history", { chatId: "42", limit: 20 }, { signal: expect.any(AbortSignal) }],
+          ["journal_tail", { stream: "ouro/activity", n: 10 }, { signal: expect.any(AbortSignal) }],
+        ]);
         expect(JSON.stringify(messages)).toContain("Собрать сводку за неделю?");
         return call("invoke_sub_agent", { prompt: "summarize", input_refs: ["telegram.history"] });
       },
@@ -559,7 +562,7 @@ describe("primary AgentLoop and tracing", () => {
     const runner = supervisor(h);
     const content = 'Telegram message in chat 42.\nText: "давай"';
     expect(await runner.runSignal({ ...signal, content })).toBe("done");
-    expect(h.callTool).toHaveBeenCalledTimes(1); // no worker fetch or extra LLM retrieval turn
+    expect(h.callTool).toHaveBeenCalledTimes(2); // history + activity; no worker fetch or extra LLM retrieval turn
     const trace = written[0]!;
     expect(trace.input).toBe(content);
     expect(trace.observations.find((o) => o.name === "get_telegram_chat_history")).toMatchObject({

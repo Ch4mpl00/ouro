@@ -3,7 +3,7 @@ import type { AgentLoop } from "../agent-loop";
 import { createSessionContext, gatherEnvData, renderContext, type EnvDataDeps, type SessionContext } from "../session-context";
 import type { Span, Trace } from "../tracing";
 import type { WorkflowRunner } from "../workflow";
-import { prepareTelegramInput } from "./telegram-context";
+import { loadRecentActivity, prepareTelegramInput } from "./telegram-context";
 import { isAbortError } from "../errors";
 import { ACTIVITY_META, type ActivityRole } from "../trace-model";
 
@@ -123,6 +123,7 @@ export function createSupervisorModule({ engine, env, workflow }: SupervisorModu
       // from the per-node judge, which treats AGENT descendants as a black box.
       span = trace.span({ name: "agent_loop", kind: "chain", metadata: { [ACTIVITY_META]: PRIMARY_LOOP_ROLE } });
       const input = await prepareTelegramInput(signal, context, engine.mcp, trace, cancellation.signal);
+      const activity = signal.source === "telegram" ? await loadRecentActivity(engine.mcp, trace, cancellation.signal) : null;
       // Transport skills describe delivery. Domain skills belong in workers;
       // a new source is a delegation hint, so adding one needs no code change.
       const transport = signal.source === "telegram" || signal.source === "scheduler";
@@ -134,6 +135,7 @@ export function createSupervisorModule({ engine, env, workflow }: SupervisorModu
         allowSkillWrites: signal.source === "dreaming",
         systemPrompt: [
           renderContext(context.env),
+          activity,
           `Signal source: ${signal.source}`,
           transport ? "" : `Delegate the domain work to skill ${JSON.stringify(signal.source)}. You own the final delivery.`,
           signal.envContext,

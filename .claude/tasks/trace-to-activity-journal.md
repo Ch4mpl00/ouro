@@ -251,6 +251,13 @@ Changed from the proposal above, by decision or because the code required it:
   capped at 2000 chars of JSON, exposed on `journal_append`/`journal_tail`,
   with a `.feature` scenario. The Rust port does not have this migration yet.
 - Note time is UTC: the worker has no user timezone.
+- **Reading it back (Telegram).** For every Telegram signal the supervisor
+  loads the last 10 notes (`journal_tail ouro/activity n=10`, ≤8 KB, whole
+  notes, oldest first) into the **system prompt** as "Recent Ouro activity",
+  telling the agent it can call `journal_tail` with a larger n for more. The
+  system prompt, not the user message: the primary loop's input is the
+  journal's follow-up context source, and notes must not be re-read as a
+  run's conversation. An unreadable journal just omits the block.
 
 ## Acceptance
 
