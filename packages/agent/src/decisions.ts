@@ -67,19 +67,25 @@ const RawResponse = z.object({
 // Per-type answers as the wire sends them. Two traps the normalised shapes
 // below remove: a score's probabilities are keyed by level INDEX ("0", "1",
 // …), not label; and a noul has no `confidence` at all — absent, not null.
+// Probabilities and confidences are shares of certainty in [0, 1]. (A
+// score is not: it is a mean level index, 0 … levels − 1.)
+const Probability = z.number().min(0).max(1);
+
 const RawChoice = z.object({
   type: z.literal("choice"),
   choice: z.string(),
-  probabilities: z.record(z.number()),
-  confidence: z.number(),
+  probabilities: z.record(Probability),
+  confidence: Probability,
 });
 const RawScore = z.object({
   type: z.literal("score"),
-  score: z.number(),
-  probabilities: z.record(z.number()),
-  confidence: z.number(),
+  score: z.number().min(0),
+  probabilities: z.record(Probability),
+  confidence: Probability,
 });
-const RawNoul = z.object({ type: z.literal("noul"), noul: z.number() });
+// A probability: anything outside [0, 1] is a malformed answer, not a very
+// confident one — it used to pass the filter's threshold silently.
+const RawNoul = z.object({ type: z.literal("noul"), noul: Probability });
 
 // ─── 2. Questions ────────────────────────────────────────────────────
 
