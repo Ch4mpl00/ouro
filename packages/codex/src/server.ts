@@ -1,21 +1,30 @@
-// No dotenv here: the codex package has zero deps and the service reads its
-// few knobs (CODEX_SERVICE_PORT, CODEX_HOME) from real env — compose sets them.
 import http from "node:http";
 import { runCodex, type CodexRunRequest } from "./runner";
 
-const port = Number(process.env.CODEX_SERVICE_PORT ?? "3010");
-const maxBodyBytes = Number(process.env.CODEX_SERVICE_MAX_BODY_BYTES ?? String(10 * 1024 * 1024));
+// The Codex sandbox service: POST /run executes one `codex exec` and returns
+// its result; GET /health. Reachable only on the compose network (`expose`).
 
-function readBody(req: http.IncomingMessage): Promise<string> {
+export interface CodexServerOptions {
+  maxBodyBytes?: number;
+}
+
+class BodyTooLarge extends Error {}
+
+// Over the limit: stop keeping the body, let the rest drain, and answer 413 —
+// destroying the request instead cut the caller off with no answer at all.
+function readBody(req: http.IncomingMessage, maxBodyBytes: number): Promise<string> {
   return new Promise((resolve, reject) => {
     let size = 0;
     let body = "";
+    let tooLarge = false;
     req.setEncoding("utf8");
     req.on("data", (chunk: string) => {
+      if (tooLarge) return;
       size += Buffer.byteLength(chunk);
       if (size > maxBodyBytes) {
-        reject(new Error(`request body exceeds ${maxBodyBytes} bytes`));
-        req.destroy();
+        tooLarge = true;
+        body = "";
+        reject(new BodyTooLarge(`request body exceeds ${maxBodyBytes} bytes`));
         return;
       }
       body += chunk;
@@ -34,37 +43,78 @@ function send(res: http.ServerResponse, status: number, body: unknown): void {
   res.end(text);
 }
 
-function validateRunRequest(input: unknown): CodexRunRequest {
-  if (!input || typeof input !== "object") throw new Error("body must be an object");
-  const obj = input as Record<string, unknown>;
-  if (typeof obj.prompt !== "string" || obj.prompt.length === 0) {
-    throw new Error("prompt must be a non-empty string");
-  }
-  return obj as unknown as CodexRunRequest;
+// The sandboxes a caller may ask for. `danger-full-access` (no sandbox) is
+// not on the list: no client needs it — code_agent runs workspace-write, the
+// judge read-only — and anything else on the compose network that can reach
+// this port must not be able to buy an unsandboxed shell with one field.
+const SANDBOXES = ["read-only", "workspace-write"] as const;
+const APPROVAL_POLICIES = ["untrusted", "on-request", "never"] as const;
+
+function oneOf<T extends string>(allowed: readonly T[], value: unknown, field: string): T | undefined {
+  if (value === undefined) return undefined;
+  const hit = allowed.find((a) => a === value);
+  if (hit === undefined) throw new Error(`${field} must be one of ${allowed.join(", ")}`);
+  return hit;
 }
 
-const server = http.createServer(async (req, res) => {
-  try {
-    if (req.method === "GET" && req.url === "/health") {
-      send(res, 200, { ok: true });
-      return;
-    }
+function optionalString(value: unknown, field: string): string | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== "string") throw new Error(`${field} must be a string`);
+  return value;
+}
 
-    if (req.method !== "POST" || req.url !== "/run") {
-      send(res, 404, { ok: false, error: "not found" });
-      return;
-    }
-
-    const raw = await readBody(req);
-    const parsed = raw ? JSON.parse(raw) : {};
-    const runReq = validateRunRequest(parsed);
-    const result = await runCodex(runReq);
-    send(res, result.ok ? 200 : 502, result);
-  } catch (err) {
-    send(res, 400, { ok: false, error: err instanceof Error ? err.message : String(err) });
+export function validateRunRequest(input: unknown): CodexRunRequest {
+  if (typeof input !== "object" || input === null || Array.isArray(input)) throw new Error("body must be an object");
+  const field = (name: string): unknown => Reflect.get(input, name);
+  const prompt = field("prompt");
+  if (typeof prompt !== "string" || prompt.length === 0) throw new Error("prompt must be a non-empty string");
+  const timeoutMs = field("timeoutMs");
+  if (timeoutMs !== undefined && (typeof timeoutMs !== "number" || !Number.isFinite(timeoutMs) || timeoutMs <= 0)) {
+    throw new Error("timeoutMs must be a positive number");
   }
-});
+  const includeEvents = field("includeEvents");
+  if (includeEvents !== undefined && typeof includeEvents !== "boolean") throw new Error("includeEvents must be a boolean");
+  const config = field("config");
+  if (config !== undefined && (typeof config !== "object" || config === null || Array.isArray(config))) {
+    throw new Error("config must be an object");
+  }
+  return {
+    prompt,
+    input: field("input"),
+    schema: field("schema"),
+    sandbox: oneOf(SANDBOXES, field("sandbox"), "sandbox"),
+    approvalPolicy: oneOf(APPROVAL_POLICIES, field("approvalPolicy"), "approvalPolicy"),
+    cwd: optionalString(field("cwd"), "cwd"),
+    model: optionalString(field("model"), "model"),
+    timeoutMs,
+    includeEvents,
+    config: config === undefined ? undefined : Object.fromEntries(Object.entries(config)),
+  };
+}
 
-server.listen(port, "0.0.0.0", () => {
-  console.log(`[codex] service listening on :${port}`);
-});
+export function createCodexServer(options: CodexServerOptions = {}): http.Server {
+  const maxBodyBytes = options.maxBodyBytes ?? 10 * 1024 * 1024;
+  return http.createServer(async (req, res) => {
+    try {
+      if (req.method === "GET" && req.url === "/health") {
+        send(res, 200, { ok: true });
+        return;
+      }
+
+      if (req.method !== "POST" || req.url !== "/run") {
+        send(res, 404, { ok: false, error: "not found" });
+        return;
+      }
+
+      const raw = await readBody(req, maxBodyBytes);
+      const parsed: unknown = raw ? JSON.parse(raw) : {};
+      const runReq = validateRunRequest(parsed);
+      const result = await runCodex(runReq);
+      send(res, result.ok ? 200 : 502, result);
+    } catch (err) {
+      if (!res.headersSent && !res.destroyed) {
+        send(res, err instanceof BodyTooLarge ? 413 : 400, { ok: false, error: err instanceof Error ? err.message : String(err) });
+      }
+    }
+  });
+}

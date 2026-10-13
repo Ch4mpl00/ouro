@@ -7,7 +7,7 @@
   "scripts": {
     "typecheck": "tsc --noEmit",
     "mcp:serve": "tsx packages/mcp/src/server.ts",
-    "codex:serve": "tsx packages/codex/src/server.ts",
+    "codex:serve": "tsx packages/codex/src/main.ts",
     "agent:start": "tsx packages/agent/src/supervisor/main.ts",
     "trace": "tsx packages/agent/src/scripts/langfuse-trace.ts",
     "judge": "tsx packages/agent/src/scripts/judge.ts",
