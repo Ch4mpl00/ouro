@@ -204,22 +204,17 @@ suites, stronger generators, scenarios from `.claude/tasks/*.md` and
 Ordered by expected bug yield. `[I]` integration, `[P]` property suite over
 the real system, `[U]` unit property for complex logic.
 
-1. **Decisions / the digest filter** `[I][P]` — `packages/agent/src/decisions.ts`
-   (Jev typed decisions, the `filter` preset the `decide` step runs):
-   batching, every item answered exactly once, threshold edges, malformed
-   or missing answers fail loudly, transient vs permanent errors, abort.
-   Fake the OpenRouter decisions API at the HTTP boundary.
-2. **News ingest** `[I][P]` — the HN / Habr providers and the Telegram
+1. **News ingest** `[I][P]` — the HN / Habr providers and the Telegram
    channel harvest (`services/news/providers/*`, pollers): ingest is
    idempotent, a failed item doesn't stop the batch, watermarks / cursors
    only move past what was stored, nothing re-ingested after a restart.
-3. **Telegram status bubble and typing** `[I]` — `telegram_send_status`
+2. **Telegram status bubble and typing** `[I]` — `telegram_send_status`
    (one bubble per id: send, edit, delete on empty; a deleted / edited-away
    message), `start_typing` keep-alive with its TTL and clean stop, on fake
    timers + the fake Bot API.
-4. **Knowledge module** `[I]` — `services/knowledge` (notes; superseded by
+3. **Knowledge module** `[I]` — `services/knowledge` (notes; superseded by
    memory facts?) — check whether anything still calls it before testing.
-5. **Evals (`judging/`, `eval/`)** — P3, the services are off (`evals`
+4. **Evals (`judging/`, `eval/`)** — P3, the services are off (`evals`
    compose profile). `packages/codex` is done (it backs code_agent in prod).
 
 ## Done
@@ -468,6 +463,20 @@ the real system, `[U]` unit property for complex logic.
   `danger-full-access`, requests were cast unchecked, oversize bodies got a
   dropped connection (`57d978b`). Mutation check: no SIGKILL, killing codex
   but not its group, full access allowed — all caught.
+- **Digest filter (decisions)** (2026-10-13, `packages/agent/test/decisions-filter.test.ts`)
+  — the real decision client and OpenAI SDK against a stand-in decisions
+  API behind fetch, on generated item lists (up to 80, some big enough to
+  fill a batch by size) and thresholds, with one batch answering badly
+  (extra key, missing answer, probability out of range, wrong type, 400):
+  every item asked once in contiguous batches within the item and char
+  budgets, numbered from 1 with one question each, bounded concurrency;
+  probabilities exact and kept = at or over the threshold in input order;
+  any bad batch fails the whole filter. **Bug fixed** (`6cff2c5`): a
+  probability outside [0, 1] was accepted and passed the threshold. Note:
+  `score` is a mean level index (0 … levels − 1), not a probability.
+  Mutation check: exclusive threshold, batch one item too big, no char
+  budget, misaligned answers — caught; skipping the up-front answer check is
+  equivalent at this level (answer() parses lazily).
 
 ## Findings
 
@@ -609,3 +618,4 @@ the real system, `[U]` unit property for complex logic.
   in the same command.
 - 2026-10-13 claude — codex service; 2 fix commits (timeout kill, sandbox
   restriction + validation).
+- 2026-10-13 claude — digest filter; 1 bug fixed (unbounded probabilities).
