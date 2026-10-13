@@ -209,6 +209,25 @@ the real system, `[U]` unit property for complex logic.
 
 ## Done
 
+- **fetch_article** (2026-10-13, `packages/mcp/test/fetch-article.test.ts`)
+  — over MCP on a real server and Postgres, the web played by a stand-in
+  fetcher serving HTML articles (small to ~20 MB of padding, with or
+  without a content type), binaries (PDF, image, zip, video, octet-stream
+  up to 30 MB), error statuses and endless bodies, counting every byte the
+  server pulls. Rules: no response read past 8 MB + a chunk; a binary is
+  refused unread and nothing stored; an error status is a tool error and
+  nothing stored; an article comes back as its text, is stored once,
+  becomes searchable, and a second call answers from the store without
+  fetching. **Bug fixed:** article extraction read every response whole
+  (`response.text()`) whatever its type or size — `fetch_article` and the
+  HN / Habr pollers, which follow whatever the front page links to — so
+  one link to a huge file could take the server's memory, and a PDF went
+  through Readability. Now non-article types are refused unread and the
+  body is read through `readCapped` (moved from `fetch_url` to
+  `services/fetch`, shared). Mutants caught: no content-type check,
+  unbounded read. F21: an article fetched by hand and then by the HN
+  poller is stored twice.
+
 - **Monobank** (2026-10-13, `packages/mcp/test/monobank.test.ts`) —
   `list_monobank_transactions` over MCP against a stand-in for the Personal
   API behind the global fetch, playing its documented rules (31 days + 1 h
@@ -785,6 +804,13 @@ the real system, `[U]` unit property for complex logic.
   Options: an optional `before` (end of the window) so the agent can page
   over several calls a minute apart, or the tool paging itself with a
   wait. Your call.
+- **F21 one article, two rows.** `fetch_article` stores a URL under
+  `external` unless the host is habr.com / ycombinator.com, but the HN
+  poller stores the same article URL under `hackernews` — fetch it by hand
+  first and the poller adds a second row (search shows it twice). Keying
+  articles by URL across sources (or looking up any source before
+  inserting) would fix it; `sourceForUrl` also matches `evilhabr.com` as
+  Habr.
 - **F19 a call whose MCP dies under it hangs for 60 s.** The server keeps
   no event store, so a POST's SSE stream has no resume point; when the
   process dies mid-call the SDK client only reports `SSE stream
@@ -865,3 +891,5 @@ the real system, `[U]` unit property for complex logic.
   the repair for good).
 - 2026-10-13 claude — Monobank; 1 bug fixed (a cut statement looked
   complete); F20.
+- 2026-10-13 claude — fetch_article; 1 bug fixed (unbounded article reads,
+  pollers included); F21.

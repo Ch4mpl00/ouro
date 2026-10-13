@@ -156,3 +156,29 @@ export async function assertPublicUrl(raw: string, isPrivate: (ip: string) => bo
   }
   return u;
 }
+
+// Reads past the cap by at most one chunk, so a body of exactly `maxBytes`
+// isn't reported as truncated, and cuts on a character boundary: a streaming
+// decoder holds back a multi-byte sequence the cap split in two.
+export async function readCapped(
+  res: Response,
+  maxBytes: number,
+): Promise<{ text: string; bytes: number; truncated: boolean }> {
+  const reader = res.body?.getReader();
+  if (!reader) return { text: "", bytes: 0, truncated: false };
+  const chunks: Buffer[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    chunks.push(Buffer.from(value));
+    if (total > maxBytes) {
+      await reader.cancel();
+      break;
+    }
+  }
+  const body = Buffer.concat(chunks);
+  if (total <= maxBytes) return { text: body.toString("utf-8"), bytes: total, truncated: false };
+  return { text: new TextDecoder().decode(body.subarray(0, maxBytes), { stream: true }), bytes: total, truncated: true };
+}
