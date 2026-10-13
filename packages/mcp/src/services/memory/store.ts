@@ -133,8 +133,9 @@ export interface MemoryStore {
   // one source run one at a time. Returns whether the rows were written.
   replaceIndex(sourceRef: string, entries: IndexUpsert[], basis: IndexBasis): Promise<boolean>;
   searchIndex(opts: SearchIndexOpts): Promise<IndexHit[]>;
-  // Rows whose inline embed failed (provider down). Drained by the backfill.
-  listUnembedded(limit: number): Promise<{ id: number; text: string }[]>;
+  // Rows whose inline embed failed (provider down), past `afterId` in id
+  // order. Drained by the backfill.
+  listUnembedded(limit: number, afterId?: number): Promise<{ id: number; text: string }[]>;
   setEmbedding(id: number, embedding: number[]): Promise<void>;
 
   // The journal. One append creates the stream if needed, stores the entry

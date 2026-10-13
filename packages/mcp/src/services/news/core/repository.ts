@@ -17,7 +17,8 @@ import {
   DEFAULT_DEDUP_THRESHOLD,
   dedupByPairwiseCosine,
 } from "../../retrieval";
-import type { EmbedResult, NewsEmbedder } from "./embedder";
+import type { BackfillBatch } from "../../embeddings/backfill";
+import type { NewsEmbedder } from "./embedder";
 import type { ListOpts, NewsItem, SaveResult } from "./types";
 
 // The single facade the rest of the codebase sees. Items go in →
@@ -84,7 +85,7 @@ export interface NewsRepository {
   list(opts: ListOpts): Promise<NewsItem[]>;
   search(opts: SearchOpts): Promise<SearchResult[]>;
   searchMany(opts: SearchManyOpts): Promise<SearchResult[]>;
-  embedMissingBatch(batchSize?: number): Promise<EmbedResult>;
+  embedMissingBatch(batchSize?: number, afterId?: number): Promise<BackfillBatch>;
 }
 
 export interface NewsRepositoryDeps {

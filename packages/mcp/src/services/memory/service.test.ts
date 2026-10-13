@@ -763,7 +763,7 @@ describe("with the embedding provider down", () => {
     h.setProviderDown(false);
     const drained = await h.indexer.embedMissingBatch();
 
-    expect(drained).toEqual({ embedded: 2, failed: 0 });
+    expect(drained).toMatchObject({ embedded: 2, failed: 0, unavailable: false });
     const hits = await h.service.recall({ query: "Dijkstra" });
     expect(hits.length).toBe(2);
   });
@@ -771,7 +771,7 @@ describe("with the embedding provider down", () => {
   it("reports nothing left to do when the backlog is empty", async () => {
     await h.service.remember({ body: "уже встроено" });
 
-    expect(await h.indexer.embedMissingBatch()).toEqual({ embedded: 0, failed: 0 });
+    expect(await h.indexer.embedMissingBatch()).toEqual({ embedded: 0, failed: 0, lastId: null, unavailable: false });
   });
 });
 

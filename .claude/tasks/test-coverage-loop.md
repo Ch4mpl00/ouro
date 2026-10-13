@@ -204,17 +204,97 @@ suites, stronger generators, scenarios from `.claude/tasks/*.md` and
 Ordered by expected bug yield. `[I]` integration, `[P]` property suite over
 the real system, `[U]` unit property for complex logic.
 
-1. **[I] Agent MCP client across a real MCP restart / session eviction** —
-   `connectMcp` against the real HTTP transport: the server restarts (or a
-   second client evicts a single-session endpoint) between and during
-   calls. Calls after it are served transparently; a call in flight when
-   the connection drops is not replayed if it may have run (side effects —
-   `send_telegram_message`). `mcp-client.test.ts` covers connect-time
-   retries only.
-2. **Evals (`judging/`, `eval/`)** — P3, the services are off (`evals`
+1. **Evals (`judging/`, `eval/`)** — P3, the services are off (`evals`
    compose profile). `packages/codex` is done (it backs code_agent in prod).
 
 ## Done
+
+- **fetch_article** (2026-10-13, `packages/mcp/test/fetch-article.test.ts`)
+  — over MCP on a real server and Postgres, the web played by a stand-in
+  fetcher serving HTML articles (small to ~20 MB of padding, with or
+  without a content type), binaries (PDF, image, zip, video, octet-stream
+  up to 30 MB), error statuses and endless bodies, counting every byte the
+  server pulls. Rules: no response read past 8 MB + a chunk; a binary is
+  refused unread and nothing stored; an error status is a tool error and
+  nothing stored; an article comes back as its text, is stored once,
+  becomes searchable, and a second call answers from the store without
+  fetching. **Bug fixed:** article extraction read every response whole
+  (`response.text()`) whatever its type or size — `fetch_article` and the
+  HN / Habr pollers, which follow whatever the front page links to — so
+  one link to a huge file could take the server's memory, and a PDF went
+  through Readability. Now non-article types are refused unread and the
+  body is read through `readCapped` (moved from `fetch_url` to
+  `services/fetch`, shared). Mutants caught: no content-type check,
+  unbounded read. F21: an article fetched by hand and then by the HN
+  poller is stored twice.
+
+- **Monobank** (2026-10-13, `packages/mcp/test/monobank.test.ts`) —
+  `list_monobank_transactions` over MCP against a stand-in for the Personal
+  API behind the global fetch, playing its documented rules (31 days + 1 h
+  per statement, newest first, at most 500 per response, one request per
+  account per 60 s on a test-driven clock). Account histories from empty to
+  800 transactions over up to 45 days, generated windows, requests a minute
+  apart or right away. Rules: returned transactions are the account's own,
+  in the window, newest first, in major units with their currency; a list
+  marked complete is the whole window and a cut one is never marked
+  complete; a 429 is a tool error naming the rate limit. **Bug fixed:** a
+  window holding more than 500 transactions came back cut at 500 with
+  nothing saying so — a month's spending totalled from it would be short.
+  The result now carries `complete` / `oldestReturned`. F20: no way to page
+  past 500. Mutants caught: always complete, minor units, an unexplained
+  429, a wrong default window.
+
+- **`embed:backfill`** (2026-10-13, `packages/mcp/test/embed-backfill.test.ts`)
+  — news, knowledge notes and the memory index, filled while the embedder
+  is down, then drained (`drainMissing`, now importable from
+  `services/embeddings/backfill.ts`; the script just calls it) against an
+  embedder that rejects some inputs for good — one rejected input fails
+  the whole request, as OpenAI's does — with an outage first now and then,
+  generated batch sizes, and rows moved on disk by no-op updates. Rules:
+  every accepted row ends with its own text's vector, rejected rows stay
+  NULL and hold up nothing, an outage changes nothing, a re-run changes
+  nothing. **Bug fixed:** one row the embedder rejects stalled the whole
+  repair for good — every batch picked the same unordered NULL rows first,
+  the request failed, and the drain gave up. Now each pass walks the
+  backlog once in id order past a cursor; a failed batch is told apart
+  from an outage by a probe and retried one row at a time; the drain stops
+  early only when the embedder is down. Mutants caught: no isolation,
+  cursor not advancing, stopping on any failure, unordered selection
+  (news, memory) — the last only once rows were moved on disk.
+
+- **Shipped skills vs prod's MCP surface** (2026-10-13,
+  `test/shipped-skills.test.ts`) — a reachability survey (static import
+  graph from every test) listed the source files no test reaches: one-shot
+  scripts, CLIs, the off evals, `supervisor/main.ts`. The risk in the
+  agent's composition root is its startup `validateAll`: a shipped skill
+  naming a tool the MCP doesn't serve keeps the agent from starting (a
+  crash loop on the droplet). The suite boots the real server process
+  (every toolset, as `mcp`), lists it through the agent's own client with
+  env transport, and runs the agent's `validateAll` over `skills.default`,
+  gateway tools allowed only under an enabled upstream's prefix in the
+  shipped `gateway.config.json`. Mutants caught: a skill naming a renamed
+  tool, MCP renaming a tool, the upstream disabled, broken frontmatter.
+  Follow-up queued: `embed:backfill` (Backlog 1). No production bugs.
+
+- **Agent MCP client across MCP restarts** (2026-10-13,
+  `packages/agent/test/mcp-reconnect.test.ts`, server
+  `packages/mcp/test/support/mcp-child.ts`) — `connectMcp` against the real
+  Streamable HTTP transport served by a process that is SIGKILLed and comes
+  back on the same port (single- and multi-session), dies under a running
+  call, is down when a call is made, or has its single session taken by
+  another client. Every call's side effect is logged outside the server.
+  Rules: nothing runs twice; a returned call ran once to completion; a call
+  made while MCP is up succeeds whatever came before; a call made while
+  down fails and starts nothing; concurrent callers open one session
+  between them. **Bug fixed:** after a restart or eviction, parallel tool
+  calls (the AgentLoop dispatches them at once) all but one failed with
+  "Connection closed" — the first caller's reconnect closed the old client
+  under the others. The old client is now retired and closed only once its
+  in-flight calls settle, so each gets the server's own answer (session
+  lost → retried on the fresh client; anything else → not replayed). F19:
+  a call whose server dies under it hangs 60 s. Trap: SIGKILL of the `tsx`
+  CLI orphans the real node process (it kept the port) — spawn
+  `node --import tsx` instead.
 
 - **Feature / acceptance audit** (2026-10-13,
   `packages/mcp/test/server-process.test.ts`) — the six `specs/*.feature`
@@ -716,6 +796,32 @@ the real system, `[U]` unit property for complex logic.
   instruction planted there can reach a skill at the next 04:00 run. A
   human review step (dreaming proposes a patch, the user approves), or
   writing only the improver-style append-only overlay, would close it.
+- **F20 `list_monobank_transactions` can't reach past 500.** Monobank
+  returns at most 500 transactions per statement, newest first; the tool
+  now says `complete: false` (and `oldestReturned`) instead of handing back
+  a silently cut list, but it has no way to ask for the older part — its
+  window always ends now, and a second request costs the 60 s rate limit.
+  Options: an optional `before` (end of the window) so the agent can page
+  over several calls a minute apart, or the tool paging itself with a
+  wait. Your call.
+- **F21 one article, two rows.** `fetch_article` stores a URL under
+  `external` unless the host is habr.com / ycombinator.com, but the HN
+  poller stores the same article URL under `hackernews` — fetch it by hand
+  first and the poller adds a second row (search shows it twice). Keying
+  articles by URL across sources (or looking up any source before
+  inserting) would fix it; `sourceForUrl` also matches `evilhabr.com` as
+  Habr.
+- **F19 a call whose MCP dies under it hangs for 60 s.** The server keeps
+  no event store, so a POST's SSE stream has no resume point; when the
+  process dies mid-call the SDK client only reports `SSE stream
+  disconnected` to `onerror` and leaves the request pending until its 60 s
+  timeout ("Request timed out"). The supervisor is blocked that long on an
+  MCP crash or deploy mid-call. Fix candidates: on a stream-disconnect
+  error, close the client (pending requests then fail at once with
+  "Connection closed", which is not replayed) and treat a closed client as
+  needing a reconnect; or a shorter per-call timeout for tools known to be
+  quick. Pinned in `mcp-reconnect.test.ts` (the killed call is cancelled
+  at 2 s there).
 - **F2 delivery is at-most-once.** `get_next_signal` marks the signal
   consumed when it pops it, so a supervisor that crashes after the pop and
   before handling loses the signal for good (no lease / ack). Possibly
@@ -777,3 +883,13 @@ the real system, `[U]` unit property for complex logic.
   unchecked in the storage path).
 - 2026-10-13 claude — feature/acceptance audit; composition-root gateway
   scoping covered by a real-process suite; 1 gap queued; no bugs.
+- 2026-10-13 claude — agent MCP client across restarts; 1 bug fixed
+  (parallel calls after a reconnect); F19.
+- 2026-10-13 claude — reachability survey; shipped skills validated against
+  the real MCP surface; embed:backfill queued; no bugs.
+- 2026-10-13 claude — embed:backfill; 1 bug fixed (a rejected row stalled
+  the repair for good).
+- 2026-10-13 claude — Monobank; 1 bug fixed (a cut statement looked
+  complete); F20.
+- 2026-10-13 claude — fetch_article; 1 bug fixed (unbounded article reads,
+  pollers included); F21.

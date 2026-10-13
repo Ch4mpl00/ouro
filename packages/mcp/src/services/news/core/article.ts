@@ -1,5 +1,5 @@
 import { extractFromHtml } from "@extractus/article-extractor";
-import type { GuardedFetch } from "../../fetch";
+import { readCapped, type GuardedFetch } from "../../fetch";
 
 export interface ExtractedArticle {
   url: string;
@@ -14,6 +14,12 @@ export interface ExtractedArticle {
 }
 
 const TIMEOUT_MS = 20_000;
+// No article page is bigger; a link to a huge file must not be pulled into
+// memory (the HN poller follows whatever the front page links to).
+const MAX_ARTICLE_BYTES = 8_000_000;
+// What can hold an article. No content type at all is given the benefit of
+// the doubt; anything else (PDF, image, archive, video) is refused unread.
+const ARTICLE_CT = /^(text\/|application\/(xhtml\+xml|xml)\b)/i;
 
 // Returns a cleaned plaintext rendition of an article. The page is fetched
 // through the SSRF guard (article URLs come from the model and from feeds),
@@ -29,7 +35,13 @@ export async function fetchArticle(fetcher: GuardedFetch, url: string): Promise<
     await response.body?.cancel();
     throw new Error(`fetching ${url} failed: HTTP ${response.status}`);
   }
-  const article = await extractFromHtml(await response.text(), finalUrl);
+  const contentType = response.headers.get("content-type");
+  if (contentType && !ARTICLE_CT.test(contentType)) {
+    await response.body?.cancel();
+    throw new Error(`${url} is not an article page (${contentType})`);
+  }
+  const { text: html } = await readCapped(response, MAX_ARTICLE_BYTES);
+  const article = await extractFromHtml(html, finalUrl);
   if (!article) throw new Error(`No article extracted from ${url}`);
   return {
     url,

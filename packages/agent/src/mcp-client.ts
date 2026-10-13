@@ -227,11 +227,39 @@ export async function connectMcp(options: ConnectMcpOptions = {}): Promise<McpHa
   // (last write wins, the rest leak unclosed).
   let reconnecting: Promise<Client> | null = null;
 
+  // Calls in flight per client. A reconnect retires the dead client but closes
+  // it only once its in-flight calls have settled: closing it under them fails
+  // each with "Connection closed", which is not a session-lost answer — they
+  // could neither retry nor tell whether the tool ran. Left alone, each gets
+  // the server's own answer: session lost (never ran, safe to retry on the
+  // fresh client) or a real failure (not replayed).
+  const inFlight = new Map<Client, number>();
+  const retired = new Set<Client>();
+
+  async function onClient<T>(used: Client, run: () => Promise<T>): Promise<T> {
+    inFlight.set(used, (inFlight.get(used) ?? 0) + 1);
+    try {
+      return await run();
+    } finally {
+      const left = (inFlight.get(used) ?? 1) - 1;
+      if (left > 0) inFlight.set(used, left);
+      else {
+        inFlight.delete(used);
+        if (retired.delete(used)) await closeQuietly(used);
+      }
+    }
+  }
+
+  async function retire(old: Client): Promise<void> {
+    if (inFlight.has(old)) retired.add(old);
+    else await closeQuietly(old);
+  }
+
   function reconnect(failed: Client): Promise<Client> {
     // Someone already swapped the client out — just use the fresh one.
     if (failed !== client) return Promise.resolve(client);
     reconnecting ??= (async () => {
-      await closeQuietly(failed);
+      await retire(failed);
       // Bounded, unlike startup: this runs inside a tool call the workflow
       // executor is waiting on. If MCP is down for longer than this, failing
       // the call is the honest answer — the poll loop retries in 2s and the
@@ -264,14 +292,14 @@ export async function connectMcp(options: ConnectMcpOptions = {}): Promise<McpHa
     const used = client;
     let result;
     try {
-      result = await used.callTool({ name, arguments: args }, undefined, options);
+      result = await onClient(used, () => used.callTool({ name, arguments: args }, undefined, options));
     } catch (err) {
       options?.signal?.throwIfAborted();
       if (!isSessionLostError(err)) throw err;
       console.warn("[mcp-client] session lost, reconnecting…");
       const fresh = await reconnect(used);
       options?.signal?.throwIfAborted();
-      result = await fresh.callTool({ name, arguments: args }, undefined, options);
+      result = await onClient(fresh, () => fresh.callTool({ name, arguments: args }, undefined, options));
     }
 
     const parts = Array.isArray(result.content) ? result.content : [];

@@ -1,6 +1,7 @@
-import { eq, isNull } from "drizzle-orm";
+import { and, asc, eq, gt, isNull } from "drizzle-orm";
 import type { Database } from "../../../db/pg/client";
 import { newsItems } from "../../../db/pg/schema";
+import { backfillRows, type BackfillBatch } from "../../embeddings/backfill";
 import type { EmbeddingService } from "../../embeddings/service";
 
 // Takes rows already in hand (from a fresh insert) or pulls
@@ -21,10 +22,10 @@ export interface EmbedResult {
 
 export interface NewsEmbedder {
   embed(rows: EmbedRow[]): Promise<EmbedResult>;
-  // Picks up rows with embedding=NULL (left behind by a previous
-  // failed inline embed) and embeds one batch. Returns 0/0 when the
-  // backlog is empty, so callers can loop until empty.
-  embedMissingBatch(batchSize?: number): Promise<EmbedResult>;
+  // Picks up rows with embedding=NULL (left behind by a previous failed
+  // inline embed) past `afterId`, in id order, and embeds one batch — see
+  // drainMissing.
+  embedMissingBatch(batchSize?: number, afterId?: number): Promise<BackfillBatch>;
 }
 
 export interface NewsEmbedderDeps {
@@ -69,7 +70,7 @@ export function createNewsEmbedder(deps: NewsEmbedderDeps): NewsEmbedder {
     return { embedded, failed: 0 };
   };
 
-  const embedMissingBatch = async (batchSize = 100): Promise<EmbedResult> => {
+  const embedMissingBatch = async (batchSize = 100, afterId = 0): Promise<BackfillBatch> => {
     const rows = await db
       .select({
         id: newsItems.id,
@@ -77,10 +78,17 @@ export function createNewsEmbedder(deps: NewsEmbedderDeps): NewsEmbedder {
         body: newsItems.body,
       })
       .from(newsItems)
-      .where(isNull(newsItems.embedding))
+      .where(and(isNull(newsItems.embedding), gt(newsItems.id, afterId)))
+      .orderBy(asc(newsItems.id))
       .limit(batchSize);
-    if (rows.length === 0) return { embedded: 0, failed: 0 };
-    return embed(rows.map((r) => ({ ...r, id: Number(r.id) })));
+    return backfillRows(
+      embeddings,
+      rows.map((r) => ({ ...r, id: Number(r.id) })),
+      buildText,
+      async (row, vector) => {
+        await db.update(newsItems).set({ embedding: vector, embeddedAt: new Date() }).where(eq(newsItems.id, row.id));
+      },
+    );
   };
 
   return { embed, embedMissingBatch };

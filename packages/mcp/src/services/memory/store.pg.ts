@@ -6,10 +6,12 @@
 import {
   and,
   arrayOverlaps,
+  asc,
   cosineDistance,
   count,
   desc,
   eq,
+  gt,
   inArray,
   isNotNull,
   isNull,
@@ -307,11 +309,12 @@ export function createPgMemoryStore(deps: PgMemoryStoreDeps): MemoryStore {
       }));
     },
 
-    listUnembedded: async (limit) => {
+    listUnembedded: async (limit, afterId = 0) => {
       const rows = await db
         .select({ id: memoryIndex.id, text: memoryIndex.text })
         .from(memoryIndex)
-        .where(isNull(memoryIndex.embedding))
+        .where(and(isNull(memoryIndex.embedding), gt(memoryIndex.id, afterId)))
+        .orderBy(asc(memoryIndex.id))
         .limit(limit);
       return rows.map((row) => ({ id: Number(row.id), text: row.text }));
     },

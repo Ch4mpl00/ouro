@@ -1,5 +1,6 @@
 export {
   getStatement,
+  STATEMENT_PAGE_LIMIT,
   isoCurrency,
   MonobankConfigError,
   MonobankApiError,

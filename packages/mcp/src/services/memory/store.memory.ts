@@ -208,9 +208,10 @@ export function createInMemoryStore(opts: InMemoryStoreOpts = {}): MemoryStore {
         .slice(0, opts_.limit);
     },
 
-    listUnembedded: async (limit) =>
+    listUnembedded: async (limit, afterId = 0) =>
       index
-        .filter((row) => row.embedding === null)
+        .filter((row) => row.embedding === null && row.id > afterId)
+        .sort((a, b) => a.id - b.id)
         .slice(0, limit)
         .map((row) => ({ id: row.id, text: row.text })),
 
