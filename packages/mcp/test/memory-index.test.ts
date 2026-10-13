@@ -113,7 +113,9 @@ const op: fc.Arbitrary<Op> = fc.oneof(
     arbitrary: fc.record({
       kind: fc.constant("update" as const),
       pick: fc.nat(),
-      body: fc.option(body, { nil: undefined }),
+      // Blank more often than in `remember`, so a refused update shows up
+      // in every run.
+      body: fc.option(fc.oneof({ weight: 3, arbitrary: body }, { weight: 1, arbitrary: fc.constantFrom("   ", "\n\t") }), { nil: undefined }),
       tags: fc.option(tags, { nil: undefined }),
       state: fc.option(fc.constantFrom("active" as const, "archived" as const), { nil: undefined }),
     }),

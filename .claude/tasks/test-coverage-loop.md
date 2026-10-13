@@ -204,13 +204,39 @@ suites, stronger generators, scenarios from `.claude/tasks/*.md` and
 Ordered by expected bug yield. `[I]` integration, `[P]` property suite over
 the real system, `[U]` unit property for complex logic.
 
-1. **Feature coverage** — every scenario in `packages/mcp/specs/*.feature`
-   and every task in `.claude/tasks/*.md` with an Acceptance list: is there
-   an automated check? Gaps → backlog.
+1. **[I] Agent MCP client across a real MCP restart / session eviction** —
+   `connectMcp` against the real HTTP transport: the server restarts (or a
+   second client evicts a single-session endpoint) between and during
+   calls. Calls after it are served transparently; a call in flight when
+   the connection drops is not replayed if it may have run (side effects —
+   `send_telegram_message`). `mcp-client.test.ts` covers connect-time
+   retries only.
 2. **Evals (`judging/`, `eval/`)** — P3, the services are off (`evals`
    compose profile). `packages/codex` is done (it backs code_agent in prod).
 
 ## Done
+
+- **Feature / acceptance audit** (2026-10-13,
+  `packages/mcp/test/server-process.test.ts`) — the six `specs/*.feature`
+  files run under `pnpm spec`. Of `.claude/tasks/*.md`, the pending tasks'
+  Acceptance lists describe unbuilt work; the shipped ones were mapped to
+  tests: unified-memory (documents → `memory_documents.feature` + model
+  check; recall across projects/facts → `memory-index`; notes import →
+  `import-notes`; embedder down + backfill → `service.test`; two sessions →
+  `shared-sessions`; scoping → `toolsets.test`), openrouter-provider
+  (`providers.test`, `agent-loop.test` routing), mcp-auth A2/A6
+  (`toolsets.test`, `http-transport`). Gap closed: the composition root —
+  `server.ts main()` decides that a restricted instance never attaches the
+  gateway, and nothing tested it. The new suite boots the real server
+  process (empty cwd, minimal env, no pollers) under generated
+  `MCP_TOOLSETS` with a paid upstream in the gateway config: restricted →
+  the upstream sees no session and no call, nothing `paid__*` is listed or
+  callable, `get_next_signal` out of scope can't be called by name; full →
+  the upstream tool is served. Mutants "gateway on restricted" and
+  "toolsets ignored" both caught. Gap queued: the agent's MCP client
+  across a real restart (Backlog 1). No production bugs. The gate caught a
+  witness flake in `memory-index.test.ts` ("a blank update is refused") →
+  update bodies biased towards blank.
 
 - **Attachment downloads** (2026-10-13,
   `packages/mcp/test/gmail-attachments.test.ts`) — `download_gmail_attachment`
@@ -749,3 +775,5 @@ the real system, `[U]` unit property for complex logic.
   mutant killed, 1 equivalent; no bugs.
 - 2026-10-13 claude — attachment downloads; 1 bug fixed (message id
   unchecked in the storage path).
+- 2026-10-13 claude — feature/acceptance audit; composition-root gateway
+  scoping covered by a real-process suite; 1 gap queued; no bugs.
