@@ -4,7 +4,7 @@ import { isPresetName, PRESET_NAMES } from "./models";
 import { CODE_AGENT_TOOL, CodeAgentArgsSchema, runCodeAgent } from "./code-agent";
 import type { CodexClient } from "./codex-client";
 import type { MemoryStore } from "./db/memory";
-import type { SkillStore } from "./skills";
+import { declaredTools, type SkillStore } from "./skills";
 import type { AgentLoopOpts } from "./agent-loop";
 import type { TraceContext } from "./tracing";
 import { renderContext, type SessionContext } from "./session-context";
@@ -38,6 +38,10 @@ export interface SyntheticToolContext {
   parentId?: string;
   // Trace-grouping session id, inherited by spawned sub-agents.
   sessionId?: string;
+  // The skills this loop runs with, and the MCP tools that exist — what
+  // write_skill needs to decide who may write and what a skill may declare.
+  skills: readonly string[];
+  mcpToolNames: readonly string[];
   log(...parts: unknown[]): void;
   skillStore: SkillStore;
   memory: MemoryStore;
@@ -473,8 +477,18 @@ export const SYNTHETIC_TOOLS: SyntheticTool[] = [
   defineTool({
     def: WRITE_SKILL_TOOL,
     schema: WriteSkillArgsSchema,
+    // A skill is the system prompt of every later signal. Only the dreaming
+    // flow revises skills; any other loop — one reading an email, a channel
+    // post, a fetched page — offered this tool is one injected instruction
+    // away from rewriting how the agent behaves for good.
+    visibleTo: (ctx) => ctx.skills.includes("dreaming"),
     handle: async (ctx, { name, content }) => {
       try {
+        const tools = declaredTools(name, content);
+        const unknown = tools === "*" ? [] : tools.filter((t) => !ctx.mcpToolNames.includes(t));
+        if (unknown.length > 0) {
+          return `[write_skill error] skill "${name}" declares tools MCP doesn't have: ${unknown.join(", ")} — the agent would refuse to start with it.`;
+        }
         const written = await ctx.skillStore.saveSkill(name, content);
         ctx.log(`write_skill ${name} (${written.sizeBytes}b → ${written.path})`);
         return JSON.stringify({ ok: true, name, ...written });

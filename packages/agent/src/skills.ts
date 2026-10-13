@@ -150,6 +150,12 @@ function parseSkillFile(name: string, raw: string, source: "live" | "default"): 
   return { body, tools, source };
 }
 
+// The tools a skill's content declares, or an error saying why the content
+// is not a loadable skill — what write_skill checks before it saves.
+export function declaredTools(name: string, content: string): string[] | "*" {
+  return parseSkillFile(name, content, "live").tools;
+}
+
 export interface SkillStoreOpts {
   liveDir?: string;
   defaultsDir?: string;
@@ -210,6 +216,9 @@ export function createSkillStore(opts: SkillStoreOpts = {}): SkillStore {
 
     async saveSkill(name, content) {
       validateName(name);
+      // Never write what readSkill would refuse: a broken live skill takes
+      // that skill down and fails validateAll at the next startup.
+      parseSkillFile(name, content, "live");
       await fs.mkdir(liveDir, { recursive: true });
       const target = path.join(liveDir, `${name}.md`);
       await fs.writeFile(target, content, "utf-8");

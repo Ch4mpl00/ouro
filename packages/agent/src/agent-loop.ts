@@ -227,6 +227,8 @@ export function createAgentLoop(engine: Engine, opts: AgentLoopOpts): AgentLoop 
     loopId: id,
     parentId,
     sessionId,
+    skills: Object.keys(opts.resolvedSkills ?? {}),
+    mcpToolNames: engine.mcp.tools.map((t) => t.function.name),
     log: (...parts) => engine.log(id, ...parts),
     sessionContext,
     skillStore: engine.skillStore,
