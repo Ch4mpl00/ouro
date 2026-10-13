@@ -143,6 +143,11 @@ Distilled from `~/Code/tickets-booking/AGENTS.md` and `test/properties/`
   and an `integration_account` row with an unexpired access token.
 - fast-check gotcha: `fc.array(..., { maxLength })` still generates short
   arrays unless `size: "max"` is given — sequences silently stay trivial.
+- fast-check gotcha 2: `fc.option(arb, { freq })` yields nil with
+  probability 1/freq — `freq: 4` means the value is present 75% of the
+  time, not 25%. For "present sometimes" use a weighted `fc.oneof`. A
+  filter that is almost always on left the news property with zero
+  candidates; print per-run counts when a mutant survives unexpectedly.
 
 ## Iteration procedure
 
@@ -190,26 +195,23 @@ suites, stronger generators, scenarios from `.claude/tasks/*.md` and
 Ordered by expected bug yield. `[I]` integration, `[P]` property suite over
 the real system, `[U]` unit property for complex logic.
 
-1. **News store** `[I][P]` — `list_news` / `fetch_article` / `search_news`
-    with fake providers + word embedder: upsert idempotency, dedup, `k`
-    bounds, filters, NULL-embedding rows still listable, backfill drains.
-2. **Tool scoping and transport** `[I][P]` — any `MCP_TOOLSETS` subset →
+1. **Tool scoping and transport** `[I][P]` — any `MCP_TOOLSETS` subset →
     `tools/list` is exactly the union of those groups; unknown name is a
     boot error; multi-session isolation in `http-transport`.
-3. **Skills** `[I]` — agent two-layer loader (live → default, patch
+2. **Skills** `[I]` — agent two-layer loader (live → default, patch
     overlay) and the MCP `read_skill` export agree on the composed
     instructions for generated bodies/patches (the two `appendPatch`
     copies must not drift).
-4. **Gateway** `[I]` — fake upstream MCP server: namespacing, upstream
+3. **Gateway** `[I]` — fake upstream MCP server: namespacing, upstream
     failure isolated from own tools, reconnect.
-5. **Agent sqlite state** `[I]` — memory KV + trace mirror
+4. **Agent sqlite state** `[I]` — memory KV + trace mirror
     (`db/trace-store.ts`): migrations on boot idempotent, trace/judgement
     invariants.
-6. **`mcp_state` boot** `[I]` — migrations idempotent, two servers booting
+5. **`mcp_state` boot** `[I]` — migrations idempotent, two servers booting
     at once (advisory lock).
-7. **Monobank, PDF, files tools** `[I]` — fake HTTP; `read_file` path
+6. **Monobank, PDF, files tools** `[I]` — fake HTTP; `read_file` path
     confinement.
-8. **Evals (`judging/`, `eval/`), `packages/codex`** — P3, services are
+7. **Evals (`judging/`, `eval/`), `packages/codex`** — P3, services are
     off; only if everything above is done.
 - **Provider tool-call ids** (P3, needs a live API) — the AgentLoop answers
   tool calls by `id`; no provider normalises ids. Check what Gemini's and
@@ -362,6 +364,21 @@ the real system, `[U]` unit property for complex logic.
   watermark was saved after the whole batch — a failure midway re-signalled
   the earlier mails. Mutation check: first page only, watermark at the end
   of the batch, the watermarked mail itself re-read — all caught.
+- **News store** (2026-10-13, `packages/mcp/test/news.test.ts`) — generated
+  corpora (sources, channels, dates, mostly untitled near-duplicate bodies,
+  some rows left unembedded) behind list_news / search_news over MCP:
+  save keeps the first copy per (source, externalId) and is idempotent;
+  results pass the filters, come in posted order / best-first, distances
+  equal the best cosine over the queries recomputed from stored vectors,
+  no near-duplicate pairs, and nothing better is left out (a missing match
+  is no closer than the last of k results, a near-duplicate of a returned
+  row, or beyond the candidate pool); chunks are an exact, balanced,
+  leading-heavy split; an unparseable date is refused. Directed: dedup at
+  the top leaves room for the next distinct match. No bugs found. Mutation
+  check: always newest first, `until` exclusive, merge keeping the worst
+  distance, pool no bigger than k, extra items in the last chunks — all
+  caught; dropping the "embedded only" filter is equivalent (dedup drops
+  vector-less rows anyway).
 
 ## Findings
 
@@ -424,6 +441,11 @@ the real system, `[U]` unit property for complex logic.
   the watermark and skipped for good; a crash between the signal and the
   watermark write signals a mail twice. Tracking seen message ids (bounded)
   next to the watermark would close all three.
+- **F11 `list_news` without `sinceISO` lists undated items first.**
+  Descending `posted_at` puts NULLs first in Postgres, so articles stored
+  without a date (fetch_article on a page with none) come before every
+  dated item and can push real news past the limit. `NULLS LAST` is
+  probably what "newest first" means; not changed.
 - **F2 delivery is at-most-once.** `get_next_signal` marks the signal
   consumed when it pops it, so a supervisor that crashes after the pop and
   before handling loses the signal for good (no lease / ack). Possibly
@@ -452,3 +474,4 @@ the real system, `[U]` unit property for complex logic.
   F9.
 - 2026-10-12 claude — Gmail poller started (seams only; usage limit hit).
 - 2026-10-13 claude — Gmail poller suite + fake Gmail; 2 bugs fixed; F10.
+- 2026-10-13 claude — news store suite; no bugs; F11.

@@ -46,7 +46,7 @@ export async function database(): Promise<{ url: string; container: StartedPostg
 
 // Deterministic stand-in for the embedding model: a bag-of-words vector, so
 // distance tracks word overlap. Recall works without OpenAI.
-const wordEmbedder: EmbeddingProvider = {
+export const wordEmbedder: EmbeddingProvider = {
   dimensions: 1536,
   embed: async (text) => embedWords(text),
   embedBatch: async (texts) => texts.map(embedWords),
