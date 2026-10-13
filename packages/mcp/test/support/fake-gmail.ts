@@ -10,7 +10,10 @@
 //   - messages.get answers metadata headers or the full payload, with one
 //     part per attachment;
 //   - `failGet(id, times)` makes the next `times` gets of a mail fail with a
-//     500.
+//     500;
+//   - attachments.get answers an attachment's bytes (`content`, or a default
+//     derived from its id) — or, with `lenient`, any attachment path at all,
+//     as an API that doesn't reject a malformed id would.
 
 import http from "node:http";
 
@@ -19,8 +22,10 @@ export interface FakeMail {
   internalDate: number;
   subject: string;
   matches: boolean;
-  attachments: { attachmentId: string; filename: string; mimeType: string; size: number }[];
+  attachments: { attachmentId: string; filename: string; mimeType: string; size: number; content?: string }[];
 }
+
+export const attachmentBytes = (a: { attachmentId: string; content?: string }): string => a.content ?? `%PDF bytes of ${a.attachmentId}`;
 
 export interface FakeGmail {
   rootUrl: string;
@@ -28,6 +33,8 @@ export interface FakeGmail {
   // Every list call's query, in order.
   queries: string[];
   failGet(id: string, times?: number): void;
+  // Answer attachments.get for any path, ids unchecked.
+  lenient: boolean;
   close(): Promise<void>;
 }
 
@@ -35,6 +42,14 @@ export async function startFakeGmail(): Promise<FakeGmail> {
   const mails: FakeMail[] = [];
   const queries: string[] = [];
   const failures = new Map<string, number>();
+  const fake: FakeGmail = {
+    rootUrl: "",
+    mails,
+    queries,
+    failGet: (id, times = 1) => void failures.set(id, (failures.get(id) ?? 0) + times),
+    lenient: false,
+    close: () => new Promise((resolve) => server.close(() => resolve())),
+  };
 
   const server = http.createServer((req, res) => {
     const url = new URL(req.url ?? "/", "http://fake");
@@ -56,6 +71,15 @@ export async function startFakeGmail(): Promise<FakeGmail> {
         ...(offset + max < hits.length ? { nextPageToken: String(offset + max) } : {}),
         resultSizeEstimate: hits.length,
       });
+    }
+    const attachment = /^\/gmail\/v1\/users\/me\/(?:messages\/([^/]+)\/)?attachments\/([^/]+)$/.exec(url.pathname);
+    if (attachment && req.method === "GET") {
+      const mid = decodeURIComponent(attachment[1] ?? "");
+      const aid = decodeURIComponent(attachment[2] ?? "");
+      const found = mails.find((m) => m.id === mid)?.attachments.find((a) => a.attachmentId === aid);
+      const bytes = found ? attachmentBytes(found) : fake.lenient ? `%PDF lenient ${mid}/${aid}` : null;
+      if (bytes === null) return json(404, { error: { code: 404, message: "Requested entity was not found." } });
+      return json(200, { size: Buffer.byteLength(bytes), data: Buffer.from(bytes).toString("base64url") });
     }
     const get = /^\/gmail\/v1\/users\/me\/messages\/([^/]+)$/.exec(url.pathname);
     if (get && req.method === "GET") {
@@ -98,11 +122,6 @@ export async function startFakeGmail(): Promise<FakeGmail> {
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
   const address = server.address();
   if (address === null || typeof address === "string") throw new Error("fake Gmail: no TCP address");
-  return {
-    rootUrl: `http://127.0.0.1:${address.port}/`,
-    mails,
-    queries,
-    failGet: (id, times = 1) => void failures.set(id, (failures.get(id) ?? 0) + times),
-    close: () => new Promise((resolve) => server.close(() => resolve())),
-  };
+  fake.rootUrl = `http://127.0.0.1:${address.port}/`;
+  return fake;
 }

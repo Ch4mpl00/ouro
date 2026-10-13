@@ -204,16 +204,27 @@ suites, stronger generators, scenarios from `.claude/tasks/*.md` and
 Ordered by expected bug yield. `[I]` integration, `[P]` property suite over
 the real system, `[U]` unit property for complex logic.
 
-1. **`download_gmail_attachment` path** — `messageId` from the model goes
-   into the storage path unsanitized; only the Gmail API rejecting a bogus
-   id first keeps `../` out. Sanitize it like the account key and pin it.
-2. **Feature coverage** — every scenario in `packages/mcp/specs/*.feature`
+1. **Feature coverage** — every scenario in `packages/mcp/specs/*.feature`
    and every task in `.claude/tasks/*.md` with an Acceptance list: is there
    an automated check? Gaps → backlog.
-3. **Evals (`judging/`, `eval/`)** — P3, the services are off (`evals`
+2. **Evals (`judging/`, `eval/`)** — P3, the services are off (`evals`
    compose profile). `packages/codex` is done (it backs code_agent in prod).
 
 ## Done
+
+- **Attachment downloads** (2026-10-13,
+  `packages/mcp/test/gmail-attachments.test.ts`) — `download_gmail_attachment`
+  then `read_file` over MCP against the fake Gmail (now answering
+  attachments.get, optionally for any path) and Postgres, with model-supplied
+  ids and filenames generated hostile. Rules: a written file sits in a
+  directory named exactly after its message inside the account directory,
+  holds the bytes Gmail sent, reads back, and nothing else is on disk.
+  **Bug fixed:** the message id went into the storage path unchecked, so
+  only Gmail rejecting it kept `..` out — with an API that answers, a file
+  landed in `storage/gmail/` outside the account. Ids are now required to be
+  base64url before Gmail is asked. Checked prod's stored ids: real
+  attachment ids differ within their first 12 characters, so the
+  `aidPrefix` file names don't collide in practice.
 
 - **Mutation sampling: memory facts and journal** (2026-10-13,
   `memory/journal.test.ts`) — 13 bugs planted in `service.ts`'s facts,
@@ -736,3 +747,5 @@ the real system, `[U]` unit property for complex logic.
   session-context); 4 surviving mutants killed; no bugs.
 - 2026-10-13 claude — mutation sampling, memory facts + journal; 1 surviving
   mutant killed, 1 equivalent; no bugs.
+- 2026-10-13 claude — attachment downloads; 1 bug fixed (message id
+  unchecked in the storage path).
