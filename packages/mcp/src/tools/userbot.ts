@@ -1,9 +1,9 @@
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { listDialogs, type Userbot } from "../services/telegram/userbot";
+import { listDialogs, type DialogsClient } from "../services/telegram/userbot";
 import { jsonResult } from "../result";
 
-export function registerUserbotTools(server: McpServer, userbot: Userbot): void {
+export function registerUserbotTools(server: McpServer, userbot: { client(): Promise<DialogsClient> }): void {
   server.registerTool(
     "list_userbot_dialogs",
     {
@@ -21,7 +21,7 @@ export function registerUserbotTools(server: McpServer, userbot: Userbot): void 
           .optional()
           .describe(
             "Filter dialogs by type. 'channel' is the right choice for the " +
-              "news digest (broadcast channels). Default 'all'.",
+              "news digest (broadcast channels); a supergroup is a 'group'. Default 'all'.",
           ),
         limit: z
           .number()
@@ -33,9 +33,8 @@ export function registerUserbotTools(server: McpServer, userbot: Userbot): void 
       },
     },
     async ({ type, limit }) => {
-      const dialogs = await listDialogs(userbot, limit);
-      const filtered = type && type !== "all" ? dialogs.filter((d) => d.type === type) : dialogs;
-      return jsonResult({ count: filtered.length, dialogs: filtered });
+      const dialogs = await listDialogs(userbot, { type: type && type !== "all" ? type : undefined, limit });
+      return jsonResult({ count: dialogs.length, dialogs });
     },
   );
 }

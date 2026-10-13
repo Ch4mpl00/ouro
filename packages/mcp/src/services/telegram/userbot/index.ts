@@ -3,6 +3,7 @@ export { createUserbotSessions, type UserbotSessions, type SavedSession } from "
 export {
   fetchChannelMessages,
   listDialogs,
+  type DialogsClient,
   type UserbotMessage,
   type UserbotChannelInfo,
   type UserbotDialog,

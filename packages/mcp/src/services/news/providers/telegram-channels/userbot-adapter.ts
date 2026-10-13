@@ -12,7 +12,10 @@ export interface ChannelsClient {
 }
 
 interface DialogLike {
+  // Telegram reports a supergroup as a channel too: `isChannel` for every
+  // channel-type chat, `isGroup` for groups including supergroups.
   isChannel: boolean;
+  isGroup: boolean;
   title?: string;
   entity?: unknown;
 }
@@ -42,7 +45,9 @@ export function createChannelsAdapter(deps: ChannelsAdapterDeps): UserbotChannel
       const client = await deps.client();
       const out: ChannelHandle[] = [];
       for (const d of await client.getDialogs({ limit: 500 })) {
-        if (!d.isChannel || typeof d.entity !== "object" || d.entity === null) continue;
+        // Broadcast channels only: a supergroup's messages are a group
+        // conversation, not posts to put in the news store.
+        if (!d.isChannel || d.isGroup || typeof d.entity !== "object" || d.entity === null) continue;
         const id: unknown = Reflect.get(d.entity, "id");
         if (id === undefined || id === null) continue;
         const title: unknown = Reflect.get(d.entity, "title");
