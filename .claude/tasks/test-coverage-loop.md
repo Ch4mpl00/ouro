@@ -204,17 +204,30 @@ suites, stronger generators, scenarios from `.claude/tasks/*.md` and
 Ordered by expected bug yield. `[I]` integration, `[P]` property suite over
 the real system, `[U]` unit property for complex logic.
 
-1. **[I] Agent MCP client across a real MCP restart / session eviction** —
-   `connectMcp` against the real HTTP transport: the server restarts (or a
-   second client evicts a single-session endpoint) between and during
-   calls. Calls after it are served transparently; a call in flight when
-   the connection drops is not replayed if it may have run (side effects —
-   `send_telegram_message`). `mcp-client.test.ts` covers connect-time
-   retries only.
-2. **Evals (`judging/`, `eval/`)** — P3, the services are off (`evals`
+1. **Evals (`judging/`, `eval/`)** — P3, the services are off (`evals`
    compose profile). `packages/codex` is done (it backs code_agent in prod).
 
 ## Done
+
+- **Agent MCP client across MCP restarts** (2026-10-13,
+  `packages/agent/test/mcp-reconnect.test.ts`, server
+  `packages/mcp/test/support/mcp-child.ts`) — `connectMcp` against the real
+  Streamable HTTP transport served by a process that is SIGKILLed and comes
+  back on the same port (single- and multi-session), dies under a running
+  call, is down when a call is made, or has its single session taken by
+  another client. Every call's side effect is logged outside the server.
+  Rules: nothing runs twice; a returned call ran once to completion; a call
+  made while MCP is up succeeds whatever came before; a call made while
+  down fails and starts nothing; concurrent callers open one session
+  between them. **Bug fixed:** after a restart or eviction, parallel tool
+  calls (the AgentLoop dispatches them at once) all but one failed with
+  "Connection closed" — the first caller's reconnect closed the old client
+  under the others. The old client is now retired and closed only once its
+  in-flight calls settle, so each gets the server's own answer (session
+  lost → retried on the fresh client; anything else → not replayed). F19:
+  a call whose server dies under it hangs 60 s. Trap: SIGKILL of the `tsx`
+  CLI orphans the real node process (it kept the port) — spawn
+  `node --import tsx` instead.
 
 - **Feature / acceptance audit** (2026-10-13,
   `packages/mcp/test/server-process.test.ts`) — the six `specs/*.feature`
@@ -716,6 +729,17 @@ the real system, `[U]` unit property for complex logic.
   instruction planted there can reach a skill at the next 04:00 run. A
   human review step (dreaming proposes a patch, the user approves), or
   writing only the improver-style append-only overlay, would close it.
+- **F19 a call whose MCP dies under it hangs for 60 s.** The server keeps
+  no event store, so a POST's SSE stream has no resume point; when the
+  process dies mid-call the SDK client only reports `SSE stream
+  disconnected` to `onerror` and leaves the request pending until its 60 s
+  timeout ("Request timed out"). The supervisor is blocked that long on an
+  MCP crash or deploy mid-call. Fix candidates: on a stream-disconnect
+  error, close the client (pending requests then fail at once with
+  "Connection closed", which is not replayed) and treat a closed client as
+  needing a reconnect; or a shorter per-call timeout for tools known to be
+  quick. Pinned in `mcp-reconnect.test.ts` (the killed call is cancelled
+  at 2 s there).
 - **F2 delivery is at-most-once.** `get_next_signal` marks the signal
   consumed when it pops it, so a supervisor that crashes after the pop and
   before handling loses the signal for good (no lease / ack). Possibly
@@ -777,3 +801,5 @@ the real system, `[U]` unit property for complex logic.
   unchecked in the storage path).
 - 2026-10-13 claude — feature/acceptance audit; composition-root gateway
   scoping covered by a real-process suite; 1 gap queued; no bugs.
+- 2026-10-13 claude — agent MCP client across restarts; 1 bug fixed
+  (parallel calls after a reconnect); F19.
