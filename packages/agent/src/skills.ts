@@ -168,7 +168,10 @@ export function createSkillStore(opts: SkillStoreOpts = {}): SkillStore {
     }
     const out = await Promise.all(
       files
-        .filter((f) => f.endsWith(".md"))
+        // A `<name>.patch.md` overlay is not a skill of its own. Listed, it
+        // reached validateAll as "<name>.patch" — an invalid name — and one
+        // improver patch on disk failed the supervisor's startup.
+        .filter((f) => f.endsWith(".md") && !f.endsWith(".patch.md") && NAME_PATTERN.test(f.slice(0, -3)))
         .map(async (f) => {
           const stat = await fs.stat(path.join(dir, f));
           if (!stat.isFile()) return null;
