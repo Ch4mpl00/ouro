@@ -22,7 +22,9 @@ export interface FakeMail {
   internalDate: number;
   subject: string;
   matches: boolean;
-  attachments: { attachmentId: string; filename: string; mimeType: string; size: number; content?: string }[];
+  // `nested`: inside a multipart/mixed part of its own, as forwarded and
+  // client-built mails put it.
+  attachments: { attachmentId: string; filename: string; mimeType: string; size: number; content?: string; nested?: boolean }[];
 }
 
 export const attachmentBytes = (a: { attachmentId: string; content?: string }): string => a.content ?? `%PDF bytes of ${a.attachmentId}`;
@@ -107,12 +109,10 @@ export async function startFakeGmail(): Promise<FakeGmail> {
           ],
           parts: [
             { partId: "0", mimeType: "text/plain", filename: "", body: { size: 5, data: "aGVsbG8" } },
-            ...mail.attachments.map((a, i) => ({
-              partId: String(i + 1),
-              mimeType: a.mimeType,
-              filename: a.filename,
-              body: { attachmentId: a.attachmentId, size: a.size },
-            })),
+            ...mail.attachments.map((a, i) => {
+              const part = { partId: String(i + 1), mimeType: a.mimeType, filename: a.filename, body: { attachmentId: a.attachmentId, size: a.size } };
+              return a.nested ? { partId: `${i + 1}`, mimeType: "multipart/mixed", filename: "", body: { size: 0 }, parts: [{ ...part, partId: `${i + 1}.1` }] } : part;
+            }),
           ],
         },
       });
