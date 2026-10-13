@@ -58,11 +58,21 @@ export async function tick(deps: SchedulerDeps, now: Date = new Date()): Promise
     const previousIso = task.last_run_at != null ? new Date(task.last_run_at * 1000).toISOString() : null;
 
     // The slot (not the wall clock) goes into last_run_at, so the following
-    // cron lookup advances correctly even when this tick is late.
-    await deps.tasks.markFired(task.id, Math.floor(slot.getTime() / 1000));
+    // cron lookup advances correctly even when this tick is late. Claimed
+    // with a compare-and-set: an overlapping tick that got there first, or a
+    // cancel since listActive, means this tick doesn't fire it.
+    const slotUnix = Math.floor(slot.getTime() / 1000);
+    if (!(await deps.tasks.swapLastRun(task.id, task.last_run_at, slotUnix))) continue;
 
     const source = task.source ?? DEFAULT_SIGNAL_SOURCE;
-    await deps.signals.record({ source, content: renderContent(task, previousIso, slot, now) });
+    try {
+      await deps.signals.record({ source, content: renderContent(task, previousIso, slot, now) });
+    } catch (err) {
+      // Give the slot back so the next tick fires it, rather than leaving it
+      // marked as done with no signal.
+      await deps.tasks.swapLastRun(task.id, slotUnix, task.last_run_at);
+      throw err;
+    }
     console.log(
       `${logPrefix()} fired task #${task.id} source=${source} (slot ${slot.toISOString()}, ${task.recurring ? "recurring" : "one-shot"})`,
     );

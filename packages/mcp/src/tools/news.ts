@@ -69,13 +69,18 @@ export function registerNewsTools(server: McpServer, news: NewsRepository, fetch
             "Batch of 1–8 independent queries for a multi-facet ask. " +
               "Mutually exclusive with `query`.",
           ),
+        // 150 so a cheap classifier step (the workflow's decide filter) can
+        // see a wide net; anything an LLM reads directly should stay ≤ 50.
         k: z
           .number()
           .int()
           .min(1)
-          .max(50)
+          .max(150)
           .optional()
-          .describe("Number of results to return. Default 10."),
+          .describe(
+            "Number of results to return. Default 10. Up to 50 when an LLM reads them directly; " +
+              "up to 150 only when a relevance filter runs over them first.",
+          ),
         source: z
           .enum(KNOWN_SOURCES)
           .optional()

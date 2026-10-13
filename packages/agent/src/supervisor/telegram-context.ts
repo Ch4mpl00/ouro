@@ -3,6 +3,8 @@ import { z } from "zod";
 import type { McpHandle } from "../mcp-client";
 import type { SessionContext } from "../session-context";
 import { isToolError } from "../tool-results";
+import { ACTIVITY_STREAM } from "../activity-journal";
+import { TOOL_META } from "../trace-model";
 import type { TraceContext } from "../tracing";
 import type { PendingSignal } from "./module";
 
@@ -79,7 +81,12 @@ export async function prepareTelegramInput(
   const chatId = header[1]!;
   const threadId = header[2] === undefined ? null : Number(header[2]);
   const args = { chatId, limit: TELEGRAM_HISTORY_LIMIT, ...(threadId === null ? {} : { threadId }) };
-  const span = trace.span({ name: "get_telegram_chat_history", kind: "tool", input: args, metadata: { automatic: true } });
+  const span = trace.span({
+    name: "get_telegram_chat_history",
+    kind: "tool",
+    input: args,
+    metadata: { [TOOL_META]: "get_telegram_chat_history", automatic: true },
+  });
   try {
     const currentText = z.string().parse(JSON.parse(header[3]!));
     const signalTime = timestamp(signal.created_at);
@@ -118,5 +125,60 @@ export async function prepareTelegramInput(
     span.end({ output: { error }, level: "ERROR", statusMessage: error });
     abortSignal?.throwIfAborted();
     return unavailable();
+  }
+}
+
+// ─── recent activity ────────────────────────────────────────────────
+
+export const RECENT_ACTIVITY_LIMIT = 10;
+export const RECENT_ACTIVITY_MAX_BYTES = 8_000;
+
+const activitySchema = z.object({
+  entries: z.array(z.object({ body: z.string() }).passthrough()),
+});
+
+// What Ouro did in its latest runs, across every chat and source: the notes
+// the activity-journal worker appended. Goes into the system prompt, not the
+// user message, so the activity journal never reads its own notes back as a
+// run's conversation context. Null when the journal can't be read — the
+// signal is handled without it.
+export async function loadRecentActivity(
+  mcp: Pick<McpHandle, "callTool">,
+  trace: TraceContext,
+  abortSignal?: AbortSignal,
+): Promise<string | null> {
+  abortSignal?.throwIfAborted();
+  const args = { stream: ACTIVITY_STREAM, n: RECENT_ACTIVITY_LIMIT };
+  const span = trace.span({ name: "journal_tail", kind: "tool", input: args, metadata: { [TOOL_META]: "journal_tail", automatic: true } });
+  try {
+    const raw = await mcp.callTool("journal_tail", args, { signal: abortSignal });
+    abortSignal?.throwIfAborted();
+    if (isToolError(raw)) throw new Error(raw);
+    const { entries } = activitySchema.parse(JSON.parse(raw));
+    // Newest first from the tool; keep whole notes, newest first, within the
+    // byte budget, then show them oldest first like the chat history.
+    const kept: string[] = [];
+    let bytes = 0;
+    for (const { body } of entries) {
+      bytes += Buffer.byteLength(body) + 2;
+      if (bytes > RECENT_ACTIVITY_MAX_BYTES) break;
+      kept.push(body);
+    }
+    span.update({ metadata: { activity_notes: kept.length } });
+    span.end({ output: raw });
+    if (kept.length === 0) return null;
+    return [
+      "## Recent Ouro activity",
+      `The last ${kept.length} notes of your activity journal (stream "${ACTIVITY_STREAM}"), oldest first: what you did in recent runs across all chats, schedules and sources.`,
+      "Background, not a request. Each note starts with its time (UTC) and source.",
+      `For older activity, call journal_tail with stream "${ACTIVITY_STREAM}" and a larger n (up to 100); each entry's metadata.trace_id identifies the run.`,
+      "",
+      kept.reverse().join("\n\n"),
+    ].join("\n");
+  } catch (err) {
+    const error = err instanceof Error ? err.message : String(err);
+    span.end({ output: { error }, level: "ERROR", statusMessage: error });
+    abortSignal?.throwIfAborted();
+    return null;
   }
 }

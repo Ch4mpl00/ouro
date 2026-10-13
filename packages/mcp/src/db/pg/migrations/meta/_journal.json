@@ -36,6 +36,20 @@
       "when": 1790957842163,
       "tag": "0004_news_chronological_indexes",
       "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "7",
+      "when": 1791823358054,
+      "tag": "0005_memory_journal",
+      "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "7",
+      "when": 1791902517698,
+      "tag": "0006_memory_journal_metadata",
+      "breakpoints": true
     }
   ]
 }

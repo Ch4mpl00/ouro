@@ -58,7 +58,7 @@ function lastResult(messages: ChatCompletionMessageParam[]): string {
 function context(id = "task") {
   return createSessionContext({
     id,
-    env: { now: new Date("2026-09-06T12:00:00Z"), timezone: "UTC", userEmail: null, newsLastReadAt: null },
+    env: { now: new Date("2026-09-06T12:00:00Z"), timezone: "UTC", userEmail: null, newsLastReadAt: null, techLastReadAt: null },
   });
 }
 
@@ -546,7 +546,10 @@ describe("primary AgentLoop and tracing", () => {
     ] };
     const h = harness([
       ({ messages }) => {
-        expect(h.callTool).toHaveBeenCalledExactlyOnceWith("get_telegram_chat_history", { chatId: "42", limit: 20 }, { signal: expect.any(AbortSignal) });
+        expect(h.callTool.mock.calls).toEqual([
+          ["get_telegram_chat_history", { chatId: "42", limit: 20 }, { signal: expect.any(AbortSignal) }],
+          ["journal_tail", { stream: "ouro/activity", n: 10 }, { signal: expect.any(AbortSignal) }],
+        ]);
         expect(JSON.stringify(messages)).toContain("Собрать сводку за неделю?");
         return call("invoke_sub_agent", { prompt: "summarize", input_refs: ["telegram.history"] });
       },
@@ -559,7 +562,7 @@ describe("primary AgentLoop and tracing", () => {
     const runner = supervisor(h);
     const content = 'Telegram message in chat 42.\nText: "давай"';
     expect(await runner.runSignal({ ...signal, content })).toBe("done");
-    expect(h.callTool).toHaveBeenCalledTimes(1); // no worker fetch or extra LLM retrieval turn
+    expect(h.callTool).toHaveBeenCalledTimes(2); // history + activity; no worker fetch or extra LLM retrieval turn
     const trace = written[0]!;
     expect(trace.input).toBe(content);
     expect(trace.observations.find((o) => o.name === "get_telegram_chat_history")).toMatchObject({
@@ -745,5 +748,38 @@ describe("primary AgentLoop and tracing", () => {
       otelContext.disable();
       propagation.disable();
     }
+  });
+});
+
+describe("engine provider routing", () => {
+  const stub = (kind: ChatProvider["kind"]): ChatProvider => ({
+    kind,
+    complete: async () => { throw new Error("Unexpected LLM call"); },
+  });
+  const engineWith = (openrouter?: ChatProvider) => createEngine({
+    providers: { openai: stub("openai"), gemini: stub("gemini"), deepseek: stub("deepseek"), openrouter },
+    mcp: { tools: [], callTool: async () => "", close: async () => {} },
+    presets: DEFAULT_PRESETS,
+    tracer: nullTracer,
+    memory: { get: () => null, set: () => {} },
+    codex: { run: async () => { throw new Error("Unexpected code_agent call"); } },
+    skillStore: harness([]).engine.skillStore,
+  });
+
+  it("routes only an explicit openrouter/ prefix to OpenRouter, ahead of the vendor prefixes", () => {
+    const engine = engineWith(stub("openrouter"));
+    expect(engine.resolveProvider("openrouter/deepseek/deepseek-v4-pro").kind).toBe("openrouter");
+    expect(engine.resolveProvider("openrouter/anthropic/claude-sonnet-5.5").kind).toBe("openrouter");
+    expect(engine.resolveProvider("deepseek-v4-pro").kind).toBe("deepseek");
+    expect(engine.resolveProvider("gemini-3.7-flash").kind).toBe("gemini");
+    expect(engine.resolveProvider("gpt-5.4").kind).toBe("openai");
+  });
+
+  it("fails loudly when an openrouter/ model has no provider configured", () => {
+    expect(() => engineWith().resolveProvider("openrouter/qwen/qwen3")).toThrow(/no OpenRouter provider/);
+  });
+
+  it("exposes no decision client unless one is configured", () => {
+    expect(engineWith().decisions).toBeNull();
   });
 });

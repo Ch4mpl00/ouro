@@ -11,4 +11,4 @@ export {
   type LegacyNote,
 } from "./import-notes";
 export { parseRef, docRef, factRef, type MemoryRef } from "./refs";
-export type { Doc, DocSummary, Fact, MemoryState, Project } from "./types";
+export type { Doc, DocSummary, Fact, JournalEntry, JournalStream, MemoryState, Project } from "./types";

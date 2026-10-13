@@ -1,19 +1,23 @@
 import type { Userbot } from "../../../telegram/userbot";
-import type {
-  ChannelHandle,
-  ChannelMessage,
-  UserbotChannelsAdapter,
-} from "./adapter";
+import type { ChannelHandle, ChannelMessage, UserbotChannelsAdapter } from "./adapter";
 
-// Default gramjs-backed implementation of UserbotChannelsAdapter.
-
-interface EntityLike {
-  id?: unknown;
-  title?: string;
-  username?: string;
+// The default adapter: the logged-in userbot's gramjs client.
+//
+// It needs two calls from the client, so it asks for just those — the real
+// TelegramClient satisfies this structurally, and a test can hand in a
+// stand-in that behaves like Telegram does.
+export interface ChannelsClient {
+  getDialogs(params: { limit: number }): Promise<Iterable<DialogLike>>;
+  getMessages(entity: unknown, params: { limit: number; minId?: number; reverse?: boolean }): Promise<Iterable<MessageLike>>;
 }
 
-interface RawMessage {
+interface DialogLike {
+  isChannel: boolean;
+  title?: string;
+  entity?: unknown;
+}
+
+interface MessageLike {
   id: number;
   date: number;
   message?: string;
@@ -21,22 +25,32 @@ interface RawMessage {
   forwards?: number;
 }
 
+export interface ChannelsAdapterDeps {
+  hasSession(): Promise<boolean>;
+  client(): Promise<ChannelsClient>;
+}
+
 export function createGramjsUserbotAdapter(userbot: Userbot): UserbotChannelsAdapter {
+  return createChannelsAdapter({ hasSession: () => userbot.hasSession(), client: () => userbot.client() });
+}
+
+export function createChannelsAdapter(deps: ChannelsAdapterDeps): UserbotChannelsAdapter {
   return {
-    hasSession: () => userbot.hasSession(),
+    hasSession: () => deps.hasSession(),
 
     listChannels: async (): Promise<ChannelHandle[]> => {
-      const client = await userbot.client();
-      const dialogs = await client.getDialogs({ limit: 500 });
+      const client = await deps.client();
       const out: ChannelHandle[] = [];
-      for (const d of dialogs) {
-        if (!d.isChannel) continue;
-        const entity = d.entity as EntityLike | undefined;
-        if (!entity || entity.id === undefined) continue;
+      for (const d of await client.getDialogs({ limit: 500 })) {
+        if (!d.isChannel || typeof d.entity !== "object" || d.entity === null) continue;
+        const id: unknown = Reflect.get(d.entity, "id");
+        if (id === undefined || id === null) continue;
+        const title: unknown = Reflect.get(d.entity, "title");
+        const username: unknown = Reflect.get(d.entity, "username");
         out.push({
-          chatId: String(entity.id),
-          title: d.title ?? entity.title ?? null,
-          username: entity.username ?? null,
+          chatId: String(id),
+          title: d.title ?? (typeof title === "string" ? title : null),
+          username: typeof username === "string" ? username : null,
           ref: d.entity,
         });
       }
@@ -44,11 +58,18 @@ export function createGramjsUserbotAdapter(userbot: Userbot): UserbotChannelsAda
     },
 
     fetchMessages: async (channel, opts): Promise<ChannelMessage[]> => {
-      const client = await userbot.client();
-      const raw = (await client.getMessages(channel.ref as Parameters<typeof client.getMessages>[0], {
-        limit: opts.limit,
-        minId: opts.sinceMessageId ?? undefined,
-      })) as unknown as RawMessage[];
+      const client = await deps.client();
+      // After a watermark: the OLDEST `limit` posts past it (`reverse`), so a
+      // channel that posted more than a tick's worth is caught up over the
+      // next ticks. Telegram's default order is newest first — that stored
+      // the newest `limit`, moved the watermark past them, and the older
+      // ones in between were never fetched. Bootstrap: the newest `limit`.
+      const raw = await client.getMessages(
+        channel.ref,
+        opts.sinceMessageId === null
+          ? { limit: opts.limit }
+          : { limit: opts.limit, minId: opts.sinceMessageId, reverse: true },
+      );
       const out: ChannelMessage[] = [];
       for (const m of raw) {
         const text = (m.message ?? "").trim();

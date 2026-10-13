@@ -39,4 +39,5 @@ export function createMemoryStore(db: AgentDatabase): MemoryStore {
 // so writers and the supervisor agree on naming.
 export const MEMORY_KEYS = {
   newsLastReadAt: "news_digest.last_read_at",
+  techLastReadAt: "tech_digest.last_read_at",
 } as const;

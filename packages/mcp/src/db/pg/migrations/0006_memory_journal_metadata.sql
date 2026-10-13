@@ -1,0 +1,1 @@
+ALTER TABLE "memory_journal_entries" ADD COLUMN "metadata" jsonb;

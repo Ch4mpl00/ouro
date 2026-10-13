@@ -2,5 +2,8 @@
   "name": "@mcp-tools/codex",
   "version": "0.1.0",
   "private": true,
-  "type": "module"
+  "type": "module",
+  "devDependencies": {
+    "fast-check": "^4.10.2"
+  }
 }

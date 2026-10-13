@@ -63,6 +63,8 @@ describe("memory tool surface", () => {
       "create_project",
       "doc_history",
       "get_fact",
+      "journal_append",
+      "journal_tail",
       "list_memory",
       "patch_doc",
       "read_doc",
@@ -196,6 +198,42 @@ describe("memory tools end to end", () => {
       ok: false,
       error: "project_not_found",
       projects: ["graphs"],
+    });
+  });
+});
+
+describe("journal tools end to end", () => {
+  it("appends, tails newest-first and stamps the instance's actor", async () => {
+    await call("journal_append", { stream: "news-digest", body: "Monday" });
+    const appended = await call("journal_append", { stream: "news-digest", body: "Tuesday", capacity: 2 });
+    expect(appended).toMatchObject({
+      ok: true,
+      entry: { stream: "news-digest", body: "Tuesday", actor: "claude-code@laptop" },
+      stream: { name: "news-digest", capacity: 2, size: 2 },
+    });
+
+    expect(await call("journal_tail", { stream: "news-digest", n: 5 })).toMatchObject({
+      ok: true,
+      stream: "news-digest",
+      entries: [{ body: "Tuesday" }, { body: "Monday" }],
+    });
+  });
+
+  it("lists journal streams next to the projects", async () => {
+    await call("create_project", { slug: "graphs", title: "Графы" });
+    await call("journal_append", { stream: "digest/news", body: "x" });
+
+    expect(await call("list_memory")).toMatchObject({
+      ok: true,
+      projects: [{ slug: "graphs" }],
+      journals: [{ name: "digest/news", capacity: 100, size: 1 }],
+    });
+  });
+
+  it("returns a bad stream name as a result, not an exception", async () => {
+    expect(await call("journal_append", { stream: "News", body: "x" })).toMatchObject({
+      ok: false,
+      error: "invalid_stream",
     });
   });
 });

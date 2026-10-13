@@ -14,36 +14,43 @@ import { Agent, fetch, type Response } from "undici";
 //   - on every redirect target before it is followed, because a literal IP
 //     host never goes through DNS.
 
-// Loopback, RFC1918, link-local / cloud metadata, the unspecified address,
-// IPv6 loopback / link-local / unique-local, and IPv4-mapped forms of those.
+// Everything that isn't the public internet: this network, RFC1918,
+// carrier-grade NAT (Tailscale), loopback, link-local / cloud metadata, the
+// same through NAT64, and IPv6 unspecified / loopback / IPv4-compatible,
+// unique-local, link-local, site-local and local-use NAT64. BlockList
+// matches IPv4 rules against IPv4-mapped IPv6 in any spelling — a URL host
+// like [::ffff:127.0.0.1] normalises to [::ffff:7f00:1], which a string
+// prefix check let straight through to loopback.
+const NON_PUBLIC = new net.BlockList();
+for (const [address, prefix] of [
+  ["0.0.0.0", 8],
+  ["10.0.0.0", 8],
+  ["100.64.0.0", 10],
+  ["127.0.0.0", 8],
+  ["169.254.0.0", 16],
+  ["172.16.0.0", 12],
+  ["192.168.0.0", 16],
+] as const) {
+  NON_PUBLIC.addSubnet(address, prefix, "ipv4");
+  NON_PUBLIC.addSubnet(`64:ff9b::${address}`, 96 + prefix, "ipv6");
+}
+for (const [address, prefix] of [
+  ["::", 96],
+  ["fc00::", 7],
+  ["fe80::", 10],
+  ["fec0::", 10],
+  ["64:ff9b:1::", 48],
+] as const) {
+  NON_PUBLIC.addSubnet(address, prefix, "ipv6");
+}
+
 export function isPrivateIp(ip: string): boolean {
-  const addr = ip.toLowerCase().replace(/^\[|\]$/g, "");
-  if (net.isIPv4(addr)) {
-    const octets = addr.split(".").map(Number);
-    const a = octets[0] ?? -1;
-    const b = octets[1] ?? -1;
-    return (
-      a === 0 ||
-      a === 10 ||
-      a === 127 ||
-      (a === 169 && b === 254) || // link-local / cloud metadata
-      (a === 172 && b >= 16 && b <= 31) ||
-      (a === 192 && b === 168)
-    );
-  }
-  // IPv4-mapped IPv6 (::ffff:1.2.3.4) — re-check the embedded v4 (one hop, the
-  // embedded value is a pure v4 so no recursion loop).
-  if (addr.startsWith("::ffff:")) {
-    const v4 = addr.slice("::ffff:".length);
-    if (net.isIPv4(v4)) return isPrivateIp(v4);
-  }
-  return (
-    addr === "::1" || // loopback
-    addr === "::" ||
-    addr.startsWith("fe80") || // link-local
-    addr.startsWith("fc") || // unique-local fc00::/7
-    addr.startsWith("fd")
-  );
+  // Brackets from a URL host, a zone id from a link-local DNS answer.
+  const addr = ip.replace(/^\[|\]$/g, "").split("%")[0] ?? "";
+  if (net.isIPv4(addr)) return NON_PUBLIC.check(addr, "ipv4");
+  if (net.isIPv6(addr)) return NON_PUBLIC.check(addr, "ipv6");
+  // Not an address at all: refuse rather than guess.
+  return true;
 }
 
 export interface FetchGuardOpts {

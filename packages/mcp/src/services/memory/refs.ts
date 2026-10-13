@@ -11,6 +11,11 @@ export const PROJECT_SLUG_RE = /^[a-z0-9][a-z0-9-]*$/;
 // Document names are markdown filenames. No slashes — a project is a flat
 // folder, and allowing separators would make refs ambiguous.
 export const DOC_NAME_RE = /^[a-z0-9][a-z0-9._-]*\.md$/;
+// Journal stream names: project-slug segments joined by "/", so a family of
+// streams reads as one ("digest/news", "digest/tech"). The separator is a
+// naming convention only — every name is its own stream.
+export const JOURNAL_STREAM_RE = /^[a-z0-9][a-z0-9-]*(\/[a-z0-9][a-z0-9-]*)*$/;
+export const JOURNAL_STREAM_MAX_LENGTH = 100;
 
 export interface DocRef {
   kind: "doc";
@@ -44,6 +49,10 @@ export function assertDocName(name: string): string {
     );
   }
   return name;
+}
+
+export function isJournalStream(name: string): boolean {
+  return name.length <= JOURNAL_STREAM_MAX_LENGTH && JOURNAL_STREAM_RE.test(name);
 }
 
 export function docRef(project: string, doc: string, chunk?: number): string {

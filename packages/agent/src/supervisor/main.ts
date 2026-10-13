@@ -1,17 +1,27 @@
 import "dotenv/config";
 import "../openai-native-fetch";
 import OpenAI from "openai";
+import {
+  createActivityJournalWorker,
+  createActivityProgressStore,
+  createNoteGenerator,
+  DEFAULT_ACTIVITY_JOURNAL_OPTS,
+  type ActivityJournalOpts,
+} from "../activity-journal";
 import { createCodexClient } from "../codex-client";
 import { createAgentDb } from "../db/client";
+import { createDecisionClient } from "../decisions";
 import { createMemoryStore } from "../db/memory";
 import { createTraceStore } from "../db/trace-store";
 import { createEngine } from "../engine";
 import { connectMcp, RETRY_UNTIL_UP } from "../mcp-client";
-import { DEFAULT_PRESETS } from "../models";
+import { DEFAULT_DECISION_MODEL, DEFAULT_PRESETS } from "../models";
 import {
   createDeepseekProvider,
   createGeminiProvider,
   createOpenAiProvider,
+  createOpenRouterClient,
+  createOpenRouterProvider,
   withRetry,
   DEEPSEEK_BASE_URL,
   GEMINI_BASE_URL,
@@ -23,7 +33,8 @@ import { langfuseTracerFromEnv } from "../tracing/langfuse";
 import { createLocalRecorderTracer } from "../tracing/local-recorder";
 import { teeTracer } from "../tracing/tee";
 import { createWorkflowRunner } from "../workflow";
-import { createSupervisorModule, type PendingSignal } from "./module";
+import { runSupervisorLoop } from "./loop";
+import { createSupervisorModule } from "./module";
 
 // Long-running supervisor — and the composition root: every long-lived
 // resource (sqlite handle, providers, MCP connection, tracer, skill store)
@@ -41,15 +52,23 @@ import { createSupervisorModule, type PendingSignal } from "./module";
 //
 // The per-signal context, trace and recovery lifecycle live in ./module.
 
-const POLL_INTERVAL_MS = 2_000;
-
-interface NextSignalResult {
-  signal: PendingSignal | null;
-  pendingAfter: number;
+function numberEnv(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw === "") return fallback;
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value <= 0) throw new Error(`${name} must be a positive number, got ${raw}`);
+  return value;
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((r) => setTimeout(r, ms));
+function activityJournalOptsFromEnv(): ActivityJournalOpts {
+  const d = DEFAULT_ACTIVITY_JOURNAL_OPTS;
+  return {
+    ...d,
+    pollIntervalMs: numberEnv("ACTIVITY_JOURNAL_POLL_INTERVAL_MS", d.pollIntervalMs),
+    batchSize: numberEnv("ACTIVITY_JOURNAL_BATCH_SIZE", d.batchSize),
+    maxGenerationAttempts: numberEnv("ACTIVITY_JOURNAL_MAX_ATTEMPTS", d.maxGenerationAttempts),
+    budget: { ...d.budget, totalChars: numberEnv("ACTIVITY_JOURNAL_MAX_INPUT_CHARS", d.budget.totalChars) },
+  };
 }
 
 async function main(): Promise<void> {
@@ -73,6 +92,13 @@ async function main(): Promise<void> {
     compiler: withEnvModel("compiler", "AGENT_COMPILER_MODEL"),
   };
 
+  // OpenRouter carries the typed-decision client (Jev), which the news digest's
+  // `decide` filter step runs on — so it is required, like the other keys. It
+  // also unlocks "openrouter/…" model overrides.
+  const openRouterApiKey = process.env.OPEN_ROUTER_API_KEY;
+  if (!openRouterApiKey) throw new Error("OPEN_ROUTER_API_KEY is not set in .env (decide steps)");
+  const openRouter = createOpenRouterClient(openRouterApiKey);
+
   // Provider retries appear as WARNING events in the active AgentLoop scope.
   const providers = {
     deepseek: withRetry(
@@ -86,7 +112,13 @@ async function main(): Promise<void> {
         new OpenAI({ apiKey: geminiApiKey, baseURL: GEMINI_BASE_URL }),
       ),
     ),
+    openrouter: withRetry(createOpenRouterProvider(openRouter)),
   };
+  const decisions = createDecisionClient({
+    client: openRouter,
+    model: process.env.AGENT_DECISION_MODEL ?? DEFAULT_DECISION_MODEL,
+  });
+  console.log(`[supervisor] decisions model=${decisions.model}`);
 
   const db = createAgentDb();
   const memory = createMemoryStore(db);
@@ -150,6 +182,7 @@ async function main(): Promise<void> {
     memory,
     tracer,
     codex,
+    decisions,
   });
 
   console.log(`[supervisor] mcp tools: ${mcp.tools.map((t) => t.function.name).join(", ")}`);
@@ -179,11 +212,42 @@ async function main(): Promise<void> {
   });
   const supervisor = createSupervisorModule({ engine, env: envDeps, workflow });
 
+  // Activity journal: a background loop in this process that turns finished
+  // production traces into notes on the shared `ouro/activity` stream, over
+  // the same MCP connection (see ../activity-journal). Base preset unless
+  // ACTIVITY_JOURNAL_MODEL overrides; ACTIVITY_JOURNAL=off disables it.
+  const journalStop = new AbortController();
+  let journalRun: Promise<void> = Promise.resolve();
+  if (process.env.ACTIVITY_JOURNAL !== "off") {
+    const journalModel = process.env.ACTIVITY_JOURNAL_MODEL ?? presets.base.model;
+    const journal = createActivityJournalWorker(
+      {
+        traces: traceStore,
+        progress: createActivityProgressStore(db, memory),
+        notes: createNoteGenerator({
+          provider: engine.resolveProvider(journalModel),
+          model: journalModel,
+          reasoningEffort: presets.base.reasoningEffort,
+        }),
+        journal: mcp,
+      },
+      activityJournalOptsFromEnv(),
+    );
+    console.log(`[supervisor] activity journal on (model=${journalModel})`);
+    journalRun = journal.run(journalStop.signal).catch((err: unknown) => {
+      console.error("[supervisor] activity journal stopped:", err);
+    });
+  }
+
   let stopping = false;
   const stop = async (sig: string): Promise<void> => {
     if (stopping) return;
     stopping = true;
     console.log(`[supervisor] ${sig} — shutting down`);
+    // The journal loop uses the MCP connection and agent.db: stop it before
+    // the supervisor closes the one and this function the other.
+    journalStop.abort();
+    await journalRun;
     await supervisor.shutdown();
     db.$client.close();
     process.exit(0);
@@ -192,26 +256,7 @@ async function main(): Promise<void> {
   process.on("SIGTERM", () => void stop("SIGTERM"));
 
   console.log("[supervisor] entering main loop (scheduler → workflow, other sources → agent-loop)");
-  while (!stopping) {
-    try {
-      const raw = await mcp.callTool("get_next_signal", {});
-      const result = JSON.parse(raw) as NextSignalResult;
-
-      if (!result.signal) {
-        await sleep(POLL_INTERVAL_MS);
-        continue;
-      }
-
-      console.log(
-        `[supervisor] signal #${result.signal.id} source=${result.signal.source} (${result.pendingAfter} pending after)`,
-      );
-      await supervisor.runSignal(result.signal);
-    } catch (err) {
-      if (stopping) break;
-      console.error("[supervisor] loop error:", err);
-      await sleep(POLL_INTERVAL_MS);
-    }
-  }
+  await runSupervisorLoop({ mcp, supervisor, stopping: () => stopping });
 }
 
 main().catch((err: unknown) => {

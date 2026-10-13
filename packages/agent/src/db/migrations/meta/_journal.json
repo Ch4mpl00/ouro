@@ -15,6 +15,13 @@
       "when": 1781789709432,
       "tag": "0001_bored_medusa",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "6",
+      "when": 1791902683744,
+      "tag": "0002_unusual_thor",
+      "breakpoints": true
     }
   ]
 }

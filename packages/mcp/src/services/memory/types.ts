@@ -88,3 +88,27 @@ export interface IndexHit extends IndexEntry {
   id: number;
   distance: number;
 }
+
+// The journal — the third read model. Operational records a workflow writes
+// and reads back by recency (the last digests, a run log), as opposed to
+// knowledge. Append-only, never indexed, no patch history: an entry is
+// immutable and leaves only when its stream outgrows its capacity.
+export interface JournalEntry {
+  id: number;
+  stream: string;
+  body: string;
+  actor: string;
+  // Provenance the writer attaches (e.g. the trace an activity note was
+  // derived from). Stored as given, never interpreted: no dedup, no lookup.
+  metadata: Record<string, unknown> | null;
+  createdAt: string;
+}
+
+// A stream is a named category of entries. Its capacity is stored with it,
+// so every writer trims by the same rule without repeating it.
+export interface JournalStream {
+  name: string;
+  capacity: number;
+  size: number;
+  lastAt: string | null;
+}

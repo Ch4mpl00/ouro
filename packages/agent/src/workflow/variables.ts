@@ -52,12 +52,12 @@ export function createStore(initial: Record<string, unknown>): VariableStore {
     let current: unknown = data.get(first);
     for (let i = 1; i < segments.length; i++) {
       const seg = segments[i] ?? "";
-      if (current == null || typeof current !== "object") {
+      // Own properties only: `${post.constructor}` or `${list.map}` name
+      // nothing in the data, so they are missing, not a function.
+      if (current == null || typeof current !== "object" || !Object.hasOwn(current, seg)) {
         return { found: false, value: undefined };
       }
-      const obj = current as Record<string, unknown>;
-      if (!(seg in obj)) return { found: false, value: undefined };
-      current = obj[seg];
+      current = Reflect.get(current, seg);
     }
     return { found: true, value: current };
   };
@@ -108,4 +108,13 @@ function substituteString(s: string, store: VariableStore): unknown {
     if (v === undefined || v === null) return String(v);
     return JSON.stringify(v);
   });
+}
+
+// Every `${path}` a value would resolve, in the order `substitute` meets
+// them — what a static check needs to know which bindings a step reads.
+export function placeholderPaths(value: unknown): string[] {
+  if (typeof value === "string") return [...value.matchAll(PARTIAL_PLACEHOLDER)].map((m) => m[1] ?? "");
+  if (Array.isArray(value)) return value.flatMap(placeholderPaths);
+  if (value && typeof value === "object") return Object.values(value).flatMap(placeholderPaths);
+  return [];
 }

@@ -14,6 +14,9 @@ import {
   createDeepseekProvider,
   createGeminiProvider,
   createOpenAiProvider,
+  createOpenRouterClient,
+  createOpenRouterProvider,
+  isOpenRouterModel,
   withRetry,
   DEEPSEEK_BASE_URL,
   GEMINI_BASE_URL,
@@ -177,6 +180,14 @@ async function main(): Promise<void> {
     compiler: withEnvModel("compiler", "AGENT_COMPILER_MODEL"),
   };
 
+  // OpenRouter is how the bench reaches a vendor we have no direct provider
+  // for: AGENT_SMART_MODEL="openrouter/anthropic/…". Optional otherwise.
+  const openRouterApiKey = process.env.OPEN_ROUTER_API_KEY;
+  const openRouterModels = Object.values(presets).map((p) => p.model).filter(isOpenRouterModel);
+  if (!openRouterApiKey && openRouterModels.length > 0) {
+    throw new Error(`OPEN_ROUTER_API_KEY is not set, but ${openRouterModels.join(", ")} routes to OpenRouter`);
+  }
+
   const providers = {
     deepseek: withRetry(
       createDeepseekProvider(new OpenAI({ apiKey: deepseekApiKey, baseURL: DEEPSEEK_BASE_URL })),
@@ -185,6 +196,9 @@ async function main(): Promise<void> {
     gemini: withRetry(
       createGeminiProvider(new OpenAI({ apiKey: geminiApiKey, baseURL: GEMINI_BASE_URL })),
     ),
+    ...(openRouterApiKey
+      ? { openrouter: withRetry(createOpenRouterProvider(createOpenRouterClient(openRouterApiKey))) }
+      : {}),
   };
 
   const db = createAgentDb();

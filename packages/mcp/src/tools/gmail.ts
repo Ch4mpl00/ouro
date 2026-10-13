@@ -32,6 +32,8 @@ function sanitize(name: string): string {
   return cleaned || "untitled";
 }
 
+const GMAIL_ID = /^[A-Za-z0-9_-]+$/;
+
 function storageRoot(): string {
   return process.env.STORAGE_DIR ?? "./storage";
 }
@@ -117,8 +119,11 @@ export function registerGmailTools(server: McpServer, gmail: GmailModule): void 
         "after list_nashdom_mails to fetch a specific PDF, then read it with the Read tool " +
         "to extract bill fields.",
       inputSchema: {
-        messageId: z.string(),
-        attachmentId: z.string(),
+        // Gmail ids are base64url. Anything else is refused before Gmail is
+        // asked: the message id names a storage directory, so where a file
+        // lands must not depend on the API rejecting a malformed id.
+        messageId: z.string().regex(GMAIL_ID, "not a Gmail message id"),
+        attachmentId: z.string().regex(GMAIL_ID, "not a Gmail attachment id"),
         filename: z
           .string()
           .optional()

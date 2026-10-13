@@ -62,7 +62,8 @@ AfterAll(async function () {
 Before(async function () {
   await env.pg.db.execute(
     sql`TRUNCATE news_items, knowledge_base_notes, memory_projects, memory_project_docs,
-                 memory_doc_patches, memory_facts, memory_index RESTART IDENTITY CASCADE`,
+                 memory_doc_patches, memory_facts, memory_index, memory_journal_streams,
+                 memory_journal_entries RESTART IDENTITY CASCADE`,
   );
   await env.state.pool.query(
     `TRUNCATE signals, scheduled_tasks, settings, telegram_messages, telegram_kv, gmail_kv,

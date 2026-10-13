@@ -18,7 +18,8 @@ import { connectStateDb, type StateDb } from "../../src/db/state";
 import { runHttpTransport, type RunningHttpTransport } from "../../src/http-transport";
 import { createServer } from "../../src/mcp-server";
 import type { EmbeddingProvider } from "../../src/services/embeddings/provider";
-import { createGuardedFetch } from "../../src/services/fetch";
+import { createGuardedFetch, type GuardedFetch } from "../../src/services/fetch";
+import { createFileAccess, defaultReadRoots } from "../../src/services/files";
 import { createGmailModule } from "../../src/services/gmail";
 import { createKnowledgeModule } from "../../src/services/knowledge";
 import { createMemoryModule } from "../../src/services/memory";
@@ -46,7 +47,7 @@ export async function database(): Promise<{ url: string; container: StartedPostg
 
 // Deterministic stand-in for the embedding model: a bag-of-words vector, so
 // distance tracks word overlap. Recall works without OpenAI.
-const wordEmbedder: EmbeddingProvider = {
+export const wordEmbedder: EmbeddingProvider = {
   dimensions: 1536,
   embed: async (text) => embedWords(text),
   embedBatch: async (texts) => texts.map(embedWords),
@@ -74,9 +75,22 @@ export interface Server {
 
 // `toolsets`: the MCP_TOOLSETS selection (omitted = every group). A restricted
 // instance is multi-session, as in production.
-export async function startServer(databaseUrl: string, toolsets?: readonly ToolsetName[]): Promise<Server> {
+// `fetcher`: the guarded fetch behind fetch_url and the news providers —
+// tests narrow what counts as private so a local server can play the public
+// internet.
+export async function startServer(
+  databaseUrl: string,
+  toolsets?: readonly ToolsetName[],
+  fetcher: GuardedFetch = createGuardedFetch(),
+): Promise<Server> {
   // Nothing may leave the box: no chat to send to, no bot, no OpenAI key.
-  for (const name of ["TELEGRAM_DEFAULT_CHAT_ID", "TELEGRAM_BOT_TOKEN", "OPENAI_API_KEY", "GMAIL_ACCOUNT_KEY"]) {
+  for (const name of [
+    "TELEGRAM_DEFAULT_CHAT_ID",
+    "TELEGRAM_BOT_TOKEN",
+    "TELEGRAM_ASSISTANT_BOT_TOKEN",
+    "OPENAI_API_KEY",
+    "GMAIL_ACCOUNT_KEY",
+  ]) {
     delete process.env[name];
   }
   process.env.DATABASE_URL = databaseUrl;
@@ -100,7 +114,8 @@ export async function startServer(databaseUrl: string, toolsets?: readonly Tools
     telegramLog: createTelegramLog(state),
     gmail: createGmailModule({ db: state }),
     userbot: createUserbot(createUserbotSessions(state)),
-    fetcher: createGuardedFetch(),
+    fetcher,
+    files: createFileAccess({ roots: defaultReadRoots(process.env, process.cwd()) }),
   };
 
   const transport: RunningHttpTransport = await runHttpTransport({

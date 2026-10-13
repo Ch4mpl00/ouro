@@ -1,6 +1,6 @@
 # Evaluate OpenRouter as a provider (opt-in experimentation surface)
 
-**Status:** pending
+**Status:** in-progress (provider shipped 2026-10-12; GAIA measurement pass pending)
 **Priority:** P3
 **Area:** agent / providers
 **Created:** 2026-06-21
@@ -49,6 +49,12 @@ three, one usage dashboard, and `AGENT_SMART_MODEL=openrouter/anthropic/claude-�
 makes the bench run through any vendor with zero new code.
 
 ## Acceptance
+
+Done 2026-10-12: the provider, the routing and the optional key (named
+`OPEN_ROUTER_API_KEY`, the spelling in `.env.agent`). Wired into the supervisor
+and the GAIA bench. Reasoning goes through OpenRouter's unified
+`reasoning: { effort }` ("disabled" omits it, "max" → "high"). Still open: the
+measurement pass.
 
 - `providers/openrouter.ts` — a `ChatProvider` against the OpenRouter base
   URL (OpenAI-compatible SDK, same `openai-native-fetch` path), reusing

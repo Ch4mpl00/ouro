@@ -5,11 +5,13 @@ import { createSettings } from "../services/settings";
 import { createSignals } from "../services/signals";
 import { createTelegramLog } from "../services/telegram/storage";
 import { connectStateDb, stateDatabaseUrl, type StateDb } from "./state";
+import { testServerUrl } from "../../test/support/database";
 
-// Runs against a throwaway server named by TEST_DATABASE_URL (never prod);
-// skipped without one. Each test gets a fresh state database on it.
+// Runs against a throwaway server named by TEST_DATABASE_URL (never prod),
+// or a container; skipped without either. Each test gets a fresh state database on it.
 
-const TEST_URL = process.env.TEST_DATABASE_URL;
+// TEST_DATABASE_URL, or a container of our own when Docker is there.
+const TEST_URL = await testServerUrl();
 
 const open: StateDb[] = [];
 afterEach(async () => {
@@ -100,7 +102,8 @@ describe.skipIf(!TEST_URL)("mcp_state", () => {
     const task = await tasks.insert({ cron_expr: "30 14 2 10 *", recurring: false, prompt: "take pills" });
     expect(task).toMatchObject({ cron_expr: "30 14 2 10 *", recurring: 0, source: null, last_run_at: null });
     expect(typeof task.id).toBe("number");
-    await tasks.markFired(task.id, 1790951400);
+    expect(await tasks.swapLastRun(task.id, null, 1790951400)).toBe(true);
+    expect(await tasks.swapLastRun(task.id, null, 1790951400)).toBe(false);
     expect((await tasks.listActive()).map((t) => t.id)).not.toContain(task.id);
     expect(await tasks.delete(task.id)).toBe(true);
     expect(await tasks.delete(task.id)).toBe(false);

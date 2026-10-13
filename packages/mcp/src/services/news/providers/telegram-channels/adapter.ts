@@ -23,7 +23,8 @@ export interface ChannelMessage {
 export interface UserbotChannelsAdapter {
   hasSession(): Promise<boolean>;
   listChannels(): Promise<ChannelHandle[]>;
-  // sinceMessageId is exclusive (gramjs minId semantics).
+  // With sinceMessageId (exclusive): the oldest `limit` messages after it.
+  // Without: the newest `limit` (the bootstrap).
   fetchMessages(
     channel: ChannelHandle,
     opts: { sinceMessageId: number | null; limit: number },

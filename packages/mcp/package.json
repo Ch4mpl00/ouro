@@ -8,7 +8,7 @@
     "@extractus/article-extractor": "^8.1.0",
     "@modelcontextprotocol/sdk": "^1.0.0",
     "better-sqlite3": "^12.9.0",
-    "cron-parser": "^5.5.0",
+    "cron-parser": "^5.10.2",
     "dotenv": "^17.4.2",
     "drizzle-orm": "^0.45.2",
     "google-auth-library": "^9.14.2",

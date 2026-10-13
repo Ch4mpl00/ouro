@@ -170,6 +170,7 @@ export function createCompiler(deps: CompilerDeps): Compiler {
           preset,
           messages,
           WorkflowSchema,
+          req.priorContext ? ["env", "signal", "context"] : ["env", "signal"],
           compileSpan,
           maxAttempts,
           req.abortSignal,
@@ -183,14 +184,18 @@ export function createCompiler(deps: CompilerDeps): Compiler {
   };
 }
 
-function parseGeneratedWorkflow(text: string, schema: Parameters<typeof parseWorkflow>[1]): ReturnType<typeof parseWorkflow> {
+function parseGeneratedWorkflow(
+  text: string,
+  schema: Parameters<typeof parseWorkflow>[1],
+  seeds: readonly string[],
+): ReturnType<typeof parseWorkflow> {
   let parsed: unknown;
   try {
     parsed = JSON.parse(text);
   } catch (error) {
     return { ok: false, errors: [`invalid JSON: ${toError(error).message}`] };
   }
-  return parseWorkflow(parsed, schema);
+  return parseWorkflow(parsed, schema, { seeds });
 }
 
 async function runRetryLoop(
@@ -200,6 +205,8 @@ async function runRetryLoop(
   // Avoid importing the schema type just for the parameter signature.
   // `unknown` here is fine — parseWorkflow accepts any ZodTypeAny.
   schema: Parameters<typeof parseWorkflow>[1],
+  // What the runtime seeds the variable store with — see runForSignal.
+  seeds: readonly string[],
   compileSpan: Span,
   maxAttempts: number,
   abortSignal?: AbortSignal,
@@ -224,7 +231,7 @@ async function runRetryLoop(
             responseFormat: { type: "json_object" }, trace: compileSpan, signal,
           });
           const text = result.message.content ?? "";
-          return { text, usage: result.usage, parsed: parseGeneratedWorkflow(text, schema) };
+          return { text, usage: result.usage, parsed: parseGeneratedWorkflow(text, schema, seeds) };
         },
         describe: ({ text, usage, parsed }) => ({
           output: text, usage,
@@ -337,6 +344,7 @@ function renderSignalPrompt(req: CompileRequest): string {
   }
   lines.push(
     `News last read at: ${req.envData.newsLastReadAt ?? "never (bootstrap with now - 24h)"}`,
+    `Tech last read at: ${req.envData.techLastReadAt ?? "never (bootstrap with now - 24h)"}`,
   );
   lines.push("</env>");
   lines.push("");

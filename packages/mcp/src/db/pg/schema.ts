@@ -212,6 +212,39 @@ export const memoryIndex = pgTable(
   ],
 );
 
+// The journal — the third read model: operational records read back by
+// recency (the last digests, a run log). Deliberately outside memory_index
+// and without patches: entries are immutable and leave only when their stream
+// outgrows its capacity.
+export const journalStreams = pgTable("memory_journal_streams", {
+  id: bigserial("id", { mode: "number" }).primaryKey(),
+  name: text("name").notNull().unique(),
+  // Stored with the stream so every writer trims by the same rule. Every
+  // append upserts this row, and the row lock it takes is what serialises
+  // appends to one stream.
+  capacity: integer("capacity").notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+});
+
+export const journalEntries = pgTable(
+  "memory_journal_entries",
+  {
+    id: bigserial("id", { mode: "number" }).primaryKey(),
+    streamId: bigint("stream_id", { mode: "number" })
+      .notNull()
+      .references(() => journalStreams.id, { onDelete: "cascade" }),
+    body: text("body").notNull(),
+    actor: text("actor").notNull(),
+    // Writer-supplied provenance (e.g. trace_id). Never unique, never used to
+    // deduplicate: an append always lands.
+    metadata: jsonb("metadata").$type<Record<string, unknown>>(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  // Order is by id, not created_at: ids are drawn under the stream lock, so
+  // they follow commit order, while now() is the transaction's start time.
+  (t) => [index("memory_journal_entries_stream_id").on(t.streamId, t.id.desc())],
+);
+
 export type ProjectRow = typeof projects.$inferSelect;
 export type ProjectDocRow = typeof projectDocs.$inferSelect;
 export type DocPatchRow = typeof docPatches.$inferSelect;

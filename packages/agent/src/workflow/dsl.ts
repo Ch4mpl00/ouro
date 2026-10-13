@@ -1,10 +1,11 @@
 import { z } from "zod";
 import { zodToJsonSchema } from "zod-to-json-schema";
 import { PRESET_NAMES } from "../models";
+import { placeholderPaths } from "./variables";
 
 // Workflow DSL — the language the compiler LLM emits and the executor runs.
 //
-// Seven step kinds, no control flow primitives beyond `parallel`:
+// Eight step kinds, no control flow primitives beyond `parallel`:
 //
 //   tool         — runtime → MCP tool with literal args, result bound
 //   llm_compose  — LLM with no tools, structured output, result bound
@@ -12,6 +13,9 @@ import { PRESET_NAMES } from "../models";
 //                  internal ReAct loop, final text bound
 //   code_agent   — delegate a computational/coding task to the Codex sandbox
 //                  (writes + runs code), result bound
+//   decide       — a typed-decision preset over a bound array (Jev, not a
+//                  chat model): `filter` keeps the items a prompt lets
+//                  through, kept array bound
 //   parallel     — flat list of independent leaf steps, run concurrently
 //   terminal     — explicit end of workflow
 //   replan       — terminator that bounces back to the compiler with the
@@ -42,6 +46,8 @@ import { PRESET_NAMES } from "../models";
 // will likely use `json_object` mode + Zod retry-loop instead.
 
 const PRESET_ENUM = z.enum(PRESET_NAMES as readonly [string, ...string[]]);
+
+export const DECIDE_PRESETS = ["filter"] as const;
 
 export interface WorkflowSchemaDeps {
   // Names from MCP tool registry, resolved at engine boot. The schema
@@ -125,6 +131,20 @@ export function createWorkflowSchema(deps: WorkflowSchemaDeps): WorkflowSchemaBu
     })
     .strict();
 
+  // `decide` runs a decisions preset (../decisions.ts) — classification on a
+  // System One model, no text generated. `items` is a `${binding}` that
+  // resolves to an array; `prompt` holds every rule (it may embed `${}`).
+  const DecideStepSchema = z
+    .object({
+      kind: z.literal("decide"),
+      preset: z.enum(DECIDE_PRESETS),
+      items: z.string().min(1),
+      prompt: z.string().min(1),
+      threshold: z.number().gt(0).lt(1).optional(),
+      bind: z.string().min(1),
+    })
+    .strict();
+
   const TerminalStepSchema = z
     .object({
       kind: z.literal("terminal"),
@@ -159,6 +179,7 @@ export function createWorkflowSchema(deps: WorkflowSchemaDeps): WorkflowSchemaBu
     LlmComposeStepSchema,
     LlmAgentStepSchema,
     CodeAgentStepSchema,
+    DecideStepSchema,
   ]);
 
   const ParallelStepSchema = z
@@ -173,6 +194,7 @@ export function createWorkflowSchema(deps: WorkflowSchemaDeps): WorkflowSchemaBu
     LlmComposeStepSchema,
     LlmAgentStepSchema,
     CodeAgentStepSchema,
+    DecideStepSchema,
     TerminalStepSchema,
     ParallelStepSchema,
     ReplanStepSchema,
@@ -237,6 +259,15 @@ export interface CodeAgentStep {
   bind: string;
 }
 
+export interface DecideStep {
+  kind: "decide";
+  preset: (typeof DECIDE_PRESETS)[number];
+  items: string;
+  prompt: string;
+  threshold?: number;
+  bind: string;
+}
+
 export interface ParallelStep {
   kind: "parallel";
   steps: LeafStep[];
@@ -252,7 +283,7 @@ export interface ReplanStep {
   note?: string;
 }
 
-export type LeafStep = ToolStep | LlmComposeStep | LlmAgentStep | CodeAgentStep;
+export type LeafStep = ToolStep | LlmComposeStep | LlmAgentStep | CodeAgentStep | DecideStep;
 export type Step = LeafStep | TerminalStep | ParallelStep | ReplanStep;
 
 export interface Workflow {
@@ -274,16 +305,27 @@ export interface WorkflowParseFailure {
 
 export type WorkflowParseResult = WorkflowParseSuccess | WorkflowParseFailure;
 
+export interface ParseWorkflowOptions {
+  // Names the runtime seeds the variable store with (env, signal, and
+  // context after a replan). Given → every `${}` must name one of them or an
+  // earlier step's bind, and binds must be unique (checkBindings).
+  seeds?: readonly string[];
+}
+
 export function parseWorkflow(
   input: unknown,
   schema: z.ZodTypeAny,
+  options: ParseWorkflowOptions = {},
 ): WorkflowParseResult {
   const result = schema.safeParse(input);
   if (!result.success) {
     return { ok: false, errors: formatWorkflowErrors(result.error) };
   }
   const workflow = result.data as Workflow;
-  const semanticErrors = postCheckWorkflow(workflow);
+  const semanticErrors = [
+    ...postCheckWorkflow(workflow),
+    ...(options.seeds ? checkBindings(workflow, options.seeds) : []),
+  ];
   if (semanticErrors.length > 0) {
     return { ok: false, errors: semanticErrors };
   }
@@ -309,6 +351,68 @@ function postCheckWorkflow(workflow: Workflow): string[] {
     }
   };
   workflow.steps.forEach((s, i) => visit(s, `steps[${i}]`));
+  return errors;
+}
+
+// The texts a step resolves `${}` in at run time.
+function resolvedTexts(step: LeafStep): unknown[] {
+  switch (step.kind) {
+    case "tool":
+      return [step.args];
+    case "llm_compose":
+      return [step.input, step.prompt];
+    case "llm_agent":
+      return [step.prompt];
+    case "code_agent":
+      return [step.task, step.data];
+    case "decide":
+      return [step.items, step.prompt];
+  }
+}
+
+// Every `${name…}` must name a binding that exists when its step runs — a
+// seed, or the bind of an earlier step — and a name is bound once. Inside
+// `parallel` the children run at once, so a child can't read a sibling's
+// bind. The executor would hit each of these only at run time, possibly
+// after an earlier step already sent something (and an execute failure is
+// not retried); here the compiler gets them back and fixes the plan.
+// Checking stops at the first terminal / replan, where the pass ends.
+function checkBindings(workflow: Workflow, seeds: readonly string[]): string[] {
+  const errors: string[] = [];
+  const bound = new Set(seeds);
+  const reads = (step: LeafStep, path: string, visible: ReadonlySet<string>, siblings: ReadonlySet<string>): void => {
+    for (const ref of placeholderPaths(resolvedTexts(step))) {
+      const root = ref.split(".")[0] ?? "";
+      if (visible.has(root)) continue;
+      errors.push(
+        siblings.has(root)
+          ? `at ${path}: \${${ref}} reads "${root}", which another step of the same parallel binds — they run at once; bind it in an earlier step`
+          : `at ${path}: \${${ref}} reads "${root}", which no earlier step binds (available: ${[...visible].join(", ")})`,
+      );
+    }
+  };
+  const binds = (step: LeafStep, path: string): void => {
+    if (step.bind === undefined) return;
+    if (bound.has(step.bind)) {
+      errors.push(
+        `at ${path}: bind "${step.bind}" is already ${seeds.includes(step.bind) ? "a reserved name" : "bound by an earlier step"}; choose another name`,
+      );
+    }
+    bound.add(step.bind);
+  };
+  for (const [i, step] of workflow.steps.entries()) {
+    const path = `steps[${i}]`;
+    if (step.kind === "terminal" || step.kind === "replan") break;
+    if (step.kind === "parallel") {
+      const before = new Set(bound);
+      const siblings = new Set(step.steps.flatMap((s) => (s.bind === undefined ? [] : [s.bind])));
+      step.steps.forEach((child, j) => reads(child, `${path}.steps[${j}]`, before, siblings));
+      step.steps.forEach((child, j) => binds(child, `${path}.steps[${j}]`));
+    } else {
+      reads(step, path, bound, new Set());
+      binds(step, path);
+    }
+  }
   return errors;
 }
 

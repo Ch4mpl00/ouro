@@ -15,9 +15,11 @@ the evidence strictly and compose; the parent handles delivery.
 
 - `candidates` — the `search_news` hits over the IT topics: each has
   `source`, `title`, `snippet`, `url`, `posted_at`, `distance`,
-  `matchedQueries`. A coarse net — plenty will be off-topic; that's expected.
-- `history` — recent chat. Scan assistant messages starting with
-  `🧠 IT-дайджест` for items already sent; don't re-send.
+  `matchedQueries`. In a workflow they have already passed a relevance
+  filter against the Interests below; when you searched yourself, they are
+  a coarse net and plenty will be off-topic.
+- `history` — the previous IT digests already sent, newest first (the
+  `tech-digest` journal stream). Don't re-send what they covered.
 - `env_now` — date / locale for the header.
 
 Inputs can arrive directly in the user message through `input_refs`. Date
@@ -46,13 +48,15 @@ basic tutorials.
 ## Protocol
 
 1. **Strict filter — yours, not the vector's.** From `candidates`, keep only
-   items that actually fit the Interests above. Distance is a coarse hint,
+   items that actually fit the Interests above (already filtered
+   candidates need only a sanity pass — drop the clearly off-topic). Distance is a coarse hint,
    not a vote — a `d=0.45` item can be junk ("5 ways to prompt ChatGPT for
    emails"); a `d=0.6` item can be golden (a real model release). Read the
    snippets and judge.
 
-2. **Dedup.** Drop duplicates by `id`. Cross-reference `history`; drop
-   anything already sent in a prior digest.
+2. **Dedup.** Drop duplicates by `id` and items about the same story.
+   Cross-reference `history`; drop anything already sent in a prior
+   digest.
 
 3. **Pick 5–10 survivors.** Lead with the biggest (model releases, major
    framework news).
@@ -77,7 +81,9 @@ basic tutorials.
 ## Rules
 
 - **< 3 matches → return a short "тихий день" message and stop.**
-- **One Telegram-sized message.** If > 4000 chars, drop lowest priority.
+- **Aim for one message (~4000 chars).** A longer digest is delivered as
+  several consecutive messages, so never drop a significant item just to fit
+  — trim filler and low-priority items instead.
 - **Russian, terse.** Each TL;DR ≤ 2 sentences.
 - **Don't fabricate.** Unclear / missing body → say so or skip.
 - **Don't quote prices / dates / version numbers** unless present in the

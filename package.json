@@ -7,7 +7,7 @@
   "scripts": {
     "typecheck": "tsc --noEmit",
     "mcp:serve": "tsx packages/mcp/src/server.ts",
-    "codex:serve": "tsx packages/codex/src/server.ts",
+    "codex:serve": "tsx packages/codex/src/main.ts",
     "agent:start": "tsx packages/agent/src/supervisor/main.ts",
     "trace": "tsx packages/agent/src/scripts/langfuse-trace.ts",
     "judge": "tsx packages/agent/src/scripts/judge.ts",
@@ -43,6 +43,7 @@
   },
   "devDependencies": {
     "@types/node": "^22.9.0",
+    "fast-check": "^4.10.2",
     "tsx": "^4.19.2",
     "typescript": "^5.6.3",
     "vitest": "^4.1.8"

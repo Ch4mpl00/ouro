@@ -28,4 +28,5 @@ export {
   type SendStatusResult,
 } from "./status";
 
-export { startTelegramPoller, type TelegramPollerDeps } from "./poller";
+export { pollOnce, startTelegramPoller, type TelegramPollerDeps } from "./poller";
+export { PartialSendError, TELEGRAM_TEXT_LIMIT, sendLongMessage, splitTelegramText } from "./split";

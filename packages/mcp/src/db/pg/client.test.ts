@@ -2,11 +2,13 @@ import { randomBytes } from "node:crypto";
 import pg from "pg";
 import { describe, expect, it } from "vitest";
 import { createPgClient } from "./client";
+import { testServerUrl } from "../../../test/support/database";
 
-// Runs against a throwaway database named by TEST_DATABASE_URL (never prod);
-// skipped without one. Each test gets a fresh database on that server.
+// Runs against a throwaway database named by TEST_DATABASE_URL (never prod),
+// or a container; skipped without either. Each test gets a fresh database on that server.
 
-const TEST_URL = process.env.TEST_DATABASE_URL;
+// TEST_DATABASE_URL, or a container of our own when Docker is there.
+const TEST_URL = await testServerUrl();
 
 async function freshDatabase(): Promise<string> {
   const name = `t_${randomBytes(8).toString("hex")}`;
@@ -48,6 +50,8 @@ describe.skipIf(!TEST_URL)("pg migrations", () => {
       ["2d868dbf377baa83", 1781001341744],
       ["563cc5c374b93cd7", 1787496077308],
       ["ede5123f9e74197b", 1790957842163],
+      ["5114e44328f417de", 1791823358054],
+      ["4b9f63ec641fecd7", 1791902517698],
     ]);
   });
 });

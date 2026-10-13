@@ -8,6 +8,7 @@ import { z } from "zod";
 import { Cause, Effect, Exit } from "effect";
 import { generationEffect } from "./generation";
 import { toError } from "./errors";
+import { TOOL_META } from "./trace-model";
 import {
   INVOKE_SUB_AGENT_TOOL_NAME,
   SYNTHETIC_TOOLS,
@@ -45,6 +46,10 @@ export interface AgentLoopOpts {
   // meta-skill (`routing`) comes from `EngineDeps.skills` and is added
   // on top unless `includeEngineSkills: false`.
   skills?: string[];
+  // Trusted caller authorization, independent of skills selected by the
+  // model. The supervisor grants it only for actual dreaming signals.
+  // Delegation may pass it to a dreaming worker, but cannot create it.
+  allowSkillWrites?: boolean;
   // Pre-resolved skill contents (name → markdown). Set by the engine
   // after skill resolution; the loop uses these to (a) compose the actual
   // system message sent to the LLM and (b) expose each skill separately
@@ -227,12 +232,18 @@ export function createAgentLoop(engine: Engine, opts: AgentLoopOpts): AgentLoop 
     loopId: id,
     parentId,
     sessionId,
+    allowSkillWrites: opts.allowSkillWrites === true,
+    skills: Object.keys(opts.resolvedSkills ?? {}),
+    mcpToolNames: engine.mcp.tools.map((t) => t.function.name),
     log: (...parts) => engine.log(id, ...parts),
     sessionContext,
     skillStore: engine.skillStore,
     memory: engine.memory,
     codex: engine.codex,
-    startAgentLoop: (o) => engine.startAgentLoop(o),
+    startAgentLoop: (o) => engine.startAgentLoop({
+      ...o,
+      allowSkillWrites: opts.allowSkillWrites === true && o.skills?.includes("dreaming") === true,
+    }),
     endAgentLoop: (loopId) => engine.endAgentLoop(loopId),
     // `__sub` (double underscore) keeps the id ASCII-only and unique
     // (used for log lines and metadata; not a trace id — the sub-agent
@@ -363,7 +374,7 @@ export function createAgentLoop(engine: Engine, opts: AgentLoopOpts): AgentLoop 
               kind:
                 call.function.name === INVOKE_SUB_AGENT_TOOL_NAME ? "agent" : "tool",
               input: { raw_arguments: call.function.arguments },
-              metadata: { ...observationMeta, tool_call_id: call.id },
+              metadata: { ...observationMeta, [TOOL_META]: call.function.name, tool_call_id: call.id },
             });
 
             const invoke = Effect.gen(function* () {

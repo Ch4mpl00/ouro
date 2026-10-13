@@ -5,6 +5,7 @@ import type { EventStartOpts, Span } from "../tracing";
 import { createOpenAiProvider } from "./openai";
 import { createDeepseekProvider } from "./deepseek";
 import { createGeminiProvider } from "./gemini";
+import { createOpenRouterProvider } from "./openrouter";
 import { withRetry } from "./retry";
 import type { ChatProvider } from "./types";
 
@@ -179,6 +180,55 @@ describe("gemini provider", () => {
     const tools = [{ type: "function" as const, function: { name: "t", parameters: {} } }];
     const r = await provider.complete({
       model: "gemini-3.5-flash",
+      messages: [],
+      reasoningEffort: "disabled",
+      tools,
+      responseFormat: { type: "json_object" },
+    });
+    expect(bodies[0]!.tools).toEqual(tools);
+    expect(bodies[0]!.response_format).toEqual({ type: "json_object" });
+    expect(r.usage).toEqual({ input: 100, output: 20, total: 120, cached: 64 });
+  });
+});
+
+describe("openrouter provider", () => {
+  it("strips our openrouter/ routing prefix from the model it sends", async () => {
+    const { client, bodies } = fakeClient(OPENAI_USAGE);
+    const provider = createOpenRouterProvider(client);
+    await provider.complete({
+      model: "openrouter/anthropic/claude-sonnet-5.5",
+      messages: [{ role: "user", content: "x" }],
+      reasoningEffort: "disabled",
+    });
+    expect(bodies[0]).toEqual({
+      model: "anthropic/claude-sonnet-5.5",
+      messages: [{ role: "user", content: "x" }],
+    });
+  });
+
+  it("disabled effort: omits reasoning (the model's default)", async () => {
+    const { client, bodies } = fakeClient(OPENAI_USAGE);
+    const provider = createOpenRouterProvider(client);
+    await provider.complete({ model: "openrouter/qwen/qwen3", messages: [], reasoningEffort: "disabled" });
+    expect(bodies[0]!.reasoning).toBeUndefined();
+    expect(bodies[0]!.reasoning_effort).toBeUndefined();
+  });
+
+  it("maps effort onto the unified reasoning field, max → high", async () => {
+    const { client, bodies } = fakeClient(OPENAI_USAGE);
+    const provider = createOpenRouterProvider(client);
+    await provider.complete({ model: "openrouter/qwen/qwen3", messages: [], reasoningEffort: "low" });
+    await provider.complete({ model: "openrouter/qwen/qwen3", messages: [], reasoningEffort: "max" });
+    expect(bodies[0]!.reasoning).toEqual({ effort: "low" });
+    expect(bodies[1]!.reasoning).toEqual({ effort: "high" });
+  });
+
+  it("passes tools and response_format through, normalizes usage like OpenAI", async () => {
+    const { client, bodies } = fakeClient(OPENAI_USAGE);
+    const provider = createOpenRouterProvider(client);
+    const tools = [{ type: "function" as const, function: { name: "t", parameters: {} } }];
+    const r = await provider.complete({
+      model: "openrouter/qwen/qwen3",
       messages: [],
       reasoningEffort: "disabled",
       tools,

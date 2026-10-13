@@ -17,6 +17,9 @@ const TIMEOUT_MS = 20_000;
 // Content types we won't return as text (binary — would be garbage in a prompt).
 const BINARY_CT = /^(image|audio|video)\/|application\/(pdf|zip|octet-stream|x-)/i;
 
+// Reads past the cap by at most one chunk, so a body of exactly `maxBytes`
+// isn't reported as truncated, and cuts on a character boundary: a streaming
+// decoder holds back a multi-byte sequence the cap split in two.
 async function readCapped(
   res: Response,
   maxBytes: number,
@@ -25,19 +28,19 @@ async function readCapped(
   if (!reader) return { text: "", bytes: 0, truncated: false };
   const chunks: Buffer[] = [];
   let total = 0;
-  let truncated = false;
   for (;;) {
     const { done, value } = await reader.read();
     if (done) break;
     total += value.byteLength;
     chunks.push(Buffer.from(value));
-    if (total >= maxBytes) {
-      truncated = true;
+    if (total > maxBytes) {
       await reader.cancel();
       break;
     }
   }
-  return { text: Buffer.concat(chunks).subarray(0, maxBytes).toString("utf-8"), bytes: total, truncated };
+  const body = Buffer.concat(chunks);
+  if (total <= maxBytes) return { text: body.toString("utf-8"), bytes: total, truncated: false };
+  return { text: new TextDecoder().decode(body.subarray(0, maxBytes), { stream: true }), bytes: total, truncated: true };
 }
 
 export function registerFetchTools(server: McpServer, fetcher: GuardedFetch): void {

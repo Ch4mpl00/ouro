@@ -74,6 +74,20 @@ export interface TraceSummary {
 export const JUDGE_NODE_META = "judge_node";
 export type JudgeNodeRole = "planner" | "compose";
 
+// Activity-journal contract. The supervisor stamps metadata[ACTIVITY_META] on
+// what the journal worker reads: "run" on the trace of a production signal
+// (the only traces it journals — benchmarks, scripts and the worker itself
+// never stamp it), and "primary_loop" on the span whose input is exactly what
+// the primary AgentLoop was given (the signal plus preloaded chat context).
+// An explicit key instead of observation names, which stay display-only.
+export const ACTIVITY_META = "activity";
+export type ActivityRole = "run" | "primary_loop";
+
+// Every tool-call span names the tool it called under metadata[TOOL_META] —
+// agent-loop calls, workflow tool steps and the supervisor's automatic
+// history fetch alike — so consumers never read the tool from a span name.
+export const TOOL_META = "tool";
+
 // Which skill composed the output. Workflow path stamps it on the
 // llm_compose / llm_agent step observation's metadata.skill; agent-loop path
 // lists it on trace.metadata.skills. First non-empty wins. Used both at

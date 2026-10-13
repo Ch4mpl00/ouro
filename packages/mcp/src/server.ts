@@ -11,6 +11,7 @@ import { createScheduledTasks, startSchedulerPoller } from "./services/scheduler
 import { createSignals } from "./services/signals";
 import { createSettings } from "./services/settings";
 import { createGuardedFetch } from "./services/fetch";
+import { createFileAccess, defaultReadRoots } from "./services/files";
 import { createPgClient, databaseUrl } from "./db/pg/client";
 import { connectStateDb } from "./db/state";
 import { createNewsModule, startNewsModule } from "./services/news";
@@ -34,6 +35,7 @@ async function main(): Promise<void> {
   const gmail = createGmailModule({ db: state });
   const userbot = createUserbot(createUserbotSessions(state));
   const fetcher = createGuardedFetch();
+  const files = createFileAccess({ roots: defaultReadRoots(process.env, process.cwd()) });
 
   const newsModule = createNewsModule({ db: pg.db, userbot, fetcher });
   const knowledgeModule = createKnowledgeModule({ db: pg.db });
@@ -80,6 +82,7 @@ async function main(): Promise<void> {
       gmail,
       userbot,
       fetcher,
+      files,
       toolsets: toolsets.names,
     });
     if (upstreams.length === 0) return ownServer;

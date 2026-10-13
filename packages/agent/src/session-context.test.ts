@@ -9,6 +9,7 @@ function createTestContext(id = "session") {
       timezone: "Europe/Chisinau",
       userEmail: null,
       newsLastReadAt: null,
+      techLastReadAt: null,
     },
   });
 }
@@ -22,6 +23,7 @@ describe("session context", () => {
       timezone: "Europe/Chisinau",
       userEmail: null,
       newsLastReadAt: null,
+      techLastReadAt: null,
     });
 
     const memory = context.memory;

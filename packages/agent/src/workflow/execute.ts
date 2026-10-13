@@ -8,12 +8,14 @@ import type { AgentLoopOpts } from "../agent-loop";
 import type { SessionContext } from "../session-context";
 import { SET_MEMORY_TOOL_NAME, SetMemoryArgsSchema } from "../synthetic-tools";
 import { runCodeAgent } from "../code-agent";
+import { filter, type DecisionClient } from "../decisions";
 import type { CodexClient } from "../codex-client";
-import { JUDGE_NODE_META } from "../trace-model";
+import { JUDGE_NODE_META, TOOL_META } from "../trace-model";
 import { appendPatch } from "../skills";
 import type { Span, SpanKind, TraceContext } from "../tracing";
 import type {
   CodeAgentStep,
+  DecideStep,
   LlmAgentStep,
   LlmComposeStep,
   ParallelStep,
@@ -55,7 +57,8 @@ export type ExecFailureReason =
   | "duplicate_binding"
   | "skill_not_found"
   | "tool_error"
-  | "llm_error";
+  | "llm_error"
+  | "decision_error";
 
 // A `replan` step asks the runtime to recompile with `context` (the named
 // bindings' values) carried forward. The executor surfaces it; the
@@ -105,6 +108,8 @@ export interface EngineSurface {
   };
   startAgentLoop(opts: AgentLoopOpts): Promise<AgentLoopHandle>;
   endAgentLoop(id: string): void | Promise<void>;
+  // Typed decisions for `decide` steps; null/absent when not configured.
+  readonly decisions?: DecisionClient | null;
 }
 
 // Surface of AgentLoop that the executor touches when running an
@@ -269,6 +274,7 @@ function stepSpanKind(kind: Step["kind"]): SpanKind {
     case "code_agent":
       return "agent";
     case "llm_compose":
+    case "decide":
     case "parallel":
     case "replan":
       return "chain";
@@ -280,7 +286,7 @@ function stepSpanKind(kind: Step["kind"]): SpanKind {
 function stepMetadata(step: Step): Record<string, unknown> {
   switch (step.kind) {
     case "tool":
-      return { tool: step.tool, bind: step.bind ?? null };
+      return { [TOOL_META]: step.tool, bind: step.bind ?? null };
     case "llm_compose":
       return {
         preset: step.preset,
@@ -296,7 +302,9 @@ function stepMetadata(step: Step): Record<string, unknown> {
         max_iterations: step.maxIterations,
       };
     case "code_agent":
-      return { bind: step.bind, has_data: step.data !== undefined };
+      return { [TOOL_META]: "code_agent", bind: step.bind, has_data: step.data !== undefined };
+    case "decide":
+      return { preset: step.preset, bind: step.bind, threshold: step.threshold ?? null };
     case "parallel":
       return { child_count: step.steps.length };
     case "terminal":
@@ -312,6 +320,7 @@ function classifyError(err: Error): ExecFailureReason {
   if (err instanceof SkillNotFoundError) return "skill_not_found";
   if (err instanceof ToolCallError) return "tool_error";
   if (err instanceof LlmCallError) return "llm_error";
+  if (err instanceof DecideCallError) return "decision_error";
   return "step_failed";
 }
 
@@ -332,6 +341,8 @@ async function dispatch(
       return { stop: false, output: await execLlmAgent(step, store, span, ctx, deps) };
     case "code_agent":
       return { stop: false, output: await execCodeAgent(step, store, span, deps, ctx.abortSignal) };
+    case "decide":
+      return { stop: false, output: await execDecide(step, store, span, deps, ctx.abortSignal) };
     case "parallel":
       await execParallel(step, store, span, ctx, deps);
       return { stop: false };
@@ -480,6 +491,45 @@ async function execCodeAgent(
   signal?.throwIfAborted();
   store.set(step.bind, result);
   return result;
+}
+
+// ─── decide ──────────────────────────────────────────────────────────
+
+class DecideCallError extends Error {
+  constructor(message: string) {
+    super(`decide failed: ${message}`);
+    this.name = "DecideCallError";
+  }
+}
+
+// Runs a decisions preset over a bound array. No fallback: when the decision
+// model is missing or fails, the step fails like any other — a filter that
+// silently passed everything would hand the composer a different job.
+async function execDecide(
+  step: DecideStep,
+  store: VariableStore,
+  span: Span,
+  deps: ExecutorDeps,
+  signal?: AbortSignal,
+): Promise<{ kept: number; of: number }> {
+  const decisions = deps.engine.decisions;
+  if (!decisions) throw new DecideCallError("no decision model configured (OPEN_ROUTER_API_KEY)");
+  const items = substitute(step.items, store);
+  if (!Array.isArray(items)) {
+    throw new DecideCallError(`items must resolve to an array, got ${items === null ? "null" : typeof items}`);
+  }
+  const prompt = substituteText(step.prompt, store);
+  span.update({ input: { preset: step.preset, items: items.length, threshold: step.threshold ?? null, prompt } });
+
+  let kept: unknown[];
+  try {
+    ({ kept } = await filter(decisions, { items, prompt, threshold: step.threshold, scope: span, signal }));
+  } catch (err) {
+    signal?.throwIfAborted();
+    throw new DecideCallError(toError(err).message);
+  }
+  store.set(step.bind, kept);
+  return { kept: kept.length, of: items.length };
 }
 
 // ─── llm_compose ─────────────────────────────────────────────────────

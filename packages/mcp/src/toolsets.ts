@@ -24,6 +24,7 @@ import type { TelegramLog } from "./services/telegram";
 import type { GmailModule } from "./services/gmail";
 import type { Userbot } from "./services/telegram/userbot";
 import type { GuardedFetch } from "./services/fetch";
+import type { FileAccess } from "./services/files";
 
 // Named tool groups a server instance can register. One MCP process serves one
 // audience: the droplet supervisor gets everything, a third-party client (e.g.
@@ -49,6 +50,8 @@ export interface ToolsetDeps {
   userbot: Userbot;
   // Every outbound page fetch (fetch_url, fetch_article) goes through this.
   fetcher: GuardedFetch;
+  // Every local file read_file / read_pdf opens goes through this.
+  files: FileAccess;
 }
 
 type ToolsetRegistrar = (server: McpServer, deps: ToolsetDeps) => void;
@@ -64,8 +67,8 @@ const TOOLSETS = {
   // send_telegram_message only — no history, no edits, no chat actions.
   "telegram-send": (server, deps) => registerTelegramSendTools(server, deps.telegramLog),
   monobank: (server) => registerMonobankTools(server),
-  pdf: (server) => registerPdfTools(server),
-  fs: (server) => registerFsTools(server),
+  pdf: (server, deps) => registerPdfTools(server, deps.files),
+  fs: (server, deps) => registerFsTools(server, deps.files),
   // fetch_url — arbitrary page fetch behind an SSRF guard. Deliberately NOT
   // handed to third-party clients: it turns our server into their proxy.
   fetch: (server, deps) => registerFetchTools(server, deps.fetcher),
@@ -142,10 +145,19 @@ export function parseToolsets(raw: string | undefined): ToolsetSelection {
   return { names: [...new Set(requested.filter(isToolsetName))], restricted: true };
 }
 
+// Groups that are a strict subset of another: selecting both would register
+// their tools twice, which the SDK refuses ("already registered") — an
+// instance with MCP_TOOLSETS=telegram,telegram-send failed to serve at all.
+const SUBSUMED_BY: Partial<Record<ToolsetName, ToolsetName>> = { "telegram-send": "telegram" };
+
 export function registerToolsets(
   server: McpServer,
   deps: ToolsetDeps,
   names: readonly ToolsetName[],
 ): void {
-  for (const name of names) TOOLSETS[name](server, deps);
+  for (const name of names) {
+    const wider = SUBSUMED_BY[name];
+    if (wider !== undefined && names.includes(wider)) continue;
+    TOOLSETS[name](server, deps);
+  }
 }

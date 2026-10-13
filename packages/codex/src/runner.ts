@@ -106,6 +106,9 @@ function parseStructuredContent(content: string): unknown | undefined {
   }
 }
 
+// How long a timed-out run gets to exit on SIGTERM before SIGKILL.
+const KILL_GRACE_MS = 2_000;
+
 export async function runCodex(req: CodexRunRequest): Promise<CodexRunResult | CodexRunFailure> {
   const workDir = req.cwd ?? process.cwd();
   const timeoutMs = req.timeoutMs ?? 10 * 60_000;
@@ -139,10 +142,13 @@ export async function runCodex(req: CodexRunRequest): Promise<CodexRunResult | C
     }
     args.push(req.prompt);
 
+    // Its own process group, so a timeout can end the commands codex started
+    // along with codex itself.
     const child = spawn("codex", args, {
       cwd: workDir,
       stdio: ["pipe", "pipe", "pipe"],
       env: process.env,
+      detached: true,
     });
 
     const input = parseInput(req.input);
@@ -160,16 +166,29 @@ export async function runCodex(req: CodexRunRequest): Promise<CodexRunResult | C
       stderr += chunk;
     });
 
+    // Past the deadline: SIGTERM to the whole group, then SIGKILL if it is
+    // still there after a grace period. SIGTERM alone let a CLI that ignores
+    // it (or a command it started) hold the request open forever.
     let timedOut = false;
+    const killGroup = (signal: NodeJS.Signals) => {
+      try {
+        if (child.pid !== undefined) process.kill(-child.pid, signal);
+      } catch {
+        /* the group is already gone */
+      }
+    };
+    let escalation: NodeJS.Timeout | undefined;
     const timeout = setTimeout(() => {
       timedOut = true;
-      child.kill("SIGTERM");
+      killGroup("SIGTERM");
+      escalation = setTimeout(() => killGroup("SIGKILL"), KILL_GRACE_MS);
     }, timeoutMs);
     const exit = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve, reject) => {
       child.on("error", reject);
       child.on("close", (code, signal) => resolve({ code, signal }));
     });
     clearTimeout(timeout);
+    clearTimeout(escalation);
 
     const parsed = parseJsonl(stdout);
     if (exit.code !== 0) {

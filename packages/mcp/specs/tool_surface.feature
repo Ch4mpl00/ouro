@@ -8,7 +8,7 @@ Feature: The tools the agent sees
       add_note append_doc cancel_scheduled_task create_project doc_history
       download_gmail_attachment edit_telegram_message fetch_article fetch_url
       find_notes get_fact get_next_signal get_telegram_chat_history get_timezone
-      list_memory list_monobank_transactions list_nashdom_mails list_news
+      journal_append journal_tail list_memory list_monobank_transactions list_nashdom_mails list_news
       list_scheduled_tasks list_signals list_userbot_dialogs patch_doc read_doc
       read_file read_pdf recall remember revert_patch schedule_task search_news
       send_telegram_chat_action send_telegram_message set_timezone start_typing
