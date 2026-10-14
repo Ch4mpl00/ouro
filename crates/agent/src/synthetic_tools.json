@@ -1,0 +1,233 @@
+[
+  {
+    "type": "function",
+    "function": {
+      "name": "working_memory_put",
+      "description": "Save a string in this session's temporary working memory under a new, literal key. An occupied key is an error. Use a new key for processed results. format is an optional text/json label; JSON is not parsed or validated.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "key": {
+            "type": "string",
+            "minLength": 1
+          },
+          "value": {
+            "type": "string"
+          },
+          "format": {
+            "type": "string",
+            "enum": [
+              "text",
+              "json"
+            ]
+          }
+        },
+        "required": [
+          "key",
+          "value"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "working_memory_get",
+      "description": "Read the complete string at a working-memory key into your context, even if large. Use only when you need the full content yourself; input_refs on invoke_sub_agent passes data directly to a child without loading it here. Missing keys are errors.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "key": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "required": [
+          "key"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "working_memory_list",
+      "description": "List this session's working-memory keys, formats and UTF-8 sizes without loading their contents.",
+      "parameters": {
+        "type": "object",
+        "properties": {}
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "working_memory_delete",
+      "description": "Delete a working-memory key from this session. Returns deleted=false if absent. Deletion affects all loops sharing this session; past message contents remain in their histories.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "key": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "required": [
+          "key"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "set_memory",
+      "description": "Persist a small piece of agent-side state to the local memory KV. Use for watermarks, last-seen markers, counters, or any note the agent wants to recall in a future session. Well-known keys (e.g. `news_digest.last_read_at`) are auto-injected into the `Current context` block of future system prompts. Values are stored as strings — JSON-stringify complex payloads yourself.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "key": {
+            "type": "string",
+            "description": "Memory key, e.g. `news_digest.last_read_at`."
+          },
+          "value": {
+            "type": "string",
+            "description": "Value to store. Use ISO timestamps for time markers."
+          }
+        },
+        "required": [
+          "key",
+          "value"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "code_agent",
+      "description": "Delegate a computational / coding task to a sandboxed code agent (Codex). It writes AND runs code (Python with pandas/openpyxl, or Node) and returns ONLY the final result. Use it for anything that must be COMPUTED rather than recalled or written by an LLM: exact arithmetic, counting, date/time math, statistics, parsing or aggregating CSV/Excel/JSON data, string/data transformations, regex extraction, unit conversions. Do NOT use it for web access, reasoning, or composing prose — only code/computation. State the task precisely and say exactly what the output should be (e.g. 'return just the number'). Put any data the code needs in `data` — it is delivered to the program on stdin (for a binary file like .xlsx, base64-encode it and say so in the task).",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "task": {
+            "type": "string",
+            "description": "Precise description of the computation to perform and the exact output expected. E.g. 'Sum the `total` column of the CSV on stdin; return only the rounded integer.'"
+          },
+          "data": {
+            "type": "string",
+            "description": "Optional input data delivered to the program on stdin (CSV/JSON/numbers/text, or base64 for a binary file). Omit if the task is self-contained."
+          }
+        },
+        "required": [
+          "task"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "read_skill",
+      "description": "Return the raw text of a skill (`skills/<name>.md`). Reads the live overlay if present, otherwise falls back to the shipped default (`skills.default/<name>.md`). Use this to consult another skill's rules mid-session (e.g. the telegram handler reading `news-digest` before composing a digest).",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Skill name without .md extension (matches signal source)."
+          }
+        },
+        "required": [
+          "name"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "write_skill",
+      "description": "Overwrite a skill with new content. Always writes to the live overlay — the shipped default stays intact, so deleting the live file at any time restores the original. Used by the `dreaming` skill to revise instructions based on observed patterns. Pass the complete new body; the file is replaced, not patched.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Skill name without .md extension."
+          },
+          "content": {
+            "type": "string",
+            "description": "Full new content of the skill file."
+          }
+        },
+        "required": [
+          "name",
+          "content"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "list_skills",
+      "description": "List all available skills (union of live overlay + shipped defaults). Each entry includes `source: 'live'|'default'` showing which layer is active for that name. Useful for the `dreaming` skill to survey what's edit-able before deciding what to revise.",
+      "parameters": {
+        "type": "object",
+        "properties": {}
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "invoke_sub_agent",
+      "description": "Delegate a focused task to a sub-agent with a clean context. The sub-agent loads ONLY the skills you name (no routing, no parent history), has access to the tools allowed by those skills, runs to completion, and returns its result through working memory. Short results include content; large results include a memory_key and preview. Use this whenever the user's request maps to a dedicated domain skill — e.g. `news-digest`, `tech-digest`, `channel-digest`, `nashdom-bill`. DO NOT also `read_skill` that skill yourself: delegation replaces local loading, keeping your own context lean. Side effects performed inside the sub-agent (Telegram messages, memory writes, etc.) take effect immediately — if the sub-agent's skill sends the user-facing reply itself, you don't need to forward its output again.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "skills": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Skill names to load in the sub-agent (e.g. [\"news-digest\"]). Optional; omit or use [] for a general-purpose focused worker with all MCP tools. Named skills restrict its MCP tools. No engine meta-skills or parent history are copied."
+          },
+          "system_prompt": {
+            "type": "string",
+            "description": "Optional goal / framing / constraints the PARENT wants the sub-agent to follow on top of its skill. Goes into the sub-agent's system message ahead of the skill content. Use this to set scope (\"only fetch X, not Y\"), output format (\"return JSON\", \"reply in Russian\"), delivery target (\"send to chat=<id> thread=<n>\"), or any other context the skill itself doesn't know about. Skip when the skill is self-sufficient."
+          },
+          "prompt": {
+            "type": "string",
+            "description": "Task / user-facing request to hand to the sub-agent — goes in as a user message and shows up as the sub-agent's trace input. Use the user's verbatim wording when possible. For self-initiated tasks (no user message) put the trigger description here."
+          },
+          "input_refs": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1
+            },
+            "description": "Optional working-memory keys. Their complete contents are loaded directly into the sub-agent's user message as data, without entering the parent's context. Parent and child share the same working memory."
+          },
+          "max_iterations": {
+            "type": "number",
+            "description": "Optional iteration budget for the sub-agent. Default 50."
+          },
+          "preset": {
+            "type": "string",
+            "enum": [
+              "base",
+              "smart",
+              "smartest"
+            ],
+            "description": "Model preset for the sub-agent. `base` — cheap chat model, no thinking (default; use for simple one-offs and lookups). `smart` — DeepSeek with thinking on (use for real editorial / parsing work: digests, semantic dedup, PDF amount extraction). Default `base`."
+          }
+        },
+        "required": [
+          "prompt"
+        ]
+      }
+    }
+  }
+]
