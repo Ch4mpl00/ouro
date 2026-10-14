@@ -50,6 +50,13 @@
       "when": 1791902517698,
       "tag": "0006_memory_journal_metadata",
       "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "7",
+      "when": 1791974288634,
+      "tag": "0007_news_embedding_hnsw",
+      "breakpoints": true
     }
   ]
 }

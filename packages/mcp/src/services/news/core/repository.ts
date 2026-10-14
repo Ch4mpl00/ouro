@@ -9,6 +9,7 @@ import {
   lte,
   or,
   sql,
+  type SQL,
 } from "drizzle-orm";
 import type { Database } from "../../../db/pg/client";
 import { newsItems } from "../../../db/pg/schema";
@@ -282,26 +283,26 @@ async function searchCore(
   // One batch embed for the whole pack, then per-query searches in
   // parallel — N round trips to PG, but a single embed provider call.
   const vectors = await embeddings.embedBatch(queries);
+  const ordering = searchOrdering(filter);
   const pools = await Promise.all(
-    vectors.map((queryVector) => {
-      const distance = cosineDistance(newsItems.embedding, queryVector);
-      return db
-        .select({
-          id: newsItems.id,
-          source: newsItems.source,
-          title: newsItems.title,
-          url: newsItems.url,
-          body: newsItems.body,
-          metadata: newsItems.metadata,
-          postedAt: newsItems.postedAt,
-          distance,
-          embedding: newsItems.embedding,
-        })
-        .from(newsItems)
-        .where(and(...filters))
-        .orderBy(distance)
-        .limit(poolSize);
-    }),
+    vectors.map((queryVector) =>
+      ordering === "exact"
+        ? searchPool(db, queryVector, filters, poolSize, "exact")
+        : db.transaction(async (tx) => {
+            // Transaction-local, so the pool's connection goes back
+            // untouched. relaxed_order keeps walking the graph past
+            // ef_search when a time filter drops candidates (the caller
+            // re-sorts by the exact distance anyway). A sequential scan is
+            // never the plan we want here — it reads every embedding — but
+            // the planner picks it once ef_search makes the index look
+            // dear, so it is priced out; a time filter still gets its
+            // posted_at index.
+            await tx.execute(
+              sql`SELECT set_config('hnsw.ef_search', ${String(annEfSearch(poolSize))}, true), set_config('hnsw.iterative_scan', 'relaxed_order', true), set_config('enable_seqscan', 'off', true)`,
+            );
+            return searchPool(tx, queryVector, filters, poolSize, "approximate");
+          }),
+    ),
   );
 
   return mergeRankedPools(pools, {
@@ -309,6 +310,62 @@ async function searchCore(
     threshold,
     annotateMatches: opts.annotateMatches,
   });
+}
+
+export type SearchOrdering = "approximate" | "exact";
+
+// The HNSW walk filters the candidates it finds, so it only works for a
+// filter that cuts across topics. Time does: the newest week holds every
+// subject. A source or a channel does not — it is a topic and a language
+// (Habr is Russian tech, channels are Russian news), so for a query far
+// from that sub-population the walk runs out of budget before it reaches
+// it. Measured on prod (117k rows): habr/hackernews top-10 recall fell to
+// 0.72–0.9 with short pools at any ef_search. Those filters keep the exact
+// ordering, which the source index narrows; see
+// .claude/tasks/done/news-search-ann.md.
+export function searchOrdering(filter: SearchFilter): SearchOrdering {
+  return filter.source || filter.channel ? "exact" : "approximate";
+}
+
+// hnsw.ef_search is the candidate list the graph walk keeps: 4× the pool,
+// floor 200, capped at 600 — past that the planner prices the index above
+// a sequential scan. Measured on prod: see .claude/tasks/done/news-search-ann.md.
+export function annEfSearch(poolSize: number): number {
+  return Math.min(600, Math.max(200, poolSize * 4));
+}
+
+type Transaction = Parameters<Parameters<Database["transaction"]>[0]>[0];
+
+// "approximate" orders by exactly the expression news_items_embedding_hnsw
+// indexes (schema.ts) — anything else is a sequential scan over every
+// embedding. Either way the distance the caller sees is the exact one on
+// the full vector. Exported for the test that pins the plan
+// (repository.pg.test.ts).
+export function searchPool(
+  tx: Database | Transaction,
+  queryVector: number[],
+  filters: SQL[],
+  poolSize: number,
+  ordering: SearchOrdering,
+) {
+  const distance = cosineDistance(newsItems.embedding, queryVector);
+  const approximate = sql`(${newsItems.embedding}::halfvec(1536)) <=> (${JSON.stringify(queryVector)}::halfvec(1536))`;
+  return tx
+    .select({
+      id: newsItems.id,
+      source: newsItems.source,
+      title: newsItems.title,
+      url: newsItems.url,
+      body: newsItems.body,
+      metadata: newsItems.metadata,
+      postedAt: newsItems.postedAt,
+      distance,
+      embedding: newsItems.embedding,
+    })
+    .from(newsItems)
+    .where(and(...filters))
+    .orderBy(ordering === "approximate" ? approximate : distance)
+    .limit(poolSize);
 }
 
 // Minimal row shape the merge step needs — a structural subset of the

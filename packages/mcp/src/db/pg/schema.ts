@@ -33,13 +33,16 @@ export const newsItems = pgTable(
     embeddedAt: timestamp("embedded_at", { withTimezone: true }),
     embedding: vector("embedding", { dimensions: 1536 }),
   },
-  // No ANN index on `embedding`: ivfflat with low row counts (<10k)
-  // is effectively a random filter — small clusters + probes=1 default
-  // means most relevant rows live in clusters the query never visits.
-  // Sequential scan + cosineDistance on 1536-dim vectors is sub-ms at
-  // this scale. Add ivfflat (or hnsw) back when the corpus crosses
-  // ~50–100k rows; tune `lists` ≈ sqrt(rows) and bump probes per query.
+  // ANN: HNSW over the embedding cast to halfvec. At 117k rows the vectors
+  // alone were 1.2 GB of TOAST on a 2 GB droplet, so the exact scan read
+  // them all from disk on every search (~9.5 s). halfvec halves the graph;
+  // the index only orders candidates — the distance a search returns is
+  // still computed on the full vector. Search must order by exactly this
+  // expression or the planner can't use it (searchPool in repository.ts).
+  // ivfflat was tried at <10k rows and dropped: with few rows and probes=1
+  // most relevant rows sat in clusters the query never visited.
   (t) => [
+    index("news_items_embedding_hnsw").using("hnsw", sql`(${t.embedding}::halfvec(1536)) halfvec_cosine_ops`),
     unique("news_items_source_external_uniq").on(t.source, t.externalId),
     index("news_items_posted_at").on(t.postedAt.desc()),
     index("news_items_source_posted").on(t.source, t.postedAt.desc()),
@@ -83,9 +86,8 @@ export const knowledgeBaseNotes = pgTable(
     embeddedAt: timestamp("embedded_at", { withTimezone: true }),
     embedding: vector("embedding", { dimensions: 1536 }),
   },
-  // No ANN index on `embedding` — same rationale as news_items: a seq
-  // scan over a small corpus is sub-ms; add ivfflat/hnsw past ~50–100k
-  // rows. GIN on `tags` keeps the optional array-overlap filter cheap.
+  // No ANN index on `embedding`: a seq scan over a small corpus is
+  // cheap; news_items needed HNSW only past ~100k rows (see above). GIN on `tags` keeps the optional array-overlap filter cheap.
   (t) => [
     index("kb_notes_created_at").on(t.createdAt.desc()),
     index("kb_notes_tags").using("gin", t.tags),
@@ -203,8 +205,8 @@ export const memoryIndex = pgTable(
     embeddedAt: timestamp("embedded_at", { withTimezone: true }),
     embedding: vector("embedding", { dimensions: 1536 }),
   },
-  // No ANN index for the same reason as news_items: ivfflat under ~50k rows
-  // is a random filter, and a seq scan over 1536-dim vectors is sub-ms here.
+  // No ANN index: a seq scan over a small corpus is cheap. news_items
+  // needed HNSW only past ~100k rows (see above).
   (t) => [
     index("memory_index_source_ref").on(t.sourceRef),
     index("memory_index_state_ts").on(t.state, t.ts.desc()),

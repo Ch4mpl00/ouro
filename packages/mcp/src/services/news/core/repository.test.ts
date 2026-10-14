@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { DEFAULT_DEDUP_THRESHOLD } from "../../retrieval";
-import { mergeRankedPools, type RankablePoolRow } from "./repository";
+import { annEfSearch, mergeRankedPools, searchOrdering, type RankablePoolRow } from "./repository";
 
 // Unit-test the pure merge/rank/dedup contract of the batch search path
 // (searchMany). The DB query + embed are I/O and live in searchCore;
@@ -94,5 +94,26 @@ describe("mergeRankedPools", () => {
     );
     expect(result.map((r) => r.id)).toEqual([2, 1]);
     expect(result.every((r) => !("matchedQueries" in r))).toBe(true);
+  });
+});
+
+describe("searchOrdering", () => {
+  it("walks the index unfiltered and under time filters", () => {
+    expect(searchOrdering({})).toBe("approximate");
+    expect(searchOrdering({ sinceISO: "2026-10-01T00:00:00Z", untilISO: "2026-10-14T00:00:00Z" })).toBe("approximate");
+    expect(searchOrdering({ asOfISO: "2026-10-01T00:00:00Z" })).toBe("approximate");
+  });
+
+  it("keeps the exact ordering under a source or a channel filter", () => {
+    expect(searchOrdering({ source: "habr" })).toBe("exact");
+    expect(searchOrdering({ source: "channel", channel: "ai_newz" })).toBe("exact");
+  });
+});
+
+describe("annEfSearch", () => {
+  it("is 4× the pool between 200 and 600", () => {
+    expect(annEfSearch(30)).toBe(200);
+    expect(annEfSearch(100)).toBe(400);
+    expect(annEfSearch(300)).toBe(600);
   });
 });
