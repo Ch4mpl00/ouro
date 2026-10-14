@@ -119,3 +119,32 @@ describe("runHttpTransport", () => {
     await expect(current.listTools()).resolves.toMatchObject({ tools: [{ name: "ping" }] });
   });
 });
+
+describe("session rejection on the HTTP wire", () => {
+  it.each(["POST", "GET", "DELETE"])("returns 404 for an unknown session on %s without creating an endpoint", async (method) => {
+    let built = 0;
+    running = await runHttpTransport({
+      port: 0,
+      multiSession: true,
+      createEndpoint: async () => { built++; return buildEndpoint(); },
+    });
+    const response = await fetch(`http://127.0.0.1:${running.port}/mcp`, {
+      method,
+      headers: { "content-type": "application/json", "mcp-session-id": "expired-session" },
+      ...(method === "POST" ? { body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }) } : {}),
+    });
+    expect(response.status).toBe(404);
+    expect(await response.json()).toMatchObject({ error: { message: "Session not found" } });
+    expect(built).toBe(0);
+  });
+
+  it("returns 400 for a request without a session id", async () => {
+    running = await runHttpTransport({ port: 0, multiSession: true, createEndpoint: async () => buildEndpoint() });
+    const response = await fetch(`http://127.0.0.1:${running.port}/mcp`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }),
+    });
+    expect(response.status).toBe(400);
+    expect(await response.json()).toMatchObject({ error: { message: "No valid session id; send an initialize request first." } });
+  });
+});
