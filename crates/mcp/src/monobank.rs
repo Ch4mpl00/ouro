@@ -21,7 +21,13 @@ use crate::time::{iso, iso_from_unix};
 pub struct Monobank {
     http: reqwest::Client,
     api_key: Option<String>,
+    // Where the API lives; tests point it at a stand-in.
+    api_root: String,
 }
+
+// A statement holds at most this many transactions, newest first; when it is
+// full, older ones in the range need another request with an earlier `to`.
+pub const STATEMENT_PAGE_LIMIT: usize = 500;
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -118,7 +124,12 @@ impl From<RawItem> for Transaction {
 
 impl Monobank {
     pub fn new(http: reqwest::Client) -> Self {
-        Self { http, api_key: std::env::var("MONOBANK_API_KEY").ok().filter(|k| !k.is_empty()) }
+        let api_key = std::env::var("MONOBANK_API_KEY").ok().filter(|k| !k.is_empty());
+        Self::with_api(http, api_key, "https://api.monobank.ua")
+    }
+
+    pub fn with_api(http: reqwest::Client, api_key: Option<String>, api_root: &str) -> Self {
+        Self { http, api_key, api_root: api_root.trim_end_matches('/').to_owned() }
     }
 
     pub async fn statement(
@@ -136,7 +147,7 @@ impl Monobank {
             );
         }
         let path = format!("/personal/statement/{}/{from_s}/{to_s}", urlencode(account));
-        let res = self.http.get(format!("https://api.monobank.ua{path}")).header("X-Token", key).send().await?;
+        let res = self.http.get(format!("{}{path}", self.api_root)).header("X-Token", key).send().await?;
         if res.status().as_u16() == 429 {
             anyhow::bail!("Monobank rate limit hit (1 request per 60s per account). Try again later.");
         }
@@ -155,14 +166,21 @@ impl Monobank {
         let to = Utc::now();
         let from = to - Duration::days(days);
         let transactions = self.statement(account, from, to).await?;
-        Ok(json!({
+        // A full page means Monobank cut the list: there may be older ones.
+        let complete = transactions.len() < STATEMENT_PAGE_LIMIT;
+        let mut out = json!({
             "accountId": account,
             "from": iso(from),
             "to": iso(to),
             "days": days,
             "count": transactions.len(),
-            "transactions": transactions,
-        }))
+            "complete": complete,
+        });
+        if !complete {
+            out["oldestReturned"] = json!(transactions.last().and_then(|t| t.time.clone()));
+        }
+        out["transactions"] = json!(transactions);
+        Ok(out)
     }
 }
 
@@ -190,7 +208,9 @@ impl McpTools {
         description = "Fetch recent transactions for a Monobank account. accountId can be a specific \
             account.id or '0' for the default UAH account. days is the lookback window \
             (default 7, max 31). Rate limit: 1 request per 60s per account — surface 429s \
-            rather than retrying."
+            rather than retrying. Monobank returns at most 500 transactions, newest first: \
+            `complete: false` means older ones in the window were left out (the list stops at \
+            `oldestReturned`), so don't total the window from it."
     )]
     async fn list_monobank_transactions(&self, Parameters(p): Parameters<ListParams>) -> ToolResult {
         if p.days.is_some_and(|d| !(1..=31).contains(&d)) {

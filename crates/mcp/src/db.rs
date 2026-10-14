@@ -114,7 +114,15 @@ async fn ensure_database(admin_url: &str, state: &Config) -> anyhow::Result<()> 
             tracing::info!(database = name, "created state database");
             Ok(())
         }
-        Err(err) if err.code() == Some(&tokio_postgres::error::SqlState::DUPLICATE_DATABASE) => Ok(()),
+        // The loser of a race to create it: duplicate_database — or the
+        // unique violation on pg_database's name index, which is what Postgres
+        // raises instead when the two CREATEs overlap.
+        Err(err)
+            if err.code() == Some(&tokio_postgres::error::SqlState::DUPLICATE_DATABASE)
+                || err.code() == Some(&tokio_postgres::error::SqlState::UNIQUE_VIOLATION) =>
+        {
+            Ok(())
+        }
         Err(err) => Err(err.into()),
     }
 }

@@ -189,6 +189,7 @@ pub struct Overrides {
     pub files: Option<FileAccess>,
     pub gmail_api_root: Option<String>,
     pub storage_dir: Option<PathBuf>,
+    pub monobank: Option<Monobank>,
 }
 
 pub async fn start_test_server_with(
@@ -258,7 +259,7 @@ async fn serve_overridden(
     embedder: SharedEmbedder,
     overrides: Overrides,
 ) -> anyhow::Result<Server> {
-    let Overrides { actor, fetcher, account, telegram, files, gmail_api_root, storage_dir } = overrides;
+    let Overrides { actor, fetcher, account, telegram, files, gmail_api_root, storage_dir, monobank } = overrides;
     let actor = actor.unwrap_or_else(|| "spec".into());
     let pool = pg::connect(database_url)?;
     pg::migrate(&pool).await?;
@@ -276,7 +277,7 @@ async fn serve_overridden(
             Some(root) => GmailModule::with_api_root(db.clone(), http.clone(), &root),
             None => GmailModule::new(db.clone(), http.clone()),
         },
-        monobank: Monobank::new(http.clone()),
+        monobank: monobank.unwrap_or_else(|| Monobank::new(http.clone())),
         userbot: account.unwrap_or_else(|| Arc::new(Userbot::new(db.clone()))),
         skills: SkillCatalog::new(PathBuf::from("skills"), PathBuf::from("../../skills.default")),
         fetcher: fetcher.unwrap_or_else(|| Arc::new(GuardedFetch::new())),
