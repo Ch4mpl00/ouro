@@ -26,7 +26,7 @@ use tokio_util::sync::CancellationToken;
 use crate::embeddings::{
     BackfillBatch, DEFAULT_DEDUP_THRESHOLD, SharedEmbedder, backfill_rows, dedup_by_pairwise_cosine,
 };
-use crate::fetch::BROWSER_UA;
+use crate::fetch::{SharedFetch, read_capped};
 use crate::pg::{PgPool, Query, parse_vector, vector_literal, where_clause};
 use crate::server::{McpTools, ToolResult, invalid_params, respond};
 use crate::time::{iso, parse_js_date, require_js_date};
@@ -87,6 +87,36 @@ pub struct Filter {
     pub channel: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchOrdering {
+    Approximate,
+    Exact,
+}
+
+// The HNSW walk filters the candidates it finds, so it only works for a
+// filter that cuts across topics. Time does: the newest week holds every
+// subject. A source or a channel does not — it is a topic and a language
+// (Habr is Russian tech, channels are Russian news), so for a query far from
+// that sub-population the walk runs out of budget before it reaches it.
+// Measured on prod (117k rows): habr/hackernews top-10 recall fell to
+// 0.72–0.9 with short pools at any ef_search. Those filters keep the exact
+// ordering, which the source index narrows; see
+// .claude/tasks/done/news-search-ann.md.
+pub fn search_ordering(filter: &Filter) -> SearchOrdering {
+    if filter.source.is_some() || filter.channel.is_some() {
+        SearchOrdering::Exact
+    } else {
+        SearchOrdering::Approximate
+    }
+}
+
+// hnsw.ef_search is the candidate list the graph walk keeps: 4× the pool,
+// floor 200, capped at 600 — past that the planner prices the index above a
+// sequential scan. Measured on prod: see .claude/tasks/done/news-search-ann.md.
+pub fn ann_ef_search(pool_size: usize) -> usize {
+    (pool_size * 4).clamp(200, 600)
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SearchResult {
@@ -129,22 +159,39 @@ pub struct Article {
     pub author: Option<String>,
 }
 
+// No article page is bigger; a link to a huge file must not be pulled into
+// memory (the HN poller follows whatever the front page links to).
+const MAX_ARTICLE_BYTES: usize = 8_000_000;
+
+// What can hold an article. No content type at all is given the benefit of
+// the doubt; anything else (PDF, image, archive, video) is refused unread.
+fn is_article_type(content_type: &str) -> bool {
+    regex::Regex::new(r"(?i)^(text/|application/(xhtml\+xml|xml)\b)").expect("valid regex").is_match(content_type)
+}
+
+// Article URLs come from the model and from feeds, so pages are fetched
+// through the SSRF guard.
 #[derive(Clone)]
 pub struct ArticleFetcher {
-    http: reqwest::Client,
+    fetch: SharedFetch,
 }
 
 impl ArticleFetcher {
-    pub fn new(http: reqwest::Client) -> Self {
-        Self { http }
+    pub fn new(fetch: SharedFetch) -> Self {
+        Self { fetch }
     }
 
     pub async fn fetch(&self, url: &str) -> anyhow::Result<Article> {
-        let res = self.http.get(url).header("user-agent", BROWSER_UA).timeout(Duration::from_secs(30)).send().await?;
-        if !res.status().is_success() {
-            anyhow::bail!("No article extracted from {url} (HTTP {})", res.status().as_u16());
+        let res = self.fetch.get(url, Duration::from_secs(30)).await?;
+        if !(200..300).contains(&res.status) {
+            anyhow::bail!("fetching {url} failed: HTTP {}", res.status);
         }
-        let html = res.text().await?;
+        if let Some(content_type) = res.content_type.as_deref()
+            && !is_article_type(content_type)
+        {
+            anyhow::bail!("{url} is not an article page ({content_type})");
+        }
+        let (html, _, _) = read_capped(res.body, MAX_ARTICLE_BYTES).await?;
         let url = url.to_owned();
         tokio::task::spawn_blocking(move || extract_article(&url, &html)).await?
     }
@@ -255,8 +302,9 @@ pub struct HackerNews {
 }
 
 impl HackerNews {
-    pub fn new(http: reqwest::Client) -> Self {
-        Self { articles: ArticleFetcher::new(http.clone()), http }
+    // `http` reads the feed; article pages go through `fetch`.
+    pub fn new(http: reqwest::Client, fetch: SharedFetch) -> Self {
+        Self { articles: ArticleFetcher::new(fetch), http }
     }
 
     async fn headlines(&self, limit: usize) -> anyhow::Result<Vec<Headline>> {
@@ -318,8 +366,9 @@ pub struct Habr {
 }
 
 impl Habr {
-    pub fn new(http: reqwest::Client) -> Self {
-        Self { articles: ArticleFetcher::new(http.clone()), http }
+    // `http` reads the feed; article pages go through `fetch`.
+    pub fn new(http: reqwest::Client, fetch: SharedFetch) -> Self {
+        Self { articles: ArticleFetcher::new(fetch), http }
     }
 
     async fn headlines(&self, limit: usize) -> anyhow::Result<Vec<Headline>> {
@@ -763,6 +812,40 @@ impl NewsRepository {
     }
 
     async fn search_vector(&self, vector: &[f32], pool_size: usize, filter: &Filter) -> anyhow::Result<Vec<PoolRow>> {
+        let ordering = search_ordering(filter);
+        let (sql, query) = Self::pool_query(vector, pool_size, filter, ordering);
+        let mut client = self.pool.get().await?;
+        let rows = match ordering {
+            SearchOrdering::Exact => client.query(&sql, &query.params()).await?,
+            SearchOrdering::Approximate => {
+                let tx = client.transaction().await?;
+                // Transaction-local, so the pool's connection goes back
+                // untouched. relaxed_order keeps walking the graph past
+                // ef_search when a time filter drops candidates (the merge
+                // re-sorts by the exact distance anyway). A sequential scan is
+                // never the plan we want here — it reads every embedding — but
+                // the planner picks it once ef_search makes the index look
+                // dear, so it is priced out; a time filter still gets its
+                // posted_at index.
+                tx.execute(
+                    "SELECT set_config('hnsw.ef_search', $1, true), set_config('hnsw.iterative_scan', 'relaxed_order', true),
+                            set_config('enable_seqscan', 'off', true)",
+                    &[&ann_ef_search(pool_size).to_string()],
+                )
+                .await?;
+                let rows = tx.query(&sql, &query.params()).await?;
+                tx.commit().await?;
+                rows
+            }
+        };
+        Ok(rows.iter().map(pool_row).collect())
+    }
+
+    // "Approximate" orders by exactly the expression news_items_embedding_hnsw
+    // indexes (migration 0007) — anything else is a sequential scan over
+    // every embedding. Either way the distance the caller sees is the exact
+    // one on the full vector. Public for the test that pins the plan.
+    pub fn pool_query(vector: &[f32], pool_size: usize, filter: &Filter, ordering: SearchOrdering) -> (String, Query) {
         let mut query = Query::default();
         let vector_param = query.bind(vector_literal(vector));
         let mut conditions = vec!["embedding IS NOT NULL".to_owned()];
@@ -770,14 +853,18 @@ impl NewsRepository {
         conditions.extend(Self::filters(&mut query, filter, "embedded_at"));
         let where_sql = where_clause(&conditions);
         let limit_param = query.bind(pool_size as i64);
+        let order = match ordering {
+            SearchOrdering::Exact => "distance".to_owned(),
+            SearchOrdering::Approximate => {
+                format!("(embedding::halfvec(1536)) <=> ({vector_param}::text::halfvec(1536))")
+            }
+        };
         let sql = format!(
             "SELECT id, source, title, url, body, metadata, posted_at,
                     (embedding <=> {vector_param}::text::vector) AS distance, embedding::text AS embedding
-             FROM news_items {where_sql} ORDER BY distance LIMIT {limit_param}"
+             FROM news_items {where_sql} ORDER BY {order} LIMIT {limit_param}"
         );
-        let client = self.pool.get().await?;
-        let rows = client.query(&sql, &query.params()).await?;
-        Ok(rows.iter().map(pool_row).collect())
+        (sql, query)
     }
 
     // Rows a failed inline embed left NULL, past `after_id` in id order —
@@ -901,8 +988,10 @@ struct SearchParams {
     query: Option<String>,
     /// Batch of 1–8 independent queries for a multi-facet ask. Mutually exclusive with `query`.
     queries: Option<Vec<String>>,
-    /// Number of results to return. Default 10.
-    #[schemars(range(min = 1, max = 50))]
+    /// Number of results to return. Default 10. Up to 50 when an LLM reads them directly; up to 150 only when a relevance filter runs over them first.
+    // 150 so a cheap classifier step (the workflow's decide filter) can see a
+    // wide net; anything an LLM reads directly should stay ≤ 50.
+    #[schemars(range(min = 1, max = 150))]
     k: Option<usize>,
     /// Restrict results to one source.
     source: Option<KnownSource>,
@@ -1109,9 +1198,9 @@ impl McpTools {
             .queries
             .as_ref()
             .is_some_and(|queries| queries.is_empty() || queries.len() > 8 || queries.iter().any(String::is_empty));
-        let invalid_k = params.k.is_some_and(|k| !(1..=50).contains(&k));
+        let invalid_k = params.k.is_some_and(|k| !(1..=150).contains(&k));
         if invalid_query || invalid_batch || invalid_k || !chunks_in_range(params.chunks) {
-            return Err(invalid_params("query must be non-empty, queries 1–8 non-empty strings, k 1–50, chunks 2–8"));
+            return Err(invalid_params("query must be non-empty, queries 1–8 non-empty strings, k 1–150, chunks 2–8"));
         }
         respond(search_news_response(&self.deps.news, params).await)
     }
@@ -1505,5 +1594,164 @@ mod tests {
         assert_eq!(source_for_url("https://habr.com/ru/articles/1/"), "habr");
         assert_eq!(source_for_url("https://news.ycombinator.com/item?id=1"), "hackernews");
         assert_eq!(source_for_url("https://example.com"), "external");
+    }
+}
+
+// ── tests: vector search on Postgres ─────────────────────────────────────────
+// A port of packages/mcp/src/services/news/core/repository.pg.test.ts and the
+// ordering half of repository.test.ts: the pool is ordered by the expression
+// the HNSW index covers (an exact `<=>` on the full vector is a sequential
+// scan over every embedding — 9.5 s at 117k rows on prod), while the distance
+// a caller sees stays exact.
+
+#[cfg(test)]
+mod search_tests {
+    use std::sync::Arc;
+
+    use async_trait::async_trait;
+
+    use super::*;
+    use crate::embeddings::Embedder;
+
+    const DIMS: usize = 1536;
+
+    // Deterministic unit vectors: a seeded LCG, so a failure reproduces.
+    fn unit_vectors(count: usize, seed: u64) -> Vec<Vec<f32>> {
+        let mut state = seed;
+        let mut next = move || {
+            state = (state * 1_103_515_245 + 12_345) % (1 << 31);
+            state as f64 / f64::from(1u32 << 31) - 0.5
+        };
+        (0..count)
+            .map(|_| {
+                let v: Vec<f64> = (0..DIMS).map(|_| next()).collect();
+                let norm = v.iter().map(|x| x * x).sum::<f64>().sqrt();
+                v.iter().map(|x| (x / norm) as f32).collect()
+            })
+            .collect()
+    }
+
+    fn cosine_distance(a: &[f32], b: &[f32]) -> f64 {
+        1.0 - a.iter().zip(b).map(|(x, y)| f64::from(*x) * f64::from(*y)).sum::<f64>()
+    }
+
+    struct Fixed(Vec<f32>);
+
+    #[async_trait]
+    impl Embedder for Fixed {
+        async fn embed_batch(&self, texts: &[String]) -> anyhow::Result<Vec<Vec<f32>>> {
+            Ok(texts.iter().map(|_| self.0.clone()).collect())
+        }
+    }
+
+    async fn setup() -> Option<(NewsRepository, PgPool, Vec<Vec<f32>>, Vec<f32>)> {
+        let pool = crate::pg::fresh_test_pool().await?;
+        let vectors = unit_vectors(60, 7);
+        let query = unit_vectors(1, 99).remove(0);
+        let client = pool.get().await.unwrap();
+        for (i, v) in vectors.iter().enumerate() {
+            client
+                .execute(
+                    "INSERT INTO news_items (source, external_id, title, body, embedding, embedded_at)
+                     VALUES ($1, $2, $3, $4, $5::text::vector, now())",
+                    &[
+                        &(if i % 2 == 0 { "habr" } else { "hackernews" }),
+                        &format!("item-{i}"),
+                        &format!("item {i}"),
+                        &format!("body {i}"),
+                        &vector_literal(v),
+                    ],
+                )
+                .await
+                .unwrap();
+        }
+        let repo = NewsRepository::new(pool.clone(), Arc::new(Fixed(query.clone())));
+        Some((repo, pool, vectors, query))
+    }
+
+    fn expected(vectors: &[Vec<f32>], query: &[f32], keep: impl Fn(usize) -> bool, k: usize) -> Vec<(String, f64)> {
+        let mut all: Vec<(String, f64)> = vectors
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| keep(*i))
+            .map(|(i, v)| (format!("item {i}"), cosine_distance(v, query)))
+            .collect();
+        all.sort_by(|a, b| a.1.total_cmp(&b.1));
+        all.truncate(k);
+        all
+    }
+
+    #[tokio::test]
+    async fn returns_the_nearest_items_in_order_with_the_exact_full_vector_distance() {
+        let Some((repo, _pool, vectors, query)) = setup().await else { return };
+        let results = repo.search(&["anything".into()], 5, &Filter::default(), false).await.unwrap();
+        let want = expected(&vectors, &query, |_| true, 5);
+        assert_eq!(
+            results.iter().map(|r| r.title.clone().unwrap_or_default()).collect::<Vec<_>>(),
+            want.iter().map(|w| w.0.clone()).collect::<Vec<_>>()
+        );
+        for (r, w) in results.iter().zip(&want) {
+            assert!((r.distance - w.1).abs() < 1e-6, "{} vs {}", r.distance, w.1);
+        }
+    }
+
+    #[tokio::test]
+    async fn returns_a_sources_exact_nearest_items_under_a_source_filter() {
+        let Some((repo, _pool, vectors, query)) = setup().await else { return };
+        let filter = Filter { source: Some("habr".into()), ..Filter::default() };
+        let results = repo.search(&["anything".into()], 10, &filter, false).await.unwrap();
+        let want = expected(&vectors, &query, |i| i % 2 == 0, 10);
+        assert_eq!(
+            results.iter().map(|r| r.title.clone().unwrap_or_default()).collect::<Vec<_>>(),
+            want.iter().map(|w| w.0.clone()).collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn orders_the_pool_by_the_expression_the_hnsw_index_covers() {
+        let Some((_repo, pool, _vectors, query)) = setup().await else { return };
+        let (sql, q) = NewsRepository::pool_query(&query, 30, &Filter::default(), SearchOrdering::Approximate);
+        let mut client = pool.get().await.unwrap();
+        let tx = client.transaction().await.unwrap();
+        // With the sequential scan priced out, a plan without the index means
+        // the ORDER BY no longer matches the indexed expression.
+        tx.batch_execute("SET LOCAL enable_seqscan = off").await.unwrap();
+        let plan: Vec<String> =
+            tx.query(&format!("EXPLAIN {sql}"), &q.params()).await.unwrap().iter().map(|r| r.get(0)).collect();
+        assert!(plan.join("\n").contains("news_items_embedding_hnsw"), "{}", plan.join("\n"));
+    }
+
+    #[test]
+    fn walks_the_index_unfiltered_and_under_time_filters() {
+        let now = Utc::now();
+        assert_eq!(search_ordering(&Filter::default()), SearchOrdering::Approximate);
+        assert_eq!(
+            search_ordering(&Filter { since: Some(now), until: Some(now), ..Filter::default() }),
+            SearchOrdering::Approximate
+        );
+        assert_eq!(search_ordering(&Filter { as_of: Some(now), ..Filter::default() }), SearchOrdering::Approximate);
+    }
+
+    #[test]
+    fn keeps_the_exact_ordering_under_a_source_or_a_channel_filter() {
+        assert_eq!(
+            search_ordering(&Filter { source: Some("habr".into()), ..Filter::default() }),
+            SearchOrdering::Exact
+        );
+        assert_eq!(
+            search_ordering(&Filter {
+                source: Some("channel".into()),
+                channel: Some("ai_newz".into()),
+                ..Filter::default()
+            }),
+            SearchOrdering::Exact
+        );
+    }
+
+    #[test]
+    fn ef_search_is_4x_the_pool_between_200_and_600() {
+        assert_eq!(ann_ef_search(30), 200);
+        assert_eq!(ann_ef_search(100), 400);
+        assert_eq!(ann_ef_search(300), 600);
     }
 }

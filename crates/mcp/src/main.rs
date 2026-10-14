@@ -55,6 +55,7 @@ async fn main() -> anyhow::Result<()> {
     let pollers_enabled = env("MCP_NO_POLLERS").as_deref() != Some("1");
 
     let http = reqwest::Client::builder().build()?;
+    let fetcher: fetch::SharedFetch = Arc::new(fetch::GuardedFetch::new());
     // Both databases must be up and migrated before any handler or poller
     // touches them: the news / memory store, and `mcp_state` beside it.
     let database_url = pg::database_url()?;
@@ -99,7 +100,7 @@ async fn main() -> anyhow::Result<()> {
         monobank: Monobank::new(http.clone()),
         userbot: userbot.clone(),
         skills: SkillCatalog::new(PathBuf::from("skills"), PathBuf::from("skills.default")),
-        fetcher: fetch::guarded_client(),
+        fetcher: fetcher.clone(),
         storage_dir: env("STORAGE_DIR").map_or_else(|| PathBuf::from("./storage"), PathBuf::from),
         news: news_repo.clone(),
         knowledge: KnowledgeRepository::new(pool.clone(), embedder.clone()),
@@ -135,8 +136,8 @@ async fn main() -> anyhow::Result<()> {
         background.spawn(gmail.run_poller(signals.clone(), cancel.clone()));
         background.spawn(scheduler::run_poller(scheduler, signals, cancel.clone()));
         let providers: Vec<Box<dyn NewsProvider>> = vec![
-            Box::new(HackerNews::new(http.clone())),
-            Box::new(Habr::new(http.clone())),
+            Box::new(HackerNews::new(http.clone(), fetcher.clone())),
+            Box::new(Habr::new(http.clone(), fetcher.clone())),
             Box::new(TelegramChannels::new(userbot, pool.clone())),
         ];
         background.spawn(news::run_poller(providers, news_repo, cancel.clone()));

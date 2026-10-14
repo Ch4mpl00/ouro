@@ -13,6 +13,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use mcp_tools::db::Db;
 use mcp_tools::embeddings::{Embedder, SharedEmbedder};
+use mcp_tools::fetch::{GuardedFetch, SharedFetch};
 use mcp_tools::gmail::GmailModule;
 use mcp_tools::knowledge::KnowledgeRepository;
 use mcp_tools::memory::{MemoryService, PgMemoryStore};
@@ -25,8 +26,8 @@ use mcp_tools::settings::Settings;
 use mcp_tools::signals::Signals;
 use mcp_tools::skills::SkillCatalog;
 use mcp_tools::telegram::{TelegramConfig, TelegramModule};
+use mcp_tools::toolsets;
 use mcp_tools::userbot::Userbot;
-use mcp_tools::{fetch, toolsets};
 use rmcp::model::CallToolRequestParams;
 use rmcp::service::{RunningService, ServiceError};
 use rmcp::transport::StreamableHttpClientTransport;
@@ -155,7 +156,7 @@ pub struct Server {
 // instance is multi-session, as in production.
 pub async fn start_server(database_url: &str, toolsets: Option<&str>) -> anyhow::Result<Server> {
     let db = Db::connect(database_url).await?;
-    serve(database_url, db, toolsets, Arc::new(WordEmbedder), "spec").await
+    serve(database_url, db, toolsets, Arc::new(WordEmbedder), "spec", None).await
 }
 
 // A server on a TestDatabase pair, as TS startServer(db.url, toolsets).
@@ -170,7 +171,19 @@ pub async fn start_test_server_as(
     actor: &str,
 ) -> anyhow::Result<Server> {
     let db = Db::connect_state(&database.url, &database.state_url).await?;
-    serve(&database.url, db, toolsets, Arc::new(WordEmbedder), actor).await
+    serve(&database.url, db, toolsets, Arc::new(WordEmbedder), actor, None).await
+}
+
+// The same, with the guarded fetch behind fetch_url and the news providers —
+// tests narrow what counts as private so a local server can play the public
+// internet.
+pub async fn start_test_server_with_fetch(
+    database: &TestDatabase,
+    toolsets: Option<&str>,
+    fetcher: SharedFetch,
+) -> anyhow::Result<Server> {
+    let db = Db::connect_state(&database.url, &database.state_url).await?;
+    serve(&database.url, db, toolsets, Arc::new(WordEmbedder), "spec", Some(fetcher)).await
 }
 
 pub fn word_embedder() -> SharedEmbedder {
@@ -183,6 +196,7 @@ async fn serve(
     toolsets: Option<&str>,
     embedder: SharedEmbedder,
     actor: &str,
+    fetcher: Option<SharedFetch>,
 ) -> anyhow::Result<Server> {
     let pool = pg::connect(database_url)?;
     pg::migrate(&pool).await?;
@@ -200,7 +214,7 @@ async fn serve(
         monobank: Monobank::new(http.clone()),
         userbot: Userbot::new(db.clone()),
         skills: SkillCatalog::new(PathBuf::from("skills"), PathBuf::from("../../skills.default")),
-        fetcher: fetch::guarded_client(),
+        fetcher: fetcher.unwrap_or_else(|| Arc::new(GuardedFetch::new())),
         storage_dir: std::env::temp_dir().join("mcp-specs-storage"),
         news: NewsRepository::new(pool.clone(), embedder.clone()),
         knowledge: KnowledgeRepository::new(pool.clone(), embedder.clone()),

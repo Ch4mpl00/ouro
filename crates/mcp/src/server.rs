@@ -54,7 +54,7 @@ pub struct Deps {
     pub userbot: Userbot,
     pub skills: SkillCatalog,
     // The SSRF-guarded client behind fetch_url (fetch.rs).
-    pub fetcher: reqwest::Client,
+    pub fetcher: crate::fetch::SharedFetch,
     // Where downloaded attachments land (STORAGE_DIR, default ./storage).
     pub storage_dir: PathBuf,
     pub news: NewsRepository,

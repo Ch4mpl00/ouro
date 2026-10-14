@@ -189,6 +189,20 @@ pub async fn test_pool() -> Option<PgPool> {
     Some(pool)
 }
 
+// A database of its own on the test server, migrated — for a test that
+// needs a table nobody else writes to.
+#[cfg(test)]
+pub async fn fresh_test_pool() -> Option<PgPool> {
+    let server = test_database_url()?;
+    let name = format!("t_{:016x}", rand::random::<u64>());
+    connect(&server).ok()?.get().await.ok()?.batch_execute(&format!("CREATE DATABASE {name}")).await.ok()?;
+    let mut config: tokio_postgres::Config = server.parse().ok()?;
+    config.dbname(&name);
+    let pool = connect_config(config).ok()?;
+    migrate(&pool).await.expect("migrations apply");
+    Some(pool)
+}
+
 #[cfg(test)]
 pub(crate) fn test_database_url() -> Option<String> {
     if let Ok(url) = std::env::var("TEST_DATABASE_URL") {
