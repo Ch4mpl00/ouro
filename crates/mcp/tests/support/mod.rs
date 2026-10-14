@@ -39,45 +39,27 @@ use rmcp::transport::StreamableHttpClientTransport;
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
 use rmcp::{RoleClient, ServiceExt};
 use serde_json::Value;
-use testcontainers_modules::postgres::Postgres;
-use testcontainers_modules::testcontainers::runners::AsyncRunner;
-use testcontainers_modules::testcontainers::{ContainerAsync, ImageExt};
 use tokio_util::sync::CancellationToken;
 
 // ── 1. database ──────────────────────────────────────────────────────────────
 
-// A container unless a throwaway database is named. Hold the container until
-// the run ends; dropping it removes it.
-pub async fn database() -> (String, Option<ContainerAsync<Postgres>>) {
-    if let Ok(url) = std::env::var("TEST_DATABASE_URL") {
-        return (url, None);
-    }
-    let pg = Postgres::default()
-        .with_name("pgvector/pgvector")
-        .with_tag("pg16")
-        .start()
-        .await
-        .expect("Docker is needed (or set TEST_DATABASE_URL)");
-    let port = pg.get_host_port_ipv4(5432).await.expect("mapped port");
-    (format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres"), Some(pg))
-}
+pub mod container;
 
 // A throwaway database pair for one test file, as packages/mcp's
-// test/support/database.ts: TEST_DATABASE_URL named → a fresh news database
-// and its own state database inside that server, dropped afterwards;
-// otherwise a container of our own.
+// test/support/database.ts: a fresh news database and its own state database
+// inside the server TEST_DATABASE_URL names, or else inside the shared test
+// container (support/container.rs). drop_all drops them; a file that holds
+// them in a static leaves them to the next day's sweep.
 pub struct TestDatabase {
     pub url: String,
     pub state_url: String,
-    admin: Option<String>,
+    admin: String,
     names: Vec<String>,
-    _container: Option<ContainerAsync<Postgres>>,
 }
 
 impl TestDatabase {
     pub async fn drop_all(self) {
-        let Some(admin) = self.admin else { return };
-        let Ok(pool) = pg::connect(&admin) else { return };
+        let Ok(pool) = pg::connect(&self.admin) else { return };
         let Ok(client) = pool.get().await else { return };
         for name in self.names {
             let _ = client.batch_execute(&format!("DROP DATABASE IF EXISTS {name} WITH (FORCE)")).await;
@@ -92,20 +74,17 @@ fn with_database(server_url: &str, name: &str) -> String {
 }
 
 pub async fn test_database() -> TestDatabase {
-    let (server, container) = database().await;
-    if container.is_some() {
-        let state_url = with_database(&server, "mcp_state");
-        return TestDatabase { url: server, state_url, admin: None, names: Vec::new(), _container: container };
-    }
-    let name = format!("t_{:016x}", rand::random::<u64>());
-    let pool = pg::connect(&server).expect("TEST_DATABASE_URL must parse");
-    pool.get().await.expect("test server").batch_execute(&format!("CREATE DATABASE {name}")).await.expect("create");
+    let server = match std::env::var("TEST_DATABASE_URL") {
+        Ok(url) => url,
+        Err(_) => container::shared_server().await.expect("Docker is needed (or set TEST_DATABASE_URL)"),
+    };
+    let name = container::database_name();
+    container::fresh_database(&server, &name).await.expect("create the test database");
     TestDatabase {
         url: with_database(&server, &name),
         state_url: with_database(&server, &format!("{name}_state")),
-        admin: Some(server),
+        admin: server,
         names: vec![format!("{name}_state"), name],
-        _container: None,
     }
 }
 
@@ -157,14 +136,9 @@ pub struct Server {
     pub scheduler: Scheduler,
 }
 
+// A server on a TestDatabase pair, as TS startServer(db.url, toolsets).
 // `toolsets`: the MCP_TOOLSETS value (None = every group). A restricted
 // instance is multi-session, as in production.
-pub async fn start_server(database_url: &str, toolsets: Option<&str>) -> anyhow::Result<Server> {
-    let db = Db::connect(database_url).await?;
-    serve(database_url, db, toolsets, Arc::new(WordEmbedder), "spec", None).await
-}
-
-// A server on a TestDatabase pair, as TS startServer(db.url, toolsets).
 pub async fn start_test_server(database: &TestDatabase, toolsets: Option<&str>) -> anyhow::Result<Server> {
     start_test_server_as(database, toolsets, "spec").await
 }

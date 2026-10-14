@@ -40,6 +40,9 @@ url = "2.5.8"
 cucumber = "0.23"
 proptest = "1"
 testcontainers-modules = { version = "0.15", features = ["postgres"] }
+# The same crate testcontainers-modules re-exports; only adds the feature that
+# lets every test process share one container (tests/support/container.rs).
+testcontainers = { version = "0.27", features = ["reusable-containers"] }
 
 # The executable specification: specs/*.feature, run against the real server.
 #   cargo test --test specs

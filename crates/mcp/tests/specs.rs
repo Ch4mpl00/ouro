@@ -28,7 +28,7 @@ use cucumber::writer::Stats as _;
 use cucumber::{World, given, then, when};
 use mcp_tools::scheduler;
 use serde_json::{Value, json};
-use support::{Client, Outcome, Server, connect, database, start_server};
+use support::{Client, Outcome, Server, connect, start_test_server, test_database};
 
 // ── 1. environment ───────────────────────────────────────────────────────────
 
@@ -390,8 +390,8 @@ async fn offers_tools(spec: &mut Spec, step: &Step) {
 
 #[tokio::main]
 async fn main() {
-    let (url, container) = database().await;
-    let env = start_server(&url, None).await.expect("server starts");
+    let db = test_database().await;
+    let env = start_test_server(&db, None).await.expect("server starts");
     let _ = ENV.set(env);
 
     let result = Spec::cucumber()
@@ -404,7 +404,7 @@ async fn main() {
         .run(concat!(env!("CARGO_MANIFEST_DIR"), "/../../packages/mcp/specs"))
         .await;
     let failed = result.execution_has_failed() || result.parsing_errors() > 0;
-    drop(container);
+    db.drop_all().await;
     if failed {
         std::process::exit(1);
     }

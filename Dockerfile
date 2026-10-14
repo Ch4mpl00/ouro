@@ -36,6 +36,10 @@ RUN set -eu; \
       echo "export CARGO_TARGET_${upper}_LINKER=${gnu}-gcc"; \
       echo "export CC_${lower}=${gnu}-gcc CXX_${lower}=${gnu}-g++ AR_${lower}=${gnu}-ar"; \
     } > /cross-env
+# Thirteen binaries link at once otherwise, and each release link of this
+# crate takes ~0.5 GB: an 8 GB Docker VM ran out (`ld … Killed`). ARGs reach
+# the RUN below as env, which cargo reads.
+ARG CARGO_BUILD_JOBS=4
 WORKDIR /src
 COPY Cargo.toml Cargo.lock rustfmt.toml ./
 COPY crates ./crates

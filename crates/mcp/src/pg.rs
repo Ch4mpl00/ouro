@@ -223,6 +223,12 @@ pub async fn fresh_test_pool() -> Option<PgPool> {
     Some(pool)
 }
 
+// The crate's unit tests share one database: TEST_DATABASE_URL's, or else a
+// fresh one in the shared test container, made once per test process.
+#[cfg(test)]
+#[path = "../tests/support/container.rs"]
+mod test_container;
+
 #[cfg(test)]
 pub(crate) fn test_database_url() -> Option<String> {
     if let Ok(url) = std::env::var("TEST_DATABASE_URL") {
@@ -230,31 +236,22 @@ pub(crate) fn test_database_url() -> Option<String> {
     }
     static URL: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
     URL.get_or_init(|| {
-        // Every #[tokio::test] has a runtime of its own that ends with the
-        // test, so the container lives on a thread and runtime of its own for
-        // the whole process.
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
-            runtime.block_on(async move {
-                use testcontainers_modules::postgres::Postgres;
-                use testcontainers_modules::testcontainers::ImageExt;
-                use testcontainers_modules::testcontainers::runners::AsyncRunner;
-                let Ok(container) = Postgres::default().with_name("pgvector/pgvector").with_tag("pg16").start().await
-                else {
-                    let _ = tx.send(None);
-                    return;
-                };
-                let url = match container.get_host_port_ipv4(5432).await {
-                    Ok(port) => Some(format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres")),
-                    Err(_) => None,
-                };
-                let _ = tx.send(url);
-                std::future::pending::<()>().await;
-                drop(container);
-            });
-        });
-        rx.recv().ok().flatten()
+        // Called from inside test runtimes, which can't be blocked on: the
+        // setup gets a thread and runtime of its own.
+        std::thread::spawn(|| {
+            let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().ok()?;
+            runtime.block_on(async {
+                let server = test_container::shared_server().await.ok()?;
+                let name = test_container::database_name();
+                test_container::fresh_database(&server, &name).await.ok()?;
+                let mut url = url::Url::parse(&server).ok()?;
+                url.set_path(&format!("/{name}"));
+                Some(url.to_string())
+            })
+        })
+        .join()
+        .ok()
+        .flatten()
     })
     .clone()
 }
