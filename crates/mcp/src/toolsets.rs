@@ -180,6 +180,8 @@ pub fn compose_router(names: &[Toolset]) -> ToolRouter<McpTools> {
 
 #[cfg(test)]
 mod tests {
+    use proptest::prelude::Strategy;
+
     use super::*;
 
     fn tool_names(names: &[Toolset]) -> Vec<String> {
@@ -313,5 +315,63 @@ mod tests {
         );
         // The agent owns synthetic tools with these names.
         assert!(!all.iter().any(|t| t == "list_skills" || t == "read_skill"));
+    }
+
+    #[test]
+    fn keeps_shared_tunnel_capabilities_in_the_default_surface() {
+        let all = tool_names(DEFAULT_TOOLSETS);
+        let restricted = tool_names(&[Toolset::NewsRead, Toolset::TelegramSend, Toolset::Skills]);
+        assert!(restricted.iter().filter(|n| *n != "list_skills" && *n != "read_skill").all(|n| all.contains(n)));
+        assert!(!all.iter().any(|t| t == "list_skills" || t == "read_skill"));
+        assert!(all.iter().any(|t| t == "get_next_signal"));
+        assert!(all.iter().any(|t| t == "get_telegram_chat_history"));
+    }
+
+    // Every known group, read from the error that names them — so a group
+    // added later is covered without touching this test.
+    fn every_group() -> Vec<Toolset> {
+        let err = parse_toolsets(Some("__none__")).unwrap_err().to_string();
+        let known = err.split("Known: ").nth(1).expect("the error names the known groups");
+        known.split(", ").map(|n| parse_toolsets(Some(n)).unwrap().names[0]).collect()
+    }
+
+    #[test]
+    fn knows_every_group() {
+        assert!(every_group().len() >= DEFAULT_TOOLSETS.len() + 2);
+    }
+
+    // Any MCP_TOOLSETS value an operator might write: a subset of the groups,
+    // in any order, repeated, padded. The instance serves exactly the union of
+    // what each chosen group serves on its own (toolsets.test.ts).
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(200))]
+
+        #[test]
+        fn serves_exactly_the_union_of_the_chosen_groups(
+            picked in proptest::sample::subsequence(every_group(), 1..=Toolset::ALL.len())
+                .prop_flat_map(|names| {
+                    let doubled: Vec<Toolset> = names.iter().chain(names.iter()).copied().collect();
+                    let n = names.len();
+                    proptest::sample::subsequence(doubled, n..=2 * n).prop_shuffle()
+                }),
+            pad in proptest::sample::select(vec!["", " ", "  "]),
+        ) {
+            use proptest::prelude::*;
+            let raw: Vec<String> = picked.iter().map(|t| format!("{pad}{}{pad}", t.name())).collect();
+            let raw = raw.join(",");
+            let selection = parse_toolsets(Some(&raw)).unwrap();
+            prop_assert!(selection.restricted);
+            let mut first_mention = Vec::new();
+            for t in &picked {
+                if !first_mention.contains(t) {
+                    first_mention.push(*t);
+                }
+            }
+            prop_assert_eq!(&selection.names, &first_mention, "{}: each group once, first mention first", raw);
+            let mut union: Vec<String> = selection.names.iter().flat_map(|t| tool_names(&[*t])).collect();
+            union.sort();
+            union.dedup();
+            prop_assert_eq!(tool_names(&selection.names), union, "{}", raw);
+        }
     }
 }

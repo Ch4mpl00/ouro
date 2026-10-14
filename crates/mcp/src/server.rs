@@ -274,11 +274,16 @@ pub struct HttpOptions {
     pub multi_session: bool,
 }
 
-pub async fn serve_http(
-    make_tools: impl Fn() -> McpTools + Send + Sync + 'static,
+// Generic over the handler so the transport's session rules can be tested on
+// their own (tests/http_transport.rs); production serves McpTools.
+pub async fn serve_http<S>(
+    make_tools: impl Fn() -> S + Send + Sync + 'static,
     options: HttpOptions,
     cancel: CancellationToken,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<()>
+where
+    S: ServerHandler + Send + 'static,
+{
     let mut config = if options.allowed_hosts.is_empty() {
         StreamableHttpServerConfig::default().disable_allowed_hosts()
     } else {
