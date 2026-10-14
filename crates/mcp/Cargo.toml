@@ -47,9 +47,10 @@ testcontainers-modules = { version = "0.15", features = ["postgres"] }
 name = "specs"
 harness = false
 
-# The reference model (model/, Lean) against the real server: random call
-# sequences, then concurrent histories checked for linearizability.
+# The reference model of memory documents (tests/model/model.rs) and the
+# real server against it: random call sequences, then concurrent histories
+# checked for linearizability.
 #   cargo test --test model
 [[test]]
 name = "model"
-harness = false
+path = "tests/model/main.rs"

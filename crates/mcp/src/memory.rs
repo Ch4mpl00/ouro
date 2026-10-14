@@ -4009,7 +4009,7 @@ mod journal_tests {
                     Ok(_) => {
                         assert!(valid);
                         let names: Vec<String> = service.list_journals().await.unwrap().into_iter().map(|s| s.name).collect();
-                        assert_eq!(names, [stream.clone()]);
+                        assert_eq!(names, std::slice::from_ref(&stream));
                     }
                     Err(err) => {
                         assert_eq!(err.downcast::<MemoryError>().expect("a MemoryError").code, "invalid_stream");
