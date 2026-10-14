@@ -190,7 +190,7 @@ pub async fn test_pool() -> Option<PgPool> {
 }
 
 #[cfg(test)]
-fn test_database_url() -> Option<String> {
+pub(crate) fn test_database_url() -> Option<String> {
     if let Ok(url) = std::env::var("TEST_DATABASE_URL") {
         return Some(url);
     }

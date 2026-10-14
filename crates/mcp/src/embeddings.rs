@@ -3,6 +3,7 @@
 // Sections:
 //   1. embedder  — the `Embedder` port + the OpenAI implementation
 //   2. retrieval — cosine distance and near-duplicate filtering
+//   3. backfill  — draining the NULL-vector backlog a failed inline embed left
 //
 // Generic infrastructure: nothing here knows a table. Domains (news,
 // knowledge, memory) compose the text they embed and store the vectors.
@@ -170,6 +171,115 @@ pub fn dedup_by_pairwise_cosine<T>(
         }
     }
     kept
+}
+
+// ── 3. backfill ──────────────────────────────────────────────────────────────
+
+// Draining the NULL-vector backlog a store keeps after a failed inline embed
+// (`embed-backfill`). Store-agnostic: each store selects its rows in id
+// order past a cursor, embeds them with `embed_isolating` and writes back.
+
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+pub struct BackfillBatch {
+    pub embedded: usize,
+    pub failed: usize,
+    // The last id this batch looked at; None when nothing is left past the
+    // cursor.
+    pub last_id: Option<i64>,
+    // The embedder itself is down: a batch failed and so did a known-good
+    // probe. Nothing later in the backlog would fare better.
+    pub unavailable: bool,
+}
+
+// A text any embedder accepts, to tell "the embedder is down" from "it
+// rejects one of these inputs".
+const PROBE: &str = "probe";
+
+// One request for the batch. When it fails: if a probe fails too, the
+// embedder is down (None); otherwise some input is rejected — one bad input
+// fails a whole request — so each text is tried on its own and only the
+// rejected ones come back None.
+pub async fn embed_isolating(embedder: &dyn Embedder, texts: &[String]) -> Option<Vec<Option<Vec<f32>>>> {
+    if texts.is_empty() {
+        return Some(Vec::new());
+    }
+    match embedder.embed_batch(texts).await {
+        Ok(vectors) => {
+            let mut vectors = vectors.into_iter();
+            Some(texts.iter().map(|_| vectors.next()).collect())
+        }
+        Err(_) => {
+            embed_one(embedder, PROBE).await.ok()?;
+            let mut out = Vec::with_capacity(texts.len());
+            for text in texts {
+                out.push(embed_one(embedder, text).await.ok());
+            }
+            Some(out)
+        }
+    }
+}
+
+// One batch of a store's backlog: `rows` are (id, text) in id order; `write`
+// stores one vector. Shared by the stores' `embed_missing_batch`, which only
+// select and write.
+pub async fn backfill_rows<W, F>(
+    embedder: &dyn Embedder,
+    rows: &[(i64, String)],
+    mut write: W,
+) -> anyhow::Result<BackfillBatch>
+where
+    W: FnMut(i64, Vec<f32>) -> F,
+    F: std::future::Future<Output = anyhow::Result<()>>,
+{
+    let last_id = rows.iter().map(|(id, _)| *id).max();
+    if rows.is_empty() {
+        return Ok(BackfillBatch::default());
+    }
+    let texts: Vec<String> = rows.iter().map(|(_, text)| text.clone()).collect();
+    let Some(vectors) = embed_isolating(embedder, &texts).await else {
+        return Ok(BackfillBatch { embedded: 0, failed: rows.len(), last_id, unavailable: true });
+    };
+    let mut embedded = 0;
+    for ((id, _), vector) in rows.iter().zip(vectors) {
+        if let Some(vector) = vector {
+            write(*id, vector).await?;
+            embedded += 1;
+        }
+    }
+    Ok(BackfillBatch { embedded, failed: rows.len() - embedded, last_id, unavailable: false })
+}
+
+// One pass over the backlog in id order: every row is tried once, so a row
+// the embedder rejects for good can't hold up the rows behind it. Stops early
+// only when the embedder is down. Returns (embedded, failed).
+pub async fn drain_missing<N, F>(
+    label: &str,
+    batch_size: i64,
+    log: &dyn Fn(&str),
+    mut next: N,
+) -> anyhow::Result<(usize, usize)>
+where
+    N: FnMut(i64, i64) -> F,
+    F: std::future::Future<Output = anyhow::Result<BackfillBatch>>,
+{
+    let (mut embedded, mut failed, mut after_id) = (0, 0, 0);
+    loop {
+        let batch = next(batch_size, after_id).await?;
+        let Some(last_id) = batch.last_id else { break };
+        embedded += batch.embedded;
+        failed += batch.failed;
+        log(&format!(
+            "[embed-backfill:{label}] batch: embedded={}, failed={} (running totals: {embedded}/{failed})",
+            batch.embedded, batch.failed
+        ));
+        if batch.unavailable {
+            log(&format!("[embed-backfill:{label}] the embedder is unavailable; giving up"));
+            break;
+        }
+        after_id = last_id;
+    }
+    log(&format!("[embed-backfill:{label}] done: embedded={embedded}, failed={failed}"));
+    Ok((embedded, failed))
 }
 
 #[cfg(test)]

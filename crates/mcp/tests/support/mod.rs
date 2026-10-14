@@ -56,6 +56,53 @@ pub async fn database() -> (String, Option<ContainerAsync<Postgres>>) {
     (format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres"), Some(pg))
 }
 
+// A throwaway database pair for one test file, as packages/mcp's
+// test/support/database.ts: TEST_DATABASE_URL named → a fresh news database
+// and its own state database inside that server, dropped afterwards;
+// otherwise a container of our own.
+pub struct TestDatabase {
+    pub url: String,
+    pub state_url: String,
+    admin: Option<String>,
+    names: Vec<String>,
+    _container: Option<ContainerAsync<Postgres>>,
+}
+
+impl TestDatabase {
+    pub async fn drop_all(self) {
+        let Some(admin) = self.admin else { return };
+        let Ok(pool) = pg::connect(&admin) else { return };
+        let Ok(client) = pool.get().await else { return };
+        for name in self.names {
+            let _ = client.batch_execute(&format!("DROP DATABASE IF EXISTS {name} WITH (FORCE)")).await;
+        }
+    }
+}
+
+fn with_database(server_url: &str, name: &str) -> String {
+    let mut url = url::Url::parse(server_url).expect("a database URL");
+    url.set_path(&format!("/{name}"));
+    url.to_string()
+}
+
+pub async fn test_database() -> TestDatabase {
+    let (server, container) = database().await;
+    if container.is_some() {
+        let state_url = with_database(&server, "mcp_state");
+        return TestDatabase { url: server, state_url, admin: None, names: Vec::new(), _container: container };
+    }
+    let name = format!("t_{:016x}", rand::random::<u64>());
+    let pool = pg::connect(&server).expect("TEST_DATABASE_URL must parse");
+    pool.get().await.expect("test server").batch_execute(&format!("CREATE DATABASE {name}")).await.expect("create");
+    TestDatabase {
+        url: with_database(&server, &name),
+        state_url: with_database(&server, &format!("{name}_state")),
+        admin: Some(server),
+        names: vec![format!("{name}_state"), name],
+        _container: None,
+    }
+}
+
 // ── 2. server ────────────────────────────────────────────────────────────────
 
 // Deterministic stand-in for the embedding model: a bag-of-words vector, so
@@ -65,19 +112,35 @@ struct WordEmbedder;
 #[async_trait]
 impl Embedder for WordEmbedder {
     async fn embed_batch(&self, texts: &[String]) -> anyhow::Result<Vec<Vec<f32>>> {
-        Ok(texts
-            .iter()
-            .map(|text| {
-                let mut v = vec![0f32; 1536];
-                for token in text.to_lowercase().split(|c: char| !c.is_alphanumeric()).filter(|t| !t.is_empty()) {
-                    let hash = token.chars().fold(0u64, |h, c| (h * 31 + u64::from(c)) % 1536);
-                    v[hash as usize] += 1.0;
-                }
-                let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt().max(f32::EPSILON);
-                v.iter().map(|x| x / norm).collect()
-            })
-            .collect())
+        Ok(word_vectors(texts))
     }
+}
+
+pub fn word_vectors(texts: &[String]) -> Vec<Vec<f32>> {
+    texts
+        .iter()
+        .map(|text| {
+            let mut v = vec![0f32; 1536];
+            for token in text.to_lowercase().split(|c: char| !c.is_alphanumeric()).filter(|t| !t.is_empty()) {
+                let hash = token.chars().fold(0u64, |h, c| (h * 31 + u64::from(c)) % 1536);
+                v[hash as usize] += 1.0;
+            }
+            let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt().max(f32::EPSILON);
+            v.iter().map(|x| x / norm).collect()
+        })
+        .collect()
+}
+
+// Property tests drive one server across many cases, so the server, its
+// database and every case run on one runtime that outlives each test fn.
+pub fn runtime() -> &'static tokio::runtime::Runtime {
+    static RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+    RUNTIME.get_or_init(|| tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("runtime"))
+}
+
+// The number of generated cases, PROPERTY_RUNS when set (as in the TS suites).
+pub fn property_runs(default: u32) -> u32 {
+    std::env::var("PROPERTY_RUNS").ok().and_then(|v| v.parse().ok()).unwrap_or(default)
 }
 
 pub struct Server {
@@ -91,11 +154,24 @@ pub struct Server {
 // `toolsets`: the MCP_TOOLSETS value (None = every group). A restricted
 // instance is multi-session, as in production.
 pub async fn start_server(database_url: &str, toolsets: Option<&str>) -> anyhow::Result<Server> {
+    let db = Db::connect(database_url).await?;
+    serve(database_url, db, toolsets, Arc::new(WordEmbedder)).await
+}
+
+// A server on a TestDatabase pair, as TS startServer(db.url, toolsets).
+pub async fn start_test_server(database: &TestDatabase, toolsets: Option<&str>) -> anyhow::Result<Server> {
+    let db = Db::connect_state(&database.url, &database.state_url).await?;
+    serve(&database.url, db, toolsets, Arc::new(WordEmbedder)).await
+}
+
+pub fn word_embedder() -> SharedEmbedder {
+    Arc::new(WordEmbedder)
+}
+
+async fn serve(database_url: &str, db: Db, toolsets: Option<&str>, embedder: SharedEmbedder) -> anyhow::Result<Server> {
     let pool = pg::connect(database_url)?;
     pg::migrate(&pool).await?;
-    let db = Db::connect(database_url).await?;
     let http = reqwest::Client::new();
-    let embedder: SharedEmbedder = Arc::new(WordEmbedder);
     let settings = Settings::new(db.clone());
     let signals = Signals::new(db.clone());
     let scheduler = Scheduler::new(db.clone(), settings.clone());

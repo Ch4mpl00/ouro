@@ -59,12 +59,22 @@ impl Db {
         Ok(self.pool.get().await?)
     }
 
-    // A fresh schema per test inside TEST_DATABASE_URL, selected through
-    // search_path, so parallel tests never see each other's rows. None (the
-    // test returns early) without a test database.
+    // The state database at an explicit URL, created if missing — for a
+    // test that puts the news store and the state of one server in a fresh
+    // pair of databases.
+    pub async fn connect_state(database_url: &str, state_database_url: &str) -> anyhow::Result<Self> {
+        let config: Config = state_database_url.parse()?;
+        ensure_database(database_url, &config).await?;
+        Self::open(config).await
+    }
+
+    // A fresh schema per test inside the test database (TEST_DATABASE_URL or
+    // a container, see pg::test_pool), selected through search_path, so
+    // parallel tests never see each other's rows. None (the test returns
+    // early) without Docker or a named database.
     #[cfg(test)]
     pub async fn test() -> Option<Self> {
-        let url = std::env::var("TEST_DATABASE_URL").ok()?;
+        let url = pg::test_database_url()?;
         let schema = format!("t_{:016x}", rand::random::<u64>());
         let admin = pg::connect(&url).expect("TEST_DATABASE_URL must parse");
         admin.get().await.unwrap().batch_execute(&format!("CREATE SCHEMA {schema}")).await.unwrap();

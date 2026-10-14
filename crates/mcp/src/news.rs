@@ -23,7 +23,9 @@ use serde_json::{Map, Value, json};
 use tokio_postgres::Row;
 use tokio_util::sync::CancellationToken;
 
-use crate::embeddings::{DEFAULT_DEDUP_THRESHOLD, SharedEmbedder, dedup_by_pairwise_cosine};
+use crate::embeddings::{
+    BackfillBatch, DEFAULT_DEDUP_THRESHOLD, SharedEmbedder, backfill_rows, dedup_by_pairwise_cosine,
+};
 use crate::fetch::BROWSER_UA;
 use crate::pg::{PgPool, Query, parse_vector, vector_literal, where_clause};
 use crate::server::{McpTools, ToolResult, invalid_params, respond};
@@ -778,14 +780,27 @@ impl NewsRepository {
         Ok(rows.iter().map(pool_row).collect())
     }
 
-    pub async fn embed_missing_batch(&self, batch: i64) -> anyhow::Result<EmbedResult> {
-        let sql = "SELECT id, title, body FROM news_items WHERE embedding IS NULL LIMIT $1";
+    // Rows a failed inline embed left NULL, past `after_id` in id order —
+    // one batch of embeddings::drain_missing.
+    pub async fn embed_missing_batch(&self, batch: i64, after_id: i64) -> anyhow::Result<BackfillBatch> {
+        let sql = "SELECT id, title, body FROM news_items WHERE embedding IS NULL AND id > $2 ORDER BY id LIMIT $1";
         let rows = {
             let client = self.pool.get().await?;
-            client.query(sql, &[&batch]).await?
+            client.query(sql, &[&batch, &after_id]).await?
         };
-        let pending: Vec<EmbedRow> = rows.iter().map(EmbedRow::from_row).collect();
-        self.embed(&pending).await
+        let pending: Vec<(i64, String)> = rows.iter().map(EmbedRow::from_row).map(|r| (r.id, r.text())).collect();
+        let pool = &self.pool;
+        backfill_rows(&*self.embedder, &pending, |id, vector| async move {
+            pool.get()
+                .await?
+                .execute(
+                    "UPDATE news_items SET embedding = $1::text::vector, embedded_at = now() WHERE id = $2",
+                    &[&vector_literal(&vector), &id],
+                )
+                .await?;
+            Ok(())
+        })
+        .await
     }
 }
 
@@ -1434,7 +1449,7 @@ mod tests {
             SaveResult { saved: 1, embedded: 0, failed: 1 }
         );
         embedder.set_down(false);
-        assert!(repo.embed_missing_batch(1000).await.unwrap().embedded >= 1);
+        assert!(repo.embed_missing_batch(1000, 0).await.unwrap().embedded >= 1);
         assert_eq!(
             repo.search(&["embedder was down".into()], 1, &filter, false).await.unwrap()[0].url.as_deref(),
             Some("https://example.com/d")
@@ -1479,7 +1494,7 @@ mod tests {
             let unembedded = NewsItem { external_id: "b".into(), ..news };
             assert_eq!(repo.save(&[unembedded]).await.unwrap().failed, 1);
             embedder.set_down(false);
-            assert!(repo.embed_missing_batch(1000).await.unwrap().embedded >= 1);
+            assert!(repo.embed_missing_batch(1000, 0).await.unwrap().embedded >= 1);
         })
         .await
         .expect("save, upsert and backfill must work with a single pooled connection");

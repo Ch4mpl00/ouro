@@ -12,7 +12,7 @@ use rmcp::{schemars, tool, tool_router};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use crate::embeddings::{SharedEmbedder, embed_one};
+use crate::embeddings::{BackfillBatch, SharedEmbedder, backfill_rows, embed_one};
 use crate::news::EmbedResult;
 use crate::pg::{PgPool, vector_literal};
 use crate::server::{McpTools, ToolResult, invalid_params, respond};
@@ -133,15 +133,32 @@ impl KnowledgeRepository {
             .collect())
     }
 
-    pub async fn embed_missing_batch(&self, batch: i64) -> anyhow::Result<EmbedResult> {
+    // Rows a failed inline embed left NULL, past `after_id` in id order —
+    // one batch of embeddings::drain_missing.
+    pub async fn embed_missing_batch(&self, batch: i64, after_id: i64) -> anyhow::Result<BackfillBatch> {
         let rows = self
             .pool
             .get()
             .await?
-            .query("SELECT id, body FROM knowledge_base_notes WHERE embedding IS NULL LIMIT $1", &[&batch])
+            .query(
+                "SELECT id, body FROM knowledge_base_notes WHERE embedding IS NULL AND id > $2 ORDER BY id LIMIT $1",
+                &[&batch, &after_id],
+            )
             .await?;
-        let rows: Vec<(i64, String)> = rows.iter().map(|r| (r.get(0), r.get(1))).collect();
-        self.embed_rows(&rows).await
+        let rows: Vec<(i64, String)> =
+            rows.iter().map(|r| (r.get(0), r.get::<_, String>(1).trim().to_owned())).collect();
+        let pool = &self.pool;
+        backfill_rows(&*self.embedder, &rows, |id, vector| async move {
+            pool.get()
+                .await?
+                .execute(
+                    "UPDATE knowledge_base_notes SET embedding = $1::text::vector, embedded_at = now() WHERE id = $2",
+                    &[&vector_literal(&vector), &id],
+                )
+                .await?;
+            Ok(())
+        })
+        .await
     }
 
     // Every note, for the one-shot import into memory facts.

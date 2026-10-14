@@ -33,7 +33,7 @@ use rmcp::{schemars, tool, tool_router};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
-use crate::embeddings::SharedEmbedder;
+use crate::embeddings::{BackfillBatch, SharedEmbedder, backfill_rows};
 use crate::pg::{PgPool, vector_literal};
 use crate::server::{McpTools, ToolResult, invalid_params, json_result, tool_failed};
 use crate::time::iso;
@@ -716,6 +716,14 @@ pub struct AppendEntry<'a> {
     pub default_capacity: i32,
 }
 
+// What an index row set was built from: the fact as it was read, or the
+// document version.
+#[derive(Debug, Clone, PartialEq)]
+pub enum IndexBasis {
+    Fact { id: i64, body: String, tags: Vec<String>, state: MemoryState },
+    Doc { doc_id: i64, version: i32 },
+}
+
 pub struct FactUpdate<'a> {
     pub body: Option<&'a str>,
     pub tags: Option<Vec<String>>,
@@ -766,8 +774,18 @@ pub trait MemoryStore: Send + Sync {
     async fn update_fact(&self, id: i64, update: FactUpdate<'_>) -> anyhow::Result<Option<Fact>>;
 
     // Replaces every row owned by `source_ref`, so a shrunken document leaves
-    // no orphaned chunks answering recalls.
-    async fn replace_index(&self, source_ref: &str, entries: Vec<IndexUpsert>) -> anyhow::Result<()>;
+    // no orphaned chunks answering recalls — but only while the source still
+    // looks like `basis` (what the entries were built from). Two writes racing
+    // on one source finish embedding in either order; the stale one finds the
+    // source moved on and writes nothing, leaving the rows to the later
+    // write's re-index. Re-indexes of one source run one at a time. Returns
+    // whether the rows were written.
+    async fn replace_index(
+        &self,
+        source_ref: &str,
+        entries: Vec<IndexUpsert>,
+        basis: &IndexBasis,
+    ) -> anyhow::Result<bool>;
     async fn search_index(
         &self,
         embedding: &[f32],
@@ -775,7 +793,9 @@ pub trait MemoryStore: Send + Sync {
         states: &[MemoryState],
         tags: &[String],
     ) -> anyhow::Result<Vec<IndexHit>>;
-    async fn list_unembedded(&self, limit: i64) -> anyhow::Result<Vec<(i64, String)>>;
+    // Rows whose inline embed failed (provider down), past `after_id` in id
+    // order. Drained by the backfill.
+    async fn list_unembedded(&self, limit: i64, after_id: i64) -> anyhow::Result<Vec<(i64, String)>>;
     async fn set_embedding(&self, id: i64, embedding: &[f32]) -> anyhow::Result<()>;
 
     // The journal. One append creates the stream if needed, stores the entry
@@ -1045,11 +1065,36 @@ impl MemoryStore for PgMemoryStore {
         Ok(row.as_ref().map(fact_of))
     }
 
-    async fn replace_index(&self, source_ref: &str, entries: Vec<IndexUpsert>) -> anyhow::Result<()> {
+    async fn replace_index(
+        &self,
+        source_ref: &str,
+        entries: Vec<IndexUpsert>,
+        basis: &IndexBasis,
+    ) -> anyhow::Result<bool> {
         // Delete-then-insert in one transaction rather than upsert: a
-        // re-indexed document can have fewer chunks than before.
+        // re-indexed document can have fewer chunks than before. The source
+        // row is locked first, so re-indexes of one source can't interleave
+        // their delete and insert (which doubled the rows), and the check sees
+        // the source's latest committed state.
         let mut client = self.pool.get().await?;
         let tx = client.transaction().await?;
+        let current = match basis {
+            IndexBasis::Fact { id, body, tags, state } => tx
+                .query_opt("SELECT body, tags, state FROM memory_facts WHERE id = $1 FOR UPDATE", &[id])
+                .await?
+                .is_some_and(|r| {
+                    r.get::<_, String>(0) == *body
+                        && r.get::<_, Vec<String>>(1) == *tags
+                        && r.get::<_, String>(2) == state.as_str()
+                }),
+            IndexBasis::Doc { doc_id, version } => tx
+                .query_opt("SELECT version FROM memory_project_docs WHERE id = $1 FOR UPDATE", &[doc_id])
+                .await?
+                .is_some_and(|r| r.get::<_, i32>(0) == *version),
+        };
+        if !current {
+            return Ok(false);
+        }
         tx.execute("DELETE FROM memory_index WHERE source_ref = $1", &[&source_ref]).await?;
         for e in &entries {
             let embedding = e.embedding.as_deref().map(vector_literal);
@@ -1061,7 +1106,7 @@ impl MemoryStore for PgMemoryStore {
             .await?;
         }
         tx.commit().await?;
-        Ok(())
+        Ok(true)
     }
 
     async fn search_index(
@@ -1100,12 +1145,15 @@ impl MemoryStore for PgMemoryStore {
             .collect())
     }
 
-    async fn list_unembedded(&self, limit: i64) -> anyhow::Result<Vec<(i64, String)>> {
+    async fn list_unembedded(&self, limit: i64, after_id: i64) -> anyhow::Result<Vec<(i64, String)>> {
         let rows = self
             .pool
             .get()
             .await?
-            .query("SELECT id, text FROM memory_index WHERE embedding IS NULL LIMIT $1", &[&limit])
+            .query(
+                "SELECT id, text FROM memory_index WHERE embedding IS NULL AND id > $2 ORDER BY id LIMIT $1",
+                &[&limit, &after_id],
+            )
             .await?;
         Ok(rows.iter().map(|r| (r.get(0), r.get(1))).collect())
     }
@@ -1270,7 +1318,8 @@ impl Indexer {
             .collect();
         // Always replace, even with nothing: an emptied document must stop
         // answering from its old chunks.
-        self.store.replace_index(&owner, entries).await
+        self.store.replace_index(&owner, entries, &IndexBasis::Doc { doc_id: doc.id, version: doc.version }).await?;
+        Ok(())
     }
 
     pub async fn index_fact(&self, fact: &Fact) -> anyhow::Result<()> {
@@ -1290,26 +1339,18 @@ impl Indexer {
                     ts: fact.updated_at,
                     embedding,
                 }],
+                &IndexBasis::Fact { id: fact.id, body: fact.body.clone(), tags: fact.tags.clone(), state: fact.state },
             )
-            .await
+            .await?;
+        Ok(())
     }
 
-    // Rows a failed inline embed left NULL. 0/0 when drained.
-    pub async fn embed_missing_batch(&self, batch: i64) -> anyhow::Result<crate::news::EmbedResult> {
-        let rows = self.store.list_unembedded(batch).await?;
-        if rows.is_empty() {
-            return Ok(crate::news::EmbedResult::default());
-        }
-        let texts: Vec<String> = rows.iter().map(|(_, t)| t.clone()).collect();
-        let vectors = self.embed_texts(&texts).await;
-        let mut embedded = 0;
-        for ((id, _), vector) in rows.iter().zip(vectors) {
-            if let Some(vector) = vector {
-                self.store.set_embedding(*id, &vector).await?;
-                embedded += 1;
-            }
-        }
-        Ok(crate::news::EmbedResult { embedded, failed: rows.len() - embedded })
+    // One batch of the rows a failed inline embed left NULL, past `after_id`
+    // in id order — see embeddings::drain_missing.
+    pub async fn embed_missing_batch(&self, batch: i64, after_id: i64) -> anyhow::Result<BackfillBatch> {
+        let rows = self.store.list_unembedded(batch, after_id).await?;
+        let store = &self.store;
+        backfill_rows(&*self.embedder, &rows, |id, vector| async move { store.set_embedding(id, &vector).await }).await
     }
 
     // None when the provider is unreachable — recall reports "search is
@@ -2719,14 +2760,32 @@ pub mod testing {
             Ok(Some(fact.clone()))
         }
 
-        async fn replace_index(&self, source_ref: &str, entries: Vec<IndexUpsert>) -> anyhow::Result<()> {
+        async fn replace_index(
+            &self,
+            source_ref: &str,
+            entries: Vec<IndexUpsert>,
+            basis: &IndexBasis,
+        ) -> anyhow::Result<bool> {
             let mut s = self.lock();
+            let current = match basis {
+                IndexBasis::Fact { id, body, tags, state } => s
+                    .facts
+                    .iter()
+                    .find(|f| f.id == *id)
+                    .is_some_and(|f| f.body == *body && f.tags == *tags && f.state == *state),
+                IndexBasis::Doc { doc_id, version } => {
+                    s.docs.iter().find(|d| d.id == *doc_id).is_some_and(|d| d.version == *version)
+                }
+            };
+            if !current {
+                return Ok(false);
+            }
             s.index.retain(|(_, e)| e.source_ref != source_ref);
             for entry in entries {
                 let id = next(&mut s);
                 s.index.push((id, entry));
             }
-            Ok(())
+            Ok(true)
         }
 
         async fn search_index(
@@ -2759,12 +2818,12 @@ pub mod testing {
             Ok(hits)
         }
 
-        async fn list_unembedded(&self, limit: i64) -> anyhow::Result<Vec<(i64, String)>> {
+        async fn list_unembedded(&self, limit: i64, after_id: i64) -> anyhow::Result<Vec<(i64, String)>> {
             Ok(self
                 .lock()
                 .index
                 .iter()
-                .filter(|(_, e)| e.embedding.is_none())
+                .filter(|(id, e)| e.embedding.is_none() && *id > after_id)
                 .take(limit as usize)
                 .map(|(id, e)| (*id, e.text.clone()))
                 .collect())
@@ -3319,9 +3378,9 @@ mod tests {
         );
 
         h.embedder.set_down(false);
-        let drained = h.service.indexer().embed_missing_batch(100).await.unwrap();
+        let drained = h.service.indexer().embed_missing_batch(100, 0).await.unwrap();
         assert_eq!((drained.embedded, drained.failed), (1, 0));
-        assert_eq!(h.service.indexer().embed_missing_batch(100).await.unwrap().embedded, 0);
+        assert_eq!(h.service.indexer().embed_missing_batch(100, 0).await.unwrap().embedded, 0);
         assert_eq!(
             h.service.recall("новый текст", None, None, None, Utc::now()).await.unwrap()[0].r#ref,
             "doc:p/a.md#0"
