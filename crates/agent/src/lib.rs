@@ -1,7 +1,7 @@
 // Runtime library for the Rust agent port. Clients and stores are injected
 // into the engine; TS judge / improver tooling reads the same agent.db and
-// canonical Langfuse trace shapes. Workflow and supervisor wiring are tracked
-// in .claude/tasks/rust-agent.md.
+// canonical Langfuse trace shapes. agent-supervisor composes the runtime;
+// progress and rollout checks live in .claude/tasks/rust-agent.md.
 
 pub mod agent;
 pub mod codex;
@@ -19,3 +19,7 @@ pub mod skills;
 pub mod tool_results;
 pub mod trace_model;
 pub mod tracing;
+
+pub mod activity;
+pub mod supervisor;
+pub mod workflow;

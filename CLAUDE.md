@@ -24,6 +24,16 @@ mirror `packages/mcp/test/*.test.ts`). **A fix in one server goes into the
 other**, with its test, until the TS server is retired. Status and history:
 `.claude/tasks/rust-rewrite.md`.
 
+
+**The agent runtime also exists twice.** `crates/agent` contains the Rust
+runtime; compose selects `agent-supervisor`. The TypeScript runtime in
+`packages/agent` remains available with
+`command: sh -c "pnpm setup:agent && pnpm agent:start"`. Both use the same
+`agent.db` migrations and trace shapes. Offline judging, improvement, GAIA and
+CLI scripts stay in TypeScript. Fix shared runtime contracts in both ports;
+run `cargo test -p agent` and `pnpm typecheck`. The Rust binary handles SQLite
+migrations itself. Port status and rollout evidence: `.claude/tasks/rust-agent.md`.
+
 ## How a signal turns into action
 
 1. A poller inside `packages/mcp` fires on its own cadence — Gmail (1 min),

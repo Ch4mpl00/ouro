@@ -200,7 +200,8 @@ same Postgres migrations, so either one boots on what the other left.
 ### Agent continuation — 2026-10-14
 
 `feat/rust-agent` in `.claude/worktrees/rust-agent` now contains a tested Rust
-runtime library (providers, tracing, SQLite, MCP client, engine / ReAct loop,
-synthetic tools, Codex and typed decisions). Workflow / supervisor / image
-wiring remain; production still runs the TS agent. Detailed progress, library
+runtime (providers, tracing, SQLite, MCP client, engine / ReAct loop,
+synthetic tools, Codex, decisions, workflow, supervisor and activity journal).
+The `agent-supervisor` binary and compose switch are prepared and tested locally;
+Linux image verification and deployment remain. Production still runs the TS agent. Detailed progress, library
 mapping and the exact continuation point: [rust-agent.md](rust-agent.md).

@@ -189,7 +189,8 @@ services:
   agent:
     build: .
     image: mcp-tools-image
-    command: sh -c "pnpm setup:agent && pnpm agent:start"
+    command: agent-supervisor
+    # Rollback: sh -c "pnpm setup:agent && pnpm agent:start"
     env_file: .env.agent
     environment:
       MCP_TRANSPORT: http

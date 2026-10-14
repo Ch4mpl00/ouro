@@ -1,0 +1,335 @@
+// Supervisor domain: 1. signal / Telegram context; 2. routing and recovery;
+// 3. serial queue loop. Composition and OS signals live in main.rs.
+use crate::{
+    activity::{ACTIVITY_STREAM, tail_utf16},
+    agent::{AgentLoop, Engine, LoopOptions},
+    errors::{aborted, check, is_aborted},
+    mcp::{Mcp, SharedMcp},
+    session::{EnvDeps, Format, Session, gather_env_data, render_context, session},
+    tool_results::is_tool_error,
+    tracing::{ContextUpdate, EventStart, Level, Scope, Span, SpanEnd, SpanKind, SpanStart, Trace, TraceStart},
+    workflow::{RunResult, WorkflowRun, WorkflowSignal},
+};
+use regex::Regex;
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use std::sync::{Arc, LazyLock};
+use std::time::Duration;
+use tokio_util::sync::CancellationToken;
+
+pub const POLL_INTERVAL: Duration = Duration::from_secs(2);
+pub const TELEGRAM_HISTORY_KEY: &str = "telegram.history";
+pub const TELEGRAM_HISTORY_LIMIT: usize = 20;
+pub const TELEGRAM_HISTORY_MAX_BYTES: usize = 8000;
+pub const RECENT_ACTIVITY_LIMIT: usize = 10;
+pub const RECENT_ACTIVITY_MAX_BYTES: usize = 8000;
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PendingSignal {
+    pub id: i64,
+    pub source: String,
+    pub content: String,
+    #[serde(rename = "envContext", deserialize_with = "required_nullable")]
+    pub env_context: Option<String>,
+    pub created_at: String,
+}
+impl PendingSignal {
+    fn workflow_signal(&self) -> WorkflowSignal {
+        WorkflowSignal {
+            id: self.id,
+            source: self.source.clone(),
+            content: self.content.clone(),
+            env_context: self.env_context.clone(),
+        }
+    }
+}
+#[derive(Deserialize)]
+pub struct NextSignal {
+    #[serde(deserialize_with = "required_nullable")]
+    pub signal: Option<PendingSignal>,
+    #[serde(rename = "pendingAfter")]
+    pub pending_after: i64,
+}
+// Nullable MCP fields are required: serde's default for Option otherwise
+// accepts absent fields which the TypeScript Zod contract rejects.
+fn required_nullable<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer)
+}
+pub fn timestamp(value: &str) -> Option<i64> {
+    chrono::DateTime::parse_from_rfc3339(value).map(|t| t.timestamp_millis()).ok().or_else(|| {
+        chrono::NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S").ok().map(|t| t.and_utc().timestamp_millis())
+    })
+}
+static TELEGRAM_HEADER: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?s)^Telegram message in chat (-?\d+)(?: \(forum topic thread_id=(\d+)\))?\.\nText: (.+)$").unwrap()
+});
+pub fn inline_history(history: &[Value]) -> (Vec<Value>, bool) {
+    let mut messages = Vec::new();
+    for message in history.iter().rev() {
+        let context = json!({"role":message["role"],"text":message["text"],"created_at":message["created_at"]});
+        let mut trial = vec![context.clone()];
+        trial.extend(messages.clone());
+        if json!(trial).to_string().len() > TELEGRAM_HISTORY_MAX_BYTES {
+            if messages.is_empty() {
+                let mut clipped = context;
+                clipped["text"] = json!("…");
+                clipped["truncated"] = true.into();
+                let mut remaining =
+                    TELEGRAM_HISTORY_MAX_BYTES.saturating_sub(json!([clipped.clone()]).to_string().len());
+                let text = message["text"].as_str().unwrap_or_default();
+                let mut tail = Vec::new();
+                for c in text.chars().rev() {
+                    let bytes = json!(c.to_string()).to_string().len() - 2;
+                    if bytes > remaining {
+                        break;
+                    }
+                    remaining -= bytes;
+                    tail.push(c);
+                }
+                clipped["text"] = json!(format!("…{}", tail.into_iter().rev().collect::<String>()));
+                messages.push(clipped);
+            }
+            return (messages, true);
+        }
+        messages.insert(0, context);
+    }
+    (messages, false)
+}
+fn unavailable(signal: &PendingSignal) -> String {
+    format!(
+        "Recent Telegram history is unavailable. Use the current request; fetch context only if needed.\n\n## Current Telegram signal\n{}",
+        signal.content
+    )
+}
+pub async fn prepare_telegram_input(
+    signal: &PendingSignal,
+    context: &Session,
+    mcp: &dyn Mcp,
+    trace: &Scope,
+    cancel: &CancellationToken,
+) -> anyhow::Result<String> {
+    check(cancel)?;
+    if signal.source != "telegram" {
+        return Ok(signal.content.clone());
+    }
+    let Some(header) = TELEGRAM_HEADER.captures(&signal.content) else {
+        return Ok(unavailable(signal));
+    };
+    let chat_id = &header[1];
+    let thread_id = header.get(2).map(|s| s.as_str().parse::<i64>()).transpose()?;
+    let mut args = json!({"chatId":chat_id,"limit":TELEGRAM_HISTORY_LIMIT}).as_object().unwrap().clone();
+    if let Some(thread) = thread_id {
+        args.insert("threadId".into(), json!(thread));
+    }
+    let span = trace.span(
+        SpanStart::new("get_telegram_chat_history", SpanKind::Tool)
+            .input(json!(args))
+            .metadata(json!({"tool":"get_telegram_chat_history","automatic":true}).as_object().unwrap().clone()),
+    );
+    let result=async{
+        let current_text: String=serde_json::from_str(&header[3])?;let signal_time=timestamp(&signal.created_at).ok_or_else(||anyhow::anyhow!("Invalid Telegram signal timestamp"))?;
+        let raw=mcp.call_tool("get_telegram_chat_history",args,cancel).await?;check(cancel)?;anyhow::ensure!(!is_tool_error(&raw),"{raw}");
+        let result:Value=serde_json::from_str(&raw)?;let messages=result["messages"].as_array().ok_or_else(||anyhow::anyhow!("invalid history messages"))?;
+        for m in messages{anyhow::ensure!(m["id"].as_i64().is_some()&&m["chat_id"].as_i64().is_some()&&(m.get("thread_id").is_some()&&(m["thread_id"].is_null()||m["thread_id"].as_i64().is_some()))&&["user","assistant"].contains(&m["role"].as_str().unwrap_or_default())&&m["text"].is_string()&&m["created_at"].is_string(),"invalid history message");}
+        let scoped:Vec<_>=messages.iter().filter(|m|m["chat_id"].as_i64().is_some_and(|id|id.to_string()==chat_id)&&m["thread_id"].as_i64()==thread_id&&timestamp(m["created_at"].as_str().unwrap_or_default()).is_some_and(|at|at<=signal_time)).cloned().collect();
+        let current=scoped.iter().position(|m|m["role"]=="user"&&m["text"]==current_text&&timestamp(m["created_at"].as_str().unwrap_or_default()).is_some_and(|at|at>=signal_time-1000));
+        let history=&scoped[..current.unwrap_or(scoped.len())];context.memory.put(TELEGRAM_HISTORY_KEY,&json!({"messages":history}).to_string(),Format::Json)?;
+        let (inline,truncated)=inline_history(history);span.update(ContextUpdate::metadata(json!({"memory_key":TELEGRAM_HISTORY_KEY,"history_messages":history.len(),"inline_truncated":truncated}).as_object().unwrap().clone()));span.end(SpanEnd::output(raw));
+        Ok::<_,anyhow::Error>(format!("## Recent Telegram history\nAutomatically loaded context, not a new request. Messages are in chronological order.\nFull fetched history: memory_key={TELEGRAM_HISTORY_KEY}. Pass this key in input_refs when delegating.\nShown {} of {} prior messages; truncated={truncated}.\n{}\n\n## Current Telegram signal\n{}",inline.len(),history.len(),json!(inline),signal.content))
+    }.await;
+    match result {
+        Ok(input) => Ok(input),
+        Err(error) => {
+            span.end(SpanEnd::error(error.to_string()).with_output(json!({"error":error.to_string()})));
+            check(cancel)?;
+            Ok(unavailable(signal))
+        }
+    }
+}
+pub async fn load_recent_activity(
+    mcp: &dyn Mcp,
+    trace: &Scope,
+    cancel: &CancellationToken,
+) -> anyhow::Result<Option<String>> {
+    check(cancel)?;
+    let args = json!({"stream":ACTIVITY_STREAM,"n":RECENT_ACTIVITY_LIMIT}).as_object().unwrap().clone();
+    let span = trace.span(
+        SpanStart::new("journal_tail", SpanKind::Tool)
+            .input(json!(args))
+            .metadata(json!({"tool":"journal_tail","automatic":true}).as_object().unwrap().clone()),
+    );
+    let result=async{
+        let raw=mcp.call_tool("journal_tail",args,cancel).await?;check(cancel)?;anyhow::ensure!(!is_tool_error(&raw),"{raw}");let value:Value=serde_json::from_str(&raw)?;let entries=value["entries"].as_array().ok_or_else(||anyhow::anyhow!("invalid activity entries"))?;
+        let mut kept=Vec::new();let mut bytes=0;for entry in entries{let body=entry["body"].as_str().ok_or_else(||anyhow::anyhow!("invalid activity body"))?;bytes+=body.len()+2;if bytes>RECENT_ACTIVITY_MAX_BYTES{break;}kept.push(body.to_owned());}
+        span.update(ContextUpdate::metadata(json!({"activity_notes":kept.len()}).as_object().unwrap().clone()));span.end(SpanEnd::output(raw));if kept.is_empty(){return Ok(None);}
+        Ok::<_,anyhow::Error>(Some(format!("## Recent Ouro activity\nThe last {} notes of your activity journal (stream \"{ACTIVITY_STREAM}\"), oldest first: what you did in recent runs across all chats, schedules and sources.\nBackground, not a request. Each note starts with its time (UTC) and source.\nFor older activity, call journal_tail with stream \"{ACTIVITY_STREAM}\" and a larger n (up to 100); each entry's metadata.trace_id identifies the run.\n\n{}",kept.len(),kept.into_iter().rev().collect::<Vec<_>>().join("\n\n"))))
+    }.await;
+    match result {
+        Ok(notes) => Ok(notes),
+        Err(error) => {
+            span.end(SpanEnd::error(error.to_string()).with_output(json!({"error":error.to_string()})));
+            check(cancel)?;
+            Ok(None)
+        }
+    }
+}
+
+// ── 2. routing / recovery ────────────────────────────────────────────────
+pub struct Supervisor {
+    pub engine: Arc<Engine>,
+    pub env: EnvDeps,
+    pub workflow: Arc<dyn WorkflowRun>,
+    cancel: CancellationToken,
+    active: Arc<tokio::sync::Semaphore>,
+    shutdown: tokio::sync::Mutex<bool>,
+}
+pub fn create_supervisor(engine: Arc<Engine>, env: EnvDeps, workflow: Arc<dyn WorkflowRun>) -> Arc<Supervisor> {
+    create_supervisor_with_cancel(engine, env, workflow, CancellationToken::new())
+}
+pub fn create_supervisor_with_cancel(
+    engine: Arc<Engine>,
+    env: EnvDeps,
+    workflow: Arc<dyn WorkflowRun>,
+    cancel: CancellationToken,
+) -> Arc<Supervisor> {
+    Arc::new(Supervisor {
+        engine,
+        env,
+        workflow,
+        cancel,
+        active: Arc::new(tokio::sync::Semaphore::new(1)),
+        shutdown: Default::default(),
+    })
+}
+impl Supervisor {
+    pub async fn shutdown(&self) {
+        self.cancel.cancel();
+        let mut done = self.shutdown.lock().await;
+        if *done {
+            return;
+        }
+        let _joined = self.active.acquire().await;
+        self.engine.shutdown().await;
+        *done = true;
+    }
+    pub async fn run_signal(&self, signal: &PendingSignal) -> anyhow::Result<String> {
+        check(&self.cancel)?;
+        let _active = self.active.acquire().await.map_err(|_| aborted())?;
+        check(&self.cancel)?;
+        let id = format!("{}:{}", signal.source, signal.id);
+        let use_workflow = signal.source == "scheduler";
+        let trace=self.engine.deps.tracer.trace(TraceStart{id:id.clone(),name:format!("signal:{}",signal.source),kind:SpanKind::Agent,session_id:Some(id.clone()),tags:Some(vec![signal.source.clone(),if use_workflow{"planner-mode"}else{"agent-loop"}.into()]),metadata:Some(json!({"signal_id":signal.id,"signal_source":signal.source,"signal_created_at":signal.created_at,"activity":"run"}).as_object().unwrap().clone())});
+        trace.update(ContextUpdate::input(signal.content.clone()));
+        let scope: Scope = trace.clone();
+        let mut context = None;
+        let mut loop_: Option<Arc<AgentLoop>> = None;
+        let mut span: Option<Arc<dyn Span>> = None;
+        let outcome=async{
+            let session=session(&id,gather_env_data(&self.env,&self.cancel).await?);context=Some(session.clone());
+            if use_workflow{
+                let result=self.workflow.run_signal(&signal.workflow_signal(),session.clone(),scope.clone(),&self.cancel).await?;check(&self.cancel)?;
+                let fallback=match result{
+                    RunResult::Ok{attempts,step_count,..}=>{let output=json!({"ok":true,"attempts":attempts,"stepCount":step_count});trace.update(ContextUpdate::output(output.clone()));return Ok(output.to_string());},
+                    RunResult::ExecuteFailed{reason,error,step_index,..}=>{trace.event(EventStart{name:"fallback".into(),level:Some(Level::Error),metadata:Some(json!({"stage":"execute","reason":reason,"step_index":step_index}).as_object().unwrap().clone()),..Default::default()});anyhow::bail!("Workflow execution failed at step {step_index} ({reason}): {error}");},
+                    RunResult::CompileFailed{reason,errors,attempts}=>json!({"stage":"compile","reason":reason,"errors":errors,"attempts":attempts}),
+                    RunResult::ReplanExhausted{passes,attempts}=>json!({"stage":"replan_exhausted","reason":"replan_exhausted","passes":passes,"attempts":attempts}),
+                };
+                trace.event(EventStart{name:"fallback".into(),level:Some(Level::Warning),metadata:fallback.as_object().cloned(),..Default::default()});trace.update(ContextUpdate::metadata(json!({"fallback":"agent-loop","workflow_failure_stage":fallback["stage"]}).as_object().unwrap().clone()));
+            }
+            let primary=trace.span(SpanStart::new("agent_loop",SpanKind::Chain).metadata(json!({"activity":"primary_loop"}).as_object().unwrap().clone()));span=Some(primary.clone());
+            let input=prepare_telegram_input(signal,&session,self.engine.deps.mcp.as_ref(),&scope,&self.cancel).await?;
+            let activity=if signal.source=="telegram"{load_recent_activity(self.engine.deps.mcp.as_ref(),&scope,&self.cancel).await?}else{None};let transport=signal.source=="telegram"||signal.source=="scheduler";
+            let mut prompts=vec![render_context(&session.env)?];if let Some(activity)=activity{prompts.push(activity);}prompts.push(format!("Signal source: {}",signal.source));if !transport{prompts.push(format!("Delegate the domain work to skill {}. You own the final delivery.",json!(signal.source)));}
+            if let Some(env)=signal.env_context.as_ref().filter(|s|!s.is_empty()){prompts.push(env.clone());}
+            let mut opts=LoopOptions::new(&id,session);opts.cancel=self.cancel.clone();opts.skills=if transport{vec![signal.source.clone()]}else{Vec::new()};opts.allow_skill_writes=signal.source=="dreaming";opts.system_prompt=Some(prompts.join("\n\n"));opts.preset=if use_workflow{crate::models::PresetName::Base}else{crate::models::PresetName::Smart};opts.trace_scope=Some(primary.clone());
+            let agent=self.engine.start_loop(opts).await?;loop_=Some(agent.clone());let output=agent.send(input).await?;primary.end(SpanEnd::output(output.clone()));trace.update(ContextUpdate{output:Some(json!(output)),metadata:Some(json!({"skills":if transport{vec![signal.source.as_str(),"orchestrator","routing"]}else{vec!["orchestrator","routing"]}}).as_object().unwrap().clone()),..Default::default()});Ok::<_,anyhow::Error>(output)
+        }.await;
+        if let Err(error) = &outcome {
+            if let Some(span) = &span {
+                span.end(SpanEnd::error(error.to_string()).with_output(json!({"error":error.to_string()})));
+            }
+            trace.update(ContextUpdate {
+                output: Some(json!({"error":error.to_string()})),
+                metadata: Some(json!({"error":true}).as_object().unwrap().clone()),
+                ..Default::default()
+            });
+            if let Some(context) = context
+                && !self.cancel.is_cancelled()
+                && !is_aborted(error)
+            {
+                self.recover(signal, context, error, loop_.as_ref(), &trace).await;
+            }
+        }
+        if span.is_some() {
+            self.engine.end_loop(&id).await;
+        }
+        trace.end();
+        check(&self.cancel)?;
+        outcome
+    }
+    async fn recover(
+        &self,
+        signal: &PendingSignal,
+        context: Session,
+        error: &anyhow::Error,
+        original: Option<&Arc<AgentLoop>>,
+        trace: &Arc<dyn Trace>,
+    ) {
+        let span = trace.span(
+            SpanStart::new("recovery", SpanKind::Agent)
+                .metadata(json!({"skill":"recovery"}).as_object().unwrap().clone()),
+        );
+        let id = format!("{}__recovery", context.id);
+        let result=async{
+            let mut opts=LoopOptions::new(&id,context.clone());opts.cancel=self.cancel.clone();opts.parent_id=Some(context.id.clone());opts.skills=vec!["recovery".into()];opts.include_engine_skills=false;opts.preset=crate::models::PresetName::Base;opts.max_iterations=5;opts.trace_scope=Some(span.clone());
+            let mut system=vec![render_context(&context.env)?];if let Some(env)=signal.env_context.as_ref().filter(|s|!s.is_empty()){system.push(env.clone());}opts.system_prompt=Some(system.join("\n\n"));
+            let recovery=self.engine.start_loop(opts).await?;let transcript=if let Some(original)=original{crate::generation::messages_json(&original.messages.lock().await).to_string()}else{"[]".into()};
+            recovery.send(format!("Original signal ({}):\n{}\n\nError: {error}\n\nRecent transcript (may be truncated):\n{}\n\nReport the failure only. Do not repeat the original actions; some may already have succeeded.",signal.source,signal.content,tail_utf16(&transcript,20000))).await
+        }.await;
+        match result {
+            Ok(output) => span.end(SpanEnd::output(output)),
+            Err(error) => {
+                span.end(SpanEnd::error(error.to_string()).with_output(json!({"error":error.to_string()})));
+                eprintln!("[{}] recovery failed: {error}", context.id);
+            }
+        }
+        self.engine.end_loop(&id).await;
+    }
+}
+
+// ── 3. polling ───────────────────────────────────────────────────────────
+pub async fn run_poll_loop(
+    mcp: SharedMcp,
+    supervisor: Arc<Supervisor>,
+    cancel: CancellationToken,
+    interval: Duration,
+) -> anyhow::Result<()> {
+    while !cancel.is_cancelled() {
+        let result = async {
+            let raw = mcp.call_tool("get_next_signal", serde_json::Map::new(), &cancel).await?;
+            let next: NextSignal = serde_json::from_str(&raw)?;
+            check(&cancel)?;
+            if let Some(signal) = next.signal {
+                eprintln!(
+                    "[supervisor] signal #{} source={} ({} pending after)",
+                    signal.id, signal.source, next.pending_after
+                );
+                supervisor.run_signal(&signal).await?;
+                Ok::<_, anyhow::Error>(true)
+            } else {
+                Ok(false)
+            }
+        }
+        .await;
+        match result {
+            Ok(true) => continue,
+            Err(error) if !cancel.is_cancelled() => eprintln!("[supervisor] loop error: {error}"),
+            _ => {}
+        }
+        tokio::select! {_=cancel.cancelled()=>break,_=tokio::time::sleep(interval)=>{}}
+    }
+    Ok(())
+}

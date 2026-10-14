@@ -1,6 +1,6 @@
 # The agent in Rust — crates/agent
 
-**Status:** in-progress — runtime library ported and tested; workflow / supervisor next
+**Status:** in-progress — Rust runtime complete locally; production rollout pending
 **Priority:** P2
 **Area:** packages/agent → crates/agent (runtime only)
 **Created:** 2026-10-14
@@ -75,11 +75,12 @@ exist.
       typed decisions + filter, engine and ReAct loop.
 - [x] HTTP MCP reconnect / cancellation and no replay after an ambiguous
       failure; checked against SDK HTTP and the actual TS HTTP test process.
-- [ ] Workflow DSL, variables, compiler, executor, patch / replan, runner.
-- [ ] Supervisor, Telegram context, signal polling, activity journal, main.
+- [x] Workflow DSL, variables, compiler, executor, patch / replan, runner.
+- [x] Supervisor, Telegram context, signal polling, activity journal, main.
 - [ ] Complete per-test TS parity matrix and mutation checks for all runtime
       tests. Current tests port contracts/cases; this is not full TS coverage.
-- [ ] Image / compose switch with TS rollback, runtime smoke and deployment.
+- [x] Image / compose wiring with TS rollback and local runtime process smoke.
+- [ ] Linux release image verification and production deployment.
 - [ ] Live Langfuse ingestion verified (currently tested on generated OTLP
       and the local mirror, without calling Langfuse).
 
@@ -88,7 +89,8 @@ exist.
 Resumed Claude session `fa4f10c4-586f-45bf-ac41-4423405ac925`, which stopped
 at `mcp.rs` at 17:57 UTC on the session limit. Worktree remains
 `.claude/worktrees/rust-agent`, branch `feat/rust-agent`, based on `4fc041f`.
-No binary or Docker switch yet: the production supervisor is still TS.
+This first checkpoint covered the runtime library. The continuation below adds
+the binary and compose wiring; the production supervisor is still TS.
 
 Completed Claude's disconnected module wiring and the unfinished MCP SDK
 constructors, then ported the engine / loop / synthetic tools as one domain
@@ -153,12 +155,6 @@ result labeled text, and replay based on text inside an ambiguous HTTP failure.
 Sources restored after each mutation. This is a targeted check, not a complete
 mutation audit of the TS runtime test suite.
 
-**Next unit:** port `workflow.ts` as one domain (DSL / validation → variable
-resolution → compiler → executor → patch/replan → runner), copying its TS
-contracts/tests before wiring the supervisor. Keep the production entry point
-and compose command on TS until those acceptance items are satisfied.
-
-
 ### Verified result at this checkpoint
 
 - `cargo test -p agent --offline -- --include-ignored`: **52 passed**, including
@@ -169,3 +165,65 @@ and compose command on TS until those acceptance items are satisfied.
   `cargo fmt -p agent -- --check`, `pnpm exec tsc --noEmit`, `git diff --check`:
   passed.
 - The TS transport fix is isolated in local commit `b686e49`.
+
+
+## Workflow and supervisor checkpoint — 2026-10-14 (Codex)
+
+All production-agent runtime domains are now in Rust. `agent-supervisor` is
+registered as a Cargo binary; compose uses it for `agent`, and the existing
+Docker Rust stage includes it when building workspace binaries. The TS
+runtime remains in the image for rollback:
+`command: sh -c "pnpm setup:agent && pnpm agent:start"`.
+The judge, improver, GAIA harness and CLI scripts remain TS by design.
+Neither live databases nor deployed containers were changed.
+
+- `workflow.rs`: strict eight-kind DSL, own-property variable resolution,
+  forward/sibling/duplicate binding checks, compiler validation retries,
+  planner/composer patches, execution, bounded parallel cancellation with
+  finalizer draining, context-carrying replans and distinct failure stages.
+- `supervisor.rs`: scheduler-to-workflow routing, domain delegation hints,
+  scoped Telegram history, recent activity in system context only, serial
+  queue consumption, recovery and coordinated shutdown. An execution failure
+  goes to recovery without re-executing the signal's side effects.
+- `activity.rs`: bounded trace projection, validated note generation,
+  code-owned provenance, persistent eligibility cutoff, draft reuse across
+  append retries/restarts, generation backoff and cancellation. The journal
+  shares the supervisor's MCP client and creates no recursive activity traces.
+- `main.rs`: cwd dotenv, injected clients/stores, startup retry, migrations,
+  skill validation, OS signal cancellation, journal lifecycle and trace flush.
+  `--check-config` opens no databases/services; `--once` handles at most one
+  signal and disables the background journal.
+
+### Additional test mapping
+
+| TS contracts | Rust |
+|---|---|
+| workflow DSL / variables | `workflow_dsl.rs`, committed TS reference cases |
+| workflow compile / execute / runner / patches | `workflow_runtime.rs` |
+| supervisor module / Telegram context / loop | `supervisor.rs` |
+| activity projection / notes / progress / worker | `activity_projection.rs`, `activity_worker.rs` |
+| composition root / cleanup / OTLP flush | `runtime_process.rs` (real binary with isolated local MCP, LLM and exporter) |
+
+Reference snapshots are generated by
+`node --import tsx crates/agent/tests/support/make-parity-fixtures.ts` using
+actual TS implementations. Projection tests compare complete JSON outputs,
+including UTF-16 budgets and omission behavior. Runtime tests combine source
+cases into scenario tests; this is **not** a claim that every TS test or
+property generator has a one-to-one Rust twin. The full parity/mutation audit
+remains an explicit acceptance item above.
+
+Validation: 90 Rust tests including the normally ignored cross-language
+process tests; clippy with warnings denied; formatting; TS typecheck; compose
+configuration validation using empty fixture env files. Process tests cover
+scheduler, Telegram and domain signals, execution-failure recovery, SIGTERM,
+matching SQLite/OTLP ids and one journal entry without recursive traces.
+No production integration credentials enter those child processes.
+
+Additional targeted compiling mutations: tag invalid plans as judge nodes,
+leave parallel siblings running, regenerate a saved journal draft. Each is
+expected to fail its corresponding assertion, and sources are restored.
+
+**Remaining rollout work:** verify the Linux release image and real Langfuse
+ingestion, then deploy and observe real signals. Build/dev scripts and deployment
+were not run, per the session instructions. Local tests do not establish live
+provider behavior or resource usage on the droplet.

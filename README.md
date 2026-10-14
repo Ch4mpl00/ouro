@@ -38,6 +38,15 @@ Two independent processes in one pnpm workspace, deployed as two containers:
 
 Neither imports code from the other. The boundary *is* the protocol.
 
+
+Compose selects the Rust runtime ports in `crates/mcp` (`mcp-tools`) and
+`crates/agent` (`agent-supervisor`). The TypeScript implementations remain for
+rollback; the judge, improver, GAIA harness and CLI scripts continue to use TS.
+Both agent runtimes share `agent.db`, skills and compatible Langfuse traces.
+To roll back the agent, change its compose command to
+`sh -c "pnpm setup:agent && pnpm agent:start"`.
+The Rust agent switch is prepared locally; production rollout is still pending.
+
 ## AgentLoop and working memory
 
 The primary agent handles each signal in a ReAct loop: call tools, observe
