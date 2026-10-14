@@ -1,6 +1,6 @@
 # Rewrite in Rust — the MCP server first, then the agent
 
-**Status:** in-progress (MCP deployed on 2026-10-02 at `577ecb5`; day-long observation and agent port remain)
+**Status:** in-progress — second switch prepared on `feat/rust-mcp` (2026-10-14); see the last section
 **Priority:** P2
 **Area:** whole repo; `crates/mcp` done, `packages/agent` next
 **Created:** 2026-10-02
@@ -125,3 +125,57 @@ So the switch is reversible by redeploying the previous image:
 - `list_news(limit=1)` took 25–28 seconds; resolved by migration 0004; see
   `done/news-list-index-order.md` (MCP response now 28 ms).
   Habr extraction also emits many html5ever namespace warnings.
+
+
+## Back to TS — 2026-10-12, and Rust again — 2026-10-14
+
+On 2026-10-12 prod returned to the TS server (`main` 29ac01d): the
+Rust-era fixes were backported, state moved to `mcp_state` in Postgres on
+both sides, and the specs + a fast-check reference model became the shared
+contract. Two days later the memory pressure on the 2 GB droplet (search
+reading 1.2 GB of TOASTed vectors, dockerd at 540 MB) made the Rust server
+worth having again.
+
+`feat/rust-mcp` (from `main` ad4ffbe) brings `crates/mcp` over from
+`feat/rust-rewrite` and catches it up with everything `packages/mcp` gained
+since:
+
+- **Ported features**: the memory journal (streams, capacity, metadata,
+  `journal_append` / `journal_tail`); HNSW `search_news` with `k` up to 150
+  (migration 0007); the index following the last write (`FOR UPDATE`) and
+  an isolating embed backfill.
+- **Bugs that existed only in Rust**, found by porting the property tests:
+  `fetch_article` and the HN / Habr fetches had no SSRF guard; `read_file` /
+  `read_pdf` were not confined to readable roots; the Gmail poller read one
+  page and moved the watermark only at the end; the scheduler could fire a
+  slot twice (no compare-and-set) and placed DST wall times differently from
+  cron-parser; userbot harvested supergroups and lost posts after a burst;
+  Telegram failed long texts instead of splitting them; Monobank never said
+  a statement was cut at 500; a racing `mcp_state` create failed boot; a
+  NUL in a post, mail subject or message stalled a poller (also fixed in TS
+  on `test/coverage-loop`).
+- **Tests, one to one**: every TS property test has a Rust twin under
+  `crates/mcp/tests/` (proptest, same generators and witnessed-case
+  checks), each mutation-checked; fakes for the Bot API, Gmail, Monobank,
+  the userbot and fetch. The Lean model is replaced by `tests/model/`, the
+  Rust copy of `packages/mcp/model` (properties, differential and
+  linearizability checks against the server). The specs runner reads
+  `packages/mcp/specs` directly — one text for both servers.
+- **Deploy**: the Dockerfile cross-compiles the crate on the build platform
+  (`mcp-build` stage, cargo caches in BuildKit mounts); compose runs
+  `mcp-tools` for `mcp` and `mcp-tunnel`. `scripts/deploy.sh` builds on the
+  laptop and ships the image.
+
+### Switching and rolling back
+
+No state import this time: both servers already use `mcp_state` and the
+same Postgres migrations, so either one boots on what the other left.
+
+- **Switch**: `scripts/deploy.sh mcp mcp-tunnel` (then `agent` if its code
+  changed). Check `docker compose ps`, both endpoints' `tools/list`, and the
+  tunnel-client log for `mcp session initialized` (restart it if it came up
+  first).
+- **Rollback without a rebuild**: the TS server is in the same image. On the
+  droplet, set `command: pnpm mcp:serve` for `mcp` and `mcp-tunnel` (or
+  check out the previous commit) and `docker compose up -d mcp mcp-tunnel`.
+  The previous TS-only image is also kept, tagged, for a full rollback.

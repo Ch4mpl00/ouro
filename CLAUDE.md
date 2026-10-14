@@ -13,6 +13,17 @@ A personal-agent system structured as two independent processes in one pnpm work
 Both communicate strictly through the MCP protocol. Neither imports code from
 the other. Deployed as two containers (`docker-compose.yml`).
 
+**The MCP server exists twice.** `crates/mcp` is a Rust port of
+`packages/mcp` (the droplet is 2 GB; the Rust server is about half the
+memory). Compose runs the Rust one (`command: mcp-tools`); the TS one stays
+in the image as the rollback (`command: pnpm mcp:serve`). They share the
+databases, the migrations (`crates/mcp/migrations` must stay byte-identical
+to `packages/mcp/src/db/pg/migrations`, a test checks), the `.feature`
+specs and the property tests, ported one to one (`crates/mcp/tests/*.rs`
+mirror `packages/mcp/test/*.test.ts`). **A fix in one server goes into the
+other**, with its test, until the TS server is retired. Status and history:
+`.claude/tasks/rust-rewrite.md`.
+
 ## How a signal turns into action
 
 1. A poller inside `packages/mcp` fires on its own cadence — Gmail (1 min),
@@ -404,6 +415,10 @@ nobody runs. `module.test.ts` pins the expected output as a literal.
   message to your bot).
 - `pnpm userbot:auth` — one-time MTProto login (phone + code).
 - `pnpm typecheck` — typecheck both packages.
+- `cargo test -p mcp-tools` — the Rust server's tests (unit, property,
+  Postgres via an auto-started pgvector testcontainer unless
+  `TEST_DATABASE_URL` is set, the shared specs, the reference model);
+  `cargo clippy --all-targets`, `cargo fmt`.
 - `pnpm spec` — the executable specification: `packages/mcp/specs/*.feature`,
   plain-English scenarios run by cucumber-js against the real server over MCP
   with a Testcontainers Postgres (needs Docker; `TEST_DATABASE_URL` uses a
@@ -439,8 +454,10 @@ nobody runs. `module.test.ts` pins the expected output as a literal.
   rows where `embedding IS NULL` (typically left behind by an OpenAI
   outage during inline embed).
 
-Deploy: see `docker-compose.yml`. `docker compose up -d --build` on the
-droplet; named volumes (`mcp-data`, `mcp-storage`, `agent-data`,
+Deploy: `scripts/deploy.sh [services…]` from the laptop — it builds the
+linux/amd64 image locally (the droplet can't compile the Rust crate), ships
+it over SSH and runs `docker compose up -d --no-build` on a checkout of the
+same commit, which must be pushed. Named volumes (`mcp-data`, `mcp-storage`, `agent-data`,
 `agent-skills`, `pg-data`) persist state across rebuilds. First boot
 needs `.env.postgres` (POSTGRES_USER / PASSWORD / DB) and
 `OPENAI_API_KEY` in `.env.mcp`.
