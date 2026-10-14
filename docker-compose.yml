@@ -33,19 +33,24 @@ services:
       retries: 10
     restart: unless-stopped
 
-  # The MCP server. All its state lives in Postgres: the news / memory store
-  # in $POSTGRES_DB, and the signal queue, tokens, scheduled tasks and chat
-  # log in a sibling database `mcp_state`, which it creates and migrates
-  # itself on boot — no setup step.
+  # The MCP server — the Rust one (crates/mcp); `pnpm mcp:serve` is the TS
+  # server still in the image, the rollback. All its state lives in Postgres:
+  # the news / memory store in $POSTGRES_DB, and the signal queue, tokens,
+  # scheduled tasks and chat log in a sibling database `mcp_state`, which it
+  # creates and migrates itself on boot — no setup step. Both servers read
+  # and write the same schema.
   mcp:
     build: .
     image: mcp-tools-image
-    command: pnpm mcp:serve
+    command: mcp-tools
     env_file:
       - .env.mcp
     environment:
       MCP_TRANSPORT: http
       MCP_PORT: "3000"
+      # rmcp validates the Host header (DNS-rebinding guard); the agent dials
+      # mcp:3000, probes use loopback.
+      MCP_ALLOWED_HOSTS: mcp,mcp:3000,localhost,127.0.0.1
       MCP_MEMORY_ACTOR: supervisor
       DATABASE_URL: postgres://${POSTGRES_USER:-mcp}:${POSTGRES_PASSWORD:-mcp}@postgres:5432/${POSTGRES_DB:-mcp}
     volumes:
@@ -77,12 +82,16 @@ services:
   mcp-tunnel:
     build: .
     image: mcp-tools-image
-    command: pnpm mcp:serve
+    command: mcp-tools
     env_file:
       - .env.mcp
     environment:
       MCP_TRANSPORT: http
       MCP_PORT: "3001"
+      # Host validation off: tunnel-client forwards requests whose Host header
+      # isn't ours to predict, and this port is only reachable inside the
+      # compose network (`expose`, never `ports`).
+      MCP_ALLOWED_HOSTS: "*"
       MCP_NO_POLLERS: "1"
       MCP_TOOLSETS: news-read,telegram-send,skills,memory
       # Signs ChatGPT's writes to shared memory, so doc_history says who did

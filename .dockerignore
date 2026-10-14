@@ -33,3 +33,6 @@ crates/*/data
 
 # Rust build output — the image compiles its own
 target
+
+# Worktrees, task notes, local agent state — none of it belongs in the image
+.claude
