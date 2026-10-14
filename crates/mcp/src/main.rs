@@ -21,7 +21,7 @@ use mcp_tools::signals::Signals;
 use mcp_tools::skills::SkillCatalog;
 use mcp_tools::telegram::{TelegramConfig, TelegramModule};
 use mcp_tools::userbot::Userbot;
-use mcp_tools::{fetch, news, pg, scheduler, telegram, toolsets};
+use mcp_tools::{fetch, fs, news, pg, scheduler, telegram, toolsets};
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
 
@@ -101,6 +101,10 @@ async fn main() -> anyhow::Result<()> {
         userbot: Arc::new(userbot.clone()),
         skills: SkillCatalog::new(PathBuf::from("skills"), PathBuf::from("skills.default")),
         fetcher: fetcher.clone(),
+        files: {
+            let cwd = std::env::current_dir()?;
+            fs::FileAccess::new(&fs::default_read_roots(&|name| env(name), &cwd), &cwd)
+        },
         storage_dir: env("STORAGE_DIR").map_or_else(|| PathBuf::from("./storage"), PathBuf::from),
         news: news_repo.clone(),
         knowledge: KnowledgeRepository::new(pool.clone(), embedder.clone()),

@@ -55,6 +55,8 @@ pub struct Deps {
     pub skills: SkillCatalog,
     // The SSRF-guarded client behind fetch_url (fetch.rs).
     pub fetcher: crate::fetch::SharedFetch,
+    // Which local files read_file / read_pdf may open.
+    pub files: crate::fs::FileAccess,
     // Where downloaded attachments land (STORAGE_DIR, default ./storage).
     pub storage_dir: PathBuf,
     pub news: NewsRepository,

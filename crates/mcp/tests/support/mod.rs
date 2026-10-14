@@ -17,6 +17,7 @@ use async_trait::async_trait;
 use mcp_tools::db::Db;
 use mcp_tools::embeddings::{Embedder, SharedEmbedder};
 use mcp_tools::fetch::{GuardedFetch, SharedFetch};
+use mcp_tools::fs::FileAccess;
 use mcp_tools::gmail::GmailModule;
 use mcp_tools::knowledge::KnowledgeRepository;
 use mcp_tools::memory::{MemoryService, PgMemoryStore};
@@ -184,6 +185,7 @@ pub struct Overrides {
     pub fetcher: Option<SharedFetch>,
     pub account: Option<SharedAccount>,
     pub telegram: Option<TelegramConfig>,
+    pub files: Option<FileAccess>,
 }
 
 pub async fn start_test_server_with(
@@ -242,7 +244,7 @@ async fn serve_with(
     fetcher: Option<SharedFetch>,
     account: Option<SharedAccount>,
 ) -> anyhow::Result<Server> {
-    let overrides = Overrides { actor: Some(actor.to_owned()), fetcher, account, telegram: None };
+    let overrides = Overrides { actor: Some(actor.to_owned()), fetcher, account, ..Overrides::default() };
     serve_overridden(database_url, db, toolsets, embedder, overrides).await
 }
 
@@ -253,7 +255,7 @@ async fn serve_overridden(
     embedder: SharedEmbedder,
     overrides: Overrides,
 ) -> anyhow::Result<Server> {
-    let Overrides { actor, fetcher, account, telegram } = overrides;
+    let Overrides { actor, fetcher, account, telegram, files } = overrides;
     let actor = actor.unwrap_or_else(|| "spec".into());
     let pool = pg::connect(database_url)?;
     pg::migrate(&pool).await?;
@@ -272,6 +274,10 @@ async fn serve_overridden(
         userbot: account.unwrap_or_else(|| Arc::new(Userbot::new(db.clone()))),
         skills: SkillCatalog::new(PathBuf::from("skills"), PathBuf::from("../../skills.default")),
         fetcher: fetcher.unwrap_or_else(|| Arc::new(GuardedFetch::new())),
+        // Nothing to read in a spec run but the shipped skills.
+        files: files.unwrap_or_else(|| {
+            FileAccess::new(&[PathBuf::from("../../skills.default")], &std::env::current_dir().unwrap_or_default())
+        }),
         storage_dir: std::env::temp_dir().join("mcp-specs-storage"),
         news: NewsRepository::new(pool.clone(), embedder.clone()),
         knowledge: KnowledgeRepository::new(pool.clone(), embedder.clone()),

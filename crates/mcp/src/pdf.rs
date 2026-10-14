@@ -56,6 +56,6 @@ impl McpTools {
             Use after download_gmail_attachment to inspect the contents of a downloaded bill."
     )]
     async fn read_pdf(&self, Parameters(p): Parameters<ReadPdfParams>) -> ToolResult {
-        respond(read_pdf(Path::new(&p.file_path)).await)
+        respond(async { read_pdf(&self.deps.files.readable_path(&p.file_path).await?).await }.await)
     }
 }
