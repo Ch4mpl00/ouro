@@ -28,3 +28,8 @@ dist
 .DS_Store
 .idea
 .vscode
+
+crates/*/data
+
+# Rust build output — the image compiles its own
+target

@@ -1,0 +1,10 @@
+name = "memory-model"
+version = "0.1.0"
+defaultTargets = ["memory-model"]
+
+[[lean_lib]]
+name = "MemoryModel"
+
+[[lean_exe]]
+name = "memory-model"
+root = "Main"
