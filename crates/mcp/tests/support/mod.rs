@@ -7,6 +7,7 @@
 
 #![allow(dead_code)]
 
+pub mod fake_gmail;
 pub mod fake_telegram;
 pub mod wall_cron;
 
@@ -186,6 +187,8 @@ pub struct Overrides {
     pub account: Option<SharedAccount>,
     pub telegram: Option<TelegramConfig>,
     pub files: Option<FileAccess>,
+    pub gmail_api_root: Option<String>,
+    pub storage_dir: Option<PathBuf>,
 }
 
 pub async fn start_test_server_with(
@@ -255,7 +258,7 @@ async fn serve_overridden(
     embedder: SharedEmbedder,
     overrides: Overrides,
 ) -> anyhow::Result<Server> {
-    let Overrides { actor, fetcher, account, telegram, files } = overrides;
+    let Overrides { actor, fetcher, account, telegram, files, gmail_api_root, storage_dir } = overrides;
     let actor = actor.unwrap_or_else(|| "spec".into());
     let pool = pg::connect(database_url)?;
     pg::migrate(&pool).await?;
@@ -269,7 +272,10 @@ async fn serve_overridden(
         scheduler: scheduler.clone(),
         // No bot token: sending fails as a tool error, nothing leaves the box.
         telegram: TelegramModule::new(telegram.unwrap_or_default(), http.clone(), db.clone()),
-        gmail: GmailModule::new(db.clone(), http.clone()),
+        gmail: match gmail_api_root {
+            Some(root) => GmailModule::with_api_root(db.clone(), http.clone(), &root),
+            None => GmailModule::new(db.clone(), http.clone()),
+        },
         monobank: Monobank::new(http.clone()),
         userbot: account.unwrap_or_else(|| Arc::new(Userbot::new(db.clone()))),
         skills: SkillCatalog::new(PathBuf::from("skills"), PathBuf::from("../../skills.default")),
@@ -278,7 +284,7 @@ async fn serve_overridden(
         files: files.unwrap_or_else(|| {
             FileAccess::new(&[PathBuf::from("../../skills.default")], &std::env::current_dir().unwrap_or_default())
         }),
-        storage_dir: std::env::temp_dir().join("mcp-specs-storage"),
+        storage_dir: storage_dir.unwrap_or_else(|| std::env::temp_dir().join("mcp-specs-storage")),
         news: NewsRepository::new(pool.clone(), embedder.clone()),
         knowledge: KnowledgeRepository::new(pool.clone(), embedder.clone()),
         memory: MemoryService::new(Arc::new(PgMemoryStore::new(pool.clone())), embedder),

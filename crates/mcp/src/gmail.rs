@@ -26,6 +26,7 @@ use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
 use crate::db::Db;
+use crate::scheduler::SignalSink;
 use crate::server::{McpTools, ToolResult, invalid_params, respond};
 use crate::signals::Signals;
 use crate::time::{iso_from_unix_ms, parse_js_date};
@@ -33,7 +34,8 @@ use crate::time::{iso_from_unix_ms, parse_js_date};
 const PROVIDER: &str = "gmail";
 const SCOPES: &[&str] =
     &["https://www.googleapis.com/auth/gmail.readonly", "https://www.googleapis.com/auth/userinfo.email"];
-const API: &str = "https://gmail.googleapis.com/gmail/v1/users/me";
+// googleapis' default; tests point a module at a local fake.
+const API_ROOT: &str = "https://gmail.googleapis.com/";
 // google-auth-library refreshes this long before expiry.
 const EAGER_REFRESH_MS: i64 = 5 * 60 * 1000;
 
@@ -43,6 +45,8 @@ const EAGER_REFRESH_MS: i64 = 5 * 60 * 1000;
 pub struct GmailModule {
     db: Db,
     http: reqwest::Client,
+    // Where the Gmail API lives, with a trailing slash.
+    api_root: String,
 }
 
 struct OAuthClient {
@@ -80,7 +84,12 @@ struct StoredTokens {
 
 impl GmailModule {
     pub fn new(db: Db, http: reqwest::Client) -> Self {
-        Self { db, http }
+        Self::with_api_root(db, http, API_ROOT)
+    }
+
+    pub fn with_api_root(db: Db, http: reqwest::Client, api_root: &str) -> Self {
+        let api_root = if api_root.ends_with('/') { api_root.to_owned() } else { format!("{api_root}/") };
+        Self { db, http, api_root }
     }
 
     pub fn auth_url(&self) -> anyhow::Result<String> {
@@ -253,7 +262,7 @@ impl GmailModule {
             let token = self.access_token(account, force_refresh).await?;
             let res = self
                 .http
-                .get(format!("{API}{path}"))
+                .get(format!("{}gmail/v1/users/me{path}", self.api_root))
                 .bearer_auth(token)
                 .query(query)
                 .timeout(Duration::from_secs(60))
@@ -549,7 +558,10 @@ impl GmailModule {
 
     // First run on a fresh install sets the watermark to now and emits
     // nothing, rather than flooding the queue with years of old mail.
-    async fn poll(&self, sub: &Subscription, account: &str, signals: &Signals) -> anyhow::Result<()> {
+    // Otherwise: query with `after:` (every page), take rows newer than the
+    // watermark, oldest first, and enqueue one signal per row, advancing the
+    // watermark past each one as it goes.
+    async fn poll(&self, sub: &Subscription, account: &str, signals: &dyn SignalSink) -> anyhow::Result<()> {
         let Some(watermark) = self.watermark(sub).await? else {
             self.set_watermark(sub, Utc::now().timestamp_millis()).await?;
             tracing::info!(subscription = sub.name, "bootstrapping gmail watermark, no emit");
@@ -557,12 +569,23 @@ impl GmailModule {
         };
         let watermark_ms: i64 = watermark.parse().unwrap_or(0);
         let query = format!("{} after:{}", sub.query, watermark_ms / 1000);
-        let mut messages = self.list_messages(account, &query, 50, None).await?.messages;
+        // Every page: Gmail lists newest first, so after an outage with more
+        // new mail than one page, stopping at the first page kept the newest,
+        // moved the watermark past them and lost the older ones for good.
+        let mut messages = Vec::new();
+        let mut page_token: Option<String> = None;
+        loop {
+            let page = self.list_messages(account, &query, 50, page_token.as_deref()).await?;
+            messages.extend(page.messages);
+            match page.next_page_token {
+                Some(token) => page_token = Some(token),
+                None => break,
+            }
+        }
         let internal = |m: &MessageSummary| m.internal_date.as_deref().and_then(|d| d.parse::<i64>().ok()).unwrap_or(0);
         // Chronological, so signals arrive in order and the watermark only advances.
         messages.sort_by_key(internal);
 
-        let mut newest = watermark_ms;
         let mut emitted = 0;
         for m in &messages {
             let at = internal(m);
@@ -573,14 +596,23 @@ impl GmailModule {
             // Attachment refs inline, so the signal is self-contained.
             let attachments = find_attachments(&self.raw_message(account, &m.id).await?);
             signals.record(sub.signal_source, &(sub.build_content)(m, &attachments)).await?;
+            // Past each mail as soon as it is signalled: a failure further down
+            // the batch resumes after it next tick instead of signalling it again.
+            self.set_watermark(sub, at).await?;
             emitted += 1;
-            newest = newest.max(at);
-        }
-        if newest != watermark_ms {
-            self.set_watermark(sub, newest).await?;
         }
         tracing::info!(subscription = sub.name, emitted, "gmail poll done");
         Ok(())
+    }
+
+    // One poll of one subscription, as the interval runs it. Errors are the
+    // poll's; the interval logs them and tries again next time.
+    pub async fn poll_subscription_once(&self, sub: &Subscription, signals: &dyn SignalSink) -> anyhow::Result<()> {
+        let Some(account) = self.resolve_account_key().await? else {
+            tracing::warn!(subscription = sub.name, "no Gmail account authorized — skipping");
+            return Ok(());
+        };
+        self.poll(sub, &account, signals).await
     }
 
     pub async fn run_poller(self, signals: Signals, cancel: CancellationToken) {
@@ -594,18 +626,7 @@ impl GmailModule {
                         _ = cancel.cancelled() => return,
                         _ = interval.tick() => {}
                     }
-                    let account = match gmail.resolve_account_key().await {
-                        Ok(Some(account)) => account,
-                        Ok(None) => {
-                            tracing::warn!(subscription = sub.name, "no Gmail account authorized — skipping");
-                            continue;
-                        }
-                        Err(err) => {
-                            tracing::error!(%err, "gmail: resolving account failed");
-                            continue;
-                        }
-                    };
-                    if let Err(err) = gmail.poll(sub, &account, &signals).await {
+                    if let Err(err) = gmail.poll_subscription_once(sub, &signals).await {
                         tracing::error!(subscription = sub.name, error = %format!("{err:#}"), "gmail poll failed");
                     }
                 }
@@ -726,6 +747,16 @@ impl McpTools {
             to extract bill fields."
     )]
     async fn download_gmail_attachment(&self, Parameters(p): Parameters<DownloadParams>) -> ToolResult {
+        // Gmail ids are base64url. Anything else is refused before Gmail is
+        // asked: the message id names a storage directory, so where a file
+        // lands must not depend on the API rejecting a malformed id.
+        let gmail_id = regex::Regex::new("^[A-Za-z0-9_-]+$").expect("valid regex");
+        if !gmail_id.is_match(&p.message_id) {
+            return Err(invalid_params("messageId: not a Gmail message id"));
+        }
+        if !gmail_id.is_match(&p.attachment_id) {
+            return Err(invalid_params("attachmentId: not a Gmail attachment id"));
+        }
         let gmail = &self.deps.gmail;
         let storage = &self.deps.storage_dir;
         respond(

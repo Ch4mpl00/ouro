@@ -165,7 +165,7 @@ fn reads_a_root_created_after_startup_and_still_refuses_escaping_symlinks() {
     runtime().block_on(async {
         let dir = temp_dir(&format!("{}/late-", env.base.display()));
         let root = dir.join("storage");
-        let (_server, client) = server_with(&env.db, FileAccess::new(&[root.clone()], &dir)).await;
+        let (_server, client) = server_with(&env.db, FileAccess::new(std::slice::from_ref(&root), &dir)).await;
         let read = |path: &'static str| call(&client, "read_file", json!({ "path": path }));
         assert!(matches!(read("storage/attachment.txt").await, Outcome::ToolError(_)));
         std::fs::create_dir(&root).unwrap();
