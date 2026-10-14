@@ -302,8 +302,11 @@ mod tests {
     #[test]
     fn env_context_matches_the_ts_wording() {
         assert_eq!(env_context(&TelegramConfig::default()), None);
-        let cfg =
-            TelegramConfig { bot_token: None, default_chat_id: Some("123".into()), topics: vec![("bills".into(), 42)] };
+        let cfg = TelegramConfig {
+            default_chat_id: Some("123".into()),
+            topics: vec![("bills".into(), 42)],
+            ..Default::default()
+        };
         assert_eq!(
             env_context(&cfg).unwrap(),
             "\n## Environment\nDefault Telegram chat id: 123.\n\

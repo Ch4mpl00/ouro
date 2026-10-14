@@ -40,7 +40,12 @@ pub struct TelegramConfig {
     // only way the agent learns which topics exist. Kept in the order the
     // JSON lists them, which is the order the prompt shows them in.
     pub topics: Vec<(String, i64)>,
+    // Where the Bot API lives; None is api.telegram.org. A test points it at
+    // a stand-in.
+    pub api_root: Option<String>,
 }
+
+const API_ROOT: &str = "https://api.telegram.org";
 
 impl TelegramConfig {
     pub fn from_env() -> Self {
@@ -49,6 +54,7 @@ impl TelegramConfig {
             bot_token: var("TELEGRAM_ASSISTANT_BOT_TOKEN"),
             default_chat_id: var("TELEGRAM_DEFAULT_CHAT_ID"),
             topics: parse_topics(var("TELEGRAM_TOPICS_JSON").as_deref()),
+            api_root: None,
         }
     }
 }
@@ -91,6 +97,7 @@ impl TelegramError {
 pub struct BotApi {
     http: reqwest::Client,
     token: Option<String>,
+    root: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -144,7 +151,11 @@ const LONG_POLL_TIMEOUT: u64 = 25;
 
 impl BotApi {
     pub fn new(http: reqwest::Client, token: Option<String>) -> Self {
-        Self { http, token }
+        Self::with_root(http, token, None)
+    }
+
+    pub fn with_root(http: reqwest::Client, token: Option<String>, root: Option<String>) -> Self {
+        Self { http, token, root: root.unwrap_or_else(|| API_ROOT.to_owned()) }
     }
 
     async fn call<T: serde::de::DeserializeOwned>(
@@ -155,7 +166,7 @@ impl BotApi {
         let token = self.token.as_deref().ok_or(TelegramError::NoToken)?;
         let res = self
             .http
-            .post(format!("https://api.telegram.org/bot{token}/{method}"))
+            .post(format!("{}/bot{token}/{method}", self.root))
             .timeout(Duration::from_secs(LONG_POLL_TIMEOUT + 15))
             .json(&body)
             .send()
@@ -352,7 +363,20 @@ impl ChatLog {
             .collect())
     }
 
-    async fn last_update_id(&self) -> anyhow::Result<Option<i64>> {
+    // The bot edited one of its messages: the log shows what the chat shows.
+    pub async fn edited(&self, chat_id: i64, tg_message_id: i64, text: &str) -> anyhow::Result<()> {
+        self.db
+            .client()
+            .await?
+            .execute(
+                "UPDATE telegram_messages SET text = $3 WHERE chat_id = $1 AND tg_message_id = $2 AND role = 'assistant'",
+                &[&chat_id, &tg_message_id, &text],
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub async fn last_update_id(&self) -> anyhow::Result<Option<i64>> {
         let row = self
             .db
             .client()
@@ -362,7 +386,7 @@ impl ChatLog {
         Ok(row.and_then(|r| r.get::<_, String>(0).parse().ok()))
     }
 
-    async fn set_last_update_id(&self, id: i64) -> anyhow::Result<()> {
+    pub async fn set_last_update_id(&self, id: i64) -> anyhow::Result<()> {
         self.db
             .client()
             .await?
@@ -458,6 +482,10 @@ impl Typing {
 pub struct StatusBubbles {
     bot: BotApi,
     entries: Arc<Mutex<HashMap<String, StatusEntry>>>,
+    // Calls for one id run one after another. An agent's tool calls run in
+    // parallel, and two that both found no bubble each sent one — the first
+    // was forgotten and stayed in the chat for good.
+    queues: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
 }
 
 #[derive(Clone)]
@@ -482,8 +510,12 @@ const STATUS_BACKOFF: Duration = Duration::from_secs(5);
 // Adjacent frames always differ, so an edit is never "not modified".
 const DOT_CYCLE: usize = 4;
 
+// The animation dots only take the room left under Telegram's cap: on a text
+// at the cap they used to push every frame over, the edits failed, and the
+// bubble froze.
 fn render_status(base: &str, frame: usize) -> String {
-    format!("{base}{}", ".".repeat(frame % DOT_CYCLE))
+    let room = TELEGRAM_TEXT_LIMIT.saturating_sub(base.encode_utf16().count());
+    format!("{base}{}", ".".repeat((frame % DOT_CYCLE).min(room)))
 }
 
 #[derive(Debug, Serialize)]
@@ -502,7 +534,7 @@ pub struct StatusResult {
 
 impl StatusBubbles {
     pub fn new(bot: BotApi) -> Self {
-        Self { bot, entries: Arc::default() }
+        Self { bot, entries: Arc::default(), queues: Arc::default() }
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, StatusEntry>> {
@@ -510,6 +542,26 @@ impl StatusBubbles {
     }
 
     pub async fn send(
+        &self,
+        id: &str,
+        text: &str,
+        chat_id: &str,
+        thread_id: Option<i64>,
+    ) -> Result<StatusResult, TelegramError> {
+        let queue = self.queues.lock().unwrap_or_else(|p| p.into_inner()).entry(id.to_owned()).or_default().clone();
+        let result = {
+            let _turn = queue.lock().await;
+            self.send_now(id, text, chat_id, thread_id).await
+        };
+        // Forget the queue once nobody else is waiting on it.
+        let mut queues = self.queues.lock().unwrap_or_else(|p| p.into_inner());
+        if queues.get(id).is_some_and(|q| Arc::ptr_eq(q, &queue) && Arc::strong_count(q) == 2) {
+            queues.remove(id);
+        }
+        result
+    }
+
+    async fn send_now(
         &self,
         id: &str,
         text: &str,
@@ -692,23 +744,13 @@ pub async fn run_poller(
     };
     tracing::info!(chat = allowed_chat, timeout = LONG_POLL_TIMEOUT, "telegram poller started");
 
+    let store = Stores { log, signals };
     loop {
-        let offset = match log.last_update_id().await {
-            Ok(last) => last.map(|id| id + 1),
-            Err(err) => {
-                tracing::error!(%err, "telegram poller: reading cursor failed");
-                None
-            }
-        };
-        let updates = tokio::select! {
+        let round = tokio::select! {
             _ = cancel.cancelled() => break,
-            updates = bot.get_updates(offset, Some(LONG_POLL_TIMEOUT)) => updates,
+            round = poll_once(&bot, &store, allowed_chat, LONG_POLL_TIMEOUT) => round,
         };
-        let outcome = match updates {
-            Ok(updates) => ingest(&updates, allowed_chat, &log, &signals).await,
-            Err(err) => Err(err.into()),
-        };
-        if let Err(err) = outcome {
+        if let Err(err) = round {
             tracing::error!(error = %format!("{err:#}"), "telegram poll error");
             tokio::select! {
                 _ = cancel.cancelled() => break,
@@ -719,20 +761,79 @@ pub async fn run_poller(
     tracing::info!("telegram poller stopped");
 }
 
-async fn ingest(updates: &[Update], allowed_chat: i64, log: &ChatLog, signals: &Signals) -> anyhow::Result<()> {
-    for update in updates {
+// The writes one poll round makes, behind a trait so a test can fail one of
+// them partway, as a dropped connection or a crash between two writes would.
+#[async_trait::async_trait]
+pub trait PollerStore: Send + Sync {
+    async fn last_update_id(&self) -> anyhow::Result<Option<i64>>;
+    async fn set_last_update_id(&self, id: i64) -> anyhow::Result<()>;
+    async fn record_message(
+        &self,
+        chat_id: i64,
+        tg_message_id: i64,
+        thread_id: Option<i64>,
+        text: &str,
+    ) -> anyhow::Result<()>;
+    async fn record_signal(&self, source: &str, content: &str) -> anyhow::Result<()>;
+}
+
+// The real store: the chat log and the signal queue.
+pub struct Stores {
+    pub log: ChatLog,
+    pub signals: Signals,
+}
+
+#[async_trait::async_trait]
+impl PollerStore for Stores {
+    async fn last_update_id(&self) -> anyhow::Result<Option<i64>> {
+        self.log.last_update_id().await
+    }
+
+    async fn set_last_update_id(&self, id: i64) -> anyhow::Result<()> {
+        self.log.set_last_update_id(id).await
+    }
+
+    async fn record_message(
+        &self,
+        chat_id: i64,
+        tg_message_id: i64,
+        thread_id: Option<i64>,
+        text: &str,
+    ) -> anyhow::Result<()> {
+        self.log.record(chat_id, Some(tg_message_id), thread_id, Role::User, text).await.map(drop)
+    }
+
+    async fn record_signal(&self, source: &str, content: &str) -> anyhow::Result<()> {
+        self.signals.record(source, content).await.map(drop)
+    }
+}
+
+// One getUpdates round from the stored cursor: each text message from the
+// allowed chat goes into the chat log and becomes a signal, and the cursor
+// moves past every update, kept or not — an update left unconfirmed comes
+// back on every getUpdates and stalls the cursor there for good. Returns how
+// many updates came back.
+pub async fn poll_once(
+    bot: &BotApi,
+    store: &dyn PollerStore,
+    allowed_chat: i64,
+    timeout: u64,
+) -> anyhow::Result<usize> {
+    let offset = store.last_update_id().await?.map(|id| id + 1);
+    let updates = bot.get_updates(offset, Some(timeout)).await?;
+    for update in &updates {
         if let Some(msg) = update.message.as_ref().or(update.edited_message.as_ref()) {
             if msg.chat.id != allowed_chat {
                 tracing::warn!(chat = msg.chat.id, "ignoring message from a chat that is not the default one");
             } else if let Some(text) = msg.text.as_deref().filter(|t| !t.is_empty()) {
-                log.record(msg.chat.id, Some(msg.message_id), msg.message_thread_id, Role::User, text).await?;
-                signals.record("telegram", &signal_content(msg.chat.id, msg.message_thread_id, text)).await?;
+                store.record_message(msg.chat.id, msg.message_id, msg.message_thread_id, text).await?;
+                store.record_signal("telegram", &signal_content(msg.chat.id, msg.message_thread_id, text)).await?;
                 tracing::info!(message = msg.message_id, thread = ?msg.message_thread_id, "stored message + signal queued");
             }
         }
-        log.set_last_update_id(update.update_id).await?;
+        store.set_last_update_id(update.update_id).await?;
     }
-    Ok(())
+    Ok(updates.len())
 }
 
 // Signal content is DATA, not instructions: the planner knows how to reply
@@ -742,6 +843,123 @@ fn signal_content(chat_id: i64, thread_id: Option<i64>, text: &str) -> String {
     let topic = thread_id.map(|t| format!(" (forum topic thread_id={t})")).unwrap_or_default();
     let quoted = serde_json::to_string(text).unwrap_or_default();
     format!("Telegram message in chat {chat_id}{topic}.\nText: {quoted}")
+}
+
+// ── 6b. long texts ───────────────────────────────────────────────────────────
+
+// Telegram caps a message at 4096 characters. A longer text — a digest that
+// came out long — is sent as several messages instead of failing the send:
+// the limit is the transport's, so the transport tool deals with it, for every
+// caller at once. Plain text only: the send tool sets no parse_mode, so a cut
+// can never break a Markdown or HTML entity.
+
+// Counted the way JS strings count: UTF-16 code units, which never
+// undercounts what Telegram measures.
+pub const TELEGRAM_TEXT_LIMIT: usize = 4096;
+
+// Where a part may end, best first. A cut lands right after the separator,
+// so the separator stays with the part before it and nothing is lost.
+const SEPARATORS: [&str; 3] = ["\n\n", "\n", " "];
+
+// Splits `text` into parts of at most `limit` UTF-16 units whose
+// concatenation is exactly `text`. Prefers ending a part at a blank line
+// (between digest blocks), then at a line break, then at a space — each only
+// if that keeps the part at least half full, so a stray early break doesn't
+// produce a sliver of a message. Failing all of that, a hard cut that never
+// splits a surrogate pair.
+pub fn split_telegram_text(text: &str, limit: usize) -> Vec<String> {
+    assert!(limit >= 2, "limit must be at least 2, got {limit}");
+    let units: Vec<u16> = text.encode_utf16().collect();
+    let mut parts = Vec::new();
+    let mut rest = &units[..];
+    while rest.len() > limit {
+        let cut = cut_point(rest, limit);
+        parts.push(String::from_utf16(&rest[..cut]).expect("cuts never split a surrogate pair"));
+        rest = &rest[cut..];
+    }
+    if !rest.is_empty() {
+        parts.push(String::from_utf16(rest).expect("whole code points"));
+    }
+    parts
+}
+
+fn last_index_of(window: &[u16], sep: &[u16]) -> Option<usize> {
+    (0..=window.len().checked_sub(sep.len())?).rev().find(|&at| &window[at..at + sep.len()] == sep)
+}
+
+fn cut_point(text: &[u16], limit: usize) -> usize {
+    let window = &text[..limit];
+    for min_end in [limit.div_ceil(2), 1] {
+        for sep in SEPARATORS {
+            let sep: Vec<u16> = sep.encode_utf16().collect();
+            if let Some(at) = last_index_of(window, &sep)
+                && at + sep.len() >= min_end
+            {
+                return at + sep.len();
+            }
+        }
+    }
+    let high_surrogate = (0xd800..=0xdbff).contains(&text[limit - 1]);
+    if high_surrogate { limit - 1 } else { limit }
+}
+
+// A send that stopped partway. The parts in `delivered` are already in the
+// chat; the caller must not blindly resend the whole text.
+#[derive(Debug, thiserror::Error)]
+#[error("Telegram send stopped after {} of {} parts{}: {cause}", delivered.len(), parts.len(), ids_note(delivered))]
+pub struct PartialSendError {
+    pub delivered: Vec<SentMessage>,
+    // Every part of the text, delivered or not; delivered[i] carried parts[i].
+    pub parts: Vec<String>,
+    cause: TelegramError,
+}
+
+fn ids_note(delivered: &[SentMessage]) -> String {
+    if delivered.is_empty() {
+        return String::new();
+    }
+    let ids: Vec<String> = delivered.iter().map(|m| m.message_id.to_string()).collect();
+    format!(" (delivered message ids: {})", ids.join(", "))
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum SendError {
+    // Nothing delivered yet: the original error is the whole story.
+    #[error(transparent)]
+    Telegram(#[from] TelegramError),
+    #[error(transparent)]
+    Partial(#[from] PartialSendError),
+}
+
+// Sends the parts in order, one after another, into the same chat and topic.
+// Parts that are only whitespace are skipped: Telegram rejects an empty
+// message, and the text around them still arrives.
+pub async fn send_long_message(
+    bot: &BotApi,
+    chat_id: &str,
+    text: &str,
+    thread_id: Option<i64>,
+) -> Result<(Vec<String>, Vec<SentMessage>), SendError> {
+    send_parts(text, |part| async move { bot.send_message(chat_id, &part, thread_id).await }).await
+}
+
+// The same with the sender injected (tests).
+pub async fn send_parts<F, Fut>(text: &str, send: F) -> Result<(Vec<String>, Vec<SentMessage>), SendError>
+where
+    F: Fn(String) -> Fut,
+    Fut: std::future::Future<Output = Result<SentMessage, TelegramError>>,
+{
+    let parts: Vec<String> =
+        split_telegram_text(text, TELEGRAM_TEXT_LIMIT).into_iter().filter(|p| !p.trim().is_empty()).collect();
+    let mut sent = Vec::new();
+    for part in &parts {
+        match send(part.clone()).await {
+            Ok(message) => sent.push(message),
+            Err(cause) if sent.is_empty() => return Err(cause.into()),
+            Err(cause) => return Err(PartialSendError { delivered: sent, parts, cause }.into()),
+        }
+    }
+    Ok((parts, sent))
 }
 
 // ── 7. tools ─────────────────────────────────────────────────────────────────
@@ -763,6 +981,11 @@ impl ChatId {
         }
     }
 }
+
+// The longest text send_telegram_message takes. Anything over Telegram's 4096
+// goes out as several messages; the cap only stops a runaway text from
+// becoming a flood.
+const MAX_SEND_CHARS: usize = 4 * TELEGRAM_TEXT_LIMIT;
 
 const NO_CHAT_TARGET: &str = "No chat target. Pass chatId, or set TELEGRAM_DEFAULT_CHAT_ID in .env (find your id with `pnpm telegram:get-chat-id`).";
 
@@ -797,29 +1020,73 @@ impl McpTools {
             returned messageId can be persisted and passed to edit_telegram_message \
             later (e.g. to mark a bill as paid). The outgoing message is also \
             recorded in the local Telegram chat log so the conversation history \
-            stays in sync."
+            stays in sync.\n\n\
+            A text over Telegram's 4096-character limit is sent as several \
+            consecutive messages, split at blank lines where possible; \
+            `messageIds` lists them all and `messageId` is the first."
     )]
     async fn send_telegram_message(&self, Parameters(p): Parameters<SendParams>) -> ToolResult {
-        check_text(&p.text, false)?;
+        let len = p.text.encode_utf16().count();
+        if len == 0 || len > MAX_SEND_CHARS {
+            return Err(invalid_params("text must be 1–16384 characters"));
+        }
         let tg = &self.deps.telegram;
         respond(
             async {
                 let target = p.chat_id.map(ChatId::into_string).or_else(|| tg.config.default_chat_id.clone());
                 let target = target.ok_or_else(|| anyhow::anyhow!(NO_CHAT_TARGET))?;
-                let sent = tg.bot.send_message(&target, &p.text, p.message_thread_id).await?;
+                // One log row per Telegram message, so the chat history matches
+                // what the user actually sees — including the parts of a send
+                // that failed partway, which are in the chat all the same.
+                let record = |messages: Vec<SentMessage>, parts: Vec<String>| async move {
+                    for (message, part) in messages.iter().zip(parts) {
+                        tg.log
+                            .record(
+                                message.chat.id,
+                                Some(message.message_id),
+                                p.message_thread_id,
+                                Role::Assistant,
+                                &part,
+                            )
+                            .await?;
+                    }
+                    anyhow::Ok(())
+                };
+                let (parts, sent) = match send_long_message(&tg.bot, &target, &p.text, p.message_thread_id).await {
+                    Ok(result) => result,
+                    Err(SendError::Partial(err)) => {
+                        // The partial send is the story the model needs; a log
+                        // failure on top of it must not replace it.
+                        let _ = record(err.delivered.clone(), err.parts.clone()).await;
+                        return Err(err.into());
+                    }
+                    Err(SendError::Telegram(err)) => return Err(err.into()),
+                };
+                let Some(first) = sent.first().cloned() else {
+                    anyhow::bail!("Nothing to send: the text is only whitespace.");
+                };
                 // The outgoing message clears the indicator client-side; stop the
                 // keep-alive so it doesn't bleed into the next session.
                 tg.typing.stop(&target, p.message_thread_id);
-                tg.log
-                    .record(sent.chat.id, Some(sent.message_id), p.message_thread_id, Role::Assistant, &p.text)
-                    .await?;
-                Ok(json!({
+                let message_ids: Vec<i64> = sent.iter().map(|m| m.message_id).collect();
+                let count = sent.len();
+                let mut reply = json!({
                     "delivered": true,
                     "chatId": target,
-                    "messageId": sent.message_id,
+                    "messageId": first.message_id,
+                    "messageIds": message_ids,
+                    "parts": count,
                     "messageThreadId": p.message_thread_id,
-                    "date": iso_from_unix(sent.date),
-                }))
+                    "date": iso_from_unix(first.date),
+                });
+                // The message is in the chat now. A failed log write must not
+                // turn that into a failure: the model would send it again.
+                if let Err(err) = record(sent, parts).await {
+                    let log_error = format!("delivered, but not recorded in the chat log: {err:#}");
+                    tracing::error!("send_telegram_message: {log_error}");
+                    reply["logError"] = log_error.into();
+                }
+                Ok(reply)
             }
             .await,
         )
@@ -895,11 +1162,27 @@ impl McpTools {
         check_text(&p.text, false)?;
         let tg = &self.deps.telegram;
         let chat_id = p.chat_id.into_string();
-        respond(async {
-            let edited = tg.bot.edit_message_text(&chat_id, p.message_id, &p.text).await?;
-            Ok(json!({ "edited": true, "chatId": chat_id, "messageId": edited.message_id, "date": iso_from_unix(edited.date) }))
-        }
-        .await)
+        respond(
+            async {
+                let edited = tg.bot.edit_message_text(&chat_id, p.message_id, &p.text).await?;
+                let mut reply = json!({
+                    "edited": true,
+                    "chatId": chat_id,
+                    "messageId": edited.message_id,
+                    "date": iso_from_unix(edited.date),
+                });
+                // The history the agent reads back should show what the user sees.
+                let logged = match chat_id.trim().parse::<i64>() {
+                    Ok(chat) => tg.log.edited(chat, p.message_id, &p.text).await,
+                    Err(_) => Err(anyhow::anyhow!("chat id {chat_id} is not numeric")),
+                };
+                if let Err(err) = logged {
+                    reply["logError"] = format!("edited, but not updated in the chat log: {err:#}").into();
+                }
+                Ok(reply)
+            }
+            .await,
+        )
     }
 
     #[tool(
@@ -1009,7 +1292,7 @@ pub struct TelegramModule {
 
 impl TelegramModule {
     pub fn new(config: TelegramConfig, http: reqwest::Client, db: Db) -> Self {
-        let bot = BotApi::new(http, config.bot_token.clone());
+        let bot = BotApi::with_root(http, config.bot_token.clone(), config.api_root.clone());
         Self {
             typing: Typing::new(bot.clone()),
             status: StatusBubbles::new(bot.clone()),
@@ -1054,28 +1337,199 @@ mod tests {
         assert_eq!(signal_content(5, None, "x"), "Telegram message in chat 5.\nText: \"x\"");
     }
 
-    #[tokio::test]
-    async fn ingest_keeps_only_the_default_chat_and_advances_the_cursor() {
-        let Some(db) = Db::test().await else { return };
-        let (log, signals) = (ChatLog::new(db.clone()), Signals::new(db));
-        let updates: Vec<Update> = serde_json::from_value(json!([
-            { "update_id": 10, "message": { "message_id": 1, "chat": { "id": 7, "type": "private" }, "text": "hello" } },
-            { "update_id": 11, "message": { "message_id": 2, "chat": { "id": 99, "type": "private" }, "text": "spam" } },
-            { "update_id": 12, "edited_message": { "message_id": 3, "chat": { "id": 7, "type": "supergroup" }, "text": "edited", "message_thread_id": 4 } },
-        ]))
-        .unwrap();
-        ingest(&updates, 7, &log, &signals).await.unwrap();
-
-        assert_eq!(log.last_update_id().await.unwrap(), Some(12));
-        let history = log.history(7, 50, None).await.unwrap();
-        assert_eq!(history.iter().map(|m| m.text.as_str()).collect::<Vec<_>>(), ["hello", "edited"]);
-        assert_eq!(log.history(7, 50, Some(4)).await.unwrap().len(), 1);
-        assert_eq!(signals.count_pending().await.unwrap(), 2);
-    }
-
     #[test]
     fn status_frames_cycle_trailing_dots() {
         let frames: Vec<String> = (0..5).map(|f| render_status("Работаю", f)).collect();
         assert_eq!(frames, ["Работаю", "Работаю.", "Работаю..", "Работаю...", "Работаю"]);
+    }
+}
+
+// ── tests: splitting long texts ──────────────────────────────────────────────
+// A port of packages/mcp/src/services/telegram/split.test.ts.
+
+#[cfg(test)]
+mod split_tests {
+    use std::sync::Mutex;
+
+    use proptest::prelude::*;
+
+    use super::*;
+
+    fn units(s: &str) -> usize {
+        s.encode_utf16().count()
+    }
+
+    fn js_slice(s: &str, from: usize, to: usize) -> Vec<u16> {
+        let u: Vec<u16> = s.encode_utf16().collect();
+        u[from.min(u.len())..to.min(u.len())].to_vec()
+    }
+
+    // Text built from the pieces that matter to the cutter: words, line
+    // breaks, blank lines, long unbroken runs and astral characters.
+    fn text(max_pieces: usize) -> impl Strategy<Value = String> {
+        proptest::collection::vec(
+            prop_oneof![
+                proptest::sample::select(vec!["\n\n", "\n", " ", "😀", "ё"]).prop_map(str::to_owned),
+                "[ -~]{1,12}",
+                (20usize..=120).prop_map(|n| "x".repeat(n)),
+            ],
+            1..=max_pieces,
+        )
+        .prop_map(|ps| ps.concat())
+    }
+
+    fn runs() -> u32 {
+        std::env::var("MODEL_CASES").ok().and_then(|v| v.parse().ok()).unwrap_or(500)
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig { max_global_rejects: 100_000, ..ProptestConfig::with_cases(runs()) })]
+
+        #[test]
+        fn loses_nothing_keeps_order_and_never_exceeds_the_limit(text in text(60), limit in 2usize..=80) {
+            let parts = split_telegram_text(&text, limit);
+            prop_assert_eq!(parts.concat(), text);
+            for part in &parts {
+                prop_assert!(units(part) > 0);
+                prop_assert!(units(part) <= limit);
+            }
+        }
+
+        // A Rust String can't hold half a surrogate pair at all; what is
+        // checked is that no part ends where a pair would have been cut.
+        #[test]
+        fn never_splits_a_surrogate_pair(text in text(60), limit in 2usize..=80) {
+            let mut offset = 0;
+            for part in split_telegram_text(&text, limit) {
+                offset += units(&part);
+                let all: Vec<u16> = text.encode_utf16().collect();
+                if offset < all.len() {
+                    prop_assert!(!(0xdc00..=0xdfff).contains(&all[offset]), "a part ends inside a pair");
+                }
+            }
+        }
+
+        #[test]
+        fn a_text_within_the_limit_is_one_part_unchanged(text in text(10)) {
+            prop_assume!(units(&text) <= TELEGRAM_TEXT_LIMIT);
+            prop_assert_eq!(split_telegram_text(&text, TELEGRAM_TEXT_LIMIT), vec![text]);
+        }
+
+        #[test]
+        fn ends_a_part_at_the_last_blank_line_when_that_keeps_it_at_least_half_full(text in text(60), limit in 4usize..=80) {
+            let parts = split_telegram_text(&text, limit);
+            let mut offset = 0;
+            for part in &parts[..parts.len().saturating_sub(1)] {
+                let window = js_slice(&text, offset, offset + limit);
+                let blank: Vec<u16> = "\n\n".encode_utf16().collect();
+                if let Some(at) = last_index_of(&window, &blank)
+                    && at + 2 >= limit.div_ceil(2)
+                {
+                    prop_assert_eq!(units(part), at + 2);
+                }
+                offset += units(part);
+            }
+        }
+
+        // A separator ends a part only where the part stays at least half
+        // full: a separator early in the window is not worth a sliver of a
+        // message when there is one further on.
+        #[test]
+        fn never_ends_a_part_in_the_first_half_when_a_separator_sits_in_the_second(
+            text in proptest::collection::vec(prop_oneof!["[ -~]{1,12}", proptest::sample::select(vec!["\n\n", "\n", " "]).prop_map(str::to_owned)], 0..=40).prop_map(|cs| cs.concat()),
+            limit in 4usize..=40,
+        ) {
+            let all: Vec<u16> = text.encode_utf16().collect();
+            let mut rest = &all[..];
+            for part in split_telegram_text(&text, limit) {
+                let window = &rest[..limit.min(rest.len())];
+                let late = SEPARATORS.iter().any(|sep| {
+                    let sep: Vec<u16> = sep.encode_utf16().collect();
+                    last_index_of(window, &sep).is_some_and(|at| at + sep.len() >= limit.div_ceil(2))
+                });
+                if rest.len() > limit && late {
+                    prop_assert!(units(&part) >= limit.div_ceil(2));
+                }
+                rest = &rest[units(&part)..];
+            }
+        }
+    }
+
+    #[test]
+    fn cuts_a_digest_between_blocks_not_inside_one() {
+        let block = |n: usize| format!("Блок {n}\n• {}\n", "новость ".repeat(300));
+        let text = [1, 2, 3].map(block).join("\n");
+        let parts = split_telegram_text(&text, TELEGRAM_TEXT_LIMIT);
+        assert!(parts.len() > 1);
+        assert_eq!(parts.concat(), text);
+        for part in &parts[1..] {
+            assert!(part.starts_with("Блок "), "{part:.20}");
+        }
+    }
+
+    #[test]
+    fn hard_cuts_a_run_with_no_separator_at_the_limit() {
+        let parts = split_telegram_text(&"x".repeat(10_000), TELEGRAM_TEXT_LIMIT);
+        assert_eq!(parts.iter().map(|p| p.len()).collect::<Vec<_>>(), [4096, 4096, 1808]);
+    }
+
+    fn sent(id: i64) -> SentMessage {
+        SentMessage { message_id: id, date: 1, chat: SentChat { id: 42 } }
+    }
+
+    // The TS fake numbers deliveries 101, 102, … and can fail on the n-th.
+    async fn send_with(
+        text: &str,
+        fail_on: Option<usize>,
+        texts: &Mutex<Vec<String>>,
+    ) -> Result<(Vec<String>, Vec<SentMessage>), SendError> {
+        send_parts(text, |part| async move {
+            let mut t = texts.lock().unwrap();
+            if Some(t.len()) == fail_on {
+                return Err(TelegramError::Api {
+                    method: "sendMessage",
+                    status: 429,
+                    description: "Too Many Requests".into(),
+                });
+            }
+            t.push(part);
+            Ok(sent(100 + t.len() as i64))
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn sends_every_part_in_order() {
+        let texts = Mutex::new(Vec::new());
+        let text = format!("{}\n\n{}", "a ".repeat(1500), "b ".repeat(1500));
+        let (_, out) = send_with(&text, None, &texts).await.unwrap();
+        assert_eq!(texts.lock().unwrap().concat(), text);
+        assert_eq!(out.iter().map(|m| m.message_id).collect::<Vec<_>>(), [101, 102]);
+    }
+
+    #[tokio::test]
+    async fn a_short_text_is_a_single_send() {
+        let texts = Mutex::new(Vec::new());
+        send_with("hi", None, &texts).await.unwrap();
+        assert_eq!(*texts.lock().unwrap(), ["hi"]);
+    }
+
+    #[tokio::test]
+    async fn a_failure_partway_names_what_was_already_delivered() {
+        let texts = Mutex::new(Vec::new());
+        let text = format!("{}\n\n{}", "a ".repeat(1500), "b ".repeat(1500));
+        let Err(SendError::Partial(err)) = send_with(&text, Some(1), &texts).await else { panic!("a partial send") };
+        assert_eq!(err.parts.len(), 2);
+        assert_eq!(err.delivered.iter().map(|m| m.message_id).collect::<Vec<_>>(), [101]);
+        assert!(err.to_string().contains("after 1 of 2 parts (delivered message ids: 101)"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_failure_on_the_first_part_is_the_original_error() {
+        let texts = Mutex::new(Vec::new());
+        let Err(SendError::Telegram(err)) = send_with(&"a".repeat(5000), Some(0), &texts).await else {
+            panic!("the original error")
+        };
+        assert!(err.to_string().contains("Too Many Requests"));
     }
 }

@@ -7,6 +7,8 @@
 
 #![allow(dead_code)]
 
+pub mod fake_telegram;
+
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -174,6 +176,24 @@ pub async fn start_test_server_as(
     serve(&database.url, db, toolsets, Arc::new(WordEmbedder), actor, None).await
 }
 
+// Everything a test may swap in for the production wiring.
+#[derive(Default)]
+pub struct Overrides {
+    pub actor: Option<String>,
+    pub fetcher: Option<SharedFetch>,
+    pub account: Option<SharedAccount>,
+    pub telegram: Option<TelegramConfig>,
+}
+
+pub async fn start_test_server_with(
+    database: &TestDatabase,
+    toolsets: Option<&str>,
+    overrides: Overrides,
+) -> anyhow::Result<Server> {
+    let db = Db::connect_state(&database.url, &database.state_url).await?;
+    serve_overridden(&database.url, db, toolsets, Arc::new(WordEmbedder), overrides).await
+}
+
 // The same, with the Telegram account played by a stand-in.
 pub async fn start_test_server_with_account(
     database: &TestDatabase,
@@ -221,6 +241,19 @@ async fn serve_with(
     fetcher: Option<SharedFetch>,
     account: Option<SharedAccount>,
 ) -> anyhow::Result<Server> {
+    let overrides = Overrides { actor: Some(actor.to_owned()), fetcher, account, telegram: None };
+    serve_overridden(database_url, db, toolsets, embedder, overrides).await
+}
+
+async fn serve_overridden(
+    database_url: &str,
+    db: Db,
+    toolsets: Option<&str>,
+    embedder: SharedEmbedder,
+    overrides: Overrides,
+) -> anyhow::Result<Server> {
+    let Overrides { actor, fetcher, account, telegram } = overrides;
+    let actor = actor.unwrap_or_else(|| "spec".into());
     let pool = pg::connect(database_url)?;
     pg::migrate(&pool).await?;
     let http = reqwest::Client::new();
@@ -232,7 +265,7 @@ async fn serve_with(
         signals: signals.clone(),
         scheduler: scheduler.clone(),
         // No bot token: sending fails as a tool error, nothing leaves the box.
-        telegram: TelegramModule::new(TelegramConfig::default(), http.clone(), db.clone()),
+        telegram: TelegramModule::new(telegram.unwrap_or_default(), http.clone(), db.clone()),
         gmail: GmailModule::new(db.clone(), http.clone()),
         monobank: Monobank::new(http.clone()),
         userbot: account.unwrap_or_else(|| Arc::new(Userbot::new(db.clone()))),
@@ -242,9 +275,13 @@ async fn serve_with(
         news: NewsRepository::new(pool.clone(), embedder.clone()),
         knowledge: KnowledgeRepository::new(pool.clone(), embedder.clone()),
         memory: MemoryService::new(Arc::new(PgMemoryStore::new(pool.clone())), embedder),
-        memory_actor: actor.into(),
+        memory_actor: actor,
         gateway: None,
     });
+    // The keep-alives behind start_typing / telegram_send_status run on every
+    // instance, as in main.rs.
+    tokio::spawn(deps.telegram.typing.clone().run(CancellationToken::new()));
+    tokio::spawn(deps.telegram.status.clone().run(CancellationToken::new()));
     let scope = toolsets::parse_toolsets(toolsets)?;
     let router = toolsets::compose_router(&scope.names);
     let port = std::net::TcpListener::bind("127.0.0.1:0")?.local_addr()?.port();
