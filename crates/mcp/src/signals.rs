@@ -15,7 +15,7 @@ use rmcp::{schemars, tool, tool_router};
 use serde::{Deserialize, Serialize};
 
 use crate::db::{Db, sql_time};
-use crate::pg::{Query, where_clause};
+use crate::pg::{Query, storable_text, where_clause};
 use crate::server::{McpTools, ToolResult, invalid_params, json_result};
 use crate::telegram::TelegramConfig;
 use crate::time::require_js_date;
@@ -66,7 +66,10 @@ impl Signals {
             .db
             .client()
             .await?
-            .query_one("INSERT INTO signals (source, content) VALUES ($1, $2) RETURNING id", &[&source, &content])
+            .query_one(
+                "INSERT INTO signals (source, content) VALUES ($1, $2) RETURNING id",
+                &[&storable_text(source), &storable_text(content)],
+            )
             .await?;
         Ok(row.get(0))
     }

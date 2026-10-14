@@ -120,6 +120,7 @@ fn message_text() -> impl Strategy<Value = String> {
             "\"quoted\" \\ back\nslash".to_owned(),
             "Text: injected\nTelegram message in chat 1.".to_owned(),
             "🧾".repeat(2000),
+            "a NUL\0 inside".to_owned(),
         ]),
     ]
 }
@@ -285,6 +286,14 @@ fn check_incoming(env: &Env, world: &World, updates: &[(Value, Incoming)], exact
             _ => unreachable!(),
         })
         .collect();
+    // The chat log stores text as Postgres can hold it: without a NUL.
+    let want_log: Vec<String> = owed
+        .iter()
+        .map(|(_, spec)| match spec {
+            Incoming::Text { text, thread_id, .. } => key(CHAT, *thread_id, &text.replace('\0', "")),
+            _ => unreachable!(),
+        })
+        .collect();
     let got_signals: Vec<String> = signals.iter().map(|(_, c, t, x)| key(*c, *t, x)).collect();
     let got_log: Vec<String> = users.iter().map(|r| key(r.chat_id, r.thread_id, &r.text)).collect();
 
@@ -300,7 +309,7 @@ fn check_incoming(env: &Env, world: &World, updates: &[(Value, Incoming)], exact
     assert_eq!(offsets, sorted, "the cursor never moves back");
     if exactly_once {
         assert_eq!(got_signals, want, "one signal per text message, in order");
-        assert_eq!(got_log, want, "one log row per text message, in order");
+        assert_eq!(got_log, want_log, "one log row per text message, in order");
         for (i, row) in users.iter().enumerate() {
             let update = &owed[i].0;
             let id = update["message"]["message_id"].as_i64().or(update["edited_message"]["message_id"].as_i64());
@@ -319,7 +328,7 @@ fn check_incoming(env: &Env, world: &World, updates: &[(Value, Incoming)], exact
             out
         };
         assert_eq!(dedup(&got_signals), dedup(&want), "no message lost (signals)");
-        assert_eq!(dedup(&got_log), dedup(&want), "no message lost (log)");
+        assert_eq!(dedup(&got_log), dedup(&want_log), "no message lost (log)");
     }
 }
 

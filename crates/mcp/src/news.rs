@@ -27,7 +27,7 @@ use crate::embeddings::{
     BackfillBatch, DEFAULT_DEDUP_THRESHOLD, SharedEmbedder, backfill_rows, dedup_by_pairwise_cosine,
 };
 use crate::fetch::{SharedFetch, read_capped};
-use crate::pg::{PgPool, Query, parse_vector, vector_literal, where_clause};
+use crate::pg::{PgPool, Query, parse_vector, storable_json, storable_text, vector_literal, where_clause};
 use crate::server::{McpTools, ToolResult, invalid_params, respond};
 use crate::time::{iso, parse_js_date, require_js_date};
 use crate::userbot::SharedAccount;
@@ -656,7 +656,24 @@ fn pool_row(row: &Row) -> PoolRow {
     }
 }
 
+// What Postgres can store: text and jsonb refuse a NUL, and one such item
+// fails the whole multi-row insert — a poller would lose its batch on every
+// tick, a channel stall on the post for good. Scraped and forwarded text does
+// carry NULs.
+fn storable(item: &NewsItem) -> NewsItem {
+    NewsItem {
+        source: storable_text(&item.source),
+        external_id: storable_text(&item.external_id),
+        title: item.title.as_deref().map(storable_text),
+        url: item.url.as_deref().map(storable_text),
+        body: storable_text(&item.body),
+        metadata: item.metadata.iter().map(|(k, v)| (storable_text(k), storable_json(v))).collect(),
+        posted_at: item.posted_at,
+    }
+}
+
 fn bind_item(query: &mut Query, item: &NewsItem) -> String {
+    let item = &storable(item);
     let source = query.bind(item.source.clone());
     let external_id = query.bind(item.external_id.clone());
     let title = query.bind(item.title.clone());
@@ -732,6 +749,7 @@ impl NewsRepository {
                      title = EXCLUDED.title, body = EXCLUDED.body, metadata = EXCLUDED.metadata,
                      embedding = NULL, embedded_at = NULL
                    RETURNING id, title, body";
+        let item = &storable(item);
         let metadata = Value::Object(item.metadata.clone());
         let row = {
             let client = self.pool.get().await?;

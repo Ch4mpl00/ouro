@@ -21,6 +21,7 @@ use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
 use crate::db::{Db, sql_time};
+use crate::pg::storable_text;
 use crate::server::{McpTools, ToolResult, invalid_params, json_result, respond};
 use crate::signals::Signals;
 use crate::time::iso_from_unix;
@@ -313,7 +314,7 @@ impl ChatLog {
             .query_one(
                 "INSERT INTO telegram_messages (chat_id, tg_message_id, thread_id, role, text)
                  VALUES ($1, $2, $3, $4, $5) RETURNING id",
-                &[&chat_id, &tg_message_id, &thread_id, &role.as_str(), &text],
+                &[&chat_id, &tg_message_id, &thread_id, &role.as_str(), &storable_text(text)],
             )
             .await?;
         Ok(row.get(0))
@@ -370,7 +371,7 @@ impl ChatLog {
             .await?
             .execute(
                 "UPDATE telegram_messages SET text = $3 WHERE chat_id = $1 AND tg_message_id = $2 AND role = 'assistant'",
-                &[&chat_id, &tg_message_id, &text],
+                &[&chat_id, &tg_message_id, &storable_text(text)],
             )
             .await?;
         Ok(())

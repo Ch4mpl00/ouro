@@ -101,16 +101,23 @@ impl TelegramAccount for FakeTelegram {
     }
 }
 
+// `nul_every`: some posts carry a NUL character, which Postgres text can't
+// hold — scraped and forwarded text does contain them.
 #[derive(Debug, Clone)]
 enum Step {
-    Posts { channel: usize, count: usize, media_every: i64 },
+    Posts { channel: usize, count: usize, media_every: i64, nul_every: i64 },
     Tick { fail_channel: Option<usize> },
 }
 
 fn step() -> impl Strategy<Value = Step> {
     prop_oneof![
-        3 => (0usize..=2, prop_oneof![4 => 1usize..=30, 1 => 201usize..=450], proptest::sample::select(vec![0i64, 7]))
-            .prop_map(|(channel, count, media_every)| Step::Posts { channel, count, media_every }),
+        3 => (
+            0usize..=2,
+            prop_oneof![4 => 1usize..=30, 1 => 201usize..=450],
+            proptest::sample::select(vec![0i64, 7]),
+            proptest::sample::select(vec![0i64, 0, 5]),
+        )
+            .prop_map(|(channel, count, media_every, nul_every)| Step::Posts { channel, count, media_every, nul_every }),
         3 => proptest::option::weighted(5.0 / 6.0, 0usize..=2).prop_map(|fail_channel| Step::Tick { fail_channel }),
     ]
 }
@@ -149,7 +156,7 @@ fn stores_every_text_post_after_the_first_tick_exactly_once_bursts_and_failures_
                 }
                 let mut next_id: BTreeMap<&str, i64> = ids.iter().chain(&[GROUP]).map(|c| (*c, 1)).collect();
                 let mut clock = 1_790_000_000i64;
-                let mut post = |channel: &'static str, count: usize, media_every: i64| {
+                let mut post = |channel: &'static str, count: usize, media_every: i64, nul_every: i64| {
                     let mut channels = telegram.channels.lock().unwrap();
                     let list = channels.get_mut(channel).unwrap();
                     for _ in 0..count {
@@ -157,6 +164,8 @@ fn stores_every_text_post_after_the_first_tick_exactly_once_bursts_and_failures_
                         next_id.insert(channel, id + 1);
                         let message = if media_every > 0 && id % media_every == 0 {
                             String::new()
+                        } else if nul_every > 0 && id % nul_every == 0 {
+                            format!("post {channel}/{id}\0 with a NUL")
                         } else {
                             format!("post {channel}/{id}")
                         };
@@ -167,10 +176,10 @@ fn stores_every_text_post_after_the_first_tick_exactly_once_bursts_and_failures_
                 // History before the harvester ever runs: only the newest 50
                 // of it is wanted (the bootstrap).
                 for c in ids {
-                    post(c, 80, 0);
+                    post(c, 80, 0, 0);
                 }
                 // The supergroup chats all along.
-                post(GROUP, 5, 0);
+                post(GROUP, 5, 0, 0);
                 let bootstrap_cut: BTreeMap<&str, i64> = ids.iter().map(|c| (*c, 81 - 50)).collect();
 
                 let provider = TelegramChannels::new(telegram.clone(), env.pool.clone()).with_delay(Duration::ZERO);
@@ -184,12 +193,15 @@ fn stores_every_text_post_after_the_first_tick_exactly_once_bursts_and_failures_
 
                 for s in &steps {
                     match s {
-                        Step::Posts { channel, count, media_every } => {
+                        Step::Posts { channel, count, media_every, nul_every } => {
                             if *count > 200 {
                                 witnessed.lock().unwrap().insert("a burst of more than one tick's worth");
                             }
-                            post(ids[*channel], *count, *media_every);
-                            post(GROUP, 5, 0);
+                            post(ids[*channel], *count, *media_every, *nul_every);
+                            if *nul_every > 0 {
+                                witnessed.lock().unwrap().insert("a post with a NUL");
+                            }
+                            post(GROUP, 5, 0, 0);
                         }
                         Step::Tick { fail_channel } => {
                             if let Some(c) = fail_channel {
@@ -237,6 +249,6 @@ fn stores_every_text_post_after_the_first_tick_exactly_once_bursts_and_failures_
         .unwrap();
     assert_eq!(
         witnessed.into_inner().unwrap().into_iter().collect::<Vec<_>>(),
-        ["a burst of more than one tick's worth", "a channel fails a tick"]
+        ["a burst of more than one tick's worth", "a channel fails a tick", "a post with a NUL"]
     );
 }

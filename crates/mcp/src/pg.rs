@@ -127,6 +127,26 @@ async fn migrate_locked(client: &mut deadpool_postgres::Object) -> anyhow::Resul
 
 // ── 3. vectors ───────────────────────────────────────────────────────────────
 
+// Postgres text and jsonb can't hold a NUL character: one in a value fails
+// the whole statement. What pollers write without a human in the loop —
+// scraped articles, mail subjects, forwarded posts — does carry them, and a
+// write that fails on every retry stalls the poller behind it. Dropping the
+// NUL is the closest storable text.
+pub fn storable_text(text: &str) -> String {
+    text.replace('\0', "")
+}
+
+// The same for a JSON value: every string in it, keys included.
+pub fn storable_json(value: &serde_json::Value) -> serde_json::Value {
+    use serde_json::Value;
+    match value {
+        Value::String(s) => Value::String(storable_text(s)),
+        Value::Array(items) => Value::Array(items.iter().map(storable_json).collect()),
+        Value::Object(map) => Value::Object(map.iter().map(|(k, v)| (storable_text(k), storable_json(v))).collect()),
+        other => other.clone(),
+    }
+}
+
 // pgvector accepts and prints `[1,2,3]`; passing it as text with a `::vector`
 // cast keeps the driver free of a pgvector-specific type binding.
 pub fn vector_literal(v: &[f32]) -> String {

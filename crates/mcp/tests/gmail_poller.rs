@@ -29,6 +29,9 @@ struct Mail {
     gap_ms: i64,
     pdfs: usize,
     others: usize,
+    // A subject carrying a NUL (a decoded RFC 2047 word can), which Postgres
+    // text can't hold.
+    nul: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -45,15 +48,21 @@ enum Step {
 }
 
 fn mail() -> impl Strategy<Value = Mail> {
-    (prop_oneof![4 => Just(true), 1 => Just(false)], 1i64..=4_000, 0usize..=2, 0usize..=1)
-        .prop_map(|(matches, gap_ms, pdfs, others)| Mail { matches, gap_ms, pdfs, others })
+    (
+        prop_oneof![4 => Just(true), 1 => Just(false)],
+        1i64..=4_000,
+        0usize..=2,
+        0usize..=1,
+        prop_oneof![6 => Just(false), 1 => Just(true)],
+    )
+        .prop_map(|(matches, gap_ms, pdfs, others, nul)| Mail { matches, gap_ms, pdfs, others, nul })
 }
 
 fn step() -> impl Strategy<Value = Step> {
     prop_oneof![
         4 => proptest::collection::vec(mail(), 1..=4).prop_map(Step::Arrive),
         // A burst after an outage: more than one page of the list.
-        1 => (51usize..=70).prop_map(|n| Step::Arrive(vec![Mail { matches: true, gap_ms: 1_000, pdfs: 1, others: 0 }; n])),
+        1 => (51usize..=70).prop_map(|n| Step::Arrive(vec![Mail { matches: true, gap_ms: 1_000, pdfs: 1, others: 0, nul: false }; n])),
         5 => prop_oneof![
             3 => Just(Step::Tick(Fault::None)),
             1 => (0usize..(i32::MAX as usize)).prop_map(|pick| Step::Tick(Fault::Get(pick))),
@@ -163,10 +172,17 @@ fn turns_every_matching_mail_into_exactly_one_signal_in_order_across_failures_an
                                     content: None,
                                     nested: false,
                                 });
+                                if m.nul && m.matches {
+                                    witnessed.lock().unwrap().insert("a subject with a NUL");
+                                }
                                 env.fake.lock().mails.push(FakeMail {
                                     id: format!("m{n}"),
                                     internal_date: clock,
-                                    subject: format!("Рахунок {n}"),
+                                    subject: if m.nul {
+                                        format!("Рахунок {n}\0")
+                                    } else {
+                                        format!("Рахунок {n}")
+                                    },
                                     matches: m.matches,
                                     attachments: pdf.chain(other).collect(),
                                 });
@@ -248,6 +264,6 @@ fn turns_every_matching_mail_into_exactly_one_signal_in_order_across_failures_an
         .unwrap();
     assert_eq!(
         witnessed.into_inner().unwrap().into_iter().collect::<Vec<_>>(),
-        ["a burst of more than one page", "a poll fails midway"]
+        ["a burst of more than one page", "a poll fails midway", "a subject with a NUL"]
     );
 }

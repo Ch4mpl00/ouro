@@ -332,6 +332,69 @@ fn save_keeps_the_first_copy_of_each_source_external_id_and_embeds_what_it_store
         .unwrap();
 }
 
+// Postgres text and jsonb can't hold a NUL — and one such item would fail the
+// whole batch's insert, every tick. Each is stored as close as it can be, and
+// the rest of the batch with it. (The TS test also feeds an Invalid Date; a
+// DateTime here can't be one.)
+#[test]
+fn save_stores_a_batch_whole_even_when_items_carry_nuls() {
+    let _serial = serial();
+    let env = env();
+    let taint = proptest::sample::select(vec!["none", "none", "nulBody", "nulTitle", "nulMetadata"]);
+    TestRunner::new(Config::with_cases(property_runs(30)))
+        .run(&proptest::collection::vec((item(), taint), 1..=20), |pairs| {
+            runtime().block_on(async {
+                let pool = &env.server.pool;
+                pool.get().await.unwrap().batch_execute("TRUNCATE news_items RESTART IDENTITY").await.unwrap();
+                let batch: Vec<NewsItem> = pairs
+                    .iter()
+                    .map(|(i, t)| {
+                        let mut item = news_item(i);
+                        match *t {
+                            "nulBody" => item.body = format!("{}\0tail", item.body),
+                            "nulTitle" => item.title = Some("head\0line".into()),
+                            "nulMetadata" => {
+                                item.metadata = json!({ "author": "a\0b", "tags": ["x\0"], "k\0": 1 })
+                                    .as_object()
+                                    .cloned()
+                                    .unwrap_or_default()
+                            }
+                            _ => {}
+                        }
+                        item
+                    })
+                    .collect();
+                env.repo.save(&batch).await.unwrap();
+                let mut firsts: BTreeMap<String, &NewsItem> = BTreeMap::new();
+                for b in &batch {
+                    firsts.entry(format!("{}:{}", b.source, b.external_id)).or_insert(b);
+                }
+                let rows = pool
+                    .get()
+                    .await
+                    .unwrap()
+                    .query("SELECT source || ':' || external_id, title, body, metadata FROM news_items", &[])
+                    .await
+                    .unwrap();
+                let at = format!("{:?}", pairs.iter().map(|(_, t)| *t).collect::<Vec<_>>());
+                let mut keys: Vec<String> = rows.iter().map(|r| r.get(0)).collect();
+                keys.sort();
+                assert_eq!(keys, firsts.keys().cloned().collect::<Vec<_>>(), "{at}: the whole batch is stored");
+                let strip = |x: &str| x.replace('\0', "");
+                for r in &rows {
+                    let b = firsts[&r.get::<_, String>(0)];
+                    assert_eq!(r.get::<_, String>(2), strip(&b.body), "{at}");
+                    assert_eq!(r.get::<_, Option<String>>(1), b.title.as_deref().map(strip), "{at}");
+                    let want =
+                        serde_json::to_string(&Value::Object(b.metadata.clone())).unwrap().replace("\\u0000", "");
+                    assert_eq!(r.get::<_, Value>(3), serde_json::from_str::<Value>(&want).unwrap(), "{at}");
+                }
+            });
+            Ok(())
+        })
+        .unwrap();
+}
+
 #[test]
 fn list_news_returns_matching_rows_in_posted_order_without_near_duplicates_leaving_nothing_out() {
     let _serial = serial();
