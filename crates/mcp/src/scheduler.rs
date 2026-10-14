@@ -10,7 +10,7 @@
 
 use std::time::Duration;
 
-use chrono::{DateTime, TimeZone, Utc};
+use chrono::{DateTime, Offset, TimeZone, Utc};
 use chrono_tz::Tz;
 use croner::Cron;
 use rmcp::handler::server::wrapper::Parameters;
@@ -121,14 +121,23 @@ impl Scheduler {
         Ok(row.as_ref().map(task_row))
     }
 
-    // For a one-shot this also retires it (list_active filters on NULL).
-    async fn mark_fired(&self, id: i64, slot_unix: i64) -> anyhow::Result<()> {
-        self.db
+    // Compare-and-set of the slot last fired for: moves last_run_at from
+    // `expected` to `next` only while it still is `expected` and the task
+    // still exists. The poller claims a slot with it (previous → slot), so
+    // overlapping ticks or a cancel in between can't fire it as well, and
+    // gives a claim back (slot → previous) when the signal couldn't be
+    // recorded. Stamping a slot on a one-shot also retires it.
+    pub async fn swap_last_run(&self, id: i64, expected: Option<i64>, next: Option<i64>) -> anyhow::Result<bool> {
+        let changed = self
+            .db
             .client()
             .await?
-            .execute("UPDATE scheduled_tasks SET last_run_at = $1 WHERE id = $2", &[&slot_unix, &id])
+            .execute(
+                "UPDATE scheduled_tasks SET last_run_at = $1 WHERE id = $2 AND last_run_at IS NOT DISTINCT FROM $3",
+                &[&next, &id, &expected],
+            )
             .await?;
-        Ok(())
+        Ok(changed > 0)
     }
 
     pub async fn delete(&self, id: i64) -> anyhow::Result<bool> {
@@ -145,8 +154,36 @@ pub fn parse_cron(expr: &str) -> Result<Cron, croner::errors::CronError> {
 }
 
 // First slot strictly after `after`, evaluated on the wall clock of `tz`.
+//
+// The match is searched on the wall clock as if it never changed, then the
+// wall time is placed on the timeline: a time the clock skipped (going
+// forward) fires shifted by the size of the jump — 03:30 on a 03:00→04:00
+// night fires at 04:30, as the TS server's cron-parser does (croner alone
+// fires at 04:00) — and a time the clock shows twice (going back) fires the
+// first time only.
 fn next_slot(cron: &Cron, tz: Tz, after: DateTime<Utc>) -> Option<DateTime<Utc>> {
-    cron.find_next_occurrence(&after.with_timezone(&tz), false).ok().map(|t| t.with_timezone(&Utc))
+    let mut cursor = after.with_timezone(&tz).naive_local();
+    // A wall match whose instant is not after `after` (the first pass of a
+    // repeated hour already behind us) moves the search on; a handful of
+    // steps always reaches the next real one.
+    for _ in 0..8 {
+        let wall = cron.find_next_occurrence(&Utc.from_utc_datetime(&cursor), false).ok()?.naive_utc();
+        let instant = match tz.from_local_datetime(&wall) {
+            chrono::LocalResult::Single(t) => t.with_timezone(&Utc),
+            chrono::LocalResult::Ambiguous(first, _) => first.with_timezone(&Utc),
+            chrono::LocalResult::None => {
+                // Skipped: read the wall time with the offset in force before
+                // the jump.
+                let before = tz.from_local_datetime(&(wall - chrono::Duration::hours(24))).earliest()?;
+                Utc.from_utc_datetime(&(wall - before.offset().fix()))
+            }
+        };
+        if instant > after {
+            return Some(instant);
+        }
+        cursor = wall;
+    }
+    None
 }
 
 fn preview_next_fires(cron: &Cron, tz: Tz, count: usize, now: DateTime<Utc>) -> Vec<String> {
@@ -174,13 +211,49 @@ fn anchor(task: &TaskRow) -> DateTime<Utc> {
 const TICK_INTERVAL: Duration = Duration::from_secs(30);
 const DEFAULT_SIGNAL_SOURCE: &str = "scheduler";
 
+// What a tick reads and writes, behind traits so a test can hold a tick
+// between listing and firing, or fail the signal write.
+#[async_trait::async_trait]
+pub trait TaskStore: Send + Sync {
+    async fn timezone(&self) -> chrono_tz::Tz;
+    async fn list_active(&self) -> anyhow::Result<Vec<TaskRow>>;
+    async fn swap_last_run(&self, id: i64, expected: Option<i64>, next: Option<i64>) -> anyhow::Result<bool>;
+}
+
+#[async_trait::async_trait]
+impl TaskStore for Scheduler {
+    async fn timezone(&self) -> chrono_tz::Tz {
+        self.settings.timezone().await
+    }
+
+    async fn list_active(&self) -> anyhow::Result<Vec<TaskRow>> {
+        Scheduler::list_active(self).await
+    }
+
+    async fn swap_last_run(&self, id: i64, expected: Option<i64>, next: Option<i64>) -> anyhow::Result<bool> {
+        Scheduler::swap_last_run(self, id, expected, next).await
+    }
+}
+
+#[async_trait::async_trait]
+pub trait SignalSink: Send + Sync {
+    async fn record(&self, source: &str, content: &str) -> anyhow::Result<()>;
+}
+
+#[async_trait::async_trait]
+impl SignalSink for Signals {
+    async fn record(&self, source: &str, content: &str) -> anyhow::Result<()> {
+        Signals::record(self, source, content).await.map(drop)
+    }
+}
+
 // Fires every task whose next slot (after its anchor) has passed. Restart-safe
 // and never double-fires a slot: the anchor is the *slot* fired for, not the
 // wall clock, so a late tick still advances to the following slot.
-pub async fn tick(scheduler: &Scheduler, signals: &Signals, now: DateTime<Utc>) -> anyhow::Result<usize> {
-    let tz = scheduler.settings.timezone().await;
+pub async fn tick(tasks: &dyn TaskStore, signals: &dyn SignalSink, now: DateTime<Utc>) -> anyhow::Result<usize> {
+    let tz = tasks.timezone().await;
     let mut fired = 0;
-    for task in scheduler.list_active().await? {
+    for task in tasks.list_active().await? {
         let cron = match parse_cron(&task.cron_expr) {
             Ok(cron) => cron,
             Err(err) => {
@@ -195,10 +268,19 @@ pub async fn tick(scheduler: &Scheduler, signals: &Signals, now: DateTime<Utc>) 
         // Snapshot before stamping, so skills (dreaming) can scope
         // `since=<previous fire>` from the signal header.
         let previous = task.last_run_at.and_then(|s| Utc.timestamp_opt(s, 0).single()).map(iso);
-        scheduler.mark_fired(task.id, slot.timestamp()).await?;
-
+        // Claimed with a compare-and-set: an overlapping tick that got there
+        // first, or a cancel since list_active, means this tick doesn't fire it.
+        let slot_unix = slot.timestamp();
+        if !tasks.swap_last_run(task.id, task.last_run_at, Some(slot_unix)).await? {
+            continue;
+        }
         let source = task.source.as_deref().unwrap_or(DEFAULT_SIGNAL_SOURCE);
-        signals.record(source, &render_content(&task, previous.as_deref(), slot, now)).await?;
+        if let Err(err) = signals.record(source, &render_content(&task, previous.as_deref(), slot, now)).await {
+            // Give the slot back so the next tick fires it, rather than
+            // leaving it marked as done with no signal.
+            tasks.swap_last_run(task.id, Some(slot_unix), task.last_run_at).await?;
+            return Err(err);
+        }
         tracing::info!(
             task = task.id,
             source,
@@ -321,6 +403,14 @@ struct TimezoneInfo {
     local_now: String,
 }
 
+// croner also reads 6-field expressions — as ones with a seconds field — so a
+// "with seconds" cron would fire on a schedule nobody wrote. Only the
+// documented 5 fields.
+fn field_count_error(cron_expr: &str) -> Option<String> {
+    let fields = cron_expr.split_whitespace().count();
+    (fields != 5).then(|| format!("expected 5 fields (minute hour day-of-month month day-of-week), got {fields}"))
+}
+
 fn upcoming_count(recurring: bool) -> usize {
     if recurring { 3 } else { 1 }
 }
@@ -348,11 +438,19 @@ impl McpTools {
         if cron_expr.is_empty() || prompt.is_empty() {
             return Err(invalid_params("cron_expr and prompt must be non-empty"));
         }
+        if let Some(error) = field_count_error(&cron_expr) {
+            return failure(format!("Invalid cron expression: {error}"));
+        }
         let cron = match parse_cron(&cron_expr) {
             Ok(cron) => cron,
             Err(err) => return failure(format!("Invalid cron expression: {err}")),
         };
         let tz = self.deps.settings.timezone().await;
+        // croner accepts a day that never comes (Nov 31) and would store a
+        // task that never fires; the TS server's parser refuses it.
+        if next_slot(&cron, tz, Utc::now()).is_none() {
+            return failure("Invalid cron expression: it never matches a date that exists".into());
+        }
         let upcoming_fires = preview_next_fires(&cron, tz, upcoming_count(recurring), Utc::now());
         let task = crate::try_tool!(self.deps.scheduler.insert(&cron_expr, recurring, &prompt, None).await);
         json_result(&Scheduled { ok: true, task, timezone: tz.name().to_owned(), upcoming_fires })
@@ -511,7 +609,7 @@ mod tests {
     async fn a_late_tick_advances_by_slot_not_by_wall_clock() {
         let Some((scheduler, signals, _db)) = setup().await else { return };
         let task = scheduler.insert("0 * * * *", true, "hourly", Some("dreaming")).await.unwrap();
-        scheduler.mark_fired(task.id, utc("2026-10-02T10:00:00Z").timestamp()).await.unwrap();
+        scheduler.swap_last_run(task.id, None, Some(utc("2026-10-02T10:00:00Z").timestamp())).await.unwrap();
 
         // Three hours late: owes the 11:00 slot now, 12:00 on the next tick.
         assert_eq!(tick(&scheduler, &signals, utc("2026-10-02T13:05:00Z")).await.unwrap(), 1);

@@ -8,6 +8,7 @@
 #![allow(dead_code)]
 
 pub mod fake_telegram;
+pub mod wall_cron;
 
 use std::path::PathBuf;
 use std::sync::Arc;
