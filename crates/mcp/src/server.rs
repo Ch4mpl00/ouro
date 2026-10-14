@@ -38,7 +38,7 @@ use crate::settings::Settings;
 use crate::signals::Signals;
 use crate::skills::SkillCatalog;
 use crate::telegram::TelegramModule;
-use crate::userbot::Userbot;
+use crate::userbot::SharedAccount;
 
 // ── 1. deps ──────────────────────────────────────────────────────────────────
 
@@ -51,7 +51,7 @@ pub struct Deps {
     pub telegram: TelegramModule,
     pub gmail: GmailModule,
     pub monobank: Monobank,
-    pub userbot: Userbot,
+    pub userbot: SharedAccount,
     pub skills: SkillCatalog,
     // The SSRF-guarded client behind fetch_url (fetch.rs).
     pub fetcher: crate::fetch::SharedFetch,

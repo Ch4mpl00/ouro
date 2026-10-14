@@ -30,7 +30,7 @@ use crate::fetch::{SharedFetch, read_capped};
 use crate::pg::{PgPool, Query, parse_vector, vector_literal, where_clause};
 use crate::server::{McpTools, ToolResult, invalid_params, respond};
 use crate::time::{iso, parse_js_date, require_js_date};
-use crate::userbot::Userbot;
+use crate::userbot::SharedAccount;
 
 // ── 1. items ─────────────────────────────────────────────────────────────────
 
@@ -418,7 +418,7 @@ impl NewsProvider for Habr {
 // BOOTSTRAP posts, then DELTA at a time; a short pause between channels
 // keeps clear of FLOOD_WAIT. No userbot session → nothing, not an error.
 pub struct TelegramChannels {
-    userbot: Userbot,
+    account: SharedAccount,
     pool: PgPool,
     inter_channel_delay: Duration,
 }
@@ -428,8 +428,13 @@ const BOOTSTRAP_LIMIT: usize = 50;
 const DELTA_LIMIT: usize = 200;
 
 impl TelegramChannels {
-    pub fn new(userbot: Userbot, pool: PgPool) -> Self {
-        Self { userbot, pool, inter_channel_delay: Duration::from_millis(200) }
+    pub fn new(account: SharedAccount, pool: PgPool) -> Self {
+        Self { account, pool, inter_channel_delay: Duration::from_millis(200) }
+    }
+
+    pub fn with_delay(mut self, inter_channel_delay: Duration) -> Self {
+        self.inter_channel_delay = inter_channel_delay;
+        self
     }
 }
 
@@ -484,15 +489,15 @@ impl NewsProvider for TelegramChannels {
     }
 
     async fn fetch(&self) -> anyhow::Result<Vec<NewsItem>> {
-        if !self.userbot.has_session().await {
+        if !self.account.has_session().await {
             tracing::warn!("no saved userbot session — run `pnpm userbot:auth`. Skipping channels tick.");
             return Ok(Vec::new());
         }
         let mut collected = Vec::new();
-        for channel in self.userbot.list_channels().await? {
+        for channel in crate::userbot::list_channels(&*self.account).await? {
             let watermark = channel_watermark(&self.pool, &channel.chat_id).await?;
             let limit = if watermark.is_none() { BOOTSTRAP_LIMIT } else { DELTA_LIMIT };
-            match self.userbot.fetch_messages(&channel, watermark, limit).await {
+            match crate::userbot::fetch_messages(&*self.account, &channel, watermark, limit).await {
                 Ok(messages) => {
                     collected.extend(messages.iter().map(|m| {
                         channel_item(&channel.chat_id, channel.title.as_deref(), channel.username.as_deref(), m)

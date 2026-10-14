@@ -27,7 +27,7 @@ use mcp_tools::signals::Signals;
 use mcp_tools::skills::SkillCatalog;
 use mcp_tools::telegram::{TelegramConfig, TelegramModule};
 use mcp_tools::toolsets;
-use mcp_tools::userbot::Userbot;
+use mcp_tools::userbot::{SharedAccount, Userbot};
 use rmcp::model::CallToolRequestParams;
 use rmcp::service::{RunningService, ServiceError};
 use rmcp::transport::StreamableHttpClientTransport;
@@ -174,6 +174,16 @@ pub async fn start_test_server_as(
     serve(&database.url, db, toolsets, Arc::new(WordEmbedder), actor, None).await
 }
 
+// The same, with the Telegram account played by a stand-in.
+pub async fn start_test_server_with_account(
+    database: &TestDatabase,
+    toolsets: Option<&str>,
+    account: SharedAccount,
+) -> anyhow::Result<Server> {
+    let db = Db::connect_state(&database.url, &database.state_url).await?;
+    serve_with(&database.url, db, toolsets, Arc::new(WordEmbedder), "spec", None, Some(account)).await
+}
+
 // The same, with the guarded fetch behind fetch_url and the news providers —
 // tests narrow what counts as private so a local server can play the public
 // internet.
@@ -198,6 +208,19 @@ async fn serve(
     actor: &str,
     fetcher: Option<SharedFetch>,
 ) -> anyhow::Result<Server> {
+    serve_with(database_url, db, toolsets, embedder, actor, fetcher, None).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn serve_with(
+    database_url: &str,
+    db: Db,
+    toolsets: Option<&str>,
+    embedder: SharedEmbedder,
+    actor: &str,
+    fetcher: Option<SharedFetch>,
+    account: Option<SharedAccount>,
+) -> anyhow::Result<Server> {
     let pool = pg::connect(database_url)?;
     pg::migrate(&pool).await?;
     let http = reqwest::Client::new();
@@ -212,7 +235,7 @@ async fn serve(
         telegram: TelegramModule::new(TelegramConfig::default(), http.clone(), db.clone()),
         gmail: GmailModule::new(db.clone(), http.clone()),
         monobank: Monobank::new(http.clone()),
-        userbot: Userbot::new(db.clone()),
+        userbot: account.unwrap_or_else(|| Arc::new(Userbot::new(db.clone()))),
         skills: SkillCatalog::new(PathBuf::from("skills"), PathBuf::from("../../skills.default")),
         fetcher: fetcher.unwrap_or_else(|| Arc::new(GuardedFetch::new())),
         storage_dir: std::env::temp_dir().join("mcp-specs-storage"),

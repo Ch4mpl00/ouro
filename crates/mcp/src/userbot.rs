@@ -133,14 +133,48 @@ pub struct Dialog {
     pub unread_count: i32,
 }
 
+// What a dialog is. Telegram (and gramjs) report a supergroup as a channel
+// too; it is a group conversation, so it is typed and harvested as one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DialogKind {
+    User,
+    BasicGroup,
+    Supergroup,
+    Channel,
+}
+
+impl DialogKind {
+    pub fn type_label(self) -> &'static str {
+        match self {
+            DialogKind::User => "user",
+            DialogKind::BasicGroup | DialogKind::Supergroup => "group",
+            DialogKind::Channel => "channel",
+        }
+    }
+}
+
+// One dialog as the account lists it.
+#[derive(Debug, Clone)]
+pub struct DialogInfo {
+    // The id list_userbot_dialogs shows (Bot API form for chats).
+    pub id: String,
+    // Bare chat id, as gramjs's `entity.id` — the key every stored channel
+    // post's metadata.chat_id and watermark uses.
+    pub bare_id: Option<String>,
+    pub kind: DialogKind,
+    pub title: Option<String>,
+    pub username: Option<String>,
+    pub unread_count: i32,
+    // How the real account addresses it; None for a stand-in.
+    pub peer: Option<PeerRef>,
+}
+
 #[derive(Debug, Clone)]
 pub struct ChannelHandle {
-    // Bare channel id, as gramjs's `entity.id` — the key every stored
-    // channel post's metadata.chat_id and watermark uses.
     pub chat_id: String,
     pub title: Option<String>,
     pub username: Option<String>,
-    pub peer: PeerRef,
+    pub peer: Option<PeerRef>,
 }
 
 #[derive(Debug, Clone)]
@@ -152,15 +186,93 @@ pub struct ChannelMessage {
     pub forwards: Option<i64>,
 }
 
-// gramjs's Dialog flags: a megagroup is a Channel there, so it counts as a
-// channel for both the dialog list and the harvester.
-fn dialog_kind(peer: &Peer) -> &'static str {
+// What the harvester and the dialog tool need from the account — two calls,
+// the way the TS server asks gramjs for them, so a test can play Telegram.
+#[async_trait::async_trait]
+pub trait TelegramAccount: Send + Sync {
+    async fn has_session(&self) -> bool;
+    // Most recent first; every dialog when `limit` is None.
+    async fn dialogs(&self, limit: Option<usize>) -> anyhow::Result<Vec<DialogInfo>>;
+    // A channel's history as Telegram serves it: newest first; with
+    // `reverse`, oldest first from just after `min_id`; never more than
+    // `limit`. Media-only posts come back with empty text.
+    async fn messages(
+        &self,
+        channel: &ChannelHandle,
+        limit: usize,
+        min_id: Option<i64>,
+        reverse: bool,
+    ) -> anyhow::Result<Vec<ChannelMessage>>;
+}
+
+pub type SharedAccount = Arc<dyn TelegramAccount>;
+
+fn dialog_kind(peer: &Peer) -> DialogKind {
     match peer {
-        Peer::Channel(_) => "channel",
-        Peer::Group(g) if g.is_megagroup() => "channel",
-        Peer::Group(_) => "group",
-        Peer::User(_) => "user",
+        Peer::Channel(_) => DialogKind::Channel,
+        Peer::Group(g) if g.is_megagroup() => DialogKind::Supergroup,
+        Peer::Group(_) => DialogKind::BasicGroup,
+        Peer::User(_) => DialogKind::User,
     }
+}
+
+// Broadcast channels only: a supergroup's messages are a group
+// conversation, not posts to put in the news store.
+pub async fn list_channels(account: &dyn TelegramAccount) -> anyhow::Result<Vec<ChannelHandle>> {
+    Ok(account
+        .dialogs(Some(500))
+        .await?
+        .into_iter()
+        .filter(|d| d.kind == DialogKind::Channel)
+        .filter_map(|d| Some(ChannelHandle { chat_id: d.bare_id?, title: d.title, username: d.username, peer: d.peer }))
+        .collect())
+}
+
+// With `since` (exclusive): the OLDEST `limit` posts after it, so a channel
+// that posted more than a tick's worth is caught up over the next ticks.
+// Telegram's default order is newest first — that stored the newest `limit`,
+// moved the watermark past them, and the older ones in between were never
+// fetched. Without: the newest `limit` (the bootstrap). Text posts only.
+pub async fn fetch_messages(
+    account: &dyn TelegramAccount,
+    channel: &ChannelHandle,
+    since: Option<i64>,
+    limit: usize,
+) -> anyhow::Result<Vec<ChannelMessage>> {
+    let raw = match since {
+        None => account.messages(channel, limit, None, false).await?,
+        Some(since) => account.messages(channel, limit, Some(since), true).await?,
+    };
+    Ok(raw
+        .into_iter()
+        .filter_map(|m| {
+            let text = m.text.trim().to_owned();
+            (!text.is_empty()).then_some(ChannelMessage { text, ..m })
+        })
+        .collect())
+}
+
+// The account's dialogs in Telegram's order (most recent first). With a
+// type, the first `limit` dialogs OF THAT TYPE — filtering after the limit
+// would hand back fewer than exist.
+pub async fn list_dialogs(
+    account: &dyn TelegramAccount,
+    kind: Option<&str>,
+    limit: usize,
+) -> anyhow::Result<Vec<Dialog>> {
+    let dialogs = account.dialogs(if kind.is_some() { None } else { Some(limit) }).await?;
+    Ok(dialogs
+        .into_iter()
+        .filter(|d| kind.is_none_or(|k| d.kind.type_label() == k))
+        .take(limit)
+        .map(|d| Dialog {
+            id: d.id,
+            kind: d.kind.type_label(),
+            title: d.title.unwrap_or_else(|| "(untitled)".into()),
+            username: d.username,
+            unread_count: d.unread_count,
+        })
+        .collect())
 }
 
 impl Userbot {
@@ -220,12 +332,19 @@ impl Userbot {
         *slot = Some(client.clone());
         Ok(client)
     }
+}
 
-    pub async fn list_dialogs(&self, limit: usize) -> anyhow::Result<Vec<Dialog>> {
+#[async_trait::async_trait]
+impl TelegramAccount for Userbot {
+    async fn has_session(&self) -> bool {
+        Userbot::has_session(self).await
+    }
+
+    async fn dialogs(&self, limit: Option<usize>) -> anyhow::Result<Vec<DialogInfo>> {
         let client = self.client().await?;
         let mut iter = client.iter_dialogs();
         let mut out = Vec::new();
-        while out.len() < limit
+        while limit.is_none_or(|l| out.len() < l)
             && let Some(dialog) = iter.next().await?
         {
             let peer = dialog.peer();
@@ -233,65 +352,42 @@ impl Userbot {
                 tl::enums::Dialog::Dialog(d) => d.unread_count,
                 tl::enums::Dialog::Folder(_) => 0,
             };
-            out.push(Dialog {
+            out.push(DialogInfo {
                 id: peer.id().bot_api_dialog_id().map_or_else(|| peer.id().to_string(), |id| id.to_string()),
+                bare_id: peer.id().bare_id().map(|id| id.to_string()),
                 kind: dialog_kind(peer),
-                title: peer.name().map(str::to_owned).unwrap_or_else(|| "(untitled)".into()),
-                username: peer.username().map(str::to_owned),
-                unread_count,
-            });
-        }
-        Ok(out)
-    }
-
-    pub async fn list_channels(&self) -> anyhow::Result<Vec<ChannelHandle>> {
-        let client = self.client().await?;
-        let mut iter = client.iter_dialogs();
-        let mut out = Vec::new();
-        let mut seen = 0;
-        while seen < 500
-            && let Some(dialog) = iter.next().await?
-        {
-            seen += 1;
-            let peer = dialog.peer();
-            if dialog_kind(peer) != "channel" {
-                continue;
-            }
-            let Some(bare) = peer.id().bare_id() else { continue };
-            out.push(ChannelHandle {
-                chat_id: bare.to_string(),
                 title: peer.name().map(str::to_owned),
                 username: peer.username().map(str::to_owned),
-                peer: dialog.peer_ref(),
+                unread_count,
+                peer: Some(dialog.peer_ref()),
             });
         }
         Ok(out)
     }
 
-    // Newest-first, at most `limit`, only ids above `since` (exclusive) —
-    // gramjs's `minId` semantics. Messages without text are skipped.
-    pub async fn fetch_messages(
+    async fn messages(
         &self,
         channel: &ChannelHandle,
-        since: Option<i64>,
         limit: usize,
+        min_id: Option<i64>,
+        reverse: bool,
     ) -> anyhow::Result<Vec<ChannelMessage>> {
+        let peer = channel.peer.ok_or_else(|| anyhow::anyhow!("channel {} has no peer", channel.chat_id))?;
         let client = self.client().await?;
-        let mut iter = client.iter_messages(channel.peer).limit(limit);
+        let mut iter = client.iter_messages(peer).limit(limit);
+        if reverse {
+            iter = iter.offset_id(i32::try_from(min_id.unwrap_or(0))?).reverse(true);
+        }
         let mut out = Vec::new();
         while let Some(message) = iter.next().await? {
             let id = i64::from(message.id());
-            if since.is_some_and(|since| id <= since) {
+            if !reverse && min_id.is_some_and(|min| id <= min) {
                 break;
-            }
-            let text = message.text().trim();
-            if text.is_empty() {
-                continue;
             }
             out.push(ChannelMessage {
                 id,
                 date: message.date(),
-                text: text.to_owned(),
+                text: message.text().to_owned(),
                 views: message.view_count().map(i64::from),
                 forwards: message.forward_count().map(i64::from),
             });
@@ -353,7 +449,7 @@ enum DialogFilter {
 
 #[derive(Deserialize, schemars::JsonSchema)]
 struct ListDialogsParams {
-    /// Filter dialogs by type. 'channel' is the right choice for the news digest (broadcast channels). Default 'all'.
+    /// Filter dialogs by type. 'channel' is the right choice for the news digest (broadcast channels); a supergroup is a 'group'. Default 'all'.
     #[serde(rename = "type")]
     kind: Option<DialogFilter>,
     /// Max dialogs to return. Default 100.
@@ -379,16 +475,14 @@ impl McpTools {
         }
         respond(
             async {
-                let dialogs = self.deps.userbot.list_dialogs(p.limit.unwrap_or(100)).await?;
-                let wanted = match p.kind {
+                let kind = match p.kind {
                     None | Some(DialogFilter::All) => None,
                     Some(DialogFilter::Channel) => Some("channel"),
                     Some(DialogFilter::Group) => Some("group"),
                     Some(DialogFilter::User) => Some("user"),
                 };
-                let filtered: Vec<Dialog> =
-                    dialogs.into_iter().filter(|d| wanted.is_none_or(|w| d.kind == w)).collect();
-                Ok(json!({ "count": filtered.len(), "dialogs": filtered }))
+                let dialogs = list_dialogs(&*self.deps.userbot, kind, p.limit.unwrap_or(100)).await?;
+                Ok(json!({ "count": dialogs.len(), "dialogs": dialogs }))
             }
             .await,
         )

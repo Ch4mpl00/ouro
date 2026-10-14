@@ -98,7 +98,7 @@ async fn main() -> anyhow::Result<()> {
         telegram: telegram.clone(),
         gmail: gmail.clone(),
         monobank: Monobank::new(http.clone()),
-        userbot: userbot.clone(),
+        userbot: Arc::new(userbot.clone()),
         skills: SkillCatalog::new(PathBuf::from("skills"), PathBuf::from("skills.default")),
         fetcher: fetcher.clone(),
         storage_dir: env("STORAGE_DIR").map_or_else(|| PathBuf::from("./storage"), PathBuf::from),
@@ -138,7 +138,7 @@ async fn main() -> anyhow::Result<()> {
         let providers: Vec<Box<dyn NewsProvider>> = vec![
             Box::new(HackerNews::new(http.clone(), fetcher.clone())),
             Box::new(Habr::new(http.clone(), fetcher.clone())),
-            Box::new(TelegramChannels::new(userbot, pool.clone())),
+            Box::new(TelegramChannels::new(Arc::new(userbot), pool.clone())),
         ];
         background.spawn(news::run_poller(providers, news_repo, cancel.clone()));
     } else {
