@@ -68,6 +68,9 @@ const MIGRATIONS: &[Migration] = &[
     Migration { when: 1781001341744, sql: include_str!("../migrations/pg/0002_wooden_anthem.sql") },
     Migration { when: 1787496077308, sql: include_str!("../migrations/pg/0003_lazy_puppet_master.sql") },
     Migration { when: 1790957842163, sql: include_str!("../migrations/pg/0004_news_chronological_indexes.sql") },
+    Migration { when: 1791823358054, sql: include_str!("../migrations/pg/0005_memory_journal.sql") },
+    Migration { when: 1791902517698, sql: include_str!("../migrations/pg/0006_memory_journal_metadata.sql") },
+    Migration { when: 1791974288634, sql: include_str!("../migrations/pg/0007_news_embedding_hnsw.sql") },
 ];
 
 const BREAKPOINT: &str = "--> statement-breakpoint";
@@ -207,8 +210,36 @@ mod tests {
                 ("2d868dbf377baa83".to_owned(), 1781001341744),
                 ("563cc5c374b93cd7".to_owned(), 1787496077308),
                 ("ede5123f9e74197b".to_owned(), 1790957842163),
+                ("5114e44328f417de".to_owned(), 1791823358054),
+                ("4b9f63ec641fecd7".to_owned(), 1791902517698),
+                ("36b2a3cfb860bb24".to_owned(), 1791974288634),
             ]
         );
+    }
+
+    // While packages/mcp still ships, both servers apply the same files: a
+    // copy that drifted would give the two journals different hashes.
+    #[test]
+    fn migration_files_match_the_ts_servers_copies() {
+        let ts = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packages/mcp/src/db/pg/migrations");
+        if !ts.exists() {
+            return;
+        }
+        let ours = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations/pg");
+        let mut names: Vec<_> = std::fs::read_dir(&ts)
+            .unwrap()
+            .filter_map(|e| e.ok()?.file_name().into_string().ok())
+            .filter(|n| n.ends_with(".sql"))
+            .collect();
+        names.sort();
+        assert_eq!(names.len(), MIGRATIONS.len(), "every TS migration has a Rust entry");
+        for name in names {
+            assert_eq!(
+                std::fs::read(ours.join(&name)).unwrap_or_default(),
+                std::fs::read(ts.join(&name)).unwrap(),
+                "{name} differs from packages/mcp's"
+            );
+        }
     }
 
     #[test]
@@ -219,7 +250,16 @@ mod tests {
             MIGRATIONS.iter().map(|m| hex::encode(Sha256::digest(m.sql.as_bytes()))[..16].to_owned()).collect();
         assert_eq!(
             hashes,
-            ["6fe80692cd40ace1", "5829fed5a52485b9", "2d868dbf377baa83", "563cc5c374b93cd7", "ede5123f9e74197b"]
+            [
+                "6fe80692cd40ace1",
+                "5829fed5a52485b9",
+                "2d868dbf377baa83",
+                "563cc5c374b93cd7",
+                "ede5123f9e74197b",
+                "5114e44328f417de",
+                "4b9f63ec641fecd7",
+                "36b2a3cfb860bb24",
+            ]
         );
         assert!(MIGRATIONS.windows(2).all(|w| w[0].when < w[1].when));
     }
