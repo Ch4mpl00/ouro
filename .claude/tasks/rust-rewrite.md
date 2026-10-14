@@ -179,3 +179,19 @@ same Postgres migrations, so either one boots on what the other left.
   droplet, set `command: pnpm mcp:serve` for `mcp` and `mcp-tunnel` (or
   check out the previous commit) and `docker compose up -d mcp mcp-tunnel`.
   The previous TS-only image is also kept, tagged, for a full rollback.
+
+### Production switch — 2026-10-14
+
+- `main` 4a8ceab deployed with `scripts/deploy.sh mcp mcp-tunnel`; the agent
+  and codex kept running and reconnected on their own. `tunnel-client` was
+  restarted so it holds a session on the new server.
+- Before: TS image tagged `mcp-tools-image:ts-backup-ad4ffbe`; `mcp_state`
+  and the main database (without `news_items` data) dumped to
+  `/root/backups/pre-rust-mcp-20261014-1658/` with the previous compose file.
+- Checks through `mcp-tunnel`: 20 tools; `search_news` 0.8–1.1 s (HNSW),
+  `list_news` 27 ms, `recall` 1.8 s, `journal_tail` and `list_skills` fine.
+- Memory (docker stats, MiB): `mcp` 242 → 34, `mcp-tunnel` 220 → 5; host
+  available RAM 673 → 1174.
+- Gmail still answers `invalid_grant`: the refresh token dates from
+  2026-05-20 and the watermark stopped on 2026-05-13 — not the switch. Renew
+  with `docker compose run --rm mcp gmail-auth`.
