@@ -5,7 +5,9 @@
 // Two read models behind one search projection (D8): projects made of
 // markdown documents, and flat facts. Both feed `memory_index`, the only
 // table with embeddings. The agent's flow is two-step: `recall` returns refs,
-// `read_doc` / `get_fact` loads the whole thing.
+// `read_doc` / `get_fact` loads the whole thing. A third read model, the
+// journal, sits outside search: operational records a workflow appends and
+// reads back by recency.
 //
 // Sections:
 //   1. types      — states, projects, documents, facts, patches, index rows
@@ -217,6 +219,50 @@ pub struct IndexHit {
     pub distance: f64,
 }
 
+// The journal — the third read model. Operational records a workflow writes
+// and reads back by recency (the last digests, a run log), as opposed to
+// knowledge. Append-only, never indexed, no patch history: an entry is
+// immutable and leaves only when its stream outgrows its capacity.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct JournalEntry {
+    pub id: i64,
+    pub stream: String,
+    pub body: String,
+    pub actor: String,
+    // Provenance the writer attaches (e.g. the trace an activity note was
+    // derived from). Stored as given, never interpreted: no dedup, no lookup.
+    pub metadata: Option<Map<String, Value>>,
+    #[serde(serialize_with = "ser_iso")]
+    pub created_at: DateTime<Utc>,
+}
+
+fn ser_iso_opt<S: serde::Serializer>(t: &Option<DateTime<Utc>>, s: S) -> Result<S::Ok, S::Error> {
+    match t {
+        Some(t) => s.serialize_str(&iso(*t)),
+        None => s.serialize_none(),
+    }
+}
+
+// A stream is a named category of entries. Its capacity is stored with it,
+// so every writer trims by the same rule without repeating it.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct JournalStream {
+    pub name: String,
+    pub capacity: i32,
+    pub size: i64,
+    #[serde(serialize_with = "ser_iso_opt")]
+    pub last_at: Option<DateTime<Utc>>,
+}
+
+// The entry and its stream after the trim.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct AppendedEntry {
+    pub entry: JournalEntry,
+    pub stream: JournalStream,
+}
+
 // ── 2. refs ──────────────────────────────────────────────────────────────────
 
 // Refs travel through an LLM, so they are parsed strictly: one that doesn't
@@ -229,6 +275,16 @@ fn slug_re() -> regex::Regex {
 // separator would make refs ambiguous.
 fn doc_name_re() -> regex::Regex {
     regex::Regex::new(r"^[a-z0-9][a-z0-9._-]*\.md$").expect("valid regex")
+}
+
+// Journal stream names: project-slug segments joined by "/", so a family of
+// streams reads as one ("digest/news", "digest/tech"). The separator is a
+// naming convention only — every name is its own stream.
+pub const JOURNAL_STREAM_RE: &str = r"^[a-z0-9][a-z0-9-]*(/[a-z0-9][a-z0-9-]*)*$";
+pub const JOURNAL_STREAM_MAX_LENGTH: usize = 100;
+
+pub fn is_journal_stream(name: &str) -> bool {
+    name.len() <= JOURNAL_STREAM_MAX_LENGTH && regex::Regex::new(JOURNAL_STREAM_RE).expect("valid regex").is_match(name)
 }
 
 pub fn assert_project_slug(slug: &str) -> anyhow::Result<()> {
@@ -649,6 +705,17 @@ pub struct NewPatch {
     pub rationale: Option<String>,
 }
 
+pub struct AppendEntry<'a> {
+    pub stream: &'a str,
+    pub body: &'a str,
+    pub actor: &'a str,
+    pub metadata: Option<&'a Map<String, Value>>,
+    // Stored on the stream when given; None keeps the stream's capacity, or
+    // `default_capacity` for a stream this append creates.
+    pub capacity: Option<i32>,
+    pub default_capacity: i32,
+}
+
 pub struct FactUpdate<'a> {
     pub body: Option<&'a str>,
     pub tags: Option<Vec<String>>,
@@ -710,6 +777,16 @@ pub trait MemoryStore: Send + Sync {
     ) -> anyhow::Result<Vec<IndexHit>>;
     async fn list_unembedded(&self, limit: i64) -> anyhow::Result<Vec<(i64, String)>>;
     async fn set_embedding(&self, id: i64, embedding: &[f32]) -> anyhow::Result<()>;
+
+    // The journal. One append creates the stream if needed, stores the entry
+    // and drops the entries beyond the stream's capacity, oldest first — all
+    // in one transaction, serialised per stream, so no reader ever sees a
+    // stream over capacity and racing appends all land.
+    async fn append_entry(&self, input: AppendEntry<'_>) -> anyhow::Result<AppendedEntry>;
+    // Newest first, by append order. Empty for a stream that does not exist.
+    async fn tail_entries(&self, stream: &str, limit: i64) -> anyhow::Result<Vec<JournalEntry>>;
+    // By name, in byte order.
+    async fn list_streams(&self) -> anyhow::Result<Vec<JournalStream>>;
 }
 
 pub struct PgMemoryStore {
@@ -878,25 +955,24 @@ impl MemoryStore for PgMemoryStore {
         // has moved on; the caller reports a conflict instead of overwriting.
         let mut client = self.pool.get().await?;
         let tx = client.transaction().await?;
-        let row =
-            match summary {
-                None => {
-                    tx
-                        .query_opt(
-                            "UPDATE memory_project_docs SET body_md = $1, version = $2, updated_at = now()
+        let row = match summary {
+            None => {
+                tx.query_opt(
+                    "UPDATE memory_project_docs SET body_md = $1, version = $2, updated_at = now()
                           WHERE id = $3 AND version = $4 RETURNING *",
-                            &[&body, &(expected_version + 1), &doc_id, &expected_version],
-                        )
-                        .await?
-                }
-                Some(summary) => tx
-                    .query_opt(
-                        "UPDATE memory_project_docs SET body_md = $1, summary = $2, version = $3, updated_at = now()
+                    &[&body, &(expected_version + 1), &doc_id, &expected_version],
+                )
+                .await?
+            }
+            Some(summary) => {
+                tx.query_opt(
+                    "UPDATE memory_project_docs SET body_md = $1, summary = $2, version = $3, updated_at = now()
                           WHERE id = $4 AND version = $5 RETURNING *",
-                        &[&body, &summary, &(expected_version + 1), &doc_id, &expected_version],
-                    )
-                    .await?,
-            };
+                    &[&body, &summary, &(expected_version + 1), &doc_id, &expected_version],
+                )
+                .await?
+            }
+        };
         let Some(row) = row else { return Ok(None) };
         let patch = insert_patch(&tx, doc_id, &patch).await?;
         tx.commit().await?;
@@ -1044,6 +1120,96 @@ impl MemoryStore for PgMemoryStore {
             )
             .await?;
         Ok(())
+    }
+
+    async fn append_entry(&self, input: AppendEntry<'_>) -> anyhow::Result<AppendedEntry> {
+        let mut client = self.pool.get().await?;
+        let tx = client.transaction().await?;
+        // The upsert always updates, even when the capacity stays, because the
+        // row lock it takes is the whole concurrency story: a second append to
+        // the stream waits here until the first commits, so its entry id is
+        // drawn later and its trim sees the first one's entry. A race to
+        // create the stream resolves the same way on the unique name.
+        let stream = tx
+            .query_one(
+                "INSERT INTO memory_journal_streams (name, capacity) VALUES ($1, $2)
+                 ON CONFLICT (name) DO UPDATE SET capacity = COALESCE($3, memory_journal_streams.capacity)
+                 RETURNING id, name, capacity",
+                &[&input.stream, &input.capacity.unwrap_or(input.default_capacity), &input.capacity],
+            )
+            .await?;
+        let (stream_id, name, capacity): (i64, String, i32) = (stream.get(0), stream.get(1), stream.get(2));
+        let metadata = input.metadata.map(|m| Value::Object(m.clone()));
+        let row = tx
+            .query_one(
+                "INSERT INTO memory_journal_entries (stream_id, body, actor, metadata) VALUES ($1, $2, $3, $4)
+                 RETURNING id, body, actor, metadata, created_at",
+                &[&stream_id, &input.body, &input.actor, &metadata],
+            )
+            .await?;
+        tx.execute(
+            "DELETE FROM memory_journal_entries WHERE stream_id = $1 AND id NOT IN (
+                 SELECT id FROM memory_journal_entries WHERE stream_id = $1 ORDER BY id DESC LIMIT $2)",
+            &[&stream_id, &i64::from(capacity)],
+        )
+        .await?;
+        let size: i64 = tx
+            .query_one("SELECT count(*) FROM memory_journal_entries WHERE stream_id = $1", &[&stream_id])
+            .await?
+            .get(0);
+        tx.commit().await?;
+        let entry = entry_of(&row, &name);
+        Ok(AppendedEntry { stream: JournalStream { name, capacity, size, last_at: Some(entry.created_at) }, entry })
+    }
+
+    async fn tail_entries(&self, stream: &str, limit: i64) -> anyhow::Result<Vec<JournalEntry>> {
+        let rows = self
+            .pool
+            .get()
+            .await?
+            .query(
+                "SELECT e.id, e.body, e.actor, e.metadata, e.created_at
+                   FROM memory_journal_entries e JOIN memory_journal_streams s ON s.id = e.stream_id
+                  WHERE s.name = $1 ORDER BY e.id DESC LIMIT $2",
+                &[&stream, &limit],
+            )
+            .await?;
+        Ok(rows.iter().map(|r| entry_of(r, stream)).collect())
+    }
+
+    async fn list_streams(&self) -> anyhow::Result<Vec<JournalStream>> {
+        // Byte order, the order the in-memory store's sort gives — a locale
+        // collation would sort "digest/news" around "digest-x".
+        let rows = self
+            .pool
+            .get()
+            .await?
+            .query(
+                "SELECT s.name, s.capacity, count(e.id) AS size, max(e.created_at) AS last_at
+                   FROM memory_journal_streams s LEFT JOIN memory_journal_entries e ON e.stream_id = s.id
+                  GROUP BY s.id ORDER BY s.name COLLATE \"C\"",
+                &[],
+            )
+            .await?;
+        Ok(rows
+            .iter()
+            .map(|r| JournalStream { name: r.get(0), capacity: r.get(1), size: r.get(2), last_at: r.get(3) })
+            .collect())
+    }
+}
+
+fn entry_of(r: &tokio_postgres::Row, stream: &str) -> JournalEntry {
+    let metadata: Option<Value> = r.get("metadata");
+    JournalEntry {
+        id: r.get("id"),
+        stream: stream.to_owned(),
+        body: r.get("body"),
+        actor: r.get("actor"),
+        metadata: match metadata {
+            Some(Value::Object(map)) => Some(map),
+            _ => None,
+        },
+        created_at: r.get("created_at"),
     }
 }
 
@@ -1226,6 +1392,40 @@ pub struct WriteDoc<'a> {
     pub expected_version: Option<i32>,
     pub actor: &'a str,
     pub rationale: Option<&'a str>,
+}
+
+// The journal's bounds. Capacity is per stream (stored with it); these are
+// the defaults and the limits a caller may set within.
+pub const JOURNAL_DEFAULT_CAPACITY: i32 = 100;
+pub const JOURNAL_MAX_CAPACITY: i64 = 1000;
+pub const JOURNAL_TAIL_DEFAULT: i64 = 5;
+pub const JOURNAL_TAIL_MAX: i64 = 100;
+// A digest is ~5k characters; the cap keeps one runaway write from making
+// every later tail expensive.
+pub const JOURNAL_MAX_BODY_CHARS: usize = 32_000;
+// Metadata is a provenance label (a trace id, a source), not a second body.
+pub const JOURNAL_MAX_METADATA_CHARS: usize = 2_000;
+
+// Lengths are counted the way the TS server counts them — UTF-16 code
+// units, JavaScript's string length — so both answer a limit alike.
+pub fn js_length(s: &str) -> usize {
+    s.encode_utf16().count()
+}
+
+pub struct JournalAppend<'a> {
+    pub stream: &'a str,
+    pub body: &'a str,
+    pub actor: &'a str,
+    // Writer's provenance, stored with the entry and returned by the tail.
+    pub metadata: Option<&'a Map<String, Value>>,
+    // Stored on the stream; None keeps whatever the stream already has.
+    pub capacity: Option<i64>,
+}
+
+#[derive(Debug, Serialize, PartialEq)]
+pub struct JournalTail {
+    pub stream: String,
+    pub entries: Vec<JournalEntry>,
 }
 
 // append_doc takes no version — it is the version-free safe op — so it
@@ -1613,7 +1813,11 @@ impl MemoryService {
         tags: Option<&[String]>,
         state: Option<MemoryState>,
     ) -> anyhow::Result<Fact> {
-        let update = FactUpdate { body: body.map(str::trim), tags: tags.map(|t| normalize_tags(Some(t))), state };
+        let body = body.map(str::trim);
+        if body == Some("") {
+            return Err(memory_error("empty_body", "A fact needs a body.", json!({})));
+        }
+        let update = FactUpdate { body, tags: tags.map(|t| normalize_tags(Some(t))), state };
         let updated = self
             .store
             .update_fact(id, update)
@@ -1660,6 +1864,82 @@ impl MemoryService {
             })
             .collect())
     }
+
+    // Never indexed, never patched: the journal is records, not knowledge.
+    pub async fn journal_append(&self, input: JournalAppend<'_>) -> anyhow::Result<AppendedEntry> {
+        require_stream(input.stream)?;
+        if input.body.trim().is_empty() {
+            return Err(memory_error("empty_body", "A journal entry needs a body.", json!({})));
+        }
+        let length = js_length(input.body);
+        if length > JOURNAL_MAX_BODY_CHARS {
+            return Err(memory_error(
+                "body_too_large",
+                format!("A journal entry is at most {JOURNAL_MAX_BODY_CHARS} characters; this one is {length}."),
+                json!({ "max": JOURNAL_MAX_BODY_CHARS, "length": length }),
+            ));
+        }
+        if let Some(capacity) = input.capacity
+            && !(1..=JOURNAL_MAX_CAPACITY).contains(&capacity)
+        {
+            return Err(memory_error(
+                "invalid_capacity",
+                format!("Capacity is a whole number of entries from 1 to {JOURNAL_MAX_CAPACITY}."),
+                json!({ "capacity": capacity, "max": JOURNAL_MAX_CAPACITY }),
+            ));
+        }
+        let metadata_chars = input.metadata.map_or(0, |m| js_length(&serde_json::to_string(m).unwrap_or_default()));
+        if metadata_chars > JOURNAL_MAX_METADATA_CHARS {
+            return Err(memory_error(
+                "metadata_too_large",
+                format!(
+                    "Journal metadata is at most {JOURNAL_MAX_METADATA_CHARS} characters of JSON; this one is {metadata_chars}."
+                ),
+                json!({ "max": JOURNAL_MAX_METADATA_CHARS, "length": metadata_chars }),
+            ));
+        }
+        self.store
+            .append_entry(AppendEntry {
+                stream: input.stream,
+                body: input.body,
+                actor: input.actor,
+                metadata: input.metadata,
+                capacity: input.capacity.map(|c| c as i32),
+                default_capacity: JOURNAL_DEFAULT_CAPACITY,
+            })
+            .await
+    }
+
+    pub async fn journal_tail(&self, stream: &str, n: Option<i64>) -> anyhow::Result<JournalTail> {
+        require_stream(stream)?;
+        let n = n.unwrap_or(JOURNAL_TAIL_DEFAULT);
+        if !(1..=JOURNAL_TAIL_MAX).contains(&n) {
+            return Err(memory_error(
+                "invalid_n",
+                format!("n is a whole number of entries from 1 to {JOURNAL_TAIL_MAX}."),
+                json!({ "n": n, "max": JOURNAL_TAIL_MAX }),
+            ));
+        }
+        Ok(JournalTail { stream: stream.to_owned(), entries: self.store.tail_entries(stream, n).await? })
+    }
+
+    pub async fn list_journals(&self) -> anyhow::Result<Vec<JournalStream>> {
+        self.store.list_streams().await
+    }
+}
+
+fn require_stream(stream: &str) -> anyhow::Result<()> {
+    if is_journal_stream(stream) {
+        return Ok(());
+    }
+    Err(memory_error(
+        "invalid_stream",
+        format!(
+            "Invalid stream \"{stream}\". Use lowercase letters, digits and hyphens, segments joined by \"/\", \
+             at most {JOURNAL_STREAM_MAX_LENGTH} characters, e.g. \"news-digest\" or \"digest/news\"."
+        ),
+        json!({ "stream": stream }),
+    ))
 }
 
 fn write_result(project: &Project, doc: &Doc, patch_id: String) -> WriteResult {
@@ -1844,6 +2124,28 @@ struct ListMemoryParams {
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
+struct JournalAppendParams {
+    /// Stream name: lowercase segments joined by "/", e.g. "news-digest" or "digest/news".
+    stream: String,
+    /// The record, stored exactly as given.
+    body: String,
+    /// Set the stream's capacity (kept for later appends). Omit to keep the current one.
+    #[schemars(range(min = 1, max = 1000))]
+    capacity: Option<i64>,
+    /// Provenance stored with the entry and returned by journal_tail, e.g. { "trace_id": "…" }. Not an identity: appending the same metadata twice stores two entries.
+    metadata: Option<Map<String, Value>>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+struct JournalTailParams {
+    /// Stream name, e.g. "news-digest".
+    stream: String,
+    /// How many entries (default 5).
+    #[schemars(range(min = 1, max = 100))]
+    n: Option<i64>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
 struct CreateProjectParams {
     /// Lowercase id, hyphens only, e.g. "leetcode-graphs".
     slug: String,
@@ -1999,7 +2301,8 @@ impl McpTools {
     #[tool(
         name = "list_memory",
         title = "List projects, or the documents in one",
-        description = "Without `project`: every project. With it: that project's documents, \
+        description = "Without `project`: every project, plus every journal stream with its \
+            capacity and size. With it: that project's documents, \
             each with a one-line summary, version and size.\n\n\
             ALWAYS call this before creating a document. It is what keeps a \
             project from growing notes.md, notes2.md and progress-new.md until \
@@ -2008,7 +2311,12 @@ impl McpTools {
     async fn list_memory(&self, Parameters(p): Parameters<ListMemoryParams>) -> ToolResult {
         let memory = &self.deps.memory;
         match p.project {
-            None => run(memory.list_projects().await.map(|projects| json!({ "projects": projects }))),
+            None => run(async {
+                let projects = memory.list_projects().await?;
+                let journals = memory.list_journals().await?;
+                Ok(json!({ "projects": projects, "journals": journals }))
+            }
+            .await),
             Some(project) => run(memory.list_docs(&project).await),
         }
     }
@@ -2145,6 +2453,53 @@ impl McpTools {
         let memory = &self.deps.memory;
         run(memory.revert(&p.project, &p.doc, &p.patch_id, p.rollback == Some(true), &self.deps.memory_actor).await)
     }
+
+    #[tool(
+        name = "journal_append",
+        title = "Add a record to a journal stream",
+        description = "Append one immutable entry to a journal stream — operational records \
+            read back by recency, like the last digests sent or a run log. Not \
+            for knowledge: entries are never searched by recall, never edited and \
+            keep no history. Use a project document or a fact for anything worth \
+            finding by meaning.\n\n\
+            The stream is created by its first entry. It keeps at most its \
+            capacity (100 unless set), dropping the oldest entries first."
+    )]
+    async fn journal_append(&self, Parameters(p): Parameters<JournalAppendParams>) -> ToolResult {
+        if p.stream.is_empty()
+            || p.body.is_empty()
+            || js_length(&p.body) > JOURNAL_MAX_BODY_CHARS
+            || p.capacity.is_some_and(|c| !(1..=JOURNAL_MAX_CAPACITY).contains(&c))
+        {
+            return Err(invalid_params(
+                "stream and body must be non-empty, body at most 32000 characters, capacity 1–1000",
+            ));
+        }
+        let memory = &self.deps.memory;
+        run(memory
+            .journal_append(JournalAppend {
+                stream: &p.stream,
+                body: &p.body,
+                actor: &self.deps.memory_actor,
+                metadata: p.metadata.as_ref(),
+                capacity: p.capacity,
+            })
+            .await)
+    }
+
+    #[tool(
+        name = "journal_tail",
+        title = "Read the newest records of a journal stream",
+        description = "Return the last `n` entries of a stream, newest first. A stream nobody \
+            has written to reads as an empty list, not an error."
+    )]
+    async fn journal_tail(&self, Parameters(p): Parameters<JournalTailParams>) -> ToolResult {
+        if p.stream.is_empty() || p.n.is_some_and(|n| !(1..=JOURNAL_TAIL_MAX).contains(&n)) {
+            return Err(invalid_params("stream must be non-empty, n 1–100"));
+        }
+        let memory = &self.deps.memory;
+        run(memory.journal_tail(&p.stream, p.n).await)
+    }
 }
 
 // ── tests: an in-memory store, literal enough that passing here means the
@@ -2166,6 +2521,17 @@ pub mod testing {
         patches: Vec<DocPatch>,
         facts: Vec<Fact>,
         index: Vec<(i64, IndexUpsert)>,
+        // Name → (capacity, surviving entries in append order).
+        streams: std::collections::BTreeMap<String, (i32, Vec<JournalEntry>)>,
+    }
+
+    fn describe_stream(name: &str, capacity: i32, entries: &[JournalEntry]) -> JournalStream {
+        JournalStream {
+            name: name.to_owned(),
+            capacity,
+            size: entries.len() as i64,
+            last_at: entries.last().map(|e| e.created_at),
+        }
     }
 
     pub type Hook = Box<dyn Fn(i64) -> BoxFuture<'static, ()> + Send + Sync>;
@@ -2409,6 +2775,48 @@ pub mod testing {
                 e.embedding = Some(embedding.to_vec());
             }
             Ok(())
+        }
+
+        // One lock from the read to the trim, so an append is atomic here the
+        // way the per-stream row lock makes it atomic in Postgres.
+        async fn append_entry(&self, input: AppendEntry<'_>) -> anyhow::Result<AppendedEntry> {
+            let mut s = self.lock();
+            let id = next(&mut s);
+            let entry = JournalEntry {
+                id,
+                stream: input.stream.to_owned(),
+                body: input.body.to_owned(),
+                actor: input.actor.to_owned(),
+                metadata: input.metadata.cloned(),
+                created_at: Utc::now(),
+            };
+            let (capacity, entries) =
+                s.streams.entry(input.stream.to_owned()).or_insert_with(|| (input.default_capacity, Vec::new()));
+            if let Some(c) = input.capacity {
+                *capacity = c;
+            }
+            entries.push(entry.clone());
+            let keep = (*capacity).max(0) as usize;
+            if entries.len() > keep {
+                entries.drain(..entries.len() - keep);
+            }
+            let stream = describe_stream(input.stream, *capacity, entries);
+            Ok(AppendedEntry { entry, stream })
+        }
+
+        async fn tail_entries(&self, stream: &str, limit: i64) -> anyhow::Result<Vec<JournalEntry>> {
+            let s = self.lock();
+            let Some((_, entries)) = s.streams.get(stream) else { return Ok(Vec::new()) };
+            Ok(entries.iter().rev().take(limit.max(0) as usize).cloned().collect())
+        }
+
+        async fn list_streams(&self) -> anyhow::Result<Vec<JournalStream>> {
+            Ok(self
+                .lock()
+                .streams
+                .iter()
+                .map(|(name, (capacity, entries))| describe_stream(name, *capacity, entries))
+                .collect())
         }
     }
 }
@@ -3025,5 +3433,532 @@ mod tests {
         assert_eq!(err["currentVersion"], 9);
         // A malformed slug is not a MemoryError: it fails the call.
         assert_eq!(run::<()>(Err(anyhow::anyhow!("Invalid project slug"))).unwrap().is_error, Some(true));
+    }
+}
+
+// ── tests: the journal ───────────────────────────────────────────────────────
+// A port of packages/mcp/src/services/memory/journal.test.ts (one test per
+// requirement: F = functional, N = non-functional, I = invariant) and
+// journal.properties.test.ts (the invariants against a reference model on
+// random call sequences). Same names, same examples, same generators.
+
+#[cfg(test)]
+mod journal_tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use proptest::prelude::*;
+
+    use super::testing::InMemoryStore;
+    use super::*;
+    use crate::embeddings::Embedder;
+
+    const ACTOR: &str = "supervisor";
+
+    // Counts every call, so N1 can say the journal never embeds.
+    #[derive(Default)]
+    struct CountingEmbedder {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl Embedder for CountingEmbedder {
+        async fn embed_batch(&self, texts: &[String]) -> anyhow::Result<Vec<Vec<f32>>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(texts.iter().map(|_| vec![1.0, 0.0, 0.0]).collect())
+        }
+    }
+
+    fn harness() -> (MemoryService, Arc<CountingEmbedder>) {
+        let embedder = Arc::new(CountingEmbedder::default());
+        (MemoryService::new(Arc::new(InMemoryStore::default()), embedder.clone()), embedder)
+    }
+
+    fn service() -> MemoryService {
+        harness().0
+    }
+
+    fn code_of<T: std::fmt::Debug>(result: anyhow::Result<T>) -> &'static str {
+        result
+            .expect_err("expected a MemoryError, the call succeeded")
+            .downcast::<MemoryError>()
+            .expect("a MemoryError")
+            .code
+    }
+
+    async fn append(
+        service: &MemoryService,
+        stream: &str,
+        body: &str,
+        capacity: Option<i64>,
+    ) -> anyhow::Result<AppendedEntry> {
+        service.journal_append(JournalAppend { stream, body, actor: ACTOR, metadata: None, capacity }).await
+    }
+
+    async fn bodies(service: &MemoryService, stream: &str, n: Option<i64>) -> Vec<String> {
+        service.journal_tail(stream, n).await.unwrap().entries.into_iter().map(|e| e.body).collect()
+    }
+
+    // ── functional ───────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn f1_append_returns_the_entry_and_the_stream_it_landed_in() {
+        let service = service();
+        let out = append(&service, "news-digest", "digest #1", None).await.unwrap();
+        assert_eq!(
+            (out.entry.stream.as_str(), out.entry.body.as_str(), out.entry.actor.as_str()),
+            ("news-digest", "digest #1", ACTOR)
+        );
+        assert!(out.entry.id > 0);
+        assert_eq!(
+            (out.stream.name.as_str(), out.stream.capacity, out.stream.size),
+            ("news-digest", JOURNAL_DEFAULT_CAPACITY, 1)
+        );
+    }
+
+    #[tokio::test]
+    async fn f2_tail_returns_the_last_n_entries_newest_first() {
+        let service = service();
+        for b in ["a", "b", "c", "d"] {
+            append(&service, "s", b, None).await.unwrap();
+        }
+        assert_eq!(bodies(&service, "s", Some(2)).await, ["d", "c"]);
+        assert_eq!(bodies(&service, "s", Some(10)).await, ["d", "c", "b", "a"]);
+    }
+
+    #[tokio::test]
+    async fn f2_tail_defaults_to_5_entries_and_caps_n_at_100() {
+        let service = service();
+        for i in 0..JOURNAL_TAIL_DEFAULT + 3 {
+            append(&service, "s", &format!("e{i}"), None).await.unwrap();
+        }
+        assert_eq!(bodies(&service, "s", None).await.len() as i64, JOURNAL_TAIL_DEFAULT);
+        assert_eq!(code_of(service.journal_tail("s", Some(JOURNAL_TAIL_MAX + 1)).await), "invalid_n");
+        assert_eq!(code_of(service.journal_tail("s", Some(0)).await), "invalid_n");
+    }
+
+    #[tokio::test]
+    async fn f3_a_stream_needs_no_setup_the_first_append_creates_it_a_missing_one_reads_empty() {
+        let service = service();
+        assert_eq!(
+            service.journal_tail("never-written", None).await.unwrap(),
+            JournalTail { stream: "never-written".into(), entries: Vec::new() }
+        );
+        append(&service, "fresh", "x", None).await.unwrap();
+        assert_eq!(bodies(&service, "fresh", None).await, ["x"]);
+    }
+
+    #[tokio::test]
+    async fn f4_capacity_is_a_property_of_the_stream_set_once_kept_by_later_appends() {
+        let service = service();
+        append(&service, "s", "a", Some(2)).await.unwrap();
+        let out = append(&service, "s", "b", None).await.unwrap();
+        assert_eq!(out.stream.capacity, 2);
+        append(&service, "s", "c", None).await.unwrap();
+        assert_eq!(bodies(&service, "s", None).await, ["c", "b"]);
+    }
+
+    #[tokio::test]
+    async fn f4_lowering_the_capacity_trims_the_stream_on_that_append() {
+        let service = service();
+        for b in ["a", "b", "c", "d"] {
+            append(&service, "s", b, None).await.unwrap();
+        }
+        let out = append(&service, "s", "e", Some(2)).await.unwrap();
+        assert_eq!((out.stream.capacity, out.stream.size), (2, 2));
+        assert_eq!(bodies(&service, "s", None).await, ["e", "d"]);
+    }
+
+    // The TS test also tries 1.5; an i64 can't hold one, and the tool's
+    // schema rejects it before the service (journal_tool_rejects_*).
+    #[tokio::test]
+    async fn f4_capacity_must_be_an_integer_in_1_to_1000() {
+        let service = service();
+        for capacity in [0, -1, JOURNAL_MAX_CAPACITY + 1] {
+            assert_eq!(code_of(append(&service, "s", "x", Some(capacity)).await), "invalid_capacity");
+        }
+        assert_eq!(service.list_journals().await.unwrap(), []);
+        // Both ends of the range are capacities.
+        for capacity in [1, JOURNAL_MAX_CAPACITY] {
+            let out = append(&service, &format!("s/{capacity}"), "x", Some(capacity)).await.unwrap();
+            assert_eq!(i64::from(out.stream.capacity), capacity);
+        }
+    }
+
+    #[tokio::test]
+    async fn f5_list_journals_names_every_stream_with_its_capacity_size_and_last_write() {
+        let service = service();
+        append(&service, "news-digest", "a", None).await.unwrap();
+        append(&service, "digest/tech", "b", Some(3)).await.unwrap();
+        append(&service, "digest/tech", "c", None).await.unwrap();
+        let listed: Vec<(String, i32, i64, bool)> = service
+            .list_journals()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|s| (s.name, s.capacity, s.size, s.last_at.is_some()))
+            .collect();
+        assert_eq!(
+            listed,
+            [("digest/tech".into(), 3, 2, true), ("news-digest".into(), JOURNAL_DEFAULT_CAPACITY, 1, true)]
+        );
+    }
+
+    #[tokio::test]
+    async fn f6_the_actor_is_recorded_on_every_entry() {
+        let service = service();
+        service
+            .journal_append(JournalAppend { stream: "s", body: "x", actor: "chatgpt", metadata: None, capacity: None })
+            .await
+            .unwrap();
+        assert_eq!(service.journal_tail("s", None).await.unwrap().entries[0].actor, "chatgpt");
+    }
+
+    #[tokio::test]
+    async fn f7_metadata_is_stored_with_the_entry_never_deduplicates_and_is_bounded() {
+        let service = service();
+        let metadata = json!({ "trace_id": "telegram:7", "source": "telegram" }).as_object().unwrap().clone();
+        for (body, metadata) in [("x", Some(&metadata)), ("x", Some(&metadata)), ("y", None)] {
+            service
+                .journal_append(JournalAppend { stream: "s", body, actor: ACTOR, metadata, capacity: None })
+                .await
+                .unwrap();
+        }
+        let entries = service.journal_tail("s", Some(10)).await.unwrap().entries;
+        assert_eq!(
+            entries.iter().map(|e| e.metadata.clone()).collect::<Vec<_>>(),
+            [None, Some(metadata.clone()), Some(metadata)]
+        );
+
+        let huge = json!({ "note": "x".repeat(JOURNAL_MAX_METADATA_CHARS) }).as_object().unwrap().clone();
+        let result = service
+            .journal_append(JournalAppend {
+                stream: "s",
+                body: "z",
+                actor: ACTOR,
+                metadata: Some(&huge),
+                capacity: None,
+            })
+            .await;
+        assert_eq!(code_of(result), "metadata_too_large");
+        assert_eq!(service.journal_tail("s", Some(10)).await.unwrap().entries.len(), 3);
+    }
+
+    // ── non-functional ───────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn n1_writing_and_reading_the_journal_never_calls_the_embedder() {
+        let (service, embedder) = harness();
+        append(&service, "s", "a digest about Odesa power outages", None).await.unwrap();
+        service.journal_tail("s", None).await.unwrap();
+        service.list_journals().await.unwrap();
+        assert_eq!(embedder.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn n3_a_body_is_non_empty_and_at_most_32000_characters() {
+        let service = service();
+        assert_eq!(code_of(append(&service, "s", "  \n", None).await), "empty_body");
+        assert_eq!(
+            code_of(append(&service, "s", &"x".repeat(JOURNAL_MAX_BODY_CHARS + 1), None).await),
+            "body_too_large"
+        );
+        append(&service, "s", &"x".repeat(JOURNAL_MAX_BODY_CHARS), None).await.unwrap();
+        assert_eq!(service.journal_tail("s", None).await.unwrap().entries.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn n3_the_body_is_stored_exactly_as_given() {
+        let service = service();
+        append(&service, "s", "  line one\n\nline two  \n", None).await.unwrap();
+        assert_eq!(bodies(&service, "s", None).await, ["  line one\n\nline two  \n"]);
+    }
+
+    // ── invariants (examples) ────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn i3_a_stream_never_holds_more_than_its_capacity_only_the_oldest_leave() {
+        let service = service();
+        for i in 0..7 {
+            append(&service, "s", &format!("e{i}"), Some(3)).await.unwrap();
+        }
+        assert_eq!(bodies(&service, "s", Some(10)).await, ["e6", "e5", "e4"]);
+    }
+
+    #[tokio::test]
+    async fn i5_concurrent_appends_all_land_and_the_newest_survive_the_trim() {
+        let service = service();
+        append(&service, "s", "seed", Some(5)).await.unwrap();
+        let results = futures::future::join_all((0..20).map(|i| {
+            let service = service.clone();
+            async move { append(&service, "s", &format!("p{i}"), None).await.unwrap() }
+        }))
+        .await;
+        let tail = service.journal_tail("s", Some(10)).await.unwrap().entries;
+        assert_eq!(tail.len(), 5);
+        let mut newest: Vec<i64> = results.iter().map(|r| r.entry.id).collect();
+        newest.sort_by(|a, b| b.cmp(a));
+        newest.truncate(5);
+        assert_eq!(tail.iter().map(|e| e.id).collect::<Vec<_>>(), newest);
+    }
+
+    #[tokio::test]
+    async fn i6_writing_one_stream_never_trims_another_even_one_sharing_a_prefix() {
+        let service = service();
+        append(&service, "digest", "keep me", Some(1)).await.unwrap();
+        for i in 0..5 {
+            append(&service, "digest/news", &format!("n{i}"), Some(1)).await.unwrap();
+        }
+        assert_eq!(bodies(&service, "digest", None).await, ["keep me"]);
+    }
+
+    #[tokio::test]
+    async fn i7_recall_never_returns_journal_entries() {
+        let service = service();
+        append(&service, "s", "Odesa power outages schedule", None).await.unwrap();
+        let hits = service.recall("Odesa power outages schedule", None, None, None, Utc::now()).await.unwrap();
+        assert!(hits.is_empty());
+    }
+
+    #[tokio::test]
+    async fn i8_the_journal_is_not_a_project() {
+        let service = service();
+        append(&service, "s", "x", None).await.unwrap();
+        assert_eq!(service.list_projects().await.unwrap(), []);
+    }
+
+    #[tokio::test]
+    async fn i9_stream_names_lowercase_segments_joined_by_slash_at_most_100_characters() {
+        let service = service();
+        let long = "x".repeat(100);
+        let ok = ["news-digest", "digest/news", "a/b/c-1", long.as_str()];
+        for name in ok {
+            append(&service, name, "x", None).await.unwrap();
+        }
+        let too_long = "x".repeat(101);
+        for bad in ["", "News", "a//b", "/a", "a/", "-a", "a/-b", "a b", "a.b", too_long.as_str()] {
+            assert_eq!(code_of(append(&service, bad, "x", None).await), "invalid_stream", "{bad}");
+            assert_eq!(code_of(service.journal_tail(bad, None).await), "invalid_stream", "{bad}");
+        }
+        let mut listed: Vec<String> = service.list_journals().await.unwrap().into_iter().map(|s| s.name).collect();
+        listed.sort();
+        let mut expected: Vec<String> = ok.iter().map(|s| s.to_string()).collect();
+        expected.sort();
+        assert_eq!(listed, expected);
+    }
+
+    // ── on Postgres (journal.pg.test.ts) ─────────────────────────────────────
+    // The invariants only Postgres can break: append and trim are one
+    // transaction (I4), and appends racing on one stream on separate
+    // connections all land with the newest `capacity` surviving (I5). Run
+    // against TEST_DATABASE_URL; each test writes streams of its own.
+
+    async fn pg_service() -> Option<MemoryService> {
+        let pool = crate::pg::test_pool().await?;
+        Some(MemoryService::new(Arc::new(PgMemoryStore::new(pool)), Arc::new(CountingEmbedder::default())))
+    }
+
+    fn unique(name: &str) -> String {
+        format!("{name}-{:08x}", rand::random::<u32>())
+    }
+
+    #[tokio::test]
+    async fn pg_i5_racing_appends_all_land_and_exactly_the_newest_capacity_survive() {
+        let Some(service) = pg_service().await else { return };
+        let stream = unique("race");
+        let capacity = 5;
+        append(&service, &stream, "seed", Some(capacity)).await.unwrap();
+        let results = futures::future::join_all((0..40).map(|i| {
+            let (service, stream) = (service.clone(), stream.clone());
+            tokio::spawn(async move { append(&service, &stream, &format!("p{i}"), None).await.unwrap() })
+        }))
+        .await;
+        let results: Vec<AppendedEntry> = results.into_iter().map(|r| r.unwrap()).collect();
+        for r in &results {
+            assert!(r.stream.size <= capacity);
+        }
+        let entries = service.journal_tail(&stream, Some(100)).await.unwrap().entries;
+        let mut newest: Vec<i64> = results.iter().map(|r| r.entry.id).collect();
+        newest.sort_by(|a, b| b.cmp(a));
+        newest.truncate(capacity as usize);
+        assert_eq!(entries.iter().map(|e| e.id).collect::<Vec<_>>(), newest);
+    }
+
+    #[tokio::test]
+    async fn pg_i5_the_first_appends_to_a_brand_new_stream_race_safely_too() {
+        let Some(service) = pg_service().await else { return };
+        let stream = unique("born-racing");
+        let results = futures::future::join_all((0..20).map(|i| {
+            let (service, stream) = (service.clone(), stream.clone());
+            tokio::spawn(async move { append(&service, &stream, &format!("p{i}"), Some(3)).await.unwrap() })
+        }))
+        .await;
+        assert!(results.iter().all(Result::is_ok));
+        let listed: Vec<JournalStream> =
+            service.list_journals().await.unwrap().into_iter().filter(|s| s.name == stream).collect();
+        assert_eq!(listed.iter().map(|s| (s.capacity, s.size)).collect::<Vec<_>>(), [(3, 3)]);
+    }
+
+    #[tokio::test]
+    async fn pg_i2_tail_is_newest_first_and_round_trips_the_body_byte_for_byte() {
+        let Some(service) = pg_service().await else { return };
+        let stream = unique("order");
+        let body = "  multi\nline «тело» ё  \n";
+        append(&service, &stream, "older", None).await.unwrap();
+        append(&service, &stream, body, None).await.unwrap();
+        assert_eq!(bodies(&service, &stream, Some(2)).await, [body, "older"]);
+    }
+
+    #[tokio::test]
+    async fn pg_f4_lowering_the_capacity_trims_on_that_append() {
+        let Some(service) = pg_service().await else { return };
+        let stream = unique("shrink");
+        for i in 0..6 {
+            append(&service, &stream, &format!("e{i}"), None).await.unwrap();
+        }
+        let out = append(&service, &stream, "last", Some(2)).await.unwrap();
+        assert_eq!((out.stream.capacity, out.stream.size), (2, 2));
+        assert_eq!(bodies(&service, &stream, Some(10)).await, ["last", "e5"]);
+    }
+
+    // ── properties against the reference model ───────────────────────────────
+
+    fn cases() -> u32 {
+        std::env::var("MODEL_CASES").ok().and_then(|v| v.parse().ok()).unwrap_or(300)
+    }
+
+    fn block_on<F: std::future::Future>(future: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(future)
+    }
+
+    // Few streams, one a prefix of another, so sequences actually collide (I6).
+    const STREAMS: [&str; 3] = ["digest", "digest/news", "log"];
+
+    #[derive(Debug, Clone)]
+    enum Op {
+        Append { stream: usize, body: String, capacity: Option<i64> },
+        Tail { stream: usize, n: i64 },
+    }
+
+    // fast-check's default string: printable ASCII.
+    fn body() -> impl Strategy<Value = String> {
+        "[ -~]{1,12}".prop_filter("not blank", |s| !s.trim().is_empty())
+    }
+
+    // Small capacities so trimming happens within a 30-step sequence.
+    fn op() -> impl Strategy<Value = Op> {
+        prop_oneof![
+            3 => (0..STREAMS.len(), body(), proptest::option::of(1i64..=6))
+                .prop_map(|(stream, body, capacity)| Op::Append { stream, body, capacity }),
+            1 => (0..STREAMS.len(), 1i64..=10).prop_map(|(stream, n)| Op::Tail { stream, n }),
+        ]
+    }
+
+    // The reference model: per stream, a capacity and the surviving entries in
+    // append order. Entries are the service's own return values, so comparing
+    // them checks immutability (I1) for free.
+    struct ModelStream {
+        capacity: i32,
+        entries: Vec<JournalEntry>,
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(cases()))]
+
+        // I1, I2, I3, I6
+        #[test]
+        fn behaves_like_a_bounded_list_per_stream(ops in proptest::collection::vec(op(), 0..=30)) {
+            block_on(async {
+                let service = service();
+                let mut model: std::collections::BTreeMap<&str, ModelStream> = Default::default();
+                for op in ops {
+                    match op {
+                        Op::Append { stream, body, capacity } => {
+                            let stream = STREAMS[stream];
+                            let out = append(&service, stream, &body, capacity).await.unwrap();
+                            let m = model.entry(stream).or_insert(ModelStream { capacity: JOURNAL_DEFAULT_CAPACITY, entries: Vec::new() });
+                            if let Some(c) = capacity {
+                                m.capacity = c as i32;
+                            }
+                            m.entries.push(out.entry.clone());
+                            let keep = m.capacity as usize;
+                            if m.entries.len() > keep {
+                                m.entries.drain(..m.entries.len() - keep);
+                            }
+                            assert_eq!(out.entry.body, body);
+                            assert_eq!((out.stream.name.as_str(), out.stream.capacity, out.stream.size), (stream, m.capacity, m.entries.len() as i64));
+                        }
+                        Op::Tail { stream, n } => {
+                            let stream = STREAMS[stream];
+                            let entries = service.journal_tail(stream, Some(n)).await.unwrap().entries;
+                            let expected: Vec<JournalEntry> = model.get(stream).map_or_else(Vec::new, |m| m.entries.iter().rev().take(n as usize).cloned().collect());
+                            assert_eq!(entries, expected);
+                        }
+                    }
+                }
+
+                // The whole state, not just what the sequence happened to tail.
+                for name in STREAMS {
+                    let m = model.get(name);
+                    let entries = service.journal_tail(name, Some(100)).await.unwrap().entries;
+                    let expected: Vec<JournalEntry> = m.map_or_else(Vec::new, |m| m.entries.iter().rev().cloned().collect());
+                    assert_eq!(entries, expected);
+                    assert!(entries.len() <= m.map_or(0, |m| m.capacity as usize));
+                }
+                let mut listed: Vec<(String, i32, i64)> = service.list_journals().await.unwrap().into_iter().map(|s| (s.name, s.capacity, s.size)).collect();
+                listed.sort();
+                let expected: Vec<(String, i32, i64)> = model.iter().map(|(name, m)| (name.to_string(), m.capacity, m.entries.len() as i64)).collect();
+                assert_eq!(listed, expected);
+            });
+        }
+
+        // I5
+        #[test]
+        fn keeps_the_newest_capacity_entries_when_appends_race(capacity in 1i64..=8, count in 1usize..=25) {
+            block_on(async {
+                let service = service();
+                append(&service, "race", "seed", Some(capacity)).await.unwrap();
+                let results = futures::future::join_all((0..count).map(|i| {
+                    let service = service.clone();
+                    async move { append(&service, "race", &format!("p{i}"), None).await.unwrap() }
+                }))
+                .await;
+                let entries = service.journal_tail("race", Some(100)).await.unwrap().entries;
+                let mut appended: Vec<i64> = results.iter().map(|r| r.entry.id).collect();
+                assert_eq!(appended.iter().collect::<std::collections::HashSet<_>>().len(), count);
+                assert_eq!(entries.len(), (capacity as usize).min(count + 1));
+                if count >= capacity as usize {
+                    appended.sort_by(|a, b| b.cmp(a));
+                    appended.truncate(capacity as usize);
+                    assert_eq!(entries.iter().map(|e| e.id).collect::<Vec<_>>(), appended);
+                }
+            });
+        }
+
+        // I9
+        #[test]
+        fn accepts_exactly_the_names_the_grammar_allows_and_a_rejected_call_writes_nothing(
+            stream in prop_oneof![
+                "[a-z0-9][a-z0-9-]*(/[a-z0-9][a-z0-9-]*)*".prop_filter("≤ 100", |s| s.len() <= 100),
+                "[ -~]{0,20}",
+                "[a/\\-1A.]{0,8}",
+            ]
+        ) {
+            block_on(async {
+                let service = service();
+                let valid = regex::Regex::new(JOURNAL_STREAM_RE).unwrap().is_match(&stream) && stream.len() <= 100;
+                match append(&service, &stream, "x", None).await {
+                    Ok(_) => {
+                        assert!(valid);
+                        let names: Vec<String> = service.list_journals().await.unwrap().into_iter().map(|s| s.name).collect();
+                        assert_eq!(names, [stream.clone()]);
+                    }
+                    Err(err) => {
+                        assert_eq!(err.downcast::<MemoryError>().expect("a MemoryError").code, "invalid_stream");
+                        assert!(!valid);
+                        assert_eq!(service.list_journals().await.unwrap(), []);
+                    }
+                }
+            });
+        }
     }
 }

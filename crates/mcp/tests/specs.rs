@@ -49,7 +49,8 @@ async fn wipe() -> anyhow::Result<()> {
         .await?
         .batch_execute(
             "TRUNCATE news_items, knowledge_base_notes, memory_projects, memory_project_docs,
-                      memory_doc_patches, memory_facts, memory_index RESTART IDENTITY CASCADE",
+                      memory_doc_patches, memory_facts, memory_index, memory_journal_streams,
+                      memory_journal_entries RESTART IDENTITY CASCADE",
         )
         .await?;
     env.db
@@ -372,8 +373,15 @@ async fn next_signal_slot(spec: &mut Spec, source: String, slot: String) {
 async fn offers_tools(spec: &mut Spec, step: &Step) {
     let mut expected: Vec<String> = docstring(step).split_whitespace().map(str::to_owned).collect();
     expected.sort();
-    let mut actual: Vec<String> =
-        spec.client().await.list_all_tools().await.expect("tools/list").into_iter().map(|t| t.name.into_owned()).collect();
+    let mut actual: Vec<String> = spec
+        .client()
+        .await
+        .list_all_tools()
+        .await
+        .expect("tools/list")
+        .into_iter()
+        .map(|t| t.name.into_owned())
+        .collect();
     actual.sort();
     assert_eq!(actual, expected, "the tool surface");
 }

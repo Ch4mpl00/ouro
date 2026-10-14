@@ -114,7 +114,9 @@ fn step(docs: usize) -> impl Strategy<Value = Step> {
 impl Call {
     fn model_json(&self) -> Value {
         match self {
-            Call::Write { doc, body, expected } => json!({ "op": "write", "doc": doc, "body": body, "expected": expected }),
+            Call::Write { doc, body, expected } => {
+                json!({ "op": "write", "doc": doc, "body": body, "expected": expected })
+            }
             Call::Append { doc, text } => json!({ "op": "append", "doc": doc, "text": text }),
             Call::Patch { doc, expected, edits } => json!({
                 "op": "patch", "doc": doc, "expected": expected,
@@ -261,8 +263,12 @@ fn normalise(call: &Call, outcome: Outcome) -> Value {
 async fn patch_ids(client: &Client, doc: &str) -> Vec<String> {
     let outcome = support::call(client, "doc_history", json!({ "project": PROJECT, "doc": doc, "limit": 100 })).await;
     let Outcome::Ok(value) = outcome else { return Vec::new() };
-    let mut ids: Vec<String> =
-        value["history"].as_array().into_iter().flatten().filter_map(|p| p["patchId"].as_str().map(str::to_owned)).collect();
+    let mut ids: Vec<String> = value["history"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|p| p["patchId"].as_str().map(str::to_owned))
+        .collect();
     ids.reverse();
     ids
 }
@@ -312,7 +318,9 @@ async fn concretise(step: &Step, model: &mut Model, client: &Client) -> Call {
                 Some(pid) => Call::Revert { doc: doc_of(*doc), index, pid: pid.clone(), rollback: *rollback },
                 // An id that never exists ("z" is not hex), and an index the
                 // model will never reach, even if patches arrive meanwhile.
-                None => Call::Revert { doc: doc_of(*doc), index: NO_PATCH, pid: "pa:zzzzzz".into(), rollback: *rollback },
+                None => {
+                    Call::Revert { doc: doc_of(*doc), index: NO_PATCH, pid: "pa:zzzzzz".into(), rollback: *rollback }
+                }
             }
         }
         Step::Read { doc } => Call::Read { doc: doc_of(*doc) },
@@ -471,28 +479,30 @@ fn main() {
     let config = Config { cases: cases(), failure_persistence: None, ..Config::default() };
 
     let only = std::env::var("MODEL_ONLY").unwrap_or_default();
-    let sequential_ok = only == "concurrent" || report(
-        "sequential",
-        TestRunner::new(config.clone()).run(&proptest::collection::vec(step(DOCS.len()), 1..30), |steps| {
-            let model = &mut model.borrow_mut();
-            rt.block_on(async {
-                fresh_start(&server, model, &client).await;
-                sequential(&steps, model, &client).await.map(|_| ()).map_err(TestCaseError::fail)
-            })
-        }),
-    );
+    let sequential_ok = only == "concurrent"
+        || report(
+            "sequential",
+            TestRunner::new(config.clone()).run(&proptest::collection::vec(step(DOCS.len()), 1..30), |steps| {
+                let model = &mut model.borrow_mut();
+                rt.block_on(async {
+                    fresh_start(&server, model, &client).await;
+                    sequential(&steps, model, &client).await.map(|_| ()).map_err(TestCaseError::fail)
+                })
+            }),
+        );
 
     let sessions = proptest::collection::vec(proptest::collection::vec(step(1), 1..4), 2..5);
-    let concurrent_ok = only == "sequential" || report(
-        "concurrent",
-        TestRunner::new(config).run(&(proptest::collection::vec(step(1), 0..6), sessions), |(prefix, sessions)| {
-            let model = &mut model.borrow_mut();
-            rt.block_on(async {
-                fresh_start(&server, model, &client).await;
-                concurrent(&prefix, &sessions, model, &client, &server.url).await.map_err(TestCaseError::fail)
-            })
-        }),
-    );
+    let concurrent_ok = only == "sequential"
+        || report(
+            "concurrent",
+            TestRunner::new(config).run(&(proptest::collection::vec(step(1), 0..6), sessions), |(prefix, sessions)| {
+                let model = &mut model.borrow_mut();
+                rt.block_on(async {
+                    fresh_start(&server, model, &client).await;
+                    concurrent(&prefix, &sessions, model, &client, &server.url).await.map_err(TestCaseError::fail)
+                })
+            }),
+        );
 
     rt.block_on(async { drop(container) });
     if !(sequential_ok && concurrent_ok) {
