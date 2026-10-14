@@ -12,7 +12,6 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use async_trait::async_trait;
 use mcp_tools::userbot::{ChannelHandle, ChannelMessage, DialogInfo, DialogKind, TelegramAccount};
-use proptest::prelude::*;
 use proptest::test_runner::{Config, TestRunner};
 use serde_json::{Value, json};
 use support::{Client, Outcome, Server, TestDatabase, call, connect, runtime, start_test_server_with_account};

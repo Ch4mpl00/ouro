@@ -196,10 +196,10 @@ fn matches(r: &Row, f: &Filters) -> bool {
     if f.source.is_some_and(|s| r.source != s) {
         return false;
     }
-    if f.since.is_some_and(|t| !r.posted_at.is_some_and(|p| p > t)) {
+    if f.since.is_some_and(|t| r.posted_at.is_none_or(|p| p <= t)) {
         return false;
     }
-    if f.until.is_some_and(|t| !r.posted_at.is_some_and(|p| p <= t)) {
+    if f.until.is_some_and(|t| r.posted_at.is_none_or(|p| p > t)) {
         return false;
     }
     if f.channel.is_some_and(|c| r.channel.as_deref() != Some(c)) {
