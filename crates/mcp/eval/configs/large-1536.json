@@ -1,0 +1,11 @@
+{
+  "name": "large-1536",
+  "retrieval": {
+    "embed": { "model": "text-embedding-3-large", "dimensions": 1536 },
+    "buildText": "title+body",
+    "topK": 10,
+    "rerank": null
+  },
+  "query": { "field": "reformulation" },
+  "scoring": { "mode": "binary" }
+}
