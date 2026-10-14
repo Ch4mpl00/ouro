@@ -3495,6 +3495,40 @@ mod tests {
     }
 }
 
+// ── tests: patch properties ──────────────────────────────────────────────────
+// The property half of packages/mcp/src/services/memory/patch.test.ts.
+
+#[cfg(test)]
+mod patch_properties {
+    use proptest::prelude::*;
+
+    use super::*;
+
+    fn piece() -> impl Strategy<Value = String> {
+        prop_oneof![
+            "\\PC{0,8}",
+            proptest::sample::select(vec!["$&", "$1", "$$", "$`", "$'", "$<n>", "\\"]).prop_map(str::to_owned),
+        ]
+    }
+
+    fn text() -> impl Strategy<Value = String> {
+        proptest::collection::vec(piece(), 0..=6).prop_map(|ps| ps.concat())
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(500))]
+
+        // applyEdits, replacement text: lands verbatim, whatever it contains.
+        #[test]
+        fn replacement_text_lands_verbatim_whatever_it_contains(before in text(), after in text(), replacement in text()) {
+            let marker = "\u{1}unique\u{1}";
+            let body = format!("{before}{marker}{after}");
+            let result = apply_edits(&body, &[Edit { old: marker.to_owned(), new: replacement.clone() }]);
+            prop_assert_eq!(result, Ok(format!("{before}{replacement}{after}")));
+        }
+    }
+}
+
 // ── tests: the journal ───────────────────────────────────────────────────────
 // A port of packages/mcp/src/services/memory/journal.test.ts (one test per
 // requirement: F = functional, N = non-functional, I = invariant) and

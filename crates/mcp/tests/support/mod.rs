@@ -155,20 +155,35 @@ pub struct Server {
 // instance is multi-session, as in production.
 pub async fn start_server(database_url: &str, toolsets: Option<&str>) -> anyhow::Result<Server> {
     let db = Db::connect(database_url).await?;
-    serve(database_url, db, toolsets, Arc::new(WordEmbedder)).await
+    serve(database_url, db, toolsets, Arc::new(WordEmbedder), "spec").await
 }
 
 // A server on a TestDatabase pair, as TS startServer(db.url, toolsets).
 pub async fn start_test_server(database: &TestDatabase, toolsets: Option<&str>) -> anyhow::Result<Server> {
+    start_test_server_as(database, toolsets, "spec").await
+}
+
+// The same, with the instance's MCP_MEMORY_ACTOR.
+pub async fn start_test_server_as(
+    database: &TestDatabase,
+    toolsets: Option<&str>,
+    actor: &str,
+) -> anyhow::Result<Server> {
     let db = Db::connect_state(&database.url, &database.state_url).await?;
-    serve(&database.url, db, toolsets, Arc::new(WordEmbedder)).await
+    serve(&database.url, db, toolsets, Arc::new(WordEmbedder), actor).await
 }
 
 pub fn word_embedder() -> SharedEmbedder {
     Arc::new(WordEmbedder)
 }
 
-async fn serve(database_url: &str, db: Db, toolsets: Option<&str>, embedder: SharedEmbedder) -> anyhow::Result<Server> {
+async fn serve(
+    database_url: &str,
+    db: Db,
+    toolsets: Option<&str>,
+    embedder: SharedEmbedder,
+    actor: &str,
+) -> anyhow::Result<Server> {
     let pool = pg::connect(database_url)?;
     pg::migrate(&pool).await?;
     let http = reqwest::Client::new();
@@ -190,7 +205,7 @@ async fn serve(database_url: &str, db: Db, toolsets: Option<&str>, embedder: Sha
         news: NewsRepository::new(pool.clone(), embedder.clone()),
         knowledge: KnowledgeRepository::new(pool.clone(), embedder.clone()),
         memory: MemoryService::new(Arc::new(PgMemoryStore::new(pool.clone())), embedder),
-        memory_actor: "spec".into(),
+        memory_actor: actor.into(),
         gateway: None,
     });
     let scope = toolsets::parse_toolsets(toolsets)?;
