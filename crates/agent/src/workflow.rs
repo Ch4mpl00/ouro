@@ -1161,9 +1161,17 @@ impl WorkflowRunner {
                         WorkflowError::Decision("no decision model configured (OPEN_ROUTER_API_KEY)".into())
                     })?;
                     let items = substitute(&json!(items), store)?;
-                    let items = items
-                        .as_array()
-                        .ok_or_else(|| WorkflowError::Decision("items must resolve to an array".into()))?;
+                    let items = items.as_array().ok_or_else(|| {
+                        // Named as JS `typeof` names it, like the TS message.
+                        let got = match &items {
+                            Value::Null => "null",
+                            Value::Bool(_) => "boolean",
+                            Value::Number(_) => "number",
+                            Value::String(_) => "string",
+                            _ => "object",
+                        };
+                        WorkflowError::Decision(format!("items must resolve to an array, got {got}"))
+                    })?;
                     let prompt = substitute_text(prompt, store)?;
                     span.update(ContextUpdate::input(
                         json!({"preset":preset,"items":items.len(),"threshold":threshold,"prompt":prompt}),

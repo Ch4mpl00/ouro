@@ -1,12 +1,115 @@
-// Port of tracing/tee.test.ts, plus OTLP/local read-shape checks.
+// Port of tracing/tee.test.ts; the OTLP / local read-shape checks after it
+// are Rust-only.
 use agent::{
-    db::{AgentDb, TraceStore},
+    db::{AgentDb, StoredTrace, TraceStore},
     langfuse::{Attr, FinishedSpan, LangfuseTracer, SpanSink, otlp_body},
     local_recorder::local_recorder_tracer,
     tracing::*,
 };
+use async_trait::async_trait;
 use serde_json::json;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+
+// A fake "Langfuse" tracer that hands out deterministic ids, standing in for
+// the backend whose observation ids the local mirror must adopt.
+#[derive(Clone)]
+struct FakeSpan {
+    id: String,
+    n: Arc<AtomicUsize>,
+}
+impl FakeSpan {
+    fn next(&self, prefix: &str) -> String {
+        format!("lf-{prefix}-{}", self.n.fetch_add(1, Ordering::SeqCst))
+    }
+}
+struct FakeGeneration(String);
+impl Generation for FakeGeneration {
+    fn id(&self) -> String {
+        self.0.clone()
+    }
+    fn end(&self, _: GenerationEnd) {}
+}
+impl TraceContext for FakeSpan {
+    fn update(&self, _: ContextUpdate) {}
+    fn generation(&self, _: GenerationStart) -> Arc<dyn Generation> {
+        Arc::new(FakeGeneration(self.next("gen")))
+    }
+    fn span(&self, _: SpanStart) -> Arc<dyn Span> {
+        Arc::new(FakeSpan { id: self.next("span"), n: self.n.clone() })
+    }
+    fn event(&self, _: EventStart) {}
+}
+impl Span for FakeSpan {
+    fn id(&self) -> String {
+        self.id.clone()
+    }
+    fn end(&self, _: SpanEnd) {}
+}
+impl Trace for FakeSpan {
+    fn id(&self) -> String {
+        self.id.clone()
+    }
+    fn end(&self) {}
+}
+struct FakePrimary;
+#[async_trait]
+impl Tracer for FakePrimary {
+    fn trace(&self, _: TraceStart) -> Arc<dyn Trace> {
+        Arc::new(FakeSpan { id: "lf-trace".into(), n: Arc::new(AtomicUsize::new(0)) })
+    }
+    async fn shutdown(&self) {}
+}
+
+#[derive(Default)]
+struct CaptureStore(Mutex<Vec<StoredTrace>>);
+impl TraceStore for CaptureStore {
+    fn write_trace(&self, t: &StoredTrace) -> anyhow::Result<()> {
+        self.0.lock().unwrap().push(t.clone());
+        Ok(())
+    }
+    fn get_trace(
+        &self,
+        _: &str,
+    ) -> anyhow::Result<Option<(agent::trace_model::Trace, Vec<agent::trace_model::Observation>)>> {
+        Ok(None)
+    }
+}
+
+#[test]
+fn the_local_mirror_records_each_child_with_the_primarys_observation_id() {
+    let store = Arc::new(CaptureStore::default());
+    let tracer = tee_tracer(Arc::new(FakePrimary), Arc::new(local_recorder_tracer(store.clone())));
+    let trace = tracer.trace(TraceStart {
+        id: "ignored".into(),
+        name: "signal:telegram".into(),
+        kind: SpanKind::Agent,
+        ..Default::default()
+    });
+    let generation =
+        trace.generation(GenerationStart { name: "attempt-1".into(), model: "m".into(), ..Default::default() });
+    let step = trace.span(SpanStart::new("step[0]:tool", SpanKind::Tool));
+    let inner =
+        step.generation(GenerationStart { name: "llm_compose:x".into(), model: "m".into(), ..Default::default() });
+    generation.end(GenerationEnd { output: Some(json!("{}")), ..Default::default() });
+    inner.end(GenerationEnd { output: Some(json!("ok")), ..Default::default() });
+    step.end(SpanEnd::output("ok"));
+    trace.end();
+
+    let written = store.0.lock().unwrap();
+    assert_eq!(written.len(), 1);
+    let by_name = |name: &str| written[0].observations.iter().find(|o| o.name == name).unwrap().id.clone();
+    // The trace id is the primary's.
+    assert_eq!(written[0].id, "lf-trace");
+    // Every teed handle's id is what the mirror stored — the primary's, not
+    // a local random UUID (the orphan-score bug).
+    assert_eq!(generation.id(), by_name("attempt-1"));
+    assert_eq!(step.id(), by_name("step[0]:tool"));
+    assert_eq!(inner.id(), by_name("llm_compose:x"));
+    assert!(by_name("attempt-1").starts_with("lf-gen-"));
+    assert!(by_name("step[0]:tool").starts_with("lf-span-"));
+    assert!(by_name("llm_compose:x").starts_with("lf-gen-"));
+}
 #[derive(Default)]
 struct Sink(Mutex<Vec<FinishedSpan>>);
 impl SpanSink for Sink {

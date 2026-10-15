@@ -128,6 +128,12 @@ impl Engine {
             }
         }
     }
+    // The loops alive now: a started loop stays registered until end_loop.
+    pub async fn loop_ids(&self) -> Vec<String> {
+        let mut ids: Vec<_> = self.loops.lock().await.keys().cloned().collect();
+        ids.sort();
+        ids
+    }
     pub async fn shutdown(&self) {
         self.stopping.store(true, Ordering::SeqCst);
         let mut done = self.shutdown.lock().await;
@@ -348,13 +354,19 @@ impl AgentLoop {
                 self.scope.update(ContextUpdate::output(content.clone()));
                 return Ok(content);
             }
-            // buffered preserves call order; cancellation is shared by all tools.
-            // Never drop a worker before its trace / child-loop finalizers run.
-            let results: Vec<_> = stream::iter(calls.into_iter().map(|call| self.dispatch(engine.clone(), call)))
-                .buffered(self.opts.max_concurrent_tools)
-                .collect()
-                .await;
-            for result in results {
+            // A finished call frees its slot at once (`buffered` would hold it
+            // until every earlier call finished); replies go back in call
+            // order. Cancellation is shared by all tools, and every dispatch
+            // runs to its end, so no worker is dropped before its trace /
+            // child-loop finalizers run.
+            let mut results: Vec<_> = stream::iter(
+                calls.into_iter().enumerate().map(|(i, call)| self.dispatch(engine.clone(), call).map(move |r| (i, r))),
+            )
+            .buffer_unordered(self.opts.max_concurrent_tools)
+            .collect()
+            .await;
+            results.sort_by_key(|(i, _)| *i);
+            for (_, result) in results {
                 let (call, presented) = result?;
                 messages.push(providers::tool_reply(&call.id, &presented));
             }

@@ -482,6 +482,8 @@ pub struct Progress {
     pub draft: Option<ActivityDraft>,
     pub next_attempt_at: Option<String>,
     pub entry_id: Option<i64>,
+    // Why the last attempt failed.
+    pub error: Option<String>,
 }
 impl AgentDb {
     pub fn activity_cutoff(&self, now: DateTime<Utc>) -> anyhow::Result<String> {
@@ -503,22 +505,23 @@ impl AgentDb {
             .collect::<Result<_, _>>()?)
     }
     pub fn activity_progress(&self, id: &str) -> anyhow::Result<Option<Progress>> {
-        type ProgressRow = (String, u32, Option<String>, Option<String>, Option<i64>);
+        type ProgressRow = (String, u32, Option<String>, Option<String>, Option<i64>, Option<String>);
         let row: Option<ProgressRow> = self
             .conn()
             .query_row(
-                "SELECT status,attempts,draft,next_attempt_at,entry_id FROM activity_projections WHERE trace_id=?1",
+                "SELECT status,attempts,draft,next_attempt_at,entry_id,error FROM activity_projections WHERE trace_id=?1",
                 [id],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
             )
             .optional()?;
-        row.map(|(status, attempts, draft, next_attempt_at, entry_id)| {
+        row.map(|(status, attempts, draft, next_attempt_at, entry_id, error)| {
             Ok(Progress {
                 status,
                 attempts,
                 draft: draft.map(|s| serde_json::from_str(&s)).transpose()?,
                 next_attempt_at,
                 entry_id,
+                error,
             })
         })
         .transpose()

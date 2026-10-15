@@ -306,6 +306,7 @@ pub async fn filter(
     let work_cancel = cancel.child_token();
     let _guard = work_cancel.clone().drop_guard();
     let child_scope: Scope = span.clone();
+    // A finished batch frees its slot at once; results land by item index.
     let results:Vec<_>=stream::iter(batches.into_iter().map(|batch|{
         let cancel=work_cancel.clone();let child_scope=child_scope.clone();async move{
             let mut request=DecisionRequest::new(json!({"rules":prompt,"items":batch.iter().enumerate().map(|(k,i)|json!({"n":k+1,"item":items[*i]})).collect::<Vec<_>>()}),child_scope,cancel.clone());request.name="decide:filter:batch".into();
@@ -317,7 +318,7 @@ pub async fn filter(
                 Err(error)=>{cancel.cancel();Err(error)}
             }
         }
-    })).buffered(FILTER_CONCURRENCY).collect().await;
+    })).buffer_unordered(FILTER_CONCURRENCY).collect().await;
     let mut probabilities = vec![0.0; items.len()];
     let mut failure = None;
     for result in results {
