@@ -1,4 +1,5 @@
-// Overlay and boot-validation contracts from TS skills.ts / write-skill tests.
+// Rust-only: the skill overlay and boot validation (skills.ts has no test file
+// of its own in packages/agent).
 use agent::skills::*;
 #[tokio::test]
 async fn overlay_defaults_patch_listing_and_validation() {

@@ -127,6 +127,18 @@ async fn preserves_an_older_identical_user_message_when_the_current_one_is_absen
 }
 
 #[tokio::test]
+async fn leaves_out_messages_logged_after_the_signal_when_the_current_one_is_absent_from_the_log() {
+    let h = Setup::new(vec![
+        message(1, "Какой период?", json!({})),
+        message(2, "Будущий ответ", json!({"created_at":"2026-09-06 12:00:05"})),
+    ]);
+    let input = h.run(&signal()).await;
+    assert!(input.contains("Какой период?"));
+    assert!(!input.contains("Будущий ответ"));
+    assert!(!h.history().contains("Будущий ответ"));
+}
+
+#[tokio::test]
 async fn keeps_the_latest_complete_messages_inline_and_preserves_omitted_history_in_memory() {
     let h = Setup::new(vec![
         message(1, &format!("OLD {}", "x".repeat(20_000)), json!({})),

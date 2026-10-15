@@ -30,9 +30,12 @@ runtime; compose selects `agent-supervisor`. The TypeScript runtime in
 `packages/agent` remains available with
 `command: sh -c "pnpm setup:agent && pnpm agent:start"`. Both use the same
 `agent.db` migrations and trace shapes. Offline judging, improvement, GAIA and
-CLI scripts stay in TypeScript. Fix shared runtime contracts in both ports;
-run `cargo test -p agent` and `pnpm typecheck`. The Rust binary handles SQLite
-migrations itself. Port status and rollout evidence: `.claude/tasks/rust-agent.md`.
+CLI scripts stay in TypeScript. The runtime tests are ported one to one
+(`crates/agent/tests/*.rs` mirror the runtime tests of `packages/agent`, one
+Rust test per TS case, the fast-check properties as proptest). Fix shared
+runtime contracts in both ports, with their tests; run `cargo test -p agent`
+and `pnpm typecheck`. The Rust binary handles SQLite migrations itself. Port
+status and rollout evidence: `.claude/tasks/rust-agent.md`.
 
 ## How a signal turns into action
 

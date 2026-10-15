@@ -1,4 +1,5 @@
-// TS compile/execute/runner contracts, exercised through the real Rust engine.
+// Rust-only: compile / execute / runner scenarios through the real engine,
+// beyond the one-to-one ports in workflow_*.rs.
 mod support;
 use agent::{
     codex::Codex,

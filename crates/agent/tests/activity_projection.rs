@@ -1,3 +1,6 @@
+// Rust-only: projections, notes and drafts compared byte for byte with what
+// the TS implementation produced (fixtures/activity-projection.json, made by
+// support/make-parity-fixtures.ts).
 use agent::{
     activity::*,
     trace_model::{Observation, Trace},

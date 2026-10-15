@@ -77,8 +77,8 @@ exist.
       failure; checked against SDK HTTP and the actual TS HTTP test process.
 - [x] Workflow DSL, variables, compiler, executor, patch / replan, runner.
 - [x] Supervisor, Telegram context, signal polling, activity journal, main.
-- [ ] Complete per-test TS parity matrix and mutation checks for all runtime
-      tests. Current tests port contracts/cases; this is not full TS coverage.
+- [x] Complete per-test TS parity matrix and mutation checks for all runtime
+      tests (see "Test parity — 2026-10-15").
 - [x] Image / compose wiring with TS rollback and local runtime process smoke.
 - [ ] Linux release image verification and production deployment.
 - [ ] Live Langfuse ingestion verified (currently tested on generated OTLP
@@ -227,3 +227,75 @@ expected to fail its corresponding assertion, and sources are restored.
 ingestion, then deploy and observe real signals. Build/dev scripts and deployment
 were not run, per the session instructions. Local tests do not establish live
 provider behavior or resource usage on the droplet.
+
+
+## Test parity — 2026-10-15
+
+Every runtime test of `packages/agent` (not `judging/`, `eval/`, `scripts/`)
+has a Rust twin: one `#[test]` per TS `it`, named after it (an `it.each`
+table loops inside one test), and every fast-check property as a proptest
+with the same generators, rules, run counts (`PROPERTY_RUNS`) and
+witnessed-path checks. Where a TS test spies on `startAgentLoop` /
+`endAgentLoop`, the Rust one reads the trace the loops leave and
+`Engine::loop_ids`. The Codex scenario tests stay, marked Rust-only.
+
+| TS | cases | Rust |
+|---|---|---|
+| `src/agent-loop.test.ts` | 32 | `agent_loop.rs` (+9 Rust-only on real skills / agent.db) |
+| `test/agent-loop.test.ts` | 2 properties | `loop_properties.rs` |
+| `test/write-skill.test.ts` | 4 + property | `write_skill.rs` |
+| `src/providers/providers.test.ts` | 21 | `providers.rs` |
+| `src/providers/retry.test.ts` | 5 (+3 per provider) | `retry.rs` (paused tokio clock for TestClock) |
+| `src/session-context.test.ts` | 13 | `session_context.rs` |
+| `src/tool-results.test.ts` | 4 | `tool_results.rs` |
+| `src/tracing/tee.test.ts` | 1 | `tracing.rs` |
+| `test/agent-db.test.ts` | 2 properties + 2 | `agent_db.rs` (three real processes via self-exec) |
+| `src/mcp-client.test.ts` | 13 | `mcp_client.rs` (real Streamable HTTP for the SDK's in-memory pair) |
+| `test/mcp-reconnect.test.ts` | property | `mcp_typescript.rs` (same TS child process; `--ignored`, needs node) |
+| `src/decisions.test.ts` | 11 | `decisions.rs` |
+| `test/decisions-filter.test.ts` | property | `decisions.rs` |
+| `src/supervisor/telegram-context.test.ts` | 13 | `telegram_context.rs` |
+| `test/supervisor.test.ts` | property | `supervisor_e2e.rs` (in-process rmcp server over a duplex pipe) |
+| `test/activity-journal.test.ts` | 13 | `activity_journal.rs` |
+| `src/workflow/dsl.test.ts` | 40 | `workflow_dsl.rs` (`workflowToJsonSchema` has no Rust twin: inspection-only, dropped) |
+| `src/workflow/variables.test.ts` | 26 | `workflow_variables.rs` |
+| `src/workflow/compile.test.ts` | 12 | `workflow_compile.rs` |
+| `src/workflow/execute.test.ts` | 52 | `workflow_execute.rs` |
+| `test/workflow.test.ts` | 3 properties + 1 | `workflow_properties.rs` |
+| `test/workflow-replan.test.ts`, `-patch`, `-execute` | properties | `workflow_properties.rs` |
+
+The ports found two behaviour differences, both fixed in Rust:
+
+- Tool calls (`maxConcurrentTools`) and filter batches ran through
+  `futures::buffered`, which keeps a finished call's slot until every
+  earlier one finishes: with a slow first call the third never started.
+  `Effect.forEach({ concurrency })` frees the slot at once. Now
+  `buffer_unordered`, with the results put back in call order.
+- A decide step whose items aren't an array says what they were
+  (`got object`), like the TS message.
+
+Run: `cargo test -p agent` (343 tests, ~40 s); `-- --include-ignored`
+adds the two cross-language tests and the reconnect property.
+
+### Mutation check
+
+31 compiling source mutations, one at a time, each run against the test files
+that cover it (script kept out of the repo; the list is the record):
+off-by-one inline / preview limits, working-memory duplicate keys and byte
+sizes, DeepSeek stamping without thinking, OpenRouter `max`, 408 not
+transient, the retry budget, MCP 408 fatal and an uncapped connect backoff,
+the filter threshold and batch size, `buffered` tool calls, workers allowed
+to delegate, `write_skill` without the signal's authority, a whitelist
+union, replies out of order, Telegram history after the signal, recent
+activity newest first, the history byte cap, the note line limit, a done
+journal entry keeping its draft, duplicate binds accepted, whole-string
+placeholders turned to text, a failed parallel child not cancelling its
+siblings, failed compile attempts tagged as planner nodes, the last-pass
+flag, array `length` paths, judge listing order, tee ids not forced, the
+patch put first.
+
+30 were caught as first written. The survivor — Telegram history keeping
+messages logged after the signal — was masked by the cut at the current
+message; the TS suite had the same gap. A case for it went into both
+(`leaves out messages logged after the signal…`), and the mutation now
+fails both.

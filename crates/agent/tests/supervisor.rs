@@ -1,4 +1,6 @@
-// Routing, source isolation, recovery and shutdown from TS supervisor tests.
+// Rust-only: routing, source isolation, recovery, shutdown and the poll loop
+// as scenarios, beyond the one-to-one ports in agent_loop.rs,
+// telegram_context.rs and supervisor_e2e.rs.
 mod support;
 use agent::{
     db::TraceStore,
