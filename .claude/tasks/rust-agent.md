@@ -1,6 +1,6 @@
 # The agent in Rust — crates/agent
 
-**Status:** in-progress — Rust runtime complete locally; production rollout pending
+**Status:** in-progress — Rust agent on prod since 2026-10-15 (from PR #28's branch); TS kept as rollback
 **Priority:** P2
 **Area:** packages/agent → crates/agent (runtime only)
 **Created:** 2026-10-14
@@ -80,9 +80,9 @@ exist.
 - [x] Complete per-test TS parity matrix and mutation checks for all runtime
       tests (see "Test parity — 2026-10-15").
 - [x] Image / compose wiring with TS rollback and local runtime process smoke.
-- [ ] Linux release image verification and production deployment.
-- [ ] Live Langfuse ingestion verified (currently tested on generated OTLP
-      and the local mirror, without calling Langfuse).
+- [x] Linux release image verification and production deployment
+      (2026-10-15, see "Production switch").
+- [x] Live Langfuse ingestion verified on the first production run.
 
 ## Continuation checkpoint — 2026-10-14 (Codex)
 
@@ -299,3 +299,29 @@ messages logged after the signal — was masked by the cut at the current
 message; the TS suite had the same gap. A case for it went into both
 (`leaves out messages logged after the signal…`), and the mutation now
 fails both.
+
+## Production switch — 2026-10-15
+
+Deployed `1832b91` with `scripts/deploy.sh agent` (compose also recreated
+`mcp` and `codex`, same code, new image). Before: `agent.db` copied with the
+agent stopped to `/root/backups/pre-rust-agent-20261015-1740/`. The TS
+agent's own image had already been pruned (only its running container held
+the layers), so the rollback is the TS agent inside the current image —
+`command: sh -c "pnpm setup:agent && pnpm agent:start"` — or the image
+`mcp-tools-image:ts-backup-ad4ffbe`; the TS agent code is the same in both.
+
+Observed:
+- boot: MCP connected on the second attempt (mcp was restarting), skill
+  validation passed (44 tools), activity journal resumed from the TS cutoff;
+- memory: agent 114 MiB (TS) → 5.7 MiB idle, 34 MiB during a run;
+- `agent.db`: the TS driver still reads it; the migration table is
+  unchanged (3), the Rust migrator applied nothing;
+- the first real signal, `scheduler:685` (the evening digest): compile,
+  parallel fetch, 20 filter batches, compose, send, watermark — all DEFAULT,
+  38 s, the same shape as the TS run of the same task the day before;
+- journal: its note appended 5 s after the run (entry 23);
+- Langfuse: the trace reads back with all 36 observations, types, model,
+  usage and `judge_node` metadata.
+
+Still to see on prod: a Telegram message (the agent-loop path, history
+preload, recovery).
