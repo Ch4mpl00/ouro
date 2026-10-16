@@ -106,6 +106,17 @@ def remote_info(host):
     return json.loads(ssh(host, ["python3", "-c", code], stdout=subprocess.PIPE, text=True).stdout)
 
 
+def extract_archive(archive, payload):
+    payload = Path(payload).resolve()
+    with tarfile.open(fileobj=io.BytesIO(archive)) as source:
+        # git archive contains only the requested, committed runtime files.
+        # Resolve macOS /var -> /private/var before containment checks.
+        for member in source.getmembers():
+            if member.issym() or member.islnk() or not (payload / member.name).resolve().is_relative_to(payload):
+                raise RuntimeError("unexpected archive entry: " + member.name)
+        source.extractall(payload)
+
+
 def local(args):
     started = time.monotonic()
     root = Path(output(["git", "rev-parse", "--show-toplevel"]))
@@ -128,15 +139,9 @@ def local(args):
         print("[deploy] no runtime changes; no build, upload or restart")
         return
     with tempfile.TemporaryDirectory(prefix="ouro-deploy-") as directory:
-        payload = Path(directory)
+        payload = Path(directory).resolve()
         archive = run(["git", "archive", revision, *ASSETS], stdout=subprocess.PIPE).stdout
-        with tarfile.open(fileobj=io.BytesIO(archive)) as source:
-            # git archive contains only the requested, committed runtime files.
-            # Keep compatibility with the laptop's system Python 3.9.
-            for member in source.getmembers():
-                if member.issym() or member.islnk() or not (payload / member.name).resolve().is_relative_to(payload):
-                    raise RuntimeError("unexpected archive entry: " + member.name)
-            source.extractall(payload)
+        extract_archive(archive, payload)
         binary_dir = payload / "bin"
         binary_dir.mkdir()
         if selection["binaries"]:

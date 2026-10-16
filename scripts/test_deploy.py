@@ -1,8 +1,10 @@
 """Deployment safety regressions; runs without Docker, SSH or production data."""
 import argparse
 import importlib.util
+import io
 from pathlib import Path
 import tempfile
+import tarfile
 import unittest
 from unittest.mock import patch
 
@@ -76,6 +78,21 @@ class Selection(unittest.TestCase):
 
 
 class Configuration(unittest.TestCase):
+    def test_payload_extracts_through_a_symlinked_temporary_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            actual = root / "actual"
+            actual.mkdir()
+            alias = root / "alias"
+            alias.symlink_to(actual, target_is_directory=True)
+            buffer = io.BytesIO()
+            with tarfile.open(fileobj=buffer, mode="w") as archive:
+                entry = tarfile.TarInfo("crates/mcp/gateway.config.json")
+                entry.size = 2
+                archive.addfile(entry, io.BytesIO(b"{}"))
+            deploy.extract_archive(buffer.getvalue(), alias)
+            self.assertEqual((actual / "crates/mcp/gateway.config.json").read_text(), "{}")
+
     def test_credentials_are_taken_from_effective_container_env_without_shell_evaluation(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
