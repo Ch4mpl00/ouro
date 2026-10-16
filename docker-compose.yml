@@ -17,6 +17,19 @@
 # them. On first creation, Docker copies the image's content into the empty
 # volume — that's how the bundled skills/ get into agent-skills.
 
+# glibc malloc tuning for the Rust binaries (mcp-tools, agent-supervisor).
+# With the defaults, mcp grew ~5 MB/h (125 → 201 MB in 15 h, 2026-10-15/16):
+# the news pollers parse 0.5–2 MB article pages, glibc raises its mmap
+# threshold after the first such buffer is freed, and the next ones land in
+# the arenas between small live objects, where freed space never goes back
+# to the OS. A fixed threshold keeps big buffers in mmap (returned on free),
+# two arenas instead of eight stop the spawn_blocking threads from spreading
+# it around, and a low trim threshold returns the heap's freed top.
+x-rust-malloc: &rust-malloc
+  MALLOC_ARENA_MAX: "2"
+  MALLOC_MMAP_THRESHOLD_: "131072"
+  MALLOC_TRIM_THRESHOLD_: "131072"
+
 services:
   postgres:
     image: pgvector/pgvector:pg16
@@ -46,6 +59,7 @@ services:
     env_file:
       - .env.mcp
     environment:
+      <<: *rust-malloc
       MCP_TRANSPORT: http
       MCP_PORT: "3000"
       # rmcp validates the Host header (DNS-rebinding guard); the agent dials
@@ -86,6 +100,7 @@ services:
     env_file:
       - .env.mcp
     environment:
+      <<: *rust-malloc
       MCP_TRANSPORT: http
       MCP_PORT: "3001"
       # Host validation off: tunnel-client forwards requests whose Host header
@@ -193,6 +208,7 @@ services:
     # Rollback: sh -c "pnpm setup:agent && pnpm agent:start"
     env_file: .env.agent
     environment:
+      <<: *rust-malloc
       MCP_TRANSPORT: http
       MCP_URL: http://mcp:3000/mcp
       CODEX_URL: http://codex:3010      # code_agent tool delegates to the codex sandbox
