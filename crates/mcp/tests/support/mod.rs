@@ -273,7 +273,12 @@ async fn serve_overridden(
     let scope = toolsets::parse_toolsets(toolsets)?;
     let router = toolsets::compose_router(&scope.names);
     let port = std::net::TcpListener::bind("127.0.0.1:0")?.local_addr()?.port();
-    let options = HttpOptions { port, allowed_hosts: Vec::new(), multi_session: toolsets.is_some() };
+    let options = HttpOptions {
+        bind_address: "127.0.0.1".parse().unwrap(),
+        port,
+        allowed_hosts: Vec::new(),
+        multi_session: toolsets.is_some(),
+    };
     tokio::spawn(mcp_tools::server::serve_http(
         move || McpTools::new(deps.clone(), router.clone()),
         options,

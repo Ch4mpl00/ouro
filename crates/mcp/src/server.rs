@@ -265,6 +265,7 @@ pub async fn serve_stdio(tools: McpTools, cancel: CancellationToken) -> anyhow::
 }
 
 pub struct HttpOptions {
+    pub bind_address: std::net::IpAddr,
     pub port: u16,
     // Hosts (`host` or `host:port`) accepted in the Host header. rmcp only
     // accepts loopback by default, which would reject the compose service
@@ -296,7 +297,7 @@ where
         config,
     );
     let app = axum::Router::new().nest_service("/mcp", service);
-    let listener = tokio::net::TcpListener::bind(("0.0.0.0", options.port)).await?;
+    let listener = tokio::net::TcpListener::bind((options.bind_address, options.port)).await?;
     tracing::info!(addr = %listener.local_addr()?, multi_session = options.multi_session, "mcp http listening");
     axum::serve(listener, app).with_graceful_shutdown(cancel.cancelled_owned()).await?;
     Ok(())
@@ -305,6 +306,35 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn http_listener_uses_the_configured_address() {
+        #[derive(Clone)]
+        struct Empty;
+        impl ServerHandler for Empty {}
+
+        // IPv6 loopback distinguishes the requested address from the old
+        // IPv4 wildcard binding; an ignored bind_address cannot pass.
+        let port = std::net::TcpListener::bind("[::1]:0").unwrap().local_addr().unwrap().port();
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(serve_http(
+            || Empty,
+            HttpOptions { bind_address: "::1".parse().unwrap(), port, allowed_hosts: Vec::new(), multi_session: true },
+            cancel.clone(),
+        ));
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let mut answered = false;
+        for _ in 0..100 {
+            if client.post(format!("http://[::1]:{port}/mcp")).send().await.is_ok() {
+                answered = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        cancel.cancel();
+        task.await.unwrap().unwrap();
+        assert!(answered, "MCP must listen on the configured IPv6 loopback address");
+    }
 
     #[tokio::test]
     async fn newest_session_evicts_the_previous_one() {

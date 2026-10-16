@@ -29,8 +29,8 @@ them one at a time, loads a matching markdown *skill*, and runs a single LLM
 session whose every side effect — a Telegram reply, a scheduled task, a DB
 write — is an MCP tool call.
 
-Two independent processes in one Cargo workspace, each its own container,
-plus a sandbox and the evaluation tooling:
+Independent processes in one Cargo workspace, with the Rust application
+managed by systemd and the sandbox/database in containers:
 
 | Crate | Role | Knows about |
 | --- | --- | --- |
@@ -153,7 +153,7 @@ signals with `source=<name>`.** No supervisor change.
 ## Skills
 
 Markdown prompts, two-layered: `skills.default/` is git-tracked and shipped in
-the image; `skills/` is a gitignored live overlay (a Docker volume) that the
+the deployment; `skills/` is a gitignored live overlay (`/var/lib/ouro/skills` on prod) that the
 agent's `dreaming` skill rewrites when it self-revises. `read_skill(name)`
 checks the overlay first.
 
@@ -244,13 +244,51 @@ Examples are checked in as `*.example`.
 
 ## Deploy
 
-One image for every container, built on the laptop and shipped to the
-droplet (it can't compile the crates):
-
 ```bash
-scripts/deploy.sh            # every service
-scripts/deploy.sh mcp agent  # only these
+scripts/deploy.sh                    # select services from runtime changes
+scripts/deploy.sh agent              # explicitly rebuild/restart the agent
+scripts/deploy.sh mcp                # both MCP instances, reconnect the agent
+scripts/deploy.sh --runtime-image    # separately update Node/Python/Codex CLI
+python3 scripts/test_deploy.py       # deployment regression checks, no Docker/SSH
 ```
 
-Named volumes (`mcp-data`, `mcp-storage`, `agent-data`, `agent-skills`,
-`pg-data`) persist state across rebuilds.
+The laptop cross-compiles only affected Linux binaries in a cached Docker
+builder and sends changed executables and small runtime assets using rsync.
+Production does not compile Rust. Test/spec/doc-only changes skip the build,
+upload and restart. `DEPLOY_HOST` and `DEPLOY_DIR` override the SSH host and
+server checkout (defaults: `root@165.22.199.65`, `/root/agent-helper`). The
+commit must be clean and pushed; deployment checks out that exact commit.
+
+- **systemd:** `ouro-mcp`, `ouro-mcp-tunnel`, `ouro-agent`, running as `ouro`.
+- **Docker:** Postgres, the Codex sandbox, tunnel-client. `ouro-containers`
+  starts the database/sandbox; `ouro-tunnel-client` waits for restricted MCP
+  before starting the tunnel container and owns its retries.
+- **Executables:** `/opt/ouro/bin`; shipped skills/gateway: `/opt/ouro/app`.
+- **State:** `/var/lib/ouro/agent`, `/var/lib/ouro/skills`, `/var/lib/ouro/storage`.
+- **Native environment:** `/etc/ouro/{agent,mcp,mcp-tunnel}.env` (root-only).
+  These files become authoritative after migration; edit them on the server
+  and restart the affected unit. Local `.env.agent` is not uploaded.
+- **Container environment:** the server checkout's `.env.mcp` (tunnel keys)
+  and `.env`/Compose interpolation (existing Postgres credentials).
+- **Private endpoints:** MCP `127.0.0.1:3000`, restricted MCP `:3001`, Codex
+  `:3010`, Postgres `:5432`. The tunnel container uses host networking to
+  reach the loopback MCP. No application/database port is public.
+
+The first deployment imports effective credentials and copies agent data,
+live skills and attachments from the stopped legacy containers' volumes;
+the old MCP/agent containers are removed before native startup. Postgres and
+Codex keep their existing data volumes. The installed image supplies the
+Codex runtime at bootstrap, without transferring another image.
+
+Binaries are replaced by atomic rename. Only the current installation and
+its revision marker are kept: **no previous release or rollback directory**.
+Concurrent applies are locked and stale deployments are rejected. Endpoint
+probes and the supervisor's MCP/skill validation must pass before recording
+a successful deployment.
+
+```bash
+# On the server
+systemctl status ouro-agent ouro-mcp ouro-mcp-tunnel ouro-tunnel-client
+journalctl -u ouro-agent -f
+systemctl restart ouro-agent
+```

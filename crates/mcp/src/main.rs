@@ -151,6 +151,8 @@ async fn main() -> anyhow::Result<()> {
 
     let transport = env("MCP_TRANSPORT").unwrap_or_else(|| "stdio".into()).to_lowercase();
     let served = if transport == "http" {
+        let bind_address =
+            env("MCP_HOST").unwrap_or_else(|| "0.0.0.0".into()).parse().context("MCP_HOST must be an IP address")?;
         let port = env("MCP_PORT").map_or(Ok(3000), |p| p.parse()).context("MCP_PORT must be a port number")?;
         // "*" turns Host validation off — for a listener only reachable inside
         // the compose network, where the caller's Host header isn't ours to
@@ -161,7 +163,7 @@ async fn main() -> anyhow::Result<()> {
         } else {
             raw_hosts.split(',').map(|h| h.trim().to_owned()).filter(|h| !h.is_empty()).collect()
         };
-        let options = HttpOptions { port, allowed_hosts, multi_session: selection.restricted };
+        let options = HttpOptions { bind_address, port, allowed_hosts, multi_session: selection.restricted };
         mcp_tools::server::serve_http(make_tools, options, cancel.clone()).await
     } else {
         mcp_tools::server::serve_stdio(make_tools(), cancel.clone()).await

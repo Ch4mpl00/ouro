@@ -1,35 +1,7 @@
-# Core services: postgres (news + pgvector), mcp (integrations), agent
-# (supervisor); plus mcp-tunnel + tunnel-client, a second, tool-restricted MCP
-# reachable only by ChatGPT through OpenAI's Secure MCP Tunnel.
-# The agent never touches Telegram/Gmail/Monobank credentials,
-# the Gmail attachments storage, the MCP sqlite, or the postgres URL — it
-# only has its own agent.db, the live skills overlay, and the network link
-# to mcp:3000. Postgres lives behind mcp; the agent talks to it solely
-# through MCP tools (search_news, list_channel_posts, …).
-#
-# Skill files now live on the agent side (the agent's reasoning config,
-# not integration state). Two layers:
-#   - skills.default/ — shipped in the image, read-only fallback
-#   - skills/         — live overlay, persisted in `agent-skills` volume
-#                       and mutated by the `dreaming` signal-handler
-#
-# Named volumes persist across `docker compose down`; only `down -v` wipes
-# them. On first creation, Docker copies the image's content into the empty
-# volume — that's how the bundled skills/ get into agent-skills.
-
-# glibc malloc tuning for the Rust binaries (mcp-tools, agent-supervisor).
-# With the defaults, mcp grew ~5 MB/h (125 → 201 MB in 15 h, 2026-10-15/16):
-# the news pollers parse 0.5–2 MB article pages, glibc raises its mmap
-# threshold after the first such buffer is freed, and the next ones land in
-# the arenas between small live objects, where freed space never goes back
-# to the OS. A fixed threshold keeps big buffers in mmap (returned on free),
-# two arenas instead of eight stop the spawn_blocking threads from spreading
-# it around, and a low trim threshold returns the heap's freed top.
-x-rust-malloc: &rust-malloc
-  MALLOC_ARENA_MAX: "2"
-  MALLOC_MMAP_THRESHOLD_: "131072"
-  MALLOC_TRIM_THRESHOLD_: "131072"
-
+# Native MCP/agent services are managed by deploy/systemd/*.service.
+# This compose project keeps only the database, Codex sandbox and tunnel
+# daemon. Keep its project name/directory stable: the existing data volumes
+# are agent-helper_pg-data and agent-helper_codex-home.
 services:
   postgres:
     image: pgvector/pgvector:pg16
@@ -37,6 +9,8 @@ services:
       POSTGRES_USER: ${POSTGRES_USER:-mcp}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-mcp}
       POSTGRES_DB: ${POSTGRES_DB:-mcp}
+    ports:
+      - "127.0.0.1:5432:5432"
     volumes:
       - pg-data:/var/lib/postgresql/data
     healthcheck:
@@ -46,146 +20,28 @@ services:
       retries: 10
     restart: unless-stopped
 
-  # The MCP server (crates/mcp). All its state lives in Postgres:
-  # the news / memory store in $POSTGRES_DB, and the signal queue, tokens,
-  # scheduled tasks and chat log in a sibling database `mcp_state`, which it
-  # creates and migrates itself on boot — no setup step.
-  mcp:
-    build: .
-    image: mcp-tools-image
-    command: mcp-tools
-    env_file:
-      - .env.mcp
+  codex:
+    # Bootstrapped from the installed image, rebuilt only explicitly with
+    # scripts/deploy.sh --runtime-image when Node/Python/Codex CLI changes.
+    image: ouro-codex-runtime:current
+    command: /ouro-bin/codex-service
     environment:
-      <<: *rust-malloc
-      MCP_TRANSPORT: http
-      MCP_PORT: "3000"
-      # rmcp validates the Host header (DNS-rebinding guard); the agent dials
-      # mcp:3000, probes use loopback.
-      MCP_ALLOWED_HOSTS: mcp,mcp:3000,localhost,127.0.0.1
-      MCP_MEMORY_ACTOR: supervisor
-      DATABASE_URL: postgres://${POSTGRES_USER:-mcp}:${POSTGRES_PASSWORD:-mcp}@postgres:5432/${POSTGRES_DB:-mcp}
+      CODEX_HOME: /codex-home
+      CODEX_SERVICE_PORT: "3010"
+    ports:
+      - "127.0.0.1:3010:3010"
     volumes:
-      - mcp-storage:/app/storage               # Gmail attachments
-    expose:
-      - "3000"
-    depends_on:
-      postgres:
-        condition: service_healthy
+      - codex-home:/codex-home
+      - /opt/ouro/bin:/ouro-bin:ro
     restart: unless-stopped
 
-  # Second MCP instance, restricted surface, for ChatGPT via OpenAI's Secure
-  # MCP Tunnel (.claude/tasks/mcp-auth-and-tool-scoping.md, A2 + A6). Same
-  # image and same code as `mcp`; the only difference is MCP_TOOLSETS, which
-  # makes it register news reading, one Telegram write, the skills export and
-  # unified memory — and nothing else. Gmail, Monobank, fs, the signals queue,
-  # the scheduler, the userbot, dreaming, knowledge and pdf are never
-  # registered, so they do not appear in tools/list at all. A
-  # restricted instance also skips the gateway, so no third-party upstream
-  # tool (tavily__*, …) is reachable through the tunnel.
-  #
-  # MCP_NO_POLLERS=1 is mandatory: Telegram getUpdates is exclusive, and a
-  # second poller against the same bot 409s the `mcp` service.
-  #
-  # send_telegram_message writes every outgoing message into the chat log in
-  # `mcp_state`, the same Postgres database `mcp` uses, so the log the agent
-  # reads includes whatever ChatGPT sent. mcp-storage (Gmail attachments) is
-  # deliberately NOT mounted — nothing in the restricted surface touches it.
-  mcp-tunnel:
-    build: .
-    image: mcp-tools-image
-    command: mcp-tools
-    env_file:
-      - .env.mcp
-    environment:
-      <<: *rust-malloc
-      MCP_TRANSPORT: http
-      MCP_PORT: "3001"
-      # Host validation off: tunnel-client forwards requests whose Host header
-      # isn't ours to predict, and this port is only reachable inside the
-      # compose network (`expose`, never `ports`).
-      MCP_ALLOWED_HOSTS: "*"
-      MCP_NO_POLLERS: "1"
-      MCP_TOOLSETS: news-read,telegram-send,skills,memory
-      # Signs ChatGPT's writes to shared memory, so doc_history says who did
-      # what. Audit metadata, not access control — the space is shared.
-      MCP_MEMORY_ACTOR: chatgpt
-      DATABASE_URL: postgres://${POSTGRES_USER:-mcp}:${POSTGRES_PASSWORD:-mcp}@postgres:5432/${POSTGRES_DB:-mcp}
-    volumes:
-      - agent-skills:/app/skills:ro            # live skills overlay exported to ChatGPT
-    # Memory lives in the shared Postgres above, so ChatGPT reads and writes
-    # the SAME projects and facts as the supervisor — that is the point of the
-    # task. Several clients can hold this instance at once because a restricted
-    # instance is multi-session and has no signals tools to race over.
-    expose:
-      - "3001"
-    # tunnel-client probes its MCP target once at startup and does NOT retry a
-    # refused connection — on 2026-08-23 it came up before this service was
-    # listening and sat there dead until a manual restart. So the daemon waits
-    # for this healthcheck instead of for "container started".
-    # A bare POST with no session is answered 400 by design ("send an
-    # initialize request first"), which is proof the HTTP listener is up.
-    healthcheck:
-      test:
-        - CMD
-        - node
-        - -e
-        - "fetch('http://127.0.0.1:3001/mcp',{method:'POST'}).then(r=>process.exit(r.status<500?0:1)).catch(()=>process.exit(1))"
-      interval: 10s
-      timeout: 5s
-      retries: 12
-      start_period: 30s
-    depends_on:
-      postgres:
-        condition: service_healthy
-      # Ordering only: both instances migrate the shared databases on boot,
-      # serialised by advisory locks either way.
-      mcp:
-        condition: service_started
-    restart: unless-stopped
-
-  # OpenAI's customer-run tunnel daemon. Outbound-only HTTPS long-poll to
-  # api.openai.com; it pulls queued MCP requests and forwards them to
-  # mcp-tunnel over the compose network. No inbound port is published, here or
-  # anywhere — that is the whole point of A6/A3.
-  #
-  # Config is env-only; no profile YAML is needed. The credentials live in
-  # .env.mcp under OUR names (OPENAI_TUNNEL_ID / OPENAI_TUNNEL_API_KEY); the
-  # daemon wants CONTROL_PLANE_TUNNEL_ID / CONTROL_PLANE_API_KEY. The
-  # entrypoint below is the one place that mapping lives — swapping in a
-  # dedicated restricted key later means editing one variable name there.
-  #
-  # Why a shell line and not `environment: CONTROL_PLANE_TUNNEL_ID:
-  # ${OPENAI_TUNNEL_ID}`: compose expands ${...} from the shell and the
-  # project-root .env at parse time, NOT from a service's env_file. Our values
-  # are only in .env.mcp, so that form would silently expand to empty. The
-  # shim runs inside the container, after env_file has been applied.
-  #
-  # The API key goes through --control-plane.api-key=env:NAME (the daemon's
-  # own indirection, verified in v0.0.12 runtimeconfig) rather than through
-  # CONTROL_PLANE_API_KEY. Two reasons: an unset/empty var is a hard startup
-  # error instead of a silent fallback, and the flag path bypasses the
-  # daemon's documented fallback to OPENAI_API_KEY — which .env.mcp also
-  # defines, as the embeddings key. We do not want a misconfiguration to
-  # quietly authenticate the tunnel with the embeddings credential.
-  #
-  # NOTE: env_file gives this third-party binary the whole of .env.mcp
-  # (Telegram/Gmail/Monobank/Tavily secrets included). It never reads them,
-  # but a dedicated .env.tunnel would be the tighter arrangement if the key
-  # is ever split out.
-  #
-  # The key is currently a project key; it SHOULD be a restricted key with
-  # Tunnels Read + Use only. Never the admin key (OPENAI_ADMIN_KEY) — that one
-  # is for tunnel CRUD from a shell, not for a daemon running unattended.
-  #
-  # Image tag is pinned; `latest` on a security-boundary component is not
-  # something to inherit silently on a rebuild.
   tunnel-client:
     image: ghcr.io/openai/tunnel-client:v0.0.12
-    env_file:
-      - .env.mcp
+    env_file: .env.mcp
+    # The restricted native MCP listens on host loopback, not a public port.
+    network_mode: host
     environment:
-      MCP_SERVER_URL: http://mcp-tunnel:3001/mcp
+      MCP_SERVER_URL: http://127.0.0.1:3001/mcp
       LOG_LEVEL: info
       LOG_FORMAT: json
     entrypoint:
@@ -194,102 +50,9 @@ services:
       - |
         export CONTROL_PLANE_TUNNEL_ID="$${OPENAI_TUNNEL_ID:?set OPENAI_TUNNEL_ID in .env.mcp}"
         exec /usr/bin/tunnel-client run --control-plane.api-key=env:OPENAI_TUNNEL_API_KEY
-    depends_on:
-      mcp-tunnel:
-        condition: service_healthy
-    restart: unless-stopped
-
-  agent:
-    build: .
-    image: mcp-tools-image
-    command: agent-supervisor
-    env_file: .env.agent
-    environment:
-      <<: *rust-malloc
-      MCP_TRANSPORT: http
-      MCP_URL: http://mcp:3000/mcp
-      CODEX_URL: http://codex:3010      # code_agent tool delegates to the codex sandbox
-    volumes:
-      # agent.db (memory, the trace mirror); the path is the TS-era layout the
-      # volume has always been mounted at (agent::db::DEFAULT_DB_PATH).
-      - agent-data:/app/packages/agent/data
-      - agent-skills:/app/skills               # live skills overlay (dreaming writes here)
-    depends_on:
-      - mcp
-      - codex
-    restart: unless-stopped
-
-  codex:
-    build: .
-    image: mcp-tools-image
-    command: codex-service
-    environment:
-      CODEX_HOME: /codex-home
-      CODEX_SERVICE_PORT: "3010"
-    volumes:
-      - codex-home:/codex-home              # Codex auth/session cache
-    expose:
-      - "3010"
-    restart: unless-stopped
-
-  # Per-node Codex judge. OFF by default since 2026-08-31 — scoring live prod
-  # runs turned out not to be worth the codex/ChatGPT quota it burns; the plan
-  # is golden sets instead. Behind the `evals` profile, so a plain
-  # `docker compose up -d` skips it. Bring it back with:
-  #   docker compose --profile evals up -d judge-worker
-  # Nothing is destroyed by leaving it off: agent-data keeps the judged corpus
-  # and the local trace mirror keeps recording every run, so whenever it is
-  # switched on again it picks up the backlog.
-  judge-worker:
-    profiles: ["evals"]
-    build: .
-    image: mcp-tools-image
-    command: judge-worker
-    env_file: .env.agent
-    environment:
-      CODEX_URL: http://codex:3010
-      JUDGE_PROVIDER: codex
-    volumes:
-      - agent-data:/app/packages/agent/data
-      - agent-skills:/app/skills
-    depends_on:
-      - codex
-    restart: unless-stopped
-
-  # Closed-loop improver (Phase 3, п3). Shares agent-data (the judged corpus +
-  # improver_state) and agent-skills (writes skills/<skill>.patch.md). Ships only
-  # when IMPROVE_APPLY=true — leave it OFF until `improve` is prod-validated.
-  #
-  # Also behind the `evals` profile (2026-08-31): it eats the same judged corpus
-  # judge-worker fills and runs its own codex gate passes, so with judging off it
-  # would keep spending quota on a corpus that no longer grows.
-  improve-worker:
-    profiles: ["evals"]
-    build: .
-    image: mcp-tools-image
-    command: improve-worker
-    env_file: .env.agent
-    environment:
-      CODEX_URL: http://codex:3010
-      JUDGE_PROVIDER: codex
-      IMPROVE_APPLY: "false"          # shadow mode until prod-validated; flip to true to ship
-      # Cost ceiling for the shared codex/ChatGPT quota (see task п3 cost notes):
-      IMPROVE_MAX_CYCLES_PER_TICK: "1" # ≤1 codex-heavy improve cycle per tick (round-robin)
-      IMPROVE_MAX_ATTEMPTS: "1"        # no informed retry by default (retry doubles gate codex)
-      IMPROVE_GUARD_FAITHFULNESS: "false" # target-axis-only judging: skip the input-heavy faithfulness pass
-    volumes:
-      - agent-data:/app/packages/agent/data
-      - agent-skills:/app/skills
-    depends_on:
-      - codex
-    restart: unless-stopped
+    # systemd owns retries and waits for the native MCP endpoint first.
+    restart: "no"
 
 volumes:
-  # The TS-era sqlite tokens.db. Nothing mounts it any more; it is kept as
-  # the source of `migrate-channel-posts` and `import-sqlite-state`.
-  mcp-data:
-  mcp-storage:
-  agent-data:
-  agent-skills:
   pg-data:
   codex-home:

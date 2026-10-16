@@ -1,0 +1,26 @@
+[Unit]
+Description=Ouro MCP server and pollers
+Wants=network-online.target
+Requires=ouro-containers.service
+After=network-online.target ouro-containers.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=exec
+User=ouro
+Group=ouro
+WorkingDirectory=/opt/ouro/app
+EnvironmentFile=/etc/ouro/mcp.env
+ExecStart=/opt/ouro/bin/mcp-tools
+Restart=always
+RestartSec=3
+TimeoutStopSec=90
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/ouro
+
+[Install]
+WantedBy=multi-user.target

@@ -90,7 +90,7 @@ async fn start(multi_session: bool) -> (String, Arc<Counts>, CancellationToken) 
             let id = factory_counts.created.fetch_add(1, Ordering::SeqCst) + 1;
             Probe(Arc::new(Instance { id, counts: factory_counts.clone() }))
         },
-        HttpOptions { port, allowed_hosts: Vec::new(), multi_session },
+        HttpOptions { bind_address: "127.0.0.1".parse().unwrap(), port, allowed_hosts: Vec::new(), multi_session },
         cancel.clone(),
     ));
     let url = format!("http://127.0.0.1:{port}/mcp");

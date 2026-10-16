@@ -162,7 +162,12 @@ async fn serve_upstream(source: String, tools: Vec<ToolSpec>) -> (String, Cancel
     // gateway's session, which the gateway must survive.
     tokio::spawn(serve_http(
         move || Upstreamed { source: source.clone(), tools: tools.clone() },
-        HttpOptions { port, allowed_hosts: Vec::new(), multi_session: false },
+        HttpOptions {
+            bind_address: "127.0.0.1".parse().unwrap(),
+            port,
+            allowed_hosts: Vec::new(),
+            multi_session: false,
+        },
         cancel.clone(),
     ));
     let url = format!("http://127.0.0.1:{port}/mcp");
