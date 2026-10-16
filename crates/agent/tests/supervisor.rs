@@ -25,6 +25,12 @@ struct ContextMcp {
     notes: Mutex<Vec<String>>,
     queue: Mutex<VecDeque<Value>>,
     closed: AtomicUsize,
+    // wait_for_signal: answers at once with nothing pending, unless `waits`
+    // (blocks until `arrived` fires) or `wait_broken` (a reply of the wrong
+    // shape).
+    waits: std::sync::atomic::AtomicBool,
+    wait_broken: std::sync::atomic::AtomicBool,
+    arrived: tokio::sync::Notify,
 }
 #[async_trait]
 impl Mcp for ContextMcp {
@@ -34,8 +40,28 @@ impl Mcp for ContextMcp {
             .map(|n| ToolDef::new(n, n, json!({"type":"object"})))
             .collect()
     }
-    async fn call_tool(&self, name: &str, args: Map<String, Value>, _: &CancellationToken) -> anyhow::Result<String> {
+    async fn call_tool(
+        &self,
+        name: &str,
+        args: Map<String, Value>,
+        cancel: &CancellationToken,
+    ) -> anyhow::Result<String> {
         self.calls.lock().unwrap().push((name.into(), args));
+        if name == "wait_for_signal" {
+            if self.wait_broken.load(Ordering::SeqCst) {
+                return Ok(json!({"ok":true}).to_string());
+            }
+            if !self.waits.load(Ordering::SeqCst) {
+                // A round trip, however short: the loop yields here.
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                return Ok(json!({"pending":0}).to_string());
+            }
+            // Cancellable, as the real client is.
+            return tokio::select! {
+                _ = self.arrived.notified() => Ok(json!({"pending":1}).to_string()),
+                _ = cancel.cancelled() => Err(agent::errors::aborted()),
+            };
+        }
         Ok(match name {
             "get_timezone" => json!({"timezone":"Europe/Chisinau"}),
             "get_telegram_chat_history" => json!({"messages":self.history.lock().unwrap().clone()}),
@@ -358,4 +384,60 @@ fn queue_contract_requires_nullable_fields_and_integer_counts() {
     ] {
         assert!(serde_json::from_value::<NextSignal>(bad.clone()).is_err(), "{bad}");
     }
+}
+
+// Rust-only: with an empty queue the loop waits on wait_for_signal and takes
+// the signal the moment the wait ends — no poll interval in between (it is
+// an hour here, so a sleep would show).
+#[tokio::test]
+async fn an_empty_queue_is_waited_on_and_a_new_signal_taken_at_once() {
+    let model = Arc::new(Scripted::new(vec![assistant("handled")]));
+    let (f, mcp, _, supervisor) = setup(model.clone(), Stage::Success);
+    mcp.waits.store(true, Ordering::SeqCst);
+    let stop = CancellationToken::new();
+    let (c, sup, s) = (mcp.clone(), supervisor.clone(), stop.clone());
+    let task = tokio::spawn(async move { run_poll_loop(c, sup, s, std::time::Duration::from_secs(3600)).await });
+    let waiting = || mcp.calls.lock().unwrap().iter().filter(|(n, _)| n == "wait_for_signal").count();
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while waiting() == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let asked = mcp.calls.lock().unwrap().iter().find(|(n, _)| n == "wait_for_signal").unwrap().1.clone();
+    assert_eq!(asked["timeoutMs"], json!(25_000), "one wait round is 25 s");
+    mcp.queue.lock().unwrap().push_back(json!({"signal":signal("dreaming",7),"pendingAfter":0}));
+    mcp.arrived.notify_waiters();
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while f.db.get_trace("dreaming:7").unwrap().is_none() {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the signal is handled right after the wait, not an interval later");
+    stop.cancel();
+    mcp.arrived.notify_waiters();
+    tokio::time::timeout(std::time::Duration::from_secs(2), task).await.unwrap().unwrap().unwrap();
+    assert_eq!(model.seen.lock().unwrap().len(), 1);
+    supervisor.shutdown().await;
+}
+
+// Rust-only: a wait that fails (MCP down, a reply of the wrong shape) is an
+// error like any other — the loop backs off instead of spinning on
+// get_next_signal.
+#[tokio::test]
+async fn a_failed_wait_backs_off_instead_of_spinning() {
+    let model = Arc::new(Scripted::new(vec![]));
+    let (_f, mcp, _, supervisor) = setup(model, Stage::Success);
+    mcp.wait_broken.store(true, Ordering::SeqCst);
+    let stop = CancellationToken::new();
+    let (c, sup, s) = (mcp.clone(), supervisor.clone(), stop.clone());
+    let task = tokio::spawn(async move { run_poll_loop(c, sup, s, std::time::Duration::from_secs(3600)).await });
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let polls = mcp.calls.lock().unwrap().iter().filter(|(n, _)| n == "get_next_signal").count();
+    assert_eq!(polls, 1, "one round, then the backoff");
+    stop.cancel();
+    tokio::time::timeout(std::time::Duration::from_secs(2), task).await.unwrap().unwrap().unwrap();
+    supervisor.shutdown().await;
 }

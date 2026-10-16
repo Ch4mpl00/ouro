@@ -12,7 +12,7 @@ Feature: The tools the agent sees
       list_scheduled_tasks list_signals list_userbot_dialogs patch_doc read_doc
       read_file read_pdf recall remember revert_patch schedule_task search_news
       send_telegram_chat_action send_telegram_message set_timezone start_typing
-      telegram_send_status update_fact write_doc
+      telegram_send_status update_fact wait_for_signal write_doc
       """
 
   Scenario: Sending to Telegram without a configured chat explains what is missing

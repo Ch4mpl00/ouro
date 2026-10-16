@@ -255,6 +255,7 @@ mod tests {
         let tunnel = tool_names(TUNNEL);
         for forbidden in [
             "get_next_signal",
+            "wait_for_signal",
             "list_nashdom_mails",
             "list_monobank_transactions",
             "read_file",
@@ -310,6 +311,7 @@ mod tests {
                 "start_typing",
                 "telegram_send_status",
                 "update_fact",
+                "wait_for_signal",
                 "write_doc",
             ]
         );

@@ -136,7 +136,8 @@ flowchart LR
 1. A poller notices something new and records a signal (source, content, envContext) —
    one row in the `signals` queue.
 2. The supervisor (`crates/agent/src/supervisor.rs`) loops on
-   `get_next_signal`.
+   `get_next_signal`; with an empty queue it waits on `wait_for_signal`,
+   which answers the moment a poller records one — no polling delay.
 3. The supervisor creates the session context and trace. A `scheduler`
    signal goes to the workflow runner (`planner` compiles the steps, the
    executor walks them); every other source starts the primary AgentLoop with

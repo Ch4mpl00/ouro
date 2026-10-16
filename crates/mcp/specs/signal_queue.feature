@@ -41,3 +41,25 @@ Feature: The signal queue
       { "count": 1, "signals": [{ "content": "b", "consumed_at": null }] }
       """
     And 2 signals are waiting
+
+  Scenario: Waiting for a signal never takes it
+    Given the signal queue holds:
+      | source   | content |
+      | telegram | hello   |
+    When I call "wait_for_signal" with:
+      """
+      { "timeoutMs": 1000 }
+      """
+    Then the result is:
+      | field   | value |
+      | pending | 1     |
+    And 1 signals are waiting
+
+  Scenario: Waiting on an empty queue ends with nothing pending
+    When I call "wait_for_signal" with:
+      """
+      { "timeoutMs": 100 }
+      """
+    Then the result is:
+      | field   | value |
+      | pending | 0     |

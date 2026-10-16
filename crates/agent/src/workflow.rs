@@ -765,7 +765,7 @@ pub struct WorkflowRunner {
     pub max_passes: usize,
 }
 pub fn create_workflow_runner(engine: Arc<Engine>, known_skills: Vec<String>) -> anyhow::Result<Arc<WorkflowRunner>> {
-    let mut tools = engine.deps.mcp.tools();
+    let mut tools = crate::mcp::model_tools(&*engine.deps.mcp);
     tools.extend(synthetic_definitions().iter().filter(|t| t.name == "set_memory").cloned());
     let schema = WorkflowSchema::new(tools.iter().map(|t| t.name.clone()).collect(), known_skills)?;
     Ok(Arc::new(WorkflowRunner { engine, schema, tools, max_attempts: 3, max_passes: 3 }))

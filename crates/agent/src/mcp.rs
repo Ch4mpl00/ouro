@@ -140,6 +140,15 @@ pub type Client = RunningService<RoleClient, ClientConfig>;
 // Opens one session: a fresh transport per attempt.
 pub type Open = Arc<dyn Fn() -> BoxFuture<'static, anyhow::Result<Client>> + Send + Sync>;
 
+// MCP tools only the supervisor calls, never offered to a model: an agent
+// loop or a workflow plan blocking on the signal queue would stall its run.
+pub const SUPERVISOR_ONLY_TOOLS: &[&str] = &["wait_for_signal"];
+
+// The tools a model may see and call.
+pub fn model_tools(mcp: &dyn Mcp) -> Vec<ToolDef> {
+    mcp.tools().into_iter().filter(|t| !SUPERVISOR_ONLY_TOOLS.contains(&t.name.as_str())).collect()
+}
+
 // The SDK's default per-request deadline the TS agent ran with.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
