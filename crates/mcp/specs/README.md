@@ -3,17 +3,16 @@
 These `.feature` files are what the MCP server must do, in plain English.
 They are not documentation next to the tests — they *are* the tests: each
 sentence is executed against the real server (over MCP, with a real Postgres
-started by Testcontainers) by cucumber-js, with the steps in `steps/steps.ts`
-and the environment in `support/environment.ts`.
+started by Testcontainers) by cucumber-rs, with the steps and the environment
+in `tests/specs.rs`.
 
 ```bash
-pnpm spec                                  # needs Docker
-TEST_DATABASE_URL=postgres://… pnpm spec   # a throwaway server instead
+cargo test -p mcp-tools --test specs                                  # needs Docker
+TEST_DATABASE_URL=postgres://… cargo test -p mcp-tools --test specs   # a throwaway server instead
 ```
 
-The same files specify the Rust port (`crates/mcp/specs` on
-`feat/rust-rewrite`); they are kept byte-identical, so a scenario means the
-same thing to both servers.
+They were written for the TypeScript server and moved here unchanged when it
+was retired; the Rust server has answered to the same text since the port.
 
 ## Reading them
 
@@ -33,7 +32,7 @@ Results are checked with two forms:
 
 Reuse the sentences that already exist (search this folder); `I call "<tool>"
 with:` reaches any tool. A new kind of sentence needs a step in
-`steps/steps.ts` — a sentence nobody taught the harness fails the run rather
+`tests/specs.rs` — a sentence nobody taught the harness fails the run rather
 than being skipped (cucumber's strict mode), so a spec can never pass on words
 that check nothing.
 

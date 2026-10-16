@@ -1,8 +1,8 @@
 {
   "mcpServers": {
     "mcp-tools": {
-      "command": "pnpm",
-      "args": ["mcp:serve"]
+      "command": "cargo",
+      "args": ["run", "--quiet", "--release", "-p", "mcp-tools", "--bin", "mcp-tools"]
     }
   }
 }

@@ -1,21 +1,19 @@
 # syntax=docker/dockerfile:1
-# Single image for every service (mcp + agent + workers). docker-compose picks
-# the command per service. Two build stages: the Rust MCP and agent binaries, and the
-# node_modules (better-sqlite3 needs a native compile at install time). The
-# runtime stage copies only their outputs + source. The TS MCP server
-# (packages/mcp) stays in the image while the Rust one proves itself: rolling
-# back is a compose `command:` change, no rebuild. The TS agent is retained
-# for the same rollback path; judge/improve/GAIA tooling continues to use TS.
+# Single image for every service (mcp + agent + codex + workers).
+# docker-compose picks the command per service. Two stages: the Rust
+# binaries (crates/mcp, crates/agent, crates/codex, crates/evals), and a
+# runtime that carries them plus the Codex CLI, which is an npm package — the
+# only reason the runtime is a node image.
 #
 # Built on a laptop and shipped to the droplet (scripts/deploy.sh): the
-# droplet is 1 vCPU / 2 GB and cannot compile the crate. The image targets
+# droplet is 1 vCPU / 2 GB and cannot compile the crates. The image targets
 # linux/amd64 while the laptop is arm64, so:
 #   - the Rust stage runs on the BUILD platform and cross-compiles — native
 #     speed instead of compiling under QEMU emulation;
 #   - cargo's registry and target dir live in BuildKit cache mounts, so a
 #     rebuild only recompiles what changed.
 
-# MCP server / CLIs and the agent supervisor (crates/mcp + crates/agent). Bookworm matches the runtime's glibc.
+# Every binary of the workspace. Bookworm matches the runtime's glibc.
 FROM --platform=$BUILDPLATFORM rust:1.90-bookworm AS mcp-build
 ARG TARGETARCH
 # Debian's triplet-prefixed gcc exists natively for the build arch; the other
@@ -37,7 +35,7 @@ RUN set -eu; \
       echo "export CARGO_TARGET_${upper}_LINKER=${gnu}-gcc"; \
       echo "export CC_${lower}=${gnu}-gcc CXX_${lower}=${gnu}-g++ AR_${lower}=${gnu}-ar"; \
     } > /cross-env
-# Thirteen binaries link at once otherwise, and each release link of this
+# Two dozen binaries link at once otherwise, and each release link of this
 # crate takes ~0.5 GB: an 8 GB Docker VM ran out (`ld … Killed`). ARGs reach
 # the RUN below as env, which cargo reads.
 ARG CARGO_BUILD_JOBS=4
@@ -52,20 +50,6 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     mkdir -p /out; \
     find "target/$TRIPLE/release" -maxdepth 1 -type f -perm -u+x -exec cp {} /out/ \;
 
-FROM node:22-bookworm-slim AS deps
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3 build-essential ca-certificates \
- && rm -rf /var/lib/apt/lists/*
-RUN npm install -g pnpm@10
-WORKDIR /app
-
-# Cache deps separately from source — manifests first.
-COPY pnpm-workspace.yaml pnpm-lock.yaml package.json ./
-COPY packages/mcp/package.json ./packages/mcp/
-COPY packages/agent/package.json ./packages/agent/
-COPY packages/codex/package.json ./packages/codex/
-RUN pnpm install --frozen-lockfile
-
 FROM node:22-bookworm-slim AS runtime
 # ca-certificates for TLS; python3 + pandas/openpyxl give the codex `code_agent`
 # sandbox a spreadsheet/data toolchain (xlsx/csv parsing, aggregation) — Codex
@@ -74,20 +58,15 @@ FROM node:22-bookworm-slim AS runtime
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates python3 python3-pandas python3-openpyxl \
  && rm -rf /var/lib/apt/lists/*
-RUN npm install -g pnpm@10
 # Codex CLI runtime for the generic codex service. Auth is persisted by mounting
 # CODEX_HOME in docker-compose.
 RUN npm install -g @openai/codex
 WORKDIR /app
 
-COPY --from=deps /app/node_modules ./node_modules
-COPY --from=deps /app/packages/mcp/node_modules ./packages/mcp/node_modules
-COPY --from=deps /app/packages/agent/node_modules ./packages/agent/node_modules
-
-# mcp-tools, agent-supervisor, mcp-setup, gmail-auth, userbot-auth, embed-backfill, …
+# mcp-tools, agent-supervisor, codex-service, judge-worker, gmail-auth, …
 COPY --from=mcp-build /out/ /usr/local/bin/
 
-# Source. .dockerignore strips data/, storage/, .env*, node_modules, and
+# Source. .dockerignore strips data/, storage/, .env*, target/, and
 # skills/ (local-dev live overlay). The shipped skills baseline lives in
 # skills.default/ which IS copied — the agent reads it as a fallback when
 # the live overlay (mounted volume) has no entry for a given skill.

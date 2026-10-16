@@ -10,7 +10,7 @@
 
 <p align="center">
   <a href="#what-it-is"><img src="https://img.shields.io/badge/status-work%20in%20progress-orange" alt="Status" /></a>
-  <a href="#stack"><img src="https://img.shields.io/badge/TypeScript-ESM-3178c6" alt="TypeScript" /></a>
+  <a href="#stack"><img src="https://img.shields.io/badge/Rust-2024-b7410e" alt="Rust" /></a>
   <a href="https://modelcontextprotocol.io"><img src="https://img.shields.io/badge/protocol-MCP-blueviolet" alt="MCP" /></a>
   <a href="#stack"><img src="https://img.shields.io/badge/LLM-DeepSeek-4b6bfb" alt="LLM" /></a>
   <a href="#stack"><img src="https://img.shields.io/badge/RAG-pgvector-336791" alt="pgvector" /></a>
@@ -29,23 +29,22 @@ them one at a time, loads a matching markdown *skill*, and runs a single LLM
 session whose every side effect — a Telegram reply, a scheduled task, a DB
 write — is an MCP tool call.
 
-Two independent processes in one pnpm workspace, deployed as two containers:
+Two independent processes in one Cargo workspace, each its own container,
+plus a sandbox and the evaluation tooling:
 
-| Package | Role | Knows about |
+| Crate | Role | Knows about |
 | --- | --- | --- |
-| **`packages/mcp`** | Stateless MCP server. Wraps Gmail / Telegram / Monobank / news as primitive tools; runs the pollers that turn external events into signals. | Nothing about the agent. |
-| **`packages/agent`** | Agent supervisor. Pulls one signal and runs a primary AgentLoop with shared working memory and focused sub-agents. | Nothing about MCP internals — only the tools the protocol exposes. |
+| **`crates/mcp`** (`mcp-tools`) | Stateless MCP server. Wraps Gmail / Telegram / Monobank / news as primitive tools; runs the pollers that turn external events into signals. | Nothing about the agent. |
+| **`crates/agent`** (`agent-supervisor`) | Agent supervisor. Pulls one signal and runs a primary AgentLoop with shared working memory and focused sub-agents. | Nothing about MCP internals — only the tools the protocol exposes. |
+| **`crates/codex`** (`codex-service`) | The sandbox `code_agent` and the codex judge run `codex exec` in. | Nothing else. |
+| **`crates/evals`** | Per-node judge, judge-noise calibration, the improver gate and closed-loop improver, trace replay, golden-set evals. | The agent's trace mirror and Langfuse. |
 
-Neither imports code from the other. The boundary *is* the protocol.
+Neither the server nor the agent imports code from the other. The boundary
+*is* the protocol.
 
-
-Compose selects the Rust runtime ports in `crates/mcp` (`mcp-tools`) and
-`crates/agent` (`agent-supervisor`). The TypeScript implementations remain for
-rollback; the judge, improver, GAIA harness and CLI scripts continue to use TS.
-Both agent runtimes share `agent.db`, skills and compatible Langfuse traces.
-To roll back the agent, change its compose command to
-`sh -c "pnpm setup:agent && pnpm agent:start"`.
-The Rust agent switch is prepared locally; production rollout is still pending.
+The system was TypeScript until October 2026; both processes were ported to
+Rust (the droplet has 2 GB) with their tests one to one, and the TS packages
+were then removed. Databases, migrations and trace shapes are unchanged.
 
 ## AgentLoop and working memory
 
@@ -93,7 +92,7 @@ is recorded in the same trace. Langfuse export uses the configured
 `LANGFUSE_*` credentials; without them the local recorder still runs.
 
 Routing is deterministic and by source, not by content. `scheduler` signals
-are compiled into a workflow (`workflow/`: compile → execute) as before —
+are compiled into a workflow (`workflow.rs`: compile → execute) as before —
 a cron body is known in advance, so a plan is cheaper and more predictable
 than an agentic loop. Every other source runs the primary AgentLoop. A
 scheduler signal whose plan fails to compile degrades to the AgentLoop in the
@@ -102,7 +101,7 @@ retried, because earlier steps may already have delivered. The AgentLoop does
 not expose a workflow tool.
 
 For incoming `telegram` signals the supervisor loads recent history of the
-same chat/topic before the first LLM turn (`supervisor/telegram-context.ts`):
+same chat/topic before the first LLM turn (`crates/agent/src/supervisor.rs`):
 a bounded inline excerpt plus the full fetched history under the
 `telegram.history` memory key for `input_refs`. No other source preloads it,
 and a failed fetch never blocks the reply.
@@ -111,7 +110,7 @@ and a failed fetch never blocks the reply.
 
 ```mermaid
 flowchart LR
-    subgraph mcp [packages/mcp]
+    subgraph mcp [crates/mcp]
         P1[Gmail poller<br/>1 min] --> Q
         P2[Telegram bot<br/>long-poll] --> Q
         P3[Userbot channels<br/>30 min] --> Q
@@ -120,7 +119,7 @@ flowchart LR
         T[MCP tools<br/>gmail / telegram / news / …]
     end
 
-    subgraph agent [packages/agent]
+    subgraph agent [crates/agent]
         S[Supervisor loop] -->|get_next_signal| Q
         S -->|source = scheduler| W[Workflow<br/>compile → execute]
         S -->|other sources| L[Primary AgentLoop]
@@ -134,11 +133,11 @@ flowchart LR
     end
 ```
 
-1. A poller notices something new and calls `recordSignal({ source, content, envContext })` —
+1. A poller notices something new and records a signal (source, content, envContext) —
    one row in the `signals` queue.
-2. The supervisor (`packages/agent/src/supervisor/main.ts`) loops on
+2. The supervisor (`crates/agent/src/supervisor.rs`) loops on
    `get_next_signal`.
-3. `supervisor/module.ts` creates the session context and trace. A `scheduler`
+3. The supervisor creates the session context and trace. A `scheduler`
    signal goes to the workflow runner (`planner` compiles the steps, the
    executor walks them); every other source starts the primary AgentLoop with
    `orchestrator` and `routing` instructions. Telegram signals also load their
@@ -154,7 +153,7 @@ signals with `source=<name>`.** No supervisor change.
 
 Markdown prompts, two-layered: `skills.default/` is git-tracked and shipped in
 the image; `skills/` is a gitignored live overlay (a Docker volume) that the
-agent's `dreaming` skill rewrites when it self-revises. `readSkill(name)`
+agent's `dreaming` skill rewrites when it self-revises. `read_skill(name)`
 checks the overlay first.
 
 Skills are named after signal sources — one per domain (bills, news digests,
@@ -165,7 +164,7 @@ loaded on the primary), `orchestrator`, `worker`, `recovery`, `planner`
 
 ## MCP tools
 
-Defined in `packages/mcp/src/tools/`. The agent calls them over StreamableHTTP;
+Defined next to their domain in `crates/mcp/src/<domain>.rs`. The agent calls them over StreamableHTTP;
 locally they're also registered with Claude Code via `.mcp.json`. Grouped by
 integration:
 
@@ -182,88 +181,74 @@ patch/revert) · **Signals queue** · **Scheduler** (cron tasks) · **Env**
 
 ```
 mcp-tools/
-├── docker-compose.yml      three services: postgres + mcp + agent
+├── docker-compose.yml      postgres, mcp (+ tunnel), agent, codex, eval workers
 ├── skills.default/         shipped skills (git-tracked fallback)
 ├── skills/                 live overlay (gitignored; dreaming writes here)
-└── packages/
-    ├── mcp/src/
-    │   ├── server.ts                pollers + HTTP/stdio transport
-    │   ├── tools/                   MCP-exposed actions
-    │   └── services/                gmail, telegram, monobank, scheduler,
-    │                                news, pdf, signals, settings, embeddings
-    └── agent/src/
-        ├── supervisor/              poll loop + failure handling
-        ├── workflow/                DSL compiler/executor (scheduler path)
-        ├── engine.ts, session.ts    DeepSeek runner + synthetic tools
-        ├── mcp-client.ts            StreamableHTTP client
-        ├── skills.ts                two-layer skill loader
-        └── tracing/                 Langfuse adapter
+└── crates/
+    ├── mcp/                one domain per file: gmail.rs, telegram.rs, news.rs,
+    │                       memory.rs, scheduler.rs, …; main.rs is the composition
+    │                       root, src/bin the one-shot CLIs, specs/ the executable
+    │                       specification
+    ├── agent/              supervisor.rs (poll loop), workflow.rs (scheduler path),
+    │                       agent.rs (engine + AgentLoop), mcp.rs (client),
+    │                       skills.rs, tracing/langfuse
+    ├── codex/              codex-service
+    └── evals/              judge, improver, replay, golden-set evals
 ```
 
 Domain code follows a strict **modules + dependency-injection** discipline:
-factory functions (`createXxxModule(deps)`), no singletons, composition root
-in `server.ts main()`. See `services/news/module.ts` for the canonical shape,
-and `CLAUDE.md` for the full rules.
-
-Use **Effect 4** for asynchronous orchestration: parallel tasks with explicit
-concurrency limits, cancellation, timeouts, retries/backoff and resource
-cleanup. Keep child tasks within their parent's lifetime, propagate
-`AbortSignal` to SDK/HTTP calls and await cleanup before closing traces or
-clients. Convert to Promises at public API boundaries. Reuse
-`packages/agent/src/generation.ts` for LLM generation/tracing and
-`providers/retry.ts` for transient failures; automatic retries belong in one
-layer and must not replay tool side effects. See `agent-loop.ts` and
-`workflow/execute.ts` for the parallel execution patterns.
+every long-lived handle is built in a composition root (`main.rs`) and passed
+down, seams are traits, no global singletons. See `CLAUDE.md` for the full
+rules. Async orchestration is tokio with explicit concurrency limits and a
+cancellation token threaded into every HTTP call; automatic retries live in
+one layer (`providers.rs`) and never replay a tool side effect.
 
 ## Stack
 
-TypeScript (ESM) · [`@modelcontextprotocol/sdk`](https://github.com/modelcontextprotocol/typescript-sdk) ·
-Effect 4 (`effect@4.0.0-rc.113`, pinned) ·
-`better-sqlite3` · Drizzle + pgvector · `googleapis` (Gmail) ·
-gramjs (MTProto userbot) · `cron-parser` · `openai` SDK pointed at DeepSeek ·
-Langfuse tracing · Vitest.
+Rust 2024 · tokio · [`rmcp`](https://github.com/modelcontextprotocol/rust-sdk)
+(MCP, stdio + Streamable HTTP) · axum · tokio-postgres + pgvector · rusqlite ·
+reqwest (Gmail REST, Telegram Bot API, OpenAI-compatible model APIs) ·
+grammers (MTProto userbot) · croner · Langfuse (OTLP) · proptest · cucumber.
 
 ## Getting started
 
 ```bash
-pnpm install
-pnpm db:init          # apply both sqlite schemas (idempotent)
+# one-time credentials (each is a binary: cargo run -p mcp-tools --bin <name>)
+gmail-auth            # Gmail OAuth → mcp_state
+userbot-auth          # MTProto login (phone + code)
+telegram-get-chat-id
 
-# one-time credentials
-pnpm gmail:auth       # Gmail OAuth → mcp_state
-pnpm userbot:auth     # MTProto login (phone + code)
-pnpm telegram:get-chat-id
-
-# run (two terminals)
-pnpm mcp:serve        # MCP server + pollers
-pnpm agent:start      # supervisor loop
+# run (two terminals); databases are created and migrated on boot
+cargo run --release -p mcp-tools --bin mcp-tools          # MCP server + pollers
+cargo run --release -p agent --bin agent-supervisor       # supervisor loop
 ```
 
-> ⚠️ Don't run `mcp:serve` locally while the production instance is up —
+> ⚠️ Don't run the MCP server locally while the production instance is up —
 > Telegram `getUpdates` is exclusive; a second poller causes 409 Conflict
 > and silently eats updates.
 
 Env files: `.env.mcp` (integration creds + `OPENAI_API_KEY` for embeddings),
-`.env.agent` (DeepSeek key + model), `.env.postgres` (PG credentials).
+`.env.agent` (model keys + presets), `.env.postgres` (PG credentials).
 Examples are checked in as `*.example`.
 
-### Useful scripts
+### Useful commands
 
-| Command                                            | What it does                                             |
-| -------------------------------------------------- | -------------------------------------------------------- |
-| `pnpm typecheck`                                   | Typecheck both packages                                  |
-| `pnpm test`                                        | Vitest suite                                             |
-| `pnpm trace` / `pnpm judge`                        | Inspect Langfuse traces / run the LLM-as-judge over them |
-| `pnpm eval:snapshot` · `eval:rag` · `eval:inspect` | RAG evaluation harness                                   |
-| `pnpm embed:backfill`                              | Re-embed `news_items` rows left without embeddings       |
-| `pnpm db:generate:pg`                              | Regenerate Drizzle migrations after schema edits         |
+| Command                                                | What it does                                             |
+| ------------------------------------------------------ | -------------------------------------------------------- |
+| `cargo test`                                           | Every crate's tests (Postgres via a testcontainer)       |
+| `cargo test -p mcp-tools --test specs`                 | The executable specification (`crates/mcp/specs`)        |
+| `langfuse-trace` / `judge`                             | Inspect Langfuse traces / run the per-node judge         |
+| `eval-snapshot` · `eval-rag` · `eval-inspect`          | RAG evaluation harness                                   |
+| `embed-backfill`                                       | Re-embed `news_items` rows left without embeddings       |
 
 ## Deploy
 
-One image, three containers:
+One image for every container, built on the laptop and shipped to the
+droplet (it can't compile the crates):
 
 ```bash
-docker compose up -d --build
+scripts/deploy.sh            # every service
+scripts/deploy.sh mcp agent  # only these
 ```
 
 Named volumes (`mcp-data`, `mcp-storage`, `agent-data`, `agent-skills`,

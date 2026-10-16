@@ -1,8 +1,8 @@
 # The agent in Rust — crates/agent
 
-**Status:** in-progress — Rust agent on prod since 2026-10-15 (from PR #28's branch); TS kept as rollback
+**Status:** done — Rust agent on prod since 2026-10-15; the TS code, tooling included, deleted 2026-10-16 (see the last section)
 **Priority:** P2
-**Area:** packages/agent → crates/agent (runtime only)
+**Area:** packages/agent → crates/agent (runtime), crates/evals (tooling); packages/codex → crates/codex
 **Created:** 2026-10-14
 
 ## Context
@@ -325,3 +325,42 @@ Observed:
 
 Still to see on prod: a Telegram message (the agent-loop path, history
 preload, recovery).
+
+## TypeScript retired — 2026-10-16
+
+The user asked to drop every TS file that has a Rust twin, then to port the
+tooling too ("перепиши тулинг на раст и всё TS удаляй") and to drop the GAIA
+benchmark outright ("gaia удаляй просто"). Branch `feat/rust-only`, stacked on
+`feat/rust-agent` (PR #28).
+
+What moved where:
+
+| TS | Rust |
+|---|---|
+| `packages/agent/src/judging/*` (schema, backend, node-judge, materials, noise, gate, gate-runtime, improver, improve-cycle, improve-worker, monitor, langfuse-scores, trace-source, print, worker, sigma-baseline) | `crates/evals/src/*` — prompts byte-identical (checked against the deleted files) |
+| `scripts/{judge,judge-worker,judge-noise,judge-gate,improve,improve-worker,judge-replay,langfuse-trace,news-filter-eval}.ts` | `crates/evals/src/bin/*` with the same names, flags and output |
+| `db/improver-store.ts` | `crates/evals/src/improver_store.rs` (same `improver_state` rows) |
+| `skills.ts` `readSkillRaw` / `savePatch` / `deletePatch` | `FsSkillStore` inherent methods in `crates/agent/src/skills.rs` |
+| `judging/noise-baseline.json` | `crates/evals/noise-baseline.json` |
+| `packages/codex` (runner + HTTP front) | `crates/codex` (`codex-service`) |
+| `test/skills-contract.test.ts`, `test/shipped-skills.test.ts` | `crates/mcp/tests/skills_contract.rs`, `shipped_skills.rs` (mcp dev-depends on agent) |
+| `crates/agent/tests/mcp_typescript.rs` (against the TS test server) | `crates/mcp/tests/agent_mcp_client.rs` — the same three tests against `serve_http`, the server a self-exec of the test binary; no longer `#[ignore]` |
+| `packages/mcp/specs/*.feature` | `crates/mcp/specs/` (moved unchanged) |
+| `eval/benchmarks/gaia/*` | deleted, not ported |
+
+Tests: one Rust test per TS case — judging 57 (gate 12, improver 12,
+materials 13, monitor 10, node-judge 2, noise 8), codex runner 5 (the
+property with 25 cases, failure, the deadline killing the process group, HTTP
+health/404, well-formed vs nine refused bodies), the skills contract property
+(150 cases) and the shipped-skills boot check. The migration byte-for-byte
+tests against the TS copies became hash pins (an applied migration never
+changes); new migrations are written by hand now — there is no drizzle-kit.
+
+Compose: `codex` runs `codex-service`, `judge-worker` / `improve-worker` run
+their binaries (opening agent.db migrates, so no setup step). The image has no
+node_modules any more; it stays a node image only for the npm-packaged Codex
+CLI (and the tunnel healthcheck's `node -e fetch`).
+
+Rollback to TS is no longer a compose edit: it is the image
+`mcp-tools-image:ts-backup-ad4ffbe` on the droplet, or a checkout before this
+branch.

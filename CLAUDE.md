@@ -1,56 +1,53 @@
 # mcp-tools
 
-A personal-agent system structured as two independent processes in one pnpm workspace:
+A personal-agent system structured as independent processes in one Cargo
+workspace:
 
-- **`packages/mcp`** — stateless MCP server. Wraps Gmail / Telegram / Monobank
-  as primitive tools and runs the pollers that turn external events into
-  signals on a queue. Knows nothing about the agent.
-- **`packages/agent`** — agent supervisor. Pulls one signal at a time from
-  MCP, loads the matching skill, runs one DeepSeek session, and stops.
-  Knows nothing about MCP internals — only the actions exposed by the
+- **`crates/mcp`** (`mcp-tools`) — stateless MCP server. Wraps Gmail /
+  Telegram / Monobank as primitive tools and runs the pollers that turn
+  external events into signals on a queue. Knows nothing about the agent.
+- **`crates/agent`** (`agent-supervisor`) — agent supervisor. Pulls one
+  signal at a time from MCP, loads the matching skill, runs one session, and
+  stops. Knows nothing about MCP internals — only the actions exposed by the
   MCP protocol.
+- **`crates/codex`** (`codex-service`) — the sandbox the agent's `code_agent`
+  tool and the codex judge run `codex exec` in, behind a small HTTP front.
+- **`crates/evals`** — the evaluation tooling around the agent: the per-node
+  judge (CLI + `judge-worker`), judge-noise calibration, the improver gate and
+  the closed-loop improver (`improve-worker`), trace replay, the news-filter
+  golden-set eval. Reads the agent's trace mirror and Langfuse; never in the
+  signal path.
 
-Both communicate strictly through the MCP protocol. Neither imports code from
-the other. Deployed as two containers (`docker-compose.yml`).
+The server and the agent communicate strictly through the MCP protocol;
+neither depends on the other's crate (only tests do: `crates/mcp/tests` drive
+the agent's client and skill loader against the real server). Deployed as
+containers of one image (`docker-compose.yml`).
 
-**The MCP server exists twice.** `crates/mcp` is a Rust port of
-`packages/mcp` (the droplet is 2 GB; the Rust server is about half the
-memory). Compose runs the Rust one (`command: mcp-tools`); the TS one stays
-in the image as the rollback (`command: pnpm mcp:serve`). They share the
-databases, the migrations (`crates/mcp/migrations` must stay byte-identical
-to `packages/mcp/src/db/pg/migrations`, a test checks), the `.feature`
-specs and the property tests, ported one to one (`crates/mcp/tests/*.rs`
-mirror `packages/mcp/test/*.test.ts`). **A fix in one server goes into the
-other**, with its test, until the TS server is retired. Status and history:
-`.claude/tasks/rust-rewrite.md`.
-
-
-**The agent runtime also exists twice.** `crates/agent` contains the Rust
-runtime; compose selects `agent-supervisor`. The TypeScript runtime in
-`packages/agent` remains available with
-`command: sh -c "pnpm setup:agent && pnpm agent:start"`. Both use the same
-`agent.db` migrations and trace shapes. Offline judging, improvement, GAIA and
-CLI scripts stay in TypeScript. The runtime tests are ported one to one
-(`crates/agent/tests/*.rs` mirror the runtime tests of `packages/agent`, one
-Rust test per TS case, the fast-check properties as proptest). Fix shared
-runtime contracts in both ports, with their tests; run `cargo test -p agent`
-and `pnpm typecheck`. The Rust binary handles SQLite migrations itself. Port
-status and rollout evidence: `.claude/tasks/rust-agent.md`.
+**Everything was TypeScript until 2026-10.** The MCP server went to Rust on
+2026-10-14, the agent on 2026-10-15, and the TS packages (`packages/mcp`,
+`packages/agent`, `packages/codex`, the tooling) were deleted afterwards.
+Their tests were ported one to one before that; a test or comment that says
+"a port of …test.ts" names where it came from. The databases, migrations,
+trace shapes and Langfuse attributes are still the ones the TS code wrote, so
+nothing on the volumes was converted. History: `.claude/tasks/rust-rewrite.md`,
+`.claude/tasks/rust-agent.md`. Rolling back to TS means an old image
+(`mcp-tools-image:ts-backup-ad4ffbe` on the droplet) or a commit before the
+deletion.
 
 ## How a signal turns into action
 
-1. A poller inside `packages/mcp` fires on its own cadence — Gmail (1 min),
+1. A poller inside `crates/mcp` fires on its own cadence — Gmail (1 min),
    Telegram bot getUpdates (long-poll), userbot channels (30 min),
    scheduler (30s, fires cron rows from `scheduled_tasks`).
-2. When it sees something new, it calls `signals.record({ source, content })`,
+2. When it sees something new, it records a signal (`Signals::record`),
    which inserts a row into the `signals` queue in the `mcp_state` Postgres
    database.
-3. The supervisor (`packages/agent/src/supervisor/main.ts`) loops on
-   `get_next_signal`. Routing is by source, decided in `supervisor/module.ts`:
-   `scheduler` runs through the `workflow/` module (compile → execute), every
-   other source runs the primary AgentLoop. A compile failure degrades to the
-   AgentLoop in the same trace; an execute failure goes to `recovery` instead
-   of being retried. The AgentLoop path loads:
+3. The supervisor (`crates/agent/src/supervisor.rs`, composed in `main.rs`)
+   loops on `get_next_signal`. Routing is by source: `scheduler` runs through
+   the workflow module (`workflow.rs`: compile → execute), every other source
+   runs the primary agent loop (`agent.rs`). A compile failure degrades to the
+   agent loop in the same trace; an execute failure goes to `recovery` instead
+   of being retried. The agent-loop path loads:
    - `skills/orchestrator.md` + `skills/routing.md` — always; how to use
      working memory and when to delegate to a domain skill.
    - `skills/<signal.source>.md` (with `skills.default/` fallback) — only for
@@ -59,7 +56,8 @@ status and rollout evidence: `.claude/tasks/rust-agent.md`.
 4. Plus a session-context block (local time, tz, watermarks) and the signal's
    `envContext` (per-source env addendum, e.g. default Telegram chat id).
    For `telegram` signals the supervisor also preloads recent chat/topic
-   history (`supervisor/telegram-context.ts`) before the first LLM turn.
+   history (`supervisor.rs`) and the latest activity-journal notes before the
+   first LLM turn.
 5. The signal's `content` is pushed as the first user message. The loop runs;
    every side effect (Telegram reply, DB write) is a tool call.
 
@@ -70,85 +68,91 @@ To add a new domain: drop a `skills.default/<name>.md` + emit signals with
 
 ```
 mcp-tools/
-├── pnpm-workspace.yaml
-├── package.json            workspace orchestration scripts only
-├── tsconfig.json           shared TS config (covers both packages)
-├── .mcp.json               registers packages/mcp with Claude Code (stdio)
+├── Cargo.toml              the workspace
+├── .mcp.json               registers mcp-tools with Claude Code (stdio, cargo run)
 ├── .env.mcp                MCP container env (integration creds)
-├── .env.agent              agent container env (DeepSeek key, model)
+├── .env.agent              agent container env (model keys, presets)
 ├── .env.example, .env.mcp.example, .env.agent.example
-├── docker-compose.yml      mcp + agent, plus mcp-tunnel + tunnel-client
-├── Dockerfile              one image for both
+├── docker-compose.yml      postgres, mcp, mcp-tunnel + tunnel-client, agent, codex,
+│                           judge-worker + improve-worker (profile `evals`)
+├── Dockerfile              one image for every service
+├── scripts/deploy.sh       build here, ship over SSH, restart
 ├── skills.default/         shipped skills (git-tracked, read-only fallback)
 ├── skills/                 live overlay, gitignored; dreaming writes here
 ├── storage/                downloaded Gmail attachments (gitignored)
-└── packages/
-    ├── mcp/
-    │   └── src/
-    │       ├── server.ts                    composition root: deps, pollers, HTTP/stdio transport
-    │       ├── mcp-server.ts                createServer(deps): one MCP endpoint
-    │       ├── db/state.ts                  the `mcp_state` database (create, migrate, seed)
-    │       ├── toolsets.ts                  named tool groups (MCP_TOOLSETS scoping)
-    │       ├── gateway.config.json          third-party MCP upstreams (git-tracked, secret-free)
-    │       ├── tools/                       MCP-exposed actions
-    │       └── services/{gmail,telegram,monobank,scheduler,news,memory,pdf,signals,settings,gateway}
-    └── agent/
-        ├── data/agent.db                    agent-side state (memory KV + trace mirror)
-        └── src/
-            ├── db/{client,memory,trace-store,schema}.ts + migrations/  Drizzle (sqlite)
-            ├── supervisor/{main,loop,module,telegram-context}.ts  poll loop,
-            │                                     per-signal routing, tg history
-            ├── workflow/                      dynamic-workflow module (compile + execute)
-            │   ├── index.ts                   createWorkflowRunner facade (runForSignal)
-            │   ├── compile.ts                 signal → validated Workflow (LLM)
-            │   ├── execute.ts                 runtime that walks the steps
-            │   ├── dsl.ts                     Workflow step schema + parse
-            │   └── variables.ts               ${path} substitution + variable store
-            ├── engine.ts, agent-loop.ts     LLM runner (ReAct loop)
-            ├── activity-journal.ts          traces → ouro/activity journal notes (background
-            │                                 loop inside the supervisor)
-            ├── providers/                   ChatProviders: openai, gemini, deepseek,
-            │                                 openrouter (opt-in, "openrouter/…" models)
-            ├── decisions.ts                 typed classification (Jev via OpenRouter's
-            │                                 decisions API) + presets (filter); the
-            │                                 workflow `decide` step runs them
-            ├── synthetic-tools.ts           agent-side tools (set_memory, …)
-            ├── mcp-client.ts                StreamableHTTP client
-            ├── session-context.ts           markdown context block builder
-            ├── skills.ts                    two-layer loader (live → default)
-            ├── tracing/{index,langfuse}.ts  Tracer interface + Langfuse adapter
-            └── db/{client.ts, memory.ts}    KV helpers
+├── eval-fixtures/          golden sets for news-filter-eval (gitignored)
+└── crates/
+    ├── mcp/                one domain per file
+    │   ├── src/main.rs                     composition root: deps, pollers, HTTP/stdio transport
+    │   ├── src/server.rs                   McpTools, the HTTP transport, session policy
+    │   ├── src/db.rs                       the `mcp_state` database (create, migrate, seed)
+    │   ├── src/pg.rs                       the news/memory Postgres pool + drizzle-compatible migrator
+    │   ├── src/toolsets.rs                 named tool groups (MCP_TOOLSETS scoping)
+    │   ├── src/{gmail,telegram,userbot,monobank,scheduler,news,memory,pdf,fs,signals,
+    │   │        settings,skills,knowledge,gateway,embeddings,fetch,eval}.rs
+    │   ├── src/bin/                        CLIs: gmail-auth, userbot-auth, mcp-setup, embed-backfill, …
+    │   ├── migrations/pg/                  the Postgres migrations (applied files never change)
+    │   ├── gateway.config.json             third-party MCP upstreams (git-tracked, secret-free)
+    │   ├── specs/*.feature                 the executable specification (the user's)
+    │   └── tests/                          black-box tests; tests/model/ the reference model
+    ├── agent/
+    │   ├── src/main.rs                     composition root (agent-supervisor)
+    │   ├── src/supervisor.rs               poll loop, per-signal routing, tg history preload
+    │   ├── src/workflow.rs                 dynamic workflows: DSL, variables, compile, execute
+    │   ├── src/agent.rs                    the engine and the ReAct agent loop
+    │   ├── src/activity.rs                 traces → ouro/activity journal notes (background
+    │   │                                   task inside the supervisor)
+    │   ├── src/providers.rs                ChatProviders: openai, gemini, deepseek, openrouter
+    │   ├── src/decisions.rs                typed classification (Jev via OpenRouter's decisions
+    │   │                                   API) + presets (filter); the workflow `decide` step
+    │   ├── src/mcp.rs                      StreamableHTTP / stdio MCP client with reconnect
+    │   ├── src/session.rs                  session context + working memory
+    │   ├── src/skills.rs                   two-layer loader (live → default) + patch overlay
+    │   ├── src/{tracing,langfuse,local_recorder,trace_model}.rs  Tracer, Langfuse, mirror
+    │   ├── src/db.rs                       agent.db: memory KV, trace mirror, judgements
+    │   └── migrations/                     agent.db migrations (drizzle journal, unchanged)
+    ├── codex/                              codex-service (POST /run, GET /health)
+    └── evals/
+        ├── src/                            judge, noise, gate, improver, scores, Langfuse API
+        ├── src/bin/                        judge, judge-worker, judge-noise, judge-gate, improve,
+        │                                   improve-worker, judge-replay, langfuse-trace,
+        │                                   news-filter-eval
+        └── noise-baseline.json             committed judge σ per (model | prompt version)
 ```
+
+`agent.db` lives at `packages/agent/data/agent.db` (`agent::db::DEFAULT_DB_PATH`)
+— the TS-era path the `agent-data` volume has always been mounted at; only that
+data directory remains under `packages/`, gitignored.
 
 ## Stack
 
-- TypeScript (ESM, `module: Preserve`, `moduleResolution: Bundler`)
-- Effect 4 (`effect@4.0.0-rc.113`, pinned) for asynchronous orchestration
-- `@modelcontextprotocol/sdk` (stdio + StreamableHTTP transport)
-- `better-sqlite3` for Node code; `sqlite3` CLI from Bash for ad-hoc queries
-- `googleapis` + `google-auth-library` (Gmail)
-- `telegram` (gramjs / MTProto) for userbot channel reading
-- `cron-parser` v5 for scheduled tasks
-- `openai` SDK pointed at DeepSeek / Gemini / OpenRouter (OpenAI-compatible)
+- Rust 2024, tokio; `anyhow` errors, `serde_json` values on the wire
+- `rmcp` (MCP server + client, stdio and Streamable HTTP), `axum`
+- `tokio-postgres` + `deadpool-postgres` + pgvector text literals (Postgres)
+- `rusqlite` (agent.db); `sqlite3` CLI from Bash for ad-hoc queries
+- `reqwest` for every HTTP API (Gmail REST, Telegram Bot API, OpenAI-compatible
+  model APIs, Langfuse); `grammers` for the MTProto userbot
+- `croner` for scheduled tasks; `proptest` for properties; `cucumber` for the specs
 
 ## Three databases — split by ownership
 
 - **`mcp_state`** (Postgres database next to the news store;
-  `packages/mcp/src/db/state.ts`) — MCP's private state: OAuth tokens and
-  the userbot session, Gmail watermarks, the Telegram cursor and chat log,
-  the `signals` queue, `scheduled_tasks`, settings. The server derives it
-  from `DATABASE_URL` (same server, database name `mcp_state`;
-  `STATE_DATABASE_URL` overrides) and creates + migrates it on boot. Its
-  schema, migration table and advisory-lock key are the Rust server's
-  (`feat/rust-rewrite`), so either server runs on a database the other
-  created. It replaced the sqlite `tokens.db`. Don't read or write it from
-  agent code — go through MCP tools.
+  `crates/mcp/src/db.rs`) — MCP's private state: OAuth tokens and the userbot
+  session, Gmail watermarks, the Telegram cursor and chat log, the `signals`
+  queue, `scheduled_tasks`, settings. The server derives it from
+  `DATABASE_URL` (same server, database name `mcp_state`;
+  `STATE_DATABASE_URL` overrides) and creates + migrates it on boot (versioned
+  migrations inline in `db.rs`). It replaced the sqlite `tokens.db`
+  (`import-sqlite-state` copies one over). Don't read or write it from agent
+  code — go through MCP tools.
 - **`packages/agent/data/agent.db`** (sqlite) — agent's domain state:
-  `memory` (freeform KV, e.g. `news_digest.last_read_at`) plus the local
-  trace mirror (`traces` + per-node `judgements`). Schema lives in code at
-  `packages/agent/src/db/schema.ts` (Drizzle ORM, sqlite); migrations are
-  generated with `pnpm db:generate:agent` and applied on boot
-  (`db/client.ts`, also `pnpm setup:agent`).
+  `memory` (freeform KV, e.g. `news_digest.last_read_at`), the local trace
+  mirror (`traces` + per-node `judgements`), `improver_state` and the
+  activity journal's progress. Migrations live in `crates/agent/migrations`
+  (drizzle's sqlite format and journal, applied on boot by `AgentDb::open`
+  under the same race-tolerant boot the TS client had); a new one is a new
+  `.sql` file plus a journal entry, and an applied one never changes (a test
+  pins the hashes).
 - **Postgres + pgvector** (containerized, `postgres` service in
   docker-compose) — the news / RAG store **and unified memory**. One table
   `news_items` unifies HN/Habr articles and harvested Telegram channel posts;
@@ -157,16 +161,14 @@ mcp-tools/
   / `memory_facts` (the read models) plus `memory_index` (the search
   projection — the only memory table with vectors). Owned by MCP; the agent
   reaches it only through MCP tools (`search_news`, `recall`, `read_doc`, …).
-  Schema lives in code at `packages/mcp/src/db/pg/schema.ts` (Drizzle ORM);
-  migrations are generated with `pnpm db:generate:pg` and applied on server
-  boot under an advisory lock (`mcp` and `mcp-tunnel` boot at once). The
-  Rust server applies the same files with the same journal, so an applied
-  migration file must never change.
+  Migrations are `crates/mcp/migrations/pg/*.sql` listed in `pg.rs`
+  (`MIGRATIONS`, with drizzle's `when` stamps), applied on server boot under
+  an advisory lock (`mcp` and `mcp-tunnel` boot at once). A new migration is
+  a new file and entry; an applied file never changes (a test pins the
+  hashes drizzle recorded).
 
-Schemas: `packages/mcp/src/db/state.ts` (`mcp_state`, versioned migrations
-inline), `packages/agent/src/db/schema.ts` (agent sqlite, Drizzle),
-`packages/mcp/src/db/pg/schema.ts` (PG, Drizzle). Everything applies
-automatically on boot; `pnpm db:init` does it without starting the servers.
+Everything applies automatically on boot; `mcp-setup` does the `mcp_state`
+part without starting the server.
 
 For ad-hoc queries during development:
 
@@ -182,87 +184,70 @@ string literals; double single quotes inside (`'O''Brien'`).
 ## Code structure: modules + DI
 
 Domain code is organised as **modules** with explicit **dependency
-injection**. Every long-lived piece of state (DB pool, OpenAI client,
-EmbeddingService, storage layer) is built once in the composition root
-(`server.ts main()` or a script's `main()`) and passed down. No
-`getX()` singletons, no service locators, no global handles in
-business code.
+injection**. Every long-lived piece of state (DB pool, HTTP clients, the
+embedder, stores) is built once in a composition root (`main.rs` of a crate,
+or a binary's `main`) and passed down. No global singletons, no service
+locators, no `static` handles in business code.
 
 ### Rules
 
-1. **Factory functions, not classes.** State that needs scoping lives
-   in a closure built by `createX(deps)`. Return a plain object with
-   the methods consumers need. No `this`, no `new`.
+1. **One domain, one file.** A domain is `src/<domain>.rs`: its types, its
+   store, its service and its `#[tool_router]` together, split into numbered
+   sections in a header comment. A file grows sections, not siblings.
 
-2. **Every module has a `module.ts`.** It declares a `XxxModule`
-   interface (the public surface) and a `createXxxModule(deps): XxxModule`
-   factory that wires everything inside. See
-   `services/news/module.ts` as the canonical example. Pattern:
-
-   ```ts
-   export interface XxxModule { /* exposed services */ }
-   export interface XxxModuleDeps { /* required deps from outside */ }
-   export function createXxxModule(deps: XxxModuleDeps): XxxModule { … }
-   ```
+2. **Seams are traits.** Anything a test must replace (a store, an embedder,
+   the web, Telegram, a model provider, the MCP client, the clock) is a trait,
+   and the domain takes `Arc<dyn Trait>` (or a generic) — never the concrete
+   type. Tests supply fakes; `InMemoryStore` is the memory contract's.
 
 3. **Generic infrastructure is dependency-free.** A reusable layer
-   (e.g. `services/embeddings/`) declares interfaces (`EmbeddingRepository`,
-   `EmbeddingProvider`, `Chunker`) and a `createEmbeddingsModule({repo, …})`
-   factory that takes them. It never imports a concrete table or
-   domain type. Domain modules supply the implementations.
+   (`embeddings.rs`, `fetch.rs`, `providers.rs`) declares its traits and never
+   names a concrete table or domain type. Domains supply the implementations.
 
-4. **Repos live with the table they own.** Implementation of
-   `EmbeddingRepository` for `news_items` lives in
-   `news/embedding-repository.ts`, not in `embeddings/`. The interface
-   is in the generic module; the impl is in the domain.
+4. **Repos live with the table they own.** A store for `news_items` lives in
+   `news.rs`, not in `embeddings.rs`.
 
-5. **DB handle is injected.** `db/pg/client.ts` exports
-   `createPgClient(): { db, ensureReady, close }` only. Anything that
-   talks to PG accepts `db: Database` (factory parameter) or sits
-   behind a storage/repo factory that does.
+5. **DB handles are injected.** `pg::connect` builds a pool, `Db` wraps
+   `mcp_state`, `AgentDb::open` opens agent.db — and anything that talks to a
+   database takes one of those as a parameter or sits behind a store that
+   does.
 
-6. **Tools and pollers take their deps in the signature.**
-   `registerXxxTools(server, deps)`, `startXxxPoller(deps)`. They
-   never reach for a global handle inside the handler.
+6. **Tools and pollers take their deps explicitly.** Tool handlers read
+   `McpTools`'s `Deps`; pollers are spawned with what they use. Nothing
+   reaches for a global inside a handler.
 
-7. **Composition root is the only place that knows the full graph.**
-   `server.ts main()` calls the factories in order, threads the
-   result through `createServer({...})` and `startXxxPoller({...})`.
-   Scripts do the same for their narrower scope and `await pg.close()`
-   in `finally`.
+7. **The composition root is the only place that knows the full graph.**
+   `main.rs` builds the deps in order, hands them to the server and the
+   pollers, and owns shutdown. Binaries in `src/bin` do the same for their
+   narrower scope.
 
-8. **Add a new domain → add a new module.** Create
-   `services/<domain>/module.ts` with `createXxxModule({db, ...})`,
-   instantiate it in `server.ts main()`, pass to whoever needs it. Do
-   not extend `NewsModule` with unrelated concerns just because PG is
-   already there.
+8. **Add a new domain → add a new file.** `src/<domain>.rs` with its own
+   types and router, wired in `main.rs`. Do not grow `news.rs` with unrelated
+   concerns just because Postgres is already there.
 
-9. **Use Effect for asynchronous orchestration.** Parallel tasks,
-   concurrency limits, cancellation, timeouts, retries/backoff and resource
-   cleanup should use Effect 4. Keep child tasks within their parent's
-   lifetime, propagate `AbortSignal` to SDK/HTTP calls and await finalizers
-   before closing traces or clients. Use `Effect.forEach` / `Effect.all`
-   with an explicit concurrency limit; convert to Promises at public API
-   boundaries. Keep the factory + DI structure above.
+9. **Async orchestration is tokio, bounded and cancellable.** Concurrency has
+   an explicit limit (`buffer_unordered(n)` with results put back in order,
+   not `buffered`, which holds a finished slot); child tasks stay within
+   their parent's lifetime; a `CancellationToken` reaches every HTTP/SDK call
+   (`errors::or_cancel`); finalizers run before a trace or client closes.
 
-   Reuse `packages/agent/src/generation.ts` for LLM generation/tracing and
-   `providers/retry.ts` for transient failures. Keep automatic retries in
-   one layer (SDK retries are disabled), and do not automatically replay
-   tool side effects. See `agent-loop.ts` and `workflow/execute.ts` for
-   existing patterns. Simple sequential SDK adapters can remain
-   `async`/`await`; add Effect when introducing orchestration.
+   Reuse `agent::generation` for LLM generation/tracing and the retry layer
+   in `providers.rs` (`with_retry`, `retry_on_transient`) for transient
+   failures. Keep automatic retries in one layer, and never automatically
+   replay a tool side effect (the MCP client reconnects only on a session the
+   transport proves was rejected before the tool ran).
 
 ### Anti-patterns (don't)
 
-- `getPgDb()` / `getXxxModule()` exported helpers that lazy-init a
-  singleton. They look convenient but turn every consumer into a
-  hidden coupling on global mutable state and make tests painful.
-- `class XxxService` with only a constructor and one method — that's
-  a factory function in disguise.
-- Importing a concrete table or schema from `services/<generic>/`.
-  Move the interface up, the impl down.
-- Handlers that pull deps inside their body (`const { news } =
-  getModule()`). The handler's signature must be the contract.
+- `static` / `OnceLock` handles to a pool or client that business code reaches
+  for. They turn every consumer into a hidden coupling on global state and
+  make tests painful. (A `OnceLock` for a compiled regex is fine.)
+- A struct with only `new` and one method — that's a function.
+- A generic module that imports a concrete table or schema. Move the trait
+  up, the impl down.
+- Handlers that build their own clients or read env vars mid-request. The
+  handler's inputs must be its contract.
+- `unsafe` (transmutes above all) to get past the borrow checker.
 
 ## Task tracking
 
@@ -278,7 +263,8 @@ doesn't evaporate.
 
 ## MCP tools (signal-emitting + agent-callable)
 
-Defined in `packages/mcp/src/tools/`. The agent calls these via MCP; you
+Defined next to their domain in `crates/mcp/src/<domain>.rs` (each file
+ends with its `#[tool_router]`). The agent calls these via MCP; you
 also see them when running `claude` locally with `.mcp.json` registered.
 
 - **Gmail** — `list_nashdom_mails`, `download_gmail_attachment`
@@ -304,23 +290,23 @@ also see them when running `claude` locally with `.mcp.json` registered.
   `cancel_scheduled_task`
 - **Env** — `get_timezone`, `set_timezone`
 - **Third-party (via gateway)** — when `gateway.config.json` lists upstreams,
-  `services/gateway/` makes own-MCP an MCP *client* to them too and re-exposes
+  `gateway.rs` makes own-MCP an MCP *client* to them too and re-exposes
   their tools namespaced as `${prefix}__${tool}` (e.g. `tavily__tavily_search`).
   The agent still sees one merged endpoint. Onboarding (config + secret + skill
   frontmatter, no code) is in `.claude/tasks/mcp-gateway.md`.
 
 ### Tool scoping (`MCP_TOOLSETS`)
 
-One MCP process serves one audience. `packages/mcp/src/toolsets.ts` holds the
-named toolset → registrar map (`gmail`, `telegram`, `telegram-send`,
+One MCP process serves one audience. `crates/mcp/src/toolsets.rs` holds the
+named toolset → router map (`gmail`, `telegram`, `telegram-send`,
 `monobank`, `pdf`, `fs`, `signals`, `news-read`, `knowledge`, `dreaming`,
 `userbot`, `scheduler`, `skills`, `memory`);
 `MCP_TOOLSETS=news-read,telegram-send,skills` makes an instance register only
 those groups. Unset/empty = every group, i.e. the behaviour before scoping
 existed. An unknown name is a boot error.
 
-A **restricted instance is also multi-session** (`runHttpTransport`'s
-`multiSession`), which is what lets several agents hold a memory connection at
+A **restricted instance is also multi-session** (`serve_http`'s
+`multi_session`), which is what lets several agents hold a memory connection at
 once: an instance scoped to `memory` has no signals tools, so nothing races
 for signal delivery.
 
@@ -334,7 +320,7 @@ auth design: `.claude/tasks/mcp-auth-and-tool-scoping.md`.
 
 One memory every agent shares — the droplet supervisor, Claude Code sessions,
 anything on the far side of the ChatGPT tunnel. Lives in
-`packages/mcp/src/services/memory/`; design and rationale in
+`crates/mcp/src/memory.rs`; design and rationale in
 `.claude/tasks/unified-memory.md`.
 
 Three read models, one search projection:
@@ -349,15 +335,15 @@ Three read models, one search projection:
   stream the digest dedups against. Streams are named categories
   (`digest/news`) with a stored capacity (default 100, oldest dropped
   first). Entries are immutable, never indexed and keep no patch history —
-  records, not knowledge. Invariants: `services/memory/journal*.test.ts`
-  (fast-check against a reference model; the Postgres race tests need
-  `TEST_DATABASE_URL`).
+  records, not knowledge. Invariants: the journal tests in `memory.rs`
+  (proptest against a reference model; the Postgres race tests run on the
+  test container or `TEST_DATABASE_URL`).
 - **`memory_index`** is the only table with embeddings. Documents and facts are
   chunked into it with their subject denormalised into the indexed text, so a
   fragment matches even though the stored document stays clean.
 
 The agent's flow is two-step, the same search→read shape that fixed the
-planner's snippet failures on GAIA: `recall` returns **refs**
+planner's snippet failures on the GAIA benchmark: `recall` returns **refs**
 (`doc:leetcode-graphs/roadmap.md#2`, `fact:88`), then `read_doc` / `get_fact`
 loads the whole thing.
 
@@ -378,10 +364,11 @@ Rules worth knowing before touching the code:
   older patch whose text later writes touched fails cleanly and names the
   version a `rollback: true` would restore. History is never rewritten.
 - **Indexing failure never fails a write.** Documents read and patch with the
-  embedder down; `pnpm embed:backfill` drains the NULL-vector backlog.
+  embedder down; `embed-backfill` drains the NULL-vector backlog.
 
-The rules live in `service.ts` and the store underneath is dumb CRUD, so the
-whole contract is tested against `store.memory.ts` without a Postgres.
+The rules live in `MemoryService` and the store underneath (`MemoryStore`) is
+dumb CRUD, so the whole contract is tested against `InMemoryStore` without a
+Postgres.
 
 **Who writes:** `MCP_MEMORY_ACTOR` names the instance (`supervisor` for `mcp`,
 `chatgpt` for `mcp-tunnel`) and is stamped onto every patch. Audit metadata,
@@ -395,91 +382,100 @@ Live under `skills.default/` (git-tracked, shipped in image) with an
 optional live overlay in `skills/` (gitignored, mounted as a Docker
 volume — written by the `dreaming` skill when it self-revises).
 
-`readSkill(name)` reads `skills/<name>.md` first, falls back to
+`read_skill(name)` reads `skills/<name>.md` first, falls back to
 `skills.default/<name>.md`. Naming is signal-source-based:
 
 - `nashdom-bill`, `news-digest`, `tech-digest`, `dreaming`, `scheduler`,
   `telegram` — primary domain skills, loaded per signal.source.
-- `routing`, `orchestrator`, `worker` — always loaded on the AgentLoop path
+- `routing`, `orchestrator`, `worker` — always loaded on the agent-loop path
   (`worker` is the default skill for a sub-agent with no domain skill).
 - `planner` — the workflow compiler's system prompt (scheduler signals).
 - `recovery` — spawned on a failed signal to phrase the failure to the user.
 
-The improver writes an append-only overlay at `skills/<name>.patch.md`; the
-runtime glues it onto the end of the body with `appendPatch`, so the
-instructions in force are body + patch. **`packages/mcp/src/services/skills/`
-re-implements that composition** for the `read_skill` export — the two
-packages may not import each other, so if you change `appendPatch` (marker,
-spacing), change the MCP copy too or the export starts describing a skill
-nobody runs. `module.test.ts` pins the expected output as a literal.
+The improver (`crates/evals`) writes an append-only overlay at
+`skills/<name>.patch.md`; the runtime glues it onto the end of the body with
+`append_patch`, so the instructions in force are body + patch.
+**`crates/mcp/src/skills.rs` re-implements that composition** for the
+`read_skill` export — the server and the agent don't share code, so if you
+change `append_patch` (marker, spacing), change the MCP copy too or the export
+starts describing a skill nobody runs. `crates/mcp/tests/skills_contract.rs`
+runs both on generated skill directories and demands they agree;
+`crates/mcp/tests/shipped_skills.rs` validates `skills.default` against the
+real server's tool list the way the agent does at boot.
 
 ## Running
 
-- `pnpm db:init` — create/migrate `mcp_state` and the PG store + apply
-  agent/agent.db (all also happen on boot).
-- `pnpm mcp:serve` — start the MCP server. **Do not run locally if the
-  droplet is also running it** — Telegram getUpdates is exclusive and the
-  second poller causes 409 Conflict.
-- `pnpm agent:start` — start the supervisor (long-running loop).
-- `pnpm gmail:auth` — one-time OAuth bootstrap. Writes to `mcp_state`
-  (needs `DATABASE_URL`).
-- `pnpm gmail:list-unread` — debug helper.
-- `pnpm telegram:get-chat-id` — discover your chat id (after sending any
-  message to your bot).
-- `pnpm userbot:auth` — one-time MTProto login (phone + code).
-- `pnpm typecheck` — typecheck both packages.
-- `cargo test -p mcp-tools` — the Rust server's tests (unit, property,
-  Postgres via an auto-started pgvector testcontainer unless
-  `TEST_DATABASE_URL` is set, the shared specs, the reference model);
-  `cargo clippy --all-targets`, `cargo fmt`.
-- `pnpm spec` — the executable specification: `packages/mcp/specs/*.feature`,
-  plain-English scenarios run by cucumber-js against the real server over MCP
-  with a Testcontainers Postgres (needs Docker; `TEST_DATABASE_URL` uses a
-  throwaway server instead). **The `.feature` files are the user's**: never
-  edit one to make a failing run pass — fix the code, or ask. New behaviour
-  gets a scenario there first. They are byte-identical to the Rust port's.
-  See `packages/mcp/specs/README.md`.
-- `pnpm spec:model` — the reference model of memory documents:
-  `packages/mcp/model/model.ts` says what write/append/patch/revert mean
-  (~200 lines, no database) and `properties.test.ts` checks its properties
-  with fast-check (part of `pnpm test`). `server.check.ts` sends random call
-  sequences, then overlapping calls from several sessions, to both the model
-  and the real server; answers must match and every concurrent history must
-  be linearizable. Needs Docker (or `TEST_DATABASE_URL`); `MODEL_CASES`
-  raises the case count. **Same ownership as the `.feature` files**: when the
-  server and the model disagree, fix the code or ask — a rule change starts
-  in `model.ts`, and its properties must still pass. See
-  `packages/mcp/model/README.md`.
-- `pnpm test` — vitest. With `TEST_DATABASE_URL=postgres://…` the Postgres
-  tests run too (point it at a throwaway pgvector server, never prod).
-- `pnpm db:generate:pg` — regenerate Drizzle migrations after editing
-  `packages/mcp/src/db/pg/schema.ts`. The new `*.sql` file lands in
-  `packages/mcp/src/db/pg/migrations/` and is applied on next mcp boot.
-- `pnpm db:generate:agent` — same for the agent sqlite schema
-  (`packages/agent/src/db/schema.ts` → `packages/agent/src/db/migrations/`,
-  applied on agent/judge-worker boot via `db/client.ts`).
-- `pnpm db:migrate:channel-posts` — one-shot copy of the legacy sqlite
-  `channel_posts` table (the old `tokens.db`, `MCP_DB_PATH`) into PG
-  `news_items` + inline-embed. Idempotent.
-- `pnpm memory:import-notes` — one-shot copy of `knowledge_base_notes` into
+Binaries run with `cargo run -p <crate> --bin <name> -- …` locally; in the
+image they are on `PATH`.
+
+- `mcp-tools` — the MCP server. **Do not run locally if the droplet is also
+  running it** — Telegram getUpdates is exclusive and the second poller
+  causes 409 Conflict. (`.mcp.json` starts it over stdio for Claude Code.)
+- `agent-supervisor` — the supervisor (long-running loop);
+  `agent-supervisor --check-config` validates env and exits.
+- `codex-service` — the codex sandbox service.
+- `mcp-setup` — create/migrate `mcp_state` without starting the server.
+- `gmail-auth` — one-time OAuth bootstrap. Writes to `mcp_state` (needs
+  `DATABASE_URL`). `gmail-list-unread` — debug helper.
+- `telegram-get-chat-id` — discover your chat id (after sending any message
+  to your bot).
+- `userbot-auth` — one-time MTProto login (phone + code).
+- `monobank-txns` — debug helper.
+- `migrate-channel-posts` — one-shot copy of the legacy sqlite
+  `channel_posts` table (the old `tokens.db`) into PG `news_items` +
+  inline-embed. Idempotent. `import-sqlite-state` moves the rest of
+  `tokens.db` into `mcp_state`.
+- `memory-import-notes` — one-shot copy of `knowledge_base_notes` into
   memory facts (idempotent; the source table is left untouched).
-- `pnpm embed:backfill` — re-attempt embeddings for any `news_items`
-  rows where `embedding IS NULL` (typically left behind by an OpenAI
-  outage during inline embed).
+- `embed-backfill` — re-attempt embeddings for any `news_items` rows where
+  `embedding IS NULL` (typically left behind by an OpenAI outage during
+  inline embed).
+- `eval-snapshot`, `eval-rag`, `eval-inspect` — the RAG eval harness over
+  `crates/mcp/eval/fixtures`.
+- `judge <traceId>` / `judge --recent N` (`--provider openai|codex`,
+  `--dump` writes the materials for the judge-trace skill) — judge a run per
+  node. `judge-noise` measures the judge's σ into `noise-baseline.json`;
+  `judge-gate` A/Bs a candidate patch; `improve` runs one improver cycle;
+  `judge-replay` replays a planner/compose generation under another model;
+  `langfuse-trace` prints a trace; `news-filter-eval` runs the filter golden
+  set (`eval-fixtures/news-filter/`).
+
+Tests:
+
+- `cargo test` — every crate: unit, property, the Postgres tests (an
+  auto-started pgvector testcontainer unless `TEST_DATABASE_URL` is set —
+  point it at a throwaway server, never prod), the specs, the reference
+  model. `PROPERTY_RUNS` raises property case counts. `cargo clippy
+  --all-targets -- -D warnings`, `cargo fmt`.
+- `cargo test -p mcp-tools --test specs` — the executable specification:
+  `crates/mcp/specs/*.feature`, plain-English scenarios run by cucumber
+  against the real server over MCP with a Testcontainers Postgres. **The
+  `.feature` files are the user's**: never edit one to make a failing run
+  pass — fix the code, or ask. New behaviour gets a scenario there first.
+  See `crates/mcp/specs/README.md`.
+- `cargo test -p mcp-tools --test model` — the reference model of memory
+  documents: `crates/mcp/tests/model/model.rs` says what
+  write/append/patch/revert mean (no database) and `properties.rs` checks its
+  properties; `main.rs` sends random call sequences, then overlapping calls
+  from several sessions, to both the model and the real server; answers must
+  match and every concurrent history must be linearizable. `MODEL_CASES`
+  raises the case count. **Same ownership as the `.feature` files**: when
+  the server and the model disagree, fix the code or ask — a rule change
+  starts in `model.rs`, and its properties must still pass.
 
 Deploy: `scripts/deploy.sh [services…]` from the laptop — it builds the
-linux/amd64 image locally (the droplet can't compile the Rust crate), ships
-it over SSH and runs `docker compose up -d --no-build` on a checkout of the
-same commit, which must be pushed. Named volumes (`mcp-data`, `mcp-storage`, `agent-data`,
-`agent-skills`, `pg-data`) persist state across rebuilds. First boot
-needs `.env.postgres` (POSTGRES_USER / PASSWORD / DB) and
+linux/amd64 image locally (the droplet can't compile the crates), ships it
+over SSH and runs `docker compose up -d --no-build` on a checkout of the
+same commit, which must be pushed. Named volumes (`mcp-data`, `mcp-storage`,
+`agent-data`, `agent-skills`, `pg-data`) persist state across rebuilds.
+First boot needs `.env.postgres` (POSTGRES_USER / PASSWORD / DB) and
 `OPENAI_API_KEY` in `.env.mcp`.
 
 The two evaluation services — `judge-worker` (per-node Codex judge) and
 `improve-worker` (closed-loop improver) — sit behind the `evals` compose
 profile and are OFF since 2026-08-31: scoring live prod runs wasn't worth
 the codex quota, and the plan is golden sets instead. A plain
-`docker compose up -d --build` skips them; bring them back with
+`docker compose up -d` skips them; bring them back with
 `docker compose --profile evals up -d judge-worker improve-worker`. The
 `codex` service itself stays ON regardless — the agent's `code_agent` tool
 runs through it.
@@ -493,7 +489,7 @@ without them:
   `MCP_NO_POLLERS=1` and
   `MCP_TOOLSETS=news-read,telegram-send,skills,memory`: news reading, one
   Telegram write, the skills export, unified memory, and no gateway. The exact
-  list is pinned by a test in `toolsets.test.ts` — if that list and this env
+  list is pinned by a test in `crates/mcp/src/toolsets.rs` — if that list and this env
   var drift apart, ChatGPT silently gets a surface nobody chose. `expose`
   only, like `mcp` — never `ports`. It shares the `mcp-data` volume because
   `send_telegram_message` appends to the `telegram_messages` chat log, and the

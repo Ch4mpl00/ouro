@@ -1,8 +1,8 @@
 // The agent's sqlite state, agent.db: the memory KV (digest watermarks), the
 // local trace mirror with the judge's judgements, and the activity journal's
-// progress. The TS tooling (packages/agent: judge, improver, scripts) opens
-// the same file, so the schema, the migrations and the JSON in its columns
-// are exactly what packages/agent/src/db writes.
+// progress. The eval tooling (crates/evals: judge, improver) opens the same
+// file. The schema, the migrations and the JSON in its columns are the ones
+// the TS agent wrote, so the volumes it ran on read the same.
 //
 // Sections:
 //   1. handle     — open, pragmas, a boot that survives other processes
@@ -41,7 +41,7 @@ impl AgentDb {
             std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
         }
         let conn = Connection::open(path).with_context(|| format!("opening {}", path.display()))?;
-        // Several processes (the agent, the TS judge tooling) open the same
+        // Several processes (the agent, the judge and improve workers) open the same
         // file and migrate at startup. busy_timeout first: switching a fresh
         // file to WAL takes a lock too.
         conn.busy_timeout(Duration::from_millis(5000))?;
@@ -85,7 +85,7 @@ fn retry_boot_race(mut step: impl FnMut() -> anyhow::Result<()>) -> anyhow::Resu
 
 // ── 2. migrations ───────────────────────────────────────────────────────────
 
-// Copies of packages/agent/src/db/migrations (a test keeps them identical),
+// The TS agent's drizzle migrations, unchanged (a test pins their hashes),
 // baked into the binary so a schema change ships with it.
 const JOURNAL: &str = include_str!("../migrations/meta/_journal.json");
 const MIGRATIONS: &[(&str, &str)] = &[
@@ -362,9 +362,8 @@ impl TraceStore for AgentDb {
     }
 }
 
-// The judge's half of the store. The Rust agent never judges — the TS
-// tooling does, on this same file — but the store keeps the whole contract,
-// tested here as it is in packages/agent.
+// The judge's half of the store. The agent never judges — crates/evals does,
+// on this same file.
 impl AgentDb {
     // Newest first; optionally only traces with no judgement for
     // (provider, prompt version).

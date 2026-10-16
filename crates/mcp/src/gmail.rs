@@ -10,7 +10,7 @@
 // Plain REST instead of a generated client: four endpoints and a token
 // refresh don't justify the dependency. Tokens live in `integration_account`
 // exactly as googleapis stored them (expires_at as an ISO string), so the
-// TS and Rust servers can share one authorised account.
+// account the TS server authorised still works.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -217,14 +217,14 @@ impl GmailModule {
     async fn require_account_key(&self) -> anyhow::Result<String> {
         self.resolve_account_key()
             .await?
-            .ok_or_else(|| anyhow::anyhow!("No authorized Gmail account; run `pnpm gmail:auth`."))
+            .ok_or_else(|| anyhow::anyhow!("No authorized Gmail account; run `gmail-auth`."))
     }
 
     async fn access_token(&self, account: &str, force_refresh: bool) -> anyhow::Result<String> {
         let stored = self
             .stored_tokens(account)
             .await?
-            .ok_or_else(|| anyhow::anyhow!("No Gmail account \"{account}\". Run `pnpm gmail:auth` to authorize."))?;
+            .ok_or_else(|| anyhow::anyhow!("No Gmail account \"{account}\". Run `gmail-auth` to authorize."))?;
         let refresh = stored
             .refresh_token
             .clone()

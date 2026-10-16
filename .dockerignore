@@ -1,5 +1,3 @@
-node_modules
-**/node_modules
 .git
 .gitignore
 
@@ -7,12 +5,10 @@ node_modules
 .env
 .env.*
 
-# Generated SQLite state. Schemas come via setup script on first boot,
-# data lives in named volumes.
-packages/*/data/*.db
-packages/*/data/*.db-journal
-packages/*/data/*.db-wal
-packages/*/data/*.db-shm
+# Generated SQLite state. Schemas are applied on boot, data lives in named
+# volumes.
+packages/*/data
+eval-fixtures
 
 # Gmail attachments — runtime data, not part of image
 storage

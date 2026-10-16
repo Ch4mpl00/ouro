@@ -46,12 +46,10 @@ services:
       retries: 10
     restart: unless-stopped
 
-  # The MCP server — the Rust one (crates/mcp); `pnpm mcp:serve` is the TS
-  # server still in the image, the rollback. All its state lives in Postgres:
+  # The MCP server (crates/mcp). All its state lives in Postgres:
   # the news / memory store in $POSTGRES_DB, and the signal queue, tokens,
   # scheduled tasks and chat log in a sibling database `mcp_state`, which it
-  # creates and migrates itself on boot — no setup step. Both servers read
-  # and write the same schema.
+  # creates and migrates itself on boot — no setup step.
   mcp:
     build: .
     image: mcp-tools-image
@@ -205,7 +203,6 @@ services:
     build: .
     image: mcp-tools-image
     command: agent-supervisor
-    # Rollback: sh -c "pnpm setup:agent && pnpm agent:start"
     env_file: .env.agent
     environment:
       <<: *rust-malloc
@@ -213,7 +210,9 @@ services:
       MCP_URL: http://mcp:3000/mcp
       CODEX_URL: http://codex:3010      # code_agent tool delegates to the codex sandbox
     volumes:
-      - agent-data:/app/packages/agent/data    # agent.db (bills, memory)
+      # agent.db (memory, the trace mirror); the path is the TS-era layout the
+      # volume has always been mounted at (agent::db::DEFAULT_DB_PATH).
+      - agent-data:/app/packages/agent/data
       - agent-skills:/app/skills               # live skills overlay (dreaming writes here)
     depends_on:
       - mcp
@@ -223,7 +222,7 @@ services:
   codex:
     build: .
     image: mcp-tools-image
-    command: pnpm codex:serve
+    command: codex-service
     environment:
       CODEX_HOME: /codex-home
       CODEX_SERVICE_PORT: "3010"
@@ -245,7 +244,7 @@ services:
     profiles: ["evals"]
     build: .
     image: mcp-tools-image
-    command: sh -c "pnpm setup:agent && pnpm judge:worker"
+    command: judge-worker
     env_file: .env.agent
     environment:
       CODEX_URL: http://codex:3010
@@ -268,7 +267,7 @@ services:
     profiles: ["evals"]
     build: .
     image: mcp-tools-image
-    command: sh -c "pnpm setup:agent && pnpm improve:worker"
+    command: improve-worker
     env_file: .env.agent
     environment:
       CODEX_URL: http://codex:3010
@@ -286,8 +285,8 @@ services:
     restart: unless-stopped
 
 volumes:
-  # The TS-era sqlite tokens.db. Nothing mounts it any more; it is kept for
-  # rollback and as the source of `db:migrate:channel-posts`.
+  # The TS-era sqlite tokens.db. Nothing mounts it any more; it is kept as
+  # the source of `migrate-channel-posts` and `import-sqlite-state`.
   mcp-data:
   mcp-storage:
   agent-data:

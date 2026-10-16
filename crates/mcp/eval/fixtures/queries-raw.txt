@@ -3,9 +3,9 @@
 # the comment after each block.
 #
 # Pipeline:
-#   1. `pnpm eval:label-draft` reads this file, runs search_news per
-#      query against fixtures/corpus.jsonl with the baseline config,
-#      writes fixtures/queries-draft.jsonl with top-30 candidates.
+#   1. A label-draft pass (the TS `eval:label-draft`, retired) read this file, runs search_news per
+#      query against fixtures/corpus.jsonl with the baseline config, and
+#      wrote fixtures/queries-draft.jsonl with top-30 candidates.
 #   2. You hand-label each candidate as gold/acceptable/off.
 #   3. The labelled file becomes fixtures/queries.jsonl — the harness
 #      reads that.

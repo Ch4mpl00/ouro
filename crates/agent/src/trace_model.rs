@@ -1,8 +1,8 @@
 // Canonical READ shape of a run's trace — what the judge and the improver
-// (TS, packages/agent/src/judging) consume. It mirrors the Langfuse public
-// API response, so the local mirror (traces.observations in agent.db) and a
-// Langfuse fetch are interchangeable. Field names and order match
-// packages/agent/src/trace-model.ts: the JSON written here is read there.
+// (crates/evals) consume. It mirrors the Langfuse public API response, so the
+// local mirror (traces.observations in agent.db) and a Langfuse fetch are
+// interchangeable. Field names and order are the TS agent's, so traces it
+// mirrored read the same.
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};

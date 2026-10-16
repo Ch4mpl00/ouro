@@ -40,8 +40,8 @@ fn resolve(cwd: &Path, input: &str) -> PathBuf {
 }
 
 // MCP_READ_ROOTS (path-list, ":"-separated) when set; otherwise where the
-// read tools' files actually live: downloaded attachments (STORAGE_DIR), the
-// skill directories, and the eval fixtures (GAIA attachments).
+// read tools' files actually live: downloaded attachments (STORAGE_DIR) and
+// the skill directories.
 pub fn default_read_roots(env: &dyn Fn(&str) -> Option<String>, cwd: &Path) -> Vec<PathBuf> {
     let listed: Vec<String> = env("MCP_READ_ROOTS")
         .map(|v| std::env::split_paths(&v).map(|p| p.to_string_lossy().into_owned()).collect())
@@ -51,12 +51,7 @@ pub fn default_read_roots(env: &dyn Fn(&str) -> Option<String>, cwd: &Path) -> V
         return listed.into_iter().map(|r| resolve(cwd, r)).collect();
     }
     let storage = env("STORAGE_DIR").unwrap_or_else(|| "./storage".into());
-    vec![
-        resolve(cwd, &storage),
-        resolve(cwd, "skills"),
-        resolve(cwd, "skills.default"),
-        resolve(cwd, "packages/agent/src/eval/fixtures"),
-    ]
+    vec![resolve(cwd, &storage), resolve(cwd, "skills"), resolve(cwd, "skills.default")]
 }
 
 impl FileAccess {
@@ -126,16 +121,11 @@ mod tests {
     }
 
     #[test]
-    fn default_roots_are_storage_the_skill_directories_and_the_eval_fixtures_otherwise() {
+    fn default_roots_are_storage_and_the_skill_directories_otherwise() {
         let env = |name: &str| (name == "STORAGE_DIR").then(|| "/data/storage".to_owned());
         assert_eq!(
             default_read_roots(&env, Path::new("/app")),
-            [
-                PathBuf::from("/data/storage"),
-                PathBuf::from("/app/skills"),
-                PathBuf::from("/app/skills.default"),
-                PathBuf::from("/app/packages/agent/src/eval/fixtures"),
-            ]
+            [PathBuf::from("/data/storage"), PathBuf::from("/app/skills"), PathBuf::from("/app/skills.default"),]
         );
     }
 }

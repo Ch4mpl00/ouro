@@ -9,8 +9,8 @@
 // The migrator matters most. The TS server migrated this database with
 // drizzle, which records each applied file in `drizzle.__drizzle_migrations`
 // keyed by the journal's `when` timestamp. Reading and writing that same
-// table, with the same hashes, is what lets the Rust and TS servers take
-// turns on one database during the switch-over without re-running DDL.
+// table, with the same hashes, is what let this server take over the
+// database at the switch-over without re-running DDL.
 
 use deadpool_postgres::{Manager, ManagerConfig, Pool, RecyclingMethod};
 use sha2::{Digest, Sha256};
@@ -286,35 +286,10 @@ mod tests {
         );
     }
 
-    // While packages/mcp still ships, both servers apply the same files: a
-    // copy that drifted would give the two journals different hashes.
-    #[test]
-    fn migration_files_match_the_ts_servers_copies() {
-        let ts = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packages/mcp/src/db/pg/migrations");
-        if !ts.exists() {
-            return;
-        }
-        let ours = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations/pg");
-        let mut names: Vec<_> = std::fs::read_dir(&ts)
-            .unwrap()
-            .filter_map(|e| e.ok()?.file_name().into_string().ok())
-            .filter(|n| n.ends_with(".sql"))
-            .collect();
-        names.sort();
-        assert_eq!(names.len(), MIGRATIONS.len(), "every TS migration has a Rust entry");
-        for name in names {
-            assert_eq!(
-                std::fs::read(ours.join(&name)).unwrap_or_default(),
-                std::fs::read(ts.join(&name)).unwrap(),
-                "{name} differs from packages/mcp's"
-            );
-        }
-    }
-
     #[test]
     fn migration_files_hash_like_drizzle_recorded_them() {
-        // The first four hashes came from TS; every applied SQL file stays
-        // immutable so both migrators agree about the migration history.
+        // The first four hashes came from the TS server's drizzle; every
+        // applied SQL file stays immutable, so the recorded history holds.
         let hashes: Vec<String> =
             MIGRATIONS.iter().map(|m| hex::encode(Sha256::digest(m.sql.as_bytes()))[..16].to_owned()).collect();
         assert_eq!(

@@ -1,15 +1,15 @@
 ---
 name: judge-trace
-description: Judge an agent run PER NODE from a Langfuse/local trace in-session (free replacement for the gpt-5.4 per-node judge in scripts/judge.ts). Use when the user asks to judge/score/evaluate a trace or recent runs. Args - a traceId, or "--recent N" for the N latest traces.
+description: Judge an agent run PER NODE from a Langfuse/local trace in-session (free replacement for the gpt-5.4 per-node judge, the `judge` binary of crates/evals). Use when the user asks to judge/score/evaluate a trace or recent runs. Args - a traceId, or "--recent N" for the N latest traces.
 ---
 
 # judge-trace — score an agent run, one generative node at a time
 
-You replace the GPT-5.4 judge from `packages/agent/src/scripts/judge.ts` for
+You replace the GPT-5.4 judge from the `judge` binary (`crates/evals/src/bin/judge.rs`) for
 cheap experimentation. The judge is PER NODE: one score per generative LLM node
 (the planner generation, each `llm_compose`, each `llm_agent` step), each scored
 against THAT node's owner contract. The rubrics below are kept verbatim-synced
-with `packages/agent/src/judging/schema.ts` (`PLANNER_NODE_PROMPT`,
+with `crates/evals/src/schema.rs` (`PLANNER_NODE_PROMPT`,
 `COMPOSER_NODE_PROMPT`, `FAITH_SYSTEM_PROMPT`, prompt version `n4`) — do not
 improvise your own criteria, or scores stop being comparable between the two
 judges.
@@ -19,8 +19,8 @@ judges.
 1. Fetch the materials (no OpenAI key needed; Langfuse creds come from `.env`):
 
    ```bash
-   pnpm judge --dump <traceId>          # one trace
-   pnpm judge --dump --recent 5         # N latest traces
+   cargo run -q -p evals --bin judge -- --dump <traceId>     # one trace
+   cargo run -q -p evals --bin judge -- --dump --recent 5    # N latest traces
    ```
 
    Each trace is written to `/tmp/judge-dump-<traceId>.md` (path is printed).
@@ -39,7 +39,7 @@ judges.
    When several nodes (or several traces) are judged, finish with the one-line
    summary table.
 
-## Planner node rubric (prompt n4 — keep verbatim-equivalent to schema.ts)
+## Planner node rubric (prompt n4 — keep verbatim-equivalent to schema.rs)
 
 You are a rigorous evaluation judge for the PLANNER (orchestrator) of an AI agent. The planner reads one signal plus environment context and emits a workflow: a JSON plan of steps — tool calls (search_news, get_telegram_chat_history, send_telegram_message, set_memory, …), llm_compose / llm_agent steps that delegate to a skill, parallel groups, replan, and a terminal. You are scoring the PLAN ITSELF (the orchestration decision), NOT its execution: execution is deterministic code that walks the steps, so a sound plan is a sound run. You did not author the plan and have no stake in it.
 
@@ -58,7 +58,7 @@ Rules:
 - The planner is ALWAYS substantively judged. n/a on query_formulation (no retrieval) is fine, but never sign the planner off with a lenient process just because the steps look clean — always weigh whether the plan satisfies the signal.
 - Ground every claim in the PLAN / SIGNAL_AND_ENV. Never invent steps or queries that aren't there.
 
-## Composer / agent node rubric (prompt n4 — keep verbatim-equivalent to schema.ts)
+## Composer / agent node rubric (prompt n4 — keep verbatim-equivalent to schema.rs)
 
 You are a rigorous evaluation judge for ONE composer node of an AI agent — a single skill that receives gathered candidates (and any chat history) as INPUT and writes a final text (F). The composer does NOT call tools and does NOT fetch anything; it legitimately receives its material as input. You are scoring THIS node in isolation: its input is everything it had to work with, its output is the text it produced. You did not author it and have no stake in it.
 
@@ -78,7 +78,7 @@ Rules:
 - Reward neither length nor fluency. A correct short output beats a verbose wrong one.
 - Ground every claim in NODE_INPUT / NODE_OUTPUT. Never invent items that aren't in R.
 
-## Faithfulness sub-judge (compose / agent nodes only — keep verbatim-equivalent to schema.ts)
+## Faithfulness sub-judge (compose / agent nodes only — keep verbatim-equivalent to schema.rs)
 
 After the two composer axes, verify that every factual claim in the node's final text (F = NODE_OUTPUT) is grounded in the material the node received (R = NODE_INPUT: the retrieved snippets and any chat history). Quoting specifics — numbers, counts, dates, version numbers — not present in R is the single most damaging error class. (Planner nodes have no faithfulness pass.)
 
@@ -97,7 +97,7 @@ Rules:
 - score = (count(supported) + 0.5 * count(partial)) / total_claims, rounded to 2 decimals.
 - Ground every verdict in R; never invent item content.
 
-## Output format (mirrors judge.ts printNodeJudgement / nodeSummaryLine)
+## Output format (mirrors print.rs print_node_judgement / node_summary_line)
 
 One block per node. Planner nodes show `query_formulation` + `process`;
 compose/agent nodes show `coverage` + `composition` + a faithfulness line.

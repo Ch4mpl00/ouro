@@ -397,8 +397,7 @@ fn formats_discriminator_mismatch_unknown_step_kind() {
 
 #[test]
 fn loads_and_validates_news_digest_example_json() {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../packages/agent/src/workflow/examples/news-digest.example.json");
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/news-digest.example.json");
     let parsed: Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
     let result = parse(parsed);
     assert!(result.is_ok(), "{:?}", result.err());

@@ -1,8 +1,6 @@
 // The executable specification's machinery. The specification itself is
-// packages/mcp/specs/*.feature — the same files the TS server runs, so both
-// servers answer to one text (see packages/mcp/specs/README.md). This
-// file only teaches cucumber what each sentence means, by driving the real
-// server over MCP:
+// specs/*.feature (see specs/README.md); this file only teaches cucumber
+// what each sentence means, by driving the real server over MCP:
 //
 // Sections:
 //   1. environment — one Postgres + the real server, in-process (tests/support)
@@ -401,7 +399,7 @@ async fn main() {
         // specification must never pass on words that check nothing.
         .fail_on_skipped()
         .before(|_, _, _, _| Box::pin(async { wipe().await.expect("clean database") }))
-        .run(concat!(env!("CARGO_MANIFEST_DIR"), "/../../packages/mcp/specs"))
+        .run(concat!(env!("CARGO_MANIFEST_DIR"), "/specs"))
         .await;
     let failed = result.execution_has_failed() || result.parsing_errors() > 0;
     db.drop_all().await;

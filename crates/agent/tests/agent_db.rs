@@ -309,27 +309,18 @@ fn three_processes_booting_at_once_all_come_up() {
 
 // ── Rust-only ───────────────────────────────────────────────────────────────
 
-// The TS agent and its tooling apply the same files and read the same
-// journal table: the SQL, the journal and the recorded hashes must match.
+// An applied migration never changes: each file still hashes the way drizzle
+// recorded it on the volumes that ran it (the first three were applied by the
+// TS agent, whose migrator this one is), and a fresh database records exactly
+// those hashes.
 #[test]
-fn migration_files_and_journal_match_typescript_byte_for_byte() {
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let rust = root.join("crates/agent/migrations");
-    let ts = root.join("packages/agent/src/db/migrations");
-    assert_eq!(
-        std::fs::read(rust.join("meta/_journal.json")).unwrap(),
-        std::fs::read(ts.join("meta/_journal.json")).unwrap()
-    );
-    let ts_sql: BTreeSet<_> = std::fs::read_dir(&ts)
-        .unwrap()
-        .filter_map(|e| e.ok()?.file_name().into_string().ok())
-        .filter(|n| n.ends_with(".sql"))
-        .collect();
+fn migration_files_hash_like_drizzle_recorded_them() {
     let migrations = migrations().unwrap();
-    assert_eq!(ts_sql, migrations.iter().map(|m| format!("{}.sql", m.tag)).collect());
+    let hashes: Vec<String> = migrations.iter().map(|m| m.hash[..16].to_owned()).collect();
+    assert_eq!(hashes, ["8da75a8e64421e83", "d156e1a7e2498f5f", "834b8c53900bee1d"]);
+    let rust = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
     for migration in &migrations {
-        let sql = std::fs::read(ts.join(format!("{}.sql", migration.tag))).unwrap();
-        assert_eq!(std::fs::read(rust.join(format!("{}.sql", migration.tag))).unwrap(), sql);
+        let sql = std::fs::read(rust.join(format!("{}.sql", migration.tag))).unwrap();
         assert_eq!(migration.hash, hex::encode(Sha256::digest(sql)));
     }
     let dir = tempfile::tempdir().unwrap();

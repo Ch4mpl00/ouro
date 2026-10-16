@@ -2,8 +2,8 @@
 // OTel span carrying `langfuse.*` attributes, posted as OTLP/HTTP JSON to
 // `${LANGFUSE_BASE_URL}/api/public/otel/v1/traces`. This module produces the
 // spans the JS SDK (@langfuse/tracing + @langfuse/otel 5.3) produced for the
-// TS agent, attribute for attribute — the TS judge reads traces back from
-// Langfuse and must not tell the two agents apart:
+// TS agent, attribute for attribute — the judge reads traces back from
+// Langfuse and must not tell the agent's runs before and after the port apart:
 //
 //   - observation type, input, output, level, status message, model, model
 //     parameters, usage details: `langfuse.observation.*`, objects as JSON;
