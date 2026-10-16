@@ -17,7 +17,7 @@ use agent::{
     },
     session::EnvDeps,
     skills::{FsSkillStore, SkillStore},
-    supervisor::{NextSignal, POLL_INTERVAL, create_supervisor_with_cancel, run_poll_loop},
+    supervisor::{ERROR_BACKOFF, NextSignal, create_supervisor_with_cancel, run_poll_loop},
     tracing::{Tracer, tee_tracer},
     workflow::create_workflow_runner,
 };
@@ -238,7 +238,7 @@ async fn run(config: Config, once: bool) -> anyhow::Result<()> {
                 let supervisor_run = supervisor.clone();
                 let poll_cancel = stopping.clone();
                 let mut poll =
-                    tokio::spawn(async move { run_poll_loop(mcp, supervisor_run, poll_cancel, POLL_INTERVAL).await });
+                    tokio::spawn(async move { run_poll_loop(mcp, supervisor_run, poll_cancel, ERROR_BACKOFF).await });
                 tokio::select! {
                     result = &mut poll => result.map_err(anyhow::Error::from).and_then(|result| result),
                     _ = stopping.cancelled() => {

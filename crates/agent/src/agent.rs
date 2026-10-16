@@ -329,10 +329,7 @@ impl AgentLoop {
         }
         for iteration in 0..self.opts.max_iterations {
             check(&self.cancel)?;
-            let mut tools: Vec<_> = engine
-                .deps
-                .mcp
-                .tools()
+            let mut tools: Vec<_> = crate::mcp::model_tools(&*engine.deps.mcp)
                 .into_iter()
                 .filter(|t| self.allowed.as_ref().is_none_or(|s| s.contains(&t.name)))
                 .collect();
@@ -433,7 +430,7 @@ impl AgentLoop {
         }
         let outcome = if synthetic {
             self.synthetic(engine, name, &args, span).await
-        } else if !engine.deps.mcp.tools().iter().any(|t| t.name == name)
+        } else if !crate::mcp::model_tools(&*engine.deps.mcp).iter().any(|t| t.name == name)
             || !self.allowed.as_ref().is_none_or(|s| s.contains(name))
         {
             return Ok(format!("[tool error] {name} is unavailable in this loop"));

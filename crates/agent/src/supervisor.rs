@@ -17,7 +17,12 @@ use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
-pub const POLL_INTERVAL: Duration = Duration::from_secs(2);
+// The pause after a failed round (MCP down, a malformed reply) before the
+// next one, so an outage isn't hammered.
+pub const ERROR_BACKOFF: Duration = Duration::from_secs(2);
+// One `wait_for_signal` round: MCP answers as soon as a signal is queued, or
+// after this with nothing pending. Under the 60 s request deadline.
+pub const SIGNAL_WAIT: Duration = Duration::from_secs(25);
 pub const TELEGRAM_HISTORY_KEY: &str = "telegram.history";
 pub const TELEGRAM_HISTORY_LIMIT: usize = 20;
 pub const TELEGRAM_HISTORY_MAX_BYTES: usize = 8000;
@@ -301,35 +306,50 @@ impl Supervisor {
 }
 
 // ── 3. polling ───────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct Waited {
+    #[allow(dead_code)]
+    pending: i64,
+}
+
+// One round: take a signal and run it, or — with an empty queue — wait on
+// `wait_for_signal` until MCP has one queued (or the wait round ends).
+async fn poll_once(mcp: &SharedMcp, supervisor: &Supervisor, cancel: &CancellationToken) -> anyhow::Result<()> {
+    let raw = mcp.call_tool("get_next_signal", serde_json::Map::new(), cancel).await?;
+    let next: NextSignal = serde_json::from_str(&raw)?;
+    check(cancel)?;
+    if let Some(signal) = next.signal {
+        eprintln!("[supervisor] signal #{} source={} ({} pending after)", signal.id, signal.source, next.pending_after);
+        supervisor.run_signal(&signal).await?;
+        return Ok(());
+    }
+    let mut args = serde_json::Map::new();
+    args.insert("timeoutMs".into(), json!(SIGNAL_WAIT.as_millis() as u64));
+    let raw = mcp.call_tool("wait_for_signal", args, cancel).await?;
+    serde_json::from_str::<Waited>(&raw)
+        .map_err(|e| anyhow::anyhow!("wait_for_signal: unexpected reply ({e}): {raw}"))?;
+    Ok(())
+}
+
+// Takes signals one at a time. With an empty queue it waits for the next one
+// through `wait_for_signal`, which MCP answers the moment a poller queues it,
+// so a signal starts at once. The wait never takes a signal: a wait left
+// behind by a dead supervisor can't lose one. A failed round backs off
+// `backoff` before the next.
 pub async fn run_poll_loop(
     mcp: SharedMcp,
     supervisor: Arc<Supervisor>,
     cancel: CancellationToken,
-    interval: Duration,
+    backoff: Duration,
 ) -> anyhow::Result<()> {
     while !cancel.is_cancelled() {
-        let result = async {
-            let raw = mcp.call_tool("get_next_signal", serde_json::Map::new(), &cancel).await?;
-            let next: NextSignal = serde_json::from_str(&raw)?;
-            check(&cancel)?;
-            if let Some(signal) = next.signal {
-                eprintln!(
-                    "[supervisor] signal #{} source={} ({} pending after)",
-                    signal.id, signal.source, next.pending_after
-                );
-                supervisor.run_signal(&signal).await?;
-                Ok::<_, anyhow::Error>(true)
-            } else {
-                Ok(false)
-            }
-        }
-        .await;
-        match result {
-            Ok(true) => continue,
+        match poll_once(&mcp, &supervisor, &cancel).await {
+            Ok(()) => continue,
             Err(error) if !cancel.is_cancelled() => eprintln!("[supervisor] loop error: {error}"),
-            _ => {}
+            Err(_) => break,
         }
-        tokio::select! {_=cancel.cancelled()=>break,_=tokio::time::sleep(interval)=>{}}
+        tokio::select! {_=cancel.cancelled()=>break,_=tokio::time::sleep(backoff)=>{}}
     }
     Ok(())
 }

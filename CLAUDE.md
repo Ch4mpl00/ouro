@@ -43,7 +43,12 @@ deletion.
    which inserts a row into the `signals` queue in the `mcp_state` Postgres
    database.
 3. The supervisor (`crates/agent/src/supervisor.rs`, composed in `main.rs`)
-   loops on `get_next_signal`. Routing is by source: `scheduler` runs through
+   loops on `get_next_signal`. With an empty queue it blocks on
+   `wait_for_signal`, which MCP answers the moment a poller records a signal
+   (25 s rounds), so a signal starts at once instead of on the next poll. The
+   wait never takes a signal: a wait abandoned by a dead supervisor can't
+   lose one. `wait_for_signal` is supervisor-only — never offered to a model
+   (`agent::mcp::SUPERVISOR_ONLY_TOOLS`). Routing is by source: `scheduler` runs through
    the workflow module (`workflow.rs`: compile → execute), every other source
    runs the primary agent loop (`agent.rs`). A compile failure degrades to the
    agent loop in the same trace; an execute failure goes to `recovery` instead
@@ -285,7 +290,8 @@ also see them when running `claude` locally with `.mcp.json` registered.
   `recall`, `remember`, `get_fact`, `update_fact`, `list_memory`,
   `create_project`, `read_doc`, `append_doc`, `patch_doc`, `write_doc`,
   `doc_history`, `revert_patch`, `journal_append`, `journal_tail`
-- **Signals queue** — `get_next_signal`, `list_signals`
+- **Signals queue** — `get_next_signal`, `wait_for_signal` (supervisor
+  only: blocks until a signal is pending, takes nothing), `list_signals`
 - **Scheduler** — `schedule_task`, `list_scheduled_tasks`,
   `cancel_scheduled_task`
 - **Env** — `get_timezone`, `set_timezone`

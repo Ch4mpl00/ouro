@@ -1330,3 +1330,25 @@ async fn close_cancels_active_round_joins_tools_and_closes_trace_once() {
     assert_eq!(obs.iter().filter(|o| o.name == "wait" && o.level == "ERROR").count(), 2);
     f.engine.shutdown().await;
 }
+
+// ── Rust-only: the supervisor's own queue tool stays out of a model's reach ──
+
+// wait_for_signal blocks on the signal queue; a model that called it would
+// stall its run. It is never offered, even under `tools: *`, and a call to it
+// by name is refused without reaching MCP.
+#[tokio::test]
+async fn a_model_is_never_offered_or_allowed_the_supervisors_wait_for_signal() {
+    let model = Arc::new(Scripted::new(vec![calls(&[("wait_for_signal", json!({}))]), assistant("done")]));
+    let f = fixture(model.clone(), &["a", "wait_for_signal"], &[("domain", "---\ntools: *\n---\n# domain\n")]);
+    let mut opts = LoopOptions::new("loop", context());
+    opts.skills = vec!["domain".into()];
+    let loop_ = f.engine.start_loop(opts).await.unwrap();
+    assert_eq!(loop_.send("go".into()).await.unwrap(), "done");
+    let seen = model.seen.lock().unwrap().iter().map(|s| (s.tools.clone(), s.messages.clone())).collect::<Vec<_>>();
+    assert!(seen[0].0.iter().any(|t| t.name == "a"));
+    assert!(!seen[0].0.iter().any(|t| t.name == "wait_for_signal"));
+    assert!(f.mcp.called.lock().unwrap().is_empty(), "the call never reached MCP");
+    let reply = seen[1].1.iter().find(|m| m["role"] == "tool").unwrap();
+    assert!(text(reply["content"].as_str().unwrap()).contains("unavailable"));
+    f.engine.shutdown().await;
+}

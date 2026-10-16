@@ -4,15 +4,19 @@
 // this process.
 //
 // Sections:
-//   1. queue       — record / pop / count / list
+//   1. queue       — record / pop / count / list / wait
 //   2. env context — the per-signal environment note for the agent's prompt
-//   3. tools       — `signals` toolset (get_next_signal),
+//   3. tools       — `signals` toolset (get_next_signal, wait_for_signal),
 //                    `dreaming` toolset (list_signals)
+
+use std::sync::Arc;
+use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::{schemars, tool, tool_router};
 use serde::{Deserialize, Serialize};
+use tokio::sync::Notify;
 
 use crate::db::{Db, sql_time};
 use crate::pg::{Query, storable_text, where_clause};
@@ -22,9 +26,13 @@ use crate::time::require_js_date;
 
 // ── 1. queue ─────────────────────────────────────────────────────────────────
 
+// Every signal is recorded by a poller in this process, through `record`,
+// so an in-process notification is enough to wake whoever waits for one;
+// `wait_for_pending` still re-checks the table on its deadline.
 #[derive(Clone)]
 pub struct Signals {
     db: Db,
+    arrived: Arc<Notify>,
 }
 
 // Timestamps go out as "YYYY-MM-DD HH:MM:SS" UTC, the shape the agent has
@@ -58,7 +66,7 @@ const DEFAULT_LIST_LIMIT: u32 = 200;
 
 impl Signals {
     pub fn new(db: Db) -> Self {
-        Self { db }
+        Self { db, arrived: Arc::new(Notify::new()) }
     }
 
     pub async fn record(&self, source: &str, content: &str) -> anyhow::Result<i64> {
@@ -71,7 +79,31 @@ impl Signals {
                 &[&storable_text(source), &storable_text(content)],
             )
             .await?;
+        self.arrived.notify_waiters();
         Ok(row.get(0))
+    }
+
+    // Waits until at least one signal is pending, or `timeout` passes, and
+    // returns how many are pending. Never pops: a waiter whose client has gone
+    // (an agent killed mid-wait) can wake and return into nothing without
+    // costing a signal — taking one stays `pop_next`'s job.
+    pub async fn wait_for_pending(&self, timeout: Duration) -> anyhow::Result<i64> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            // Registered before the count, so a signal recorded in between
+            // still wakes this waiter.
+            let arrived = self.arrived.notified();
+            tokio::pin!(arrived);
+            arrived.as_mut().enable();
+            let pending = self.count_pending().await?;
+            if pending > 0 {
+                return Ok(pending);
+            }
+            tokio::select! {
+                _ = &mut arrived => {}
+                _ = tokio::time::sleep_until(deadline) => return self.count_pending().await,
+            }
+        }
     }
 
     // Atomically pops the oldest pending signal. SKIP LOCKED: a concurrent
@@ -206,6 +238,45 @@ impl McpTools {
             pending_after: crate::try_tool!(signals.count_pending().await),
         })
     }
+
+    #[tool(
+        name = "wait_for_signal",
+        title = "Wait for a signal",
+        description = "Supervisor plumbing: blocks until the queue holds at least \
+            one pending signal, or `timeoutMs` passes (default 25000, max \
+            50000), and returns `{ pending }`. Never takes a signal — call \
+            get_next_signal for that. Lets the supervisor react to a new \
+            signal at once instead of polling."
+    )]
+    async fn wait_for_signal(
+        &self,
+        Parameters(WaitForSignalParams { timeout_ms }): Parameters<WaitForSignalParams>,
+    ) -> ToolResult {
+        let timeout_ms = timeout_ms.unwrap_or(DEFAULT_WAIT_MS);
+        if timeout_ms > MAX_WAIT_MS {
+            return Err(invalid_params("timeoutMs must be at most 50000"));
+        }
+        let pending = crate::try_tool!(self.deps.signals.wait_for_pending(Duration::from_millis(timeout_ms)).await);
+        json_result(&WaitForSignalResult { pending })
+    }
+}
+
+// The longest wait a caller may ask for — under the agent's 60 s request
+// deadline, so a wait always answers before its caller gives up on it.
+pub const MAX_WAIT_MS: u64 = 50_000;
+const DEFAULT_WAIT_MS: u64 = 25_000;
+
+#[derive(Deserialize, schemars::JsonSchema)]
+struct WaitForSignalParams {
+    /// How long to wait for a signal, in milliseconds. Default 25000, max 50000.
+    #[serde(rename = "timeoutMs")]
+    #[schemars(range(min = 0, max = 50000))]
+    timeout_ms: Option<u64>,
+}
+
+#[derive(Serialize)]
+struct WaitForSignalResult {
+    pending: i64,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -300,6 +371,70 @@ mod tests {
         assert_eq!(after, ["b", "c"]);
         assert_eq!(s.list(&ListSignals { limit: Some(1), ..Default::default() }).await.unwrap().len(), 1);
         assert_eq!(s.count_pending().await.unwrap(), 3);
+    }
+
+    // A signal recorded while someone waits ends the wait at once; the wait
+    // takes nothing, so the signal is still there for get_next_signal.
+    #[tokio::test]
+    async fn a_wait_ends_when_a_signal_is_recorded_and_takes_nothing() {
+        let Some(db) = Db::test().await else { return };
+        let s = Signals::new(db);
+        let waiter = {
+            let s = s.clone();
+            tokio::spawn(async move {
+                let started = std::time::Instant::now();
+                (s.wait_for_pending(Duration::from_secs(20)).await.unwrap(), started.elapsed())
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!waiter.is_finished(), "an empty queue keeps the waiter waiting");
+        s.record("telegram", "now").await.unwrap();
+        let (pending, waited) = tokio::time::timeout(Duration::from_secs(5), waiter).await.unwrap().unwrap();
+        assert_eq!(pending, 1);
+        assert!(waited < Duration::from_secs(5), "woken by the record, not the deadline: {waited:?}");
+        assert_eq!(s.count_pending().await.unwrap(), 1, "the wait took nothing");
+        assert_eq!(s.pop_next().await.unwrap().unwrap().content, "now");
+    }
+
+    #[tokio::test]
+    async fn a_wait_returns_at_once_when_a_signal_is_already_pending() {
+        let Some(db) = Db::test().await else { return };
+        let s = Signals::new(db);
+        s.record("gmail", "waiting").await.unwrap();
+        let started = std::time::Instant::now();
+        assert_eq!(s.wait_for_pending(Duration::from_secs(20)).await.unwrap(), 1);
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(s.count_pending().await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_wait_on_an_empty_queue_ends_at_its_deadline_with_nothing_pending() {
+        let Some(db) = Db::test().await else { return };
+        let s = Signals::new(db);
+        let started = std::time::Instant::now();
+        assert_eq!(s.wait_for_pending(Duration::from_millis(300)).await.unwrap(), 0);
+        let waited = started.elapsed();
+        assert!(waited >= Duration::from_millis(300) && waited < Duration::from_secs(5), "{waited:?}");
+    }
+
+    // Several waiters (a stale session's and the live one's) all wake on one
+    // signal, and none of them consumes it.
+    #[tokio::test]
+    async fn every_waiter_wakes_on_one_signal() {
+        let Some(db) = Db::test().await else { return };
+        let s = Signals::new(db);
+        let waiters: Vec<_> = (0..3)
+            .map(|_| {
+                let s = s.clone();
+                tokio::spawn(async move { s.wait_for_pending(Duration::from_secs(20)).await.unwrap() })
+            })
+            .collect();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        s.record("telegram", "one").await.unwrap();
+        for w in waiters {
+            assert_eq!(tokio::time::timeout(Duration::from_secs(5), w).await.unwrap().unwrap(), 1);
+        }
+        assert_eq!(s.count_pending().await.unwrap(), 1);
     }
 
     #[test]
