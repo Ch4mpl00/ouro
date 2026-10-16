@@ -1,5 +1,3 @@
-node_modules/
-dist/
 .env
 .env.local
 .env.mcp
@@ -10,20 +8,18 @@ dist/
 # Local attachment / blob storage
 storage/
 
-# GAIA benchmark cache (gated dataset — must not be committed/reshared;
-# metadata.jsonl + attachments are pulled per-machine from HuggingFace)
-packages/agent/src/eval/fixtures/gaia/
+# Golden sets for the evals (news-filter-eval): real channel posts and
+# labels, kept per-machine.
+/eval-fixtures/
 
 # Live (runtime) skills — mutable, edited by the `dreaming` signal-handler.
 # Defaults checked in under skills.default/ act as fallback when a live
 # file is absent.
 /skills/
 
-# Generated SQLite databases (schema.sql is the source of truth)
-packages/*/data/*.db
-packages/*/data/*.db-journal
-packages/*/data/*.db-wal
-packages/*/data/*.db-shm
+# The agent's sqlite state (agent.db and friends; migrations live in
+# crates/agent/migrations), and the improver's audit log beside it.
+packages/*/data/
 
 # OS / editor
 .DS_Store

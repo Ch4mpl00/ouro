@@ -4,13 +4,13 @@
 // Sections:
 //   1. session — the stored credential, in gramjs StringSession format
 //   2. client  — lazy connection, dialogs, channel history
-//   3. login   — the one-time interactive flow behind `userbot:auth`
+//   3. login   — the one-time interactive flow behind `userbot-auth`
 //   4. tools   — `userbot` toolset: list_userbot_dialogs
 //
 // The session string is the long-lived credential: whoever has it has the
 // account. It lives only in the `mcp_state` database. It is kept in the exact
 // format gramjs wrote ("1" + base64(dc, address, port, 256-byte key)), so the
-// TS and Rust servers read the same row and a switch needs no re-login.
+// session the TS server logged in with still works, no re-login.
 
 use std::net::{Ipv4Addr, SocketAddrV4, SocketAddrV6};
 use std::sync::Arc;
@@ -323,9 +323,10 @@ impl Userbot {
         if let Some(client) = slot.as_ref() {
             return Ok(client.clone());
         }
-        let (_, raw) = self.saved_session().await?.ok_or_else(|| {
-            anyhow::anyhow!("Telegram userbot is not authorized. Run `pnpm userbot:auth` once to log in.")
-        })?;
+        let (_, raw) = self
+            .saved_session()
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Telegram userbot is not authorized. Run `userbot-auth` once to log in."))?;
         let creds = api_credentials()?;
         let session = Arc::new(StringSession::decode(&raw)?.into_session()?);
         let client = connect(session, creds.api_id);
@@ -466,7 +467,7 @@ impl McpTools {
             private chats) the userbot is subscribed to. Mostly useful for \
             discovery / debugging — to read channel posts use `list_news` \
             with source='channel'; the news poller harvests every subscribed \
-            channel in the background. Requires `pnpm userbot:auth` to have \
+            channel in the background. Requires `userbot-auth` to have \
             been run once."
     )]
     async fn list_userbot_dialogs(&self, Parameters(p): Parameters<ListDialogsParams>) -> ToolResult {

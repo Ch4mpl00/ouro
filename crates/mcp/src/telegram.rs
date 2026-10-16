@@ -988,7 +988,8 @@ impl ChatId {
 // becoming a flood.
 const MAX_SEND_CHARS: usize = 4 * TELEGRAM_TEXT_LIMIT;
 
-const NO_CHAT_TARGET: &str = "No chat target. Pass chatId, or set TELEGRAM_DEFAULT_CHAT_ID in .env (find your id with `pnpm telegram:get-chat-id`).";
+const NO_CHAT_TARGET: &str =
+    "No chat target. Pass chatId, or set TELEGRAM_DEFAULT_CHAT_ID in .env (find your id with `telegram-get-chat-id`).";
 
 fn check_text(text: &str, allow_empty: bool) -> Result<(), ErrorData> {
     let len = text.encode_utf16().count();

@@ -150,7 +150,7 @@ fn client_info() -> ClientConfig {
 }
 
 // From MCP_TRANSPORT / MCP_URL (http) or MCP_STDIO_COMMAND (stdio, default
-// `pnpm mcp:serve`). A malformed MCP_URL fails here, outside any retry.
+// `mcp-tools`). A malformed MCP_URL fails here, outside any retry.
 pub fn open_from_env() -> anyhow::Result<Open> {
     let mode = std::env::var("MCP_TRANSPORT").unwrap_or_else(|_| "stdio".into()).to_lowercase();
     if mode == "http" {
@@ -158,12 +158,12 @@ pub fn open_from_env() -> anyhow::Result<Open> {
         url::Url::parse(&url).map_err(|e| anyhow::anyhow!("MCP_URL {url:?}: {e}"))?;
         return Ok(open_http(url));
     }
-    let command = std::env::var("MCP_STDIO_COMMAND").unwrap_or_else(|_| "pnpm mcp:serve".into());
+    let command = std::env::var("MCP_STDIO_COMMAND").unwrap_or_else(|_| "mcp-tools".into());
     Ok(Arc::new(move || {
         let command = command.clone();
         Box::pin(async move {
             let mut parts = command.split_whitespace();
-            let program = parts.next().unwrap_or("pnpm");
+            let program = parts.next().unwrap_or("mcp-tools");
             let mut cmd = tokio::process::Command::new(program);
             cmd.args(parts);
             let transport = rmcp::transport::TokioChildProcess::new(cmd)?;

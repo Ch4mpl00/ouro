@@ -490,7 +490,7 @@ impl NewsProvider for TelegramChannels {
 
     async fn fetch(&self) -> anyhow::Result<Vec<NewsItem>> {
         if !self.account.has_session().await {
-            tracing::warn!("no saved userbot session — run `pnpm userbot:auth`. Skipping channels tick.");
+            tracing::warn!("no saved userbot session — run `userbot-auth`. Skipping channels tick.");
             return Ok(Vec::new());
         }
         let mut collected = Vec::new();

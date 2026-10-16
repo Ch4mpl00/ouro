@@ -1,8 +1,8 @@
 # Rewrite in Rust — the MCP server first, then the agent
 
-**Status:** in-progress — second switch prepared on `feat/rust-mcp` (2026-10-14); see the last section
+**Status:** done — Rust MCP on prod since 2026-10-14; `packages/mcp` deleted 2026-10-16 (rust-agent.md, last section)
 **Priority:** P2
-**Area:** whole repo; `crates/mcp` done, `packages/agent` next
+**Area:** whole repo; `crates/mcp`, `crates/agent`, `crates/codex`, `crates/evals`
 **Created:** 2026-10-02
 
 ## Context

@@ -8,7 +8,7 @@
 // None. save_skill always writes the live overlay — defaults are never touched
 // at runtime, so deleting a live file resets a skill.
 //
-// The improver (TS) appends lessons to `skills/<name>.patch.md`; the runtime
+// The improver (crates/evals) appends lessons to `skills/<name>.patch.md`; the runtime
 // glues them onto the END of a skill's system text with `append_patch`. The
 // MCP server's read_skill export (crates/mcp/src/skills.rs) composes it the
 // same way — change one, change both.
@@ -201,6 +201,37 @@ impl FsSkillStore {
             );
         }
         Ok(())
+    }
+
+    // The active file's exact text, frontmatter included — the contract the
+    // judge scores a node against. Live → default, None when neither exists.
+    pub async fn read_skill_raw(&self, name: &str) -> anyhow::Result<Option<String>> {
+        validate_name(name)?;
+        if let Some(live) = read_if_exists(&self.live_dir.join(format!("{name}.md"))).await? {
+            return Ok(Some(live));
+        }
+        read_if_exists(&self.defaults_dir.join(format!("{name}.md"))).await
+    }
+
+    // Write the improver's patch overlay (skills/<name>.patch.md). Deleting
+    // the file is the clean revert (the body falls back to its unpatched form).
+    pub async fn save_patch(&self, name: &str, content: &str) -> anyhow::Result<Written> {
+        validate_name(name)?;
+        tokio::fs::create_dir_all(&self.live_dir).await?;
+        let target = self.live_dir.join(format!("{name}.patch.md"));
+        tokio::fs::write(&target, content).await?;
+        Ok(Written { path: target.to_string_lossy().into_owned(), size_bytes: content.len() })
+    }
+
+    // Delete the patch overlay entirely — the auto-revert's clean reset to the
+    // body. True if a file was removed, false if there was none.
+    pub async fn delete_patch(&self, name: &str) -> anyhow::Result<bool> {
+        validate_name(name)?;
+        match tokio::fs::remove_file(self.live_dir.join(format!("{name}.patch.md"))).await {
+            Ok(()) => Ok(true),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(err) => Err(err.into()),
+        }
     }
 }
 

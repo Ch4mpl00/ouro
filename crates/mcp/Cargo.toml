@@ -37,8 +37,12 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 url = "2.5.8"
 
 [dev-dependencies]
+# The agent's skill loader and MCP client, for the cross-crate contract tests
+# (tests/skills_contract.rs, tests/shipped_skills.rs).
+agent = { path = "../agent" }
 cucumber = "0.23"
 proptest = "1"
+tempfile = "3"
 testcontainers-modules = { version = "0.15", features = ["postgres"] }
 # The same crate testcontainers-modules re-exports; only adds the feature that
 # lets every test process share one container (tests/support/container.rs).

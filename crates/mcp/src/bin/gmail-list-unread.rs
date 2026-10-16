@@ -11,7 +11,7 @@ async fn main() -> anyhow::Result<()> {
         None => gmail
             .resolve_account_key()
             .await?
-            .ok_or_else(|| anyhow::anyhow!("No Gmail account in DB. Run `pnpm gmail:auth` first."))?,
+            .ok_or_else(|| anyhow::anyhow!("No Gmail account in DB. Run `gmail-auth` first."))?,
     };
     let query = cli::arg("query").unwrap_or_else(|| "is:unread".into());
     let limit: u32 = cli::arg("limit").map_or(Ok(10), |l| l.parse())?;

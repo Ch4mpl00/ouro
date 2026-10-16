@@ -28,8 +28,8 @@ gold/acceptable IDs in `queries.jsonl` point into `corpus.jsonl` by id.
 Regenerate `corpus.jsonl`:
 
 ```
-pnpm eval:snapshot                  # most recent 2000 rows
-pnpm eval:snapshot -- --limit 5000  # bigger window
+cargo run --release -p mcp-tools --bin eval-snapshot                 # most recent 2000 rows
+cargo run --release -p mcp-tools --bin eval-snapshot -- --limit 5000 # bigger window
 ```
 
 **A corpus refresh invalidates the labels.** `queries.jsonl` `gold`

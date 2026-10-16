@@ -1,1 +1,0 @@
-DROP INDEX "news_items_embedding_ivf";
