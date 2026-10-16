@@ -1,0 +1,20 @@
+[Unit]
+Description=Ouro tunnel client container
+Requires=docker.service ouro-mcp-tunnel.service
+After=docker.service ouro-mcp-tunnel.service
+PartOf=ouro-mcp-tunnel.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+WorkingDirectory=__REPOSITORY__
+ExecStartPre=/usr/bin/python3 /opt/ouro/app/probe.py mcp-tunnel
+ExecStart=/usr/bin/docker compose up --no-build --no-deps --exit-code-from tunnel-client tunnel-client
+ExecStop=-/usr/bin/docker compose stop -t 30 tunnel-client
+Restart=always
+RestartSec=3
+TimeoutStartSec=120
+TimeoutStopSec=45
+
+[Install]
+WantedBy=multi-user.target

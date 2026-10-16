@@ -95,7 +95,7 @@ fn env() -> &'static Env {
                     handler_seen.sessions.fetch_add(1, Ordering::SeqCst);
                     Paid(handler_seen.clone())
                 },
-                HttpOptions { port, allowed_hosts: Vec::new(), multi_session: true },
+                HttpOptions { bind_address: "127.0.0.1".parse().unwrap(), port, allowed_hosts: Vec::new(), multi_session: true },
                 cancel.clone(),
             ));
             std::fs::write(
@@ -117,6 +117,7 @@ async fn boot(env: &Env, toolsets: Option<&str>) -> (String, Child) {
         .env("PATH", std::env::var("PATH").unwrap_or_default())
         .env("HOME", std::env::var("HOME").unwrap_or_default())
         .env("MCP_TRANSPORT", "http")
+        .env("MCP_HOST", "127.0.0.1")
         .env("MCP_PORT", port.to_string())
         .env("MCP_NO_POLLERS", "1")
         .env("DATABASE_URL", &env.db.url)

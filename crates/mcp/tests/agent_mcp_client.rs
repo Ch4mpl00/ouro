@@ -101,7 +101,12 @@ fn effects_child() {
             log(&ledger, &format!("session {generation}"));
             Effects { ledger: ledger.clone() }
         };
-        let options = HttpOptions { port: port.parse().unwrap(), allowed_hosts: Vec::new(), multi_session: multi };
+        let options = HttpOptions {
+            bind_address: "127.0.0.1".parse().unwrap(),
+            port: port.parse().unwrap(),
+            allowed_hosts: Vec::new(),
+            multi_session: multi,
+        };
         serve_http(make, options, CancellationToken::new()).await.unwrap();
     });
 }

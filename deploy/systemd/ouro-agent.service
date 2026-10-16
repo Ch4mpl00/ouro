@@ -1,0 +1,28 @@
+[Unit]
+Description=Ouro agent supervisor
+Wants=network-online.target ouro-mcp.service
+Requires=ouro-containers.service
+After=network-online.target ouro-containers.service ouro-mcp.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=exec
+User=ouro
+Group=ouro
+WorkingDirectory=/opt/ouro/app
+EnvironmentFile=/etc/ouro/agent.env
+ExecStartPre=/usr/bin/python3 /opt/ouro/app/probe.py mcp
+ExecStartPre=/usr/bin/python3 /opt/ouro/app/probe.py codex
+ExecStart=/opt/ouro/bin/agent-supervisor
+Restart=always
+RestartSec=3
+TimeoutStopSec=180
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/ouro
+
+[Install]
+WantedBy=multi-user.target

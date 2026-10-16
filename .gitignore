@@ -34,5 +34,8 @@ packages/*/data/
 # Rust build output
 /target/
 
+# Deployment/test Python helpers
+__pycache__/
+
 # Rust MCP local state
 crates/*/data/

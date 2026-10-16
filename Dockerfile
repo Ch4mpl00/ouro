@@ -39,6 +39,9 @@ RUN set -eu; \
 # crate takes ~0.5 GB: an 8 GB Docker VM ran out (`ld … Killed`). ARGs reach
 # the RUN below as env, which cargo reads.
 ARG CARGO_BUILD_JOBS=4
+# Native deployments select just the affected binaries; the full runtime
+# image still builds every CLI when BINARIES is empty.
+ARG BINARIES=""
 WORKDIR /src
 COPY Cargo.toml Cargo.lock rustfmt.toml ./
 COPY crates ./crates
@@ -46,9 +49,18 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,target=/src/target,sharing=locked \
     set -eu; . /cross-env; \
-    cargo build --release --locked --bins --target "$TRIPLE"; \
+    if [ -n "$BINARIES" ]; then \
+      set --; for binary in $BINARIES; do set -- "$@" --bin "$binary"; done; \
+      cargo build --release --locked --target "$TRIPLE" "$@"; \
+    else cargo build --release --locked --bins --target "$TRIPLE"; fi; \
     mkdir -p /out; \
-    find "target/$TRIPLE/release" -maxdepth 1 -type f -perm -u+x -exec cp {} /out/ \;
+    if [ -n "$BINARIES" ]; then \
+      for binary in $BINARIES; do cp "target/$TRIPLE/release/$binary" /out/; done; \
+    else find "target/$TRIPLE/release" -maxdepth 1 -type f -perm -u+x -exec cp {} /out/ \;; fi
+
+# Export files, without a runtime image or docker save/load round trip.
+FROM scratch AS native
+COPY --from=mcp-build /out/ /
 
 FROM node:22-bookworm-slim AS runtime
 # ca-certificates for TLS; python3 + pandas/openpyxl give the codex `code_agent`

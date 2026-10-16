@@ -21,7 +21,8 @@ workspace:
 The server and the agent communicate strictly through the MCP protocol;
 neither depends on the other's crate (only tests do: `crates/mcp/tests` drive
 the agent's client and skill loader against the real server). Deployed as
-containers of one image (`docker-compose.yml`).
+three native systemd services; Postgres, Codex and tunnel-client stay in
+Docker (`docker-compose.yml`). See README.md, Deploy, for the current layout.
 
 **Everything was TypeScript until 2026-10.** The MCP server went to Rust on
 2026-10-14, the agent on 2026-10-15, and the TS packages (`packages/mcp`,
@@ -78,10 +79,10 @@ mcp-tools/
 ├── .env.mcp                MCP container env (integration creds)
 ├── .env.agent              agent container env (model keys, presets)
 ├── .env.example, .env.mcp.example, .env.agent.example
-├── docker-compose.yml      postgres, mcp, mcp-tunnel + tunnel-client, agent, codex,
-│                           judge-worker + improve-worker (profile `evals`)
-├── Dockerfile              one image for every service
-├── scripts/deploy.sh       build here, ship over SSH, restart
+├── docker-compose.yml      postgres, codex, tunnel-client (native app: systemd)
+├── Dockerfile              cached cross-builder + explicit Codex runtime image
+├── scripts/deploy.sh       changed binaries via rsync; tests/docs skip deploy
+├── deploy/systemd/         native services and container startup ordering
 ├── skills.default/         shipped skills (git-tracked, read-only fallback)
 ├── skills/                 live overlay, gitignored; dreaming writes here
 ├── storage/                downloaded Gmail attachments (gitignored)
@@ -474,49 +475,46 @@ Tests:
   the server and the model disagree, fix the code or ask — a rule change
   starts in `model.rs`, and its properties must still pass.
 
-Deploy: `scripts/deploy.sh [services…]` from the laptop — it builds the
-linux/amd64 image locally (the droplet can't compile the crates), ships it
-over SSH and runs `docker compose up -d --no-build` on a checkout of the
-same commit, which must be pushed. Named volumes (`mcp-data`, `mcp-storage`,
-`agent-data`, `agent-skills`, `pg-data`) persist state across rebuilds.
-First boot needs `.env.postgres` (POSTGRES_USER / PASSWORD / DB) and
-`OPENAI_API_KEY` in `.env.mcp`.
+## Production deployment
 
-The two evaluation services — `judge-worker` (per-node Codex judge) and
-`improve-worker` (closed-loop improver) — sit behind the `evals` compose
-profile and are OFF since 2026-08-31: scoring live prod runs wasn't worth
-the codex quota, and the plan is golden sets instead. A plain
-`docker compose up -d` skips them; bring them back with
-`docker compose --profile evals up -d judge-worker improve-worker`. The
-`codex` service itself stays ON regardless — the agent's `code_agent` tool
-runs through it.
+`README.md` → Deploy is the deployment reference. `scripts/deploy.sh`
+selects runtime changes, cross-compiles affected binaries locally, skips
+unchanged binaries by hash and sends them via rsync. Test/spec/doc-only
+changes do not build, upload or restart. `scripts/test_deploy.py` checks this.
 
-### ChatGPT connector (Secure MCP Tunnel)
+Native units: `ouro-mcp`, `ouro-mcp-tunnel`, `ouro-agent`, running as the
+`ouro` user. Application files are `/opt/ouro/{bin,app}`; mutable state is
+`/var/lib/ouro/{agent,skills,storage}`. Native credentials live in root-only
+`/etc/ouro/{agent,mcp,mcp-tunnel}.env`, imported from the effective server
+container environment at migration. They are authoritative afterwards;
+local env files are never uploaded. `AGENT_DB_PATH` points at the migrated
+sqlite database; its TS-era default path is still used locally.
 
-Two extra compose services, both optional — the rest of the stack runs
-without them:
+Postgres and Codex remain containerized, with the existing `pg-data` and
+`codex-home` volumes. Codex uses a stable runtime image and the deployed
+`codex-service` executable through a read-only bind mount. Use
+`scripts/deploy.sh --runtime-image` only for runtime dependencies; ordinary
+Rust deployments never send the whole image. Evaluation workers remain off;
+evaluation binaries can still be run explicitly as CLIs.
 
-- **`mcp-tunnel`** — a second `mcp` process on port 3001 with
-  `MCP_NO_POLLERS=1` and
-  `MCP_TOOLSETS=news-read,telegram-send,skills,memory`: news reading, one
-  Telegram write, the skills export, unified memory, and no gateway. The exact
-  list is pinned by a test in `crates/mcp/src/toolsets.rs` — if that list and this env
-  var drift apart, ChatGPT silently gets a surface nobody chose. `expose`
-  only, like `mcp` — never `ports`. It shares the `mcp-data` volume because
-  `send_telegram_message` appends to the `telegram_messages` chat log, and the
-  same Postgres as `mcp`, so **memory really is shared**: ChatGPT reads and
-  writes the same projects and facts as the supervisor, signed
-  `MCP_MEMORY_ACTOR=chatgpt` in `doc_history`.
-- **`tunnel-client`** — `ghcr.io/openai/tunnel-client`, OpenAI's daemon. It
-  long-polls `api.openai.com` outbound and forwards MCP requests to
-  `http://mcp-tunnel:3001/mcp`. Nothing is published; ChatGPT only ever knows
-  a `tunnel_id`. In ChatGPT the connector is a developer-mode app with
-  *Connection → Tunnel*.
+`ouro-containers` starts Postgres and Codex on boot. `ouro-tunnel-client`
+waits for the restricted native endpoint before starting the tunnel
+container, and retries if the daemon exits. The daemon still uses the
+server checkout's `.env.mcp`; it uses host networking to reach
+`http://127.0.0.1:3001/mcp`. Credentials are mapped inside its entrypoint
+as before. Native MCP binds loopback with `MCP_HOST=127.0.0.1`; Postgres
+and Codex publish only on loopback. Neither MCP endpoint is public.
 
-  Credentials live in `.env.mcp` as `OPENAI_TUNNEL_ID` +
-  `OPENAI_TUNNEL_API_KEY`; the service's entrypoint is the single place that
-  maps them onto the daemon's `CONTROL_PLANE_TUNNEL_ID` /
-  `--control-plane.api-key`. Note that compose expands `${VAR}` from the
-  shell and the project-root `.env`, **not** from a service's `env_file`, so
-  the mapping has to happen inside the container. The key should be a
-  restricted one (Tunnels Read + Use), never the admin key.
+The restricted endpoint keeps `MCP_NO_POLLERS=1`,
+`MCP_TOOLSETS=news-read,telegram-send,skills,memory`, actor `chatgpt`,
+and multi-session transport. The full MCP is actor `supervisor` and owns
+the only Telegram poller. Both share the same PG-backed memory; the
+restricted endpoint reads the same live skills through the state symlink.
+
+The first migration stops/removes legacy MCP/agent containers, copies the
+closed sqlite database, live skills and attachments to native state, and
+retains the existing database/sandbox volumes. No previous application
+release or rollback copy is kept (explicit user preference). Binaries are
+atomically replaced. Deploys require a clean pushed commit, reject stale
+or concurrent applies, and record the current revision only after endpoint
+health and the supervisor's skill validation pass.
