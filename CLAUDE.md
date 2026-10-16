@@ -448,6 +448,11 @@ image they are on `PATH`.
 
 Tests:
 
+- `scripts/test.py` — the whole suite with the test binaries side by side
+  (6 at a time, `TEST_JOBS`; ~2 min instead of ~7 for `cargo test`). Builds
+  once, logs each binary to `target/test-logs/`, prints a failing one's log;
+  extra args go to cargo (`scripts/test.py -p agent`). Each test file uses its
+  own database in the shared test Postgres, so binaries don't collide.
 - `cargo test` — every crate: unit, property, the Postgres tests (an
   auto-started pgvector testcontainer unless `TEST_DATABASE_URL` is set —
   point it at a throwaway server, never prod), the specs, the reference

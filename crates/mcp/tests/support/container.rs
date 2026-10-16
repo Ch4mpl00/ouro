@@ -28,6 +28,9 @@ pub async fn shared_server() -> anyhow::Result<String> {
             .with_name("pgvector/pgvector")
             .with_tag("pg16")
             .with_container_name(CONTAINER)
+            // Test binaries run side by side (scripts/test.py), each with its
+            // own servers and pools; the default 100 runs out.
+            .with_cmd(["postgres", "-c", "max_connections=500"])
             .with_reuse(ReuseDirective::Always)
             .start()
             .await;
@@ -80,6 +83,17 @@ pub async fn fresh_database(admin: &str, name: &str) -> anyhow::Result<()> {
             let _ = client.batch_execute(&format!("DROP DATABASE IF EXISTS {old} WITH (FORCE)")).await;
         }
     }
-    client.batch_execute(&format!("CREATE DATABASE {name}")).await?;
-    Ok(())
+    // CREATE DATABASE copies template1 and fails while another process is
+    // copying it too; parallel test binaries do that, so try again.
+    let mut attempt = 0;
+    loop {
+        match client.batch_execute(&format!("CREATE DATABASE {name}")).await {
+            Ok(()) => return Ok(()),
+            Err(err) if attempt < 20 && format!("{err:?}").contains("is being accessed by other users") => {
+                attempt += 1;
+                tokio::time::sleep(Duration::from_millis(100 + 50 * attempt)).await;
+            }
+            Err(err) => return Err(err.into()),
+        }
+    }
 }
