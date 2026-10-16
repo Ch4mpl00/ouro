@@ -130,11 +130,17 @@ export async function runHttpTransport(options: HttpTransportOptions): Promise<R
           await endpoint.connect(transport);
           if (sharedEndpoint) boundTransport = transport;
         } else {
-          res.writeHead(400, { "content-type": "application/json" });
+          // An attached session that no longer exists is a transport-level
+          // rejection: the tool has not run. Streamable HTTP clients (including
+          // rmcp) use 404 to renew the session safely. A missing id is still 400.
+          res.writeHead(sessionId ? 404 : 400, { "content-type": "application/json" });
           res.end(
             JSON.stringify({
               jsonrpc: "2.0",
-              error: { code: -32000, message: "No valid session id; send an initialize request first." },
+              error: {
+                code: -32000,
+                message: sessionId ? "Session not found" : "No valid session id; send an initialize request first.",
+              },
               id: null,
             }),
           );

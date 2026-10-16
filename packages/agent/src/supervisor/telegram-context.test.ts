@@ -80,6 +80,14 @@ describe("Telegram signal context", () => {
     expect(JSON.parse(h.context.memory.get(TELEGRAM_HISTORY_KEY)).messages).toHaveLength(2);
   });
 
+  it("leaves out messages logged after the signal when the current one is absent from the log", async () => {
+    const h = setup([message(1, "Какой период?"), message(2, "Будущий ответ", { created_at: "2026-09-06 12:00:05" })]);
+    const input = await h.run();
+    expect(input).toContain("Какой период?");
+    expect(input).not.toContain("Будущий ответ");
+    expect(h.context.memory.get(TELEGRAM_HISTORY_KEY)).not.toContain("Будущий ответ");
+  });
+
   it("keeps the latest complete messages inline and preserves omitted history in memory", async () => {
     const h = setup([message(1, "OLD " + "x".repeat(20_000)), message(2, "Recent question"), message(3, "Recent answer")]);
     const input = await h.run();

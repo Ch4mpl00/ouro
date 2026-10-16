@@ -1,10 +1,11 @@
 # syntax=docker/dockerfile:1
 # Single image for every service (mcp + agent + workers). docker-compose picks
-# the command per service. Two build stages: the Rust MCP binaries, and the
+# the command per service. Two build stages: the Rust MCP and agent binaries, and the
 # node_modules (better-sqlite3 needs a native compile at install time). The
 # runtime stage copies only their outputs + source. The TS MCP server
 # (packages/mcp) stays in the image while the Rust one proves itself: rolling
-# back is a compose `command:` change, no rebuild.
+# back is a compose `command:` change, no rebuild. The TS agent is retained
+# for the same rollback path; judge/improve/GAIA tooling continues to use TS.
 #
 # Built on a laptop and shipped to the droplet (scripts/deploy.sh): the
 # droplet is 1 vCPU / 2 GB and cannot compile the crate. The image targets
@@ -14,7 +15,7 @@
 #   - cargo's registry and target dir live in BuildKit cache mounts, so a
 #     rebuild only recompiles what changed.
 
-# MCP server and its CLIs (crates/mcp). Bookworm matches the runtime's glibc.
+# MCP server / CLIs and the agent supervisor (crates/mcp + crates/agent). Bookworm matches the runtime's glibc.
 FROM --platform=$BUILDPLATFORM rust:1.90-bookworm AS mcp-build
 ARG TARGETARCH
 # Debian's triplet-prefixed gcc exists natively for the build arch; the other
@@ -83,7 +84,7 @@ COPY --from=deps /app/node_modules ./node_modules
 COPY --from=deps /app/packages/mcp/node_modules ./packages/mcp/node_modules
 COPY --from=deps /app/packages/agent/node_modules ./packages/agent/node_modules
 
-# mcp-tools (the server), mcp-setup, gmail-auth, userbot-auth, embed-backfill, …
+# mcp-tools, agent-supervisor, mcp-setup, gmail-auth, userbot-auth, embed-backfill, …
 COPY --from=mcp-build /out/ /usr/local/bin/
 
 # Source. .dockerignore strips data/, storage/, .env*, node_modules, and

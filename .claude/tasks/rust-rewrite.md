@@ -195,3 +195,13 @@ same Postgres migrations, so either one boots on what the other left.
 - Gmail still answers `invalid_grant`: the refresh token dates from
   2026-05-20 and the watermark stopped on 2026-05-13 — not the switch. Renew
   with `docker compose run --rm mcp gmail-auth`.
+
+
+### Agent continuation — 2026-10-14
+
+`feat/rust-agent` in `.claude/worktrees/rust-agent` now contains a tested Rust
+runtime (providers, tracing, SQLite, MCP client, engine / ReAct loop,
+synthetic tools, Codex, decisions, workflow, supervisor and activity journal).
+The `agent-supervisor` binary and compose switch are prepared and tested locally;
+Linux image verification and deployment remain. Production still runs the TS agent. Detailed progress, library
+mapping and the exact continuation point: [rust-agent.md](rust-agent.md).
