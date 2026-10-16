@@ -12,14 +12,16 @@ def ready(service):
     request = urllib.request.Request(
         f"http://127.0.0.1:{port}{path}",
         method="GET" if service == "codex" else "POST",
-        headers={"Accept": "application/json, text/event-stream"},
+        data=None if service == "codex" else b'{"jsonrpc":"2.0","id":0,"method":"ping"}',
+        headers={"Accept": "application/json, text/event-stream", "Content-Type": "application/json"},
     )
     try:
         with urllib.request.urlopen(request, timeout=2) as response:
             return service == "codex" and response.status == 200
     except urllib.error.HTTPError as error:
-        # An empty POST is rejected before a session is allocated.
-        return service != "codex" and error.code == 400
+        # A valid ping without a session gets "expect initialize request".
+        # This proves the protocol is up without allocating/evicting a session.
+        return service != "codex" and error.code == 422
     except (OSError, TimeoutError):
         return False
 

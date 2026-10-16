@@ -110,12 +110,13 @@ class Configuration(unittest.TestCase):
 
     def test_probe_requires_mcp_protocol_rejection_without_creating_a_session(self):
         import urllib.error
-        for status, expected in [(400, True), (403, False), (404, False), (500, False)]:
+        for status, expected in [(422, True), (400, False), (403, False), (404, False), (500, False)]:
             with self.subTest(status=status), patch.object(probe.urllib.request, "urlopen",
                     side_effect=urllib.error.HTTPError("url", status, "", {}, None)) as request:
                 self.assertEqual(probe.ready("mcp"), expected)
                 self.assertEqual(request.call_args.args[0].method, "POST")
-                self.assertIsNone(request.call_args.args[0].data)
+                self.assertEqual(request.call_args.args[0].data, b'{"jsonrpc":"2.0","id":0,"method":"ping"}')
+                self.assertEqual(request.call_args.args[0].get_header("Content-type"), "application/json")
 
 
 if __name__ == "__main__":
