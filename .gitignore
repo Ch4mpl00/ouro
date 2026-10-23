@@ -1,7 +1,4 @@
-/target
-node_modules/
-*.node
-.env
-.env.*
-!.env.example
-.DS_Store
+/target/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal

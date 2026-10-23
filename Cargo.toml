@@ -1,0 +1,9 @@
+[workspace]
+resolver = "3"
+members = ["crates/owf"]
+
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
