@@ -13,6 +13,8 @@ struct StoredRun {
     awaits: BTreeMap<String, i64>,
     listeners: BTreeMap<String, Vec<String>>,
     events: Vec<StoredEvent>,
+    #[serde(default)]
+    subscriptions: BTreeMap<String, Vec<String>>,
 }
 
 fn key(kind: &str, id: &str) -> (String, String) {
@@ -85,6 +87,7 @@ fn insert(rows: &mut Rows, admission: &Admission, now: i64) -> anyhow::Result<bo
             awaits: BTreeMap::new(),
             listeners: BTreeMap::new(),
             events: Vec::new(),
+            subscriptions: BTreeMap::new(),
         },
     )?;
     Ok(true)
@@ -97,6 +100,9 @@ fn close(snapshot: &mut StoredRun, types: &[String]) {
     }
 }
 fn envelope(event: &StoredEvent) -> anyhow::Result<Value> {
+    if let Some(envelope) = &event.envelope {
+        return Ok(envelope.clone());
+    }
     Ok(
         json!({"type":event.type_, "data":event.data, "time":chrono::DateTime::from_timestamp_millis(event.delivered_at_ms).ok_or_else(|| anyhow::anyhow!("invalid event timestamp"))?.to_rfc3339()}),
     )
@@ -115,10 +121,56 @@ fn deliver(rows: &mut Rows, t: &str, data: &Value, now: i64, target: Option<&str
     let Some(mut snapshot) = eligible.into_iter().next() else {
         return Ok(None);
     };
-    snapshot.events.push(StoredEvent { type_: t.into(), data: data.clone(), delivered_at_ms: now, consumed_key: None });
+    snapshot.events.push(StoredEvent {
+        type_: t.into(),
+        data: data.clone(),
+        delivered_at_ms: now,
+        consumed_key: None,
+        envelope: None,
+    });
     snapshot.run.wake_at_ms = now;
     store_run(rows, &snapshot)?;
     Ok(Some(snapshot.run.admission.id))
+}
+/// Whether a pending event may be taken by `types` (`*` takes published ones).
+fn takes(types: &[String], event: &StoredEvent) -> bool {
+    types.contains(&event.type_) || (event.envelope.is_some() && types.iter().any(|t| t == "*"))
+}
+fn subscribed(snapshot: &StoredRun, event: &StoredEvent) -> bool {
+    event.envelope.is_some() && snapshot.subscriptions.values().any(|types| takes(types, event))
+}
+fn same_event(a: &Value, b: &Value) -> bool {
+    a.get("id").is_some() && a.get("id") == b.get("id") && a.get("source") == b.get("source")
+}
+fn publish(rows: &mut Rows, event: &Value, target: Option<&str>, now: i64) -> anyhow::Result<Vec<String>> {
+    let t = event
+        .get("type")
+        .and_then(Value::as_str)
+        .filter(|t| !t.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("a published event needs a type"))?;
+    let stored = StoredEvent {
+        type_: t.into(),
+        data: event.get("data").cloned().unwrap_or(Value::Null),
+        delivered_at_ms: now,
+        consumed_key: None,
+        envelope: Some(event.clone()),
+    };
+    let mut receivers = Vec::new();
+    for mut snapshot in all_runs(rows)? {
+        let eligible = snapshot.run.ended_ms.is_none()
+            && match target {
+                Some(id) => id == snapshot.run.admission.id,
+                None => subscribed(&snapshot, &stored),
+            }
+            && !snapshot.events.iter().any(|e| e.envelope.as_ref().is_some_and(|e| same_event(e, event)));
+        if eligible {
+            snapshot.events.push(stored.clone());
+            snapshot.run.wake_at_ms = now;
+            receivers.push(snapshot.run.admission.id.clone());
+            store_run(rows, &snapshot)?;
+        }
+    }
+    Ok(receivers)
 }
 fn lifecycle(rows: &mut Rows, id: &str, status: &Status, now: i64) -> anyhow::Result<()> {
     let Some(link) = run(rows, id)?.run.child else {
@@ -151,6 +203,7 @@ fn terminate(rows: &mut Rows, id: &str, status: &Status, now: i64) -> anyhow::Re
     snapshot.run.lease_until_ms = None;
     snapshot.awaits.clear();
     snapshot.listeners.clear();
+    snapshot.subscriptions.clear();
     store_run(rows, &snapshot)?;
     // Iterative cascade avoids stack growth on arbitrarily nested child runs.
     let mut parents = vec![id.to_string()];
@@ -166,6 +219,7 @@ fn terminate(rows: &mut Rows, id: &str, status: &Status, now: i64) -> anyhow::Re
             child.run.lease_until_ms = None;
             child.awaits.clear();
             child.listeners.clear();
+            child.subscriptions.clear();
             parents.push(child.run.admission.id.clone());
             store_run(rows, &child)?;
             lifecycle(rows, &child.run.admission.id, &Status::Cancelled, now)?;
@@ -273,7 +327,7 @@ impl RunStore for TransactionalStore {
                 };
                 return Ok(Some(event.clone()));
             }
-            let candidate = s.events.iter().position(|e| e.consumed_key.is_none() && types.contains(&e.type_));
+            let candidate = s.events.iter().position(|e| e.consumed_key.is_none() && takes(types, e));
             let result = if let Some(i) = candidate {
                 let event = envelope(&s.events[i])?;
                 s.events[i].consumed_key = Some(k.into());
@@ -292,6 +346,33 @@ impl RunStore for TransactionalStore {
             Ok(result)
         })
     }
+    fn subscribe(&self, f: &Fence, k: &str, types: &[String], now: i64) -> anyhow::Result<()> {
+        self.update(|rows| {
+            let mut s = checked(rows, f, now)?;
+            s.subscriptions.insert(k.into(), types.to_vec());
+            store_run(rows, &s)
+        })
+    }
+    fn unsubscribe(&self, f: &Fence, k: &str, now: i64) -> anyhow::Result<()> {
+        self.update(|rows| {
+            let mut s = checked(rows, f, now)?;
+            s.subscriptions.remove(k);
+            store_run(rows, &s)
+        })
+    }
+    fn publish(&self, event: &Value, target: Option<&str>, now: i64) -> anyhow::Result<Vec<String>> {
+        self.update(|rows| publish(rows, event, target, now))
+    }
+    fn definition_names(&self) -> anyhow::Result<Vec<String>> {
+        Ok(self
+            .backend
+            .snapshot()?
+            .rows
+            .keys()
+            .filter(|(kind, _)| kind == "definitions")
+            .map(|(_, id)| id.clone())
+            .collect())
+    }
     fn finish(&self, f: &Fence, outcome: &Status, now: i64, threshold: u32) -> anyhow::Result<Status> {
         self.update(|rows| {
             let mut s = checked(rows, f, now)?;
@@ -301,7 +382,10 @@ impl RunStore for TransactionalStore {
                     s.run.state = RunState::Waiting;
                     s.run.interruptions = 0;
                     s.run.wake_at_ms = *wake_at_ms;
-                    if s.events.iter().any(|e| e.consumed_key.is_none() && s.awaits.contains_key(&e.type_)) {
+                    if s.events
+                        .iter()
+                        .any(|e| e.consumed_key.is_none() && (s.awaits.contains_key(&e.type_) || subscribed(&s, e)))
+                    {
                         s.run.wake_at_ms = now;
                     }
                 }

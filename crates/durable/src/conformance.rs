@@ -36,7 +36,7 @@ fn audit(store: &dyn RunStore) -> anyhow::Result<()> {
     for r in store.list(None, "")? {
         let s = store.inspect(&r.admission.id)?.unwrap();
         if r.ended_ms.is_some() {
-            assert!(s.awaits.is_empty() && s.listeners.is_empty());
+            assert!(s.awaits.is_empty() && s.listeners.is_empty() && s.subscriptions.is_empty());
             assert!(r.fence.is_none());
         }
         let mut pending = BTreeSet::new();
@@ -49,8 +49,12 @@ fn audit(store: &dyn RunStore) -> anyhow::Result<()> {
                 };
                 assert_eq!(event["type"], e.type_);
                 assert_eq!(event["data"], e.data);
-            } else {
+            } else if e.envelope.is_none() {
                 assert!(pending.insert(&e.type_), "duplicate pending delivery");
+            }
+            if let Some(envelope) = &e.envelope {
+                assert_eq!(envelope["type"], e.type_);
+                assert_eq!(envelope.get("data").unwrap_or(&Value::Null), &e.data);
             }
         }
         for (k, r) in &s.records {
@@ -158,6 +162,59 @@ pub fn run_all(factory: impl Fn(&str) -> anyhow::Result<TestStore>) -> anyhow::R
         "terminal cleanup",
     ]);
 
+    let t = factory("published")?;
+    report.cases += 1;
+    let s = &t.store;
+    let event = |id: &str, t: &str| json!({"specversion":"1.0","id":id,"source":"/test","type":t,"data":{"n":id}});
+    let a = s.start(&admission("a"), 0)?.unwrap();
+    let b = s.start(&admission("b"), 0)?.unwrap();
+    s.start(&admission("idle"), 0)?.unwrap();
+    s.subscribe(&a, "listen", &["reading".into()], 0)?;
+    s.subscribe(&b, "listen", &["*".into()], 0)?;
+    assert_eq!(s.publish(&event("1", "reading"), None, 1)?, vec!["a".to_string(), "b".into()]);
+    assert!(s.publish(&event("1", "reading"), None, 1)?.is_empty(), "republishing is idempotent");
+    assert_eq!(s.publish(&event("2", "reading"), None, 1)?.len(), 2, "events of one type queue");
+    assert_eq!(s.publish(&event("3", "other"), None, 1)?, vec!["b".to_string()]);
+    assert_eq!(s.publish(&event("4", "other"), Some("idle"), 1)?, vec!["idle".to_string()]);
+    assert!(s.publish(&json!({"data":1}), None, 1).is_err());
+    // Subscriptions outlive consumption; takes keep publication order.
+    for (k, n) in [("e0", "1"), ("e1", "2")] {
+        assert_eq!(s.take_event(&a, k, &["reading".into()], 2)?.unwrap()["data"]["n"], n);
+    }
+    assert_eq!(s.publish(&event("5", "reading"), None, 2)?, vec!["a".to_string(), "b".into()]);
+    // A wildcard takes published events, never targeted deliveries.
+    s.register_wait(&b, &["answer".into()], 2)?;
+    s.deliver("answer", &json!(0), 2)?;
+    for (k, n) in [("w0", "1"), ("w1", "2"), ("w2", "3"), ("w3", "5")] {
+        let taken = s.take_event(&b, k, &["*".into()], 3)?.unwrap();
+        assert_eq!((taken["data"]["n"].as_str(), taken["specversion"].as_str()), (Some(n), Some("1.0")));
+    }
+    assert!(s.take_event(&b, "w4", &["*".into()], 3)?.is_none());
+    // A published event wakes a waiting subscriber, even one already releasing.
+    s.finish(&a, &Status::Waiting { wake_at_ms: i64::MAX }, 3, 3)?;
+    assert_eq!(s.get("a")?.unwrap().wake_at_ms, 3, "a pending subscribed event wakes it");
+    let a = s.claim("a", 3)?.unwrap();
+    s.take_event(&a, "e2", &["reading".into()], 3)?.unwrap();
+    s.finish(&a, &Status::Waiting { wake_at_ms: i64::MAX }, 3, 3)?;
+    assert_eq!(s.get("a")?.unwrap().wake_at_ms, i64::MAX);
+    s.publish(&event("6", "reading"), None, 4)?;
+    assert_eq!(s.get("a")?.unwrap().wake_at_ms, 4);
+    let a = s.claim("a", 4)?.unwrap();
+    s.unsubscribe(&a, "listen", 4)?;
+    assert_eq!(s.publish(&event("7", "reading"), None, 4)?, vec!["b".to_string()], "unsubscribed");
+    s.finish(&b, &Status::Completed(json!(0)), 5, 3)?;
+    assert!(s.publish(&event("9", "reading"), Some("b"), 5)?.is_empty(), "terminal runs receive nothing");
+    s.save_definition("first", "yaml")?;
+    s.save_definition("second", "yaml")?;
+    assert_eq!(s.definition_names()?, vec!["first".to_string(), "second".into()]);
+    audit(&**s)?;
+    report.operations += 33;
+    report.witnesses.extend([
+        "published events reach every subscriber once",
+        "subscriptions outlive consumption",
+        "wildcards skip targeted deliveries",
+    ]);
+
     let t = factory("children")?;
     report.cases += 1;
     let s = &t.store;
@@ -256,6 +313,8 @@ pub fn run_all(factory: impl Fn(&str) -> anyhow::Result<TestStore>) -> anyhow::R
         "renew",
         "definition",
         "activate",
+        "subscribe",
+        "publish",
     ] {
         for point in [
             CommitFault::BeforeWrite(0),
@@ -271,6 +330,7 @@ pub fn run_all(factory: impl Fn(&str) -> anyhow::Result<TestStore>) -> anyhow::R
             let f = s.start(&admission("p"), 0)?.unwrap();
             s.register_wait(&f, &["answer".into()], 0)?;
             s.take_event(&f, "event", &["answer".into()], 0)?;
+            s.subscribe(&f, "listen", &["answer".into()], 0)?;
             if operation == "take" {
                 s.deliver("answer", &json!(42), 0)?;
             }
@@ -319,6 +379,8 @@ pub fn run_all(factory: impl Fn(&str) -> anyhow::Result<TestStore>) -> anyhow::R
                 "renew" => s.renew(&f, 1),
                 "definition" => s.save_definition("workflow", "next").map(|_| ()),
                 "activate" => s.activate("workflow", d.version),
+                "subscribe" => s.subscribe(&f, "other", &["*".into()], 0),
+                "publish" => s.publish(&json!({"type":"answer","source":"/t","id":"1"}), None, 0).map(|_| ()),
                 _ => unreachable!(),
             };
             t.faults.clear();
@@ -421,7 +483,7 @@ pub fn run_all(factory: impl Fn(&str) -> anyhow::Result<TestStore>) -> anyhow::R
         audit(&*s)?;
     }
     report.witnesses.insert("finite histories drain every live listener");
-    assert_eq!(report.witnesses.len(), 12);
+    assert_eq!(report.witnesses.len(), 15);
     let t = factory("concurrent-claims")?;
     report.cases += 1;
     t.store.admit(&admission("r"), 0)?;

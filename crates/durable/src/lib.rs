@@ -81,6 +81,11 @@ pub struct StoredEvent {
     pub data: Value,
     pub delivered_at_ms: i64,
     pub consumed_key: Option<String>,
+    /// The CloudEvent as published (`publish`): its `type` and `data` equal
+    /// the fields above. `None` for a targeted `deliver`, such as a child's
+    /// lifecycle notification, which a wildcard subscription never takes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub envelope: Option<Value>,
 }
 
 /// A consistent persisted view, used by adapter conformance and diagnostics.
@@ -91,6 +96,9 @@ pub struct RunSnapshot {
     pub awaits: BTreeMap<String, i64>,
     pub listeners: BTreeMap<String, Vec<String>>,
     pub events: Vec<StoredEvent>,
+    /// Open subscriptions to published events, by key: event types, `*` for any.
+    #[serde(default)]
+    pub subscriptions: BTreeMap<String, Vec<String>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -125,7 +133,32 @@ pub trait RunStore: Send + Sync {
     /// A delivery targets the oldest eligible registration. One pending copy
     /// per run/type; consumed invocation keys remain durable for replay.
     fn deliver(&self, type_: &str, data: &Value, now_ms: i64) -> anyhow::Result<Option<String>>;
+    /// `types` may hold `*`, which takes any published event (never a
+    /// targeted delivery). A published event is taken as its envelope.
     fn take_event(&self, fence: &Fence, key: &str, types: &[String], now_ms: i64) -> anyhow::Result<Option<Value>>;
+    /// Opens a subscription under `key` (idempotent) for published events of
+    /// `types` (`*`: every published event). It stays open until
+    /// `unsubscribe` or the run's end, across consumptions, so a listen that
+    /// takes several events misses none published between two takes.
+    fn subscribe(&self, _fence: &Fence, _key: &str, _types: &[String], _now_ms: i64) -> anyhow::Result<()> {
+        anyhow::bail!("this store does not support published events")
+    }
+    fn unsubscribe(&self, _fence: &Fence, _key: &str, _now_ms: i64) -> anyhow::Result<()> {
+        anyhow::bail!("this store does not support published events")
+    }
+    /// Appends a CloudEvent (an object with at least `type`) to every
+    /// unfinished run with a subscription to its type or to `*`, or only to
+    /// `target` when given, subscribed or not. A run that already holds an
+    /// event with the same `source` and `id` is skipped, so publishing again
+    /// is idempotent. Several pending events of one type queue in order.
+    /// Receiving runs wake; they are returned.
+    fn publish(&self, _event: &Value, _target: Option<&str>, _now_ms: i64) -> anyhow::Result<Vec<String>> {
+        anyhow::bail!("this store does not support published events")
+    }
+    /// Every definition name with at least one saved version.
+    fn definition_names(&self) -> anyhow::Result<Vec<String>> {
+        anyhow::bail!("this store does not list definitions")
+    }
     fn finish(&self, fence: &Fence, outcome: &Status, now_ms: i64, breaker_threshold: u32) -> anyhow::Result<Status>;
     /// Parent ownership, child admission, and completion subscriptions commit
     /// together. Replaying a link joins the original immutable child.
