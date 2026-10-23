@@ -15,9 +15,11 @@ serde_json = { version = "1.0.151", features = ["preserve_order"] }
 serde_yaml_ng = "0.10.0"
 jsonschema = { version = "0.59.0", default-features = false }
 chrono = "0.4.45"
+croner = "4.0.1"
 thiserror = "2.0.21"
 tokio = { version = "1.53.1", features = ["time", "sync", "macros", "rt"] }
 tokio-util = "0.7.19"
+uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 proptest = "1"

@@ -113,7 +113,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
 
-pub const VERSION: u32 = 1;
+/// 2: a listen keeps every consumed event (`#event[i]`), child runs are
+/// joined at `#child`, attempts may have a deadline (`#attempt[k]`).
+pub const VERSION: u32 = 2;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

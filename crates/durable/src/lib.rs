@@ -216,6 +216,14 @@ impl Events for Lease {
         anyhow::ensure!(run_id == self.fence.run_id, "event run does not own this lease");
         self.store.unregister_wait(&self.fence, key, types, self.clock.now_ms())
     }
+    fn subscribe(&self, run_id: &str, key: &str, types: &[String]) -> anyhow::Result<()> {
+        anyhow::ensure!(run_id == self.fence.run_id, "event run does not own this lease");
+        self.store.subscribe(&self.fence, key, types, self.clock.now_ms())
+    }
+    fn unsubscribe(&self, run_id: &str, key: &str) -> anyhow::Result<()> {
+        anyhow::ensure!(run_id == self.fence.run_id, "event run does not own this lease");
+        self.store.unsubscribe(&self.fence, key, self.clock.now_ms())
+    }
     fn take(&self, run_id: &str, key: &str, types: &[String]) -> anyhow::Result<Option<Value>> {
         anyhow::ensure!(run_id == self.fence.run_id, "event run does not own this lease");
         self.store.take_event(&self.fence, key, types, self.clock.now_ms())

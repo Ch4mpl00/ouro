@@ -1,9 +1,12 @@
 //! Embeddable durable workflow host. Register functions, save and activate
 //! definitions, admit runs, then drive or recover them with a bounded worker.
+mod capabilities;
 mod execution;
 mod registry;
+mod schedule;
 mod telemetry;
 mod testing;
+pub use capabilities::{EventSink, ProcessRunner, ResourceResolver, SecretResolver};
 pub use execution::{Config, Runtime};
 pub use opentelemetry;
 #[cfg(feature = "otlp")]
