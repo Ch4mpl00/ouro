@@ -773,8 +773,10 @@ impl Functions for ExecutionFunctions {
             }
             Mode::Live => {
                 let now = self.lease.clock.now_ms();
+                // A storage failure is no answer: the run stops recoverably and
+                // recovery publishes the same envelope again (deduplicated).
                 crate::schedule::publish(&*self.lease.store, &self.admitter, event, now)
-                    .map_err(|e| CallFailure::Unknown(WorkflowError::runtime(e.to_string())))?;
+                    .map_err(|e| CallFailure::Interrupted(WorkflowError::runtime(e.to_string())))?;
                 if let Some(sink) = &self.admitter.capabilities.sink {
                     sink.emit(event).await.map_err(CallFailure::Response)?;
                 }

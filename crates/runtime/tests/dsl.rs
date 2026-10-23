@@ -604,3 +604,127 @@ async fn schedule_on_starts_a_run_per_match_through_trigger_runs() {
     f.rt.schedule(1, 2).unwrap();
     assert!(f.rt.list(Some("alarm#on"), "").unwrap().iter().all(|r| r.ended_ms.is_some()));
 }
+
+// ── crashes at every commit ────────────────────────────────────────────────
+
+/// A memory backend whose `n`th commit fails, before or after it lands.
+struct Crashing {
+    inner: durable::memory::MemoryBackend,
+    commits: AtomicUsize,
+    fail_at: usize,
+    after: bool,
+}
+impl AtomicBackend for Crashing {
+    fn snapshot(&self) -> anyhow::Result<durable::Snapshot> {
+        self.inner.snapshot()
+    }
+    fn compare_exchange(&self, before: &durable::Snapshot, rows: &durable::Rows) -> anyhow::Result<bool> {
+        let n = self.commits.fetch_add(1, Ordering::SeqCst) + 1;
+        if n == self.fail_at && !self.after {
+            anyhow::bail!("injected crash before commit {n}");
+        }
+        let done = self.inner.compare_exchange(before, rows)?;
+        if n == self.fail_at && self.after {
+            anyhow::bail!("injected crash after commit {n}");
+        }
+        Ok(done)
+    }
+}
+
+const PARENT: &str = r#"use:
+  extensions:
+    - audit: { extend: run, before: [ { note: { call: read, with: { at: '${ $task.reference }' } } } ] }
+do:
+  - child: { run: { workflow: { namespace: test, name: child, version: latest, input: { n: 1 } } } }
+  - announce: { emit: { event: { with: { type: started, source: 'https://parent', data: '${ . }' } } } }
+  - orders:
+      listen: { to: { any: [ { with: { type: order } } ], until: '${ length >= 2 }' } }
+      foreach: { item: o, do: [ { book: { call: write, with: { order: '${ $o.n }' } } } ], output: { as: '${ .order }' } }
+  - done: { set: { orders: '${ . }' } }"#;
+
+/// Runs the parent to its end with a crash at commit `fail_at`, recovering
+/// like a restarted worker would; publishes two orders once it listens.
+async fn crash_run(fail_at: usize, after: bool) -> (Option<Status>, Vec<Value>, usize, usize, usize) {
+    let backend = Arc::new(Crashing {
+        inner: durable::memory::MemoryBackend::default(),
+        commits: AtomicUsize::new(0),
+        fail_at,
+        after,
+    });
+    let store = Arc::new(durable::TransactionalStore::new(backend.clone()));
+    let f = fixture_on(store.clone(), Arc::default(), Arc::default(), Arc::default());
+    let setup = |rt: &Runtime| -> anyhow::Result<()> {
+        for (name, body) in [
+            ("child", "do: [ { w: { call: write, with: { child: '${ .n }' } } } ]"),
+            ("parent", PARENT),
+        ] {
+            let d = rt.save(name, &doc(name, body))?;
+            rt.activate(name, d.version)?;
+        }
+        rt.start("p", "parent", json!({}))?;
+        Ok(())
+    };
+    while setup(&f.rt).is_err() {}
+    let mut published = 0;
+    for step in 1..200 {
+        if let Some(status) = store.get("p").ok().flatten().and_then(|r| r.outcome) {
+            let consumed = store
+                .inspect("p")
+                .unwrap()
+                .unwrap()
+                .events
+                .iter()
+                .filter(|e| e.consumed_key.is_some() && e.type_ == "order")
+                .count();
+            let children = store.list(Some("child"), "").unwrap().len();
+            let commits = backend.commits.load(Ordering::SeqCst);
+            return (Some(status), f.seen.lock().unwrap().clone(), consumed, children, commits);
+        }
+        let _ = f.rt.recover_once(&CancellationToken::new()).await;
+        let listening = store.inspect("p").ok().flatten().is_some_and(|s| !s.subscriptions.is_empty());
+        while listening && published < 2 {
+            let n = published + 1;
+            if f.rt.publish(event(&n.to_string(), "order", json!({ "n": n }))).is_err() {
+                break;
+            }
+            published += 1;
+        }
+        // Leases of a crashed worker expire; interruptions back off.
+        f.time.set(step * (durable::LEASE_MS + 600_001));
+    }
+    (None, f.seen.lock().unwrap().clone(), 0, 0, 0)
+}
+
+#[tokio::test]
+async fn crashes_at_every_commit_never_repeat_a_child_an_event_or_a_write() {
+    let (status, writes, consumed, children, commits) = crash_run(usize::MAX, false).await;
+    let expected = Status::Completed(json!({ "orders": [1, 2] }));
+    assert_eq!(status.as_ref(), Some(&expected));
+    assert_eq!(writes, vec![json!({"child": 1}), json!({"order": 1}), json!({"order": 2})]);
+    assert_eq!((consumed, children), (2, 1));
+    let mut completed = 0;
+    for after in [false, true] {
+        for fail_at in 1..=commits {
+            let (status, writes, consumed, children, _) = crash_run(fail_at, after).await;
+            let label = format!("crash at commit {fail_at}, after={after}: {status:?} {writes:?}");
+            // An at-most-once write whose answer was lost is an unknown
+            // outcome, never a second dispatch; otherwise the run completes.
+            match &status {
+                Some(s) if *s == expected => {
+                    completed += 1;
+                    assert_eq!(writes.len(), 3, "{label}");
+                    assert_eq!((consumed, children), (2, 1), "{label}");
+                }
+                Some(Status::Faulted(e)) if e.is("outcome_unknown") => {}
+                _ => panic!("{label}"),
+            }
+            let mut unique = writes.clone();
+            unique.dedup();
+            assert_eq!(unique.len(), writes.len(), "a write was sent twice: {label}");
+            assert!(children <= 1, "{label}");
+        }
+    }
+    // Most crash points recover to the same result; the rest lose a write's
+    // answer and say so.
+    assert!(completed * 4 > commits * 2 * 3, "{completed} of {} crash points completed", commits * 2);
+}
