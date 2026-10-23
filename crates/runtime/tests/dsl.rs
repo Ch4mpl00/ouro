@@ -4,8 +4,8 @@
 // schedules. Durability cases restart the runtime on the same SQLite file.
 use async_trait::async_trait;
 use ouro_runtime::{
-    Config, Effect, EventSink, Function, FunctionContext, FunctionError, ProcessRunner, Registry, ResourceResolver,
-    Runtime, SecretResolver,
+    Config, Delivery, Effect, EventSink, Function, FunctionContext, FunctionError, ProcessRunner, Registry,
+    ResourceResolver, Runtime, SecretResolver,
     durable::{self, AtomicBackend, Clock, RunStore},
     owf::run::{Status, WorkflowError},
 };
@@ -40,17 +40,21 @@ fn doc(name: &str, body: &str) -> String {
     format!("document: {{ dsl: '1.0.4', namespace: test, name: {name}, version: '1.0.0' }}\n{body}\n")
 }
 
-/// Functions every test may call: `write` counts and echoes, `read` echoes.
+/// Functions every test may call: `write` counts and echoes, and is declared
+/// at most once (it must never be repeated); `read` echoes.
 fn registry(writes: Arc<AtomicUsize>, seen: Arc<Mutex<Vec<Value>>>) -> Registry {
     let mut registry = Registry::new();
     let w = writes.clone();
     let s = seen.clone();
     registry
-        .register(Function::new("write", json!({}), json!({}), Effect::Write, move |a: Value, _: FunctionContext| {
-            w.fetch_add(1, Ordering::SeqCst);
-            s.lock().unwrap().push(a.clone());
-            async move { Ok(a) }
-        }))
+        .register(
+            Function::new("write", json!({}), json!({}), Effect::Write, move |a: Value, _: FunctionContext| {
+                w.fetch_add(1, Ordering::SeqCst);
+                s.lock().unwrap().push(a.clone());
+                async move { Ok(a) }
+            })
+            .with_delivery(Delivery::AtMostOnce),
+        )
         .unwrap();
     registry
         .register(Function::new(

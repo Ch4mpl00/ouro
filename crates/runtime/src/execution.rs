@@ -15,7 +15,7 @@ use futures::{StreamExt, future::BoxFuture, stream::FuturesUnordered};
 use opentelemetry::{Context, global::BoxedTracer, trace::FutureExt};
 use ouro_durable::{Admission, ChildLink, Clock, Definition, Fence, Lease, RunStore, SavedRun, SystemClock};
 use owf::{
-    durable::CallFailure,
+    durable::{CallFailure, Delivery},
     model::{self, Process, Workflow},
     run::{self, CallInfo, Child, ChildTarget, Effect, Functions, Host, Limits, Status, WorkflowError},
 };
@@ -801,12 +801,13 @@ impl Functions for ExecutionFunctions {
         }
     }
     fn at_most_once(&self, name: &str, _: &Value) -> bool {
-        // Writes, processes included, are delivered at most once.
-        let effect = match name.strip_prefix(&Process::function("")) {
-            Some(kind) => self.process(kind),
-            None => self.effect(name),
+        // The declared delivery, never the effect; the interpreter applies a
+        // task's `metadata.delivery` on top, which can only tighten it.
+        let delivery = match name.strip_prefix(&Process::function("")) {
+            Some(kind) => self.admitter.capabilities.processes.as_ref().map(|p| p.delivery(kind)),
+            None => self.registry.get(name).map(|f| f.function.delivery),
         };
-        effect == Some(Effect::Write)
+        delivery == Some(Delivery::AtMostOnce)
     }
     async fn invoke(&self, n: &str, a: Value, i: &CallInfo<'_>) -> Result<Value, CallFailure> {
         self.invoke_function(n, None, a, i).await

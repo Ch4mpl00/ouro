@@ -121,7 +121,9 @@ pub trait Functions: Send + Sync {
     fn effect_of(&self, name: &str, _args: &Value) -> Option<Effect> {
         self.effect(name)
     }
-    /// Whether this invocation is at most once whatever its task says.
+    /// Whether this invocation is at most once whatever its task says: the
+    /// function's declared delivery. A task's `metadata.delivery` can only
+    /// tighten it; the effect never implies it.
     fn at_most_once(&self, _name: &str, _args: &Value) -> bool {
         false
     }
@@ -1510,11 +1512,12 @@ impl Run<'_> {
         {
             return Err(Fault::Fatal(WorkflowError::runtime("function effect classification changed")));
         }
-        // A retry attempt of a protected call: an earlier attempt's success
-        // stands, so the call is not sent again.
+        // A retry attempt of a protected (at-most-once) call: an earlier
+        // attempt's success stands, so the call is not sent again. The effect
+        // plays no part: an at-least-once write runs again like a read.
         if prior.is_none()
             && logical != reference
-            && (effect == Effect::Write || delivery == Delivery::AtMostOnce)
+            && delivery == Delivery::AtMostOnce
             && let Some(result) = self.earlier_attempt(&logical, &key, name, &args, reference)
         {
             return result;

@@ -703,7 +703,12 @@ impl Tools {
 #[async_trait]
 impl Functions for Tools {
     fn effect(&self, name: &str) -> Option<Effect> {
-        Some(if name.starts_with("send") { Effect::Write } else { Effect::Read })
+        Some(if name.starts_with("send") || name == "post" { Effect::Write } else { Effect::Read })
+    }
+    // Delivery is declared, never derived from the effect: `send` is declared
+    // at most once, `post` is a write with the default at-least-once delivery.
+    fn at_most_once(&self, name: &str, _: &Value) -> bool {
+        name == "send"
     }
     async fn call(&self, name: &str, args: Value, info: &CallInfo<'_>) -> Result<Value, WorkflowError> {
         self.invoke(name, args, info).await.map_err(|failure| match failure {
@@ -781,7 +786,7 @@ async fn a_write_that_failed_is_sent_again_by_the_retry() {
     let body = r#"
 do:
   - guard:
-      try: [ { send: { call: send, with: { text: hi } } } ]
+      try: [ { send: { call: post, with: { text: hi } } } ]
       catch:
         retry: { delay: DELAY, limit: { attempt: { count: 3 } } }
 "#;
@@ -795,8 +800,8 @@ do:
             let tools = Tools::new(move |_, args, before| if before == 0 { Err(failure()) } else { Ok(args.clone()) });
             let status = retried(&tools, body, delay).await;
             assert_eq!(status, Status::Completed(json!({"text":"hi"})), "{case} {delay}");
-            assert_eq!(tools.count("send"), 2, "{case} {delay}: the failed send is retried");
-            assert_eq!(tools.succeeded("send").len(), 1, "{case} {delay}");
+            assert_eq!(tools.count("post"), 2, "{case} {delay}: the failed send is retried");
+            assert_eq!(tools.succeeded("post").len(), 1, "{case} {delay}");
         }
     }
 }
@@ -925,8 +930,10 @@ async fn nested_retries_reuse_a_write_the_inner_retry_got_through() {
     // The inner try needs two attempts to send; then the outer one retries.
     // Its inner try finds the send already done, in whichever inner attempt.
     for delay in DELAYS {
+        // Proven not executed: the only failure that lets an at-most-once
+        // call go out again.
         let tools = Tools::new(|name, args, before| match (name, before) {
-            ("send", 0) => Err(rejected()),
+            ("send", 0) => Err(CallFailure::NotExecuted(WorkflowError::communication(503, "refused"))),
             _ => check_fails_once(name, args, before),
         });
         let status = retried(&tools, NESTED, delay).await;
@@ -980,17 +987,20 @@ async fn an_ephemeral_run_still_never_retries_an_attempt_that_wrote() {
 
 // A crash at any checkpoint, before or after its commit, then recovery. An
 // at-most-once send goes out at most once, and exactly once when the run
-// completes. An at-least-once send may go out twice only because of the
-// crash, never because of the retry; the run always completes.
+// completes. An at-least-once write (`post`) may be sent again by the outer
+// retry, under the same idempotency key, and once more because of the crash;
+// the run always completes.
 #[tokio::test]
 async fn retried_writes_survive_a_crash_at_every_checkpoint() {
     for (delivery, extra) in [("at_most_once", ", metadata: { delivery: at_most_once }"), ("at_least_once", "")] {
-        let body = NESTED.replace("with: { text: hi } }", &format!("with: {{ text: hi }}{extra} }}"));
+        let mut body = NESTED.replace("with: { text: hi } }", &format!("with: {{ text: hi }}{extra} }}"));
+        let function = if delivery == "at_least_once" { "post" } else { "send" };
+        body = body.replace("call: send", &format!("call: {function}"));
         // An at-most-once send cannot be retried after a rejection, so the
         // inner retry is exercised by the at-least-once pass only.
         let first_send_fails = delivery == "at_least_once";
         let script = move |name: &str, args: &Value, before: usize| match (name, before) {
-            ("send", 0) if first_send_fails => Err(rejected()),
+            ("post", 0) if first_send_fails => Err(rejected()),
             _ => check_fails_once(name, args, before),
         };
         for delay in DELAYS {
@@ -999,7 +1009,8 @@ async fn retried_writes_survive_a_crash_at_every_checkpoint() {
             let time = Arc::new(Time(AtomicI64::new(1_000)));
             let tools = Tools::new(script);
             drive(&tools_host(tools.clone(), time.clone()), &time, &wf, &baseline).await;
-            assert_eq!(tools.succeeded("send").len(), 1, "{delivery} {delay}: baseline");
+            let expected = if delivery == "at_least_once" { 2 } else { 1 };
+            assert_eq!(tools.succeeded(function).len(), expected, "{delivery} {delay}: baseline");
             let saves = baseline.saves.load(Ordering::SeqCst);
             for after_commit in [false, true] {
                 for at in 1..=saves {
@@ -1008,7 +1019,7 @@ async fn retried_writes_survive_a_crash_at_every_checkpoint() {
                     let time = Arc::new(Time(AtomicI64::new(1_000)));
                     let tools = Tools::new(script);
                     let status = drive(&tools_host(tools.clone(), time.clone()), &time, &wf, &store).await;
-                    let sent = tools.succeeded("send").len();
+                    let sent = tools.succeeded(function).len();
                     let case = format!("{delivery} {delay} crash at {at} (after commit: {after_commit})");
                     if delivery == "at_most_once" {
                         assert!(sent <= 1, "{case}: sent {sent}");
@@ -1019,7 +1030,9 @@ async fn retried_writes_survive_a_crash_at_every_checkpoint() {
                         }
                     } else {
                         assert!(matches!(status, Status::Completed(_)), "{case}: {status:?}");
-                        assert!((1..=2).contains(&sent), "{case}: sent {sent}");
+                        // One when recovery re-dispatches the failed check and it
+                        // now passes (no outer retry), three with a crash resend.
+                        assert!((1..=3).contains(&sent), "{case}: sent {sent}");
                     }
                 }
             }

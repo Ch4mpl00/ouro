@@ -1,7 +1,7 @@
 //! A single process restart, using only public APIs and local files. The
 //! ledger stands in for an external service whose effect outlives a worker.
 use ouro_runtime::{
-    Config, Effect, Function, FunctionContext, Registry, Runtime,
+    Config, Delivery, Effect, Function, FunctionContext, Registry, Runtime,
     durable::{self, Clock},
     owf::run::{Status, WorkflowError},
 };
@@ -57,7 +57,9 @@ fn registry(dir: &Path, recovering: bool) -> anyhow::Result<Registry> {
         },
     ))?;
     let ledger = dir.join("ledger");
-    registry.register(Function::new("write", input, output, Effect::Write, move |a: Value, _: FunctionContext| {
+    // A ledger entry must not be repeated: the function declares at-most-once
+    // delivery (calls are at least once unless their function says otherwise).
+    let write = Function::new("write", input, output, Effect::Write, move |a: Value, _: FunctionContext| {
         let ledger = ledger.clone();
         async move {
             let mut f = OpenOptions::new().create(true).append(true).open(ledger).map_err(io_error)?;
@@ -65,7 +67,8 @@ fn registry(dir: &Path, recovering: bool) -> anyhow::Result<Registry> {
             f.sync_all().map_err(io_error)?;
             Ok(a)
         }
-    }))?;
+    });
+    registry.register(write.with_delivery(Delivery::AtMostOnce))?;
     Ok(registry)
 }
 fn runtime(dir: &Path, recovering: bool) -> anyhow::Result<Runtime> {

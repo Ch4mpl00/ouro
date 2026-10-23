@@ -26,7 +26,8 @@ crates depends on another checkout or on an application database.
 ## Public API
 
 Register `Function::new(name, input_schema, output_schema, effect, handler)`
-with a `Registry`. Handlers receive arguments and `FunctionContext`: a
+with a `Registry`; `.with_delivery(Delivery::AtMostOnce)` declares a function
+that must never be repeated (calls are at least once otherwise). Handlers receive arguments and `FunctionContext`: a
 cancellation token, run ID, task path, retry attempt, stable idempotency key
 and current OpenTelemetry context. Return JSON or `FunctionError` (OWF Problem
 Details); YAML `try/catch` handles ordinary function and schema errors.
@@ -47,7 +48,7 @@ embedding applications that own their polling and control surface.
 Versions are immutable. Activation remembers the prior active version; N
 consecutive faults of the current version atomically roll back to it (default
 N = 3). A success resets the count. In-flight runs keep their admitted YAML,
-version, input and schema/effect bindings. Handler implementations remain the
+version, input and schema/effect/delivery bindings. Handler implementations remain the
 host's responsibility to keep compatible with those bindings.
 
 `start_child` is available through the host API and as a reserved
@@ -82,8 +83,8 @@ the choices made where the specification is silent (`CHOICE` comments).
   saved version whose document has that `version`), owned and joined
   atomically; recovery joins the same child and never reruns a completed
   one. `await: false` starts an independent run. `run: container | script |
-  shell` need a `ProcessRunner` (`with_process_runner`); it is recorded and
-  delivered like a function of its effect.
+  shell` need a `ProcessRunner` (`with_process_runner`); it is recorded like
+  a function call, with the effect and delivery the runner declares per kind.
 - `emit` builds a CloudEvents envelope, records it like a write, delivers it
   to the runs listening for it and hands it to an optional `EventSink`.
   `publish` delivers an external CloudEvent the same way, idempotently per
@@ -111,12 +112,20 @@ the choices made where the specification is silent (`CHOICE` comments).
 
 ## Durability and storage
 
-Completed calls and tasks restore their saved results on resume. Writes always
-use at-most-once delivery: intent is committed before dispatch. Intent without
-a response produces `outcome_unknown`, never another dispatch. This can lose a
-write if the process dies before sending; it does not promise exactly-once
-external effects. A function may use its stable idempotency key for application
-reconciliation. Cancellation cannot undo an external effect already sent.
+Completed calls and tasks restore their saved results on resume. Delivery is
+declared, not derived from the effect. Every call, reads and writes alike, is
+at least once by default: a call whose outcome is unknown after a crash may be
+dispatched again, with the same idempotency key. A function declares
+`Delivery::AtMostOnce` at registration (a process runner per kind); a task may
+tighten its call with `metadata.delivery: at_most_once`, never loosen it. The
+effective delivery is bound into the invocation record and into the run's
+pinned bindings. At most once commits intent before dispatch; intent without a
+response produces `outcome_unknown`, never another dispatch. This can lose a
+call if the process dies before sending; neither mode promises exactly-once
+external effects. A function may use its stable idempotency key for recipient
+deduplication or reconciliation. `effect` decides what a dry run mocks and
+whether a failure happened before the first write. Cancellation cannot undo
+an external effect already sent.
 
 Fenced commits reject expired or replaced workers. Event consumption and its
 journal evidence share a commit; child completion and parent notification do

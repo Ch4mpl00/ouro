@@ -178,14 +178,17 @@ async fn shutdown_releases_the_lease_and_unknown_writes_never_dispatch_again() {
     let w = writes.clone();
     let n = started.clone();
     registry
-        .register(Function::new("write", json!({}), json!({}), Effect::Write, move |_: Value, ctx: FunctionContext| {
-            w.fetch_add(1, Ordering::SeqCst);
-            n.notify_one();
-            async move {
-                ctx.cancel.cancelled().await;
-                Ok(Value::Null)
-            }
-        }))
+        .register(
+            Function::new("write", json!({}), json!({}), Effect::Write, move |_: Value, ctx: FunctionContext| {
+                w.fetch_add(1, Ordering::SeqCst);
+                n.notify_one();
+                async move {
+                    ctx.cancel.cancelled().await;
+                    Ok(Value::Null)
+                }
+            })
+            .with_delivery(Delivery::AtMostOnce),
+        )
         .unwrap();
     let rt = runtime(Arc::new(durable::memory::memory()), registry, Arc::new(Time::default()));
     save(&rt, &yaml("  - write: { call: write }"));
@@ -308,6 +311,76 @@ async fn host_concurrency_is_bounded_and_cancellation_reaches_handlers() {
     assert_eq!(rt.get("r0").unwrap().unwrap().outcome, Some(Status::Cancelled));
     assert!(peak.load(Ordering::SeqCst) > 0);
 }
+// Delivery is declared, not derived from the effect: a write with the default
+// at-least-once delivery goes out again under the same idempotency key after
+// its outcome was lost; a declared or YAML-tightened at-most-once one never
+// does; a changed declaration fails recovery as a changed binding.
+#[tokio::test]
+async fn delivery_is_declared_not_derived_from_the_effect() {
+    type Keys = Arc<std::sync::Mutex<Vec<(String, String)>>>;
+    fn registry(keys: Keys, post: Delivery) -> Registry {
+        let mut registry = Registry::new();
+        for (name, delivery) in [("post", post), ("send", Delivery::AtMostOnce)] {
+            let keys = keys.clone();
+            let f = Function::new(name, json!({}), json!({}), Effect::Write, move |_: Value, ctx: FunctionContext| {
+                keys.lock().unwrap().push((name.to_string(), ctx.idempotency_key.clone()));
+                async move {
+                    // The answer is lost: the worker stops before it is saved.
+                    ctx.cancel.cancelled().await;
+                    Ok(json!({}))
+                }
+            });
+            registry.register(f.with_delivery(delivery)).unwrap();
+        }
+        registry
+    }
+    async fn interrupted(rt: &Runtime, id: &str, keys: &Keys, calls: usize) {
+        let stop = CancellationToken::new();
+        let stopping = async {
+            while keys.lock().unwrap().len() < calls {
+                tokio::task::yield_now().await;
+            }
+            stop.cancel();
+        };
+        let (status, ()) = tokio::join!(rt.drive(id, &stop), stopping);
+        assert!(matches!(status.unwrap(), Some(Status::Interrupted(_))), "{id}");
+    }
+    let store: Arc<dyn RunStore> = Arc::new(durable::memory::memory());
+    let keys = Keys::default();
+    let rt = runtime(store.clone(), registry(keys.clone(), Delivery::AtLeastOnce), Arc::new(Time::default()));
+    for (name, task) in [
+        ("default", "  - post: { call: post }"),
+        ("declared", "  - send: { call: send }"),
+        ("tightened", "  - post: { call: post, metadata: { delivery: at_most_once } }"),
+    ] {
+        let d = rt.save(name, &yaml(task)).unwrap();
+        rt.activate(name, d.version).unwrap();
+        rt.start(name, name, json!({})).unwrap();
+        let before = keys.lock().unwrap().len();
+        interrupted(&rt, name, &keys, before + 1).await;
+        if name == "default" {
+            interrupted(&rt, name, &keys, before + 2).await;
+            let sent = keys.lock().unwrap()[before..].to_vec();
+            assert_eq!(sent[0], sent[1], "re-dispatched once more, under the same idempotency key");
+        } else {
+            let outcome = rt.drive(name, &CancellationToken::new()).await.unwrap();
+            assert!(matches!(outcome, Some(Status::Faulted(e)) if e.is("outcome_unknown")), "{name}");
+            assert_eq!(keys.lock().unwrap().len(), before + 1, "{name}: never sent again");
+        }
+        let delivery = rt.records(name).unwrap().values().find_map(|r| match r {
+            Record::Call { delivery, .. } => Some(*delivery),
+            _ => None,
+        });
+        let expected = if name == "default" { Delivery::AtLeastOnce } else { Delivery::AtMostOnce };
+        assert_eq!(delivery, Some(expected), "{name}: the effective delivery is bound into the record");
+    }
+    // The declaration is a pinned binding: a host that now declares `post` at
+    // most once cannot resume a run admitted under at-least-once.
+    let changed = runtime(store, registry(keys.clone(), Delivery::AtMostOnce), Arc::new(Time::default()));
+    let outcome = changed.drive("default", &CancellationToken::new()).await.unwrap();
+    assert!(matches!(outcome, Some(Status::Interrupted(e)) if e.to_string().contains("bindings changed")));
+}
+
 #[tokio::test]
 async fn write_response_survives_crash_before_task_checkpoint() {
     let backend = Arc::new(durable::memory::MemoryBackend::default());
@@ -317,14 +390,17 @@ async fn write_response_survives_crash_before_task_checkpoint() {
     let w = writes.clone();
     let mut registry = Registry::new();
     registry
-        .register(Function::new("write", json!({}), json!({}), Effect::Write, move |_: Value, _: FunctionContext| {
-            w.fetch_add(1, Ordering::SeqCst);
-            let b = b.clone();
-            async move {
-                b.faults.arm(durable::CommitFault::AfterCommit);
-                Ok(json!(42))
-            }
-        }))
+        .register(
+            Function::new("write", json!({}), json!({}), Effect::Write, move |_: Value, _: FunctionContext| {
+                w.fetch_add(1, Ordering::SeqCst);
+                let b = b.clone();
+                async move {
+                    b.faults.arm(durable::CommitFault::AfterCommit);
+                    Ok(json!(42))
+                }
+            })
+            .with_delivery(Delivery::AtMostOnce),
+        )
         .unwrap();
     let time = Arc::new(Time::default());
     let rt = runtime(store, registry, time.clone());

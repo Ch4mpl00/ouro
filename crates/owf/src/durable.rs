@@ -4,9 +4,10 @@
 //! # Invariants
 //!
 //! The interpreter and Journal host jointly enforce the run/call contract.
-//! Event waits use the same invocation identities and checkpoints.
-//! `Effect` alone never determines
-//! retry safety.
+//! Event waits use the same invocation identities and checkpoints. Retry
+//! safety is a call's effective delivery, bound into its record; `Effect`
+//! never determines it (it only decides what a dry run mocks and whether a
+//! failure happened before the first write).
 //!
 //! ## Run identity and replay
 //!
@@ -22,14 +23,15 @@
 //!    and full invocation path, including nested loop iterations, `then` visits,
 //!    reusable-function callers and fork branches. Recovery keeps that identity;
 //!    a genuinely new invocation gets a different one. A DSL retry attempt is
-//!    not a new invocation for a protected call (a `Write`, or any at-most-once
-//!    call): its identity is the first attempt's (`Record::Call::logical`),
+//!    not a new invocation for a protected call (one whose effective delivery
+//!    is at most once): its identity is the first attempt's (`Record::Call::logical`),
 //!    taken from the attempts the interpreter is running, never parsed out of
 //!    a path that holds author-chosen task names. A protected call an earlier
 //!    attempt completed returns that saved result instead of being sent again;
 //!    different function or arguments under the same identity are a conflict
 //!    that fails the run without sending. A failed one is sent again under its
-//!    delivery policy. Reads and model steps run afresh on every attempt.
+//!    delivery policy. Every other call, a write included, runs afresh on
+//!    every attempt, under the same idempotency key.
 //! 4. Function, arguments and delivery policy are bound to the invocation ID.
 //!    A mismatch on replay is an error, never a cache miss or a new side effect.
 //!    Decisions influenced by time, external data or concurrency must be saved
@@ -56,8 +58,10 @@
 //! ## External calls
 //!
 //! 9. Delivery policy belongs to the host's durable layer and applies to
-//!    third-party functions without requiring service changes. The DSL defaults
-//!    to `at least once`; `at most once` is explicit and independent of the
+//!    third-party functions without requiring service changes. Every call
+//!    defaults to `at least once`; `at most once` is declared by the function
+//!    (`Functions::at_most_once`) and a task may tighten it
+//!    (`metadata.delivery`), never loosen it. It is independent of the
 //!    function's read/write classification. This is no external exactly-once
 //!    guarantee and does not require a host-side idempotency guard.
 //! 10. `At least once`: durably save the received result before using it. Without

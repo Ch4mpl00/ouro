@@ -7,7 +7,7 @@
 //! credentials and remote resources belong to the embedding application.
 use crate::{FunctionContext, FunctionError, Registry};
 use async_trait::async_trait;
-use owf::{model::Catalog, run::Effect};
+use owf::{durable::Delivery, model::Catalog, run::Effect};
 use serde_json::Value;
 use std::sync::Arc;
 
@@ -17,9 +17,13 @@ use std::sync::Arc;
 #[async_trait]
 pub trait ProcessRunner: Send + Sync {
     /// The effect of running a `kind` process, or `None` when this runner
-    /// does not run that kind. A write is delivered at most once, like a
-    /// write function.
+    /// does not run that kind. Dry runs mock writes.
     fn effect(&self, kind: &str) -> Option<Effect>;
+    /// The delivery of a `kind` process, like a function's declaration: at
+    /// least once unless the runner declares it at most once.
+    fn delivery(&self, _kind: &str) -> Delivery {
+        Delivery::AtLeastOnce
+    }
     /// `definition` is the rendered `run.<kind>` object with `await` added.
     /// Returns a process result `{ code, stdout, stderr }`; `return` picks
     /// from it. A process that is not awaited may return as soon as it starts.
