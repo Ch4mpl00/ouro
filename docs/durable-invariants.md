@@ -921,3 +921,41 @@ public runtime exports already implement that rule.
 [DF]: https://www.microsoft.com/en-us/research/uploads/prod/2021/10/DF-Semantics-With-Proofs.pdf
 [DBOS]: https://www.dbos.dev/blog/how-to-test-durable-execution
 [CIDR]: https://www.vldb.org/cidrdb/papers/2026/p9-stonebraker.pdf
+
+## 8. Decisions (2026-10-23)
+
+These settle open decisions 1, 2, 5, 6 and 7 of section 6; the invariants that
+depended on them are to be read under these choices. The others stay open.
+
+1. **Event identity (W2).** `deliver` requires an event identity (`source` +
+   `id`, as in CloudEvents). The same identity with a different payload is a
+   conflict returned to the caller, never a silent drop. Deduplication scope:
+   the recipient run for addressed delivery (kept for the run's evidence
+   lifetime); global per identity for trigger ingress, so one event starts at
+   most one run (kept as a tombstone with its own TTL).
+2. **Mailbox (W3).** Events addressed to one run (`deliver` to a run,
+   `publish` with a target) are kept in that run's mailbox until a `listen`
+   consumes them or a TTL expires (configurable, default one day). A `listen`
+   reads its mailbox before waiting; per-type FIFO. An expired event is removed
+   with an observable record, never silently. Broadcast `publish` still reaches
+   only the runs subscribed at that moment.
+3. **Schedules (T1, T2).** Every activation and every breaker rollback starts
+   a new activation epoch. Triggers are re-armed in the same transaction that
+   changes the active version; a trigger of an older epoch never fires.
+   Activating a version without `schedule` removes its triggers in that
+   transaction; runs already started finish. Missed slots: `catchup: latest`
+   (default, one late run) or `none`. Overlap: a slot whose previous run of the
+   same schedule is still running is skipped, with a record.
+4. **Time (T3, L4).** Deadlines are absolute instants fixed when they start
+   (a workflow `timeout` from admission, not from the last resume), so moving
+   between processes never resets them. Clock skew between workers is bounded
+   by a configured ε: a worker stops acting ε before its lease ends, and a lease
+   is taken over only after it ends. Every time-related invariant holds under
+   skew ≤ ε. Storage time (e.g. Postgres `now()`) may later replace host time.
+5. **Breaker (V2).** It counts terminal faults of runs of the active version:
+   unhandled errors, timeouts, outcome-unknown that ended the run. It does not
+   count cancellations or infrastructure interruptions (a process or storage
+   failure that a later attempt resumes). Success and a new epoch reset the
+   count. With no predecessor to roll back to, the definition is marked
+   tripped: new runs and its schedule stop, visibly in the runs API; running
+   runs finish; a new activation clears it.
