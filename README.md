@@ -5,7 +5,7 @@ YAML in the [Open Workflow Specification](https://github.com/serverlessworkflow/
 DSL, executed by a Rust core, with your own functions as the extension point.
 
 Status: design. The plan and its reasoning are in
-[Ch4mpl00/ouro-agent#61](https://github.com/Ch4mpl00/ouro-agent/issues/61);
+[#1](https://github.com/Ch4mpl00/ouro/issues/1);
 the code is being extracted from [ouro-agent](https://github.com/Ch4mpl00/ouro-agent),
 which becomes this runtime's first consumer.
 
