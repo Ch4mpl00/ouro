@@ -1,0 +1,6 @@
+{
+  "name": "ouro-durable-spec",
+  "private": true,
+  "version": "0.1.0",
+  "devDependencies": { "@informalsystems/quint": "0.33.0" }
+}
