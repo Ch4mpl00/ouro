@@ -11,7 +11,10 @@ pub mod memory;
 pub mod postgres;
 pub mod sqlite;
 
-pub use backend::{AtomicBackend, CommitFault, FaultInjector, Rows, Snapshot, TransactionalStore};
+pub use backend::{
+    AtomicBackend, CommitFault, Conflict, FaultInjector, IoCounts, Key, Metrics, Rows, Snapshot, Transaction,
+    TransactionalStore,
+};
 use owf::{
     durable::{Journal, Record},
     run::{Events, Status},
