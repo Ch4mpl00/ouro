@@ -462,3 +462,86 @@ async fn dropping_a_stale_attempt_preserves_cancellation_of_its_successor() {
         Some(Status::Cancelled)
     );
 }
+
+#[test]
+fn x1_x2_generated_dry_runs_and_replays_are_isolated() {
+    use durable::AtomicBackend;
+    use proptest::{prelude::*, test_runner::TestRunner};
+    let strategy = (prop::collection::vec(any::<bool>(), 1..16), 0i64..100);
+    let config = proptest::test_runner::Config { cases: 64, ..Default::default() };
+    TestRunner::new(config)
+        .run(&strategy, |(writes_in_program, input)| {
+            let executor = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            executor.block_on(async {
+                let reads = Arc::new(AtomicUsize::new(0));
+                let writes = Arc::new(AtomicUsize::new(0));
+                let backend = Arc::new(durable::memory::MemoryBackend::default());
+                let store = Arc::new(durable::TransactionalStore::new(backend.clone()));
+                let rt =
+                    runtime(store.clone(), counter_registry(reads.clone(), writes.clone()), Arc::new(Time::default()));
+                let body = writes_in_program
+                    .iter()
+                    .enumerate()
+                    .map(|(i, write)| {
+                        format!(
+                            "  - step{i}: {{ call: {}, with: {{ n: '${{ .n + 1 }}' }} }}",
+                            if *write { "write" } else { "read" }
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let definition = yaml(&body);
+                save(&rt, &definition);
+                let before = backend.snapshot().unwrap().rows;
+                let dry = rt
+                    .dry_run(
+                        &definition,
+                        json!({"n":input}),
+                        Arc::new(|_: &str, a: &Value, _: &FunctionContext| Ok(a.clone())),
+                        &CancellationToken::new(),
+                    )
+                    .await
+                    .unwrap();
+                prop_assert!(matches!(dry.status, Status::Completed(_)));
+                prop_assert_eq!(writes.load(Ordering::SeqCst), 0);
+                prop_assert_eq!(dry.writes.len(), writes_in_program.iter().filter(|x| **x).count());
+                prop_assert_eq!(backend.snapshot().unwrap().rows, before);
+                rt.start("recorded", "workflow", json!({"n":input})).unwrap();
+                let original = rt.drive("recorded", &CancellationToken::new()).await.unwrap();
+                let before = backend.snapshot().unwrap().rows;
+                let counts = (reads.load(Ordering::SeqCst), writes.load(Ordering::SeqCst));
+                let replay = rt.replay("recorded", &CancellationToken::new()).await.unwrap();
+                prop_assert_eq!(Some(replay.status), original);
+                // Changed arguments must refuse instead of falling through to a handler.
+                let changed = definition.replace(".n + 1", ".n + 2");
+                let changed = rt.replay_definition(&changed, "recorded", &CancellationToken::new()).await;
+                prop_assert!(changed.is_err() || matches!(changed.unwrap().status, Status::Faulted(_)));
+                prop_assert_eq!((reads.load(Ordering::SeqCst), writes.load(Ordering::SeqCst)), counts);
+                prop_assert_eq!(backend.snapshot().unwrap().rows, before);
+                store.sweep(durable::RECORDS_KEPT_MS + 1, durable::RECORDS_KEPT_MS).unwrap();
+                prop_assert!(rt.replay("recorded", &CancellationToken::new()).await.is_err());
+                prop_assert_eq!((reads.load(Ordering::SeqCst), writes.load(Ordering::SeqCst)), counts);
+                Ok(())
+            })
+        })
+        .unwrap();
+}
+
+#[tokio::test]
+#[ignore = "pending #4: workflow deadline starts at admission, before the first drive"]
+async fn t3_admission_fixes_the_workflow_deadline() {
+    let reads = Arc::new(AtomicUsize::new(0));
+    let clock = Arc::new(Time::default());
+    let rt = runtime(
+        Arc::new(durable::memory::memory()),
+        counter_registry(reads.clone(), Arc::new(AtomicUsize::new(0))),
+        clock.clone(),
+    );
+    let definition = yaml("  - read: { call: read, with: {} }").replace("\ndo:", "\ntimeout: { after: PT1S }\ndo:");
+    save(&rt, &definition);
+    rt.start("deadline", "workflow", json!({})).unwrap();
+    clock.0.store(2000, Ordering::SeqCst);
+    let outcome = rt.drive("deadline", &CancellationToken::new()).await.unwrap();
+    assert!(matches!(outcome,Some(Status::Faulted(e)) if e.is("timeout")), "admission deadline was restarted");
+    assert_eq!(reads.load(Ordering::SeqCst), 0);
+}
