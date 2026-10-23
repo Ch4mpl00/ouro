@@ -273,7 +273,15 @@ impl State<StoreDriver> for DatabaseView {
                     _ => false,
                 })
                 .collect::<Vec<_>>();
-            due.sort_by_key(|r| (r.wake_at_ms, r.admission.id.clone()));
+            // Ordered by when each run became eligible: a running run by its
+            // lease expiry, not the wake time it was claimed at.
+            due.sort_by_key(|r| {
+                let eligible = match r.state {
+                    RunState::Running => r.lease_until_ms.unwrap_or(r.wake_at_ms),
+                    _ => r.wake_at_ms,
+                };
+                (eligible, r.admission.id.clone())
+            });
             due.into_iter().map(|r| r.admission.id).collect()
         };
         ensure!(d.store.due(d.now, 3)? == expected_due, "due projection differs");
@@ -705,7 +713,14 @@ fn with_quint(name: &str, run: impl FnOnce() -> anyhow::Result<()>) {
         run().unwrap();
         return;
     }
-    let bin = spec_path("node_modules/.bin").canonicalize().expect("run npm ci --prefix spec first");
+    // Quint is a Node package; a checkout without `npm ci --prefix spec` skips
+    // the bridge instead of failing the Rust suite. OURO_REQUIRE_QUINT=1 (CI)
+    // turns the skip into a failure.
+    let Ok(bin) = spec_path("node_modules/.bin").canonicalize() else {
+        assert!(std::env::var_os("OURO_REQUIRE_QUINT").is_none(), "run npm ci --prefix spec first");
+        eprintln!("skipping {name}: Quint is not installed (npm ci --prefix spec)");
+        return;
+    };
     let mut paths = vec![bin];
     paths.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()));
     let result = std::process::Command::new(std::env::current_exe().unwrap())
