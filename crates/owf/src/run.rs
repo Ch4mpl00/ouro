@@ -37,6 +37,10 @@ pub enum Effect {
 pub struct CallInfo<'a> {
     pub run_id: &'a str,
     pub reference: &'a str,
+    /// Stable logical invocation identity across DSL retries.
+    pub logical: &'a str,
+    /// The enclosing retry attempt, starting at one.
+    pub attempt: u32,
     pub cancel: &'a CancellationToken,
     pub delivery: Delivery,
 }
@@ -602,7 +606,7 @@ struct Run<'a> {
     journal: Option<&'a dyn Journal>,
     records: Mutex<BTreeMap<String, Record>>,
     /// Attempt prefixes of the `try`s running now: `<task>/try[k]` → `<task>/try`.
-    attempts: Mutex<Vec<(String, String)>>,
+    attempts: Mutex<Vec<(String, String, u32)>>,
 }
 
 impl Run<'_> {
@@ -661,12 +665,15 @@ impl Run<'_> {
     fn logical(&self, reference: &str) -> String {
         let attempts = self.attempts.lock().unwrap_or_else(|e| e.into_inner());
         let mut logical = reference.to_owned();
-        while let Some((attempt, first)) = attempts
+        while let Some((attempt, first, _)) = attempts
             .iter()
-            .filter(|(attempt, _)| {
-                logical.strip_prefix(attempt.as_str()).is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+            .filter(|(attempt, first, _)| {
+                attempt != first
+                    && logical
+                        .strip_prefix(attempt.as_str())
+                        .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
             })
-            .max_by_key(|(attempt, _)| attempt.len())
+            .max_by_key(|(attempt, _, _)| attempt.len())
         {
             logical = format!("{first}{}", &logical[attempt.len()..]);
         }
@@ -713,8 +720,12 @@ impl Run<'_> {
         // so that no other path can send an at-most-once call twice.
         for (_, _, delivery, state) in &earlier {
             match (delivery, state) {
-                (Delivery::AtMostOnce, CallState::Pending) => return Some(Err(self.unknown(reference))),
-                (Delivery::AtMostOnce, CallState::Done(Err(error))) => return Some(Err(Fault::Error(error.clone()))),
+                (Delivery::AtMostOnce, CallState::Pending) => {
+                    return Some(Err(self.unknown(reference)));
+                }
+                (Delivery::AtMostOnce, CallState::Done(Err(error))) => {
+                    return Some(Err(Fault::Error(error.clone())));
+                }
                 _ => {}
             }
         }
@@ -969,7 +980,9 @@ impl Run<'_> {
                     tokio::time::timeout(remaining, self.kind(task, reference, &input, ctx, scope, &desc)).await
                 };
                 match result {
-                    Ok(Err(Fault::Waiting(wake))) => return Err(Fault::Waiting(wake.min(deadline))),
+                    Ok(Err(Fault::Waiting(wake))) => {
+                        return Err(Fault::Waiting(wake.min(deadline)));
+                    }
                     Ok(r) => r?,
                     Err(_) => {
                         if self.has_unknown(reference) {
@@ -1243,7 +1256,18 @@ impl Run<'_> {
         if effect == Effect::Write && prior.is_none() {
             self.writes.fetch_add(1, Ordering::SeqCst);
         }
-        let info = CallInfo { run_id: self.run_id, reference, cancel: self.cancel, delivery };
+        let attempt = self
+            .attempts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|(prefix, _, _)| {
+                reference.strip_prefix(prefix.as_str()).is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+            })
+            .max_by_key(|(prefix, _, _)| prefix.len())
+            .map_or(1, |(_, _, attempt)| *attempt);
+        let info =
+            CallInfo { run_id: self.run_id, reference, logical: &logical, attempt, cancel: self.cancel, delivery };
         let cooperative = self.host.functions.cooperative(name);
         if self.journal.is_none() {
             let result = if cooperative {
@@ -1462,7 +1486,9 @@ impl Run<'_> {
         };
         let text = |t: &Option<String>| -> Result<Option<String>, Fault> {
             let Some(s) = t else { return Ok(None) };
-            let Some(code) = expr::strip(s) else { return Ok(Some(s.clone())) };
+            let Some(code) = expr::strip(s) else {
+                return Ok(Some(s.clone()));
+            };
             Ok(match expr::eval(code, input, args).map_err(expression)? {
                 Value::Null => None,
                 Value::String(s) => Some(s),
@@ -1506,12 +1532,13 @@ impl Run<'_> {
                 format!("{reference}/try")
             } else {
                 let attempt_ref = format!("{reference}/try[{attempt}]");
-                self.attempts
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .push((attempt_ref.clone(), format!("{reference}/try")));
                 attempt_ref
             };
+            self.attempts.lock().unwrap_or_else(|e| e.into_inner()).push((
+                attempt_ref.clone(),
+                format!("{reference}/try"),
+                attempt,
+            ));
             let error = match self.list(tasks, attempt_ref.clone(), Some(reference), input.clone(), ctx, scope).await {
                 Ok(next) => return Ok(ended(next)),
                 Err(Fault::Error(e)) => e,
@@ -1526,7 +1553,9 @@ impl Run<'_> {
             let decision_key = format!("{reference}#retry-decision[{attempt}]");
             let delay = match self.record(&decision_key) {
                 Some(Record::Retry { delay_ms }) => delay_ms.map(Duration::from_millis),
-                Some(_) => return Err(Fault::Interrupted(WorkflowError::runtime("invalid retry record"))),
+                Some(_) => {
+                    return Err(Fault::Interrupted(WorkflowError::runtime("invalid retry record")));
+                }
                 None => {
                     let safe = if self.journal.is_some() {
                         !self.blocks_retry(&attempt_ref)
@@ -1640,7 +1669,9 @@ impl Run<'_> {
         if self.journal.is_some() {
             let deadline_ms = match self.record(key) {
                 Some(Record::Timer { deadline_ms }) => deadline_ms,
-                Some(_) => return Err(Fault::Interrupted(WorkflowError::runtime("invalid timer record"))),
+                Some(_) => {
+                    return Err(Fault::Interrupted(WorkflowError::runtime("invalid timer record")));
+                }
                 None => {
                     let deadline_ms = self
                         .host

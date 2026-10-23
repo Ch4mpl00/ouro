@@ -1,0 +1,28 @@
+[package]
+name = "ouro-runtime"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = []
+otlp = ["dep:opentelemetry-otlp"]
+
+[dependencies]
+anyhow = "1.0.104"
+async-trait = "0.1.92"
+futures = "0.3.34"
+chrono = "0.4.45"
+jsonschema = { version = "0.59.0", default-features = false }
+owf = { path = "../owf" }
+ouro-durable = { path = "../durable" }
+serde_json = { version = "1.0.151", features = ["preserve_order"] }
+tokio = { version = "1.53.1", features = ["rt", "sync", "time", "macros"] }
+tokio-util = "0.7.19"
+opentelemetry = { version = "0.31", default-features = false, features = ["trace", "futures"] }
+opentelemetry-otlp = { version = "0.31", optional = true, default-features = false, features = ["trace", "http-proto", "reqwest-client"] }
+
+[dev-dependencies]
+serde_yaml_ng = "0.10.0"
+tempfile = "3"
+tokio = { version = "1.53.1", features = ["full", "test-util"] }
+opentelemetry_sdk = { version = "0.31", features = ["testing"] }

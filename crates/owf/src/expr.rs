@@ -84,7 +84,9 @@ fn run(code: &str, args: &Args, input: Option<&Value>) -> Result<Value, String> 
         .with_global_vars(args.names.iter().map(String::as_str))
         .compile(modules)
         .map_err(|errs| format!("invalid jq `{code}`: {:?}", errs.into_iter().map(|(_, e)| e).collect::<Vec<_>>()))?;
-    let Some(input) = input else { return Ok(Value::Null) };
+    let Some(input) = input else {
+        return Ok(Value::Null);
+    };
     let vars = args.values.iter().map(to_val).collect::<Result<Vec<_>, _>>()?;
     let ctx = Ctx::<data::JustLut<Val>>::new(&filter.lut, Vars::new(vars));
     let mut out = filter.id.run((ctx, to_val(input)?));

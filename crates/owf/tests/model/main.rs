@@ -38,7 +38,9 @@ pub fn model_limits() -> Limits {
 fn real_shape(status: &Status) -> Value {
     match status {
         Status::Completed(v) => json!({ "completed": v }),
-        Status::Faulted(e) => json!({ "faulted": { "type": e.type_, "status": e.status, "instance": e.instance } }),
+        Status::Faulted(e) => {
+            json!({ "faulted": { "type": e.type_, "status": e.status, "instance": e.instance } })
+        }
         other => {
             assert!(matches!(other, Status::Cancelled), "a non-durable run suspended: {other:?}");
             json!("cancelled")

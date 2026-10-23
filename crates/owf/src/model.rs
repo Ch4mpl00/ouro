@@ -395,7 +395,9 @@ impl Parser {
 
     fn uses(&mut self, v: &Value) -> Uses {
         let mut uses = Uses::default();
-        let Some(m) = self.object(v, "/use") else { return uses };
+        let Some(m) = self.object(v, "/use") else {
+            return uses;
+        };
         for (k, why) in [
             ("authentications", "authentication is not supported; functions carry their own credentials"),
             ("catalogs", "external catalogs are not supported; functions come from the runtime's catalog"),
@@ -463,7 +465,9 @@ impl Parser {
         let mut out: TaskList = Vec::new();
         for (i, item) in items.iter().enumerate() {
             let at = format!("{at}/{i}");
-            let Some(m) = self.object(item, &at) else { continue };
+            let Some(m) = self.object(item, &at) else {
+                continue;
+            };
             if m.len() != 1 {
                 self.fail(&at, "each entry must be a single `name: task` pair");
                 continue;
@@ -731,13 +735,17 @@ impl Parser {
         let mut defaults = 0;
         for (i, item) in items.iter().enumerate() {
             let cat = format!("{at}/{i}");
-            let Some(m) = self.object(item, &cat) else { continue };
+            let Some(m) = self.object(item, &cat) else {
+                continue;
+            };
             let Some((name, case)) = m.iter().next().filter(|_| m.len() == 1) else {
                 self.fail(&cat, "each entry must be a single `name: case` pair");
                 continue;
             };
             let cat = format!("{cat}/{name}");
-            let Some(c) = self.object(case, &cat) else { continue };
+            let Some(c) = self.object(case, &cat) else {
+                continue;
+            };
             self.only(c, &cat, &["when", "then"]);
             let when = self.string(c, "when", &cat).map(|s| expr::bare(&s).to_string());
             if when.is_none() {
@@ -852,7 +860,9 @@ impl Parser {
     }
 
     fn input(&mut self, v: &Value, at: &str) -> Input {
-        let Some(m) = self.object(v, at) else { return Input::default() };
+        let Some(m) = self.object(v, at) else {
+            return Input::default();
+        };
         self.only(m, at, &["schema", "from"]);
         Input {
             schema: m.get("schema").and_then(|s| self.schema(s, &format!("{at}/schema"))),
@@ -861,7 +871,9 @@ impl Parser {
     }
 
     fn output(&mut self, v: &Value, at: &str) -> Output {
-        let Some(m) = self.object(v, at) else { return Output::default() };
+        let Some(m) = self.object(v, at) else {
+            return Output::default();
+        };
         self.only(m, at, &["schema", "as"]);
         Output {
             schema: m.get("schema").and_then(|s| self.schema(s, &format!("{at}/schema"))),

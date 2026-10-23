@@ -181,7 +181,9 @@ fn well_formed(journal: &[Entry], status: &Status) -> Result<(), String> {
                 if let Some(err) = error {
                     match err.instance.as_deref() {
                         Some(inst) if inst == reference || faulted.contains(inst) => {}
-                        other => return Err(format!("#{i}: {reference} faults with instance {other:?}, not inner")),
+                        other => {
+                            return Err(format!("#{i}: {reference} faults with instance {other:?}, not inner"));
+                        }
                     }
                     faulted.insert(reference.clone());
                 }
@@ -258,7 +260,9 @@ fn effects_started_means_a_write_was_called_and_no_retry_replays_one() {
         ensure(ran.outcome.effects_started == wrote, &p, format!("effects_started {}", ran.outcome.effects_started))?;
         let calls = ancestry(&ran.journal);
         for (k, e) in ran.journal.iter().enumerate() {
-            let Entry::Retrying { reference, .. } = e else { continue };
+            let Entry::Retrying { reference, .. } = e else {
+                continue;
+            };
             // The attempt began at the try's start or at its previous retry.
             let began = ran.journal[..k]
                 .iter()
@@ -443,8 +447,9 @@ fn json_value() -> impl Strategy<Value = Value> {
     leaf.prop_recursive(5, 48, 5, |inner| {
         prop_oneof![
             prop::collection::vec(inner.clone(), 0..4).prop_map(Value::Array),
-            prop::collection::vec((prop::sample::select(WORDS), inner), 0..5)
-                .prop_map(|kv| Value::Object(kv.into_iter().map(|(k, v)| (k.to_string(), v)).collect::<Map<_, _>>())),
+            prop::collection::vec((prop::sample::select(WORDS), inner), 0..5).prop_map(|kv| {
+                Value::Object(kv.into_iter().map(|(k, v)| (k.to_string(), v)).collect::<Map<_, _>>())
+            }),
         ]
     })
 }
