@@ -548,26 +548,33 @@ async fn every_cron_and_after_start_each_slot_once() {
     save(&f.rt, "every", &doc("every", "schedule: { every: PT1M }\ndo: [ { a: { set: { ok: true } } } ]"));
     save(&f.rt, "cron", &doc("cron", "schedule: { cron: '*/5 * * * *' }\ndo: [ { a: { set: { ok: true } } } ]"));
     save(&f.rt, "after", &doc("after", "schedule: { after: PT10S }\ndo: [ { a: { set: { ok: true } } } ]"));
-    let started = f.rt.schedule(0, 60_000).unwrap();
-    assert!(started.contains(&"schedule:every:every:60000".to_string()), "{started:?}");
-    assert!(started.iter().any(|id| id.starts_with("schedule:after:after:")));
-    assert!(!started.iter().any(|id| id.starts_with("schedule:cron:")), "no cron slot in the first minute");
-    // Two schedulers over the same window start nothing more.
-    assert!(f.rt.schedule(0, 60_000).unwrap().is_empty());
-    let started = f.rt.schedule(60_000, 300_000).unwrap();
-    assert!(started.contains(&"schedule:cron:cron:300000".to_string()), "{started:?}");
-    assert!(started.contains(&"schedule:every:every:300000".to_string()));
+    // Activation at 0 arms the first `after` run at once and the others at
+    // their next slots.
+    assert_eq!(f.rt.fire_due().unwrap(), vec!["schedule:after:after:0000000001".to_string()]);
+    f.time.set(60_000);
+    assert_eq!(f.rt.fire_due().unwrap(), vec!["schedule:every:every:60000".to_string()]);
+    // A second scheduler at the same time starts nothing more.
+    assert!(f.rt.fire_due().unwrap().is_empty());
+    // Down until 10 minutes: each missed schedule starts once, late.
+    f.time.set(600_000);
+    let mut started = f.rt.fire_due().unwrap();
+    started.sort();
+    assert_eq!(started, vec!["schedule:cron:cron:300000".to_string(), "schedule:every:every:120000".into()]);
+    assert!(f.rt.fire_due().unwrap().is_empty());
     // The next `after` run waits for the previous one to end, plus the delay.
-    assert!(!started.iter().any(|id| id.starts_with("schedule:after:")));
-    f.time.set(300_000);
     settle(&f.rt, "schedule:after:after:0000000001").await;
-    assert!(f.rt.schedule(300_000, 305_000).unwrap().is_empty());
-    let started = f.rt.schedule(305_000, 310_000).unwrap();
-    assert_eq!(started, vec!["schedule:after:after:0000000002".to_string()]);
+    f.time.set(609_999);
+    assert!(f.rt.fire_due().unwrap().is_empty());
+    f.time.set(610_000);
+    assert_eq!(f.rt.fire_due().unwrap(), vec!["schedule:after:after:0000000002".to_string()]);
+    // A version without the schedule removes its trigger.
+    save(&f.rt, "every", &doc("every", "do: [ { a: { set: { ok: true } } } ]"));
+    f.time.set(10_000_000);
+    assert!(!f.rt.fire_due().unwrap().iter().any(|id| id.starts_with("schedule:every:")));
 }
 
 #[tokio::test]
-async fn schedule_on_starts_a_run_per_match_through_trigger_runs() {
+async fn schedule_on_starts_a_run_per_match() {
     let f = fixture();
     save(
         &f.rt,
@@ -577,32 +584,19 @@ async fn schedule_on_starts_a_run_per_match_through_trigger_runs() {
             "schedule: { on: { one: { with: { type: heartbeat.low, data: '${ .bpm < 50 }' } } } }\ndo: [ { a: { set: { patient: '${ .[0].patient }' } } } ]",
         ),
     );
-    for (id, bpm, patient) in [("1", 40, "ann"), ("2", 70, "bob"), ("3", 45, "cid")] {
-        f.rt.publish(event(id, "heartbeat.low", json!({"bpm": bpm, "patient": patient}))).unwrap();
+    let mut started = Vec::new();
+    for (id, bpm, patient) in [("1", 40, "ann"), ("2", 70, "bob"), ("3", 45, "cid"), ("1", 40, "ann")] {
+        started.extend(f.rt.publish(event(id, "heartbeat.low", json!({"bpm": bpm, "patient": patient}))).unwrap());
     }
-    let mut outputs = Vec::new();
-    for _ in 0..10 {
-        f.rt.schedule(0, 1).unwrap();
-        while f.rt.recover_once(&CancellationToken::new()).await.unwrap() > 0 {}
-        outputs =
-            f.rt.list(Some("alarm"), "")
-                .unwrap()
-                .into_iter()
-                .filter_map(|r| match r.outcome {
-                    Some(Status::Completed(v)) => Some(v["patient"].clone()),
-                    _ => None,
-                })
-                .collect();
-        if outputs.len() == 2 {
-            break;
-        }
-    }
+    assert_eq!(started.len(), 2, "one run per match, none for a republished event: {started:?}");
+    while f.rt.recover_once(&CancellationToken::new()).await.unwrap() > 0 {}
+    let mut outputs: Vec<Value> =
+        f.rt.list(Some("alarm"), "").unwrap().into_iter().map(|r| completed(r.outcome)["patient"].clone()).collect();
     outputs.sort_by_key(|v| v.to_string());
     assert_eq!(outputs, vec![json!("ann"), json!("cid")]);
-    // A deactivated schedule stops listening.
+    // A version without the schedule stops reacting.
     save(&f.rt, "alarm", &doc("alarm", "do: [ { a: { set: { ok: true } } } ]"));
-    f.rt.schedule(1, 2).unwrap();
-    assert!(f.rt.list(Some("alarm#on"), "").unwrap().iter().all(|r| r.ended_ms.is_some()));
+    assert!(f.rt.publish(event("4", "heartbeat.low", json!({"bpm": 1}))).unwrap().is_empty());
 }
 
 // ── crashes at every commit ────────────────────────────────────────────────
@@ -851,17 +845,10 @@ async fn schedule_on_all_starts_once_every_filter_has_matched() {
             "schedule:\n  on: { all: [ { with: { type: a } }, { with: { type: b } } ] }\n  read: envelope\ndo: [ { s: { set: '${ map(.type) }' } } ]",
         ),
     );
-    f.rt.publish(event("1", "a", json!(1))).unwrap();
-    f.rt.schedule(0, 1).unwrap();
-    while f.rt.recover_once(&CancellationToken::new()).await.unwrap() > 0 {}
-    assert!(f.rt.list(Some("pair"), "").unwrap().is_empty(), "one of two is not enough");
-    f.rt.publish(event("2", "b", json!(2))).unwrap();
-    for _ in 0..3 {
-        while f.rt.recover_once(&CancellationToken::new()).await.unwrap() > 0 {}
-        f.rt.schedule(1, 2).unwrap();
-    }
-    while f.rt.recover_once(&CancellationToken::new()).await.unwrap() > 0 {}
-    let runs = f.rt.list(Some("pair"), "").unwrap();
-    assert_eq!(runs.len(), 1);
-    assert_eq!(runs[0].outcome, Some(Status::Completed(json!(["a", "b"]))));
+    assert!(f.rt.publish(event("1", "a", json!(1))).unwrap().is_empty(), "one of two is not enough");
+    assert!(f.rt.publish(event("2", "a", json!(2))).unwrap().is_empty(), "a filled filter drops a second match");
+    let started = f.rt.publish(event("3", "b", json!(3))).unwrap();
+    assert_eq!(started.len(), 1);
+    assert_eq!(completed(settle(&f.rt, &started[0]).await), json!(["a", "b"]));
+    assert!(f.rt.publish(event("4", "b", json!(4))).unwrap().is_empty(), "the next pair starts afresh");
 }

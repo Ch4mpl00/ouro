@@ -156,7 +156,8 @@ impl Runtime {
         let definitions = self.store.definitions(name)?;
         let d = definitions.versions.get(&version).ok_or_else(|| anyhow::anyhow!("unknown definition version"))?;
         self.validate(&d.yaml)?;
-        self.store.activate(name, version)
+        self.store.activate(name, version)?;
+        self.arm(name)
     }
     pub(crate) fn admitter(&self) -> Admitter {
         Admitter {
@@ -372,6 +373,8 @@ impl Runtime {
                 Some((id,result))=running.next(),if !running.is_empty()=> {ids.remove(&id);if let Err(e)=result {failure=Some(e);break;}},
                 _=tick.tick()=> {
                     if sweep.elapsed()>=Duration::from_secs(3600) {if let Err(e)=self.store.sweep(self.clock.now_ms(),self.config.retention_ms) {failure=Some(e);break;} sweep=tokio::time::Instant::now();}
+                    // Due schedule slots: a range of the trigger index ending now.
+                    if let Err(e)=self.fire_due() {failure=Some(e);break;}
                     let due=match self.store.due(self.clock.now_ms(),self.config.max_concurrency) {Ok(due)=>due,Err(e)=>{failure=Some(e);break;}};
                     for id in due {
                         if ids.len()>=self.config.max_concurrency {break;}

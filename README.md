@@ -98,12 +98,16 @@ the choices made where the specification is silent (`CHOICE` comments).
   readable as `$secrets` in `input.from` only and are redacted from records,
   spans, errors and outcomes. `schema.resource` resolves through a
   `ResourceResolver` (`with_resources`) and is pinned at admission.
-- `schedule` (`every`, `cron` in UTC, `after`, `on`) starts runs of active
-  definitions from `schedule(from, to)` or the host-started `scheduler`
-  loop. Run ids derive from slots, so concurrent schedulers start each once.
-  `on` is served by trigger runs (named `<name>#on`) that listen with the
-  schedule's strategy; each completed one starts the workflow with the
-  consumed events.
+- `schedule` (`every`, `cron` in UTC, `after`, `on`) keeps generic
+  triggers in the store, armed on `activate`: indexed by the time they are
+  next due and by the event types they react to. The `worker` fires due
+  slots on each tick (`fire_due`, a range read of the due index); the
+  trigger moves to its next slot in the commit that admits the slot's run,
+  whose id derives from the slot, so concurrent workers start each once.
+  `after` re-arms when its run ends. `on` keeps the events matched so far
+  in its trigger and starts the workflow, with the consumed events as
+  input, once the strategy is satisfied; a publish reads only the triggers
+  indexed under its type.
 
 ## Durability and storage
 

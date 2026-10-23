@@ -1,253 +1,224 @@
-//! Published events and schedules: 1. publishing an event to the runs
-//! listening for it and to event-triggered schedules (`schedule.on`);
-//! 2. the runs `every`, `cron` and `after` owe, and the trigger runs behind
-//! `on`; 3. the loop a host starts.
+//! Schedules and published events: 1. the triggers a definition's
+//! `schedule` keeps in the store, armed on activation; 2. firing due
+//! triggers (`every`, `cron`, `after`); 3. publishing an event to the runs
+//! listening for it and to event-triggered schedules (`on`).
 //!
-//! Every start is idempotent: a run's id is derived from its slot, its
-//! trigger run or the predecessor that owes it, and admission commits once
-//! per id (a compare-and-swap in the store), so schedulers in several
+//! The store holds generic triggers (`ouro_durable::Trigger`): indexed by
+//! the time they are next due and by the event types they react to, and
+//! changed only by compare-and-swap together with the runs they admit. The
+//! DSL stays here: cron, intervals and event strategies are computed by the
+//! runtime. Nothing scans definitions or runs: the worker reads the due
+//! index (a range ending now), and a publish reads the trigger index of the
+//! event's type.
+//!
+//! A slot's run id is derived from the slot (`schedule:<name>:every:<ms>`,
+//! `…:cron:<ms>`, `…:after:<n>`, `…:on:<digest of the events>`) and the
+//! trigger moves to the next slot in the commit that admits it, so several
 //! processes start each run once.
 //!
-//! `schedule.on` is served by trigger runs: a run (named `<name>#on`) of a
-//! generated definition that only listens with the schedule's strategy, so
-//! filters, correlation, `all` and `until` mean what they mean in a
-//! `listen`. Publishing hands each matching event to the open trigger run,
-//! subscribed yet or not; once it completes, the scheduler starts the
-//! workflow on the events it consumed (`read` applied) and opens the next
-//! trigger run, moving over the events the previous one left unconsumed.
+//! `on` keeps the events matched so far in its trigger's state and replays
+//! them through the same consumer a `listen` uses (`owf::events`), so `all`,
+//! correlation and `until` mean what they mean in a listen. CHOICE: no
+//! listener run is involved (an earlier version kept one per schedule): a
+//! run exists only once its events have arrived, nothing waits between two
+//! generations of listeners, and a publish costs a read of the matching
+//! triggers instead of a delivery to a run plus a later scan.
 use crate::{Runtime, execution::Admitter};
-use ouro_durable::{Definition, RunStore};
+use ouro_durable::{Rearm, RunStore, Trigger};
 use owf::{
-    events,
-    model::{self, Schedule},
-    run::Status,
+    events::{self, Consumer, Offer},
+    expr::{self, Args},
+    model::{self, Schedule, Strategy, Until},
 };
 use serde_json::{Value, json};
-use std::time::Duration;
-use tokio_util::sync::CancellationToken;
 
-/// The schedule and parsed document of each active definition that has one.
-struct Scheduled {
-    definition: Definition,
-    schedule: Schedule,
-    /// `schedule` as written, which identifies a trigger generation.
-    raw: Value,
-    document: Value,
+/// How many due triggers one call fires, and how many triggers one event
+/// may reach; more wait for the next tick.
+const BATCH: usize = 256;
+
+const KINDS: [&str; 4] = ["every", "cron", "after", "on"];
+
+fn key(name: &str, kind: &str) -> String {
+    format!("{name}#{kind}")
 }
 
-fn scheduled(store: &dyn RunStore) -> anyhow::Result<Vec<Scheduled>> {
-    let mut out = Vec::new();
-    for name in store.definition_names()? {
-        let definitions = store.definitions(&name)?;
-        let Some(d) = definitions.active.and_then(|v| definitions.versions.get(&v)) else { continue };
-        // A definition that no longer parses has no schedule to honour.
-        let Ok(wf) = model::parse_yaml(&d.yaml) else { continue };
-        if let Some(schedule) = wf.schedule {
-            out.push(Scheduled {
-                definition: d.clone(),
-                schedule,
-                raw: wf.definition["schedule"].clone(),
-                document: wf.definition["document"].clone(),
-            });
-        }
-    }
-    Ok(out)
-}
-
-// ── 1. publishing ──────────────────────────────────────────────────────────
-
-/// Delivers a CloudEvent to every run subscribed to it and to the open
-/// trigger run of every `schedule.on` it may match. Idempotent per
-/// `source` + `id`. Returns the receiving runs.
-pub(crate) fn publish(
-    store: &dyn RunStore,
-    admitter: &Admitter,
-    event: &Value,
-    now: i64,
-) -> anyhow::Result<Vec<String>> {
-    let mut receivers = store.publish(event, None, now)?;
-    let t = event.get("type").and_then(Value::as_str).unwrap_or_default();
-    for s in scheduled(&*admitter.definitions)? {
-        let Some(on) = &s.schedule.on else { continue };
-        let routes = events::routes(on, &owf::expr::Args::new());
-        if !routes.iter().any(|r| r == "*" || r == t) {
-            continue;
-        }
-        let trigger = open_trigger(store, admitter, &s, now)?;
-        receivers.extend(store.publish(event, Some(&trigger), now)?);
-    }
-    receivers.sort();
-    receivers.dedup();
-    Ok(receivers)
-}
-
-/// FNV-1a: a stable digest of a schedule, the same in every process.
+/// FNV-1a: a stable digest, the same in every process.
 fn digest(text: &str) -> String {
     let hash = text.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |h, b| (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3));
     format!("{hash:016x}")
 }
 
-fn trigger_name(name: &str) -> String {
-    format!("{name}#on")
+fn millis(d: std::time::Duration) -> i64 {
+    i64::try_from(d.as_millis()).unwrap_or(i64::MAX).max(1)
 }
 
-fn trigger_prefix(s: &Scheduled) -> String {
-    format!("schedule:{}:on:{}:", s.definition.name, digest(&s.raw.to_string()))
+/// The first `every` slot after `after`: slots are aligned to the epoch.
+fn next_every(every: i64, after: i64) -> i64 {
+    after - after.rem_euclid(every) + every
 }
 
-/// The trigger runs of this schedule generation, by sequence number.
-fn triggers(store: &dyn RunStore, s: &Scheduled) -> anyhow::Result<Vec<(u64, ouro_durable::SavedRun)>> {
-    let prefix = trigger_prefix(s);
-    let mut runs: Vec<_> = store
-        .list(Some(&trigger_name(&s.definition.name)), &prefix)?
-        .into_iter()
-        .filter_map(|r| Some((r.admission.id.strip_prefix(&prefix)?.parse::<u64>().ok()?, r)))
-        .collect();
-    runs.sort_by_key(|(n, _)| *n);
-    Ok(runs)
+/// The first `cron` occurrence (UTC) after `after`.
+fn next_cron(cron: &str, after: i64) -> anyhow::Result<i64> {
+    let cron: croner::Cron = cron.parse()?;
+    let at = chrono::DateTime::from_timestamp_millis(after).ok_or_else(|| anyhow::anyhow!("invalid time"))?;
+    Ok(cron.find_next_occurrence(&at, false)?.timestamp_millis())
 }
 
-/// The id of the open trigger run, admitting the next one when none is open.
-fn open_trigger(store: &dyn RunStore, admitter: &Admitter, s: &Scheduled, now: i64) -> anyhow::Result<String> {
-    let runs = triggers(store, s)?;
-    if let Some((_, open)) = runs.iter().find(|(_, r)| r.ended_ms.is_none()) {
-        return Ok(open.admission.id.clone());
-    }
-    let n = runs.last().map_or(1, |(n, _)| n + 1);
-    let id = format!("{}{n:010}", trigger_prefix(s));
-    let mut listen = json!({ "to": s.raw["on"] });
-    if let Some(read) = s.raw.get("read") {
-        listen["read"] = read.clone();
-    }
-    let definition = json!({
-        "document": {
-            "dsl": s.document["dsl"],
-            "namespace": s.document["namespace"],
-            "name": s.document["name"],
-            "version": s.document["version"],
-        },
-        "do": [ { "trigger": { "listen": listen } } ],
-    });
-    let generated = Definition {
-        name: trigger_name(&s.definition.name),
-        version: s.definition.version,
-        yaml: serde_json::to_string(&definition)?,
-    };
-    // Admission compares and sets on the id: a concurrent scheduler that got
-    // there first leaves this one a no-op.
-    store.admit(&admitter.of(&id, &generated, json!({}))?, now)?;
-    Ok(id)
+/// The active definition's schedule and its `schedule` as written.
+struct Active {
+    schedule: Option<Schedule>,
+    raw: Value,
 }
 
-// ── 2. owed runs ───────────────────────────────────────────────────────────
+fn active(definitions: &dyn RunStore, name: &str) -> anyhow::Result<Option<Active>> {
+    let definitions = definitions.definitions(name)?;
+    let Some(d) = definitions.active.and_then(|v| definitions.versions.get(&v)) else { return Ok(None) };
+    let wf = model::parse_yaml(&d.yaml)?;
+    Ok(Some(Active { schedule: wf.schedule, raw: wf.definition["schedule"].clone() }))
+}
+
+// ── 1. arming ──────────────────────────────────────────────────────────────
 
 impl Runtime {
-    /// Starts the runs schedules owe for the time in `(from_ms, to_ms]`
-    /// and serves trigger runs. CHOICE: `every` slots are aligned to the
-    /// epoch and `cron` (UTC) slots are its occurrences; only the latest
-    /// slot in the window starts, so a scheduler that was down does not
-    /// start a burst of missed runs. The first `after` run starts when the
-    /// definition is first seen active, each next one `after` the previous
-    /// ended (in any terminal state). Scheduled runs get `{}` as input; a
-    /// workflow started by `on` gets the array of consumed events.
-    /// Returns the runs it admitted.
-    pub fn schedule(&self, from_ms: i64, to_ms: i64) -> anyhow::Result<Vec<String>> {
-        // Runs are admitted at the clock's time, due at once, whatever window
-        // they were owed for.
+    /// Brings `name`'s triggers in line with its active definition: arms
+    /// what its schedule declares, removes what it no longer does. Called on
+    /// activation; four point reads and at most four swaps.
+    pub(crate) fn arm(&self, name: &str) -> anyhow::Result<()> {
+        let active = active(&*self.store, name)?;
+        let now = self.clock.now_ms();
+        for kind in KINDS {
+            let k = key(name, kind);
+            for _ in 0..16 {
+                let current = self.store.trigger(&k)?;
+                let desired = desired(name, kind, active.as_ref(), current.as_ref(), now)?;
+                if desired == current
+                    || self.store.swap_trigger(&k, current.as_ref(), desired.as_ref(), &[], None, now)?
+                {
+                    break;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The trigger a schedule wants for `kind`. One already in place for the
+/// same schedule is kept: its slot, its `after` count, its matched events.
+fn desired(
+    name: &str,
+    kind: &str,
+    active: Option<&Active>,
+    current: Option<&Trigger>,
+    now: i64,
+) -> anyhow::Result<Option<Trigger>> {
+    let Some(Active { schedule: Some(s), raw }) = active else { return Ok(None) };
+    let fingerprint = digest(&raw.to_string());
+    let same = |t: &Trigger| t.state["schedule"] == fingerprint;
+    let state = |extra: Value| {
+        let mut state = json!({ "name": name, "kind": kind, "schedule": fingerprint });
+        if let (Value::Object(m), Value::Object(e)) = (&mut state, extra) {
+            m.extend(e);
+        }
+        state
+    };
+    Ok(match kind {
+        "every" => s.every.map(|every| {
+            current.filter(|t| same(t)).cloned().unwrap_or_else(|| Trigger {
+                at_ms: Some(next_every(millis(every), now)),
+                types: Vec::new(),
+                state: state(json!({})),
+            })
+        }),
+        "cron" => match &s.cron {
+            None => None,
+            Some(cron) => match current.filter(|t| same(t)) {
+                Some(t) => Some(t.clone()),
+                None => {
+                    Some(Trigger { at_ms: Some(next_cron(cron, now)?), types: Vec::new(), state: state(json!({})) })
+                }
+            },
+        },
+        // The `after` chain survives new versions: a new one neither starts
+        // a second chain nor restarts the count.
+        "after" => s.after.map(|_| {
+            current.cloned().unwrap_or_else(|| Trigger {
+                at_ms: Some(now),
+                types: Vec::new(),
+                state: state(json!({ "n": 1 })),
+            })
+        }),
+        _ => s.on.as_ref().map(|on| {
+            current.filter(|t| same(t)).cloned().unwrap_or_else(|| Trigger {
+                at_ms: None,
+                types: events::routes(on, &Args::new()),
+                state: state(json!({ "events": [] })),
+            })
+        }),
+    })
+}
+
+// ── 2. firing ──────────────────────────────────────────────────────────────
+
+impl Runtime {
+    /// Starts the runs whose slots are due now and moves each trigger to its
+    /// next slot in the same commit. CHOICE: a slot missed while no worker
+    /// ran starts once, late, and the next slot is the first after now, so a
+    /// scheduler that was down does not start a burst. Scheduled runs get
+    /// `{}` as input. Returns the runs it admitted. The worker calls it on
+    /// every tick: when nothing is due it reads no rows.
+    pub fn fire_due(&self) -> anyhow::Result<Vec<String>> {
         let now = self.clock.now_ms();
         let mut started = Vec::new();
-        let mut admit = |id: String, name: &str, input: Value| -> anyhow::Result<()> {
-            if self.store.get(&id)?.is_none() && self.store.admit(&self.admission(&id, name, input)?, now)? {
-                started.push(id);
-            }
-            Ok(())
+        for (k, t) in self.store.due_triggers(now, BATCH)? {
+            started.extend(self.fire(&k, &t, now)?);
+        }
+        Ok(started)
+    }
+
+    fn fire(&self, k: &str, t: &Trigger, now: i64) -> anyhow::Result<Option<String>> {
+        let (Some(name), Some(kind), Some(slot)) = (t.state["name"].as_str(), t.state["kind"].as_str(), t.at_ms) else {
+            anyhow::bail!("trigger {k} is not a schedule's");
         };
-        let all = scheduled(&*self.store)?;
-        let mut triggered = Vec::new();
-        for s in &all {
-            let name = &s.definition.name;
-            if let Some(every) = s.schedule.every {
-                let every = i64::try_from(every.as_millis()).unwrap_or(i64::MAX).max(1);
-                let slot = to_ms - to_ms.rem_euclid(every);
-                if slot > from_ms {
-                    admit(format!("schedule:{name}:every:{slot}"), name, json!({}))?;
-                }
+        let schedule = active(&*self.store, name)?.and_then(|a| a.schedule);
+        let mut next = t.clone();
+        let mut rearm = None;
+        let id = match (kind, &schedule) {
+            ("every", Some(Schedule { every: Some(every), .. })) => {
+                next.at_ms = Some(next_every(millis(*every), slot.max(now)));
+                format!("schedule:{name}:every:{slot}")
             }
-            if let Some(cron) = &s.schedule.cron {
-                let cron: croner::Cron = cron.parse()?;
-                let at =
-                    chrono::DateTime::from_timestamp_millis(to_ms).ok_or_else(|| anyhow::anyhow!("invalid time"))?;
-                let slot = cron.find_previous_occurrence(&at, true)?.timestamp_millis();
-                if slot > from_ms {
-                    admit(format!("schedule:{name}:cron:{slot}"), name, json!({}))?;
-                }
+            ("cron", Some(Schedule { cron: Some(cron), .. })) => {
+                next.at_ms = Some(next_cron(cron, slot.max(now))?);
+                format!("schedule:{name}:cron:{slot}")
             }
-            if let Some(after) = s.schedule.after {
-                let prefix = format!("schedule:{name}:after:");
-                let last = self
-                    .store
-                    .list(Some(name), &prefix)?
-                    .into_iter()
-                    .filter_map(|r| Some((r.admission.id.strip_prefix(&prefix)?.parse::<u64>().ok()?, r)))
-                    .max_by_key(|(n, _)| *n);
-                let after = i64::try_from(after.as_millis()).unwrap_or(i64::MAX);
-                match last {
-                    None => admit(format!("{prefix}{:010}", 1), name, json!({}))?,
-                    Some((n, r)) if r.ended_ms.is_some_and(|ended| ended.saturating_add(after) <= to_ms) => {
-                        admit(format!("{prefix}{:010}", n + 1), name, json!({}))?
-                    }
-                    Some(_) => {}
-                }
+            ("after", Some(Schedule { after: Some(after), .. })) => {
+                let n = t.state["n"].as_u64().unwrap_or(1);
+                // Not due again until this run ends: the store re-arms it then.
+                next.at_ms = None;
+                next.state["n"] = json!(n + 1);
+                rearm = Some(Rearm { trigger: k.to_owned(), delay_ms: millis(*after) });
+                format!("schedule:{name}:after:{n:010}")
             }
-            if s.schedule.on.is_some() {
-                triggered.extend(self.serve_triggers(s, now)?);
+            // The schedule no longer declares it (another version is active).
+            _ => {
+                self.store.swap_trigger(k, Some(t), None, &[], None, now)?;
+                return Ok(None);
             }
-        }
-        started.extend(triggered);
-        // A trigger run whose schedule changed or went away stops listening.
-        let current: Vec<String> = all.iter().filter(|s| s.schedule.on.is_some()).map(trigger_prefix).collect();
-        for r in self.store.list(None, "schedule:")? {
-            if r.ended_ms.is_none()
-                && r.admission.name.ends_with("#on")
-                && !current.iter().any(|p| r.admission.id.starts_with(p))
-            {
-                self.store.cancel(&r.admission.id, now)?;
-            }
-        }
-        Ok(started)
+        };
+        let admission = self.admission(&id, name, json!({}))?;
+        let fired = self.store.swap_trigger(k, Some(t), Some(&next), &[admission], rearm.as_ref(), now)?;
+        Ok(fired.then_some(id))
     }
+}
 
-    /// Starts the workflow for each completed trigger run, keeps one trigger
-    /// run open and moves to it what the previous one left unconsumed.
-    fn serve_triggers(&self, s: &Scheduled, now: i64) -> anyhow::Result<Vec<String>> {
-        let name = &s.definition.name;
-        let mut started = Vec::new();
-        for (_, r) in triggers(&*self.store, s)? {
-            let Some(Status::Completed(consumed)) = &r.outcome else { continue };
-            let id = format!("{}:run", r.admission.id);
-            if self.store.get(&id)?.is_none() && self.store.admit(&self.admission(&id, name, consumed.clone())?, now)? {
-                started.push(id);
-            }
-        }
-        let admitter = self.admitter();
-        let open = open_trigger(&*self.store, &admitter, s, now)?;
-        let runs = triggers(&*self.store, s)?;
-        if let Some((_, previous)) = runs.iter().rev().find(|(_, r)| r.ended_ms.is_some())
-            && let Some(snapshot) = self.store.inspect(&previous.admission.id)?
-        {
-            for e in snapshot.events.iter().filter(|e| e.consumed_key.is_none()) {
-                if let Some(envelope) = &e.envelope {
-                    self.store.publish(envelope, Some(&open), now)?;
-                }
-            }
-        }
-        Ok(started)
-    }
+// ── 3. publishing ──────────────────────────────────────────────────────────
 
+impl Runtime {
     /// Delivers a CloudEvent (at least `id`, `source` and `type`) to every
     /// run listening for it and to the event-triggered schedules it may
     /// start. `specversion` and `time` are filled in when absent.
     /// Publishing the same `source` + `id` again delivers nothing new.
+    /// Returns the runs it reached or started.
     pub fn publish(&self, mut event: Value) -> anyhow::Result<Vec<String>> {
         let now = self.clock.now_ms();
         let Value::Object(e) = &mut event else { anyhow::bail!("an event is an object") };
@@ -260,26 +231,102 @@ impl Runtime {
         });
         publish(&*self.store, &self.admitter(), &event, now)
     }
+}
 
-    // ── 3. the loop ────────────────────────────────────────────────────────
+/// The runs a published event reaches, and the runs it starts through the
+/// `on` schedules indexed under its type (runs and triggers in `store`,
+/// definitions where the admitter reads them).
+pub(crate) fn publish(
+    store: &dyn RunStore,
+    admitter: &Admitter,
+    event: &Value,
+    now: i64,
+) -> anyhow::Result<Vec<String>> {
+    let mut reached = store.publish(event, None, now)?;
+    let t = event.get("type").and_then(Value::as_str).unwrap_or_default();
+    for (k, trigger) in store.triggers_for(t, BATCH)? {
+        reached.extend(offer(store, admitter, &k, trigger, event, now)?);
+    }
+    Ok(reached)
+}
 
-    /// Run on host startup, next to `worker`: every poll interval it starts
-    /// what schedules owe since the previous tick (from its own start).
-    pub async fn scheduler(&self, stop: CancellationToken) -> anyhow::Result<()> {
-        let mut from = self.clock.now_ms();
-        let mut tick = tokio::time::interval(self.config.poll_interval.max(Duration::from_millis(1)));
-        loop {
-            tokio::select! {
-                biased;
-                _ = stop.cancelled() => return Ok(()),
-                _ = tick.tick() => {
-                    let to = self.clock.now_ms();
-                    if to > from {
-                        self.schedule(from, to)?;
-                        from = to;
-                    }
+/// Offers the event to an `on` trigger: its matched events plus this one
+/// go through the schedule's strategy again; a complete match starts the
+/// workflow and empties the trigger in one commit, a partial one is kept.
+fn offer(
+    store: &dyn RunStore,
+    admitter: &Admitter,
+    k: &str,
+    mut trigger: Trigger,
+    event: &Value,
+    now: i64,
+) -> anyhow::Result<Option<String>> {
+    let same = |a: &Value| a.get("id") == event.get("id") && a.get("source") == event.get("source");
+    for _ in 0..16 {
+        let name = trigger.state["name"].as_str().unwrap_or_default().to_owned();
+        let Some(Schedule { on: Some(on), read, .. }) = active(&*admitter.definitions, &name)?.and_then(|a| a.schedule)
+        else {
+            return Ok(None);
+        };
+        let mut matched: Vec<Value> = trigger.state["events"].as_array().cloned().unwrap_or_default();
+        if matched.iter().any(same) {
+            return Ok(None);
+        }
+        matched.push(event.clone());
+        let Some(outcome) = consume(&on, &matched)? else { return Ok(None) };
+        let mut next = trigger.clone();
+        let mut admit = Vec::new();
+        let mut id = None;
+        match outcome {
+            Some(consumed) => {
+                next.state["events"] = json!([]);
+                let ids: Vec<String> = matched.iter().map(|e| format!("{}\u{0}{}", e["source"], e["id"])).collect();
+                let run = format!("schedule:{name}:on:{}", digest(&ids.join("\u{1}")));
+                // The same events again (republished): that run exists.
+                if store.get(&run)?.is_some() {
+                    return Ok(None);
+                }
+                let input: Vec<Value> = consumed.iter().map(|e| events::read(e, read)).collect();
+                admit.push(admitter.active(&run, &name, Value::Array(input))?);
+                id = Some(run);
+            }
+            None => next.state["events"] = Value::Array(matched),
+        }
+        if store.swap_trigger(k, Some(&trigger), Some(&next), &admit, None, now)? {
+            return Ok(id);
+        }
+        match store.trigger(k)? {
+            Some(t) => trigger = t,
+            None => return Ok(None),
+        }
+    }
+    anyhow::bail!("trigger {k} changed too often to offer an event")
+}
+
+/// Replays `events` through the strategy. `None`: the last one is not
+/// wanted. `Some(None)`: wanted, not complete yet. `Some(Some(consumed))`:
+/// complete, with the events that belong to the output (`until` ones excluded).
+#[allow(clippy::option_option)]
+fn consume(strategy: &Strategy, events: &[Value]) -> anyhow::Result<Option<Option<Vec<Value>>>> {
+    let args = Args::new();
+    let mut consumer = Consumer::new(strategy);
+    let mut consumed = Vec::new();
+    let mut last = Offer::Ignored;
+    for e in events {
+        last = consumer.offer(e, &Value::Null, &args).map_err(|e| anyhow::anyhow!(e))?;
+        if last == Offer::Consumed {
+            consumed.push(e.clone());
+            if let Strategy::Any { until: Some(Until::Condition(c)), .. } = strategy {
+                let data: Vec<Value> = consumed.iter().map(|e| events::read(e, model::Read::Data)).collect();
+                if expr::truthy(&expr::eval(c, &Value::Array(data), &args).map_err(|e| anyhow::anyhow!(e))?) {
+                    consumer.stop();
                 }
             }
         }
     }
+    Ok(match last {
+        Offer::Ignored => None,
+        _ if consumer.done() => Some(Some(consumed)),
+        _ => Some(None),
+    })
 }
