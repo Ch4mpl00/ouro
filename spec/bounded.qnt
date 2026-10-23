@@ -30,4 +30,7 @@ module bounded {
     finishWith(Set(0,1), Set(4,5), Set(0,1,2)), claimWith(Set(0,1,2), Set(0,1)),
     activateWith(Set(1,2))
   }
+  // One Boolean query avoids duplicating the large transition audit for each
+  // conjunct. This is equivalent to safety; no property is dropped.
+  val combinedSafety = (if (safety) 1 else 0) == 1
 }

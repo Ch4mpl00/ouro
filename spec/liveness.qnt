@@ -60,4 +60,16 @@ module liveness {
     (runs.nth(r).state == 2 and not(runs.nth(r).live)).leadsTo(runs.nth(r).live or runs.nth(r).state == 4)))
   temporal consumption = fair.implies(RUNS.forall(r => runs.nth(r).pending.leadsTo(runs.nth(r).consumed)))
   val safety = RUNS.forall(r => not(runs.nth(r).pending and runs.nth(r).consumed))
+
+  // These finite prefixes extend to fair infinite executions by ticking after
+  // settling. Fairness is satisfiable both with and without external delivery.
+  run drainTest = init.then(stabilize)
+    .then(claim(0)).then(tick).then(claim(0))
+    .then(progress(0)).then(deliver(0)).then(progress(0)).then(progress(0))
+    .then(claim(1)).then(progress(1)).then(deliver(1)).then(progress(1)).then(progress(1))
+    .expect(RUNS.forall(r => runs.nth(r).state == 4 and runs.nth(r).consumed))
+  run quietWaitTest = init.then(stabilize)
+    .then(claim(0)).then(progress(0)).then(progress(0))
+    .then(claim(1)).then(progress(1)).then(progress(1))
+    .expect(RUNS.forall(r => runs.nth(r).state == 3 and not(runs.nth(r).pending)))
 }

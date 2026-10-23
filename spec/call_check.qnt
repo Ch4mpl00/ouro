@@ -3,10 +3,10 @@
 module call_check {
   import calls.* from "./calls"
   type CallModel = { now: int, generation: List[int], lease: List[int],
-    fences: List[int], phases: List[int], records: List[int], sends: List[int], bad: bool }
+    fences: List[int], phases: List[int], records: List[int], sends: List[int] }
   var c: CallModel
   action init = c' = { now: 0, generation: [0,0], lease: [0,0],
-    fences: [0,0,0,0], phases: [0,0,0,0,0,0,0,0], records: [0,0,0,0], sends: [0,0,0,0], bad: false }
+    fences: [0,0,0,0], phases: [0,0,0,0,0,0,0,0], records: [0,0,0,0], sends: [0,0,0,0] }
   action step = {
     nondet r = Set(0,1).oneOf()
     nondet i = Set(0,1).oneOf()
