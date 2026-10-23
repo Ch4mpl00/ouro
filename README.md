@@ -220,6 +220,12 @@ Each case creates and drops its own database; the URL's existing database is
 used only for administration. The official schema's attribution and the
 upstream example-corpus exception are in [schema/README.md](crates/owf/schema/README.md).
 
+## Protocol model
+
+[spec/README.md](spec/README.md) documents the Quint durable-protocol model,
+model-checking bounds, crash witnesses and `quint-connect` tests against the
+public `RunStore` API. Run `spec/check.sh` for the full model and Rust checks.
+
 ## Roadmap
 
 - LLM steps and providers; typed decisions.
