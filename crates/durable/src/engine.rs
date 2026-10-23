@@ -17,23 +17,89 @@ struct StoredRun {
     subscriptions: BTreeMap<String, Vec<String>>,
 }
 
-fn key(kind: &str, id: &str) -> (String, String) {
+fn key(kind: &str, id: &str) -> Key {
     (kind.into(), id.into())
 }
-fn get<T: DeserializeOwned>(rows: &Rows, kind: &str, id: &str) -> anyhow::Result<Option<T>> {
-    rows.get(&key(kind, id)).cloned().map(serde_json::from_value).transpose().map_err(Into::into)
+fn get<T: DeserializeOwned>(rows: &mut dyn Transaction, kind: &str, id: &str) -> anyhow::Result<Option<T>> {
+    rows.get(kind, id)?.map(serde_json::from_value).transpose().map_err(Into::into)
 }
-fn put(rows: &mut Rows, kind: &str, id: &str, value: &impl Serialize) -> anyhow::Result<()> {
-    rows.insert(key(kind, id), serde_json::to_value(value)?);
-    Ok(())
+fn put(rows: &mut dyn Transaction, kind: &str, id: &str, value: &impl Serialize) -> anyhow::Result<()> {
+    rows.put(kind, id, &serde_json::to_value(value)?)
 }
-fn run(rows: &Rows, id: &str) -> anyhow::Result<StoredRun> {
+fn run(rows: &mut dyn Transaction, id: &str) -> anyhow::Result<StoredRun> {
     get(rows, "run", id)?.ok_or_else(|| anyhow::anyhow!("unknown run {id}"))
 }
-fn store_run(rows: &mut Rows, snapshot: &StoredRun) -> anyhow::Result<()> {
-    put(rows, "run", &snapshot.run.admission.id, snapshot)
+fn component(value: &str) -> String {
+    value.as_bytes().iter().map(|b| format!("{b:02x}")).collect()
 }
-fn checked(rows: &Rows, fence: &Fence, now: i64) -> anyhow::Result<StoredRun> {
+// Flip the sign bit so lexicographic order also covers negative timestamps.
+fn time_key(ms: i64) -> String {
+    format!("{:016x}", u64::from_be_bytes((ms ^ i64::MIN).to_be_bytes()))
+}
+fn timed(ms: i64, id: &str) -> String {
+    format!("{}:{id}", time_key(ms))
+}
+fn partition(kind: &str, value: &str) -> String {
+    format!("{kind}:{}", component(value))
+}
+fn prefix_end(prefix: &str) -> Option<String> {
+    let mut chars: Vec<_> = prefix.chars().collect();
+    while let Some(last) = chars.pop() {
+        let mut next = u32::from(last) + 1;
+        if next == 0xd800 {
+            next = 0xe000;
+        }
+        if let Some(next) = char::from_u32(next) {
+            chars.push(next);
+            return Some(chars.into_iter().collect());
+        }
+    }
+    None
+}
+// Index only eligible waits and unswept evidence: a full inbox or an already
+// swept run must not make subsequent lookups walk historical registrations.
+fn indexes(s: &StoredRun) -> Rows {
+    let mut keys = Rows::new();
+    let id = &s.run.admission.id;
+    let value = json!(id);
+    keys.insert(key(&partition("name", &s.run.admission.name), id), value.clone());
+    if s.run.ended_ms.is_none() {
+        let due = if s.run.state == RunState::Running { s.run.lease_until_ms } else { Some(s.run.wake_at_ms) };
+        if let Some(due) = due {
+            keys.insert(key("due", &timed(due, id)), value.clone());
+        }
+        if let Some(link) = &s.run.child {
+            keys.insert(key(&partition("children", &link.parent), id), value.clone());
+        }
+        for (t, at) in &s.awaits {
+            if !s.events.iter().any(|e| e.type_ == *t && e.consumed_key.is_none()) {
+                keys.insert(key(&partition("wait", t), &timed(*at, id)), value.clone());
+            }
+        }
+        // A publish reads only the runs subscribed to its type (or to `*`).
+        for t in s.subscriptions.values().flatten() {
+            keys.insert(key(&partition("subs", t), id), value.clone());
+        }
+    } else if !s.records.is_empty() || !s.events.is_empty() {
+        keys.insert(key("finished", &timed(s.run.ended_ms.unwrap(), id)), value);
+    }
+    keys
+}
+fn store_run(rows: &mut dyn Transaction, snapshot: &StoredRun) -> anyhow::Result<()> {
+    let id = &snapshot.run.admission.id;
+    let old: Option<StoredRun> = get(rows, "run", id)?;
+    let before = old.as_ref().map(indexes).unwrap_or_default();
+    let after = indexes(snapshot);
+    for ((kind, id), value) in crate::backend::changes(&before, &after) {
+        if let Some(value) = value {
+            rows.put(kind, id, value)?;
+        } else {
+            rows.delete(kind, id)?;
+        }
+    }
+    put(rows, "run", id, snapshot)
+}
+fn checked(rows: &mut dyn Transaction, fence: &Fence, now: i64) -> anyhow::Result<StoredRun> {
     let snapshot = run(rows, &fence.run_id)?;
     anyhow::ensure!(
         snapshot.run.state == RunState::Running
@@ -44,8 +110,17 @@ fn checked(rows: &Rows, fence: &Fence, now: i64) -> anyhow::Result<StoredRun> {
     );
     Ok(snapshot)
 }
-fn all_runs(rows: &Rows) -> anyhow::Result<Vec<StoredRun>> {
-    rows.iter().filter(|((kind, _), _)| kind == "run").map(|(_, v)| Ok(serde_json::from_value(v.clone())?)).collect()
+fn indexed_runs(
+    rows: &mut dyn Transaction,
+    kind: &str,
+    start: &str,
+    end: Option<&str>,
+    limit: usize,
+) -> anyhow::Result<Vec<StoredRun>> {
+    rows.scan(kind, start, end, limit)?
+        .into_values()
+        .map(|id| run(rows, id.as_str().ok_or_else(|| anyhow::anyhow!("invalid run index"))?))
+        .collect()
 }
 fn claimable(r: &SavedRun, now: i64) -> bool {
     match r.state {
@@ -63,7 +138,7 @@ fn claim_run(snapshot: &mut StoredRun, now: i64, owner: &str) -> anyhow::Result<
     r.state = RunState::Running;
     Ok(fence)
 }
-fn insert(rows: &mut Rows, admission: &Admission, now: i64) -> anyhow::Result<bool> {
+fn insert(rows: &mut dyn Transaction, admission: &Admission, now: i64) -> anyhow::Result<bool> {
     if let Some(existing) = get::<StoredRun>(rows, "run", &admission.id)? {
         anyhow::ensure!(existing.run.admission.name == admission.name, "run already belongs to another definition");
         return Ok(false);
@@ -107,18 +182,23 @@ fn envelope(event: &StoredEvent) -> anyhow::Result<Value> {
         json!({"type":event.type_, "data":event.data, "time":chrono::DateTime::from_timestamp_millis(event.delivered_at_ms).ok_or_else(|| anyhow::anyhow!("invalid event timestamp"))?.to_rfc3339()}),
     )
 }
-fn deliver(rows: &mut Rows, t: &str, data: &Value, now: i64, target: Option<&str>) -> anyhow::Result<Option<String>> {
-    let mut eligible: Vec<_> = all_runs(rows)?
-        .into_iter()
-        .filter(|s| {
-            s.run.ended_ms.is_none()
-                && target.is_none_or(|id| id == s.run.admission.id)
-                && s.awaits.contains_key(t)
-                && !s.events.iter().any(|e| e.type_ == t && e.consumed_key.is_none())
-        })
-        .collect();
-    eligible.sort_by_key(|s| (s.awaits[t], s.run.admission.id.clone()));
-    let Some(mut snapshot) = eligible.into_iter().next() else {
+fn deliver(
+    rows: &mut dyn Transaction,
+    t: &str,
+    data: &Value,
+    now: i64,
+    target: Option<&str>,
+) -> anyhow::Result<Option<String>> {
+    let candidate = if let Some(id) = target {
+        let s = run(rows, id)?;
+        (s.run.ended_ms.is_none()
+            && s.awaits.contains_key(t)
+            && !s.events.iter().any(|e| e.type_ == t && e.consumed_key.is_none()))
+        .then_some(s)
+    } else {
+        indexed_runs(rows, &partition("wait", t), "", None, 1)?.into_iter().next()
+    };
+    let Some(mut snapshot) = candidate else {
         return Ok(None);
     };
     snapshot.events.push(StoredEvent {
@@ -142,7 +222,9 @@ fn subscribed(snapshot: &StoredRun, event: &StoredEvent) -> bool {
 fn same_event(a: &Value, b: &Value) -> bool {
     a.get("id").is_some() && a.get("id") == b.get("id") && a.get("source") == b.get("source")
 }
-fn publish(rows: &mut Rows, event: &Value, target: Option<&str>, now: i64) -> anyhow::Result<Vec<String>> {
+/// Reads only the runs indexed under the event's type and `*` (or the
+/// target): bounded by the subscribers, never by the runs stored.
+fn publish(rows: &mut dyn Transaction, event: &Value, target: Option<&str>, now: i64) -> anyhow::Result<Vec<String>> {
     let t = event
         .get("type")
         .and_then(Value::as_str)
@@ -155,13 +237,23 @@ fn publish(rows: &mut Rows, event: &Value, target: Option<&str>, now: i64) -> an
         consumed_key: None,
         envelope: Some(event.clone()),
     };
-    let mut receivers = Vec::new();
-    for mut snapshot in all_runs(rows)? {
-        let eligible = snapshot.run.ended_ms.is_none()
-            && match target {
-                Some(id) => id == snapshot.run.admission.id,
-                None => subscribed(&snapshot, &stored),
+    let candidates = match target {
+        Some(id) => get::<StoredRun>(rows, "run", id)?.into_iter().collect(),
+        None => {
+            let mut runs = indexed_runs(rows, &partition("subs", t), "", None, usize::MAX)?;
+            for s in indexed_runs(rows, &partition("subs", "*"), "", None, usize::MAX)? {
+                if !runs.iter().any(|r| r.run.admission.id == s.run.admission.id) {
+                    runs.push(s);
+                }
             }
+            runs.sort_by(|a, b| a.run.admission.id.cmp(&b.run.admission.id));
+            runs
+        }
+    };
+    let mut receivers = Vec::new();
+    for mut snapshot in candidates {
+        let eligible = snapshot.run.ended_ms.is_none()
+            && (target.is_some() || subscribed(&snapshot, &stored))
             && !snapshot.events.iter().any(|e| e.envelope.as_ref().is_some_and(|e| same_event(e, event)));
         if eligible {
             snapshot.events.push(stored.clone());
@@ -172,7 +264,7 @@ fn publish(rows: &mut Rows, event: &Value, target: Option<&str>, now: i64) -> an
     }
     Ok(receivers)
 }
-fn lifecycle(rows: &mut Rows, id: &str, status: &Status, now: i64) -> anyhow::Result<()> {
+fn lifecycle(rows: &mut dyn Transaction, id: &str, status: &Status, now: i64) -> anyhow::Result<()> {
     let Some(link) = run(rows, id)?.run.child else {
         return Ok(());
     };
@@ -190,7 +282,7 @@ fn lifecycle(rows: &mut Rows, id: &str, status: &Status, now: i64) -> anyhow::Re
     deliver(rows, &t, &data, now, Some(&link.parent))?;
     Ok(())
 }
-fn terminate(rows: &mut Rows, id: &str, status: &Status, now: i64) -> anyhow::Result<()> {
+fn terminate(rows: &mut dyn Transaction, id: &str, status: &Status, now: i64) -> anyhow::Result<()> {
     let mut snapshot = run(rows, id)?;
     snapshot.run.state = match status {
         Status::Completed(_) => RunState::Completed,
@@ -208,10 +300,7 @@ fn terminate(rows: &mut Rows, id: &str, status: &Status, now: i64) -> anyhow::Re
     // Iterative cascade avoids stack growth on arbitrarily nested child runs.
     let mut parents = vec![id.to_string()];
     while let Some(parent) = parents.pop() {
-        for mut child in all_runs(rows)?
-            .into_iter()
-            .filter(|s| s.run.ended_ms.is_none() && s.run.child.as_ref().is_some_and(|l| l.parent == parent))
-        {
+        for mut child in indexed_runs(rows, &partition("children", &parent), "", None, usize::MAX)? {
             child.run.state = RunState::Cancelled;
             child.run.outcome = Some(Status::Cancelled);
             child.run.ended_ms = Some(now);
@@ -276,12 +365,15 @@ impl RunStore for TransactionalStore {
         })
     }
     fn load_records(&self, f: &Fence, now: i64) -> anyhow::Result<BTreeMap<String, Record>> {
-        checked(&self.backend.snapshot()?.rows, f, now)?
-            .records
-            .into_iter()
-            .map(|(key, value)| Ok((key, serde_json::from_value(value)?)))
-            .collect()
+        self.update(|rows| {
+            checked(rows, f, now)?
+                .records
+                .into_iter()
+                .map(|(key, value)| Ok((key, serde_json::from_value(value)?)))
+                .collect()
+        })
     }
+
     fn save_record(&self, f: &Fence, k: &str, r: &Record, now: i64) -> anyhow::Result<()> {
         self.update(|rows| {
             let mut s = checked(rows, f, now)?;
@@ -364,14 +456,7 @@ impl RunStore for TransactionalStore {
         self.update(|rows| publish(rows, event, target, now))
     }
     fn definition_names(&self) -> anyhow::Result<Vec<String>> {
-        Ok(self
-            .backend
-            .snapshot()?
-            .rows
-            .keys()
-            .filter(|(kind, _)| kind == "definitions")
-            .map(|(_, id)| id.clone())
-            .collect())
+        self.update(|rows| Ok(rows.scan("definitions", "", None, usize::MAX)?.into_keys().map(|(_, id)| id).collect()))
     }
     fn finish(&self, f: &Fence, outcome: &Status, now: i64, threshold: u32) -> anyhow::Result<Status> {
         self.update(|rows| {
@@ -462,19 +547,24 @@ impl RunStore for TransactionalStore {
         })
     }
     fn child_outcome(&self, parent: &str, k: &str, child: &str) -> anyhow::Result<Option<Status>> {
-        let s = run(&self.backend.snapshot()?.rows, child)?;
-        anyhow::ensure!(
-            s.run.child.as_ref().is_some_and(|l| l.parent == parent && l.key == k),
-            "child belongs to another parent or key"
-        );
-        Ok(s.run.outcome)
+        self.update(|rows| {
+            let s = run(rows, child)?;
+            anyhow::ensure!(
+                s.run.child.as_ref().is_some_and(|l| l.parent == parent && l.key == k),
+                "child belongs to another parent or key"
+            );
+            Ok(s.run.outcome)
+        })
     }
     fn due(&self, now: i64, limit: usize) -> anyhow::Result<Vec<String>> {
-        let mut due: Vec<_> =
-            all_runs(&self.backend.snapshot()?.rows)?.into_iter().filter(|s| claimable(&s.run, now)).collect();
-        due.sort_by_key(|s| (s.run.wake_at_ms, s.run.admission.id.clone()));
-        Ok(due.into_iter().take(limit).map(|s| s.run.admission.id).collect())
+        self.update(|rows| {
+            rows.scan("due", "", Some(&format!("{};", time_key(now))), limit)?
+                .into_values()
+                .map(|id| id.as_str().map(str::to_owned).ok_or_else(|| anyhow::anyhow!("invalid due index")))
+                .collect()
+        })
     }
+
     fn cancel(&self, id: &str, now: i64) -> anyhow::Result<bool> {
         self.update(|rows| {
             let Some(s) = get::<StoredRun>(rows, "run", id)? else {
@@ -491,7 +581,13 @@ impl RunStore for TransactionalStore {
         anyhow::ensure!(kept >= 0, "negative retention");
         self.update(|rows| {
             let mut count = 0;
-            for mut s in all_runs(rows)? {
+            for mut s in indexed_runs(
+                rows,
+                "finished",
+                "",
+                Some(&format!("{};", time_key(now.saturating_sub(kept)))),
+                usize::MAX,
+            )? {
                 if s.run.ended_ms.is_some_and(|at| at <= now.saturating_sub(kept)) {
                     count += s.records.len();
                     s.records.clear();
@@ -503,18 +599,28 @@ impl RunStore for TransactionalStore {
         })
     }
     fn get(&self, id: &str) -> anyhow::Result<Option<SavedRun>> {
-        Ok(get::<StoredRun>(&self.backend.snapshot()?.rows, "run", id)?.map(|s| s.run))
+        self.update(|rows| Ok(get::<StoredRun>(rows, "run", id)?.map(|s| s.run)))
     }
     fn list(&self, name: Option<&str>, prefix: &str) -> anyhow::Result<Vec<SavedRun>> {
-        Ok(all_runs(&self.backend.snapshot()?.rows)?
-            .into_iter()
-            .map(|s| s.run)
-            .filter(|r| name.is_none_or(|name| name == r.admission.name) && r.admission.id.starts_with(prefix))
-            .collect())
+        self.update(|rows| {
+            let end = prefix_end(prefix);
+            if let Some(name) = name {
+                Ok(indexed_runs(rows, &partition("name", name), prefix, end.as_deref(), usize::MAX)?
+                    .into_iter()
+                    .map(|s| s.run)
+                    .collect())
+            } else {
+                rows.scan("run", prefix, end.as_deref(), usize::MAX)?
+                    .into_values()
+                    .map(|v| Ok(serde_json::from_value::<StoredRun>(v)?.run))
+                    .collect()
+            }
+        })
     }
     fn inspect(&self, id: &str) -> anyhow::Result<Option<RunSnapshot>> {
-        get(&self.backend.snapshot()?.rows, "run", id)
+        self.update(|rows| get(rows, "run", id))
     }
+
     fn save_definition(&self, name: &str, yaml: &str) -> anyhow::Result<Definition> {
         self.update(|rows| {
             let mut defs: Definitions = get(rows, "definitions", name)?.unwrap_or_default();
@@ -542,6 +648,6 @@ impl RunStore for TransactionalStore {
         })
     }
     fn definitions(&self, name: &str) -> anyhow::Result<Definitions> {
-        Ok(get(&self.backend.snapshot()?.rows, "definitions", name)?.unwrap_or_default())
+        self.update(|rows| Ok(get(rows, "definitions", name)?.unwrap_or_default()))
     }
 }

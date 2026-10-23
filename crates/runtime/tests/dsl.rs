@@ -615,19 +615,41 @@ struct Crashing {
     after: bool,
 }
 impl AtomicBackend for Crashing {
+    fn begin(&self) -> anyhow::Result<Box<dyn durable::Transaction + '_>> {
+        Ok(Box::new(CrashingTx { inner: self.inner.begin()?, backend: self }))
+    }
     fn snapshot(&self) -> anyhow::Result<durable::Snapshot> {
         self.inner.snapshot()
     }
-    fn compare_exchange(&self, before: &durable::Snapshot, rows: &durable::Rows) -> anyhow::Result<bool> {
-        let n = self.commits.fetch_add(1, Ordering::SeqCst) + 1;
-        if n == self.fail_at && !self.after {
+}
+struct CrashingTx<'a> {
+    inner: Box<dyn durable::Transaction + 'a>,
+    backend: &'a Crashing,
+}
+impl durable::Transaction for CrashingTx<'_> {
+    fn get(&mut self, kind: &str, id: &str) -> anyhow::Result<Option<Value>> {
+        self.inner.get(kind, id)
+    }
+    fn scan(&mut self, kind: &str, start: &str, end: Option<&str>, limit: usize) -> anyhow::Result<durable::Rows> {
+        self.inner.scan(kind, start, end, limit)
+    }
+    fn put(&mut self, kind: &str, id: &str, value: &Value) -> anyhow::Result<()> {
+        self.inner.put(kind, id, value)
+    }
+    fn delete(&mut self, kind: &str, id: &str) -> anyhow::Result<()> {
+        self.inner.delete(kind, id)
+    }
+    fn commit(self: Box<Self>) -> anyhow::Result<()> {
+        let b = self.backend;
+        let n = b.commits.fetch_add(1, Ordering::SeqCst) + 1;
+        if n == b.fail_at && !b.after {
             anyhow::bail!("injected crash before commit {n}");
         }
-        let done = self.inner.compare_exchange(before, rows)?;
-        if n == self.fail_at && self.after {
+        self.inner.commit()?;
+        if n == b.fail_at && b.after {
             anyhow::bail!("injected crash after commit {n}");
         }
-        Ok(done)
+        Ok(())
     }
 }
 
@@ -667,15 +689,18 @@ async fn crash_run(fail_at: usize, after: bool) -> (Option<Status>, Vec<Value>, 
     let mut published = 0;
     for step in 1..200 {
         if let Some(status) = store.get("p").ok().flatten().and_then(|r| r.outcome) {
-            let consumed = store
-                .inspect("p")
-                .unwrap()
-                .unwrap()
-                .events
-                .iter()
-                .filter(|e| e.consumed_key.is_some() && e.type_ == "order")
-                .count();
-            let children = store.list(Some("child"), "").unwrap().len();
+            // Reads commit too: one may meet the injected crash; read again.
+            let snapshot = loop {
+                if let Ok(Some(s)) = store.inspect("p") {
+                    break s;
+                }
+            };
+            let consumed = snapshot.events.iter().filter(|e| e.consumed_key.is_some() && e.type_ == "order").count();
+            let children = loop {
+                if let Ok(runs) = store.list(Some("child"), "") {
+                    break runs.len();
+                }
+            };
             let commits = backend.commits.load(Ordering::SeqCst);
             return (Some(status), f.seen.lock().unwrap().clone(), consumed, children, commits);
         }
