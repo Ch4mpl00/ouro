@@ -67,7 +67,6 @@ fn registry(writes: Arc<AtomicUsize>, seen: Arc<Mutex<Vec<Value>>>) -> Registry 
 struct Fixture {
     rt: Runtime,
     time: Arc<Time>,
-    writes: Arc<AtomicUsize>,
     seen: Arc<Mutex<Vec<Value>>>,
 }
 
@@ -85,7 +84,7 @@ fn fixture_on(
         tracer(),
     )
     .unwrap();
-    Fixture { rt, time, writes, seen }
+    Fixture { rt, time, seen }
 }
 
 fn fixture() -> Fixture {
