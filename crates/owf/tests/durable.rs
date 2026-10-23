@@ -1439,3 +1439,143 @@ async fn ephemeral_and_durable_host_stops_cannot_be_caught_by_yaml() {
         }
     }
 }
+
+struct RecoveryJournal {
+    store: Store,
+    decisions: Mutex<Vec<(String, Record)>>,
+}
+impl Journal for RecoveryJournal {
+    fn load(&self) -> anyhow::Result<BTreeMap<String, Record>> {
+        self.store.load()
+    }
+    fn save(&self, key: &str, record: &Record) -> anyhow::Result<()> {
+        self.store.save(key, record)?;
+        self.decisions.lock().unwrap().push((key.into(), record.clone()));
+        Ok(())
+    }
+}
+
+// Equal durable cuts are recovered in fresh interpreter/host instances. Compare
+// decisions through the resulting journal and dispatch trace, not just outputs.
+#[test]
+fn r2_generated_recoveries_from_one_journal_make_identical_decisions() {
+    use proptest::{prelude::*, test_runner::TestRunner};
+    use support::program::{Profile, input, program};
+    let strategy = (program(Profile::CORE), input(), 1usize..40, any::<bool>());
+    TestRunner::new(support::host::config(64, file!()))
+        .run(&strategy, |(p, input, cut, after_commit)| {
+            let wf = support::host::workflow(&p);
+            let rt = tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap();
+            let time = Arc::new(Time(AtomicI64::new(1000)));
+            let store = Store { fail_at: AtomicUsize::new(cut), after_commit, ..Default::default() };
+            let world = Arc::new(PropertyWorld::default());
+            let h = Host {
+                functions: world,
+                clock: time.clone(),
+                observer: Arc::new(Silent),
+                limits: support::host::limits(),
+                runtime: json!({}),
+            };
+            rt.block_on(run::resume(&h, &wf, "same-cut", input.clone(), &CancellationToken::new(), &store));
+            let bytes = serde_json::to_vec(&store.load().unwrap()).unwrap();
+            let recover = || {
+                let records = serde_json::from_slice(&bytes).unwrap();
+                let recovered = RecoveryJournal {
+                    store: Store { records: Mutex::new(records), ..Default::default() },
+                    decisions: Mutex::default(),
+                };
+                let calls = Arc::new(PropertyWorld::default());
+                let h = Host {
+                    functions: calls.clone(),
+                    clock: time.clone(),
+                    observer: Arc::new(Silent),
+                    limits: support::host::limits(),
+                    runtime: json!({}),
+                };
+                let outcome =
+                    rt.block_on(run::resume(&h, &wf, "same-cut", input.clone(), &CancellationToken::new(), &recovered));
+                let dispatches = calls.calls.lock().unwrap().clone();
+                let decisions = recovered.decisions.lock().unwrap().clone();
+                (outcome.status, recovered.load().unwrap(), decisions, dispatches)
+            };
+            prop_assert_eq!(recover(), recover());
+            Ok(())
+        })
+        .unwrap();
+}
+
+#[derive(Default)]
+struct EffectWorld(Mutex<Vec<(String, String, Value)>>);
+#[async_trait]
+impl Functions for EffectWorld {
+    fn effect(&self, name: &str) -> Option<Effect> {
+        support::host::effect(name)
+    }
+    async fn call(&self, name: &str, args: Value, info: &CallInfo<'_>) -> Result<Value, WorkflowError> {
+        if self.effect(name) == Some(Effect::Write) {
+            // Independent recipient ledger, never reconstructed from the journal.
+            self.0.lock().unwrap().push((info.reference.into(), name.into(), args.clone()));
+        }
+        support::host::behave(name, &args, 2)
+    }
+}
+
+// A sequential generated program has one legal effect order. With uncertainty,
+// the faulty execution must be its exact prefix ending at the orphan intent;
+// without uncertainty both the result and the entire effect log must agree.
+#[test]
+fn generated_faulty_histories_refine_crash_free_effect_histories() {
+    use proptest::{prelude::*, test_runner::TestRunner};
+    use support::program::{Profile, input, program};
+    let strategy = (program(Profile::CORE), input(), 1usize..80, any::<bool>());
+    TestRunner::new(support::host::config(128, file!()))
+        .run(&strategy, |(p, input, cut, after_commit)| {
+            let mut definition = support::program::definition(&p);
+            delivery_policies(&mut definition, &[true], &mut 0);
+            let wf = model::parse(definition).unwrap();
+            let rt = tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap();
+            let execute = |failure| {
+                let time = Arc::new(Time(AtomicI64::new(1000)));
+                let world = Arc::new(EffectWorld::default());
+                let h = Host {
+                    functions: world.clone(),
+                    clock: time.clone(),
+                    observer: Arc::new(Silent),
+                    limits: support::host::limits(),
+                    runtime: json!({}),
+                };
+                let store = Store { fail_at: AtomicUsize::new(failure), after_commit, ..Default::default() };
+                let status = rt.block_on(async {
+                    for _ in 0..100 {
+                        let status =
+                            run::resume(&h, &wf, "run", input.clone(), &CancellationToken::new(), &store).await.status;
+                        if !matches!(status, Status::Interrupted(_)) {
+                            return status;
+                        }
+                    }
+                    panic!("recovery did not drain")
+                });
+                let ledger = world.0.lock().unwrap().clone();
+                (status, ledger, store.load().unwrap())
+            };
+            let (ideal, expected, _) = execute(0);
+            let (actual, effects, evidence) = execute(cut);
+            let unknown = matches!(&actual,Status::Faulted(e) if e.is("outcome_unknown"));
+            if unknown {
+                prop_assert!(
+                    evidence
+                        .values()
+                        .any(|r| matches!(r, Record::Call { state: owf::durable::CallState::Pending, .. })),
+                    "unknown requires an orphan intent"
+                );
+                prop_assert!(expected.starts_with(&effects), "unexpected effects: {effects:?}, ideal {expected:?}");
+            } else {
+                prop_assert_eq!(actual, ideal);
+                prop_assert_eq!(&effects, &expected);
+            }
+            let keys: std::collections::BTreeSet<_> = effects.iter().map(|e| &e.0).collect();
+            prop_assert_eq!(keys.len(), effects.len());
+            Ok(())
+        })
+        .unwrap();
+}

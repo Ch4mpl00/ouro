@@ -801,3 +801,9 @@ fn quint_sqlite() {
 fn quint_postgres() {
     with_quint("quint_postgres", || simulation(Adapter::Postgres));
 }
+
+#[path = "quint/concurrent.rs"]
+mod concurrent;
+
+#[path = "quint/gaps.rs"]
+mod gaps;

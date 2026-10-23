@@ -2296,6 +2296,7 @@ dependencies = [
  "opentelemetry_sdk",
  "ouro-durable",
  "owf",
+ "proptest",
  "serde_json",
  "serde_yaml_ng",
  "tempfile",

@@ -1,8 +1,8 @@
 # Durable protocol specification
 
-The normative contract is [`owf::durable`](../crates/owf/src/durable.rs), especially
-its numbered invariants, and the public [`RunStore`](../crates/durable/src/lib.rs)
-transactions. [Issue #1 and its comments](https://github.com/Ch4mpl00/ouro/issues/1)
+The normative contract is [`docs/durable-invariants.md`](../docs/durable-invariants.md),
+including its section 8 decisions. The public `RunStore` and interpreter are
+implementations to check against it; they do not define away pending #3/#4 rules. [Issue #1 and its comments](https://github.com/Ch4mpl00/ouro/issues/1)
 establish the embeddable-runtime boundary. No application policy or storage
 layout is modelled.
 
@@ -11,10 +11,153 @@ model is simulated and drives real stores. Smaller safety slices are checked
 symbolically with Apalache; a finite progress quotient is checked exhaustively
 with TLC. [RESULTS.md](RESULTS.md) records the actual bounds, timings and limits.
 
+## Contract coverage
+
+`contract.qnt` is a separate normative invocation-level model; `protocol.qnt`
+remains the existing implementation bridge's projection. The latter's
+registration-only delivery and version-only breaker are **not** the settled
+contract. Keeping the bridge executable does not relax the normative model.
+`contract_progress.qnt` supplies E5 and the five temporal obligations. All 38 IDs
+have named predicates, but the scopes below matter: naming a predicate does not
+prove every clause of its English contract.
+
+The new model has two runs, two workers, two invocation positions (write/read),
+two event identities of one type, and two definition versions. Time, generations,
+epochs and observation lists grow with trace length. A run carries its admission,
+application compatibility, execution mode, fixed deadline and epoch. Event copies
+have payload, identity, absolute expiry and explicit consumed/expired disposition.
+Trigger ingress uses global identity tombstones with a separate five-tick horizon;
+recipient identities last for the evidence horizon. Time units and horizons are
+representatives, not production defaults (mailbox default: one day). The two-run
+bound represents one parent/child, not arbitrary subtree depth.
+
+| Contract ID | Model predicate / checked scope | Adapter or interpreter evidence |
+| --- | --- | --- |
+| A1 | `contract::A1`: admission fields and occurrence counts | Serial bridge; admission conformance |
+| A2 | `A2`: abort atomicity and acknowledged evidence | Concurrent reply/state linearizability; commit-fault conformance |
+| A3 | `A3`: outcome/end-time absorption | Serial bridge; terminal replay properties |
+| A4 | `A4`: representative result schema | Existing schema and corruption tests; arbitrary format evolution is not modeled |
+| A5 | `A5`: authority at the mutation | Serial bridge; concurrent expired save/claim batch |
+| E1 | `E1`: invocation binding survives generation changes | Generated effect-ledger keys and existing branch/retry properties |
+| E2 | `E2`: ghost dispatch counts and intent dependency | Serial bridge; generated independent effect ledger |
+| E3 | `E3`: orphan intent yields unknown | Ambiguous-intent witness; generated uncertain-prefix check |
+| E4 | `E4`: immutable committed values | Serial bridge; generated recovery/replay properties |
+| E5 | `contract_progress::E5`, `E5_delivery`: atomic recipient receipt/effect | Conditional fake-recipient model only; no claim of a new runtime mode |
+| R1 | `R1`: sum of committed invocation values | Existing generated continuation tests and new effect-history comparison |
+| R2 | `R2`: deterministic invocation decision | `r2_generated_recoveries_from_one_journal_make_identical_decisions` compares fresh hosts, journal decisions and dispatches |
+| R3 | `R3`: checkpoint frontier requires call evidence | Checkpoint-boundary tests; arbitrary branch/event causal DAGs are not represented |
+| W1 | `W1`: copy/key uniqueness and immutable consumption | Four-racer batches with same and distinct take keys; serial bridge |
+| W2 | `W2`: recipient identity and immutable payload | Existing publish tests; ignored conflicting-payload regression for #4 |
+| W3 | `W3`: addressed mailbox and explicit expiry | Mailbox/expiry witnesses; ignored live-mailbox TTL regression for #4 |
+| W4 | `W4`: FIFO among pending matching copies | Existing delivery conformance; one type in the normative model |
+| W5 | `W5`: publication recipients and subscription survival | Concurrent publish/finish batch; existing multi-take DSL tests |
+| C1 | `C1`: acyclic owned link and one child admission | Serial child witness; existing native-child recovery tests |
+| C2 | `C2`: terminal child has notification obligation | Serial bridge and child conformance |
+| C3 | `C3`: cancellation closes the bounded subtree | Serial cascade witness; handler cancellation tests remain separate |
+| T1 | `T1`: slot disposition coupled to admission/skip | Concurrent trigger CAS batch; schedule, catchup and overlap witnesses; ignored global-ingress and overlap regressions for #4 |
+| T2 | `T2`: activation epoch and dormant rearm | Rearm witness; ignored old-epoch rearm regression for #4 |
+| T3 | `T3`: fixed admission deadline | Deadline witness; ignored admission-to-first-drive deadline regression for #4 |
+| V1 | `V1`: activation and pinned admission | Serial bridge; runtime pinned-version recovery |
+| V2 | `V2`: epoch, fault classification, reset/rollback/trip | Breaker witness; ignored same-version epoch regression for #4 |
+| V3 | `V3`: undeclared/exact-match claim and mutation guards | Compatibility witness; ignored version-aware claim bridge for #3 |
+| O1 | `O1`: failed operation stops the attempt | Fault switches; store fault tests and generated interrupted journals |
+| O2 | `O2`: terminal-only retention and stable identities | Serial sweep witness; replay-after-sweep refusal property |
+| O3 | `O3`: one authorized permit | Existing runtime ownership/concurrency tests; external work after lease loss is not modeled |
+| X1 | `X1`: dry-mode write dispatch count | `x1_x2_generated_dry_runs_and_replays_are_isolated`; existing child/emit dry tests |
+| X2 | `X2`: replay-mode dispatch count | Same property: changed bindings, expired evidence, all persisted rows unchanged |
+| X3 | `X3`: no silent readmission/reopening | No checkpoint-fork API is assumed; terminal/admission checks |
+| L1 | `contract_progress::L1`: ready work eventually completes under F | Existing finite drains; temporal quotient |
+| L2 | `L2`: abandoned ownership eventually claimed/completed under F | Concurrent expiry batch; temporal quotient |
+| L3 | `L3`: accepted event eventually consumed under F | Temporal quotient; event/recovery conformance |
+| L4 | `L4`: due slot and deadline resolve under F | Temporal quotient, schedule/deadline witnesses; no implementation proof of #4 |
+| L5 | `L5`: failed owner's waiter becomes reclaimable in the same process | Temporal quotient only for the new obligation; no new runtime waiter-error property test |
+
+Aliases such as `admissionImmutable`, `currentFenceOnly`, `terminalImmutable`,
+`completedNeverOverwritten`, `protectedAtMostOnce`, `eventAndRecordAtomic`,
+`deliveredNeverLost`, `childOutcomeAtomic` and `evidenceRetained` retain matching
+names. The original 15 names remain available unchanged in `protocol.qnt`.
+
+### Refinement scope and limits
+
+The crash-free shadow in `contract.qnt` consumes labels through `idealEvent`,
+without inspecting concrete post-state. It independently tracks admissions,
+inputs, intents, dispatches, results, checkpoints, terminal decisions, accepted
+copies and consumption keys. `refinement` additionally relates that state to
+concrete durable facts, so emitting an acknowledgement without committing its fact
+cannot satisfy correspondence. Crashes, leases and storage failures stutter unless
+a durable semantic transition occurred. A recovered orphan intent admits unknown
+with zero or one dispatch. Ambiguous operations commit once or abort; only a
+fresh acknowledged intent grants dispatch.
+
+**This is a checked invocation/event projection, not the full section 2 theorem.**
+The shadow does not independently execute catalog/trigger rules, arbitrary
+workflow control flow or host capacity lifetimes, and no fairness-preserving
+simulation from the composed model to the progress quotient has been proved.
+The new Rust effect-history property checks sequential generated CORE workflows,
+fixed external responses, and one random before/after commit failure per case.
+It compares exact results/effect logs without uncertainty; with unknown it requires
+an orphan intent and the exact crash-free effect prefix. It does not prove
+all concurrent programs or arbitrary external choices. These gaps are findings,
+not reasons to weaken the contract.
+
+The configured margin is represented as `epsilon = 1` in the lease guard and a
+bounded forward clock-jump switch. Independent positive/negative worker skew is
+not enumerated, so real-time safety under every skew within ε is **not checked**.
+Compatibility uses exact matching plus undeclared admission metadata. Workers
+have declared versions; mixed undeclared-worker cases, no-compatible-worker waiting,
+and an arbitrary host-supplied compatibility relation are **not checked**.
+
+### Executable contract experiments
+
+```sh
+spec/node_modules/.bin/quint test spec/contract_witnesses.qnt --max-samples 1 --seed 20261023
+spec/node_modules/.bin/quint run spec/contract.qnt --invariant checked --max-samples 10000 --max-steps 150 --seed 20261023
+python3 spec/contract_mutations.py
+python3 spec/contract_faults.py
+python3 spec/contract_fault_detection.py
+APALACHE_ENDPOINT=localhost:8823 python3 spec/deeper.py
+APALACHE_ENDPOINT=localhost:8823 python3 spec/deeper.py --contract-depth 4
+# Restart the native checker after heap exhaustion before the smaller attempt.
+APALACHE_ENDPOINT=localhost:8823 python3 spec/deeper.py --contract-depth 3
+APALACHE_ENDPOINT=localhost:8823 JAVA=/path/to/java APALACHE_JAR=/path/to/apalache.jar python3 spec/contract_temporal.py
+```
+
+`contract_mutations.py` changes one mechanism per safety ID in a temporary copy,
+then executes a reachable scripted witness and records **all** sticky monitor
+violations at its end. Its final-state sentinel exports the trace; the script
+requires the target property to be violated, not merely a nonzero CLI exit.
+Off-target clean cells are sampled witness observations, not exhaustive
+separations. `contract_temporal.py` exhausts each progress/recipient mutant against
+every property in that quotient. Cross-model properties are structurally absent.
+
+Fault switches 1–11 correspond to every contract matrix row: boundary abort,
+lost reply, duplicate request, accept/take reordering, alternate concurrent actor,
+lease expiry, bounded clock jump, storage disconnect, invalid value, intervening
+activation and alternate application version. `contract_faults.py` interleaves each
+switch with fault-free steps. `contract_fault_detection.py` couples each row to an
+explicit broken mechanism and records the observed bad-consequence footprint.
+These two experiments distinguish tolerance from oracle sensitivity; they do not
+establish all predicted cells of the contract's broad matrix.
+
+Concurrent MBT lives in `crates/durable/tests/quint/concurrent.rs`. Each adapter
+runs 12 repetitions of five batches (60 batches, 180 operations): four consumers
+with distinct keys; four consumers with the same key; publish/finish; two trigger
+swaps; two expiry claims plus an expired save. Scoped threads synchronize at a
+barrier. SQLite uses independent connections; memory/Postgres share the adapter
+with concurrent transactional handles. The independent Rust reference state
+searches every order extending measured response-before-invocation precedence
+and compares every reply plus a fresh public snapshot. Negative checker tests
+reject duplicate acquisitions even when a final row hides one, and reject an order
+that contradicts real time. This is a bounded reference model, not a claim that
+all 38 properties are exercised by every batch. Postgres remains explicitly opt-in.
+
 ## Structure and abstraction
 
 | File | Responsibility |
 | --- | --- |
+| `contract.qnt`, `contract_witnesses.qnt` | Normative contract monitors, invocation/event shadow and 17 reachable witnesses |
+| `contract_bounded.qnt` | Reachable call fixture for checking the normative shadow symbolically |
+| `contract_progress.qnt` | E5 and L1–L5 finite temporal obligation quotient |
 | `types.qnt` | Run identity, lease/fence predicates and fixed domains |
 | `calls.qnt` | Shared dispatch eligibility for absent/intent/result/failure records |
 | `events.qnt` | Registration, held listeners, routing, atomic take and child notification |
@@ -270,6 +413,6 @@ uses the shared-rule slices where possible.
 - Schedule slot claims in a separate scheduling module once the public operation lands.
 - `listen` correlation, multiple event-type filters, fan-out and timeout resolution from the interpreter branch.
 - Native `run: workflow`, including public admission/link semantics beyond the current child-function API.
-- Concurrent linearizability histories over independent handles after the per-key store rewrite. Current MBT histories exercise serial transaction linearizations; existing conformance tests exercise concurrent claims.
+- Broaden the concurrent batch model beyond the five bounded families above; include storage faults and further child/breaker operations.
 - A production-interpreter MBT adapter for nested invocation identity and DSL retries, transport rejection proofs, corrupt/unsupported checkpoint formats and time-dependent winner selection.
 - A checked refinement relation between the compact safety/progress quotients and the composed model, plus larger symbolic bounds. No such refinement theorem is claimed here.
