@@ -545,3 +545,35 @@ async fn t3_admission_fixes_the_workflow_deadline() {
     assert!(matches!(outcome,Some(Status::Faulted(e)) if e.is("timeout")), "admission deadline was restarted");
     assert_eq!(reads.load(Ordering::SeqCst), 0);
 }
+
+#[test]
+#[ignore = "pending #4: one ingress identity starts at most one run across trigger names"]
+fn t1_ingress_identity_is_global_across_triggers() {
+    let rt = runtime(Arc::new(durable::memory::memory()), Registry::new(), Arc::new(Time::default()));
+    let definition = yaml("  - done: { set: { ok: true } }")
+        .replace("\ndo:", "\nschedule: { on: { one: { with: { type: event } } } }\ndo:");
+    for name in ["first", "second"] {
+        let version = rt.save(name, &definition).unwrap();
+        rt.activate(name, version.version).unwrap();
+    }
+    let event = json!({"specversion":"1.0","source":"test","id":"one","type":"event","data":{}});
+    let started = rt.publish(event.clone()).unwrap();
+    assert_eq!(started.len(), 1, "one ingress event acquired multiple admission obligations");
+    assert!(rt.publish(event).unwrap().is_empty());
+}
+
+#[tokio::test]
+#[ignore = "pending #4: a live prior schedule run makes the next slot an explicit skip"]
+async fn t1_live_schedule_run_prevents_overlap() {
+    let clock = Arc::new(Time::default());
+    let rt = runtime(Arc::new(durable::memory::memory()), Registry::new(), clock.clone());
+    let definition = yaml("  - wait: { wait: PT1H }").replace("\ndo:", "\nschedule: { every: PT1S }\ndo:");
+    save(&rt, &definition);
+    clock.0.store(1000, Ordering::SeqCst);
+    let started = rt.fire_due().unwrap();
+    assert_eq!(started.len(), 1);
+    assert!(matches!(rt.drive(&started[0], &CancellationToken::new()).await.unwrap(), Some(Status::Waiting { .. })));
+    clock.0.store(2000, Ordering::SeqCst);
+    assert!(rt.fire_due().unwrap().is_empty(), "overlap admitted a second live run");
+    assert_eq!(rt.list(None, "").unwrap().len(), 1);
+}
