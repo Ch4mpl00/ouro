@@ -204,9 +204,6 @@ pub fn run_all(factory: impl Fn(&str) -> anyhow::Result<TestStore>) -> anyhow::R
     assert_eq!(s.publish(&event("7", "reading"), None, 4)?, vec!["b".to_string()], "unsubscribed");
     s.finish(&b, &Status::Completed(json!(0)), 5, 3)?;
     assert!(s.publish(&event("9", "reading"), Some("b"), 5)?.is_empty(), "terminal runs receive nothing");
-    s.save_definition("first", "yaml")?;
-    s.save_definition("second", "yaml")?;
-    assert_eq!(s.definition_names()?, vec!["first".to_string(), "second".into()]);
     audit(&**s)?;
     report.operations += 33;
     report.witnesses.extend([
@@ -214,6 +211,54 @@ pub fn run_all(factory: impl Fn(&str) -> anyhow::Result<TestStore>) -> anyhow::R
         "subscriptions outlive consumption",
         "wildcards skip targeted deliveries",
     ]);
+
+    let t = factory("triggers")?;
+    report.cases += 1;
+    let s = &t.store;
+    let timer = |at: Option<i64>, n: i64| Trigger { at_ms: at, types: Vec::new(), state: json!({ "n": n }) };
+    let on = Trigger { at_ms: None, types: vec!["order".into(), "*".into()], state: json!({}) };
+    assert!(s.swap_trigger("late", None, Some(&timer(Some(30), 0)), &[], None, 0)?);
+    assert!(s.swap_trigger("early", None, Some(&timer(Some(10), 0)), &[], None, 0)?);
+    assert!(!s.swap_trigger("early", None, Some(&timer(Some(5), 0)), &[], None, 0)?, "it exists already");
+    assert!(s.swap_trigger("on", None, Some(&on), &[], None, 0)?);
+    let due: Vec<String> = s.due_triggers(30, 10)?.into_iter().map(|(k, _)| k).collect();
+    assert_eq!(due, vec!["early".to_string(), "late".into()]);
+    assert_eq!(s.due_triggers(9, 10)?.len(), 0);
+    assert_eq!(s.due_triggers(30, 1)?.len(), 1);
+    assert_eq!(s.triggers_for("order", 10)?.len(), 1, "matched once though indexed twice");
+    assert_eq!(s.triggers_for("other", 10)?[0].0, "on", "a wildcard reacts to every type");
+    assert!(s.triggers_for("order", 0)?.is_empty());
+    // Firing claims the slot and admits its run in one commit, once.
+    let fired = admission("slot:10");
+    let rearm = Rearm { trigger: "early".into(), delay_ms: 100 };
+    let parked = timer(None, 1);
+    assert!(s.swap_trigger(
+        "early",
+        Some(&timer(Some(10), 0)),
+        Some(&parked),
+        std::slice::from_ref(&fired),
+        Some(&rearm),
+        10
+    )?);
+    assert!(!s.swap_trigger(
+        "early",
+        Some(&timer(Some(10), 0)),
+        Some(&parked),
+        std::slice::from_ref(&fired),
+        None,
+        10
+    )?);
+    assert!(s.get("slot:10")?.is_some());
+    assert!(s.due_triggers(i64::MAX, 10)?.iter().all(|(k, _)| k != "early"), "parked: not due");
+    // The fired run's end makes the trigger due again after the delay.
+    let f = s.claim("slot:10", 20)?.unwrap();
+    s.finish(&f, &Status::Completed(json!(0)), 50, 3)?;
+    assert_eq!(s.trigger("early")?, Some(timer(Some(150), 1)));
+    assert!(s.swap_trigger("on", Some(&on), None, &[], None, 60)?);
+    assert!(s.trigger("on")?.is_none() && s.triggers_for("order", 10)?.is_empty());
+    audit(&**s)?;
+    report.operations += 18;
+    report.witnesses.extend(["triggers fire once and re-arm at a run's end"]);
 
     let t = factory("children")?;
     report.cases += 1;
@@ -315,6 +360,7 @@ pub fn run_all(factory: impl Fn(&str) -> anyhow::Result<TestStore>) -> anyhow::R
         "activate",
         "subscribe",
         "publish",
+        "trigger",
     ] {
         for point in [
             CommitFault::BeforeWrite(0),
@@ -381,6 +427,16 @@ pub fn run_all(factory: impl Fn(&str) -> anyhow::Result<TestStore>) -> anyhow::R
                 "activate" => s.activate("workflow", d.version),
                 "subscribe" => s.subscribe(&f, "other", &["*".into()], 0),
                 "publish" => s.publish(&json!({"type":"answer","source":"/t","id":"1"}), None, 0).map(|_| ()),
+                "trigger" => s
+                    .swap_trigger(
+                        "slot",
+                        None,
+                        Some(&Trigger { at_ms: Some(5), types: vec!["answer".into()], state: json!(1) }),
+                        &[admission("fired")],
+                        Some(&Rearm { trigger: "slot".into(), delay_ms: 1 }),
+                        0,
+                    )
+                    .map(|_| ()),
                 _ => unreachable!(),
             };
             t.faults.clear();
@@ -483,7 +539,7 @@ pub fn run_all(factory: impl Fn(&str) -> anyhow::Result<TestStore>) -> anyhow::R
         audit(&*s)?;
     }
     report.witnesses.insert("finite histories drain every live listener");
-    assert_eq!(report.witnesses.len(), 15);
+    assert_eq!(report.witnesses.len(), 16);
     let t = factory("concurrent-claims")?;
     report.cases += 1;
     t.store.admit(&admission("r"), 0)?;

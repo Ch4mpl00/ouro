@@ -158,9 +158,35 @@ pub trait RunStore: Send + Sync {
     fn publish(&self, _event: &Value, _target: Option<&str>, _now_ms: i64) -> anyhow::Result<Vec<String>> {
         anyhow::bail!("this store does not support published events")
     }
-    /// Every definition name with at least one saved version.
-    fn definition_names(&self) -> anyhow::Result<Vec<String>> {
-        anyhow::bail!("this store does not list definitions")
+    /// The trigger stored under `key`.
+    fn trigger(&self, _key: &str) -> anyhow::Result<Option<Trigger>> {
+        anyhow::bail!("this store does not support triggers")
+    }
+    /// Up to `limit` triggers due at `now_ms` or earlier, earliest first.
+    fn due_triggers(&self, _now_ms: i64, _limit: usize) -> anyhow::Result<Vec<(String, Trigger)>> {
+        anyhow::bail!("this store does not support triggers")
+    }
+    /// Up to `limit` triggers reacting to events of `type_` (or to `*`).
+    fn triggers_for(&self, _type_: &str, _limit: usize) -> anyhow::Result<Vec<(String, Trigger)>> {
+        anyhow::bail!("this store does not support triggers")
+    }
+    /// Compare-and-swap on a trigger, the claim-once primitive: commits only
+    /// when the stored trigger equals `expected` (`None`: absent), then
+    /// stores `next` (`None` deletes it) and admits each admission whose id
+    /// is not stored yet, in the same commit. `rearm` is attached to those
+    /// runs: at a run's terminal commit, if its trigger still exists and is
+    /// not due, it becomes due `delay_ms` after the end. Returns whether it
+    /// committed.
+    fn swap_trigger(
+        &self,
+        _key: &str,
+        _expected: Option<&Trigger>,
+        _next: Option<&Trigger>,
+        _admit: &[Admission],
+        _rearm: Option<&Rearm>,
+        _now_ms: i64,
+    ) -> anyhow::Result<bool> {
+        anyhow::bail!("this store does not support triggers")
     }
     fn finish(&self, fence: &Fence, outcome: &Status, now_ms: i64, breaker_threshold: u32) -> anyhow::Result<Status>;
     /// Parent ownership, child admission, and completion subscriptions commit
@@ -182,6 +208,25 @@ pub trait RunStore: Send + Sync {
     fn save_definition(&self, name: &str, yaml: &str) -> anyhow::Result<Definition>;
     fn activate(&self, name: &str, version: u64) -> anyhow::Result<()>;
     fn definitions(&self, name: &str) -> anyhow::Result<Definitions>;
+}
+
+/// A host-defined trigger: a keyed record the store indexes by the time it
+/// is next due and by the event types it reacts to (`*`: any). The store
+/// never interprets `state`; the host decides what firing means.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Trigger {
+    pub at_ms: Option<i64>,
+    #[serde(default)]
+    pub types: Vec<String>,
+    #[serde(default)]
+    pub state: Value,
+}
+
+/// Makes a trigger due again `delay_ms` after a run ends (`swap_trigger`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Rearm {
+    pub trigger: String,
+    pub delay_ms: i64,
 }
 
 pub trait Clock: Send + Sync {

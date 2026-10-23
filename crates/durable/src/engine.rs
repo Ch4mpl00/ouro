@@ -15,6 +15,8 @@ struct StoredRun {
     events: Vec<StoredEvent>,
     #[serde(default)]
     subscriptions: BTreeMap<String, Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    rearm: Option<Rearm>,
 }
 
 fn key(kind: &str, id: &str) -> Key {
@@ -163,6 +165,7 @@ fn insert(rows: &mut dyn Transaction, admission: &Admission, now: i64) -> anyhow
             listeners: BTreeMap::new(),
             events: Vec::new(),
             subscriptions: BTreeMap::new(),
+            rearm: None,
         },
     )?;
     Ok(true)
@@ -264,6 +267,49 @@ fn publish(rows: &mut dyn Transaction, event: &Value, target: Option<&str>, now:
     }
     Ok(receivers)
 }
+fn trigger_indexes(key_: &str, t: &Trigger) -> Rows {
+    let mut keys = Rows::new();
+    if let Some(at) = t.at_ms {
+        keys.insert(key("trigger_due", &timed(at, key_)), json!(key_));
+    }
+    for ty in &t.types {
+        keys.insert(key(&partition("trigger_type", ty), key_), json!(key_));
+    }
+    keys
+}
+/// Writes a trigger and moves its index keys, like `store_run`.
+fn store_trigger(
+    rows: &mut dyn Transaction,
+    key_: &str,
+    before: Option<&Trigger>,
+    after: Option<&Trigger>,
+) -> anyhow::Result<()> {
+    let old = before.map(|t| trigger_indexes(key_, t)).unwrap_or_default();
+    let new = after.map(|t| trigger_indexes(key_, t)).unwrap_or_default();
+    for ((kind, id), value) in crate::backend::changes(&old, &new) {
+        if let Some(value) = value {
+            rows.put(kind, id, value)?;
+        } else {
+            rows.delete(kind, id)?;
+        }
+    }
+    match after {
+        Some(t) => put(rows, "trigger", key_, t),
+        None => rows.delete("trigger", key_),
+    }
+}
+fn indexed_triggers(rows: &mut dyn Transaction, keys: Rows) -> anyhow::Result<Vec<(String, Trigger)>> {
+    let mut out: Vec<(String, Trigger)> = Vec::new();
+    for value in keys.into_values() {
+        let k = value.as_str().ok_or_else(|| anyhow::anyhow!("invalid trigger index"))?.to_owned();
+        if out.iter().any(|(o, _)| *o == k) {
+            continue;
+        }
+        let t = get(rows, "trigger", &k)?.ok_or_else(|| anyhow::anyhow!("dangling trigger index {k}"))?;
+        out.push((k, t));
+    }
+    Ok(out)
+}
 fn lifecycle(rows: &mut dyn Transaction, id: &str, status: &Status, now: i64) -> anyhow::Result<()> {
     let Some(link) = run(rows, id)?.run.child else {
         return Ok(());
@@ -297,6 +343,13 @@ fn terminate(rows: &mut dyn Transaction, id: &str, status: &Status, now: i64) ->
     snapshot.listeners.clear();
     snapshot.subscriptions.clear();
     store_run(rows, &snapshot)?;
+    if let Some(rearm) = &snapshot.rearm
+        && let Some(t) = get::<Trigger>(rows, "trigger", &rearm.trigger)?
+        && t.at_ms.is_none()
+    {
+        let due = Trigger { at_ms: Some(now.saturating_add(rearm.delay_ms)), ..t.clone() };
+        store_trigger(rows, &rearm.trigger, Some(&t), Some(&due))?;
+    }
     // Iterative cascade avoids stack growth on arbitrarily nested child runs.
     let mut parents = vec![id.to_string()];
     while let Some(parent) = parents.pop() {
@@ -455,8 +508,47 @@ impl RunStore for TransactionalStore {
     fn publish(&self, event: &Value, target: Option<&str>, now: i64) -> anyhow::Result<Vec<String>> {
         self.update(|rows| publish(rows, event, target, now))
     }
-    fn definition_names(&self) -> anyhow::Result<Vec<String>> {
-        self.update(|rows| Ok(rows.scan("definitions", "", None, usize::MAX)?.into_keys().map(|(_, id)| id).collect()))
+    fn trigger(&self, key: &str) -> anyhow::Result<Option<Trigger>> {
+        self.update(|rows| get(rows, "trigger", key))
+    }
+    fn due_triggers(&self, now: i64, limit: usize) -> anyhow::Result<Vec<(String, Trigger)>> {
+        self.update(|rows| {
+            let keys = rows.scan("trigger_due", "", Some(&format!("{};", time_key(now))), limit)?;
+            indexed_triggers(rows, keys)
+        })
+    }
+    fn triggers_for(&self, t: &str, limit: usize) -> anyhow::Result<Vec<(String, Trigger)>> {
+        self.update(|rows| {
+            let mut keys = rows.scan(&partition("trigger_type", t), "", None, limit)?;
+            if t != "*" && keys.len() < limit {
+                keys.extend(rows.scan(&partition("trigger_type", "*"), "", None, limit - keys.len())?);
+            }
+            indexed_triggers(rows, keys)
+        })
+    }
+    fn swap_trigger(
+        &self,
+        key: &str,
+        expected: Option<&Trigger>,
+        next: Option<&Trigger>,
+        admit: &[Admission],
+        rearm: Option<&Rearm>,
+        now: i64,
+    ) -> anyhow::Result<bool> {
+        self.update(|rows| {
+            if get::<Trigger>(rows, "trigger", key)?.as_ref() != expected {
+                return Ok(false);
+            }
+            store_trigger(rows, key, expected, next)?;
+            for a in admit {
+                if insert(rows, a, now)? && rearm.is_some() {
+                    let mut s = run(rows, &a.id)?;
+                    s.rearm = rearm.cloned();
+                    store_run(rows, &s)?;
+                }
+            }
+            Ok(true)
+        })
     }
     fn finish(&self, f: &Fence, outcome: &Status, now: i64, threshold: u32) -> anyhow::Result<Status> {
         self.update(|rows| {
