@@ -3,12 +3,24 @@
 // (expressions compile, calls resolve, flow targets exist); 4. static
 // analysis (the call sites, for manifests and previews).
 //
-// Supported subset of DSL 1.0: do, call, set, for, switch, try/catch with
-// retry, raise, fork, wait; input/output/export transforms and schemas;
-// if/then/timeout; use.functions/errors/retries/timeouts. Everything else
-// (listen, emit, run, schedule, catalogs, authentication, secrets,
-// extensions) is rejected at parse time so a definition never fails later
-// on a construct this runtime does not implement.
+// What the core implements of DSL 1.0 (the semantics of every task and
+// definition property): do, call, emit, for, fork, listen (one/any/all,
+// until, filters, correlation, read, foreach), raise, run (workflow natively;
+// container/script/shell through a host process runner), set, switch,
+// try/catch with retry (limit.attempt.duration included), wait;
+// input/output/export transforms and schemas (inline or a host-resolved
+// `resource`); if/then/timeout; schedule (every, cron, after, on);
+// use.functions/errors/retries/timeouts/extensions/secrets; evaluate (jq,
+// strict). Runtime arguments: $context, $input, $output, $task, $workflow,
+// $runtime, and $secrets in `input.from` only.
+//
+// Not the core's, rejected here: use.authentications and use.catalogs
+// (protocol functions and packs carry credentials and resolve their own
+// functions), $authorization (it describes a call's authentication),
+// evaluate.mode `loose` and languages other than jq. Protocol calls (`call:
+// http`, `openapi`, …) are ordinary host functions; a construct whose host
+// capability is missing (events, emit, child runs, a process runner,
+// secrets, resources) fails validation, never later.
 use crate::expr::{self, Args};
 use serde_json::{Map, Value};
 use std::sync::OnceLock;

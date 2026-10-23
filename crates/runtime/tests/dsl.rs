@@ -727,3 +727,116 @@ async fn crashes_at_every_commit_never_repeat_a_child_an_event_or_a_write() {
     // answer and say so.
     assert!(completed * 4 > commits * 2 * 3, "{completed} of {} crash points completed", commits * 2);
 }
+
+// ── runtime expression arguments, dry runs, event-triggered `all` ──────────
+
+#[tokio::test]
+async fn runtime_arguments_have_the_shapes_the_dsl_defines() {
+    let store = Arc::new(durable::memory::memory());
+    let config = Config { metadata: json!({ "tenant": "t1" }), ..Config::default() };
+    let rt = Runtime::new(
+        store,
+        Arc::new(registry(Arc::default(), Arc::default())),
+        config,
+        Arc::new(Time::default()),
+        tracer(),
+    )
+    .unwrap()
+    .with_secrets(Arc::new(Vault));
+    save(
+        &rt,
+        "args",
+        &doc(
+            "args",
+            r#"use: { secrets: [ api ] }
+input: { from: '${ { raw: ., secret: ($secrets.api.token | length) } }' }
+do:
+  - probe:
+      input: { from: '${ . + { from: $workflow.input } }' }
+      set:
+        runtime: '${ $runtime }'
+        workflow: '${ $workflow | { id, input, definition: (.definition.document.name), startedAt } }'
+        task: '${ $task | { name, reference, input, definition: (.definition | keys), startedAt } }'
+        input: '${ $input }'
+        context: '${ $context }'
+      output: { as: '${ . + { raw: $task.output.input.from } }' }
+      export: { as: '${ { output: $output.task.name } }' }
+  - last: { set: '${ . + { exported: $context } }' }"#,
+        ),
+    );
+    rt.start("r", "args", json!({ "n": 1 })).unwrap();
+    let out = completed(settle(&rt, "r").await);
+    assert_eq!(out["runtime"]["name"], "ouro-runtime");
+    assert!(out["runtime"]["version"].is_string());
+    assert_eq!(out["runtime"]["metadata"], json!({ "tenant": "t1" }));
+    assert_eq!(out["runtime"].as_object().unwrap().len(), 3, "no bindings leak into $runtime");
+    assert_eq!(out["workflow"]["id"], "r");
+    assert_eq!(out["workflow"]["input"], json!({ "n": 1 }), "$workflow.input is the raw input");
+    assert_eq!(out["workflow"]["definition"], "args");
+    for d in [&out["workflow"]["startedAt"], &out["task"]["startedAt"]] {
+        assert!(
+            d["iso8601"].is_string() && d["epoch"]["seconds"].is_i64() && d["epoch"]["milliseconds"].is_i64(),
+            "{d}"
+        );
+    }
+    assert_eq!(out["task"]["name"], "probe");
+    assert_eq!(out["task"]["reference"], "/do/0/probe");
+    assert_eq!(out["task"]["input"], json!({ "raw": { "n": 1 }, "secret": 14 }), "$task.input is the raw task input");
+    assert_eq!(out["task"]["definition"], json!(["export", "input", "output", "set"]));
+    assert_eq!(out["input"]["from"], json!({ "n": 1 }), "$input is the transformed input");
+    assert_eq!(out["context"], json!({ "raw": { "n": 1 }, "secret": 14 }));
+    assert_eq!(out["raw"], json!({ "n": 1 }), "$task.output is the raw output");
+    assert_eq!(out["exported"], json!({ "output": "probe" }), "$output in export.as");
+    let bad = doc("bad", "do: [ { a: { set: { x: '${ $authorization }' } } } ]");
+    assert!(rt.save("bad", &bad).unwrap_err().to_string().contains("$authorization"));
+}
+
+#[tokio::test]
+async fn dry_runs_record_emits_and_run_children_from_the_catalog() {
+    let f = fixture();
+    save(&f.rt, "child", &doc("child", "do: [ { w: { call: write, with: { from: child } } } ]"));
+    let definition = doc(
+        "parent",
+        "do:\n  - sub: { run: { workflow: { namespace: test, name: child, version: latest } } }\n  - say: { emit: { event: { with: { type: said, source: 'https://p', data: '${ . }' } } } }",
+    );
+    let dry =
+        f.rt.dry_run(
+            &definition,
+            json!({}),
+            Arc::new(|_: &str, a: &Value, _: &FunctionContext| Ok(a.clone())),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(dry.status, Status::Completed(_)), "{:?}", dry.status);
+    let functions: Vec<&str> = dry.writes.iter().map(|w| w.function.as_str()).collect();
+    assert_eq!(functions, ["write", "emit"]);
+    assert_eq!(f.seen.lock().unwrap().len(), 0, "nothing reached the real write");
+    assert!(f.rt.list(None, "").unwrap().is_empty(), "nothing was admitted for real");
+}
+
+#[tokio::test]
+async fn schedule_on_all_starts_once_every_filter_has_matched() {
+    let f = fixture();
+    save(
+        &f.rt,
+        "pair",
+        &doc(
+            "pair",
+            "schedule:\n  on: { all: [ { with: { type: a } }, { with: { type: b } } ] }\n  read: envelope\ndo: [ { s: { set: '${ map(.type) }' } } ]",
+        ),
+    );
+    f.rt.publish(event("1", "a", json!(1))).unwrap();
+    f.rt.schedule(0, 1).unwrap();
+    while f.rt.recover_once(&CancellationToken::new()).await.unwrap() > 0 {}
+    assert!(f.rt.list(Some("pair"), "").unwrap().is_empty(), "one of two is not enough");
+    f.rt.publish(event("2", "b", json!(2))).unwrap();
+    for _ in 0..3 {
+        while f.rt.recover_once(&CancellationToken::new()).await.unwrap() > 0 {}
+        f.rt.schedule(1, 2).unwrap();
+    }
+    while f.rt.recover_once(&CancellationToken::new()).await.unwrap() > 0 {}
+    let runs = f.rt.list(Some("pair"), "").unwrap();
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].outcome, Some(Status::Completed(json!(["a", "b"]))));
+}
