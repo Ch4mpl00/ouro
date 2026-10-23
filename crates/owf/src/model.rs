@@ -3,12 +3,24 @@
 // (expressions compile, calls resolve, flow targets exist); 4. static
 // analysis (the call sites, for manifests and previews).
 //
-// Supported subset of DSL 1.0: do, call, set, for, switch, try/catch with
-// retry, raise, fork, wait; input/output/export transforms and schemas;
-// if/then/timeout; use.functions/errors/retries/timeouts. Everything else
-// (listen, emit, run, schedule, catalogs, authentication, secrets,
-// extensions) is rejected at parse time so a definition never fails later
-// on a construct this runtime does not implement.
+// What the core implements of DSL 1.0 (the semantics of every task and
+// definition property): do, call, emit, for, fork, listen (one/any/all,
+// until, filters, correlation, read, foreach), raise, run (workflow natively;
+// container/script/shell through a host process runner), set, switch,
+// try/catch with retry (limit.attempt.duration included), wait;
+// input/output/export transforms and schemas (inline or a host-resolved
+// `resource`); if/then/timeout; schedule (every, cron, after, on);
+// use.functions/errors/retries/timeouts/extensions/secrets; evaluate (jq,
+// strict). Runtime arguments: $context, $input, $output, $task, $workflow,
+// $runtime, and $secrets in `input.from` only.
+//
+// Not the core's, rejected here: use.authentications and use.catalogs
+// (protocol functions and packs carry credentials and resolve their own
+// functions), $authorization (it describes a call's authentication),
+// evaluate.mode `loose` and languages other than jq. Protocol calls (`call:
+// http`, `openapi`, …) are ordinary host functions; a construct whose host
+// capability is missing (events, emit, child runs, a process runner,
+// secrets, resources) fails validation, never later.
 use crate::expr::{self, Args};
 use serde_json::{Map, Value};
 use std::sync::OnceLock;
@@ -24,6 +36,8 @@ pub struct Workflow {
     pub uses: Uses,
     pub tasks: TaskList,
     pub timeout: Option<DurationSpec>,
+    /// When a host's scheduler starts runs; the interpreter ignores it.
+    pub schedule: Option<Schedule>,
     /// The definition as parsed, exposed as `$workflow.definition`.
     pub definition: Value,
 }
@@ -44,6 +58,136 @@ pub struct Uses {
     pub errors: Vec<(String, ErrorDef)>,
     pub retries: Vec<(String, Retry)>,
     pub timeouts: Vec<(String, DurationSpec)>,
+    /// In declaration order: the first wraps the others (its `before` runs
+    /// first, its `after` last).
+    pub extensions: Vec<(String, Extension)>,
+    /// The names `$secrets` may hold; the host resolves their values.
+    pub secrets: Vec<String>,
+}
+
+/// Tasks run around every task of a kind (`use.extensions`).
+#[derive(Clone, Debug)]
+pub struct Extension {
+    /// A task kind (`Kind::name`), `composite` (do and fork) or `all`.
+    pub extend: String,
+    pub when: Option<String>,
+    pub before: Option<TaskList>,
+    pub after: Option<TaskList>,
+}
+
+impl Extension {
+    pub fn extends(&self, kind: &Kind) -> bool {
+        match self.extend.as_str() {
+            "all" => true,
+            "composite" => matches!(kind, Kind::Do(_) | Kind::Fork { .. }),
+            other => other == kind.name(),
+        }
+    }
+}
+
+/// `schedule`: when a host's scheduler starts runs of the definition.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Schedule {
+    pub every: Option<Duration>,
+    pub cron: Option<String>,
+    pub after: Option<Duration>,
+    pub on: Option<Strategy>,
+    pub read: Read,
+}
+
+/// `listen`: what to consume, how to read it, what to do with each event.
+#[derive(Clone, Debug)]
+pub struct Listen {
+    pub to: Strategy,
+    pub read: Read,
+    pub foreach: Option<Foreach>,
+}
+
+/// An event consumption strategy.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Strategy {
+    One(EventFilter),
+    /// An empty list consumes any event.
+    Any {
+        filters: Vec<EventFilter>,
+        until: Option<Until>,
+    },
+    All(Vec<EventFilter>),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum Until {
+    /// Evaluated on the events consumed so far, after each one.
+    Condition(String),
+    /// Events consumed by this strategy stop the listen; they are not output.
+    Events(Box<Strategy>),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct EventFilter {
+    /// Attribute name → literal (equality or a regular expression) or
+    /// runtime expression (see `events::matches`).
+    pub with: Map<String, Value>,
+    pub correlate: Vec<(String, Correlation)>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Correlation {
+    pub from: String,
+    /// A constant, or a `${ }` expression evaluated on the task input.
+    pub expect: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Read {
+    #[default]
+    Data,
+    Envelope,
+    Raw,
+}
+
+/// `listen.foreach`: tasks run for each consumed event, in consumption order.
+#[derive(Clone, Debug)]
+pub struct Foreach {
+    pub item: String,
+    pub at: String,
+    pub tasks: TaskList,
+    pub output: Option<Output>,
+    pub export: Option<Export>,
+}
+
+/// `run`: a process, awaited or not, and what of its result the task outputs.
+#[derive(Clone, Debug)]
+pub struct RunTask {
+    pub process: Process,
+    pub await_: bool,
+    pub return_: Return,
+}
+
+#[derive(Clone, Debug)]
+pub enum Process {
+    /// A child run of a workflow the host's catalog holds.
+    Workflow { namespace: String, name: String, version: String, input: Option<Value> },
+    /// `container`, `script` or `shell` and its definition (a template),
+    /// for a host-registered process runner.
+    External { kind: String, definition: Value },
+}
+
+impl Process {
+    /// The name its durable call records carry (`run:shell`, …).
+    pub fn function(kind: &str) -> String {
+        format!("run:{kind}")
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Return {
+    #[default]
+    Stdout,
+    Stderr,
+    Code,
+    All,
+    None,
 }
 
 pub type TaskList = Vec<(String, Task)>;
@@ -93,7 +237,10 @@ pub enum Kind {
     },
     Raise(Raise),
     Wait(DurationSpec),
-    Listen(Vec<Value>),
+    Listen(Box<Listen>),
+    /// `emit.event.with`: the event's attributes, a template.
+    Emit(Map<String, Value>),
+    Run(Box<RunTask>),
 }
 
 impl Kind {
@@ -109,6 +256,8 @@ impl Kind {
             Kind::Raise(_) => "raise",
             Kind::Wait(_) => "wait",
             Kind::Listen(_) => "listen",
+            Kind::Emit(_) => "emit",
+            Kind::Run(_) => "run",
         }
     }
 }
@@ -127,16 +276,23 @@ pub enum Flow {
     Goto(String),
 }
 
+/// A JSON Schema: inline, or an external resource the host resolves.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Schema {
+    Document(Value),
+    Resource(String),
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Input {
-    pub schema: Option<Value>,
+    pub schema: Option<Schema>,
     /// A bare/`${}` expression string, or an object template.
     pub from: Option<Value>,
 }
 
 #[derive(Clone, Debug, Default)]
 pub struct Output {
-    pub schema: Option<Value>,
+    pub schema: Option<Schema>,
     pub as_: Option<Value>,
 }
 
@@ -167,6 +323,8 @@ pub struct Retry {
     pub delay: Option<DurationSpec>,
     pub backoff: Backoff,
     pub attempts: Option<u32>,
+    /// `limit.attempt.duration`: how long each attempt may run.
+    pub attempt_duration: Option<DurationSpec>,
     pub duration: Option<DurationSpec>,
     pub jitter: Option<(DurationSpec, DurationSpec)>,
 }
@@ -264,10 +422,6 @@ fn problem(at: &str, message: impl Into<String>) -> Problem {
 }
 
 const COMMON: &[&str] = &["if", "input", "output", "export", "timeout", "then", "metadata"];
-const UNSUPPORTED_TASKS: &[(&str, &str)] = &[
-    ("emit", "emitting events is not supported yet"),
-    ("run", "run (container/script/shell/workflow) is not supported; call a function instead"),
-];
 
 #[derive(Default)]
 struct Parser {
@@ -326,9 +480,6 @@ impl Parser {
     fn workflow(&mut self, v: &Value) -> Option<Workflow> {
         let m = self.object(v, "")?;
         self.only(m, "", &["document", "input", "output", "use", "do", "timeout", "schedule", "evaluate"]);
-        if m.contains_key("schedule") {
-            self.fail("/schedule", "schedules live in the scheduler (a cron row), not in the definition");
-        }
         if let Some(ev) = m.get("evaluate").and_then(|e| self.object(e, "/evaluate")) {
             self.only(ev, "/evaluate", &["language", "mode"]);
             if ev.get("language").is_some_and(|l| l != "jq") {
@@ -363,6 +514,9 @@ impl Parser {
                 slot.1 = t;
             }
         }
+        if let Some(e) = m.get("use").and_then(|u| u.get("extensions")) {
+            uses.extensions = self.extensions(e);
+        }
         let tasks = match m.get("do") {
             Some(d) => self.task_list(d, "/do"),
             None => {
@@ -373,7 +527,8 @@ impl Parser {
         let input = m.get("input").map(|i| self.input(i, "/input"));
         let output = m.get("output").map(|o| self.output(o, "/output"));
         let timeout = m.get("timeout").and_then(|t| self.timeout(t, "/timeout"));
-        Some(Workflow { document: document?, input, output, uses, tasks, timeout, definition: v.clone() })
+        let schedule = m.get("schedule").and_then(|s| self.schedule(s));
+        Some(Workflow { document: document?, input, output, uses, tasks, timeout, schedule, definition: v.clone() })
     }
 
     fn document(&mut self, v: &Value) -> Option<Document> {
@@ -401,8 +556,6 @@ impl Parser {
         for (k, why) in [
             ("authentications", "authentication is not supported; functions carry their own credentials"),
             ("catalogs", "external catalogs are not supported; functions come from the runtime's catalog"),
-            ("extensions", "extensions are not supported"),
-            ("secrets", "secrets are not supported; functions carry their own credentials"),
         ] {
             if m.contains_key(k) {
                 self.fail(&format!("/use/{k}"), why);
@@ -413,6 +566,21 @@ impl Parser {
             "/use",
             &["functions", "errors", "retries", "timeouts", "authentications", "catalogs", "extensions", "secrets"],
         );
+        match m.get("secrets") {
+            None => {}
+            Some(Value::Array(names)) => {
+                for (i, name) in names.iter().enumerate() {
+                    match name.as_str().filter(|n| !n.is_empty()) {
+                        Some(n) if uses.secrets.iter().any(|s| s == n) => {
+                            self.fail(&format!("/use/secrets/{i}"), format!("secret `{n}` is declared twice"))
+                        }
+                        Some(n) => uses.secrets.push(n.to_string()),
+                        None => self.fail(&format!("/use/secrets/{i}"), "expected a secret name"),
+                    }
+                }
+            }
+            Some(_) => self.fail("/use/secrets", "expected a list of secret names"),
+        }
         if let Some(e) = m.get("errors").and_then(|e| self.object(e, "/use/errors")) {
             for (name, def) in e {
                 if let Some(d) = self.error_def(def, &format!("/use/errors/{name}")) {
@@ -485,12 +653,6 @@ impl Parser {
 
     fn task(&mut self, v: &Value, at: &str) -> Option<Task> {
         let m = self.object(v, at)?;
-        for (k, why) in UNSUPPORTED_TASKS {
-            if m.contains_key(*k) {
-                self.fail(&format!("{at}/{k}"), *why);
-                return None;
-            }
-        }
         let kind = if m.contains_key("for") {
             self.only(m, at, &[COMMON, &["for", "while", "do"]].concat());
             self.for_task(m, at)
@@ -526,14 +688,14 @@ impl Parser {
             self.only(m, at, &[COMMON, &["raise"]].concat());
             self.raise_task(r, &format!("{at}/raise"))
         } else if let Some(v) = m.get("listen") {
-            for key in ["read", "foreach"] {
-                if m.contains_key(key) {
-                    self.fail(&format!("{at}/{key}"), "listen read/foreach is not supported");
-                    return None;
-                }
-            }
-            self.only(m, at, &[COMMON, &["listen"]].concat());
-            self.listen(v, &format!("{at}/listen"))
+            self.only(m, at, &[COMMON, &["listen", "foreach"]].concat());
+            self.listen(v, m.get("foreach"), at)
+        } else if let Some(e) = m.get("emit") {
+            self.only(m, at, &[COMMON, &["emit"]].concat());
+            self.emit(e, &format!("{at}/emit"))
+        } else if let Some(r) = m.get("run") {
+            self.only(m, at, &[COMMON, &["run"]].concat());
+            self.run_task(r, &format!("{at}/run"))
         } else if let Some(w) = m.get("wait") {
             self.only(m, at, &[COMMON, &["wait"]].concat());
             self.duration(w, &format!("{at}/wait")).map(Kind::Wait)
@@ -541,7 +703,10 @@ impl Parser {
             self.only(m, at, &[COMMON, &["do"]].concat());
             Some(Kind::Do(self.task_list(d, &format!("{at}/do"))))
         } else {
-            self.fail(at, "unknown task: expected one of call, do, for, fork, set, switch, try, raise, wait");
+            self.fail(
+                at,
+                "unknown task: expected one of call, do, emit, for, fork, listen, raise, run, set, switch, try, wait",
+            );
             None
         };
         let when = self.string(m, "if", at);
@@ -584,44 +749,239 @@ impl Parser {
         Some(Task { delivery, hold, when, input, output, export, timeout, then, kind: kind?, definition: v.clone() })
     }
 
-    fn listen(&mut self, v: &Value, at: &str) -> Option<Kind> {
-        let m = self.object(v, at)?;
-        for key in m.keys().filter(|k| k.as_str() != "to") {
-            self.fail(&format!("{at}/{key}"), "listen option not supported");
+    fn listen(&mut self, v: &Value, foreach: Option<&Value>, task_at: &str) -> Option<Kind> {
+        let at = format!("{task_at}/listen");
+        let m = self.object(v, &at)?;
+        self.only(m, &at, &["to", "read"]);
+        let read = self.read(m.get("read"), &format!("{at}/read"));
+        let to = match m.get("to") {
+            Some(to) => self.strategy(to, &format!("{at}/to"), true)?,
+            None => {
+                self.fail(&at, "missing `to`");
+                return None;
+            }
+        };
+        let foreach = match foreach {
+            None => None,
+            Some(f) => {
+                let fat = format!("{task_at}/foreach");
+                let f = self.object(f, &fat)?;
+                self.only(f, &fat, &["item", "at", "do", "output", "export"]);
+                Some(Foreach {
+                    item: self.string(f, "item", &fat).unwrap_or_else(|| "item".into()),
+                    at: self.string(f, "at", &fat).unwrap_or_else(|| "index".into()),
+                    tasks: f.get("do").map(|d| self.task_list(d, &format!("{fat}/do"))).unwrap_or_default(),
+                    output: f.get("output").map(|o| self.output(o, &format!("{fat}/output"))),
+                    export: f.get("export").map(|o| self.output(o, &format!("{fat}/export"))),
+                })
+            }
+        };
+        Some(Kind::Listen(Box::new(Listen { to, read, foreach })))
+    }
+
+    fn read(&mut self, v: Option<&Value>, at: &str) -> Read {
+        match v.map(|v| v.as_str()) {
+            None | Some(Some("data")) => Read::Data,
+            Some(Some("envelope")) => Read::Envelope,
+            Some(Some("raw")) => Read::Raw,
+            Some(_) => {
+                self.fail(at, "expected data, envelope or raw");
+                Read::Data
+            }
         }
-        let to = self.object(m.get("to").unwrap_or(&Value::Null), &format!("{at}/to"))?;
-        if to.len() != 1 || !(to.contains_key("one") || to.contains_key("any")) {
-            self.fail(at, "only listen.to.one and listen.to.any are supported; all/until/correlate are not supported");
+    }
+
+    /// An event consumption strategy; `until` only where the DSL allows it.
+    fn strategy(&mut self, v: &Value, at: &str, until: bool) -> Option<Strategy> {
+        let m = self.object(v, at)?;
+        self.only(m, at, &["one", "any", "all", "until"]);
+        let kinds = ["one", "any", "all"].iter().filter(|k| m.contains_key(**k)).count();
+        if kinds != 1 {
+            self.fail(at, "expected exactly one of one, any, all");
             return None;
         }
-        let filters = if let Some(one) = to.get("one") {
-            vec![one]
-        } else if let Some(Value::Array(any)) = to.get("any") {
-            any.iter().collect()
-        } else {
-            self.fail(at, "listen.to.any requires an array");
+        if m.contains_key("until") && !(until && m.contains_key("any")) {
+            self.fail(&format!("{at}/until"), "until applies to `any` only, and not inside another until");
+        }
+        if let Some(one) = m.get("one") {
+            return self.filter(one, &format!("{at}/one")).map(Strategy::One);
+        }
+        let list = |p: &mut Self, key: &str| -> Vec<EventFilter> {
+            match m.get(key) {
+                Some(Value::Array(items)) => {
+                    items.iter().enumerate().filter_map(|(i, f)| p.filter(f, &format!("{at}/{key}/{i}"))).collect()
+                }
+                _ => {
+                    p.fail(&format!("{at}/{key}"), "expected a list of event filters");
+                    Vec::new()
+                }
+            }
+        };
+        if m.contains_key("all") {
+            let filters = list(self, "all");
+            if filters.is_empty() {
+                self.fail(&format!("{at}/all"), "`all` needs at least one event filter");
+            }
+            return Some(Strategy::All(filters));
+        }
+        let filters = list(self, "any");
+        let until = match m.get("until") {
+            None => None,
+            Some(Value::String(code)) => Some(Until::Condition(expr::bare(code).to_string())),
+            Some(other) => self.strategy(other, &format!("{at}/until"), false).map(|s| Until::Events(Box::new(s))),
+        };
+        Some(Strategy::Any { filters, until })
+    }
+
+    fn filter(&mut self, v: &Value, at: &str) -> Option<EventFilter> {
+        let m = self.object(v, at)?;
+        self.only(m, at, &["with", "correlate"]);
+        let with = match m.get("with") {
+            Some(w) => self.object(w, &format!("{at}/with"))?.clone(),
+            None => {
+                self.fail(at, "missing `with`");
+                return None;
+            }
+        };
+        if with.is_empty() {
+            self.fail(&format!("{at}/with"), "an event filter needs at least one attribute");
+        }
+        let mut correlate = Vec::new();
+        if let Some(c) = m.get("correlate").and_then(|c| self.object(c, &format!("{at}/correlate"))) {
+            for (name, def) in c {
+                let cat = format!("{at}/correlate/{name}");
+                let Some(d) = self.object(def, &cat) else { continue };
+                self.only(d, &cat, &["from", "expect"]);
+                let from = self.required_string(d, "from", &cat);
+                let expect = self.string(d, "expect", &cat);
+                correlate.push((name.clone(), Correlation { from: expr::bare(&from).to_string(), expect }));
+            }
+        }
+        Some(EventFilter { with, correlate })
+    }
+
+    fn emit(&mut self, v: &Value, at: &str) -> Option<Kind> {
+        let m = self.object(v, at)?;
+        self.only(m, at, &["event"]);
+        let Some(event) = m.get("event").and_then(|e| self.object(e, &format!("{at}/event"))) else {
+            self.fail(at, "missing `event`");
             return None;
         };
-        if filters.is_empty() {
-            self.fail(at, "listening without an event type is not supported");
+        self.only(event, &format!("{at}/event"), &["with"]);
+        let with = self.object(event.get("with").unwrap_or(&Value::Null), &format!("{at}/event/with"))?.clone();
+        if with.get("type").and_then(Value::as_str).is_none_or(str::is_empty) {
+            self.fail(&format!("{at}/event/with"), "an emitted event needs a `type`");
         }
-        let mut types = Vec::new();
-        for filter in filters {
-            let f = self.object(filter, at)?;
-            for key in f.keys().filter(|k| k.as_str() != "with") {
-                self.fail(&format!("{at}/{key}"), "event filter option not supported");
+        Some(Kind::Emit(with))
+    }
+
+    fn run_task(&mut self, v: &Value, at: &str) -> Option<Kind> {
+        let m = self.object(v, at)?;
+        self.only(m, at, &["container", "script", "shell", "workflow", "await", "return"]);
+        let await_ = match m.get("await") {
+            None => true,
+            Some(Value::Bool(b)) => *b,
+            Some(_) => {
+                self.fail(&format!("{at}/await"), "expected a boolean");
+                true
             }
-            let with = self.object(f.get("with").unwrap_or(&Value::Null), at)?;
-            for key in with.keys().filter(|k| k.as_str() != "type") {
-                self.fail(&format!("{at}/{key}"), "event filter option not supported");
+        };
+        let return_ = match m.get("return").map(|r| r.as_str()) {
+            None | Some(Some("stdout")) => Return::Stdout,
+            Some(Some("stderr")) => Return::Stderr,
+            Some(Some("code")) => Return::Code,
+            Some(Some("all")) => Return::All,
+            Some(Some("none")) => Return::None,
+            Some(_) => {
+                self.fail(&format!("{at}/return"), "expected stdout, stderr, code, all or none");
+                Return::Stdout
             }
-            let t = self.required_string(with, "type", at);
-            if t.is_empty() {
-                self.fail(at, "event type must not be empty");
+        };
+        let kinds: Vec<&str> =
+            ["container", "script", "shell", "workflow"].into_iter().filter(|k| m.contains_key(*k)).collect();
+        let [kind] = kinds[..] else {
+            self.fail(at, "expected exactly one of container, script, shell, workflow");
+            return None;
+        };
+        let wat = format!("{at}/{kind}");
+        let definition = self.object(&m[kind], &wat)?;
+        let process = if kind == "workflow" {
+            self.only(definition, &wat, &["namespace", "name", "version", "input"]);
+            Process::Workflow {
+                namespace: self.required_string(definition, "namespace", &wat),
+                name: self.required_string(definition, "name", &wat),
+                version: self.string(definition, "version", &wat).unwrap_or_else(|| "latest".into()),
+                input: definition.get("input").cloned(),
             }
-            types.push(Value::String(t));
+        } else {
+            Process::External { kind: kind.to_string(), definition: Value::Object(definition.clone()) }
+        };
+        Some(Kind::Run(Box::new(RunTask { process, await_, return_ })))
+    }
+
+    fn extensions(&mut self, v: &Value) -> Vec<(String, Extension)> {
+        let Value::Array(items) = v else {
+            self.fail("/use/extensions", "expected a list of `- name: extension` entries");
+            return Vec::new();
+        };
+        let mut out: Vec<(String, Extension)> = Vec::new();
+        for (i, item) in items.iter().enumerate() {
+            let at = format!("/use/extensions/{i}");
+            let Some((name, def)) = item.as_object().filter(|m| m.len() == 1).and_then(|m| m.iter().next()) else {
+                self.fail(&at, "each entry must be a single `name: extension` pair");
+                continue;
+            };
+            let at = format!("{at}/{name}");
+            let Some(e) = self.object(def, &at) else { continue };
+            self.only(e, &at, &["extend", "when", "before", "after"]);
+            let extend = self.required_string(e, "extend", &at);
+            const KINDS: &[&str] =
+                &["call", "composite", "emit", "for", "listen", "raise", "run", "set", "switch", "try", "wait", "all"];
+            if !extend.is_empty() && !KINDS.contains(&extend.as_str()) {
+                self.fail(&format!("{at}/extend"), format!("expected one of {}", KINDS.join(", ")));
+            }
+            out.push((
+                name.clone(),
+                Extension {
+                    extend,
+                    when: self.string(e, "when", &at).map(|w| expr::bare(&w).to_string()),
+                    before: e.get("before").map(|b| self.task_list(b, &format!("{at}/before"))),
+                    after: e.get("after").map(|b| self.task_list(b, &format!("{at}/after"))),
+                },
+            ));
         }
-        Some(Kind::Listen(types))
+        out
+    }
+
+    fn schedule(&mut self, v: &Value) -> Option<Schedule> {
+        let at = "/schedule";
+        let m = self.object(v, at)?;
+        self.only(m, at, &["every", "cron", "after", "on", "read"]);
+        let fixed = |p: &mut Self, key: &str| match m.get(key).and_then(|d| p.duration(d, &format!("{at}/{key}"))) {
+            Some(DurationSpec::Fixed(d)) if !d.is_zero() => Some(d),
+            Some(_) => {
+                p.fail(&format!("{at}/{key}"), "expected a positive literal duration");
+                None
+            }
+            None => None,
+        };
+        let every = fixed(self, "every");
+        let after = fixed(self, "after");
+        let cron = self.string(m, "cron", at);
+        if let Some(c) = &cron
+            && let Err(e) = c.parse::<croner::Cron>()
+        {
+            self.fail(&format!("{at}/cron"), format!("invalid cron expression: {e}"));
+        }
+        let on = m.get("on").and_then(|o| self.strategy(o, &format!("{at}/on"), true));
+        if m.contains_key("read") && !m.contains_key("on") {
+            self.fail(&format!("{at}/read"), "read applies only with `on`");
+        }
+        let read = self.read(m.get("read"), &format!("{at}/read"));
+        if every.is_none() && after.is_none() && cron.is_none() && on.is_none() {
+            self.fail(at, "a schedule needs every, cron, after or on");
+        }
+        Some(Schedule { every, cron, after, on, read })
     }
 
     fn for_task(&mut self, m: &Map<String, Value>, at: &str) -> Option<Kind> {
@@ -827,14 +1187,13 @@ impl Parser {
             self.only(l, &lat, &["attempt", "duration"]);
             if let Some(a) = l.get("attempt").and_then(|a| self.object(a, &format!("{lat}/attempt"))) {
                 self.only(a, &format!("{lat}/attempt"), &["count", "duration"]);
-                if a.contains_key("duration") {
-                    // The specification leaves open whether it bounds each
-                    // attempt or all of them; a task `timeout` says either.
-                    self.fail(
-                        &format!("{lat}/attempt/duration"),
-                        "limit.attempt.duration is not supported; put a `timeout` on the task inside `try`",
-                    );
-                }
+                // CHOICE: the reference calls it "the duration limit for all
+                // retry attempts" next to `limit.duration` ("during which to
+                // retry"); under `attempt`, beside the count, it bounds each
+                // attempt, which times out like a task `timeout` and is
+                // caught by this same `catch`.
+                retry.attempt_duration =
+                    a.get("duration").and_then(|d| self.duration(d, &format!("{lat}/attempt/duration")));
                 retry.attempts = match a.get("count") {
                     None => None,
                     Some(Value::Number(n)) if n.as_u64().is_some() => {
@@ -893,19 +1252,38 @@ impl Parser {
         }
     }
 
-    fn schema(&mut self, v: &Value, at: &str) -> Option<Value> {
+    fn schema(&mut self, v: &Value, at: &str) -> Option<Schema> {
         let m = self.object(v, at)?;
         self.only(m, at, &["format", "document", "resource"]);
         if m.get("format").is_some_and(|f| f != "json") {
             self.fail(&format!("{at}/format"), "only JSON Schema (`json`) is supported");
         }
-        if m.contains_key("resource") {
-            self.fail(&format!("{at}/resource"), "external schemas are not supported; inline the `document`");
-            return None;
+        if let (Some(r), None) = (m.get("resource"), m.get("document")) {
+            let rat = format!("{at}/resource");
+            let r = self.object(r, &rat)?;
+            self.only(r, &rat, &["name", "endpoint"]);
+            return match r.get("endpoint") {
+                Some(Value::String(uri)) => Some(Schema::Resource(uri.clone())),
+                Some(Value::Object(e)) => {
+                    let eat = format!("{rat}/endpoint");
+                    self.only(e, &eat, &["uri", "authentication"]);
+                    if e.contains_key("authentication") {
+                        self.fail(
+                            &format!("{eat}/authentication"),
+                            "authentication is not supported; the host's resource resolver carries credentials",
+                        );
+                    }
+                    Some(Schema::Resource(self.required_string(e, "uri", &eat)))
+                }
+                _ => {
+                    self.fail(&rat, "missing `endpoint`");
+                    None
+                }
+            };
         }
         match m.get("document") {
             Some(d) => match jsonschema::validator_for(d) {
-                Ok(_) => Some(d.clone()),
+                Ok(_) => Some(Schema::Document(d.clone())),
                 Err(e) => {
                     self.fail(&format!("{at}/document"), format!("invalid JSON Schema: {e}"));
                     None
@@ -1032,11 +1410,34 @@ pub fn parse_iso_duration(s: &str) -> Option<Duration> {
 
 // ── 3. validation ──────────────────────────────────────────────────────────
 
-/// What validation needs to know about the runtime's functions.
+/// What validation needs to know about the host: its functions and which of
+/// the DSL's host-provided capabilities it has. A construct whose capability
+/// is missing fails validation, never later.
 pub trait Catalog {
     /// Whether `name` is callable here.
     fn has(&self, name: &str) -> bool;
+    /// `listen`: durable event delivery.
     fn events(&self) -> bool {
+        false
+    }
+    /// `emit`: publishing events.
+    fn emits(&self) -> bool {
+        false
+    }
+    /// `run: workflow`: child runs.
+    fn children(&self) -> bool {
+        false
+    }
+    /// `run: container | script | shell`: a process runner for `kind`.
+    fn processes(&self, _kind: &str) -> bool {
+        false
+    }
+    /// `use.secrets`: a secret resolver.
+    fn secrets(&self) -> bool {
+        false
+    }
+    /// `schema.resource`: a resource resolver.
+    fn resources(&self) -> bool {
         false
     }
 }
@@ -1050,27 +1451,81 @@ pub fn function_name(call: &str) -> &str {
     }
 }
 
-/// The runtime arguments every expression may use.
+/// The runtime arguments every expression may use. `$secrets` is bound only
+/// in `input.from` (see `SECRETS`); `$authorization` describes a call's
+/// resolved authentication, which this runtime leaves to functions.
 pub const BASE_VARS: &[&str] = &["context", "input", "output", "task", "workflow", "runtime"];
+
+/// The argument holding the declared secrets. CHOICE: the DSL's argument
+/// table ticks `$secrets` for every expression, but its description says
+/// "to avoid unintentional bleeding, secrets can only be used in the
+/// `input.from` runtime expression"; the narrower rule holds here.
+pub const SECRETS: &str = "secrets";
 
 fn base_args() -> Args {
     BASE_VARS.iter().fold(Args::new(), |a, n| a.with(n, Value::Null))
 }
 
+/// The secret names an expression reads (`$secrets.name`, `$secrets["name"]`);
+/// `None` when it reads them some other way (the whole map, a computed key).
+pub fn secret_names(code: &str) -> Option<Vec<String>> {
+    let mut names = Vec::new();
+    let mut rest = code;
+    while let Some(i) = rest.find("$secrets") {
+        let after = &rest[i + "$secrets".len()..];
+        if after.starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_') {
+            // `$secretsX` is another variable.
+            rest = after;
+            continue;
+        }
+        let name: String = if let Some(n) = after.strip_prefix('.') {
+            n.chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_').collect()
+        } else if let Some(n) = after.strip_prefix("[\"") {
+            n.split('"').next().unwrap_or_default().to_string()
+        } else {
+            String::new()
+        };
+        if name.is_empty() {
+            return None;
+        }
+        names.push(name);
+        rest = after;
+    }
+    Some(names)
+}
+
 /// Checks what parsing cannot: expressions compile with the variables in
 /// scope, calls resolve, flow directives target tasks of their own list,
-/// named errors exist, value strings do not embed `${`.
+/// named errors exist, value strings do not embed `${`, and the host offers
+/// every capability the definition needs.
 pub fn validate(wf: &Workflow, catalog: &dyn Catalog) -> Result<(), Invalid> {
     let mut v = Validator { wf, catalog, problems: Vec::new() };
     let args = base_args();
+    if !wf.uses.secrets.is_empty() && !catalog.secrets() {
+        v.problems.push(problem("/use/secrets", "secrets need a host secret resolver"));
+    }
     if let Some(i) = &wf.input {
-        v.transform(i.from.as_ref(), "/input/from", &args);
+        v.input(i, "/input", &args);
     }
     if let Some(o) = &wf.output {
-        v.transform(o.as_.as_ref(), "/output/as", &args);
+        v.output(o, "/output", &args);
     }
     for (name, f) in &wf.uses.functions {
         v.task(f, &format!("/use/functions/{name}"), &args, &[]);
+    }
+    for (i, (name, e)) in wf.uses.extensions.iter().enumerate() {
+        let at = format!("/use/extensions/{i}/{name}");
+        if let Some(w) = &e.when {
+            v.expr(w, &format!("{at}/when"), &args);
+        }
+        for (key, list) in [("before", &e.before), ("after", &e.after)] {
+            if let Some(list) = list {
+                v.list(list, &format!("{at}/{key}"), &args);
+            }
+        }
+    }
+    if let Some(on) = wf.schedule.as_ref().and_then(|s| s.on.as_ref()) {
+        v.strategy(on, "/schedule/on", &args);
     }
     v.list(&wf.tasks, "/do", &args);
     if v.problems.is_empty() { Ok(()) } else { Err(Invalid(v.problems)) }
@@ -1083,7 +1538,29 @@ struct Validator<'a> {
 }
 
 impl Validator<'_> {
+    fn fail(&mut self, at: &str, message: impl Into<String>) {
+        self.problems.push(problem(at, message));
+    }
+
     fn expr(&mut self, code: &str, at: &str, args: &Args) {
+        if code.contains("$authorization") {
+            self.fail(
+                at,
+                "`$authorization` describes a call's resolved authentication, which this runtime does not implement; functions carry their own credentials",
+            );
+            return;
+        }
+        if code.contains("$secrets") {
+            if !args.names().any(|n| n == SECRETS) {
+                self.fail(at, "`$secrets` is only available in `input.from`");
+                return;
+            }
+            for name in secret_names(code).unwrap_or_default() {
+                if !self.wf.uses.secrets.contains(&name) {
+                    self.fail(at, format!("secret `{name}` is not declared under use.secrets"));
+                }
+            }
+        }
         if let Err(e) = expr::check(code, args) {
             self.problems.push(problem(at, e));
         }
@@ -1110,6 +1587,26 @@ impl Validator<'_> {
         }
     }
 
+    fn schema(&mut self, s: Option<&Schema>, at: &str) {
+        if let Some(Schema::Resource(uri)) = s
+            && !self.catalog.resources()
+        {
+            self.fail(at, format!("external schema `{uri}` needs a host resource resolver"));
+        }
+    }
+
+    /// `input`: its `from` also sees `$secrets`.
+    fn input(&mut self, i: &Input, at: &str, args: &Args) {
+        self.schema(i.schema.as_ref(), &format!("{at}/schema"));
+        let with_secrets = args.clone().with(SECRETS, Value::Null);
+        self.transform(i.from.as_ref(), &format!("{at}/from"), &with_secrets);
+    }
+
+    fn output(&mut self, o: &Output, at: &str, args: &Args) {
+        self.schema(o.schema.as_ref(), &format!("{at}/schema"));
+        self.transform(o.as_.as_ref(), &format!("{at}/as"), args);
+    }
+
     fn flow(&mut self, f: &Option<Flow>, at: &str, siblings: &[&str]) {
         if let Some(Flow::Goto(name)) = f
             && !siblings.contains(&name.as_str())
@@ -1128,18 +1625,55 @@ impl Validator<'_> {
         }
     }
 
+    fn filter(&mut self, f: &EventFilter, at: &str, args: &Args) {
+        for (attribute, value) in &f.with {
+            if let Some(code) = value.as_str().and_then(expr::strip) {
+                self.expr(code, &format!("{at}/with/{attribute}"), args);
+            } else if value.as_str().is_some_and(expr::is_embedded) {
+                self.fail(&format!("{at}/with/{attribute}"), "embeds `${` inside text; make it one expression");
+            }
+        }
+        for (name, c) in &f.correlate {
+            self.expr(&c.from, &format!("{at}/correlate/{name}/from"), args);
+            if let Some(code) = c.expect.as_deref().and_then(expr::strip) {
+                self.expr(code, &format!("{at}/correlate/{name}/expect"), args);
+            }
+        }
+    }
+
+    fn strategy(&mut self, s: &Strategy, at: &str, args: &Args) {
+        match s {
+            Strategy::One(f) => self.filter(f, &format!("{at}/one"), args),
+            Strategy::All(filters) => {
+                for (i, f) in filters.iter().enumerate() {
+                    self.filter(f, &format!("{at}/all/{i}"), args);
+                }
+            }
+            Strategy::Any { filters, until } => {
+                for (i, f) in filters.iter().enumerate() {
+                    self.filter(f, &format!("{at}/any/{i}"), args);
+                }
+                match until {
+                    Some(Until::Condition(c)) => self.expr(c, &format!("{at}/until"), args),
+                    Some(Until::Events(s)) => self.strategy(s, &format!("{at}/until"), args),
+                    None => {}
+                }
+            }
+        }
+    }
+
     fn task(&mut self, t: &Task, at: &str, args: &Args, siblings: &[&str]) {
         if let Some(c) = &t.when {
             self.expr(expr::bare(c), &format!("{at}/if"), args);
         }
         if let Some(i) = &t.input {
-            self.transform(i.from.as_ref(), &format!("{at}/input/from"), args);
+            self.input(i, &format!("{at}/input"), args);
         }
         if let Some(o) = &t.output {
-            self.transform(o.as_.as_ref(), &format!("{at}/output/as"), args);
+            self.output(o, &format!("{at}/output"), args);
         }
         if let Some(e) = &t.export {
-            self.transform(e.as_.as_ref(), &format!("{at}/export/as"), args);
+            self.output(e, &format!("{at}/export"), args);
         }
         if let Some(DurationSpec::Expr(e)) = &t.timeout {
             self.expr(e, &format!("{at}/timeout"), args);
@@ -1206,6 +1740,11 @@ impl Validator<'_> {
                             self.expr(c, &format!("{at}/catch/retry/{key}"), &caught);
                         }
                     }
+                    for d in [&r.delay, &r.attempt_duration, &r.duration].into_iter().flatten() {
+                        if let DurationSpec::Expr(e) = d {
+                            self.expr(e, &format!("{at}/catch/retry"), &caught);
+                        }
+                    }
                 }
                 if let Some(handler) = &catch.tasks {
                     self.list(handler, &format!("{at}/catch/do"), &caught);
@@ -1232,14 +1771,47 @@ impl Validator<'_> {
                     }
                 }
             }
-            Kind::Listen(types) => {
+            Kind::Listen(listen) => {
                 if !self.catalog.events() {
                     self.problems.push(problem(&format!("{at}/listen"), "events are not supported by this host"));
                 }
-                for t in types {
-                    self.template(t, &format!("{at}/listen"), args);
+                self.strategy(&listen.to, &format!("{at}/listen/to"), args);
+                if let Some(f) = &listen.foreach {
+                    let inner = args.clone().with(&f.item, Value::Null).with(&f.at, Value::Null);
+                    self.list(&f.tasks, &format!("{at}/foreach/do"), &inner);
+                    if let Some(o) = &f.output {
+                        self.output(o, &format!("{at}/foreach/output"), &inner);
+                    }
+                    if let Some(e) = &f.export {
+                        self.output(e, &format!("{at}/foreach/export"), &inner);
+                    }
                 }
             }
+            Kind::Emit(with) => {
+                if !self.catalog.emits() {
+                    self.fail(&format!("{at}/emit"), "emitting events is not supported by this host");
+                }
+                self.template(&Value::Object(with.clone()), &format!("{at}/emit/event/with"), args);
+            }
+            Kind::Run(r) => match &r.process {
+                Process::Workflow { input, .. } => {
+                    if !self.catalog.children() {
+                        self.fail(&format!("{at}/run/workflow"), "child workflows are not supported by this host");
+                    }
+                    if let Some(i) = input {
+                        self.template(i, &format!("{at}/run/workflow/input"), args);
+                    }
+                }
+                Process::External { kind, definition } => {
+                    if !self.catalog.processes(kind) {
+                        self.fail(
+                            &format!("{at}/run/{kind}"),
+                            format!("run: {kind} needs a host process runner, and this host has none for it"),
+                        );
+                    }
+                    self.template(definition, &format!("{at}/run/{kind}"), args);
+                }
+            },
             Kind::Wait(d) => {
                 if let DurationSpec::Expr(e) = d {
                     self.expr(e, &format!("{at}/wait"), args);
@@ -1261,38 +1833,97 @@ pub struct CallSite {
     pub delivery: crate::durable::Delivery,
 }
 
-/// Every call site, including those inside reusable functions, in
-/// definition order. Callers derive manifests and previews from it.
-pub fn call_sites(wf: &Workflow) -> Vec<CallSite> {
-    fn list(tasks: &TaskList, at: &str, out: &mut Vec<CallSite>) {
+/// Every task list in the definition with the reference prefix its tasks
+/// get: the top level, reusable functions and extension lists included.
+fn lists(wf: &Workflow, visit: &mut dyn FnMut(&Task, &str)) {
+    fn list(tasks: &TaskList, at: &str, visit: &mut dyn FnMut(&Task, &str)) {
         for (i, (name, t)) in tasks.iter().enumerate() {
-            task(t, &format!("{at}/{i}/{name}"), out);
+            task(t, &format!("{at}/{i}/{name}"), visit);
         }
     }
-    fn task(t: &Task, at: &str, out: &mut Vec<CallSite>) {
+    fn task(t: &Task, at: &str, visit: &mut dyn FnMut(&Task, &str)) {
+        visit(t, at);
         match &t.kind {
-            Kind::Call { function, with } => out.push(CallSite {
+            Kind::Do(tasks) | Kind::For { tasks, .. } => list(tasks, &format!("{at}/do"), visit),
+            Kind::Fork { branches, .. } => list(branches, &format!("{at}/fork/branches"), visit),
+            Kind::Try { tasks, catch } => {
+                list(tasks, &format!("{at}/try"), visit);
+                if let Some(h) = &catch.tasks {
+                    list(h, &format!("{at}/catch/do"), visit);
+                }
+            }
+            Kind::Listen(l) => {
+                if let Some(f) = &l.foreach {
+                    list(&f.tasks, &format!("{at}/foreach/do"), visit);
+                }
+            }
+            Kind::Set(_) | Kind::Switch(_) | Kind::Raise(_) | Kind::Wait(_) | Kind::Emit(_) | Kind::Run(_) => {}
+            Kind::Call { .. } => {}
+        }
+    }
+    for (name, f) in &wf.uses.functions {
+        task(f, &format!("/use/functions/{name}"), visit);
+    }
+    for (i, (name, e)) in wf.uses.extensions.iter().enumerate() {
+        for (key, l) in [("before", &e.before), ("after", &e.after)] {
+            if let Some(l) = l {
+                list(l, &format!("/use/extensions/{i}/{name}/{key}"), visit);
+            }
+        }
+    }
+    list(&wf.tasks, "/do", visit);
+}
+
+/// Every call site, including those inside reusable functions and
+/// extensions, in definition order. Callers derive manifests and previews.
+pub fn call_sites(wf: &Workflow) -> Vec<CallSite> {
+    let mut out = Vec::new();
+    lists(wf, &mut |t, at| {
+        if let Kind::Call { function, with } = &t.kind {
+            out.push(CallSite {
                 reference: at.to_string(),
                 function: function_name(function).to_string(),
                 with: with.clone(),
                 delivery: t.delivery,
-            }),
-            Kind::Do(tasks) | Kind::For { tasks, .. } => list(tasks, &format!("{at}/do"), out),
-            Kind::Fork { branches, .. } => list(branches, &format!("{at}/fork/branches"), out),
-            Kind::Try { tasks, catch } => {
-                list(tasks, &format!("{at}/try"), out);
-                if let Some(h) = &catch.tasks {
-                    list(h, &format!("{at}/catch/do"), out);
-                }
-            }
-            Kind::Set(_) | Kind::Switch(_) | Kind::Raise(_) | Kind::Wait(_) | Kind::Listen(_) => {}
+            });
         }
-    }
+    });
+    out
+}
+
+/// Every external schema the definition refers to, for a host to resolve
+/// and pin before admitting a run.
+pub fn schema_resources(wf: &Workflow) -> Vec<String> {
     let mut out = Vec::new();
-    for (name, f) in &wf.uses.functions {
-        task(f, &format!("/use/functions/{name}"), &mut out);
+    let mut add = |s: Option<&Schema>| {
+        if let Some(Schema::Resource(uri)) = s
+            && !out.contains(uri)
+        {
+            out.push(uri.clone());
+        }
+    };
+    let io = |i: &Option<Input>, o: &Option<Output>, e: &Option<Export>| {
+        [
+            i.as_ref().and_then(|i| i.schema.clone()),
+            o.as_ref().and_then(|o| o.schema.clone()),
+            e.as_ref().and_then(|e| e.schema.clone()),
+        ]
+    };
+    for s in io(&wf.input, &wf.output, &None) {
+        add(s.as_ref());
     }
-    list(&wf.tasks, "/do", &mut out);
+    let mut found = Vec::new();
+    lists(wf, &mut |t, _| {
+        found.extend(io(&t.input, &t.output, &t.export));
+        if let Kind::Listen(l) = &t.kind
+            && let Some(f) = &l.foreach
+        {
+            found.extend(io(&None, &f.output, &f.export));
+        }
+    });
+    for s in found {
+        add(s.as_ref());
+    }
     out
 }
 
@@ -1346,17 +1977,134 @@ do:
     }
 
     #[test]
-    fn unsupported_and_unknown_constructs_fail_at_parse_time() {
+    fn host_capabilities_and_unknown_constructs_are_checked() {
+        // Constructs the host must provide fail validation on a bare host.
         let p = problems("do:\n  - a: { listen: { to: { one: { with: { type: x } } } } }\n", &[]);
         assert!(p[0].contains("/do/0/a/listen") && p[0].contains("not supported"), "{p:?}");
-        let p = problems("schedule: { cron: '0 * * * *' }\ndo: [ { a: { set: { x: 1 } } } ]\n", &[]);
-        assert!(p.iter().any(|p| p.contains("scheduler")), "{p:?}");
+        let p = problems("do: [ { a: { emit: { event: { with: { type: x } } } } } ]\n", &[]);
+        assert!(p[0].contains("/do/0/a/emit") && p[0].contains("not supported"), "{p:?}");
+        let p = problems("do: [ { a: { run: { shell: { command: ls } } } } ]\n", &[]);
+        assert!(p[0].contains("/do/0/a/run/shell") && p[0].contains("process runner"), "{p:?}");
+        let p = problems("do: [ { a: { run: { workflow: { namespace: t, name: c, version: '1.0.0' } } } } ]\n", &[]);
+        assert!(p[0].contains("/do/0/a/run/workflow"), "{p:?}");
+        let p = problems("use: { secrets: [ token ] }\ndo: [ { a: { set: { x: 1 } } } ]\n", &[]);
+        assert!(p.iter().any(|p| p.contains("/use/secrets") && p.contains("resolver")), "{p:?}");
+        let p = problems(
+            "do: [ { a: { set: { x: 1 }, input: { schema: { format: json, resource: { endpoint: 'https://x/s.json' } } } } } ]\n",
+            &[],
+        );
+        assert!(p.iter().any(|p| p.contains("resource resolver")), "{p:?}");
+        // A schedule is part of the definition.
+        assert!(problems("schedule: { cron: '0 * * * *' }\ndo: [ { a: { set: { x: 1 } } } ]\n", &[]).is_empty());
+        let p = problems("schedule: { cron: 'every day' }\ndo: [ { a: { set: { x: 1 } } } ]\n", &[]);
+        assert!(p.iter().any(|p| p.contains("/schedule/cron")), "{p:?}");
+        // Authentication and catalogs are not the core's.
+        let p =
+            problems("use: { catalogs: { c: { endpoint: 'https://x' } } }\ndo: [ { a: { set: { x: 1 } } } ]\n", &[]);
+        assert!(p.iter().any(|p| p.contains("/use/catalogs") && p.contains("not supported")), "{p:?}");
         let p = problems("do: [ { a: { set: { x: 1 }, color: red } } ]\n", &[]);
         assert!(p.iter().any(|p| p.contains("/do/0/a/color") && p.contains("unknown property")), "{p:?}");
         let p = problems("do: [ { a: { frobnicate: 1 } } ]\n", &[]);
         assert!(p.iter().any(|p| p.contains("unknown task")), "{p:?}");
-        let p = problems("use: { secrets: [ token ] }\ndo: [ { a: { set: { x: 1 } } } ]\n", &[]);
-        assert!(p.iter().any(|p| p.contains("/use/secrets")), "{p:?}");
+    }
+
+    struct Everything;
+    impl Catalog for Everything {
+        fn has(&self, _: &str) -> bool {
+            true
+        }
+        fn events(&self) -> bool {
+            true
+        }
+        fn emits(&self) -> bool {
+            true
+        }
+        fn children(&self) -> bool {
+            true
+        }
+        fn processes(&self, _: &str) -> bool {
+            true
+        }
+        fn secrets(&self) -> bool {
+            true
+        }
+        fn resources(&self) -> bool {
+            true
+        }
+    }
+
+    fn checked(body: &str) -> Vec<String> {
+        match wf(body) {
+            Err(Invalid(p)) => p.iter().map(|p| p.to_string()).collect(),
+            Ok(w) => validate(&w, &Everything)
+                .err()
+                .map(|Invalid(p)| p.iter().map(|p| p.to_string()).collect())
+                .unwrap_or_default(),
+        }
+    }
+
+    #[test]
+    fn secrets_only_in_input_from_and_only_declared_ones() {
+        let ok = "use: { secrets: [ api ] }\ndo: [ { a: { input: { from: '${ { key: $secrets.api.key } }' }, call: f, with: { k: '${ .key }' } } } ]\n";
+        assert!(checked(ok).is_empty(), "{:?}", checked(ok));
+        let p = checked("use: { secrets: [ api ] }\ndo: [ { a: { call: f, with: { k: '${ $secrets.api }' } } } ]\n");
+        assert!(p[0].contains("only available in `input.from`"), "{p:?}");
+        let p = checked(
+            "use: { secrets: [ api ] }\ninput: { from: '${ $secrets.other }' }\ndo: [ { a: { set: { x: 1 } } } ]\n",
+        );
+        assert!(p[0].contains("`other` is not declared"), "{p:?}");
+        let p = checked("do: [ { a: { set: { x: '${ $authorization.parameter }' } } } ]\n");
+        assert!(p[0].contains("$authorization"), "{p:?}");
+        assert_eq!(secret_names("$secrets.a + $secrets[\"b\"]"), Some(vec!["a".to_string(), "b".into()]));
+        assert_eq!(secret_names("$secrets | keys"), None);
+    }
+
+    #[test]
+    fn listen_emit_run_extensions_and_schedules_parse() {
+        let w = wf(r#"
+schedule: { on: { all: [ { with: { type: a }, correlate: { k: { from: .k } } }, { with: { type: b } } ] }, read: envelope }
+use:
+  extensions:
+    - log: { extend: call, when: '$task.call == "f"', before: [ { b: { set: { x: 1 } } } ] }
+do:
+  - l:
+      listen: { to: { any: [ { with: { type: a, data: '${ .n > 1 }' } } ], until: '${ length > 2 }' }, read: envelope }
+      foreach: { item: e, do: [ { s: { set: '${ $e }' } } ], output: { as: '${ . }' } }
+  - e: { emit: { event: { with: { type: done, source: 'https://x', data: '${ . }' } } } }
+  - r: { run: { workflow: { namespace: t, name: child, version: '1.0.0', input: { n: '${ .n }' } }, await: false } }
+  - c: { run: { container: { image: x }, return: all } }
+"#)
+        .unwrap();
+        let s = w.schedule.as_ref().unwrap();
+        assert!(matches!(&s.on, Some(Strategy::All(f)) if f.len() == 2 && f[0].correlate.len() == 1));
+        assert_eq!(s.read, Read::Envelope);
+        assert_eq!(w.uses.extensions[0].1.extend, "call");
+        let kinds: Vec<&str> = w.tasks.iter().map(|(_, t)| t.kind.name()).collect();
+        assert_eq!(kinds, ["listen", "emit", "run", "run"]);
+        let Kind::Listen(l) = &w.tasks[0].1.kind else { panic!() };
+        assert!(matches!(&l.to, Strategy::Any { until: Some(Until::Condition(c)), .. } if c == "length > 2"));
+        assert_eq!(l.foreach.as_ref().map(|f| f.item.as_str()), Some("e"));
+        let Kind::Run(r) = &w.tasks[3].1.kind else { panic!() };
+        assert!(
+            matches!(&r.process, Process::External { kind, .. } if kind == "container") && r.return_ == Return::All
+        );
+        assert!(validate(&w, &Everything).is_ok(), "{:?}", validate(&w, &Everything).err().map(|e| e.to_string()));
+        for (body, expected) in [
+            (
+                "do: [ { a: { listen: { to: { one: { with: { type: x } }, until: '${ true }' } } } } ]\n",
+                "until applies",
+            ),
+            ("do: [ { a: { emit: { event: { with: { source: s } } } } } ]\n", "needs a `type`"),
+            ("do: [ { a: { run: { shell: { command: ls }, script: { code: x } } } } ]\n", "exactly one"),
+            ("schedule: { read: data }\ndo: [ { a: { set: { x: 1 } } } ]\n", "read applies"),
+            (
+                "use: { extensions: [ { x: { extend: nothing } } ] }\ndo: [ { a: { set: { x: 1 } } } ]\n",
+                "expected one of",
+            ),
+        ] {
+            let p = checked(body);
+            assert!(p.iter().any(|p| p.contains(expected)), "{body}: {p:?}");
+        }
     }
 
     #[test]
@@ -1433,9 +2181,12 @@ do:
                 .iter()
                 .any(|p| p.contains("use.timeouts"))
         );
-        let p =
-            problems("do: [ { t: { try: [], catch: { retry: { limit: { attempt: { duration: PT1S } } } } } } ]\n", &[]);
-        assert!(p.iter().any(|p| p.contains("/limit/attempt/duration") && p.contains("not supported")), "{p:?}");
+        let w =
+            wf("do: [ { t: { try: [], catch: { retry: { limit: { attempt: { duration: PT1S } } } } } } ]\n").unwrap();
+        let Kind::Try { catch, .. } = &w.tasks[0].1.kind else { panic!() };
+        assert!(
+            matches!(catch.retry.as_ref().and_then(|r| r.attempt_duration.clone()), Some(DurationSpec::Fixed(d)) if d.as_secs() == 1)
+        );
     }
 
     #[test]

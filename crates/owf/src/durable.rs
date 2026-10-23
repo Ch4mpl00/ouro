@@ -105,6 +105,19 @@
 //!     Each loop iteration has a distinct event key. Registration is idempotent;
 //!     terminal runs cannot receive events. A host must preserve a delivery's
 //!     wake-up when the executor concurrently releases its worker as waiting.
+//! 18. A listen consuming several events takes each under its own key
+//!     (`<task>#event[i]`) and replays them in order through a pure
+//!     consumer, so its decisions, output and `foreach` iterations recover.
+//!     Its subscription stays open from the first take to the end, so an
+//!     event published between two takes is queued, not lost; publishing is
+//!     idempotent per `source` + `id`. An emitted event is saved with its
+//!     generated `id` before it is handed over and re-emitted unchanged.
+//! 19. A child run is admitted and linked atomically with the parent's
+//!     ownership; its outcome reaches the parent as an event the parent
+//!     takes at `<task>#child`. Recovery joins the same child (its id is
+//!     the parent's and the invocation's) and never starts another.
+//! 20. Secret values are never persisted: records hold markers restored on
+//!     load from the values resolved for this execution.
 use crate::{
     model::Flow,
     run::{Effect, WorkflowError},
@@ -113,7 +126,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
 
-pub const VERSION: u32 = 1;
+/// 2: a listen keeps every consumed event (`#event[i]`), child runs are
+/// joined at `#child`, attempts may have a deadline (`#attempt[k]`).
+pub const VERSION: u32 = 2;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

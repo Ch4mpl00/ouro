@@ -13,6 +13,10 @@ struct StoredRun {
     awaits: BTreeMap<String, i64>,
     listeners: BTreeMap<String, Vec<String>>,
     events: Vec<StoredEvent>,
+    #[serde(default)]
+    subscriptions: BTreeMap<String, Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    rearm: Option<Rearm>,
 }
 
 fn key(kind: &str, id: &str) -> Key {
@@ -73,6 +77,10 @@ fn indexes(s: &StoredRun) -> Rows {
             if !s.events.iter().any(|e| e.type_ == *t && e.consumed_key.is_none()) {
                 keys.insert(key(&partition("wait", t), &timed(*at, id)), value.clone());
             }
+        }
+        // A publish reads only the runs subscribed to its type (or to `*`).
+        for t in s.subscriptions.values().flatten() {
+            keys.insert(key(&partition("subs", t), id), value.clone());
         }
     } else if !s.records.is_empty() || !s.events.is_empty() {
         keys.insert(key("finished", &timed(s.run.ended_ms.unwrap(), id)), value);
@@ -156,6 +164,8 @@ fn insert(rows: &mut dyn Transaction, admission: &Admission, now: i64) -> anyhow
             awaits: BTreeMap::new(),
             listeners: BTreeMap::new(),
             events: Vec::new(),
+            subscriptions: BTreeMap::new(),
+            rearm: None,
         },
     )?;
     Ok(true)
@@ -168,6 +178,9 @@ fn close(snapshot: &mut StoredRun, types: &[String]) {
     }
 }
 fn envelope(event: &StoredEvent) -> anyhow::Result<Value> {
+    if let Some(envelope) = &event.envelope {
+        return Ok(envelope.clone());
+    }
     Ok(
         json!({"type":event.type_, "data":event.data, "time":chrono::DateTime::from_timestamp_millis(event.delivered_at_ms).ok_or_else(|| anyhow::anyhow!("invalid event timestamp"))?.to_rfc3339()}),
     )
@@ -191,10 +204,111 @@ fn deliver(
     let Some(mut snapshot) = candidate else {
         return Ok(None);
     };
-    snapshot.events.push(StoredEvent { type_: t.into(), data: data.clone(), delivered_at_ms: now, consumed_key: None });
+    snapshot.events.push(StoredEvent {
+        type_: t.into(),
+        data: data.clone(),
+        delivered_at_ms: now,
+        consumed_key: None,
+        envelope: None,
+    });
     snapshot.run.wake_at_ms = now;
     store_run(rows, &snapshot)?;
     Ok(Some(snapshot.run.admission.id))
+}
+/// Whether a pending event may be taken by `types` (`*` takes published ones).
+fn takes(types: &[String], event: &StoredEvent) -> bool {
+    types.contains(&event.type_) || (event.envelope.is_some() && types.iter().any(|t| t == "*"))
+}
+fn subscribed(snapshot: &StoredRun, event: &StoredEvent) -> bool {
+    event.envelope.is_some() && snapshot.subscriptions.values().any(|types| takes(types, event))
+}
+fn same_event(a: &Value, b: &Value) -> bool {
+    a.get("id").is_some() && a.get("id") == b.get("id") && a.get("source") == b.get("source")
+}
+/// Reads only the runs indexed under the event's type and `*` (or the
+/// target): bounded by the subscribers, never by the runs stored.
+fn publish(rows: &mut dyn Transaction, event: &Value, target: Option<&str>, now: i64) -> anyhow::Result<Vec<String>> {
+    let t = event
+        .get("type")
+        .and_then(Value::as_str)
+        .filter(|t| !t.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("a published event needs a type"))?;
+    let stored = StoredEvent {
+        type_: t.into(),
+        data: event.get("data").cloned().unwrap_or(Value::Null),
+        delivered_at_ms: now,
+        consumed_key: None,
+        envelope: Some(event.clone()),
+    };
+    let candidates = match target {
+        Some(id) => get::<StoredRun>(rows, "run", id)?.into_iter().collect(),
+        None => {
+            let mut runs = indexed_runs(rows, &partition("subs", t), "", None, usize::MAX)?;
+            for s in indexed_runs(rows, &partition("subs", "*"), "", None, usize::MAX)? {
+                if !runs.iter().any(|r| r.run.admission.id == s.run.admission.id) {
+                    runs.push(s);
+                }
+            }
+            runs.sort_by(|a, b| a.run.admission.id.cmp(&b.run.admission.id));
+            runs
+        }
+    };
+    let mut receivers = Vec::new();
+    for mut snapshot in candidates {
+        let eligible = snapshot.run.ended_ms.is_none()
+            && (target.is_some() || subscribed(&snapshot, &stored))
+            && !snapshot.events.iter().any(|e| e.envelope.as_ref().is_some_and(|e| same_event(e, event)));
+        if eligible {
+            snapshot.events.push(stored.clone());
+            snapshot.run.wake_at_ms = now;
+            receivers.push(snapshot.run.admission.id.clone());
+            store_run(rows, &snapshot)?;
+        }
+    }
+    Ok(receivers)
+}
+fn trigger_indexes(key_: &str, t: &Trigger) -> Rows {
+    let mut keys = Rows::new();
+    if let Some(at) = t.at_ms {
+        keys.insert(key("trigger_due", &timed(at, key_)), json!(key_));
+    }
+    for ty in &t.types {
+        keys.insert(key(&partition("trigger_type", ty), key_), json!(key_));
+    }
+    keys
+}
+/// Writes a trigger and moves its index keys, like `store_run`.
+fn store_trigger(
+    rows: &mut dyn Transaction,
+    key_: &str,
+    before: Option<&Trigger>,
+    after: Option<&Trigger>,
+) -> anyhow::Result<()> {
+    let old = before.map(|t| trigger_indexes(key_, t)).unwrap_or_default();
+    let new = after.map(|t| trigger_indexes(key_, t)).unwrap_or_default();
+    for ((kind, id), value) in crate::backend::changes(&old, &new) {
+        if let Some(value) = value {
+            rows.put(kind, id, value)?;
+        } else {
+            rows.delete(kind, id)?;
+        }
+    }
+    match after {
+        Some(t) => put(rows, "trigger", key_, t),
+        None => rows.delete("trigger", key_),
+    }
+}
+fn indexed_triggers(rows: &mut dyn Transaction, keys: Rows) -> anyhow::Result<Vec<(String, Trigger)>> {
+    let mut out: Vec<(String, Trigger)> = Vec::new();
+    for value in keys.into_values() {
+        let k = value.as_str().ok_or_else(|| anyhow::anyhow!("invalid trigger index"))?.to_owned();
+        if out.iter().any(|(o, _)| *o == k) {
+            continue;
+        }
+        let t = get(rows, "trigger", &k)?.ok_or_else(|| anyhow::anyhow!("dangling trigger index {k}"))?;
+        out.push((k, t));
+    }
+    Ok(out)
 }
 fn lifecycle(rows: &mut dyn Transaction, id: &str, status: &Status, now: i64) -> anyhow::Result<()> {
     let Some(link) = run(rows, id)?.run.child else {
@@ -227,7 +341,15 @@ fn terminate(rows: &mut dyn Transaction, id: &str, status: &Status, now: i64) ->
     snapshot.run.lease_until_ms = None;
     snapshot.awaits.clear();
     snapshot.listeners.clear();
+    snapshot.subscriptions.clear();
     store_run(rows, &snapshot)?;
+    if let Some(rearm) = &snapshot.rearm
+        && let Some(t) = get::<Trigger>(rows, "trigger", &rearm.trigger)?
+        && t.at_ms.is_none()
+    {
+        let due = Trigger { at_ms: Some(now.saturating_add(rearm.delay_ms)), ..t.clone() };
+        store_trigger(rows, &rearm.trigger, Some(&t), Some(&due))?;
+    }
     // Iterative cascade avoids stack growth on arbitrarily nested child runs.
     let mut parents = vec![id.to_string()];
     while let Some(parent) = parents.pop() {
@@ -239,6 +361,7 @@ fn terminate(rows: &mut dyn Transaction, id: &str, status: &Status, now: i64) ->
             child.run.lease_until_ms = None;
             child.awaits.clear();
             child.listeners.clear();
+            child.subscriptions.clear();
             parents.push(child.run.admission.id.clone());
             store_run(rows, &child)?;
             lifecycle(rows, &child.run.admission.id, &Status::Cancelled, now)?;
@@ -349,7 +472,7 @@ impl RunStore for TransactionalStore {
                 };
                 return Ok(Some(event.clone()));
             }
-            let candidate = s.events.iter().position(|e| e.consumed_key.is_none() && types.contains(&e.type_));
+            let candidate = s.events.iter().position(|e| e.consumed_key.is_none() && takes(types, e));
             let result = if let Some(i) = candidate {
                 let event = envelope(&s.events[i])?;
                 s.events[i].consumed_key = Some(k.into());
@@ -368,6 +491,65 @@ impl RunStore for TransactionalStore {
             Ok(result)
         })
     }
+    fn subscribe(&self, f: &Fence, k: &str, types: &[String], now: i64) -> anyhow::Result<()> {
+        self.update(|rows| {
+            let mut s = checked(rows, f, now)?;
+            s.subscriptions.insert(k.into(), types.to_vec());
+            store_run(rows, &s)
+        })
+    }
+    fn unsubscribe(&self, f: &Fence, k: &str, now: i64) -> anyhow::Result<()> {
+        self.update(|rows| {
+            let mut s = checked(rows, f, now)?;
+            s.subscriptions.remove(k);
+            store_run(rows, &s)
+        })
+    }
+    fn publish(&self, event: &Value, target: Option<&str>, now: i64) -> anyhow::Result<Vec<String>> {
+        self.update(|rows| publish(rows, event, target, now))
+    }
+    fn trigger(&self, key: &str) -> anyhow::Result<Option<Trigger>> {
+        self.update(|rows| get(rows, "trigger", key))
+    }
+    fn due_triggers(&self, now: i64, limit: usize) -> anyhow::Result<Vec<(String, Trigger)>> {
+        self.update(|rows| {
+            let keys = rows.scan("trigger_due", "", Some(&format!("{};", time_key(now))), limit)?;
+            indexed_triggers(rows, keys)
+        })
+    }
+    fn triggers_for(&self, t: &str, limit: usize) -> anyhow::Result<Vec<(String, Trigger)>> {
+        self.update(|rows| {
+            let mut keys = rows.scan(&partition("trigger_type", t), "", None, limit)?;
+            if t != "*" && keys.len() < limit {
+                keys.extend(rows.scan(&partition("trigger_type", "*"), "", None, limit - keys.len())?);
+            }
+            indexed_triggers(rows, keys)
+        })
+    }
+    fn swap_trigger(
+        &self,
+        key: &str,
+        expected: Option<&Trigger>,
+        next: Option<&Trigger>,
+        admit: &[Admission],
+        rearm: Option<&Rearm>,
+        now: i64,
+    ) -> anyhow::Result<bool> {
+        self.update(|rows| {
+            if get::<Trigger>(rows, "trigger", key)?.as_ref() != expected {
+                return Ok(false);
+            }
+            store_trigger(rows, key, expected, next)?;
+            for a in admit {
+                if insert(rows, a, now)? && rearm.is_some() {
+                    let mut s = run(rows, &a.id)?;
+                    s.rearm = rearm.cloned();
+                    store_run(rows, &s)?;
+                }
+            }
+            Ok(true)
+        })
+    }
     fn finish(&self, f: &Fence, outcome: &Status, now: i64, threshold: u32) -> anyhow::Result<Status> {
         self.update(|rows| {
             let mut s = checked(rows, f, now)?;
@@ -377,7 +559,10 @@ impl RunStore for TransactionalStore {
                     s.run.state = RunState::Waiting;
                     s.run.interruptions = 0;
                     s.run.wake_at_ms = *wake_at_ms;
-                    if s.events.iter().any(|e| e.consumed_key.is_none() && s.awaits.contains_key(&e.type_)) {
+                    if s.events
+                        .iter()
+                        .any(|e| e.consumed_key.is_none() && (s.awaits.contains_key(&e.type_) || subscribed(&s, e)))
+                    {
                         s.run.wake_at_ms = now;
                     }
                 }

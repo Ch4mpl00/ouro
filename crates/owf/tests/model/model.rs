@@ -279,8 +279,8 @@ impl Machine<'_> {
             Body::Raise(status) => {
                 Err(Stop::Error(Error { type_: RAISED.into(), status: *status, instance: Some(reference.into()) }))
             }
-            Body::Fork { .. } | Body::Wait(_) => {
-                panic!("fork and wait are outside the model's profile")
+            Body::Fork { .. } | Body::Wait(_) | Body::Emit(_) => {
+                panic!("fork, wait and emit are outside the model's profile")
             }
         }
     }

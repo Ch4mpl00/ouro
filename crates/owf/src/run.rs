@@ -1,17 +1,23 @@
-// The interpreter: 1. the host's seams (functions, observer, clock) and the
-// outcome; 2. errors (Problem Details with the standard types); 3. the run
-// (data flow, flow directives, limits); 4. task kinds; 5. try, retries and
-// durations.
+// The interpreter: 1. the host's seams (functions, events, children,
+// secrets, resources, observer, clock) and the outcome; 2. errors (Problem
+// Details with the standard types); 3. the run (data flow, flow directives,
+// extensions, limits); 4. task kinds; 5. events: listen and emit; 6. child
+// workflows and processes; 7. try, retries and durations.
 //
 // Each step is reported to the observer under its task reference
 // (`/do/1/fetch/try/0/get`), so a trace names exactly which part of the
-// definition ran. Only `call` reaches the host; everything else is evaluated
-// here.
+// definition ran. Calls, processes, emitted events, child runs, secrets and
+// external schemas reach the host through its seams; the DSL's semantics
+// (flow, data, errors, retries, timers, event matching and consumption,
+// extensions) are evaluated here.
 use crate::durable::{self, CallFailure, CallState, Delivery, Journal, Record, StepOutcome, TaskResult};
+use crate::events::{self, Offer};
 use crate::expr::{self, Args};
 use crate::model::{
-    self, Backoff, Catalog, Catch, DurationSpec, Flow, Invalid, Items, Kind, Raise, Retry, Task, TaskList, Workflow,
+    self, Backoff, Catalog, Catch, DurationSpec, Extension, Flow, Foreach, Invalid, Items, Kind, Listen, Process,
+    Raise, Retry, Return, RunTask, Schema, Strategy, Task, TaskList, Until, Workflow,
 };
+use crate::secrets::Redaction;
 use async_trait::async_trait;
 use chrono::{DateTime, SecondsFormat, Utc};
 use futures::future::{BoxFuture, try_join_all};
@@ -43,14 +49,57 @@ pub struct CallInfo<'a> {
     pub attempt: u32,
     pub cancel: &'a CancellationToken,
     pub delivery: Delivery,
+    /// The task's transformed input, for a function that resolves templates
+    /// against it (an HTTP endpoint's `{petId}`).
+    pub input: &'a Value,
+    /// Hides the run's secrets in what the host reports about the call
+    /// (a span's error); the call itself gets the real values.
+    pub secrets: &'a Redaction,
 }
 
-/// The user functions `call` reaches.
+/// The user functions `call` reaches, and the host's other seams. Each
+/// optional seam an absent host lacks makes validation reject the
+/// constructs that need it.
 #[async_trait]
 pub trait Functions: Send + Sync {
-    /// Optional event adapter; absent hosts reject event waits at validation.
+    /// Durable event delivery for `listen`.
     fn events(&self) -> Option<&dyn Events> {
         None
+    }
+    /// Child runs for `run: workflow`.
+    fn children(&self) -> Option<&dyn Children> {
+        None
+    }
+    /// Secret values for `use.secrets`.
+    fn secrets(&self) -> Option<&dyn crate::secrets::Secrets> {
+        None
+    }
+    /// External schemas (`schema.resource`).
+    fn resources(&self) -> Option<&dyn Resources> {
+        None
+    }
+    /// Whether `emit` publishes through this host.
+    fn emits(&self) -> bool {
+        false
+    }
+    /// Publishes an emitted event (its full CloudEvents envelope). Called
+    /// again with the same envelope (`id`) when recovery cannot tell whether
+    /// the first attempt got through, so receivers deduplicate by
+    /// `source` + `id`.
+    async fn emit(&self, _event: &Value, _info: &CallInfo<'_>) -> Result<(), CallFailure> {
+        Err(CallFailure::NotExecuted(WorkflowError::runtime("emitting events is not supported by this host")))
+    }
+    /// The effect of `run: <kind>` (`container`, `script`, `shell`) here;
+    /// `None`: this host has no runner for it.
+    fn process(&self, _kind: &str) -> Option<Effect> {
+        None
+    }
+    /// Runs a process: `definition` is the rendered `run.<kind>` with
+    /// `await` added. The result is a process result `{ code, stdout,
+    /// stderr }`; a process that is not awaited may return anything.
+    /// Recorded and delivered like a call to a function of its effect.
+    async fn run_process(&self, kind: &str, _definition: Value, _info: &CallInfo<'_>) -> Result<Value, CallFailure> {
+        Err(CallFailure::NotExecuted(WorkflowError::runtime(format!("no process runner for `{kind}`"))))
     }
 
     /// The function's effect class; `None` when the host has no such function.
@@ -174,7 +223,17 @@ impl Drop for TaskSpan<'_> {
 /// AND saves `Record::Event` at `key` in this run's journal. It must fence the
 /// executor just like Journal::save. Repeating a take returns the saved event.
 /// Registration is idempotent, including registration before a question is sent.
+/// A type `*` in `take` and `subscribe` stands for every published event.
 pub trait Events: Send + Sync {
+    /// Opens (idempotently) a subscription under `key` that keeps receiving
+    /// published events of `types` until `unsubscribe`, across takes, so a
+    /// listen consuming several events misses none in between.
+    fn subscribe(&self, run_id: &str, _key: &str, types: &[String]) -> anyhow::Result<()> {
+        self.register(run_id, types)
+    }
+    fn unsubscribe(&self, _run_id: &str, _key: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
     /// Subscribe before taking, so a delivery between take and wait is not lost.
     /// Hosts without in-memory notifications still support zero-hold listens.
     fn notification(&self, _run_id: &str) -> BoxFuture<'_, ()> {
@@ -185,6 +244,43 @@ pub trait Events: Send + Sync {
     /// matching listen, but cannot keep an unrelated wait awake.
     fn unregister(&self, run_id: &str, key: &str, types: &[String]) -> anyhow::Result<()>;
     fn take(&self, run_id: &str, key: &str, types: &[String]) -> anyhow::Result<Option<Value>>;
+}
+
+/// Child runs for `run: workflow`.
+pub trait Children: Send + Sync {
+    /// Starts, or with the same `key` joins, a run of the target workflow and
+    /// returns its id and the event type that carries its outcome, with
+    /// `data` `{ status: completed, output } | { status: faulted, error } |
+    /// { status: cancelled }`, delivered to this run through `Events`. An
+    /// owned child commits atomically with the parent's ownership and its
+    /// subscription to that event; `owned: false` starts an independent run
+    /// that nothing awaits. `NotExecuted`/`Response` are catchable (no such
+    /// workflow); `Interrupted`/`Unknown` stop the run recoverably.
+    fn start(
+        &self,
+        run_id: &str,
+        key: &str,
+        target: &ChildTarget<'_>,
+        input: &Value,
+        owned: bool,
+    ) -> Result<Child, CallFailure>;
+}
+
+/// `run.workflow`'s reference: the version is a semantic version or `latest`.
+pub struct ChildTarget<'a> {
+    pub namespace: &'a str,
+    pub name: &'a str,
+    pub version: &'a str,
+}
+
+pub struct Child {
+    pub id: String,
+    pub done: String,
+}
+
+/// External resources: JSON Schemas named by `schema.resource`.
+pub trait Resources: Send + Sync {
+    fn schema(&self, uri: &str) -> anyhow::Result<Value>;
 }
 
 pub trait Clock: Send + Sync {
@@ -264,6 +360,21 @@ pub fn validate(wf: &Workflow, functions: &dyn Functions) -> Result<(), Invalid>
         fn events(&self) -> bool {
             self.0.events().is_some()
         }
+        fn emits(&self) -> bool {
+            self.0.emits()
+        }
+        fn children(&self) -> bool {
+            self.0.children().is_some() && self.0.events().is_some()
+        }
+        fn processes(&self, kind: &str) -> bool {
+            self.0.process(kind).is_some()
+        }
+        fn secrets(&self) -> bool {
+            self.0.secrets().is_some()
+        }
+        fn resources(&self) -> bool {
+            self.0.resources().is_some()
+        }
     }
     model::validate(wf, &Known(functions))
 }
@@ -316,6 +427,22 @@ impl WorkflowError {
     /// Whether this is the standard error `kind` (`"timeout"`, …).
     pub fn is(&self, kind: &str) -> bool {
         self.type_.strip_prefix(STANDARD_ERRORS) == Some(kind)
+    }
+    /// Whether a `catch.errors.with.type` names this error's type. CHOICE: a
+    /// standard error also answers to its kind under the namespaces the DSL
+    /// has used: the deprecated `https://serverlessworkflow.io/spec/1.0.0/errors/`
+    /// and `https://open-workflow-specification.org/dsl/errors/types/`
+    /// (the conformance kit's), so portable definitions catch it either way.
+    pub fn has_type(&self, filter: &str) -> bool {
+        filter == self.type_
+            || self.type_.strip_prefix(STANDARD_ERRORS).is_some_and(|kind| {
+                [
+                    "https://serverlessworkflow.io/spec/1.0.0/errors/",
+                    "https://open-workflow-specification.org/dsl/errors/types/",
+                ]
+                .iter()
+                .any(|ns| filter.strip_prefix(ns) == Some(kind))
+            })
     }
     fn to_value(&self) -> Value {
         serde_json::to_value(self).unwrap_or(Value::Null)
@@ -377,18 +504,34 @@ fn conform(schema: &Value, value: &Value, what: &str) -> Result<(), Fault> {
 /// and index, `catch.as`); a later entry shadows an earlier one.
 type Scope = Vec<(String, Value)>;
 
-/// How a task list finished: on its own (or `exit`), or by `then: end`,
-/// which ends the whole workflow.
+/// How a task list finished: on its own, by `then: exit` (which only an
+/// extension's `before` list tells apart: it skips the extended task), or by
+/// `then: end`, which ends the whole workflow.
 enum Next {
     Done(Value),
+    Exit(Value),
     End(Value),
 }
 
 fn ended(next: Next) -> (Value, Option<Flow>) {
     match next {
-        Next::Done(v) => (v, None),
+        Next::Done(v) | Next::Exit(v) => (v, None),
         Next::End(v) => (v, Some(Flow::End)),
     }
+}
+
+/// Where a run waits forever for a delivery (the end of 9999, in ms).
+const NO_DEADLINE: i64 = 253_402_300_799_000;
+
+/// A reference segment that marks a task of an extension's `before` or
+/// `after` list; those tasks are not extended themselves.
+const EXTENSION_TASKS: &str = "/use/extensions/";
+
+/// The effect a call record names: a function, or a process run.
+#[derive(Clone, Copy)]
+enum Target<'a> {
+    Function(&'a str),
+    Process(&'a str),
 }
 
 fn datetime(t: DateTime<Utc>) -> Value {
@@ -424,15 +567,31 @@ async fn execute(
     cancel: &CancellationToken,
     journal: Option<&dyn Journal>,
 ) -> Outcome {
-    let records = match journal.map(Journal::load).transpose() {
-        Ok(records) => records.unwrap_or_default(),
-        Err(e) => {
-            return Outcome {
-                status: Status::Interrupted(WorkflowError::runtime(e.to_string())),
-                effects_started: true,
-                tasks_run: 0,
-            };
-        }
+    let interrupted = |e: String| Outcome {
+        status: Status::Interrupted(WorkflowError::runtime(e)),
+        effects_started: true,
+        tasks_run: 0,
+    };
+    // Secrets resolve again on every start, before anything is loaded: the
+    // saved records hold markers, which loading turns back into values.
+    let secrets = match (wf.uses.secrets.is_empty(), host.functions.secrets()) {
+        (true, _) => Redaction::default(),
+        (false, Some(store)) => match Redaction::resolve(&wf.uses.secrets, store) {
+            Ok(r) => r,
+            Err(e) => return interrupted(format!("resolving secrets: {e}")),
+        },
+        (false, None) => return interrupted("this host has no secret resolver".into()),
+    };
+    let loaded = journal.map(Journal::load).transpose().map_err(|e| e.to_string()).and_then(|records| {
+        records
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(k, r)| Ok((k, secrets.restore(r)?)))
+            .collect::<Result<BTreeMap<_, _>, String>>()
+    });
+    let records = match loaded {
+        Ok(records) => records,
+        Err(e) => return interrupted(secrets.text(&e)),
     };
     let tasks = records.values().filter(|r| matches!(r, Record::Task { .. })).count();
     let writes = records.values().filter(|r| matches!(r, Record::Call { effect: Effect::Write, .. })).count();
@@ -490,8 +649,8 @@ async fn execute(
         Record::Task { .. } => key.ends_with("#task"),
         Record::Call { .. } => key.ends_with("#call"),
         Record::Winner { .. } => key.ends_with("#winner"),
-        Record::Event { .. } => key.ends_with("#event"),
-        Record::Timer { .. } => key.ends_with("#wait") || key.contains("#retry["),
+        Record::Event { .. } => key.contains("#event[") || key.ends_with("#child"),
+        Record::Timer { .. } => key.ends_with("#wait") || key.contains("#retry[") || key.contains("#attempt["),
         Record::Retry { .. } => key.contains("#retry-decision["),
     }) {
         return Outcome {
@@ -524,9 +683,10 @@ async fn execute(
         journal,
         records: Mutex::new(records),
         attempts: Mutex::default(),
+        secrets,
     };
     if let Some(Record::Finished { status }) = run.record("finished") {
-        return Outcome { status, effects_started: writes > 0, tasks_run: tasks };
+        return Outcome { status: run.secrets.status(&status), effects_started: writes > 0, tasks_run: tasks };
     }
     let result = async {
         if run.record("execution").is_none() {
@@ -586,7 +746,7 @@ async fn execute(
         status = Status::Interrupted(error);
     }
     Outcome {
-        status,
+        status: run.secrets.status(&status),
         effects_started: run.writes.load(Ordering::SeqCst) > 0,
         tasks_run: run.tasks_run.load(Ordering::SeqCst),
     }
@@ -607,6 +767,8 @@ struct Run<'a> {
     records: Mutex<BTreeMap<String, Record>>,
     /// Attempt prefixes of the `try`s running now: `<task>/try[k]` → `<task>/try`.
     attempts: Mutex<Vec<(String, String, u32)>>,
+    /// The declared secrets; what is persisted or reported is redacted.
+    secrets: Redaction,
 }
 
 impl Run<'_> {
@@ -620,9 +782,12 @@ impl Run<'_> {
                 durable::check_transition(&old, &record)
                     .map_err(|e| Fault::Interrupted(WorkflowError::runtime(e.to_string())))?;
             }
-            journal
-                .save(key, &record)
-                .map_err(|e| Fault::Interrupted(WorkflowError::runtime(format!("checkpoint {key}: {e}"))))?;
+            journal.save(key, &self.secrets.record(&record)).map_err(|e| {
+                Fault::Interrupted(WorkflowError::runtime(format!(
+                    "checkpoint {key}: {}",
+                    self.secrets.text(&e.to_string())
+                )))
+            })?;
             self.records.lock().unwrap_or_else(|e| e.into_inner()).insert(key.to_owned(), record);
         }
         Ok(())
@@ -749,7 +914,66 @@ impl Run<'_> {
     }
 
     fn observe(&self, event: Event<'_>) {
-        self.host.observer.event(&event);
+        if !self.secrets.active() {
+            return self.host.observer.event(&event);
+        }
+        let observer = &self.host.observer;
+        match event {
+            Event::TaskStarted { reference, parent, kind, input } => {
+                let input = self.secrets.value(input);
+                observer.event(&Event::TaskStarted { reference, parent, kind, input: &input })
+            }
+            Event::TaskCompleted { reference, output } => {
+                let output = self.secrets.value(output);
+                observer.event(&Event::TaskCompleted { reference, output: &output })
+            }
+            Event::TaskFaulted { reference, error } => {
+                let error = self.secrets.error(error);
+                observer.event(&Event::TaskFaulted { reference, error: &error })
+            }
+            Event::TaskRetrying { reference, attempt, delay, error } => {
+                let error = self.secrets.error(error);
+                observer.event(&Event::TaskRetrying { reference, attempt, delay, error: &error })
+            }
+            other => observer.event(&other),
+        }
+    }
+
+    /// Arguments for an `input.from`, the only expression that sees
+    /// `$secrets`; only the secrets it names are required to exist.
+    fn input_args(&self, mut args: Args, t: &Value) -> Result<Args, Fault> {
+        let mut codes = Vec::new();
+        match t {
+            Value::String(code) => codes.push(code.clone()),
+            template => expr::template_exprs(template, &mut codes),
+        }
+        let value = if codes.iter().any(|c| c.contains("$secrets")) {
+            let names: Option<Vec<String>> =
+                codes.iter().map(|c| model::secret_names(c)).collect::<Option<Vec<_>>>().map(|n| n.concat());
+            self.secrets.argument(names.as_deref())?
+        } else {
+            Value::Null
+        };
+        args.set(model::SECRETS, value);
+        Ok(args)
+    }
+
+    /// Validates against an inline or a host-resolved schema.
+    fn conform(&self, schema: &Schema, value: &Value, what: &str) -> Result<(), Fault> {
+        match schema {
+            Schema::Document(d) => conform(d, value, what),
+            Schema::Resource(uri) => {
+                let resources = self
+                    .host
+                    .functions
+                    .resources()
+                    .ok_or_else(|| WorkflowError::validation(format!("no resource resolver for `{uri}`")))?;
+                let document = resources
+                    .schema(uri)
+                    .map_err(|e| Fault::Interrupted(WorkflowError::runtime(format!("schema `{uri}`: {e}"))))?;
+                conform(&document, value, what)
+            }
+        }
     }
 
     /// The runtime arguments, then the scope's variables. Arguments an
@@ -782,10 +1006,10 @@ impl Run<'_> {
         let null = Value::Null;
         let none = Scope::new();
         if let Some(s) = self.wf.input.as_ref().and_then(|i| i.schema.as_ref()) {
-            conform(s, &raw, "the workflow input")?;
+            self.conform(s, &raw, "the workflow input")?;
         }
         let input = match self.wf.input.as_ref().and_then(|i| i.from.as_ref()) {
-            Some(t) => self.transform(t, &raw, &self.args(&null, &null, &null, &null, &none))?,
+            Some(t) => self.transform(t, &raw, &self.input_args(self.args(&null, &null, &null, &null, &none), t)?)?,
             None => raw,
         };
         let mut ctx = input.clone();
@@ -795,7 +1019,7 @@ impl Run<'_> {
             None => out,
         };
         if let Some(s) = self.wf.output.as_ref().and_then(|o| o.schema.as_ref()) {
-            conform(s, &out, "the workflow output")?;
+            self.conform(s, &out, "the workflow output")?;
         }
         Ok(out)
     }
@@ -822,7 +1046,7 @@ impl Run<'_> {
                 data = out;
                 i = match flow {
                     Flow::Continue => i + 1,
-                    Flow::Exit => break,
+                    Flow::Exit => return Ok(Next::Exit(data)),
                     Flow::End => return Ok(Next::End(data)),
                     Flow::Goto(target) => tasks.iter().position(|(n, _)| *n == target).ok_or_else(|| {
                         Fault::Fatal(WorkflowError::runtime(format!("`then: {target}` names no task in {at}")))
@@ -910,8 +1134,8 @@ impl Run<'_> {
         })
     }
 
-    /// if → input.schema → input.from → the task (under its timeout) →
-    /// output.as → output.schema → export.as → export.schema.
+    /// if → input.schema → input.from → the task with its extensions (under
+    /// its timeout) → output.as → output.schema → export.as → export.schema.
     #[allow(clippy::too_many_arguments)]
     async fn steps(
         &self,
@@ -942,10 +1166,10 @@ impl Run<'_> {
             }
         }
         if let Some(s) = task.input.as_ref().and_then(|i| i.schema.as_ref()) {
-            conform(s, &raw, "the task input")?;
+            self.conform(s, &raw, "the task input")?;
         }
         let input = match task.input.as_ref().and_then(|i| i.from.as_ref()) {
-            Some(t) => self.transform(t, &raw, &self.args(ctx, &null, &null, &desc, scope))?,
+            Some(t) => self.transform(t, &raw, &self.input_args(self.args(ctx, &null, &null, &desc, scope), t)?)?,
             None => raw,
         };
         let limit = match &task.timeout {
@@ -954,43 +1178,50 @@ impl Run<'_> {
         };
         self.observe(Event::TaskStarted { reference, parent, kind: task.kind.name(), input: &input });
         span.active = true;
+        let (extensions, described) = self.extensions(task, reference, &input, ctx, scope, &desc)?;
+        let mut around = scope.clone();
+        around.push(("task".into(), described));
+        macro_rules! run {
+            ($deadline:expr) => {
+                self.layer(0, &extensions, task, reference, input.clone(), ctx, scope, &around, &desc, $deadline)
+            };
+        }
+        let child_done = matches!(&task.kind, Kind::Run(r) if matches!(r.process, Process::Workflow { .. }))
+            && self.record(&format!("{reference}#child")).is_some();
         let (out, flow) = match limit {
-            None => self.kind(task, reference, &input, ctx, scope, &desc).await?,
-            Some(_) if self.record(&format!("{reference}#event")).is_some() => {
-                self.kind(task, reference, &input, ctx, scope, &desc).await?
-            }
+            None => run!(None).await?,
+            // A child that already reported finishes; its deadline was met.
+            Some(_) if child_done => run!(None).await?,
             Some(limit) => {
-                let remaining = self.remaining(limit, started_ms);
-                if remaining.is_err()
-                    && let Kind::Listen(filters) = &task.kind
-                    && let Some(events) = self.host.functions.events()
-                {
-                    let types = listen_types(filters, &input, &self.args(ctx, &input, &null, &desc, scope))?;
-                    events
-                        .unregister(self.run_id, &format!("{reference}#event"), &types)
-                        .map_err(|e| Fault::Interrupted(WorkflowError::runtime(e.to_string())))?;
-                }
-                let (remaining, deadline) = remaining
-                    .map_err(|error| if self.has_unknown(reference) { self.unknown(reference) } else { error })?;
-                // A listen reaching its deadline suspends first; replay then
-                // performs the normal durable timeout and closes its subscription.
-                let result = if matches!(task.kind, Kind::Listen(_)) {
-                    Ok(self.kind(task, reference, &input, ctx, scope, &desc).await)
-                } else {
-                    tokio::time::timeout(remaining, self.kind(task, reference, &input, ctx, scope, &desc)).await
-                };
-                match result {
-                    Ok(Err(Fault::Waiting(wake))) => {
-                        return Err(Fault::Waiting(wake.min(deadline)));
+                let millis = i64::try_from(limit.as_millis()).unwrap_or(i64::MAX);
+                let deadline = started_ms.saturating_add(millis);
+                if matches!(task.kind, Kind::Listen(_)) {
+                    // A listen enforces its deadline itself, only when it needs
+                    // a fresh event: events consumed before a crash still
+                    // complete it after the deadline.
+                    match run!(Some(deadline)).await {
+                        Err(Fault::Waiting(wake)) => return Err(Fault::Waiting(wake.min(deadline))),
+                        other => other?,
                     }
-                    Ok(r) => r?,
-                    Err(_) => {
-                        if self.has_unknown(reference) {
-                            return Err(self.unknown(reference));
+                } else {
+                    let (left, expired) = match self.remaining(limit, started_ms) {
+                        Ok((left, _)) => (left, false),
+                        Err(_) => (Duration::ZERO, true),
+                    };
+                    // A body that replays to its end without waiting still
+                    // completes past the deadline: the inner future is polled
+                    // before the timer. One that would wait has timed out.
+                    match tokio::time::timeout(left, run!(None)).await {
+                        Ok(Err(Fault::Waiting(wake))) if !expired => return Err(Fault::Waiting(wake.min(deadline))),
+                        Ok(r) if !matches!(r, Err(Fault::Waiting(_))) => r?,
+                        _ => {
+                            if self.has_unknown(reference) {
+                                return Err(self.unknown(reference));
+                            }
+                            return Err(
+                                WorkflowError::timeout(format!("{reference} did not finish within {limit:?}")).into()
+                            );
                         }
-                        return Err(
-                            WorkflowError::timeout(format!("{reference} did not finish within {limit:?}")).into()
-                        );
                     }
                 }
             }
@@ -1001,24 +1232,115 @@ impl Run<'_> {
             None => out,
         };
         if let Some(s) = task.output.as_ref().and_then(|o| o.schema.as_ref()) {
-            conform(s, &out, "the task output")?;
+            self.conform(s, &out, "the task output")?;
         }
         if let Some(export) = &task.export {
             if let Some(t) = &export.as_ {
                 *ctx = self.transform(t, &out, &self.args(ctx, &input, &out, &desc, scope))?;
             }
             if let Some(s) = &export.schema {
-                conform(s, ctx, "the exported context")?;
+                self.conform(s, ctx, "the exported context")?;
             }
         }
         self.observe(Event::TaskCompleted { reference, output: &out });
         Ok((out, flow.or_else(|| task.then.clone()).unwrap_or(Flow::Continue)))
     }
 
+    /// The extensions that apply to this task, in declaration order (those
+    /// extending its kind whose `when` holds), and what `$task` is for them.
+    /// CHOICE: in `when` and in the extension's tasks, `$task` describes the
+    /// extended task: its descriptor, to which its own definition properties
+    /// are added (the DSL's examples write `$task.with.endpoint`, and log
+    /// `$task.reference` from a `before` task); the descriptor's names win.
+    /// `when` is evaluated on the transformed task input. Tasks of an
+    /// extension are not extended.
+    #[allow(clippy::type_complexity)]
+    fn extensions(
+        &self,
+        task: &Task,
+        reference: &str,
+        input: &Value,
+        ctx: &Value,
+        scope: &Scope,
+        desc: &Value,
+    ) -> Result<(Vec<(usize, &str, &Extension)>, Value), Fault> {
+        if self.wf.uses.extensions.is_empty() || reference.contains(EXTENSION_TASKS) {
+            return Ok((Vec::new(), Value::Null));
+        }
+        let mut described = task.definition.as_object().cloned().unwrap_or_default();
+        if let Value::Object(d) = desc {
+            described.extend(d.clone());
+        }
+        let described = Value::Object(described);
+        let mut out = Vec::new();
+        for (i, (name, e)) in self.wf.uses.extensions.iter().enumerate() {
+            if !e.extends(&task.kind) {
+                continue;
+            }
+            if let Some(w) = &e.when {
+                let hit = expr::eval(w, input, &self.args(ctx, input, &Value::Null, &described, scope))
+                    .map_err(expression)?;
+                if !expr::truthy(&hit) {
+                    continue;
+                }
+            }
+            out.push((i, name.as_str(), e));
+        }
+        Ok((out, described))
+    }
+
+    /// Extension `i` around the inner layers: its `before` list runs on the
+    /// task's input and its output becomes the input inside; its `after`
+    /// list runs on the output from inside and its output is the task's.
+    /// `then: exit` in a `before` list skips what is inside (the extended
+    /// task included) and this extension's `after`: its output is the
+    /// task's. `then: end` in either ends the workflow.
+    #[allow(clippy::too_many_arguments)]
+    fn layer<'s>(
+        &'s self,
+        i: usize,
+        extensions: &'s [(usize, &'s str, &'s Extension)],
+        task: &'s Task,
+        reference: &'s str,
+        input: Value,
+        ctx: &'s mut Value,
+        scope: &'s Scope,
+        around: &'s Scope,
+        desc: &'s Value,
+        deadline: Option<i64>,
+    ) -> BoxFuture<'s, Result<(Value, Option<Flow>), Fault>> {
+        Box::pin(async move {
+            let Some((index, name, e)) = extensions.get(i) else {
+                return self.kind(task, reference, &input, ctx, scope, desc, deadline).await;
+            };
+            let at = format!("{reference}{EXTENSION_TASKS}{index}/{name}");
+            let mut data = input;
+            if let Some(before) = &e.before {
+                match self.list(before, format!("{at}/before"), Some(reference), data, ctx, around).await? {
+                    Next::Exit(v) => return Ok((v, None)),
+                    Next::End(v) => return Ok((v, Some(Flow::End))),
+                    Next::Done(v) => data = v,
+                }
+            }
+            let (out, flow) =
+                self.layer(i + 1, extensions, task, reference, data, ctx, scope, around, desc, deadline).await?;
+            match &e.after {
+                None => Ok((out, flow)),
+                Some(after) => {
+                    match self.list(after, format!("{at}/after"), Some(reference), out, ctx, around).await? {
+                        Next::End(v) => Ok((v, Some(Flow::End))),
+                        Next::Done(v) | Next::Exit(v) => Ok((v, flow)),
+                    }
+                }
+            }
+        })
+    }
+
     // ── 4. task kinds ──────────────────────────────────────────────────────
 
     /// The task's raw output and the directive it chose, if any (a switch
-    /// case, `catch.then`, or `end` from inside).
+    /// case, `catch.then`, or `end` from inside). `deadline`: a listen's.
+    #[allow(clippy::too_many_arguments)]
     async fn kind(
         &self,
         task: &Task,
@@ -1027,6 +1349,7 @@ impl Run<'_> {
         ctx: &mut Value,
         scope: &Scope,
         desc: &Value,
+        deadline: Option<i64>,
     ) -> Result<(Value, Option<Flow>), Fault> {
         let args = |ctx: &Value| self.args(ctx, input, &Value::Null, desc, scope);
         match &task.kind {
@@ -1035,7 +1358,8 @@ impl Run<'_> {
                     Some(w) => expr::render(w, input, &args(ctx)).map_err(expression)?,
                     None => Value::Object(Map::new()),
                 };
-                Ok((self.call(model::function_name(function), call_args, reference, ctx, task.delivery).await?, None))
+                let target = Target::Function(model::function_name(function));
+                Ok((self.call(target, call_args, reference, ctx, task.delivery, input).await?, None))
             }
             Kind::Do(tasks) => Ok(ended(
                 self.list(tasks, format!("{reference}/do"), Some(reference), input.clone(), ctx, scope).await?,
@@ -1071,7 +1395,7 @@ impl Run<'_> {
                         }
                     }
                     match self.list(tasks, format!("{reference}[{i}]/do"), Some(reference), data, ctx, &inner).await? {
-                        Next::Done(v) => data = v,
+                        Next::Done(v) | Next::Exit(v) => data = v,
                         Next::End(v) => return Ok((v, Some(Flow::End))),
                     }
                 }
@@ -1109,65 +1433,10 @@ impl Run<'_> {
             }
             Kind::Try { tasks, catch } => self.attempt(tasks, catch, reference, input, ctx, scope, desc).await,
             Kind::Raise(r) => Err(self.raise(r, reference, input, &args(ctx))?.into()),
-            Kind::Listen(filters) => {
-                if let Some(Record::Event { event }) = self.record(&format!("{reference}#event")) {
-                    return Ok((json!([event]), None));
-                }
-                let events = self
-                    .host
-                    .functions
-                    .events()
-                    .ok_or_else(|| WorkflowError::validation("events are not supported by this host"))?;
-                let types = listen_types(filters, input, &args(ctx))?;
-                let storage = |e: anyhow::Error| Fault::Interrupted(WorkflowError::runtime(e.to_string()));
-                events.register(self.run_id, &types).map_err(storage)?;
-                let key = format!("{reference}#event");
-                if self.journal.is_none() {
-                    if let Some(event) = events.take(self.run_id, &key, &types).map_err(storage)? {
-                        return Ok((json!([event]), None));
-                    }
-                    return Err(
-                        WorkflowError::runtime("listen requires a durable journal; cannot wait in a dry run").into()
-                    );
-                }
-                let mut hold = task.hold;
-                // The host's ceiling, when it is reached first: the timeout
-                // fires there instead of the run suspending until it.
-                let mut expires = None;
-                if let Some(spec) = &task.timeout {
-                    let limit = self.duration(spec, input, &args(ctx))?;
-                    let started = desc["startedAt"]["epoch"]["milliseconds"]
-                        .as_i64()
-                        .ok_or_else(|| WorkflowError::runtime("invalid task start"))?;
-                    hold = hold.min(self.remaining(limit, started)?.0);
-                    if let Some(max) = self.host.limits.max_listen.filter(|max| *max <= hold) {
-                        hold = max;
-                        expires = Some(limit);
-                    }
-                }
-                let deadline = tokio::time::Instant::now() + hold;
-                loop {
-                    let notification = events.notification(self.run_id);
-                    if let Some(event) = events.take(self.run_id, &key, &types).map_err(storage)? {
-                        self.save(&key, Record::Event { event: event.clone() })?;
-                        return Ok((json!([event]), None));
-                    }
-                    if tokio::time::Instant::now() >= deadline {
-                        break;
-                    }
-                    tokio::select! {
-                        _ = notification => {},
-                        _ = tokio::time::sleep_until(deadline) => break,
-                    }
-                }
-                if let Some(limit) = expires {
-                    events.unregister(self.run_id, &key, &types).map_err(storage)?;
-                    return Err(WorkflowError::timeout(format!(
-                        "no event within {hold:?}, the most this host waits (the timeout allows {limit:?})"
-                    ))
-                    .into());
-                }
-                Err(Fault::Waiting(253_402_300_799_000))
+            Kind::Listen(listen) => self.listen(task, listen, reference, input, ctx, scope, desc, deadline).await,
+            Kind::Emit(with) => Ok((self.emit(with, reference, input, &args(ctx)).await?, None)),
+            Kind::Run(run) => {
+                Ok((self.run_process(run, reference, input, ctx, &args(ctx), task.delivery).await?, None))
             }
             Kind::Wait(spec) => {
                 let d = self.duration(spec, input, &args(ctx))?;
@@ -1179,13 +1448,21 @@ impl Run<'_> {
 
     async fn call(
         &self,
-        name: &str,
+        target: Target<'_>,
         args: Value,
         reference: &str,
         ctx: &mut Value,
         delivery: Delivery,
+        input: &Value,
     ) -> Result<Value, Fault> {
-        if let Some((_, function)) = self.wf.uses.functions.iter().find(|(n, _)| n == name) {
+        let name = match target {
+            Target::Function(name) => name.to_owned(),
+            Target::Process(kind) => Process::function(kind),
+        };
+        let name = name.as_str();
+        if let Target::Function(name) = target
+            && let Some((_, function)) = self.wf.uses.functions.iter().find(|(n, _)| n == name)
+        {
             if delivery != Delivery::AtLeastOnce {
                 return Err(Fault::Fatal(WorkflowError::validation(
                     "delivery belongs on the external call inside a reusable function",
@@ -1223,11 +1500,11 @@ impl Run<'_> {
         } else if prior.is_some() {
             return Err(Fault::Interrupted(WorkflowError::runtime("invalid call record")));
         }
-        let effect = self
-            .host
-            .functions
-            .effect_of(name, &args)
-            .ok_or_else(|| Fault::Fatal(WorkflowError::runtime(format!("unknown function `{name}`"))))?;
+        let effect = match target {
+            Target::Function(_) => self.host.functions.effect_of(name, &args),
+            Target::Process(kind) => self.host.functions.process(kind),
+        }
+        .ok_or_else(|| Fault::Fatal(WorkflowError::runtime(format!("unknown function `{name}`"))))?;
         if let Some(Record::Call { effect: original, .. }) = &prior
             && *original != effect
         {
@@ -1266,16 +1543,33 @@ impl Run<'_> {
             })
             .max_by_key(|(prefix, _, _)| prefix.len())
             .map_or(1, |(_, _, attempt)| *attempt);
-        let info =
-            CallInfo { run_id: self.run_id, reference, logical: &logical, attempt, cancel: self.cancel, delivery };
+        let info = CallInfo {
+            run_id: self.run_id,
+            reference,
+            logical: &logical,
+            attempt,
+            cancel: self.cancel,
+            delivery,
+            input,
+            secrets: &self.secrets,
+        };
         let cooperative = self.host.functions.cooperative(name);
+        let functions = &self.host.functions;
+        let info = &info;
+        let dispatch = move |args: Value, durable: bool| async move {
+            match target {
+                Target::Process(kind) => functions.run_process(kind, args, info).await,
+                Target::Function(_) if durable => functions.invoke(name, args, info).await,
+                Target::Function(_) => functions.execute(name, args, info).await,
+            }
+        };
         if self.journal.is_none() {
             let result = if cooperative {
-                self.host.functions.execute(name, args, &info).await
+                dispatch(args, false).await
             } else {
                 tokio::select! {
                     _ = self.cancel.cancelled() => return Err(Fault::Cancelled),
-                    r = self.host.functions.execute(name, args, &info) => r,
+                    r = dispatch(args, false) => r,
                 }
             };
             if self.cancel.is_cancelled() {
@@ -1289,12 +1583,12 @@ impl Run<'_> {
             });
         }
         let result = if cooperative {
-            self.host.functions.invoke(name, args.clone(), &info).await
+            dispatch(args.clone(), true).await
         } else {
             tokio::select! {
                 biased;
                 _ = self.cancel.cancelled() => return Err(Fault::Cancelled),
-                r = self.host.functions.invoke(name, args.clone(), &info) => r,
+                r = dispatch(args.clone(), true) => r,
             }
         };
         let (state, result) = match result {
@@ -1362,7 +1656,7 @@ impl Run<'_> {
         let mut end = None;
         for (_, next) in done {
             match next {
-                Ok(Next::Done(v)) => output.push(v),
+                Ok(Next::Done(v) | Next::Exit(v)) => output.push(v),
                 Ok(Next::End(v)) => {
                     output.push(v);
                     end = Some(Flow::End);
@@ -1504,7 +1798,416 @@ impl Run<'_> {
         })
     }
 
-    // ── 5. try, retries and durations ──────────────────────────────────────
+    // ── 5. events: listen and emit ─────────────────────────────────────────
+
+    /// Consumes events until the strategy is satisfied: each one taken under
+    /// its own key (`<task>#event[i]`) atomically with its record, offered to
+    /// a consumer (`events::Consumer`), and, with `foreach`, processed before
+    /// the next is taken. On recovery the saved events are offered again in
+    /// order, so the consumer, the output and the iterations replay; only
+    /// then is a fresh event taken. The subscription stays open from the
+    /// first take to the end, so nothing published in between is missed.
+    /// CHOICE: an event of a routed type that no filter wants is consumed
+    /// and dropped (`Offer::Ignored`), as a broadcast subscriber would.
+    #[allow(clippy::too_many_arguments)]
+    async fn listen(
+        &self,
+        task: &Task,
+        listen: &Listen,
+        reference: &str,
+        input: &Value,
+        ctx: &mut Value,
+        scope: &Scope,
+        desc: &Value,
+        deadline: Option<i64>,
+    ) -> Result<(Value, Option<Flow>), Fault> {
+        let events = self
+            .host
+            .functions
+            .events()
+            .ok_or_else(|| WorkflowError::validation("events are not supported by this host"))?;
+        let routes = events::routes(&listen.to, &self.args(ctx, input, &Value::Null, desc, scope));
+        let storage = |e: anyhow::Error| Fault::Interrupted(WorkflowError::runtime(e.to_string()));
+        let condition = match &listen.to {
+            Strategy::Any { until: Some(Until::Condition(c)), .. } => Some(c.as_str()),
+            _ => None,
+        };
+        let mut consumer = events::Consumer::new(&listen.to);
+        let mut consumed = Vec::new();
+        let mut outputs = Vec::new();
+        let mut subscribed = false;
+        let mut i = 0;
+        while !consumer.done() {
+            let key = format!("{reference}#event[{i}]");
+            i += 1;
+            let event = match self.record(&key) {
+                Some(Record::Event { event }) => event,
+                Some(_) => return Err(Fault::Interrupted(WorkflowError::runtime("invalid event record"))),
+                None => {
+                    if !subscribed {
+                        let typed: Vec<String> = routes.iter().filter(|r| *r != "*").cloned().collect();
+                        if !typed.is_empty() {
+                            events.register(self.run_id, &typed).map_err(storage)?;
+                        }
+                        events.subscribe(self.run_id, reference, &routes).map_err(storage)?;
+                        subscribed = true;
+                    }
+                    self.next_event(events, task, reference, &key, &routes, input, ctx, scope, desc, deadline).await?
+                }
+            };
+            let args = self.args(ctx, input, &Value::Null, desc, scope);
+            if consumer.offer(&event, input, &args).map_err(expression)? != Offer::Consumed {
+                continue;
+            }
+            let item = events::read(&event, listen.read);
+            consumed.push(item.clone());
+            if let Some(f) = &listen.foreach {
+                let n = outputs.len();
+                match self.foreach(f, reference, n, item, ctx, scope).await? {
+                    (out, None) => outputs.push(out),
+                    (out, Some(flow)) => {
+                        events.unsubscribe(self.run_id, reference).map_err(storage)?;
+                        return Ok((out, Some(flow)));
+                    }
+                }
+            }
+            if let Some(c) = condition {
+                let args = self.args(ctx, input, &Value::Null, desc, scope);
+                if expr::truthy(&expr::eval(c, &Value::Array(consumed.clone()), &args).map_err(expression)?) {
+                    consumer.stop();
+                }
+            }
+        }
+        events.unsubscribe(self.run_id, reference).map_err(storage)?;
+        Ok((Value::Array(if listen.foreach.is_some() { outputs } else { consumed }), None))
+    }
+
+    /// One event for `key`: available now, or delivered within the task's
+    /// hold. Otherwise the run suspends until a delivery wakes it, or the
+    /// listen times out: its deadline has come, or the host's ceiling
+    /// (`Limits::max_listen`) cut the hold short of it.
+    #[allow(clippy::too_many_arguments)]
+    async fn next_event(
+        &self,
+        events: &dyn Events,
+        task: &Task,
+        reference: &str,
+        key: &str,
+        routes: &[String],
+        input: &Value,
+        ctx: &Value,
+        scope: &Scope,
+        desc: &Value,
+        deadline: Option<i64>,
+    ) -> Result<Value, Fault> {
+        let storage = |e: anyhow::Error| Fault::Interrupted(WorkflowError::runtime(e.to_string()));
+        let expire = |detail: String| -> Fault {
+            let typed: Vec<String> = routes.iter().filter(|r| *r != "*").cloned().collect();
+            if let Err(e) = events.unregister(self.run_id, key, &typed) {
+                return storage(e);
+            }
+            if let Err(e) = events.unsubscribe(self.run_id, reference) {
+                return storage(e);
+            }
+            WorkflowError::timeout(detail).into()
+        };
+        if self.journal.is_none() {
+            if let Some(event) = events.take(self.run_id, key, routes).map_err(storage)? {
+                return Ok(event);
+            }
+            return Err(WorkflowError::runtime("listen requires a durable journal; cannot wait in a dry run").into());
+        }
+        let now = self.host.clock.now().timestamp_millis();
+        let mut hold = task.hold;
+        let mut expires = None;
+        if let Some(at) = deadline {
+            if now >= at {
+                return Err(expire(format!("{reference}: no event before its deadline")));
+            }
+            hold = hold.min(Duration::from_millis(u64::try_from(at - now).unwrap_or(0)));
+            if let Some(max) = self.host.limits.max_listen.filter(|max| *max <= hold) {
+                hold = max;
+                let limit = match &task.timeout {
+                    Some(spec) => {
+                        Some(self.duration(spec, input, &self.args(ctx, input, &Value::Null, desc, scope))?)
+                    }
+                    None => None,
+                };
+                expires = Some(limit);
+            }
+        }
+        let until = tokio::time::Instant::now() + hold;
+        loop {
+            let notification = events.notification(self.run_id);
+            if let Some(event) = events.take(self.run_id, key, routes).map_err(storage)? {
+                self.save(key, Record::Event { event: event.clone() })?;
+                return Ok(event);
+            }
+            if tokio::time::Instant::now() >= until {
+                break;
+            }
+            tokio::select! {
+                _ = notification => {},
+                _ = tokio::time::sleep_until(until) => break,
+            }
+        }
+        if let Some(limit) = expires {
+            return Err(expire(format!(
+                "no event within {hold:?}, the most this host waits (the timeout allows {limit:?})"
+            )));
+        }
+        Err(Fault::Waiting(NO_DEADLINE))
+    }
+
+    /// `listen.foreach` for the `n`th consumed event: its tasks on the item,
+    /// then `output.as` (the item's output) and `export.as` (the context).
+    /// The directive is `end` when an iteration ended the workflow.
+    async fn foreach(
+        &self,
+        f: &Foreach,
+        reference: &str,
+        n: usize,
+        item: Value,
+        ctx: &mut Value,
+        scope: &Scope,
+    ) -> Result<(Value, Option<Flow>), Fault> {
+        let mut inner = scope.clone();
+        inner.push((f.item.clone(), item.clone()));
+        inner.push((f.at.clone(), json!(n)));
+        let (out, flow) = ended(
+            self.list(&f.tasks, format!("{reference}/foreach/{n}/do"), Some(reference), item.clone(), ctx, &inner)
+                .await?,
+        );
+        let null = Value::Null;
+        let out = match f.output.as_ref().and_then(|o| o.as_.as_ref()) {
+            Some(t) => self.transform(t, &out, &self.args(ctx, &item, &null, &null, &inner))?,
+            None => out,
+        };
+        if let Some(s) = f.output.as_ref().and_then(|o| o.schema.as_ref()) {
+            self.conform(s, &out, "the iteration output")?;
+        }
+        if let Some(export) = &f.export {
+            if let Some(t) = &export.as_ {
+                *ctx = self.transform(t, &out, &self.args(ctx, &item, &out, &null, &inner))?;
+            }
+            if let Some(s) = &export.schema {
+                self.conform(s, ctx, "the exported context")?;
+            }
+        }
+        Ok((out, flow))
+    }
+
+    /// Publishes the event through the host, recorded like a write call
+    /// delivered at least once: the envelope (its generated `id` and `time`
+    /// included) is saved before it is handed over, and recovery hands over
+    /// that same envelope again, which receivers deduplicate by `id`. A
+    /// retry attempt reuses an earlier attempt's emitted event. The output
+    /// is the envelope.
+    async fn emit(
+        &self,
+        with: &Map<String, Value>,
+        reference: &str,
+        input: &Value,
+        args: &Args,
+    ) -> Result<Value, Fault> {
+        const EMIT: &str = "emit";
+        let key = format!("{reference}#call");
+        let logical = self.logical(reference);
+        let prior = self.record(&key);
+        let envelope = match &prior {
+            Some(Record::Call { function, state: CallState::Done(result), .. }) if function == EMIT => {
+                return result.clone().map_err(Fault::Error);
+            }
+            Some(Record::Call { function, arguments, .. }) if function == EMIT => arguments.clone(),
+            Some(_) => return Err(Fault::Interrupted(WorkflowError::runtime("invalid emit record"))),
+            None => {
+                if logical != reference
+                    && let Some(earlier) =
+                        self.records.lock().unwrap_or_else(|e| e.into_inner()).values().find_map(|r| match r {
+                            Record::Call { logical: l, function, state: CallState::Done(Ok(v)), .. }
+                                if *l == logical && function == EMIT =>
+                            {
+                                Some(v.clone())
+                            }
+                            _ => None,
+                        })
+                {
+                    return Ok(earlier);
+                }
+                let rendered = expr::render(&Value::Object(with.clone()), input, args).map_err(expression)?;
+                let document = &self.wf.document;
+                let defaults = events::Defaults {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    source: format!("/{}/{}/{}", document.namespace, document.name, document.version),
+                    time: self.host.clock.now().to_rfc3339_opts(SecondsFormat::Millis, true),
+                };
+                let Value::Object(rendered) = rendered else {
+                    return Err(expression("the emitted event's attributes must be an object".into()));
+                };
+                events::envelope(rendered, defaults).map_err(expression)?
+            }
+        };
+        let pending = |state| Record::Call {
+            logical: logical.clone(),
+            function: EMIT.into(),
+            arguments: envelope.clone(),
+            effect: Effect::Write,
+            delivery: Delivery::AtLeastOnce,
+            state,
+        };
+        self.save(&key, pending(CallState::Pending))?;
+        if prior.is_none() {
+            self.writes.fetch_add(1, Ordering::SeqCst);
+        }
+        let info = CallInfo {
+            run_id: self.run_id,
+            reference,
+            logical: &logical,
+            attempt: 1,
+            cancel: self.cancel,
+            delivery: Delivery::AtLeastOnce,
+            input,
+            secrets: &self.secrets,
+        };
+        let result = tokio::select! {
+            biased;
+            _ = self.cancel.cancelled() => return Err(Fault::Cancelled),
+            r = self.host.functions.emit(&envelope, &info) => r,
+        };
+        match result {
+            Ok(()) => {
+                self.save(&key, pending(CallState::Done(Ok(envelope.clone()))))?;
+                Ok(envelope)
+            }
+            Err(CallFailure::Response(e)) => {
+                self.save(&key, pending(CallState::Done(Err(e.clone()))))?;
+                Err(Fault::Error(e))
+            }
+            Err(CallFailure::NotExecuted(e)) => {
+                self.save(&key, pending(CallState::NotExecuted(e.clone())))?;
+                Err(Fault::Error(e))
+            }
+            // Delivered at least once: recovery hands the same envelope over.
+            Err(CallFailure::Unknown(e)) => Err(Fault::Error(e)),
+            Err(CallFailure::Interrupted(e)) if self.cancel.is_cancelled() => {
+                let _ = e;
+                Err(Fault::Cancelled)
+            }
+            Err(CallFailure::Interrupted(e)) => Err(Fault::Interrupted(e)),
+        }
+    }
+
+    // ── 6. child workflows and processes ───────────────────────────────────
+
+    /// `run`: a child workflow through `Children`, or a process through the
+    /// host's runner, recorded like a call of the runner's effect. Without
+    /// `await` the task outputs its input.
+    async fn run_process(
+        &self,
+        run: &RunTask,
+        reference: &str,
+        input: &Value,
+        ctx: &mut Value,
+        args: &Args,
+        delivery: Delivery,
+    ) -> Result<Value, Fault> {
+        let (namespace, name, version, template) = match &run.process {
+            Process::External { kind, definition } => {
+                let mut definition = expr::render(definition, input, args).map_err(expression)?;
+                if let Value::Object(d) = &mut definition {
+                    d.insert("await".into(), Value::Bool(run.await_));
+                }
+                let result = self.call(Target::Process(kind), definition, reference, ctx, delivery, input).await?;
+                if !run.await_ {
+                    return Ok(input.clone());
+                }
+                return Ok(match run.return_ {
+                    Return::Stdout => result.get("stdout").cloned().unwrap_or(Value::Null),
+                    Return::Stderr => result.get("stderr").cloned().unwrap_or(Value::Null),
+                    Return::Code => result.get("code").cloned().unwrap_or(Value::Null),
+                    Return::All => result,
+                    Return::None => Value::Null,
+                });
+            }
+            Process::Workflow { namespace, name, version, input } => (namespace, name, version, input),
+        };
+        let child_input = match template {
+            Some(t) => expr::render(t, input, args).map_err(expression)?,
+            None => Value::Object(Map::new()),
+        };
+        let target = ChildTarget { namespace, name, version };
+        let children = self
+            .host
+            .functions
+            .children()
+            .ok_or_else(|| WorkflowError::validation("child workflows are not supported by this host"))?;
+        let failed = |f: CallFailure| match f {
+            CallFailure::NotExecuted(e) | CallFailure::Response(e) => Fault::Error(e),
+            CallFailure::Unknown(e) | CallFailure::Interrupted(e) => Fault::Interrupted(e),
+        };
+        if !run.await_ {
+            children.start(self.run_id, reference, &target, &child_input, false).map_err(failed)?;
+            return Ok(input.clone());
+        }
+        let key = format!("{reference}#child");
+        let event = match self.record(&key) {
+            Some(Record::Event { event }) => event,
+            Some(_) => return Err(Fault::Interrupted(WorkflowError::runtime("invalid child record"))),
+            None => {
+                if self.journal.is_none() {
+                    return Err(WorkflowError::runtime("a child workflow needs a durable journal").into());
+                }
+                let events = self
+                    .host
+                    .functions
+                    .events()
+                    .ok_or_else(|| WorkflowError::validation("child workflows need events on this host"))?;
+                // The raw reference, not the logical one: a DSL retry starts a
+                // new child, while recovery joins the one it started.
+                let child = children.start(self.run_id, reference, &target, &child_input, true).map_err(failed)?;
+                let storage = |e: anyhow::Error| Fault::Interrupted(WorkflowError::runtime(e.to_string()));
+                let types = [child.done];
+                events.register(self.run_id, &types).map_err(storage)?;
+                match events.take(self.run_id, &key, &types).map_err(storage)? {
+                    Some(event) => {
+                        self.save(&key, Record::Event { event: event.clone() })?;
+                        event
+                    }
+                    None => return Err(Fault::Waiting(NO_DEADLINE)),
+                }
+            }
+        };
+        let data = event.get("data").cloned().unwrap_or(Value::Null);
+        let output = match data["status"].as_str() {
+            Some("completed") => data.get("output").cloned().unwrap_or(Value::Null),
+            Some("faulted") => {
+                // The child's error, located at this task: its own instance
+                // points into the child's definition.
+                let mut error: WorkflowError = serde_json::from_value(data["error"].clone())
+                    .unwrap_or_else(|_| WorkflowError::runtime("the child workflow faulted"));
+                error.instance = Some(reference.into());
+                return Err(error.into());
+            }
+            _ => {
+                return Err(WorkflowError {
+                    instance: Some(reference.into()),
+                    ..WorkflowError::standard("runtime", 499, "Child Cancelled", "the child workflow was cancelled")
+                }
+                .into());
+            }
+        };
+        // CHOICE: a workflow has no streams; it completes with code 0 and
+        // its output stands for stdout.
+        Ok(match run.return_ {
+            Return::Stdout => output,
+            Return::Stderr => json!(""),
+            Return::Code => json!(0),
+            Return::All => json!({ "code": 0, "stdout": output, "stderr": "" }),
+            Return::None => Value::Null,
+        })
+    }
+
+    // ── 7. try, retries and durations ──────────────────────────────────────
 
     /// A retry restores the original context and gets its own invocation path.
     /// In a durable run a protected call keeps the first attempt's identity
@@ -1539,7 +2242,15 @@ impl Run<'_> {
                 format!("{reference}/try"),
                 attempt,
             ));
-            let error = match self.list(tasks, attempt_ref.clone(), Some(reference), input.clone(), ctx, scope).await {
+            let body = self.list(tasks, attempt_ref.clone(), Some(reference), input.clone(), ctx, scope);
+            let result = match catch.retry.as_ref().and_then(|r| r.attempt_duration.as_ref()) {
+                None => body.await,
+                Some(spec) => {
+                    let limit = self.duration(spec, input, &self.args(&snapshot, input, &Value::Null, desc, scope))?;
+                    self.within(limit, &format!("{reference}#attempt[{attempt}]"), &attempt_ref, body).await
+                }
+            };
+            let error = match result {
                 Ok(next) => return Ok(ended(next)),
                 Err(Fault::Error(e)) => e,
                 Err(stop) => return Err(stop),
@@ -1600,12 +2311,55 @@ impl Run<'_> {
         }
     }
 
-    /// `catch.errors.with` (each listed property equals the error's), then
-    /// `when` / `exceptWhen`.
+    /// One attempt bounded by `limit.attempt.duration`. Its deadline is saved
+    /// at `key` when the attempt starts, so recovery keeps it; an attempt
+    /// past it fails with a timeout error the same `catch` sees (an attempt
+    /// that replays without waiting still completes: the body is polled
+    /// before the timer).
+    async fn within<T>(
+        &self,
+        limit: Duration,
+        key: &str,
+        attempt: &str,
+        body: impl std::future::Future<Output = Result<T, Fault>>,
+    ) -> Result<T, Fault> {
+        let deadline_ms = match self.record(key) {
+            Some(Record::Timer { deadline_ms }) => deadline_ms,
+            Some(_) => return Err(Fault::Interrupted(WorkflowError::runtime("invalid attempt record"))),
+            None => {
+                let deadline_ms = self
+                    .host
+                    .clock
+                    .now()
+                    .timestamp_millis()
+                    .saturating_add(i64::try_from(limit.as_millis()).unwrap_or(i64::MAX));
+                self.save(key, Record::Timer { deadline_ms })?;
+                deadline_ms
+            }
+        };
+        let left = if self.journal.is_some() {
+            deadline_ms.saturating_sub(self.host.clock.now().timestamp_millis()).max(0)
+        } else {
+            i64::try_from(limit.as_millis()).unwrap_or(i64::MAX)
+        };
+        let expired = self.journal.is_some() && left == 0;
+        match tokio::time::timeout(Duration::from_millis(left as u64), body).await {
+            Ok(Err(Fault::Waiting(wake))) if !expired => Err(Fault::Waiting(wake.min(deadline_ms))),
+            Ok(r) if !matches!(r, Err(Fault::Waiting(_))) => r,
+            _ if self.has_unknown(attempt) => Err(self.unknown(attempt)),
+            _ => Err(WorkflowError::timeout(format!("{attempt} did not finish within {limit:?}")).into()),
+        }
+    }
+
+    /// `catch.errors.with` (each listed property equals the error's; `type`
+    /// also by `WorkflowError::has_type`), then `when` / `exceptWhen`.
     fn catches(&self, catch: &Catch, error: &WorkflowError, input: &Value, args: &Args) -> Result<bool, Fault> {
         if let Some(filter) = &catch.errors {
             let e = error.to_value();
-            if !filter.iter().all(|(k, v)| e.get(k) == Some(v)) {
+            if !filter.iter().all(|(k, v)| match (k.as_str(), v.as_str()) {
+                ("type", Some(t)) => error.has_type(t),
+                _ => e.get(k) == Some(v),
+            }) {
                 return Ok(false);
             }
         }
@@ -1693,19 +2447,6 @@ impl Run<'_> {
             _ = tokio::time::sleep(d) => Ok(()),
         }
     }
-}
-
-fn listen_types(filters: &[Value], input: &Value, args: &Args) -> Result<Vec<String>, Fault> {
-    filters
-        .iter()
-        .map(|v| {
-            let v = expr::render(v, input, args).map_err(expression)?;
-            v.as_str()
-                .filter(|s| !s.is_empty())
-                .map(str::to_owned)
-                .ok_or_else(|| expression("event type must be a non-empty string".into()))
-        })
-        .collect()
 }
 
 /// `when` must hold and `exceptWhen` must not.

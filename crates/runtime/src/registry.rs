@@ -1,4 +1,5 @@
 //! User functions: schemas, effects and explicit injected async handlers.
+use crate::capabilities::{Capabilities, HostCatalog};
 use async_trait::async_trait;
 use opentelemetry::Context as SpanContext;
 pub use owf::run::Effect;
@@ -20,6 +21,9 @@ pub struct FunctionContext {
     pub idempotency_key: String,
     /// The current function span; use as the parent of client/SDK spans.
     pub span: SpanContext,
+    /// The task's transformed input, against which a protocol function
+    /// resolves URI templates (`https://host/pet/{petId}`).
+    pub input: Value,
 }
 #[async_trait]
 pub trait Handler: Send + Sync {
@@ -77,9 +81,14 @@ impl Registry {
     pub(crate) fn get(&self, name: &str) -> Option<&Registered> {
         self.entries.get(name)
     }
+    /// Parses and validates a definition against these functions and a
+    /// runtime without optional capabilities (`Runtime::validate` knows its own).
     pub fn validate(&self, yaml: &str) -> anyhow::Result<Workflow> {
+        self.validate_with(yaml, &Capabilities::default())
+    }
+    pub(crate) fn validate_with(&self, yaml: &str, capabilities: &Capabilities) -> anyhow::Result<Workflow> {
         let wf = model::parse_yaml(yaml)?;
-        model::validate(&wf, self)?;
+        model::validate(&wf, &HostCatalog { registry: self, capabilities })?;
         for site in model::call_sites(&wf) {
             let Some(f) = self.get(&site.function) else {
                 continue;
@@ -135,7 +144,18 @@ impl Catalog for Registry {
     fn events(&self) -> bool {
         true
     }
+    fn emits(&self) -> bool {
+        true
+    }
+    fn children(&self) -> bool {
+        true
+    }
 }
+/// The reserved functions: `start_child` starts an owned child that the
+/// parent joins later with `listen` (its `done` event type), and
+/// `child_outcome` reads an owned child's stored outcome. `run: workflow`
+/// is the DSL's way to run a child; these remain for a parent that starts
+/// a child, keeps working and joins it afterwards.
 pub(crate) fn builtin(name: &str) -> bool {
     matches!(name, "start_child" | "child_outcome")
 }

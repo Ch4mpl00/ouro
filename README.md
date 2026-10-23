@@ -50,11 +50,12 @@ N = 3). A success resets the count. In-flight runs keep their admitted YAML,
 version, input and schema/effect bindings. Handler implementations remain the
 host's responsibility to keep compatible with those bindings.
 
-`start_child` is available through the host API and as a reserved workflow
-function. It returns `id`, `key`, `done` and `waiting` event types; a parent can
-join with `listen`, or read the owned result with `child_outcome`. The worker
-drives children under the same bounds. Native `run: workflow` syntax remains
-unsupported by the extracted interpreter.
+`start_child` is available through the host API and as a reserved
+workflow function, for a parent that starts a child, keeps working and
+joins it later: it returns `id`, `key`, `done` and `waiting` event types; a
+parent joins with `listen`, or reads the owned result with `child_outcome`.
+The worker drives children under the same bounds. Native `run: workflow`
+(below) is the DSL's way to run a child and wait for it.
 
 `dry_run` executes real reads, records writes and answers them through an
 injected `Mock`, using a private memory store for all runs and definitions.
@@ -68,6 +69,45 @@ not a deterministic simulation; that is future work.
 The runtime uses the OpenTelemetry API. Hosts inject a tracer and configure
 export/flush/shutdown themselves. `--features otlp` exposes the optional OTLP
 exporter crate; merely enabling it opens no connection.
+
+## The DSL
+
+The core implements the DSL's semantics; what it does not implement are
+protocol clients, processes, authentication and catalogs, which are host
+functions or packs. `src/model.rs` in `owf` lists the supported subset and
+the choices made where the specification is silent (`CHOICE` comments).
+
+- `run: workflow` starts a durable child run of a saved definition (the
+  catalog entry named `name`, the active version for `latest`, else the
+  saved version whose document has that `version`), owned and joined
+  atomically; recovery joins the same child and never reruns a completed
+  one. `await: false` starts an independent run. `run: container | script |
+  shell` need a `ProcessRunner` (`with_process_runner`); it is recorded and
+  delivered like a function of its effect.
+- `emit` builds a CloudEvents envelope, records it like a write, delivers it
+  to the runs listening for it and hands it to an optional `EventSink`.
+  `publish` delivers an external CloudEvent the same way, idempotently per
+  `source` + `id`. `listen` supports `one`, `any` (empty: any event), `all`,
+  `until` (a condition or events), filters (literal, regular expression or
+  runtime expression per attribute), `correlate`, `read` and `foreach`;
+  each event is consumed atomically with its record, and the subscription
+  stays open for the whole listen. `deliver` keeps the targeted delivery to
+  the oldest waiting run.
+- `use.extensions` run `before`/`after` tasks around matching tasks.
+  `use.secrets` resolve through a `SecretResolver` (`with_secrets`), are
+  readable as `$secrets` in `input.from` only and are redacted from records,
+  spans, errors and outcomes. `schema.resource` resolves through a
+  `ResourceResolver` (`with_resources`) and is pinned at admission.
+- `schedule` (`every`, `cron` in UTC, `after`, `on`) keeps generic
+  triggers in the store, armed on `activate`: indexed by the time they are
+  next due and by the event types they react to. The `worker` fires due
+  slots on each tick (`fire_due`, a range read of the due index); the
+  trigger moves to its next slot in the commit that admits the slot's run,
+  whose id derives from the slot, so concurrent workers start each once.
+  `after` re-arms when its run ends. `on` keeps the events matched so far
+  in its trigger and starts the workflow, with the consumed events as
+  input, once the strategy is satisfied; a publish reads only the triggers
+  indexed under its type.
 
 ## Durability and storage
 
@@ -147,6 +187,10 @@ using the public API. Its injected recovery clock advances past the dead
 worker's lease to avoid a 30-second pause; production hosts share a wall clock.
 It uses local files and calls no external service.
 
+The official conformance kit (`crates/owf/tests/ctk`) runs with
+`cargo test -p owf --test ctk`; its HTTP and OpenAPI scenarios use local
+fakes registered as `http` and `openapi` functions.
+
 `ouro_durable::conformance::run_all(factory)` is public. It checks admission,
 fencing, immutable evidence, event histories, held listens, every interpreter
 checkpoint boundary, child notifications, rollback and ambiguous commits,
@@ -186,9 +230,10 @@ public `RunStore` API. Run `spec/check.sh` for the full model and Rust checks.
 
 - LLM steps and providers; typed decisions.
 - MCP as a function source and other protocol/function packs.
-- Triggers, cron and scheduling integrations.
+- Webhook and broker integrations feeding `publish`.
 - napi binding, server binary and language bindings.
-- Official CTK runner and broader DSL coverage, including native child syntax.
+- Differential testing against another implementation; extending the
+  reference model beyond its CORE profile.
 - Deterministic simulation and the kill -9 load/fault harness.
 - Version-compatibility corpora.
 

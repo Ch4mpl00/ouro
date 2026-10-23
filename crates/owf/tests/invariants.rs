@@ -72,7 +72,7 @@ fn cycle() -> Task {
         status: None,
         as_: None,
         when: None,
-        retry: Some(support::program::Retry { count: Some(3), delay_ms: 0, when: None }),
+        retry: Some(support::program::Retry { count: Some(3), delay_ms: 0, when: None, attempt_ms: None }),
         handler: Some(vec![task("h", Body::Set(Template::Obj(support::program::Num::Lit(-1))))]),
         then: None,
     };
@@ -85,6 +85,8 @@ fn a_then_cycle_hits_the_ceiling_which_no_try_catches() {
         30,
         (program(Profile::FULL), input(), any::<prop::sample::Index>(), any::<prop::sample::Index>()),
         |(mut p, input, l, at)| {
+            // An extension may bypass the cycle's tasks or make them fail.
+            p.extensions.clear();
             let paths = lists(&p);
             let list = list_at(&mut p, &paths[l.index(paths.len())]);
             let at = at.index(list.len() + 1);

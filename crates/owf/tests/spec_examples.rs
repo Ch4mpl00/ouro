@@ -1,13 +1,17 @@
 // The specification's own examples (tests/spec-examples, see schema/README.md):
-// each one is valid by the bundled schema, and our parser either accepts it
-// or rejects it only for a construct this runtime does not support. Any
-// other rejection means the parser disagrees with the specification.
+// each one is valid by the bundled schema, and our parser and validation
+// either accept it or reject it only for a construct outside the core: a
+// protocol call, a process, authentication or a catalog, all of which are
+// host functions or packs. Any other rejection means we disagree with the
+// specification.
 use owf::model::{Invalid, conforms, parse};
 use std::path::PathBuf;
 
-/// Messages a deliberate subset produces (see model.rs, section 2).
-const UNSUPPORTED: &[&str] =
-    &["not supported", "scheduler", "only jq", "only strict", "only JSON Schema", "inline the `document`"];
+/// What the parser rejects outside the core (see model.rs, section 2).
+const OUT_OF_CORE: &[&str] = &["authentication is not supported", "external catalogs are not supported"];
+
+/// Protocol calls: host functions or packs, not core.
+const PROTOCOLS: &[&str] = &["http", "openapi", "grpc", "asyncapi", "a2a", "mcp"];
 
 fn examples() -> Vec<(String, serde_json::Value)> {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/spec-examples");
@@ -41,7 +45,7 @@ fn the_parser_accepts_examples_or_names_the_unsupported_construct() {
             Err(Invalid(problems)) => {
                 for p in &problems {
                     let m = p.to_string();
-                    assert!(UNSUPPORTED.iter().any(|u| m.contains(u)), "{name}: unexpected rejection {m}");
+                    assert!(OUT_OF_CORE.iter().any(|u| m.contains(u)), "{name}: unexpected rejection {m}");
                 }
             }
         }
@@ -59,6 +63,99 @@ fn the_parser_accepts_examples_or_names_the_unsupported_construct() {
     ] {
         assert!(accepted.iter().any(|a| a == expected), "{expected} should parse; accepted: {accepted:?}");
     }
+}
+
+/// A host with every capability the core defines and no protocol function,
+/// process runner or catalog: what remains unknown is out of the core.
+struct Core;
+impl owf::model::Catalog for Core {
+    fn has(&self, _: &str) -> bool {
+        false
+    }
+    fn events(&self) -> bool {
+        true
+    }
+    fn emits(&self) -> bool {
+        true
+    }
+    fn children(&self) -> bool {
+        true
+    }
+    fn secrets(&self) -> bool {
+        true
+    }
+    fn resources(&self) -> bool {
+        true
+    }
+}
+
+/// Why validation on a core-only host rejects an example, or `None` when
+/// a problem is not explained by a protocol, a process or a catalog. A
+/// protocol call's own arguments belong to the protocol (an AsyncAPI
+/// subscription binds `$message` for its `foreach`).
+fn out_of_core(problems: &[owf::model::Problem]) -> Option<&'static str> {
+    let mut reason = None;
+    let mut protocol_tasks = Vec::new();
+    for p in problems {
+        if let Some(function) = p.message.strip_prefix("unknown function `").and_then(|m| m.strip_suffix('`')) {
+            reason = Some(if PROTOCOLS.contains(&function) {
+                protocol_tasks.push(p.at.trim_end_matches("/call").to_string());
+                "protocol"
+            } else {
+                "catalog"
+            });
+        } else if p.message.contains("needs a host process runner") {
+            reason = Some("process");
+        }
+    }
+    for p in problems {
+        let explained = p.message.starts_with("unknown function `")
+            || p.message.contains("needs a host process runner")
+            || protocol_tasks.iter().any(|t| p.at.starts_with(&format!("{t}/")));
+        if !explained {
+            return None;
+        }
+    }
+    reason
+}
+
+#[test]
+fn every_example_is_accepted_by_the_core_or_needs_a_protocol_process_auth_or_catalog() {
+    let mut verdicts = std::collections::BTreeMap::new();
+    for (name, doc) in examples() {
+        let verdict = match parse(doc) {
+            Err(Invalid(problems)) => {
+                assert!(
+                    problems.iter().all(|p| OUT_OF_CORE.iter().any(|u| p.message.contains(u))),
+                    "{name}: {problems:?}"
+                );
+                "auth/catalog"
+            }
+            Ok(wf) => match owf::model::validate(&wf, &Core) {
+                Ok(()) => "accepted",
+                Err(Invalid(problems)) => {
+                    out_of_core(&problems).unwrap_or_else(|| panic!("{name}: rejected inside the core: {problems:?}"))
+                }
+            },
+        };
+        verdicts.insert(name, verdict);
+    }
+    for name in [
+        "emit.yaml",
+        "listen-to-all.yaml",
+        "listen-to-all read-envelope.yaml",
+        "listen-to-any.yaml",
+        "listen-to-any-filter.yaml",
+        "listen-to-any-until-condition.yaml",
+        "listen-to-any-until-consumed.yaml",
+        "run-subflow.yaml",
+        "set.yaml",
+        "switch-then-string.yaml",
+        "wait-duration-iso8601.yaml",
+    ] {
+        assert_eq!(verdicts.get(name).copied(), Some("accepted"), "{name}");
+    }
+    eprintln!("{verdicts:#?}");
 }
 
 #[test]

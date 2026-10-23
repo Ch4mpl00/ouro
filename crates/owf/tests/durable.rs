@@ -654,6 +654,7 @@ fn repeated_crashes_can_hit_the_same_pending_checkpoint_before_progress() {
         input_from: None,
         output_as: None,
         functions: vec![],
+        extensions: vec![],
         bare: false,
         tasks: vec![task("send", Body::Call("inc".into(), Num::N))],
     };
@@ -1184,7 +1185,7 @@ impl run::Events for Inbox {
             return Ok(Some(event.clone()));
         }
         let mut queued = self.queued.lock().unwrap();
-        let found = queued.iter().position(|e| types.iter().any(|t| e["type"] == *t));
+        let found = queued.iter().position(|e| types.iter().any(|t| t == "*" || e["type"] == *t));
         Ok(found.map(|i| {
             let event = queued.remove(i);
             records.insert(key.into(), Record::Event { event: event.clone() });
@@ -1214,7 +1215,7 @@ fn delivered(t: &str) -> Value {
 #[tokio::test]
 async fn listen_early_late_any_and_replay_after_consumption() {
     let wf = workflow(
-        "do:\n - wait: { listen: { to: { any: [ { with: { type: '${ .yes }' } }, { with: { type: no } } ] } }, timeout: { after: PT24H } }\n",
+        "do:\n - wait: { listen: { to: { any: [ { with: { type: '${ $input.yes }' } }, { with: { type: no } } ] }, read: envelope }, timeout: { after: PT24H } }\n",
     );
     for early in [false, true] {
         let inbox = Arc::new(Inbox::default());
@@ -1294,7 +1295,7 @@ async fn ephemeral_listen_consumes_an_available_event_but_never_waits() {
     let inbox = Arc::new(Inbox::default());
     inbox.queued.lock().unwrap().push(delivered("x"));
     let h = event_host(inbox, Arc::new(Time(AtomicI64::new(1000))));
-    let wf = workflow("do: [ { w: { listen: { to: { one: { with: { type: x } } } } } } ]\n");
+    let wf = workflow("do: [ { w: { listen: { to: { one: { with: { type: x } } }, read: envelope } } } ]\n");
     assert_eq!(
         run::run(&h, &wf, "early", json!({}), &CancellationToken::new()).await.status,
         Status::Completed(json!([delivered("x")]))
@@ -1325,7 +1326,7 @@ async fn listen_holds_until_delivery_or_the_shorter_deadline_and_replays_a_crash
         let h = event_host(inbox.clone(), time);
         let timeout = if mode == "timeout" { ", timeout: { after: PT0.02S }" } else { "" };
         let wf = workflow(&format!(
-            "do: [ {{ w: {{ listen: {{ to: {{ one: {{ with: {{ type: x }} }} }} }}, metadata: {{ hold: PT0.1S }}{timeout} }} }} ]"
+            "do: [ {{ w: {{ listen: {{ to: {{ one: {{ with: {{ type: x }} }} }}, read: envelope }}, metadata: {{ hold: PT0.1S }}{timeout} }} }} ]"
         ));
         let token = CancellationToken::new();
         let mut future = Box::pin(run::resume(&h, &wf, "run", json!({}), &token, &*inbox.journal));
@@ -1366,7 +1367,7 @@ async fn listen_holds_until_delivery_or_the_shorter_deadline_and_replays_a_crash
 async fn a_listen_ceiling_takes_a_delivered_event_or_fires_the_timeout_at_once() {
     use std::time::Duration;
     let wf = workflow(
-        "do:\n - t:\n     try: [ { w: { listen: { to: { one: { with: { type: x } } } }, metadata: { hold: PT5S }, timeout: { after: PT24H } } } ]\n     catch: { errors: { with: { status: 408 } }, do: [ { expired: { set: { expired: true } } } ] }\n",
+        "do:\n - t:\n     try: [ { w: { listen: { to: { one: { with: { type: x } } }, read: envelope }, metadata: { hold: PT5S }, timeout: { after: PT24H } } } ]\n     catch: { errors: { with: { status: 408 } }, do: [ { expired: { set: { expired: true } } } ] }\n",
     );
     for early in [true, false] {
         let inbox = Arc::new(Inbox::default());

@@ -5,6 +5,11 @@
 // definition `owf::model::parse` accepts; 5. rewrites the metamorphic tests
 // apply.
 //
+// Beyond the reference model's CORE profile, programs may emit events (with
+// fixed ids and times, so outputs stay deterministic), declare extensions
+// around tasks and bound retry attempts with deadlines. Listens and child
+// workflows need a durable host and are covered by the durable tests.
+//
 // The data every task sees is an object with an integer counter, `{ n: 3 }`.
 // Flow targets are indices into the task's own list, resolved to names only
 // when rendered, so renaming a task cannot break a `then`.
@@ -19,9 +24,20 @@ pub struct Program {
     pub output_as: Option<Data>,
     /// `use.functions`: each is a task; its `name` is the function's name.
     pub functions: Vec<Task>,
+    /// `use.extensions`, in declaration order.
+    pub extensions: Vec<Ext>,
     pub tasks: Vec<Task>,
     /// Expression-typed fields written bare (`.n > 1`) instead of `${ … }`.
     pub bare: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Ext {
+    /// `call`, `set` or `all`.
+    pub extend: String,
+    pub when: Option<Cond>,
+    pub before: Option<Vec<Task>>,
+    pub after: Option<Vec<Task>>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -71,6 +87,8 @@ pub enum Body {
         compete: bool,
     },
     Wait(u64),
+    /// Emits `{ n: <num> }` as an event with a fixed id, source and time.
+    Emit(Num),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -103,6 +121,8 @@ pub struct Retry {
     pub count: Option<u32>,
     pub delay_ms: u64,
     pub when: Option<Cond>,
+    /// `limit.attempt.duration`.
+    pub attempt_ms: Option<u64>,
 }
 
 /// The variable names a catch binds when `as` is absent, and a loop when
@@ -225,20 +245,40 @@ pub struct Profile {
     pub fork: bool,
     pub compete: bool,
     pub wait: bool,
+    /// Task timeouts and retry attempt deadlines.
     pub timeouts: bool,
     pub functions: bool,
+    pub emit: bool,
+    pub extensions: bool,
     /// Calls to unknown functions and `then`s that may name nothing.
     pub sloppy: bool,
 }
 
 impl Profile {
     /// What the reference model interprets.
-    pub const CORE: Profile =
-        Profile { fork: false, compete: false, wait: false, timeouts: false, functions: true, sloppy: false };
-    pub const FULL: Profile =
-        Profile { fork: true, compete: true, wait: true, timeouts: true, functions: true, sloppy: false };
-    /// Everything but racing branches, whose winner depends on timing.
-    pub const DETERMINISTIC: Profile = Profile { compete: false, ..Profile::FULL };
+    pub const CORE: Profile = Profile {
+        fork: false,
+        compete: false,
+        wait: false,
+        timeouts: false,
+        functions: true,
+        emit: false,
+        extensions: false,
+        sloppy: false,
+    };
+    pub const FULL: Profile = Profile {
+        fork: true,
+        compete: true,
+        wait: true,
+        timeouts: true,
+        functions: true,
+        emit: true,
+        extensions: true,
+        sloppy: false,
+    };
+    /// Everything but racing branches, whose winner depends on timing, and
+    /// extensions, which run around the tasks a rewrite adds.
+    pub const DETERMINISTIC: Profile = Profile { compete: false, extensions: false, ..Profile::FULL };
     pub const SLOPPY: Profile = Profile { sloppy: true, ..Profile::DETERMINISTIC };
 }
 
@@ -307,6 +347,7 @@ fn leaf() -> BoxedStrategy<Body> {
         4 => (function(), num()).prop_map(|(f, n)| Body::Call(f, n)),
         1 => status().prop_map(Body::Raise),
         1 => prop::sample::select(vec![0u64, 4, 50, 2_000]).prop_map(Body::Wait),
+        1 => num().prop_map(Body::Emit),
     ]
     .boxed()
 }
@@ -339,8 +380,9 @@ fn catch(list: impl Strategy<Value = Vec<Task>> + 'static) -> BoxedStrategy<Catc
         prop::option::weighted(0.8, 1u32..5),
         prop::sample::select(vec![0u64, 10]),
         prop::option::weighted(0.3, cond()),
+        prop::option::weighted(0.2, prop::sample::select(vec![2u64, 30, 1_000])),
     )
-        .prop_map(|(count, delay_ms, when)| Retry { count, delay_ms, when });
+        .prop_map(|(count, delay_ms, when, attempt_ms)| Retry { count, delay_ms, when, attempt_ms });
     (
         prop::option::weighted(0.4, status()),
         prop::option::of(prop::sample::select(vec!["err", "e"]).prop_map(String::from)),
@@ -381,6 +423,13 @@ fn tree() -> BoxedStrategy<Task> {
         .boxed()
 }
 
+fn extension() -> BoxedStrategy<Ext> {
+    let list = || prop::option::weighted(0.6, prop::collection::vec(decorate(leaf()), 1..3));
+    (prop::sample::select(vec!["call", "set", "all"]), prop::option::weighted(0.4, cond()), list(), list())
+        .prop_map(|(extend, when, before, after)| Ext { extend: extend.into(), when, before, after })
+        .boxed()
+}
+
 /// A random program; every one parses and validates (the sloppy profile's
 /// may fail validation, and only there).
 pub fn program(profile: Profile) -> impl Strategy<Value = Program> {
@@ -390,9 +439,10 @@ pub fn program(profile: Profile) -> impl Strategy<Value = Program> {
         prop::option::weighted(0.2, data()),
         prop::option::weighted(0.2, data()),
         any::<bool>(),
+        prop::collection::vec(extension(), 0..3),
     )
-        .prop_map(move |(tasks, functions, input_from, output_as, bare)| {
-            let mut p = Program { input_from, output_as, functions, tasks, bare };
+        .prop_map(move |(tasks, functions, input_from, output_as, bare, extensions)| {
+            let mut p = Program { input_from, output_as, functions, extensions, tasks, bare };
             fix(&mut p, profile);
             p
         })
@@ -434,6 +484,18 @@ pub fn fix(p: &mut Program, profile: Profile) {
     } else {
         p.functions.clear();
     }
+    if profile.extensions {
+        for e in &mut p.extensions {
+            if let Some(c) = &mut e.when {
+                fix_cond(c, &Scope::default());
+            }
+            for list in [&mut e.before, &mut e.after].into_iter().flatten() {
+                fix_list(list, &Scope::default(), profile, false);
+            }
+        }
+    } else {
+        p.extensions.clear();
+    }
     fix_list(&mut p.tasks, &Scope::default(), profile, true);
 }
 
@@ -471,6 +533,7 @@ fn fix_task(t: &mut Task, len: usize, scope: &Scope, profile: Profile, calls_fun
     t.body = match body {
         Body::Fork { branches, .. } if !profile.fork => Body::Do(branches),
         Body::Wait(_) if !profile.wait => Body::Set(Template::Expr(Data::Same)),
+        Body::Emit(n) if !profile.emit => Body::Set(Template::Obj(n)),
         other => other,
     };
     match &mut t.body {
@@ -541,7 +604,14 @@ fn fix_task(t: &mut Task, len: usize, scope: &Scope, profile: Profile, calls_fun
                 }
             }
         }
+        Body::Emit(n) => fix_num(n, scope),
         Body::Raise(_) | Body::Wait(_) => {}
+    }
+    if !profile.timeouts
+        && let Body::Try { catch, .. } = &mut t.body
+        && let Some(r) = &mut catch.retry
+    {
+        r.attempt_ms = None;
     }
 }
 
@@ -593,9 +663,34 @@ pub fn definition(p: &Program) -> Value {
     if let Some(d) = &p.output_as {
         root.insert("output".into(), json!({ "as": r.expr(&d.code()) }));
     }
+    let mut uses = Map::new();
     if !p.functions.is_empty() {
         let functions: Map<String, Value> = p.functions.iter().map(|t| (t.name.clone(), r.task(t, &[]))).collect();
-        root.insert("use".into(), json!({ "functions": functions }));
+        uses.insert("functions".into(), Value::Object(functions));
+    }
+    if !p.extensions.is_empty() {
+        let extensions: Vec<Value> = p
+            .extensions
+            .iter()
+            .enumerate()
+            .map(|(i, e)| {
+                let mut x = Map::new();
+                x.insert("extend".into(), json!(e.extend));
+                if let Some(c) = &e.when {
+                    x.insert("when".into(), r.expr(&c.code()));
+                }
+                for (key, list) in [("before", &e.before), ("after", &e.after)] {
+                    if let Some(list) = list {
+                        x.insert(key.into(), r.list(list));
+                    }
+                }
+                json!({ format!("x{i}"): x })
+            })
+            .collect();
+        uses.insert("extensions".into(), Value::Array(extensions));
+    }
+    if !uses.is_empty() {
+        root.insert("use".into(), Value::Object(uses));
     }
     root.insert("do".into(), r.list(&p.tasks));
     Value::Object(root)
@@ -721,8 +816,15 @@ impl Render {
                     if r.delay_ms > 0 {
                         retry.insert("delay".into(), json!({ "milliseconds": r.delay_ms }));
                     }
+                    let mut attempt = Map::new();
                     if let Some(count) = r.count {
-                        retry.insert("limit".into(), json!({ "attempt": { "count": count } }));
+                        attempt.insert("count".into(), json!(count));
+                    }
+                    if let Some(ms) = r.attempt_ms {
+                        attempt.insert("duration".into(), json!({ "milliseconds": ms }));
+                    }
+                    if !attempt.is_empty() {
+                        retry.insert("limit".into(), json!({ "attempt": attempt }));
                     }
                     if let Some(w) = &r.when {
                         retry.insert("when".into(), self.expr(&w.code()));
@@ -750,6 +852,13 @@ impl Render {
             }
             Body::Wait(ms) => {
                 m.insert("wait".into(), json!({ "milliseconds": ms }));
+            }
+            Body::Emit(n) => {
+                let with = json!({
+                    "type": "generated", "source": "/generated", "id": "event",
+                    "time": "2026-01-01T00:00:00Z", "data": { "n": self.num_value(n) },
+                });
+                m.insert("emit".into(), json!({ "event": { "with": with } }));
             }
         }
         Value::Object(m)
@@ -831,6 +940,11 @@ pub fn each_task(p: &mut Program, f: &mut impl FnMut(&mut Task)) {
     }
     for t in &mut p.functions {
         f(t);
+    }
+    for e in &mut p.extensions {
+        for list in [&mut e.before, &mut e.after].into_iter().flatten() {
+            walk(list, f);
+        }
     }
     walk(&mut p.tasks, f);
 }

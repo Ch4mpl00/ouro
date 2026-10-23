@@ -84,6 +84,11 @@ pub struct StoredEvent {
     pub data: Value,
     pub delivered_at_ms: i64,
     pub consumed_key: Option<String>,
+    /// The CloudEvent as published (`publish`): its `type` and `data` equal
+    /// the fields above. `None` for a targeted `deliver`, such as a child's
+    /// lifecycle notification, which a wildcard subscription never takes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub envelope: Option<Value>,
 }
 
 /// A consistent persisted view, used by adapter conformance and diagnostics.
@@ -94,6 +99,9 @@ pub struct RunSnapshot {
     pub awaits: BTreeMap<String, i64>,
     pub listeners: BTreeMap<String, Vec<String>>,
     pub events: Vec<StoredEvent>,
+    /// Open subscriptions to published events, by key: event types, `*` for any.
+    #[serde(default)]
+    pub subscriptions: BTreeMap<String, Vec<String>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -128,7 +136,58 @@ pub trait RunStore: Send + Sync {
     /// A delivery targets the oldest eligible registration. One pending copy
     /// per run/type; consumed invocation keys remain durable for replay.
     fn deliver(&self, type_: &str, data: &Value, now_ms: i64) -> anyhow::Result<Option<String>>;
+    /// `types` may hold `*`, which takes any published event (never a
+    /// targeted delivery). A published event is taken as its envelope.
     fn take_event(&self, fence: &Fence, key: &str, types: &[String], now_ms: i64) -> anyhow::Result<Option<Value>>;
+    /// Opens a subscription under `key` (idempotent) for published events of
+    /// `types` (`*`: every published event). It stays open until
+    /// `unsubscribe` or the run's end, across consumptions, so a listen that
+    /// takes several events misses none published between two takes.
+    fn subscribe(&self, _fence: &Fence, _key: &str, _types: &[String], _now_ms: i64) -> anyhow::Result<()> {
+        anyhow::bail!("this store does not support published events")
+    }
+    fn unsubscribe(&self, _fence: &Fence, _key: &str, _now_ms: i64) -> anyhow::Result<()> {
+        anyhow::bail!("this store does not support published events")
+    }
+    /// Appends a CloudEvent (an object with at least `type`) to every
+    /// unfinished run with a subscription to its type or to `*`, or only to
+    /// `target` when given, subscribed or not. A run that already holds an
+    /// event with the same `source` and `id` is skipped, so publishing again
+    /// is idempotent. Several pending events of one type queue in order.
+    /// Receiving runs wake; they are returned.
+    fn publish(&self, _event: &Value, _target: Option<&str>, _now_ms: i64) -> anyhow::Result<Vec<String>> {
+        anyhow::bail!("this store does not support published events")
+    }
+    /// The trigger stored under `key`.
+    fn trigger(&self, _key: &str) -> anyhow::Result<Option<Trigger>> {
+        anyhow::bail!("this store does not support triggers")
+    }
+    /// Up to `limit` triggers due at `now_ms` or earlier, earliest first.
+    fn due_triggers(&self, _now_ms: i64, _limit: usize) -> anyhow::Result<Vec<(String, Trigger)>> {
+        anyhow::bail!("this store does not support triggers")
+    }
+    /// Up to `limit` triggers reacting to events of `type_` (or to `*`).
+    fn triggers_for(&self, _type_: &str, _limit: usize) -> anyhow::Result<Vec<(String, Trigger)>> {
+        anyhow::bail!("this store does not support triggers")
+    }
+    /// Compare-and-swap on a trigger, the claim-once primitive: commits only
+    /// when the stored trigger equals `expected` (`None`: absent), then
+    /// stores `next` (`None` deletes it) and admits each admission whose id
+    /// is not stored yet, in the same commit. `rearm` is attached to those
+    /// runs: at a run's terminal commit, if its trigger still exists and is
+    /// not due, it becomes due `delay_ms` after the end. Returns whether it
+    /// committed.
+    fn swap_trigger(
+        &self,
+        _key: &str,
+        _expected: Option<&Trigger>,
+        _next: Option<&Trigger>,
+        _admit: &[Admission],
+        _rearm: Option<&Rearm>,
+        _now_ms: i64,
+    ) -> anyhow::Result<bool> {
+        anyhow::bail!("this store does not support triggers")
+    }
     fn finish(&self, fence: &Fence, outcome: &Status, now_ms: i64, breaker_threshold: u32) -> anyhow::Result<Status>;
     /// Parent ownership, child admission, and completion subscriptions commit
     /// together. Replaying a link joins the original immutable child.
@@ -149,6 +208,25 @@ pub trait RunStore: Send + Sync {
     fn save_definition(&self, name: &str, yaml: &str) -> anyhow::Result<Definition>;
     fn activate(&self, name: &str, version: u64) -> anyhow::Result<()>;
     fn definitions(&self, name: &str) -> anyhow::Result<Definitions>;
+}
+
+/// A host-defined trigger: a keyed record the store indexes by the time it
+/// is next due and by the event types it reacts to (`*`: any). The store
+/// never interprets `state`; the host decides what firing means.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Trigger {
+    pub at_ms: Option<i64>,
+    #[serde(default)]
+    pub types: Vec<String>,
+    #[serde(default)]
+    pub state: Value,
+}
+
+/// Makes a trigger due again `delay_ms` after a run ends (`swap_trigger`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Rearm {
+    pub trigger: String,
+    pub delay_ms: i64,
 }
 
 pub trait Clock: Send + Sync {
@@ -185,6 +263,14 @@ impl Events for Lease {
     fn unregister(&self, run_id: &str, key: &str, types: &[String]) -> anyhow::Result<()> {
         anyhow::ensure!(run_id == self.fence.run_id, "event run does not own this lease");
         self.store.unregister_wait(&self.fence, key, types, self.clock.now_ms())
+    }
+    fn subscribe(&self, run_id: &str, key: &str, types: &[String]) -> anyhow::Result<()> {
+        anyhow::ensure!(run_id == self.fence.run_id, "event run does not own this lease");
+        self.store.subscribe(&self.fence, key, types, self.clock.now_ms())
+    }
+    fn unsubscribe(&self, run_id: &str, key: &str) -> anyhow::Result<()> {
+        anyhow::ensure!(run_id == self.fence.run_id, "event run does not own this lease");
+        self.store.unsubscribe(&self.fence, key, self.clock.now_ms())
     }
     fn take(&self, run_id: &str, key: &str, types: &[String]) -> anyhow::Result<Option<Value>> {
         anyhow::ensure!(run_id == self.fence.run_id, "event run does not own this lease");

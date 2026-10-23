@@ -76,7 +76,7 @@ impl Runtime {
         mock: Arc<dyn Mock>,
         stop: &CancellationToken,
     ) -> anyhow::Result<DryRun> {
-        self.registry.validate(yaml)?;
+        self.validate(yaml)?;
         let store = Arc::new(ouro_durable::memory::memory());
         let clock = Arc::new(TestClock(std::sync::atomic::AtomicI64::new(self.clock.now_ms())));
         let mut config = self.config.clone();
@@ -89,6 +89,7 @@ impl Runtime {
             clock.clone(),
             opentelemetry::global::BoxedTracer::new(Box::new(opentelemetry::trace::noop::NoopTracer::new())),
         )?;
+        runtime.capabilities = self.capabilities.clone();
         let d = runtime.save("dry-run", yaml)?;
         runtime.activate(&d.name, d.version)?;
         runtime.start("dry-run", "dry-run", input)?;
@@ -106,7 +107,7 @@ impl Runtime {
     /// Exercise a candidate definition using a recorded run's input and
     /// function results. Changed call names, arguments or effects fail replay.
     pub async fn replay_definition(&self, yaml: &str, id: &str, stop: &CancellationToken) -> anyhow::Result<Replay> {
-        self.registry.validate(yaml)?;
+        self.validate(yaml)?;
         self.replay_inner(id, Some(yaml), stop).await
     }
     async fn replay_inner(&self, id: &str, yaml: Option<&str>, stop: &CancellationToken) -> anyhow::Result<Replay> {
@@ -118,7 +119,7 @@ impl Runtime {
             .filter_map(|(k, r)| if let Record::Event { event } = r { Some((k.clone(), event.clone())) } else { None })
             .collect();
         if let Some(yaml) = yaml {
-            let wf = self.registry.validate(yaml)?;
+            let wf = self.validate(yaml)?;
             original.run.admission.definition = yaml.into();
             original.run.admission.runtime["bindings"] = self.registry.bindings(&wf);
         }
@@ -152,13 +153,14 @@ impl Runtime {
         // Preserve admitted identity and bindings. This isolated store never
         // writes to the original run, and no handler is invoked during replay.
         store.admit(&original.run.admission, started)?;
-        let runtime = Runtime::new(
+        let mut runtime = Runtime::new(
             store,
             self.registry.clone(),
             self.config.clone(),
             clock.clone(),
             opentelemetry::global::BoxedTracer::new(Box::new(opentelemetry::trace::noop::NoopTracer::new())),
         )?;
+        runtime.capabilities = self.capabilities.clone();
         let used = Arc::new(Mutex::new(BTreeSet::new()));
         let count = calls.len();
         let status = run_isolated(

@@ -13,6 +13,8 @@ pub fn seed(backend: &Arc<dyn AtomicBackend>, size: usize) -> anyhow::Result<()>
         let f = store.start(&admission(&id), now)?.unwrap();
         store.save_record(&f, "timer", &Record::Timer { deadline_ms: 42 }, now)?;
         store.register_wait(&f, &["unrelated".into()], now)?;
+        // Unfinished seeds also subscribe to published events of another type.
+        store.subscribe(&f, "listen", &["unrelated".into()], now)?;
         let outcome = if mode == 1 {
             Status::Completed(json!(42))
         } else {

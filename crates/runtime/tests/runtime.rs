@@ -205,7 +205,7 @@ async fn shutdown_releases_the_lease_and_unknown_writes_never_dispatch_again() {
 #[tokio::test]
 async fn events_resume_a_waiting_listen_and_cancel_is_terminal() {
     let rt = runtime(Arc::new(durable::memory::memory()), Registry::new(), Arc::new(Time::default()));
-    save(&rt, &yaml("  - listen: { listen: { to: { one: { with: { type: answer } } } } }"));
+    save(&rt, &yaml("  - listen: { listen: { to: { one: { with: { type: answer } } }, read: envelope } }"));
     rt.start("r", "workflow", Value::Null).unwrap();
     assert!(matches!(rt.drive("r", &CancellationToken::new()).await.unwrap(), Some(Status::Waiting { .. })));
     assert_eq!(rt.deliver("answer", json!(42)).unwrap(), Some("r".into()));
@@ -227,7 +227,7 @@ async fn child_runs_join_via_durable_events_with_one_worker_slot() {
     save(
         &rt,
         &yaml(
-            "  - child: { call: start_child, with: { name: child, input: {} }, export: { as: '${ . }' } }\n  - join: { listen: { to: { one: { with: { type: '${ $context.done }' } } } } }",
+            "  - child: { call: start_child, with: { name: child, input: {} }, export: { as: '${ . }' } }\n  - join: { listen: { to: { one: { with: { type: '${ $context.done }' } } }, read: envelope } }",
         ),
     );
     rt.start("p", "workflow", json!({})).unwrap();
@@ -404,7 +404,7 @@ async fn dry_children_are_isolated_and_event_replay_uses_recorded_envelopes() {
     let child = rt.save("child", &yaml("  - write: { call: write, with: { n: 42 } }")).unwrap();
     rt.activate("child", child.version).unwrap();
     let definition = yaml(
-        "  - child: { call: start_child, with: { name: child, input: {} }, export: { as: '${ . }' } }\n  - join: { listen: { to: { one: { with: { type: '${ $context.done }' } } } } }",
+        "  - child: { call: start_child, with: { name: child, input: {} }, export: { as: '${ . }' } }\n  - join: { listen: { to: { one: { with: { type: '${ $context.done }' } } }, read: envelope } }",
     );
     let dry = rt
         .dry_run(

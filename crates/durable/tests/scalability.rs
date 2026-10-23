@@ -1,6 +1,6 @@
 use ouro_durable::{
-    AtomicBackend, Conflict, Fence, IoCounts, Metrics, RunState, RunStore, TransactionalStore, conformance::admission,
-    memory::MemoryBackend, postgres::PostgresBackend, sqlite::SqliteBackend,
+    AtomicBackend, Conflict, Fence, IoCounts, Metrics, Rearm, RunState, RunStore, TransactionalStore, Trigger,
+    conformance::admission, memory::MemoryBackend, postgres::PostgresBackend, sqlite::SqliteBackend,
 };
 use owf::{
     durable::Record,
@@ -62,6 +62,47 @@ fn bounds(backend: Arc<dyn AtomicBackend>, metrics: Arc<Metrics>) -> anyhow::Res
     bounded(&metrics, "take_event_replay", 0, || s.take_event(&f, "answer", &types, 1))?;
     bounded(&metrics, "unregister_wait", 0, || s.unregister_wait(&f, "answer", &types, 1))?;
     assert_eq!(bounded(&metrics, "load_records", 2, || s.load_records(&f, 1))?.len(), 2);
+    // Published events: thousands of seeded runs subscribe to another type.
+    let published = |id: &str, t: &str| json!({ "id": id, "source": "/bounds", "type": t, "data": 1 });
+    bounded(&metrics, "subscribe", 0, || s.subscribe(&f, "listen", &["published".into()], 1))?;
+    assert_eq!(bounded(&metrics, "publish", 1, || s.publish(&published("1", "published"), None, 1))?.len(), 1);
+    assert!(
+        bounded(&metrics, "publish_republished", 1, || s.publish(&published("1", "published"), None, 1))?.is_empty()
+    );
+    assert!(
+        bounded(&metrics, "publish_unsubscribed_type", 0, || s.publish(&published("2", "nobody"), None, 1))?.is_empty()
+    );
+    assert_eq!(
+        bounded(&metrics, "publish_target", 1, || s.publish(&published("3", "x"), Some(&other.id), 1))?.len(),
+        1
+    );
+    assert!(
+        bounded(&metrics, "take_event_published", 0, || s.take_event(&f, "published", &["*".into()], 1))?.is_some()
+    );
+    bounded(&metrics, "unsubscribe", 0, || s.unsubscribe(&f, "listen", 1))?;
+    // Triggers: many scheduled entries far in the future and of other types.
+    for n in 0..1_000 {
+        let unrelated = Trigger { at_ms: Some(1_000_000 + n), types: vec!["unrelated".into()], state: json!(n) };
+        s.swap_trigger(&format!("unrelated{n:04}"), None, Some(&unrelated), &[], None, 1)?;
+    }
+    let timer = Trigger { at_ms: Some(5), types: vec!["order".into()], state: json!({ "n": 1 }) };
+    assert!(bounded(&metrics, "swap_trigger_create", 0, || s.swap_trigger("slot", None, Some(&timer), &[], None, 1))?);
+    assert!(bounded(&metrics, "trigger", 0, || s.trigger("slot"))?.is_some());
+    assert_eq!(bounded(&metrics, "due_triggers", 1, || s.due_triggers(5, 16))?.len(), 1);
+    assert!(bounded(&metrics, "due_triggers_none", 0, || s.due_triggers(4, 16))?.is_empty());
+    assert_eq!(bounded(&metrics, "triggers_for", 1, || s.triggers_for("order", 16))?.len(), 1);
+    assert!(bounded(&metrics, "triggers_for_absent", 0, || s.triggers_for("absent", 16))?.is_empty());
+    let mut slot_run = a.clone();
+    slot_run.id = "target:slot".into();
+    let parked = Trigger { at_ms: None, ..timer.clone() };
+    let rearm = Rearm { trigger: "slot".into(), delay_ms: 10 };
+    assert!(bounded(&metrics, "swap_trigger_fire", 1, || {
+        s.swap_trigger("slot", Some(&timer), Some(&parked), &[slot_run.clone()], Some(&rearm), 1)
+    })?);
+    assert!(!bounded(&metrics, "swap_trigger_lost", 0, || s.swap_trigger("slot", Some(&timer), None, &[], None, 1))?);
+    let fired = s.claim("target:slot", 1)?.unwrap();
+    bounded(&metrics, "finish_rearm", 1, || s.finish(&fired, &Status::Completed(json!(0)), 2, 3))?;
+    assert_eq!(s.trigger("slot")?.and_then(|t| t.at_ms), Some(12));
     bounded(&metrics, "finish_waiting", 0, || s.finish(&f, &Status::Waiting { wake_at_ms: 1 }, 1, 3))?;
     let f = bounded(&metrics, "claim_waiting", 0, || s.claim(&a.id, 1))?.unwrap();
     bounded(&metrics, "release", 0, || s.release(&f, 1))?;
@@ -81,8 +122,8 @@ fn bounds(backend: Arc<dyn AtomicBackend>, metrics: Arc<Metrics>) -> anyhow::Res
     assert!(bounded(&metrics, "get", 0, || s.get(&a.id))?.is_some());
     assert!(bounded(&metrics, "get_absent", 0, || s.get("missing"))?.is_none());
     bounded(&metrics, "inspect", 2, || s.inspect(&a.id))?;
-    assert_eq!(bounded(&metrics, "list_name", 4, || s.list(Some("target"), "target:"))?.len(), 4);
-    assert_eq!(bounded(&metrics, "list_prefix", 4, || s.list(None, "target:"))?.len(), 4);
+    assert_eq!(bounded(&metrics, "list_name", 5, || s.list(Some("target"), "target:"))?.len(), 5);
+    assert_eq!(bounded(&metrics, "list_prefix", 5, || s.list(None, "target:"))?.len(), 5);
     assert_eq!(bounded(&metrics, "due_page", 7, || s.due(1, 7))?.len(), 7);
     assert!(bounded(&metrics, "due_empty", 0, || s.due(-1, 7))?.is_empty());
     assert!(bounded(&metrics, "due_zero_limit", 0, || s.due(i64::MAX, 0))?.is_empty());
@@ -312,6 +353,9 @@ fn index_atomicity(
         "unregister",
         "definition",
         "activate",
+        "subscribe",
+        "publish",
+        "trigger",
     ] {
         let before = backend.snapshot()?;
         assert!(backend.compare_exchange(&before, &ouro_durable::Rows::new())?);
@@ -357,6 +401,18 @@ fn index_atomicity(
                 "unregister" => s.unregister_wait(&p, "event", &["answer".into()], 0),
                 "definition" => s.save_definition("workflow", "third").map(|_| ()),
                 "activate" => s.activate("workflow", second.version),
+                "subscribe" => s.subscribe(&p, "listen", &["answer".into()], 0),
+                "publish" => s.publish(&json!({"id":"1","source":"/s","type":"published"}), Some("p"), 0).map(|_| ()),
+                "trigger" => s
+                    .swap_trigger(
+                        "slot",
+                        None,
+                        Some(&Trigger { at_ms: Some(5), types: vec!["t".into()], state: json!(1) }),
+                        &[admission("fired")],
+                        Some(&Rearm { trigger: "slot".into(), delay_ms: 1 }),
+                        0,
+                    )
+                    .map(|_| ()),
                 _ => unreachable!(),
             }
         };

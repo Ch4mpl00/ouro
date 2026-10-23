@@ -16,8 +16,8 @@ use proptest::test_runner::{TestCaseError, TestRunner};
 use serde_json::{Value, json};
 use support::host::{Entry, Observed, Options, Ran, calls, execute, hit_limit, observed, pretty};
 use support::program::{
-    Body, Catch, Cond, Data, Flow, Items, Num, Profile, Program, Task, Template, definition, each_task, fix, input,
-    list_at, lists, program, task,
+    Body, Catch, Cond, Data, Ext, Flow, Items, Num, Profile, Program, Task, Template, definition, each_task, fix,
+    input, list_at, lists, program, task,
 };
 
 fn check<S: Strategy>(strategy: S, test: impl Fn(S::Value) -> Result<(), TestCaseError>)
@@ -209,6 +209,22 @@ fn identity_transforms_change_nothing() {
 }
 
 #[test]
+fn identity_extensions_and_extensions_that_never_apply_change_nothing() {
+    check((program(Profile::DETERMINISTIC), input()), |(p, input)| {
+        let identity = || Some(vec![task("same", Body::Set(Template::Expr(Data::Same)))]);
+        let mut q = p.clone();
+        q.extensions.push(Ext { extend: "all".into(), when: None, before: identity(), after: identity() });
+        q.extensions.push(Ext {
+            extend: "all".into(),
+            when: Some(Cond::False),
+            before: Some(vec![task("never", Body::Raise(500))]),
+            after: None,
+        });
+        same(&p, &q, input)
+    });
+}
+
+#[test]
 fn set_as_an_expression_or_a_template_is_the_same() {
     check((program(Profile::DETERMINISTIC), input()), |(p, input)| {
         let mut q = p.clone();
@@ -251,6 +267,7 @@ fn a_fork_outputs_what_each_branch_outputs_alone() {
             input_from: None,
             output_as: None,
             functions: p.functions.clone(),
+            extensions: Vec::new(),
             tasks: vec![task("f", Body::Fork { branches: p.tasks.clone(), compete: false })],
             bare: p.bare,
         };
