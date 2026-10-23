@@ -30,6 +30,7 @@ fn run(rows: &mut dyn Transaction, id: &str) -> anyhow::Result<StoredRun> {
 fn component(value: &str) -> String {
     value.as_bytes().iter().map(|b| format!("{b:02x}")).collect()
 }
+// Flip the sign bit so lexicographic order also covers negative timestamps.
 fn time_key(ms: i64) -> String {
     format!("{:016x}", u64::from_be_bytes((ms ^ i64::MIN).to_be_bytes()))
 }
@@ -53,6 +54,8 @@ fn prefix_end(prefix: &str) -> Option<String> {
     }
     None
 }
+// Index only eligible waits and unswept evidence: a full inbox or an already
+// swept run must not make subsequent lookups walk historical registrations.
 fn indexes(s: &StoredRun) -> Rows {
     let mut keys = Rows::new();
     let id = &s.run.admission.id;

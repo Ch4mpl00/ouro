@@ -85,16 +85,50 @@ too. Terminal runs cannot reopen. Interrupted runs back off from 2 seconds to
 kept for seven days by default; outcomes and version history remain.
 
 `RunStore` describes transactions, without SQL. Third-party adapters may
-implement it directly or reuse `TransactionalStore` over `AtomicBackend`
-(ordered consistent snapshots plus atomic compare-and-swap). The bundled
-adapters store a JSON aggregate per run and a catalog per definition name, and
-atomically update changed rows. A database-wide revision serializes writers.
-This favors one shared correctness implementation in phase 1; snapshot reads
-scale with stored state, and these adapters are not tuned for high throughput.
+implement it directly or reuse `TransactionalStore` over `AtomicBackend`.
+That seam opens a serializable transaction with point reads, ordered
+`[start, end)` scans with a limit, writes, deletes and a durable atomic commit.
+Full `snapshot` and `compare_exchange` methods serve persisted-state audits
+and corruption injection only; runtime operations never call them.
+
+The engine owns primary and secondary keys in `(kind, id)` order:
+
+| Kind | ID | Purpose |
+| --- | --- | --- |
+| `run` | run ID | One run's admission, lease, records, waits and events |
+| `definitions` | definition name | One name's immutable versions and activation/breaker state |
+| `name:<hex name>` | run ID | Listing by name and run-ID prefix |
+| `due` | ordered time + run ID | Bounded pages of eligible runs; running runs use lease expiry |
+| `wait:<hex event type>` | ordered registration time + run ID | Oldest eligible delivery, excluding pending copies |
+| `children:<hex parent ID>` | child ID | Live descendants for atomic cancellation |
+| `finished` | ordered end time + run ID | Retained evidence due for sweeping |
+
+Index entries contain the run ID and change in the same transaction as the
+run. Times use sign-adjusted, fixed-width hexadecimal; names and event types
+use hexadecimal UTF-8 so delimiters cannot collide. Database composite primary
+keys are B-tree indexes with binary ordering. Point operations touch a constant
+number of rows; listing, cancellation and retention read their matches, and
+`due` reads at most its requested page. JSON work still scales with the evidence
+inside the affected run or the versions of the affected definition name.
+
+SQLite uses `BEGIN IMMEDIATE`, WAL and `synchronous = FULL`. Postgres uses
+`SERIALIZABLE`; memory validates per-key versions and limited range results,
+including missing keys and phantoms. The engine retries only definite
+serialization/deadlock aborts, at most 128 attempts with capped backoff.
+Unrelated runs share no revision or validation counter. Runs finishing against
+the same active definition intentionally share its breaker transaction.
+Ambiguous commits and transport errors propagate without retry.
+
+Both initial migrations were replaced before any release or deployment. This
+layout requires a fresh database from the earlier development checkout; there
+is no conversion of that unreleased layout. Applied migrations are immutable
+from the next release onward.
 
 The interpreter's persistence seams are synchronous. The Postgres adapter uses
-`tokio-postgres` and `deadpool-postgres` on a dedicated I/O thread with bounded
-requests and a 30-second operation timeout. The calling thread waits for the
+`tokio-postgres` and `deadpool-postgres` on a dedicated I/O thread with a
+64-request admission queue, at most 16 concurrent sessions and a 30-second
+transaction timeout. Dropping the backend drains its sessions and joins the
+I/O thread. The calling thread waits for the
 commit. Use a multithreaded Tokio host for concurrent workloads. Inject a
 `deadpool_postgres::Manager` with `PostgresBackend::with_manager` for TLS or
 custom connection settings; the URL convenience constructor uses `NoTls`.
@@ -119,6 +153,18 @@ checkpoint boundary, child notifications, rollback and ambiguous commits,
 corruption, concurrent claims, retention and liveness drains. Factories supply
 an independent reopen handle, persisted-row inspection and failure injection.
 
+`cargo test -p ouro-durable --test scalability -- --nocapture` checks every
+operation's row bound with 10,000 unrelated persisted runs, full inboxes,
+index rollback boundaries, eight contending workers, lease replacement and
+an exact shared breaker count on all three adapters. Backend `Metrics` expose
+returned rows, attempted row mutations and definite conflicts; memory also
+counts its validation reads. The ignored local benchmark reports start,
+claim, save-record and finish operations per second at 1,000 and 10,000 runs:
+
+```sh
+cargo test -p ouro-durable --test throughput -- --ignored --nocapture
+```
+
 Postgres tests automatically start a `postgres:16` testcontainer. To use an
 existing test server, provide a URL with permission to create databases:
 
@@ -138,7 +184,6 @@ upstream example-corpus exception are in [schema/README.md](crates/owf/schema/RE
 - napi binding, server binary and language bindings.
 - Official CTK runner and broader DSL coverage, including native child syntax.
 - Deterministic simulation and the kill -9 load/fault harness.
-- Storage layout that scales: per-run rows and per-key compare-and-swap instead of whole-store snapshots behind one global revision.
 - Version-compatibility corpora.
 
 Agents (agent loops, guards, confirmations, sub-agents, skills) are applications built on this runtime, not part of it; [ouro-agent](https://github.com/Ch4mpl00/ouro-agent) is one.
