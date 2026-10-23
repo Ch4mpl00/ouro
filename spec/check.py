@@ -103,6 +103,7 @@ def main():
         if selected("mutations"):
             run("contract-mutants", ["python3", str(ROOT / "contract_mutations.py")])
             run("contract-faults", ["python3", str(ROOT / "contract_faults.py")])
+            run("contract-fault-detection", ["python3", str(ROOT / "contract_fault_detection.py")])
             run("mutations", ["python3", str(ROOT / "mutations.py")])
             run("mutations-apalache", ["python3", str(ROOT / "mutations.py"), "all", "--backend", "apalache"])
         if selected("rust"):
@@ -112,6 +113,11 @@ def main():
             run("fmt", ["cargo", "fmt", "--all", "--", "--check"])
             run("clippy", ["cargo", "clippy", "--workspace", "--all-targets", "--", "-D", "warnings"])
             run("workspace-tests", ["cargo", "test", "--workspace"])
+            aliases = {"fmt": "fmt-final", "clippy": "clippy-final", "workspace-tests": "workspace-final"}
+            (output / "final-rust-checks.json").write_text(json.dumps([
+                {"check": aliases[row["check"]], "seconds": row["seconds"], "exit": row["exit"]}
+                for row in results if row["check"] in aliases
+            ], indent=2) + "\n")
             run("restart-example", ["cargo", "run", "-p", "ouro-restart-example"])
             if "TEST_DATABASE_URL" in os.environ:
                 run("postgres-mbt", ["cargo", "test", "-p", "ouro-durable", "--test", "quint", "quint_postgres", "--", "--ignored", "--nocapture"])

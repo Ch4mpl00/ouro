@@ -54,7 +54,7 @@ bound represents one parent/child, not arbitrary subtree depth.
 | C1 | `C1`: acyclic owned link and one child admission | Serial child witness; existing native-child recovery tests |
 | C2 | `C2`: terminal child has notification obligation | Serial bridge and child conformance |
 | C3 | `C3`: cancellation closes the bounded subtree | Serial cascade witness; handler cancellation tests remain separate |
-| T1 | `T1`: slot disposition coupled to admission/skip | Concurrent trigger CAS batch; schedule, catchup and overlap witnesses |
+| T1 | `T1`: slot disposition coupled to admission/skip | Concurrent trigger CAS batch; schedule, catchup and overlap witnesses; ignored global-ingress and overlap regressions for #4 |
 | T2 | `T2`: activation epoch and dormant rearm | Rearm witness; ignored old-epoch rearm regression for #4 |
 | T3 | `T3`: fixed admission deadline | Deadline witness; ignored admission-to-first-drive deadline regression for #4 |
 | V1 | `V1`: activation and pinned admission | Serial bridge; runtime pinned-version recovery |
@@ -103,8 +103,9 @@ not reasons to weaken the contract.
 The configured margin is represented as `epsilon = 1` in the lease guard and a
 bounded forward clock-jump switch. Independent positive/negative worker skew is
 not enumerated, so real-time safety under every skew within ε is **not checked**.
-Compatibility uses exact matching plus the undeclared default; an arbitrary
-host-supplied compatibility relation and its governance are **not checked**.
+Compatibility uses exact matching plus undeclared admission metadata. Workers
+have declared versions; mixed undeclared-worker cases, no-compatible-worker waiting,
+and an arbitrary host-supplied compatibility relation are **not checked**.
 
 ### Executable contract experiments
 
@@ -114,6 +115,10 @@ spec/node_modules/.bin/quint run spec/contract.qnt --invariant checked --max-sam
 python3 spec/contract_mutations.py
 python3 spec/contract_faults.py
 python3 spec/contract_fault_detection.py
+APALACHE_ENDPOINT=localhost:8823 python3 spec/deeper.py
+APALACHE_ENDPOINT=localhost:8823 python3 spec/deeper.py --contract-depth 4
+# Restart the native checker after heap exhaustion before the smaller attempt.
+APALACHE_ENDPOINT=localhost:8823 python3 spec/deeper.py --contract-depth 3
 APALACHE_ENDPOINT=localhost:8823 JAVA=/path/to/java APALACHE_JAR=/path/to/apalache.jar python3 spec/contract_temporal.py
 ```
 
@@ -151,6 +156,7 @@ all 38 properties are exercised by every batch. Postgres remains explicitly opt-
 | File | Responsibility |
 | --- | --- |
 | `contract.qnt`, `contract_witnesses.qnt` | Normative contract monitors, invocation/event shadow and 17 reachable witnesses |
+| `contract_bounded.qnt` | Reachable call fixture for checking the normative shadow symbolically |
 | `contract_progress.qnt` | E5 and L1–L5 finite temporal obligation quotient |
 | `types.qnt` | Run identity, lease/fence predicates and fixed domains |
 | `calls.qnt` | Shared dispatch eligibility for absent/intent/result/failure records |

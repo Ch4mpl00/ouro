@@ -1,3 +1,215 @@
+# Contract checking — 2026-10-23
+
+All 38 contract IDs now have named model predicates and a detected target
+mutant. This is **bounded and partial verification**, not a proof of the whole
+contract: the shadow checks the invocation/event projection; a full section 2
+refinement, including fair-history correspondence, remains unproved. The exact
+coverage and exclusions are in [README.md](README.md#contract-coverage).
+
+No `crates/*/src` file changed. Work stayed on `feat/quint-contract`; no push.
+Environment: Cargo 1.90.0, Node 22.16.0, Quint 0.33.0, Apalache 0.62.4,
+portable JDK 21.0.8. Local fake effects only. Public issue pages #1–#4 were read;
+no issue/comment was written.
+
+## Results
+
+- Normative contract: **17 deterministic witnesses pass**; **10,000 × 150** mixed-fault
+  simulated steps, seed **20261023**, pass `checked` (all safety monitors plus shadow
+  correspondence), **117.599 s evaluator time**. This is sampling, not exhaustive.
+- Each of the **11 fault rows**: **1,000 × 150** traces, seed 20261023, no violation.
+  Separate broken-mechanism witnesses detect a bad consequence for every row.
+- **32 safety mutants**: one per ID, every target detected. Every safety monitor is
+  evaluated along each scripted trace; off-target clean cells are only sampled.
+- **E5 + L1–L5**: complete finite obligation quotient, baseline **1,748 generated /
+  373 distinct states**, complete graph depth **13**, no error. All six mutants
+  are detected. Each mutant is checked against all six IDs plus E5 delivery.
+- Concurrent MBT: Memory and SQLite each pass **60 batches / 180 operations**,
+  with all legal real-time-respecting orders searched. Dedicated run: **0.49 s**
+  for both plus the negative checker test. Postgres concurrent MBT is ignored
+  unless explicitly selected with `TEST_DATABASE_URL`; it was not run here.
+- Generated interpreter properties: **64 R2 cases**, **128 effect-history cases**.
+  Runtime isolation property: **64 read/write sequence cases**. The default
+  workspace run also executes the prior generated properties and conformance.
+
+The new contract call/shadow fixture reuses `transition`, `audit`, `idealEvent`
+and state correspondence unchanged from a reachable admitted/claimed state.
+Other domains are inactive in that fixture. Both new-fixture symbolic attempts
+exhausted the 4 GiB heap; neither supplies a passing bounded proof. The old composed fixture still checks the
+original implementation-shaped protocol, now one step deeper.
+
+| Symbolic check | Depth | Result | Wall seconds |
+| --- | ---: | --- | ---: |
+| version_check | 12 | Pass | 8.683 |
+| event_check | 10 | Pass | 97.439 |
+| child_check | 6 | Pass | 46.513 |
+| call_check | 9 | Inconclusive: timeout | 900.007 |
+| bounded | 3 | Pass | 463.379 |
+| New contract call/shadow fixture | 4 | Inconclusive: 4 GiB Java heap exhausted | 210.399 |
+| New contract call/shadow fixture | 3 | Inconclusive: Java heap space | 197.911 |
+
+Required Rust checks (all with `CARGO_HOME=/private/tmp/ouro-cargo`; workspace uses `OURO_REQUIRE_QUINT=1`):
+
+| Command | Exit | Wall seconds |
+| --- | ---: | ---: |
+| `cargo fmt --all -- --check` | 0 | 0.301 |
+| `cargo clippy --workspace --all-targets -- -D warnings` | 0 | 1.52 |
+| `OURO_REQUIRE_QUINT=1 cargo test --workspace` | 0 | 284.602 |
+
+## Pending and bug regressions
+
+The following eight tests are deliberately ignored by default. Each was selected
+explicitly and **failed at its contract assertion**, confirming the gap. The store
+fixtures enumerate Memory and SQLite, but an explicit failing invocation stops
+at its first Memory fixture; it does not establish both pending adapter outcomes.
+
+| Test | Ignore reason / observed mismatch |
+| --- | --- |
+| `gaps::w2_conflicting_event_identity_is_an_error` | pending #4: conflicting source/id payload is silently accepted |
+| `gaps::w3_mailbox_expiry_is_observable` | pending #4: live addressed event remains pending past one-day TTL |
+| `gaps::t2_old_completion_cannot_rearm_new_epoch` | pending #4: old run changes replacement epoch trigger from dormant to due at 11 |
+| `gaps::v2_old_epoch_fault_does_not_count_after_reactivation` | pending #4: same-version reactivation permits an old fault to increment count to 1 |
+| `gaps::v3_incompatible_worker_cannot_claim` | pending #3: the current public claim has no worker-version argument and grants the claim |
+| `t3_admission_fixes_the_workflow_deadline` | pending #4: first drive restarts the workflow deadline after admission has expired |
+| `t1_ingress_identity_is_global_across_triggers` | pending #4: one ingress identity starts two runs under two trigger names |
+| `t1_live_schedule_run_prevents_overlap` | pending #4: a waiting prior schedule run does not prevent another admission |
+
+The compatibility test's command carries the worker version; its adapter currently
+cannot pass that argument to `RunStore::claim`. The ignored assertion exposes the
+missing public seam; no test-side compatibility guard pretends to implement #3.
+No new non-#3/#4 production bug was found; no `#[ignore = "bug: ..."]` test was added.
+The other default ignores are the two opt-in Postgres MBT tests and the existing
+throughput benchmark.
+
+## Mutant footprint and independence
+
+The following list is the compact matrix: each row lists every observed violation.
+The full 38-column matrix, explicit `sampled_clean`, `exhaustive_clean`,
+`structurally_absent` and `not_checked` cells, commands/bounds and source hashes are
+in [contract-evidence.json](contract-evidence.json), regenerated with
+`python3 spec/evidence.py` after the experiments.
+
+A1's mutant also trips V1's admission clause, as predicted. E3's fabricated result
+also trips R2's decision rule. R1's wrong accumulator is caught without E4, showing
+why immutable records alone do not establish continuation. R3's missing causal
+record is caught without a second dispatch. L5's missing cleanup blocks L1–L4 in
+this quotient; this agrees with the contract's intentional progress overlap.
+A3's mutant also violates fencing because its chosen mechanism writes through a
+terminal renewal; that footprint is not a proof that A3 follows from A5. The
+matrices make no minimal-basis or universal independence claim.
+
+| Target | Observed violations | Scope | Seconds |
+| --- | --- | --- | ---: |
+| A1 | A1, O2, V1, X3 | Scripted witness | 3.476 |
+| A2 | A2 | Scripted witness | 3.362 |
+| A3 | A3, A5, X3 | Scripted witness | 3.335 |
+| A4 | A4 | Scripted witness | 3.373 |
+| A5 | A5 | Scripted witness | 3.358 |
+| E1 | E1 | Scripted witness | 3.448 |
+| E2 | E2 | Scripted witness | 3.412 |
+| E3 | E3, R2 | Scripted witness | 3.396 |
+| E4 | E4 | Scripted witness | 3.408 |
+| R1 | R1 | Scripted witness | 3.353 |
+| R2 | R2 | Scripted witness | 3.314 |
+| R3 | R3 | Scripted witness | 3.311 |
+| W1 | W1 | Scripted witness | 3.384 |
+| W2 | W2 | Scripted witness | 3.409 |
+| W3 | W3 | Scripted witness | 3.444 |
+| W4 | W4 | Scripted witness | 3.517 |
+| W5 | W5 | Scripted witness | 3.645 |
+| C1 | C1 | Scripted witness | 3.339 |
+| C2 | C2 | Scripted witness | 3.972 |
+| C3 | C3 | Scripted witness | 3.523 |
+| T1 | T1 | Scripted witness | 3.321 |
+| T2 | T2 | Scripted witness | 3.392 |
+| T3 | T3 | Scripted witness | 3.424 |
+| V1 | V1 | Scripted witness | 3.445 |
+| V2 | V2 | Scripted witness | 3.38 |
+| V3 | V3 | Scripted witness | 3.378 |
+| O1 | O1 | Scripted witness | 3.399 |
+| O2 | O2 | Scripted witness | 3.349 |
+| O3 | O3 | Scripted witness | 3.325 |
+| X1 | X1 | Scripted witness | 3.38 |
+| X2 | X2 | Scripted witness | 3.396 |
+| X3 | A1, A3, O2, V1, X3 | Scripted witness | 3.387 |
+| E5 | E5 | Exhaustive quotient | 5.079 |
+| L1 | L1 | Exhaustive quotient | 4.837 |
+| L2 | L1, L2 | Exhaustive quotient | 4.401 |
+| L3 | L3 | Exhaustive quotient | 4.401 |
+| L4 | L4 | Exhaustive quotient | 4.494 |
+| L5 | L1, L2, L3, L4, L5 | Exhaustive quotient | 3.829 |
+
+## Fault × property experiment
+
+| Fault switch | Defective mechanism | Observed violations | Detection seconds | Tolerance seconds |
+| --- | --- | --- | ---: | ---: |
+| 1: boundary crash | O1 mutant | E2, O1 | 3.447 | 13.637 |
+| 2: ambiguous commit | E3 mutant | E3, R2 | 3.422 | 14.636 |
+| 3: duplicate delivery | W2 mutant | W2 | 3.6 | 17.559 |
+| 4: reordering | W4 mutant | W4 | 3.647 | 17.01 |
+| 5: concurrent racers | W1 mutant | W1 | 3.377 | 14.759 |
+| 6: lease expiry | A5 mutant | A5 | 3.36 | 14.413 |
+| 7: clock jump | T3 mutant | T3 | 3.341 | 14.455 |
+| 8: storage disconnect | O1 mutant | E2, O1 | 3.442 | 13.394 |
+| 9: schema-invalid data | A4 mutant | A4 | 3.309 | 14.565 |
+| 10: version change | V2 mutant | V2 | 3.467 | 15.185 |
+| 11: mixed deployment | V3 mutant | V3 | 3.364 | 14.641 |
+
+## Findings and limits
+
+1. **Full top-level refinement is not complete.** The independent shadow verifies
+   calls/events and persisted correspondence, but not a second executor for all
+   catalog, trigger, capacity and workflow control-flow semantics. Its liveness
+   relation to the progress quotient is not proved. `checked` must not be cited
+   as the full section 2 theorem.
+2. **No exhaustive safety independence claim.** All target mutants fail, but clean
+   off-target safety cells are scripted samples. Temporal cells are exhaustive
+   only within their finite quotient. Cross-model domains are structurally absent.
+3. **The entire predicted fault × property matrix is not proved.** Every row is
+   executed and has a detected bad consequence; this does not establish every
+   predicted cell. Zero violations in the unmodified fault runs mean tolerance,
+   not an uncovered defect. No defective row in the measured detection experiment
+   escaped all monitors.
+4. Independent signed worker skew within ε is not enumerated. A one-tick safety
+   margin and bounded forward clock change do not prove the complete skew claim.
+5. V3 models undeclared/exact versions. An arbitrary declared compatibility relation,
+   compatibility-wait timeout and version-aware renew/finish adapter bridge remain
+   unimplemented/unverified. The current domains do not exercise no-compatible-worker waiting or an undeclared
+   worker against a declared admission. No compatible-worker API exists yet.
+6. A4 uses a representative numeric result schema; R3 uses invocation frontiers.
+   Arbitrary corrupted-format restoration and causal DAGs need more modeling;
+   existing Rust corruption and interpreter tests are complementary, not a theorem.
+7. E5 is a conditional atomic fake-recipient composition, not a new production
+   execution mode. O3's capacity quotient does not bound external work after lease
+   loss. L5's quotient has same-process cleanup, but no new runtime-level injected
+   waiter-acquisition error test was added.
+8. Generated effect-history comparison uses sequential CORE workflows, stable
+   responses and one random commit failure per case. R2 uses separate hosts in one
+   process, not OS-process isolation. X1/X2 generation covers function calls;
+   existing DSL tests separately cover child and emit paths.
+9. The old serial Quint bridge remains a narrower implementation projection;
+   ignored gap assertions do not yet constitute a complete new-model adapter for
+   every #3/#4 transition. Concurrent batches cover five operation families, not
+   every interleaving of the full public API.
+
+Decisions beyond the brief are bounded abstractions: two runs/workers/invocations,
+one event type, two versions, a one-permit domain, five-tick representative TTLs,
+atomic broadcast fanout, no checkpoint-fork API, and an optional atomic recipient
+for E5. These are model choices, not edits to the contract's remaining open policy
+decisions. Events use integer representatives for `(source,id)` identities.
+
+The model's development found monitor/fixture errors (aborted activation audited
+as committed, duplicate activation audited as one epoch change, and false label-only
+shadow acceptance). They were corrected without changing the contract. The concurrent
+oracle initially expected data instead of the API's event envelope; its projection
+was corrected. One initial pending-schedule fixture used invalid empty `set` syntax;
+the corrected fixture failed at the intended ingress assertion. None is reported
+as a production bug.
+
+## Previous implementation-model pass
+
+The following is historical evidence from the preceding pass; its narrower claims
+and test counts are not replacements for the contract results above.
+
 # Checked evidence — 2026-10-23
 
 Environment: Apple Silicon macOS, Node 22.16.0, Rust/Cargo 1.90.0,
