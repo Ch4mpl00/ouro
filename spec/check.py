@@ -45,6 +45,8 @@ def main():
         for source in sorted(ROOT.glob("*.qnt")):
             run(f"typecheck-{source.stem}", [QUINT, "typecheck", str(source)])
         run("unit-witnesses", [QUINT, "test", str(ROOT / "witnesses.qnt"), "--max-samples", "1", "--seed", "20261023"])
+        run("unit-contract", [QUINT, "test", str(ROOT / "contract_witnesses.qnt"), "--max-samples", "1", "--seed", "20261023"])
+        run("contract-simulation", [QUINT, "run", str(ROOT / "contract.qnt"), "--invariant", "checked", "--max-samples", str(args.samples), "--max-steps", "150", "--seed", "20261023", "--verbosity", "1"])
         run("unit-liveness", [QUINT, "test", str(ROOT / "liveness.qnt"), "--max-samples", "10", "--seed", "20261023"])
         run("simulation", [QUINT, "run", str(ROOT / "protocol.qnt"), "--max-samples", str(args.samples),
                            "--max-steps", "150", "--seed", "20261023", "--invariant", "safety", "--witnesses",
@@ -71,6 +73,7 @@ def main():
                     time.sleep(1)
                 else:
                     raise RuntimeError("Apalache did not start; see apalache-server.log")
+        os.environ["APALACHE_ENDPOINT"] = endpoint
         if selected("symbolic"):
             for module, depth in [("call_check", 7), ("event_check", 6), ("version_check", 8), ("child_check", 4)]:
                 run(f"bmc-{module}", [QUINT, "verify", str(ROOT / f"{module}.qnt"), "--invariant",
@@ -96,10 +99,14 @@ def main():
                                "-v", f"{directory}:/models", "-w", "/models", IMAGE, "-Xmx2g", "-cp", "/opt/apalache/lib/apalache.jar",
                                "tlc2.TLC", "-workers", "2", "-metadir", "/tmp/tlc", "liveness.tla"]
                 run("tlc-liveness", command)
+            run("contract-temporal", ["python3", str(ROOT / "contract_temporal.py")])
         if selected("mutations"):
+            run("contract-mutants", ["python3", str(ROOT / "contract_mutations.py")])
+            run("contract-faults", ["python3", str(ROOT / "contract_faults.py")])
             run("mutations", ["python3", str(ROOT / "mutations.py")])
             run("mutations-apalache", ["python3", str(ROOT / "mutations.py"), "all", "--backend", "apalache"])
         if selected("rust"):
+            os.environ["OURO_REQUIRE_QUINT"] = "1"
             env_cache = os.environ.get("CARGO_HOME", "/private/tmp/ouro-cargo")
             os.environ["CARGO_HOME"] = env_cache
             run("fmt", ["cargo", "fmt", "--all", "--", "--check"])
