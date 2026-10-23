@@ -1,0 +1,25 @@
+[package]
+name = "ouro-durable"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+async-trait = "0.1.92"
+anyhow = "1.0.104"
+owf = { path = "../owf" }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = { version = "1.0.151", features = ["preserve_order"] }
+chrono = "0.4.45"
+futures = "0.3.34"
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+tokio = { version = "1.53.1", features = ["rt", "sync", "time", "test-util"] }
+tokio-util = "0.7.19"
+tokio-postgres = "0.7.18"
+deadpool-postgres = "0.14.2"
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+proptest = "1"
+tempfile = "3"
+testcontainers = "0.27.3"
+tokio = { version = "1.53.1", features = ["full", "test-util"] }

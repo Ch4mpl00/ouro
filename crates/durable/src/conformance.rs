@@ -1,0 +1,656 @@
+//! Adapter-independent safety and liveness checks. Every audit reloads persisted
+//! state. Factories must return a fresh store for each case; reopening must
+//! create an independent handle to the same database (memory may share state).
+//! Based on the original admission, event-history, child and crash properties.
+use crate::*;
+use owf::run::WorkflowError;
+use serde_json::json;
+use std::collections::BTreeSet;
+
+pub struct TestStore {
+    pub store: Arc<dyn RunStore>,
+    pub reopen: Arc<dyn Fn() -> anyhow::Result<Arc<dyn RunStore>> + Send + Sync>,
+    pub faults: Arc<FaultInjector>,
+    /// Read actual adapter rows, independently of the transition engine.
+    pub backend: Arc<dyn AtomicBackend>,
+}
+#[derive(Debug, Default)]
+pub struct Report {
+    pub cases: usize,
+    pub operations: usize,
+    pub crash_points: usize,
+    pub execution_crashes: usize,
+    pub witnesses: BTreeSet<&'static str>,
+}
+pub fn admission(id: &str) -> Admission {
+    Admission {
+        id: id.into(),
+        name: "workflow".into(),
+        version: 1,
+        definition: "original".into(),
+        input: json!({"n":1}),
+        runtime: json!({}),
+    }
+}
+fn audit(store: &dyn RunStore) -> anyhow::Result<()> {
+    for r in store.list(None, "")? {
+        let s = store.inspect(&r.admission.id)?.unwrap();
+        if r.ended_ms.is_some() {
+            assert!(s.awaits.is_empty() && s.listeners.is_empty());
+            assert!(r.fence.is_none());
+        }
+        let mut pending = BTreeSet::new();
+        let mut consumed = BTreeSet::new();
+        for e in &s.events {
+            if let Some(k) = &e.consumed_key {
+                assert!(consumed.insert(k));
+                let Some(Record::Event { event }) = s.records.get(k) else {
+                    panic!("consumption without journal evidence")
+                };
+                assert_eq!(event["type"], e.type_);
+                assert_eq!(event["data"], e.data);
+            } else {
+                assert!(pending.insert(&e.type_), "duplicate pending delivery");
+            }
+        }
+        for (k, r) in &s.records {
+            if matches!(r, Record::Event { .. }) {
+                assert!(consumed.contains(k));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Run the full contract against any adapter. The factory label is suitable
+/// for naming a fresh database. Panics are assertion failures; storage errors
+/// are returned with their original cause.
+pub fn run_all(factory: impl Fn(&str) -> anyhow::Result<TestStore>) -> anyhow::Result<Report> {
+    let mut report = Report::default();
+    let t = factory("leases")?;
+    report.cases += 1;
+    let s = &t.store;
+    assert!(s.admit(&admission("r"), 0)?);
+    let mut changed = admission("r");
+    changed.definition = "changed".into();
+    changed.input = json!(2);
+    assert!(!s.admit(&changed, 0)?);
+    changed.name = "other".into();
+    assert!(s.admit(&changed, 0).is_err());
+    assert_eq!(s.get("r")?.unwrap().admission, admission("r"));
+    let old = s.claim("r", 0)?.unwrap();
+    assert!(s.claim("r", 0)?.is_none());
+    s.renew(&old, 1)?;
+    let record = Record::Timer { deadline_ms: 100 };
+    s.save_record(&old, "wait", &record, 2)?;
+    assert!(s.save_record(&old, "wait", &Record::Timer { deadline_ms: 200 }, 2).is_err());
+    let reopened = (t.reopen)()?;
+    let current = reopened.claim("r", LEASE_MS + 2)?.unwrap();
+    assert!(s.load_records(&old, LEASE_MS + 2).is_err());
+    assert!(s.renew(&old, LEASE_MS + 2).is_err());
+    assert!(s.release(&old, LEASE_MS + 2).is_err());
+    assert!(s.save_record(&old, "new", &record, LEASE_MS + 2).is_err());
+    assert!(s.finish(&old, &Status::Completed(json!(0)), LEASE_MS + 2, 3).is_err());
+    assert_eq!(reopened.load_records(&current, LEASE_MS + 2)?.get("wait"), Some(&record));
+    reopened.finish(&current, &Status::Completed(json!(42)), LEASE_MS + 2, 3)?;
+    assert!(reopened.due(i64::MAX, 100)?.is_empty());
+    assert!(reopened.claim("r", i64::MAX)?.is_none());
+    audit(&*reopened)?;
+    report.operations += 18;
+    report.witnesses.insert("expired worker fenced after reopen");
+
+    let t = factory("interruptions")?;
+    report.cases += 1;
+    let s = &t.store;
+    let mut now = 0;
+    let mut f = s.start(&admission("r"), now)?.unwrap();
+    assert!(s.due(now, 100)?.is_empty());
+    assert!(s.start(&admission("r"), now)?.is_none());
+    for n in 1..=MAX_INTERRUPTIONS {
+        let status = s.finish(&f, &Status::Interrupted(WorkflowError::runtime("corrupt")), now, 3)?;
+        audit(&**s)?;
+        report.operations += 1;
+        if n == MAX_INTERRUPTIONS {
+            assert!(matches!(status, Status::Faulted(_)));
+            break;
+        }
+        let r = s.get("r")?.unwrap();
+        assert_eq!(r.interruptions, n);
+        assert!(r.wake_at_ms > now);
+        assert!(s.claim("r", r.wake_at_ms - 1)?.is_none());
+        now = r.wake_at_ms;
+        f = s.claim("r", now)?.unwrap();
+    }
+    report.witnesses.insert("interruptions back off and terminate");
+
+    let t = factory("events")?;
+    report.cases += 1;
+    let s = &t.store;
+    let f = s.start(&admission("r"), 0)?.unwrap();
+    let types = vec!["answer".into()];
+    s.register_wait(&f, &types, 0)?;
+    for k in ["first", "second"] {
+        assert!(s.take_event(&f, k, &types, 0)?.is_none());
+    }
+    assert_eq!(s.deliver("answer", &json!(1), 1)?, Some("r".into()));
+    assert!(s.deliver("answer", &json!(2), 1)?.is_none());
+    let first = s.take_event(&f, "first", &types, 2)?.unwrap();
+    assert_eq!(s.take_event(&f, "first", &types, 2)?, Some(first));
+    assert!(s.deliver("answer", &json!(2), 2)?.is_some());
+    // Delivery wins the race against the worker releasing as waiting.
+    s.finish(&f, &Status::Waiting { wake_at_ms: i64::MAX }, 3, 3)?;
+    let f = s.claim("r", 3)?.unwrap();
+    assert_eq!(s.take_event(&f, "second", &types, 3)?.unwrap()["data"], 2);
+    s.register_wait(&f, &types, 3)?;
+    s.take_event(&f, "timeout", &types, 3)?;
+    s.take_event(&f, "sibling", &types, 3)?;
+    s.unregister_wait(&f, "timeout", &types, 3)?;
+    assert!(s.deliver("answer", &json!(3), 3)?.is_some());
+    assert!(s.take_event(&f, "sibling", &types, 3)?.is_some());
+    s.finish(&f, &Status::Completed(json!(3)), 3, 3)?;
+    assert!(s.deliver("answer", &json!(4), 3)?.is_none());
+    audit(&**s)?;
+    report.operations += 20;
+    report.witnesses.extend([
+        "same-type concurrent listeners",
+        "replayed consumption",
+        "delivery wake survives release",
+        "terminal cleanup",
+    ]);
+
+    let t = factory("children")?;
+    report.cases += 1;
+    let s = &t.store;
+    let p = s.start(&admission("p"), 0)?.unwrap();
+    let link = ChildLink { parent: "p".into(), key: "round:1".into(), reference: "/start".into() };
+    let c = s.start_child(&p, &admission("c"), &link, 0)?.unwrap();
+    s.finish(&c, &Status::Waiting { wake_at_ms: 0 }, 1, 3)?;
+    assert!(s.take_event(&p, "waiting", &["waiting:c".into()], 1)?.is_some());
+    let c = s.claim("c", 1)?.unwrap();
+    s.finish(&c, &Status::Completed(json!(42)), 2, 3)?;
+    assert!(s.take_event(&p, "done", &["done:c".into()], 2)?.is_some());
+    assert!(s.start_child(&p, &admission("c"), &link, 2)?.is_none());
+    assert!(s.take_event(&p, "again", &["done:c".into()], 2)?.is_none());
+    assert!(s.child_outcome("other", "round:1", "c").is_err());
+    assert_eq!(s.child_outcome("p", "round:1", "c")?, Some(Status::Completed(json!(42))));
+    let c = s
+        .start_child(
+            &p,
+            &admission("active"),
+            &ChildLink { parent: "p".into(), key: "2".into(), reference: "/start".into() },
+            2,
+        )?
+        .unwrap();
+    s.start_child(
+        &c,
+        &admission("nested"),
+        &ChildLink { parent: "active".into(), key: "3".into(), reference: "/start".into() },
+        2,
+    )?;
+    s.finish(&p, &Status::Completed(json!(0)), 3, 3)?;
+    for id in ["active", "nested"] {
+        assert_eq!(s.get(id)?.unwrap().outcome, Some(Status::Cancelled));
+    }
+    audit(&**s)?;
+    report.operations += 16;
+    report.witnesses.insert("child completion and cascading cancellation");
+
+    let t = factory("retention")?;
+    report.cases += 1;
+    let s = &t.store;
+    for id in ["old", "recent", "waiting"] {
+        let f = s.start(&admission(id), 0)?.unwrap();
+        s.save_record(&f, "k", &record, 0)?;
+        s.finish(
+            &f,
+            &if id == "waiting" { Status::Waiting { wake_at_ms: i64::MAX } } else { Status::Completed(json!(id)) },
+            if id == "old" { 0 } else { 100 },
+            3,
+        )?;
+    }
+    assert_eq!(s.sweep(100, 50)?, 1);
+    assert!(s.inspect("old")?.unwrap().records.is_empty());
+    assert!(!s.inspect("recent")?.unwrap().records.is_empty());
+    assert!(!s.inspect("waiting")?.unwrap().records.is_empty());
+    assert!(s.claim("old", 100)?.is_none());
+    audit(&**s)?;
+    report.operations += 14;
+    report.witnesses.insert("retention keeps terminal outcome");
+
+    let t = factory("definitions")?;
+    report.cases += 1;
+    let s = &t.store;
+    let first = s.save_definition("workflow", "first")?;
+    s.activate("workflow", first.version)?;
+    let second = s.save_definition("workflow", "second")?;
+    s.activate("workflow", second.version)?;
+    let pinned = s.get("absent")?;
+    assert!(pinned.is_none());
+    for n in 0..3 {
+        let mut a = admission(&format!("fault{n}"));
+        a.version = second.version;
+        a.definition = second.yaml.clone();
+        let f = s.start(&a, 0)?.unwrap();
+        s.finish(&f, &Status::Faulted(WorkflowError::runtime("fault")), 0, 3)?;
+    }
+    assert_eq!(s.definitions("workflow")?.active, Some(first.version));
+    assert_eq!(s.get("fault0")?.unwrap().admission.version, second.version);
+    assert!(s.activate("workflow", 99).is_err());
+    report.operations += 13;
+    report.witnesses.insert("breaker rolls back without changing pinned runs");
+
+    // Inject before every aggregate write, before commit, and after commit.
+    // Child start touches both parent and child. Terminal finish may also
+    // touch definitions and every live descendant; each point gets a fresh DB.
+    for operation in [
+        "admit",
+        "record",
+        "register",
+        "take",
+        "deliver",
+        "child",
+        "finish",
+        "cancel",
+        "sweep",
+        "release",
+        "renew",
+        "definition",
+        "activate",
+    ] {
+        for point in [
+            CommitFault::BeforeWrite(0),
+            CommitFault::BeforeWrite(1),
+            CommitFault::BeforeWrite(2),
+            CommitFault::BeforeWrite(3),
+            CommitFault::BeforeCommit,
+            CommitFault::AfterCommit,
+        ] {
+            let t = factory("crash")?;
+            report.cases += 1;
+            let s = &t.store;
+            let f = s.start(&admission("p"), 0)?.unwrap();
+            s.register_wait(&f, &["answer".into()], 0)?;
+            s.take_event(&f, "event", &["answer".into()], 0)?;
+            if operation == "take" {
+                s.deliver("answer", &json!(42), 0)?;
+            }
+            if operation == "sweep" {
+                s.save_record(&f, "timer", &record, 0)?;
+                s.finish(&f, &Status::Completed(json!(0)), 0, 3)?;
+            }
+            let d = s.save_definition("workflow", "yaml")?;
+            if matches!(operation, "finish" | "cancel") {
+                s.activate("workflow", d.version)?;
+                let child = s
+                    .start_child(
+                        &f,
+                        &admission("active"),
+                        &ChildLink { parent: "p".into(), key: "child".into(), reference: "/child".into() },
+                        0,
+                    )?
+                    .unwrap();
+                s.start_child(
+                    &child,
+                    &admission("nested"),
+                    &ChildLink { parent: "active".into(), key: "nested".into(), reference: "/nested".into() },
+                    0,
+                )?;
+            }
+            let before = t.backend.snapshot()?;
+            t.faults.arm(point);
+            let result: anyhow::Result<()> = match operation {
+                "admit" => s.admit(&admission("new"), 0).map(|_| ()),
+                "record" => s.save_record(&f, "timer", &record, 0),
+                "register" => s.register_wait(&f, &["another".into()], 0),
+                "take" => s.take_event(&f, "event", &["answer".into()], 0).map(|_| ()),
+                "deliver" => s.deliver("answer", &json!(42), 0).map(|_| ()),
+                "child" => s
+                    .start_child(
+                        &f,
+                        &admission("c"),
+                        &ChildLink { parent: "p".into(), key: "k".into(), reference: "/child".into() },
+                        0,
+                    )
+                    .map(|_| ()),
+                "finish" => s.finish(&f, &Status::Faulted(WorkflowError::runtime("fault")), 0, 3).map(|_| ()),
+                "cancel" => s.cancel("p", 0).map(|_| ()),
+                "sweep" => s.sweep(1, 0).map(|_| ()),
+                "release" => s.release(&f, 0),
+                "renew" => s.renew(&f, 1),
+                "definition" => s.save_definition("workflow", "next").map(|_| ()),
+                "activate" => s.activate("workflow", d.version),
+                _ => unreachable!(),
+            };
+            t.faults.clear();
+            let after = t.backend.snapshot()?;
+            if result.is_err() && point != CommitFault::AfterCommit {
+                assert_eq!(before, after, "partial commit: {operation} at {point:?}");
+                report.crash_points += 1;
+            }
+            if point == CommitFault::AfterCommit {
+                assert!(result.is_err());
+                assert_ne!(before, after);
+                report.crash_points += 1;
+            }
+            let reopened = (t.reopen)()?;
+            audit(&*reopened)?;
+            report.operations += 1;
+        }
+    }
+    report.witnesses.insert("rollback at each write and ambiguous committed error");
+
+    // Generated overlapping event histories. Check actual stored aggregates
+    // after EVERY operation, then drain surviving listeners to completion.
+    for seed in 1..=24u64 {
+        let t = factory("history")?;
+        report.cases += 1;
+        let mut s = t.store.clone();
+        let mut now = 0;
+        let mut rng = seed;
+        let mut leases = Vec::new();
+        for id in ["r0", "r1", "r2"] {
+            leases.push(s.start(&admission(id), now)?);
+        }
+        for step in 0..80 {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let r = usize::try_from((rng >> 32) % 3)?;
+            let op = (rng >> 40) % 9;
+            let id = format!("r{r}");
+            let k = format!("listen{}", (rng >> 48) % 4);
+            let types = vec![format!("type{}", (rng >> 52) % 3)];
+            match op {
+                0 | 1 => {
+                    if let Some(f) = &leases[r] {
+                        s.register_wait(f, &types, now)?;
+                        s.take_event(f, &k, &types, now)?;
+                    }
+                }
+                2 | 3 => {
+                    s.deliver(&types[0], &json!({"step":step}), now)?;
+                }
+                4 => {
+                    if let Some(f) = &leases[r] {
+                        s.unregister_wait(f, &k, &types, now)?;
+                    }
+                }
+                5 => {
+                    s.cancel(&id, now)?;
+                    leases[r] = None;
+                }
+                6 => {
+                    s = (t.reopen)()?;
+                    now += LEASE_MS + 1;
+                    leases = (0..3).map(|r| s.claim(&format!("r{r}"), now)).collect::<anyhow::Result<_>>()?;
+                    report.witnesses.insert("generated reopen and lease replacement");
+                }
+                7 => {
+                    s.sweep(now, 0)?;
+                }
+                8 => {
+                    let before = t.backend.snapshot()?;
+                    t.faults.arm(CommitFault::BeforeCommit);
+                    assert!(s.deliver(&types[0], &json!(step), now).is_err());
+                    t.faults.clear();
+                    assert_eq!(t.backend.snapshot()?, before);
+                }
+                _ => unreachable!(),
+            }
+            audit(&*s)?;
+            report.operations += 1;
+        }
+        for f in leases.iter().flatten() {
+            let listeners = s.inspect(&f.run_id)?.unwrap().listeners;
+            for (key, types) in listeners {
+                let mut taken = false;
+                for _ in 0..3 {
+                    for t in &types {
+                        s.deliver(t, &json!({"drain":true}), now)?;
+                    }
+                    taken = s.take_event(f, &key, &types, now)?.is_some();
+                    audit(&*s)?;
+                    report.operations += 1;
+                    if taken {
+                        break;
+                    }
+                }
+                assert!(taken, "listener stranded after finite history");
+            }
+            s.finish(f, &Status::Completed(json!({})), now, 3)?;
+        }
+        assert!(s.due(i64::MAX, 100)?.is_empty());
+        audit(&*s)?;
+    }
+    report.witnesses.insert("finite histories drain every live listener");
+    assert_eq!(report.witnesses.len(), 12);
+    let t = factory("concurrent-claims")?;
+    report.cases += 1;
+    t.store.admit(&admission("r"), 0)?;
+    let barrier = Arc::new(std::sync::Barrier::new(8));
+    let workers: Vec<_> = (0..8)
+        .map(|_| {
+            let reopen = t.reopen.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || -> anyhow::Result<bool> {
+                let store = reopen()?;
+                barrier.wait();
+                Ok(store.claim("r", 0)?.is_some())
+            })
+        })
+        .collect();
+    let mut winners = 0;
+    for worker in workers {
+        winners += usize::from(worker.join().expect("claim worker panicked")?);
+    }
+    assert_eq!(winners, 1);
+    audit(&*t.store)?;
+    report.witnesses.insert("concurrent claims have one winner");
+    let t = factory("corruption")?;
+    report.cases += 1;
+    t.store.start(&admission("r"), 0)?;
+    let before = t.backend.snapshot()?;
+    let mut corrupt = before.rows.clone();
+    corrupt.get_mut(&("run".into(), "r".into())).unwrap()["records"]["bad"] = json!("invalid record");
+    assert!(t.backend.compare_exchange(&before, &corrupt)?);
+    let reopened = (t.reopen)()?;
+    let fence = reopened.claim("r", LEASE_MS + 1)?.unwrap();
+    assert!(reopened.load_records(&fence, LEASE_MS + 1).is_err());
+    assert!(reopened.save_record(&fence, "bad", &Record::Timer { deadline_ms: 1 }, LEASE_MS + 1).is_err());
+    assert!(reopened.cancel("r", LEASE_MS + 1)?);
+    assert_eq!(reopened.get("r")?.unwrap().outcome, Some(Status::Cancelled));
+    assert_eq!(
+        t.backend.snapshot()?.rows[&("run".into(), "r".into())]["records"],
+        corrupt[&("run".into(), "r".into())]["records"]
+    );
+    report.witnesses.insert("corruption fails closed without erasure");
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().start_paused(true).build()?;
+    for mode in 0..4 {
+        let t = factory("listen-baseline")?;
+        let saves = rt.block_on(listen_case(t, mode, usize::MAX, false, false))?.0;
+        report.cases += 1;
+        for after in [false, true] {
+            for fail in 0..saves {
+                let t = factory("listen-checkpoint")?;
+                let (_, interrupted) = rt.block_on(listen_case(t, mode, fail, after, false))?;
+                assert!(interrupted, "checkpoint was not reached: {mode}/{fail}/{after}");
+                report.execution_crashes += 1;
+                report.cases += 1;
+            }
+        }
+        if mode < 2 {
+            let t = factory("listen-atomic-take")?;
+            assert!(rt.block_on(listen_case(t, mode, usize::MAX, false, true))?.1);
+            report.execution_crashes += 1;
+            report.cases += 1;
+        }
+    }
+    report
+        .witnesses
+        .extend(["listen recovery before and after every interpreter commit", "held delivery and catchable timeout"]);
+    Ok(report)
+}
+
+// Interpreter-level recovery, ported from the checkpoint/hold properties.
+// Every commit boundary is visited explicitly, rather than relying on random
+// histories to reach it. Only the clock is virtual; database writes are real.
+struct LeaseTime(std::sync::atomic::AtomicI64);
+impl Clock for LeaseTime {
+    fn now_ms(&self) -> i64 {
+        self.0.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+struct WorkflowTime(tokio::time::Instant);
+impl owf::run::Clock for WorkflowTime {
+    fn now(&self) -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::from_timestamp_millis(1000 + i64::try_from(self.0.elapsed().as_millis()).unwrap()).unwrap()
+    }
+}
+struct Inbox {
+    lease: Arc<Lease>,
+    saves: std::sync::atomic::AtomicUsize,
+    fail: usize,
+    after_save: bool,
+    after_take: bool,
+}
+impl Journal for Inbox {
+    fn load(&self) -> anyhow::Result<BTreeMap<String, Record>> {
+        self.lease.load()
+    }
+    fn save(&self, key: &str, record: &Record) -> anyhow::Result<()> {
+        let n = self.saves.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        anyhow::ensure!(self.after_save || n != self.fail, "crash before checkpoint {n}");
+        self.lease.save(key, record)?;
+        anyhow::ensure!(!self.after_save || n != self.fail, "crash after checkpoint {n}");
+        Ok(())
+    }
+}
+impl Events for Inbox {
+    fn notification(&self, id: &str) -> futures::future::BoxFuture<'_, ()> {
+        self.lease.notification(id)
+    }
+    fn register(&self, id: &str, types: &[String]) -> anyhow::Result<()> {
+        self.lease.register(id, types)
+    }
+    fn unregister(&self, id: &str, key: &str, types: &[String]) -> anyhow::Result<()> {
+        self.lease.unregister(id, key, types)
+    }
+    fn take(&self, id: &str, key: &str, types: &[String]) -> anyhow::Result<Option<Value>> {
+        let event = self.lease.take(id, key, types)?;
+        anyhow::ensure!(!self.after_take || event.is_none(), "crash after atomic event consumption");
+        Ok(event)
+    }
+}
+#[async_trait::async_trait]
+impl owf::run::Functions for Inbox {
+    fn effect(&self, _: &str) -> Option<owf::run::Effect> {
+        None
+    }
+    fn events(&self) -> Option<&dyn Events> {
+        Some(self)
+    }
+    async fn call(&self, _: &str, _: Value, _: &owf::run::CallInfo<'_>) -> Result<Value, WorkflowError> {
+        unreachable!("listen-only workflow")
+    }
+}
+async fn listen_case(
+    t: TestStore,
+    mode: u8,
+    fail: usize,
+    after_save: bool,
+    after_take: bool,
+) -> anyhow::Result<(usize, bool)> {
+    use owf::run::{self, Host, Limits, Silent};
+    use std::{
+        sync::atomic::{AtomicI64, AtomicUsize, Ordering},
+        task::Poll,
+        time::Duration,
+    };
+    let time = Arc::new(WorkflowTime(tokio::time::Instant::now()));
+    let lease_time = Arc::new(LeaseTime(AtomicI64::new(1000)));
+    let fence = t.store.start(&admission("r"), 1000)?.unwrap();
+    let lease = Arc::new(Lease { store: t.store.clone(), fence, clock: lease_time.clone() });
+    let inbox = Arc::new(Inbox { lease: lease.clone(), saves: AtomicUsize::new(0), fail, after_save, after_take });
+    let timeout = if mode == 3 { 5 } else { 50 };
+    let definition = format!(
+        "document: {{ dsl: '1.0.4', namespace: test, name: listen, version: '1.0.0' }}\ndo:\n - attempt:\n     try:\n       - listen:\n           listen: {{ to: {{ one: {{ with: {{ type: answer }} }} }} }}\n           metadata: {{ hold: PT0.010S }}\n           timeout: {{ after: PT0.{timeout:03}S }}\n     catch:\n       errors: {{ with: {{ status: 408 }} }}\n       do: [ {{ expired: {{ set: {{ expired: true }} }} }} ]\n"
+    );
+    let wf = owf::model::parse_yaml(&definition)?;
+    let host = Host {
+        functions: inbox.clone(),
+        observer: Arc::new(Silent),
+        clock: time.clone(),
+        limits: Limits::default(),
+        runtime: json!({}),
+    };
+    let token = tokio_util::sync::CancellationToken::new();
+    if mode == 0 {
+        lease.register("r", &["answer".into()])?;
+        t.store.deliver("answer", &json!("answer"), 1000)?;
+    }
+    let mut future = Box::pin(run::resume(&host, &wf, "r", json!({}), &token, &*inbox));
+    let first = match futures::poll!(future.as_mut()) {
+        Poll::Ready(outcome) => outcome.status,
+        Poll::Pending => {
+            if mode == 1 {
+                tokio::time::advance(Duration::from_millis(2)).await;
+                t.store.deliver("answer", &json!("answer"), 1000)?;
+            } else {
+                tokio::time::advance(Duration::from_millis(10)).await;
+            }
+            future.await.status
+        }
+    };
+    let saves = inbox.saves.load(Ordering::SeqCst);
+    let interrupted = matches!(first, Status::Interrupted(_));
+    audit(&*t.store)?;
+    if !interrupted {
+        t.store.finish(&lease.fence, &first, 1000, 3)?;
+    }
+    let reopened = (t.reopen)()?;
+    if reopened.get("r")?.unwrap().outcome.is_none() {
+        let now = LEASE_MS + 1001;
+        lease_time.0.store(now, Ordering::SeqCst);
+        let fence = reopened.claim("r", now)?.unwrap();
+        assert!(t.store.renew(&lease.fence, now).is_err());
+        let current = Arc::new(Lease { store: reopened.clone(), fence, clock: lease_time });
+        let next = Arc::new(Inbox {
+            lease: current.clone(),
+            saves: AtomicUsize::new(0),
+            fail: usize::MAX,
+            after_save: false,
+            after_take: false,
+        });
+        let host = Host {
+            functions: next.clone(),
+            observer: Arc::new(Silent),
+            clock: time,
+            limits: Limits::default(),
+            runtime: json!({}),
+        };
+        if mode != 3 {
+            current.register("r", &["answer".into()])?;
+            reopened.deliver("answer", &json!("answer"), now)?;
+        } else {
+            tokio::time::advance(Duration::from_millis(100)).await;
+        }
+        let mut status = run::resume(&host, &wf, "r", json!({}), &token, &*next).await.status;
+        if mode == 3 && matches!(status, Status::Waiting { .. }) {
+            tokio::time::advance(Duration::from_millis(100)).await;
+            status = run::resume(&host, &wf, "r", json!({}), &token, &*next).await.status;
+        }
+        assert!(matches!(status, Status::Completed(_)), "recovery stalled: {mode}/{fail}/{after_save}: {status:?}");
+        reopened.finish(&current.fence, &status, now, 3)?;
+    }
+    let outcome = reopened.get("r")?.unwrap().outcome.unwrap();
+    if mode == 3 {
+        assert_eq!(outcome, Status::Completed(json!({"expired":true})));
+    } else {
+        let Status::Completed(v) = outcome else { panic!("{outcome:?}") };
+        assert_eq!(v[0]["data"], "answer");
+    }
+    audit(&*reopened)?;
+    assert_eq!(
+        reopened.inspect("r")?.unwrap().events.iter().filter(|e| e.consumed_key.is_some()).count(),
+        usize::from(mode != 3)
+    );
+    Ok((saves, interrupted))
+}
