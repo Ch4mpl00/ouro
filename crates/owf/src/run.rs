@@ -1178,10 +1178,12 @@ impl Run<'_> {
         };
         self.observe(Event::TaskStarted { reference, parent, kind: task.kind.name(), input: &input });
         span.active = true;
-        let extensions = self.extensions(task, reference, &input, ctx, scope, &desc)?;
+        let (extensions, described) = self.extensions(task, reference, &input, ctx, scope, &desc)?;
+        let mut around = scope.clone();
+        around.push(("task".into(), described));
         macro_rules! run {
             ($deadline:expr) => {
-                self.layer(0, &extensions, task, reference, input.clone(), ctx, scope, &desc, $deadline)
+                self.layer(0, &extensions, task, reference, input.clone(), ctx, scope, &around, &desc, $deadline)
             };
         }
         let child_done = matches!(&task.kind, Kind::Run(r) if matches!(r.process, Process::Workflow { .. }))
@@ -1202,16 +1204,17 @@ impl Run<'_> {
                         other => other?,
                     }
                 } else {
-                    let left = match self.remaining(limit, started_ms) {
-                        Ok((left, _)) => left,
-                        Err(_) => Duration::ZERO,
+                    let (left, expired) = match self.remaining(limit, started_ms) {
+                        Ok((left, _)) => (left, false),
+                        Err(_) => (Duration::ZERO, true),
                     };
-                    // A body that replays without waiting still completes at
-                    // zero: the inner future is polled before the timer.
+                    // A body that replays to its end without waiting still
+                    // completes past the deadline: the inner future is polled
+                    // before the timer. One that would wait has timed out.
                     match tokio::time::timeout(left, run!(None)).await {
-                        Ok(Err(Fault::Waiting(wake))) => return Err(Fault::Waiting(wake.min(deadline))),
-                        Ok(r) => r?,
-                        Err(_) => {
+                        Ok(Err(Fault::Waiting(wake))) if !expired => return Err(Fault::Waiting(wake.min(deadline))),
+                        Ok(r) if !matches!(r, Err(Fault::Waiting(_))) => r?,
+                        _ => {
                             if self.has_unknown(reference) {
                                 return Err(self.unknown(reference));
                             }
@@ -1243,12 +1246,15 @@ impl Run<'_> {
         Ok((out, flow.or_else(|| task.then.clone()).unwrap_or(Flow::Continue)))
     }
 
-    /// The extensions that apply to this task, in declaration order: those
-    /// extending its kind whose `when` holds. CHOICE: `when` is evaluated on
-    /// the transformed task input with `$task` the task descriptor, to which
-    /// the task's own definition properties are added (the DSL's examples
-    /// write `$task.with.endpoint`); the descriptor's names win. Tasks of an
+    /// The extensions that apply to this task, in declaration order (those
+    /// extending its kind whose `when` holds), and what `$task` is for them.
+    /// CHOICE: in `when` and in the extension's tasks, `$task` describes the
+    /// extended task: its descriptor, to which its own definition properties
+    /// are added (the DSL's examples write `$task.with.endpoint`, and log
+    /// `$task.reference` from a `before` task); the descriptor's names win.
+    /// `when` is evaluated on the transformed task input. Tasks of an
     /// extension are not extended.
+    #[allow(clippy::type_complexity)]
     fn extensions(
         &self,
         task: &Task,
@@ -1257,9 +1263,9 @@ impl Run<'_> {
         ctx: &Value,
         scope: &Scope,
         desc: &Value,
-    ) -> Result<Vec<(usize, &str, &Extension)>, Fault> {
+    ) -> Result<(Vec<(usize, &str, &Extension)>, Value), Fault> {
         if self.wf.uses.extensions.is_empty() || reference.contains(EXTENSION_TASKS) {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), Value::Null));
         }
         let mut described = task.definition.as_object().cloned().unwrap_or_default();
         if let Value::Object(d) = desc {
@@ -1280,7 +1286,7 @@ impl Run<'_> {
             }
             out.push((i, name.as_str(), e));
         }
-        Ok(out)
+        Ok((out, described))
     }
 
     /// Extension `i` around the inner layers: its `before` list runs on the
@@ -1299,6 +1305,7 @@ impl Run<'_> {
         input: Value,
         ctx: &'s mut Value,
         scope: &'s Scope,
+        around: &'s Scope,
         desc: &'s Value,
         deadline: Option<i64>,
     ) -> BoxFuture<'s, Result<(Value, Option<Flow>), Fault>> {
@@ -1309,19 +1316,22 @@ impl Run<'_> {
             let at = format!("{reference}{EXTENSION_TASKS}{index}/{name}");
             let mut data = input;
             if let Some(before) = &e.before {
-                match self.list(before, format!("{at}/before"), Some(reference), data, ctx, scope).await? {
+                match self.list(before, format!("{at}/before"), Some(reference), data, ctx, around).await? {
                     Next::Exit(v) => return Ok((v, None)),
                     Next::End(v) => return Ok((v, Some(Flow::End))),
                     Next::Done(v) => data = v,
                 }
             }
-            let (out, flow) = self.layer(i + 1, extensions, task, reference, data, ctx, scope, desc, deadline).await?;
+            let (out, flow) =
+                self.layer(i + 1, extensions, task, reference, data, ctx, scope, around, desc, deadline).await?;
             match &e.after {
                 None => Ok((out, flow)),
-                Some(after) => match self.list(after, format!("{at}/after"), Some(reference), out, ctx, scope).await? {
-                    Next::End(v) => Ok((v, Some(Flow::End))),
-                    Next::Done(v) | Next::Exit(v) => Ok((v, flow)),
-                },
+                Some(after) => {
+                    match self.list(after, format!("{at}/after"), Some(reference), out, ctx, around).await? {
+                        Next::End(v) => Ok((v, Some(Flow::End))),
+                        Next::Done(v) | Next::Exit(v) => Ok((v, flow)),
+                    }
+                }
             }
         })
     }
@@ -2332,11 +2342,12 @@ impl Run<'_> {
         } else {
             i64::try_from(limit.as_millis()).unwrap_or(i64::MAX)
         };
+        let expired = self.journal.is_some() && left == 0;
         match tokio::time::timeout(Duration::from_millis(left as u64), body).await {
-            Ok(Err(Fault::Waiting(wake))) => Err(Fault::Waiting(wake.min(deadline_ms))),
-            Ok(r) => r,
-            Err(_) if self.has_unknown(attempt) => Err(self.unknown(attempt)),
-            Err(_) => Err(WorkflowError::timeout(format!("{attempt} did not finish within {limit:?}")).into()),
+            Ok(Err(Fault::Waiting(wake))) if !expired => Err(Fault::Waiting(wake.min(deadline_ms))),
+            Ok(r) if !matches!(r, Err(Fault::Waiting(_))) => r,
+            _ if self.has_unknown(attempt) => Err(self.unknown(attempt)),
+            _ => Err(WorkflowError::timeout(format!("{attempt} did not finish within {limit:?}")).into()),
         }
     }
 

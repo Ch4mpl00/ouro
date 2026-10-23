@@ -152,9 +152,12 @@ impl Runtime {
     /// workflow started by `on` gets the array of consumed events.
     /// Returns the runs it admitted.
     pub fn schedule(&self, from_ms: i64, to_ms: i64) -> anyhow::Result<Vec<String>> {
+        // Runs are admitted at the clock's time, due at once, whatever window
+        // they were owed for.
+        let now = self.clock.now_ms();
         let mut started = Vec::new();
         let mut admit = |id: String, name: &str, input: Value| -> anyhow::Result<()> {
-            if self.store.get(&id)?.is_none() && self.store.admit(&self.admission(&id, name, input)?, to_ms)? {
+            if self.store.get(&id)?.is_none() && self.store.admit(&self.admission(&id, name, input)?, now)? {
                 started.push(id);
             }
             Ok(())
@@ -197,7 +200,7 @@ impl Runtime {
                 }
             }
             if s.schedule.on.is_some() {
-                triggered.extend(self.serve_triggers(s, to_ms)?);
+                triggered.extend(self.serve_triggers(s, now)?);
             }
         }
         started.extend(triggered);
@@ -208,7 +211,7 @@ impl Runtime {
                 && r.admission.name.ends_with("#on")
                 && !current.iter().any(|p| r.admission.id.starts_with(p))
             {
-                self.store.cancel(&r.admission.id, to_ms)?;
+                self.store.cancel(&r.admission.id, now)?;
             }
         }
         Ok(started)
