@@ -959,3 +959,14 @@ depended on them are to be read under these choices. The others stay open.
    count. With no predecessor to roll back to, the definition is marked
    tripped: new runs and its schedule stop, visibly in the runs API; running
    runs finish; a new activation clears it.
+6. **Delivery is declared, not derived from the effect (E2, E5).** The
+   default delivery of every call, reads and writes alike, is at-least-once:
+   a call whose outcome is unknown after a crash may be dispatched again, with
+   the same idempotency key. A function that must not be repeated (sending a
+   message, charging a card) declares `delivery: at_most_once` when it is
+   registered; a call in YAML may tighten its function's delivery
+   (`metadata.delivery: at_most_once`) but never loosen it. "Protected call" in
+   this document means a call whose effective delivery is at-most-once, and E2
+   applies to exactly those. `effect` (`read` | `write`) stays independent and
+   keeps its other roles: dry runs mock writes, and a failure before the first
+   write can hand the task over.
