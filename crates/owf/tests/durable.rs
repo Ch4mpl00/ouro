@@ -654,6 +654,7 @@ fn repeated_crashes_can_hit_the_same_pending_checkpoint_before_progress() {
         input_from: None,
         output_as: None,
         functions: vec![],
+        extensions: vec![],
         bare: false,
         tasks: vec![task("send", Body::Call("inc".into(), Num::N))],
     };

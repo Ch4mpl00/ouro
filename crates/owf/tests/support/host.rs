@@ -54,6 +54,25 @@ impl Functions for Fake {
         effect(name)
     }
 
+    fn emits(&self) -> bool {
+        true
+    }
+
+    /// An emitted event is a write the journal records like a call.
+    async fn emit(&self, event: &Value, info: &CallInfo<'_>) -> Result<(), owf::durable::CallFailure> {
+        self.journal.push(Entry::Call {
+            name: "emit".into(),
+            args: event.clone(),
+            reference: info.reference.into(),
+            write: true,
+            after_cancel: info.cancel.is_cancelled(),
+        });
+        if !self.latency.is_zero() {
+            tokio::time::sleep(self.latency).await;
+        }
+        Ok(())
+    }
+
     async fn call(&self, name: &str, args: Value, info: &CallInfo<'_>) -> Result<Value, WorkflowError> {
         let before = {
             let mut counts = self.counts.lock().unwrap();
@@ -207,6 +226,9 @@ pub struct Known;
 impl Functions for Known {
     fn effect(&self, name: &str) -> Option<Effect> {
         effect(name)
+    }
+    fn emits(&self) -> bool {
+        true
     }
     async fn call(&self, _: &str, _: Value, _: &CallInfo<'_>) -> Result<Value, WorkflowError> {
         unreachable!("validation only")

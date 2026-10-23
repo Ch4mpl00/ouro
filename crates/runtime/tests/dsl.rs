@@ -654,10 +654,9 @@ async fn crash_run(fail_at: usize, after: bool) -> (Option<Status>, Vec<Value>, 
     let store = Arc::new(durable::TransactionalStore::new(backend.clone()));
     let f = fixture_on(store.clone(), Arc::default(), Arc::default(), Arc::default());
     let setup = |rt: &Runtime| -> anyhow::Result<()> {
-        for (name, body) in [
-            ("child", "do: [ { w: { call: write, with: { child: '${ .n }' } } } ]"),
-            ("parent", PARENT),
-        ] {
+        for (name, body) in
+            [("child", "do: [ { w: { call: write, with: { child: '${ .n }' } } } ]"), ("parent", PARENT)]
+        {
             let d = rt.save(name, &doc(name, body))?;
             rt.activate(name, d.version)?;
         }

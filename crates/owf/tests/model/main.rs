@@ -11,6 +11,11 @@
 //   cargo test -p owf --test model
 //   PROPERTY_RUNS=2000 cargo test -p owf --test model
 //
+// The model stays at CORE: it does not interpret fork, wait, timeouts,
+// attempt deadlines, emit, extensions, listen, run, secrets or schedules;
+// those are covered by the invariants, metamorphic relations, the durable
+// tests and the conformance kit instead.
+//
 // properties.rs checks the model itself. A failure prints the smallest
 // program that still disagrees (proptest shrinks it), as YAML, with both
 // sides' steps.
@@ -93,6 +98,7 @@ fn a_default_switch_case_does_not_preempt_a_later_match() {
         input_from: None,
         output_as: None,
         functions: vec![],
+        extensions: vec![],
         bare: false,
         tasks: vec![
             task(
