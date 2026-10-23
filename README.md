@@ -132,11 +132,13 @@ upstream example-corpus exception are in [schema/README.md](crates/owf/schema/RE
 
 ## Roadmap
 
-- Agent layer: agent-loop, model turns, guard, confirmations, sub-agents, skills.
 - LLM steps and providers; typed decisions.
 - MCP as a function source and other protocol/function packs.
 - Triggers, cron and scheduling integrations.
 - napi binding, server binary and language bindings.
 - Official CTK runner and broader DSL coverage, including native child syntax.
 - Deterministic simulation and the kill -9 load/fault harness.
-- Storage throughput improvements and version-compatibility corpora.
+- Storage layout that scales: per-run rows and per-key compare-and-swap instead of whole-store snapshots behind one global revision.
+- Version-compatibility corpora.
+
+Agents (agent loops, guards, confirmations, sub-agents, skills) are applications built on this runtime, not part of it; [ouro-agent](https://github.com/Ch4mpl00/ouro-agent) is one.
