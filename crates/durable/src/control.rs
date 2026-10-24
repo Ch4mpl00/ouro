@@ -1,7 +1,7 @@
 //! Store-only operator commands and bounded observations. Authorization belongs
 //! to the embedding host; request identities make ambiguous commits retryable.
 use crate::{RunSnapshot, RunState, SavedRun, Trigger};
-use owf::{durable::CallEntry, events::PendingWait};
+use ows::{durable::CallEntry, events::PendingWait};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;

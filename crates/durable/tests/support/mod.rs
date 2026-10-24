@@ -1,5 +1,5 @@
 use ouro_durable::{AtomicBackend, RunStore, TransactionalStore, conformance::admission};
-use owf::{durable::Record, run::Status};
+use ows::{durable::Record, run::Status};
 use serde_json::json;
 use std::sync::Arc;
 
@@ -17,7 +17,7 @@ pub async fn seed(backend: &Arc<dyn AtomicBackend>, size: usize) -> anyhow::Resu
         store.subscribe(&f, "listen", &["unrelated".into()], now).await?;
         let mut wait = ouro_durable::conformance::control_wait();
         wait.types = vec!["unrelated".into()];
-        if let owf::model::Strategy::One(filter) = &mut wait.strategy {
+        if let ows::model::Strategy::One(filter) = &mut wait.strategy {
             filter.with.insert("type".into(), json!("unrelated"));
         }
         wait.since_ms = now;

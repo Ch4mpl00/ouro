@@ -4,8 +4,8 @@
 // clock, so waits, retries and timeouts take no real time.
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use owf::model::{self, Workflow};
-use owf::run::{self, CallInfo, Clock, Event, Functions, Host, Limits, Observer, Outcome, Status, WorkflowError};
+use ows::model::{self, Workflow};
+use ows::run::{self, CallInfo, Clock, Event, Functions, Host, Limits, Observer, Outcome, Status, WorkflowError};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -69,7 +69,7 @@ impl Functions for Fake {
     }
 
     /// An emitted event is recorded like an at-least-once call.
-    async fn emit(&self, event: &Value, info: &CallInfo<'_>) -> Result<(), owf::durable::CallFailure> {
+    async fn emit(&self, event: &Value, info: &CallInfo<'_>) -> Result<(), ows::durable::CallFailure> {
         self.journal.push(Entry::Call {
             name: "emit".into(),
             args: event.clone(),
@@ -293,7 +293,7 @@ pub fn try_execute_workflow(wf: &Workflow, input: Value, opts: &Options) -> Opti
             observer: journal.clone(),
             clock: Arc::new(Fixed),
             limits: opts.limits.clone(),
-            runtime: json!({ "name": "owf-properties" }),
+            runtime: json!({ "name": "ows-properties" }),
         };
         let cancel = CancellationToken::new();
         if let Some(at) = opts.cancel_at {

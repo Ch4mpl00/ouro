@@ -2893,7 +2893,7 @@ mod tests {
             observer: log.clone(),
             clock: Arc::new(Fixed),
             limits: Limits::default(),
-            runtime: json!({ "name": "owf-test" }),
+            runtime: json!({ "name": "ows-test" }),
         };
         Setup { host, fake, log }
     }
@@ -3332,7 +3332,7 @@ do:
         let o = exec(&s, "do:\n  - probe: { set: { task: '${ $task.reference }', name: '${ $task.name }', run: '${ $workflow.id }', at: '${ $task.startedAt.epoch.seconds }', rt: '${ $runtime.name }', raw: '${ $workflow.input }' } }\n", json!(7)).await;
         assert_eq!(
             completed(&o),
-            &json!({"task": "/do/0/probe", "name": "probe", "run": "run-1", "at": 1_700_000_000, "rt": "owf-test", "raw": 7})
+            &json!({"task": "/do/0/probe", "name": "probe", "run": "run-1", "at": 1_700_000_000, "rt": "ows-test", "raw": 7})
         );
     }
 }

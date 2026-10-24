@@ -8,7 +8,7 @@
 //! decision's record row and moves that counter, so a child's unit and the
 //! root's count commit together without touching the root's run row.
 use crate::*;
-use owf::{
+use ows::{
     durable::{EXCEEDED, VERSION, check_transition},
     run::WorkflowError,
 };
@@ -50,7 +50,7 @@ struct StoredRun {
     awaits: BTreeMap<String, i64>,
     listeners: BTreeMap<String, Vec<String>>,
     subscriptions: BTreeMap<String, Vec<String>>,
-    waits: BTreeMap<String, owf::events::PendingWait>,
+    waits: BTreeMap<String, ows::events::PendingWait>,
     budget_ended: Option<u64>,
     addressed_waits: std::collections::BTreeSet<String>,
     /// The rearm a firing attached and the trigger that firing stored: a
@@ -1277,7 +1277,7 @@ impl RunStore for TransactionalStore {
         })
         .await
     }
-    async fn describe_wait(&self, f: &Fence, k: &str, wait: &owf::events::PendingWait, now: i64) -> anyhow::Result<()> {
+    async fn describe_wait(&self, f: &Fence, k: &str, wait: &ows::events::PendingWait, now: i64) -> anyhow::Result<()> {
         self.update(|rows| {
             Box::pin(async move {
                 let mut s = checked(rows, f, now, self.policy.skew_ms).await?;
@@ -1313,12 +1313,12 @@ impl RunStore for TransactionalStore {
                     .collect();
                 let runtime = &s.run.admission.runtime;
                 let budget_limit = runtime["limits"]["max_jumps"].as_u64().map(|host| {
-                    owf::model::parse_yaml(&s.run.admission.definition).map_or(host, |w| w.budget.max_jumps(host))
+                    ows::model::parse_yaml(&s.run.admission.definition).map_or(host, |w| w.budget.max_jumps(host))
                 });
                 let trace_id = runtime["trace_id"].as_str().map(str::to_owned);
                 let span_id = runtime["span_id"].as_str().map(str::to_owned);
                 let snapshot = snapshot(rows, s).await?;
-                let calls = owf::durable::call_journal(&snapshot.records);
+                let calls = ows::durable::call_journal(&snapshot.records);
                 Ok(Some(control::Inspection {
                     snapshot,
                     calls,

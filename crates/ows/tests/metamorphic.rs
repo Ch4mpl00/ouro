@@ -4,8 +4,8 @@
 // renaming); 2. identity tasks and transforms; 3. flow directives; 4. fork
 // against its branches run alone.
 //
-//   cargo test -p owf --test metamorphic
-//   PROPERTY_RUNS=2000 cargo test -p owf --test metamorphic
+//   cargo test -p ows --test metamorphic
+//   PROPERTY_RUNS=2000 cargo test -p ows --test metamorphic
 //
 // A rewrite adds or removes tasks, so a run that reaches the host's task
 // ceiling may stop elsewhere; those runs are left out of the comparison.

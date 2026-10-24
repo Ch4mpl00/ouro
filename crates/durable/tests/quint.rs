@@ -18,7 +18,7 @@ use ouro_durable::{
     IdentityConflict, Overlap, OverlapGuard, Policy, Rearm, Refused, RunSnapshot, RunState, RunStore,
     TransactionalStore, Trigger, memory::MemoryBackend, sqlite::SqliteBackend,
 };
-use owf::{
+use ows::{
     durable::{CallState, Delivery, Record, StepOutcome, TaskResult},
     model::Flow,
     run::{Status, WorkflowError},
@@ -1339,7 +1339,7 @@ impl StoreDriver {
                 };
                 view.frontier.insert(i.parse()?);
                 view.continuation = view.continuation.max(output.as_i64().context("continuation")?);
-            } else if key == owf::durable::EXCEEDED {
+            } else if key == ows::durable::EXCEEDED {
                 // The run's first refusal: one of its refused decisions, the
                 // one every refusal names.
                 let Record::Exceeded { by } = record else { anyhow::bail!("not a first refusal") };
@@ -1350,7 +1350,7 @@ impl StoreDriver {
             } else if let Some(i) = key.strip_prefix("jump") {
                 let i: usize = i.parse()?;
                 let Record::Budget { granted, spent, first } = record else { anyhow::bail!("not a budget decision") };
-                let named = snapshot.records.get(owf::durable::EXCEEDED);
+                let named = snapshot.records.get(ows::durable::EXCEEDED);
                 ensure!(
                     *granted == first.is_none()
                         && first.as_ref().is_none_or(|by| named == Some(&Record::Exceeded { by: by.clone() })),

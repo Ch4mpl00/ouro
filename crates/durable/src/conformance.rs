@@ -4,7 +4,7 @@
 //! Based on the original admission, event-history, child and crash properties.
 use crate::*;
 use futures::future::BoxFuture;
-use owf::run::WorkflowError;
+use ows::run::WorkflowError;
 use serde_json::json;
 use std::collections::BTreeSet;
 
@@ -852,10 +852,10 @@ async fn budgets(factory: &impl AsyncFn(&str) -> anyhow::Result<TestStore>, repo
     assert_eq!(s.spend(&f, "c#jump", 2, 1).await?, budget(false, 2));
     assert_eq!(s.spend(&f, "c2#jump", 2, 1).await?, budget(false, 2), "a later refusal names the first");
     assert_eq!(
-        s.load_records(&f, 1).await?.get(owf::durable::EXCEEDED),
+        s.load_records(&f, 1).await?.get(ows::durable::EXCEEDED),
         Some(&Record::Exceeded { by: "c#jump".into() })
     );
-    assert!(s.save_record(&f, owf::durable::EXCEEDED, &Record::Exceeded { by: "a#jump".into() }, 1).await.is_err());
+    assert!(s.save_record(&f, ows::durable::EXCEEDED, &Record::Exceeded { by: "a#jump".into() }, 1).await.is_err());
     assert_eq!(counter(&t, "root").await?, Some(json!(2)));
     // Only `spend` commits a decision: a forged one is refused.
     assert!(s.save_record(&f, "d#jump", &budget(true, 0), 1).await.is_err());
@@ -1540,7 +1540,7 @@ impl RunStore for Offloaded {
         let id = id.to_owned();
         offloaded!(self, |s| s.inspect_control(&id))
     }
-    async fn describe_wait(&self, f: &Fence, k: &str, wait: &owf::events::PendingWait, now: i64) -> anyhow::Result<()> {
+    async fn describe_wait(&self, f: &Fence, k: &str, wait: &ows::events::PendingWait, now: i64) -> anyhow::Result<()> {
         let (f, k, wait) = (f.clone(), k.to_owned(), wait.clone());
         offloaded!(self, |s| s.describe_wait(&f, &k, &wait, now))
     }
@@ -1556,7 +1556,7 @@ impl Clock for LeaseTime {
     }
 }
 struct WorkflowTime(tokio::time::Instant);
-impl owf::run::Clock for WorkflowTime {
+impl ows::run::Clock for WorkflowTime {
     fn now(&self) -> chrono::DateTime<chrono::Utc> {
         chrono::DateTime::from_timestamp_millis(1000 + i64::try_from(self.0.elapsed().as_millis()).unwrap()).unwrap()
     }
@@ -1604,14 +1604,14 @@ impl Events for Inbox {
     }
 }
 #[async_trait::async_trait]
-impl owf::run::Functions for Inbox {
+impl ows::run::Functions for Inbox {
     fn has(&self, _: &str) -> bool {
         false
     }
     fn events(&self) -> Option<&dyn Events> {
         Some(self)
     }
-    async fn call(&self, _: &str, _: Value, _: &owf::run::CallInfo<'_>) -> Result<Value, WorkflowError> {
+    async fn call(&self, _: &str, _: Value, _: &ows::run::CallInfo<'_>) -> Result<Value, WorkflowError> {
         unreachable!("listen-only workflow")
     }
 }
@@ -1622,7 +1622,7 @@ async fn listen_case(
     after_save: bool,
     after_take: bool,
 ) -> anyhow::Result<(usize, bool)> {
-    use owf::run::{self, Host, Limits, Silent};
+    use ows::run::{self, Host, Limits, Silent};
     use std::{
         sync::atomic::{AtomicI64, AtomicUsize, Ordering},
         task::Poll,
@@ -1644,7 +1644,7 @@ async fn listen_case(
     let definition = format!(
         "document: {{ dsl: '1.0.4', namespace: test, name: listen, version: '1.0.0' }}\ndo:\n - attempt:\n     try:\n       - listen:\n           listen: {{ to: {{ one: {{ with: {{ type: answer }} }} }}, read: envelope }}\n           metadata: {{ hold: PT0.010S }}\n           timeout: {{ after: PT0.{timeout:03}S }}\n     catch:\n       errors: {{ with: {{ status: 408 }} }}\n       do: [ {{ expired: {{ set: {{ expired: true }} }} }} ]\n"
     );
-    let wf = owf::model::parse_yaml(&definition)?;
+    let wf = ows::model::parse_yaml(&definition)?;
     let host = Host {
         functions: inbox.clone(),
         observer: Arc::new(Silent),
@@ -1779,8 +1779,8 @@ async fn overlap_policies(
                 logical: "call".into(),
                 function: "f".into(),
                 arguments: json!({}),
-                delivery: owf::durable::Delivery::AtMostOnce,
-                state: owf::durable::CallState::Pending,
+                delivery: ows::durable::Delivery::AtMostOnce,
+                state: ows::durable::CallState::Pending,
             },
             1,
         )
@@ -1815,7 +1815,7 @@ async fn overlap_policies(
             assert!(s.save_record(&child, "late", &Record::Timer { deadline_ms: 0 }, 3).await.is_err());
             assert!(matches!(
                 s.inspect("owned").await?.unwrap().records["protected"],
-                Record::Call { state: owf::durable::CallState::Pending, .. }
+                Record::Call { state: ows::durable::CallState::Pending, .. }
             ));
         } else {
             s.cancel("slot1", 4).await?;
@@ -2059,8 +2059,8 @@ async fn overlap_policies(
 
 /// A listen with an expression, a literal filter and expected correlation.
 /// Kept public so adapter scalability tests exercise the same matcher.
-pub fn control_wait() -> owf::events::PendingWait {
-    use owf::{
+pub fn control_wait() -> ows::events::PendingWait {
+    use ows::{
         events::Consumer,
         expr::Args,
         model::{Correlation, EventFilter, Strategy},
@@ -2073,7 +2073,7 @@ pub fn control_wait() -> owf::events::PendingWait {
         )],
     });
     let progress = Consumer::new(&strategy).progress();
-    owf::events::PendingWait {
+    ows::events::PendingWait {
         types: vec!["answer".into()],
         strategy,
         input: json!({"ticket":42}),
@@ -2423,7 +2423,7 @@ async fn audit_control(t: &TestStore) -> anyhow::Result<()> {
             if let Some(link) = r.child {
                 expected.insert((format!("control_parent:{}", hex(&link.parent)), time(r.admitted_ms, id)), json!(id));
             }
-            let waits: BTreeMap<String, owf::events::PendingWait> = serde_json::from_value(value["waits"].clone())?;
+            let waits: BTreeMap<String, ows::events::PendingWait> = serde_json::from_value(value["waits"].clone())?;
             assert!(r.ended_ms.is_none() || waits.is_empty());
             for (key, waiting) in waits {
                 let k = time(waiting.since_ms, &format!("{}:{}", hex(id), hex(&key)));

@@ -4,7 +4,7 @@
 //! durable call records.
 use crate::{FunctionContext, FunctionError, Runtime};
 use ouro_durable::{Clock, RunStore};
-use owf::{
+use ows::{
     durable::{CallState, Delivery, Record},
     run::{Status, WorkflowError},
 };

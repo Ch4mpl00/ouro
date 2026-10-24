@@ -16,8 +16,8 @@ pub use backend::{
     AtomicBackend, CommitFault, Conflict, FaultInjector, IoCounts, Key, Metrics, Rows, Snapshot, Transaction,
     TransactionalStore,
 };
-pub use owf::model::Overlap;
-use owf::{
+pub use ows::model::Overlap;
+use ows::{
     durable::{Journal, Record},
     run::{Events, Status, WorkflowError},
 };
@@ -445,7 +445,7 @@ pub trait RunStore: Send + Sync {
         &self,
         fence: &Fence,
         key: &str,
-        wait: &owf::events::PendingWait,
+        wait: &ows::events::PendingWait,
         now_ms: i64,
     ) -> anyhow::Result<()>;
 
@@ -585,7 +585,7 @@ pub trait RunStore: Send + Sync {
     /// `limit` are spent, and saves `Record::Budget` at `key` with the
     /// decision and the count after it, in one fenced commit; repeating
     /// returns the saved record. A refusal also saves the run's first
-    /// refusal (`Record::Exceeded` at `owf::durable::EXCEEDED`) in that commit
+    /// refusal (`Record::Exceeded` at `ows::durable::EXCEEDED`) in that commit
     /// unless the run has one, and names it (`first`). The count survives
     /// restarts and ends with the root; the store never interprets what a
     /// unit stands for.
@@ -689,7 +689,7 @@ impl Journal for Lease {
 }
 #[async_trait::async_trait]
 impl Events for Lease {
-    async fn waiting(&self, run_id: &str, key: &str, wait: &owf::events::PendingWait) -> anyhow::Result<()> {
+    async fn waiting(&self, run_id: &str, key: &str, wait: &ows::events::PendingWait) -> anyhow::Result<()> {
         anyhow::ensure!(run_id == self.fence.run_id, "event run does not own this lease");
         self.store.describe_wait(&self.fence, key, wait, self.clock.now_ms()).await
     }

@@ -18,7 +18,7 @@ use ouro_durable::{
     Admission, ChildLink, Clock, Compatibility, Definition, DefinitionTripped, Fence, Lease, RunStore, SavedRun, Swept,
     SystemClock,
 };
-use owf::{
+use ows::{
     durable::{CallEntry, CallFailure, Delivery},
     model::{self, Process, Workflow},
     run::{self, CallInfo, Child, ChildTarget, Functions, Host, Limits, Status, WorkflowError},
@@ -239,7 +239,7 @@ impl Runtime {
     pub async fn definitions(&self, name: &str) -> anyhow::Result<ouro_durable::Definitions> {
         self.store.definitions(name).await
     }
-    pub async fn records(&self, id: &str) -> anyhow::Result<BTreeMap<String, owf::durable::Record>> {
+    pub async fn records(&self, id: &str) -> anyhow::Result<BTreeMap<String, ows::durable::Record>> {
         Ok(self.store.inspect(id).await?.ok_or_else(|| anyhow::anyhow!("unknown run"))?.records)
     }
     /// The run's call journal: every call (and emitted event) it made, with
@@ -247,7 +247,7 @@ impl Runtime {
     /// call changed the world; the host decides that from this journal (to
     /// rerun a failed run, hand it over, or reconcile it).
     pub async fn calls(&self, id: &str) -> anyhow::Result<Vec<CallEntry>> {
-        Ok(owf::durable::call_journal(&self.records(id).await?))
+        Ok(ows::durable::call_journal(&self.records(id).await?))
     }
     /// Delivers an identified CloudEvent (`id`, `source`, `type`; the
     /// `specversion` and `time` are filled in when absent): to `target`'s
@@ -457,7 +457,7 @@ impl Runtime {
             }
             _ => None,
         };
-        let journal: &dyn owf::durable::Journal = match &replayed {
+        let journal: &dyn ows::durable::Journal = match &replayed {
             Some(replayed) => replayed,
             None => &*lease,
         };
@@ -1154,14 +1154,14 @@ struct ReplayJournal {
     first: Option<String>,
 }
 #[async_trait]
-impl owf::durable::Journal for ReplayJournal {
-    async fn load(&self) -> anyhow::Result<BTreeMap<String, owf::durable::Record>> {
+impl ows::durable::Journal for ReplayJournal {
+    async fn load(&self) -> anyhow::Result<BTreeMap<String, ows::durable::Record>> {
         self.lease.load().await
     }
-    async fn save(&self, key: &str, record: &owf::durable::Record) -> anyhow::Result<()> {
+    async fn save(&self, key: &str, record: &ows::durable::Record) -> anyhow::Result<()> {
         self.lease.save(key, record).await
     }
-    async fn spend(&self, key: &str, limit: u64) -> anyhow::Result<Option<owf::durable::Record>> {
+    async fn spend(&self, key: &str, limit: u64) -> anyhow::Result<Option<ows::durable::Record>> {
         let limit = match self.budgets.get(key) {
             Some(true) => u64::MAX,
             Some(false) => {
@@ -1182,7 +1182,7 @@ fn child_id(run_id: &str, key: &str) -> String {
 }
 #[async_trait]
 impl run::Events for ExecutionFunctions {
-    async fn waiting(&self, id: &str, key: &str, wait: &owf::events::PendingWait) -> anyhow::Result<()> {
+    async fn waiting(&self, id: &str, key: &str, wait: &ows::events::PendingWait) -> anyhow::Result<()> {
         run::Events::waiting(&*self.lease, id, key, wait).await
     }
 
@@ -1280,7 +1280,7 @@ impl Functions for ExecutionFunctions {
     fn children(&self) -> Option<&dyn run::Children> {
         Some(self)
     }
-    fn secrets(&self) -> Option<&dyn owf::secrets::Secrets> {
+    fn secrets(&self) -> Option<&dyn ows::secrets::Secrets> {
         self.admitter.capabilities.secrets.as_deref()
     }
     fn resources(&self) -> Option<&dyn run::Resources> {

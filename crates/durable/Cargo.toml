@@ -6,7 +6,7 @@ edition = "2024"
 [dependencies]
 async-trait = "0.1.92"
 anyhow = "1.0.104"
-owf = { path = "../owf" }
+ows = { path = "../ows" }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.151", features = ["preserve_order"] }
 chrono = "0.4.45"

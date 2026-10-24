@@ -963,7 +963,7 @@ public runtime exports already implement that rule.
 [AGENTS]: ../AGENTS.md
 [API]: ../crates/durable/src/lib.rs
 [RAPI]: ../crates/runtime/src/lib.rs
-[OWF]: ../crates/owf/README.md
+[OWF]: ../crates/ows/README.md
 [I1]: https://github.com/Ch4mpl00/ouro/issues/1
 [I1P]: https://github.com/Ch4mpl00/ouro/issues/1#issuecomment-6368474860
 [I1S]: https://github.com/Ch4mpl00/ouro/issues/1#issuecomment-6368475090

@@ -1,4 +1,4 @@
-# owf
+# ows
 
 An interpreter for the Open Workflow Specification DSL 1.0.4. Parse and
 validate YAML with `model::parse_yaml` and `run::validate`; execute with

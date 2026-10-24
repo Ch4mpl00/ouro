@@ -3,7 +3,7 @@
 use ouro_runtime::{
     Config, Delivery, Function, FunctionContext, Registry, Runtime,
     durable::{self, Clock},
-    owf::run::{Status, WorkflowError},
+    ows::run::{Status, WorkflowError},
 };
 use serde_json::{Value, json};
 use std::{

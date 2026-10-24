@@ -1,4 +1,4 @@
-// Differential test: the interpreter (owf::run) against the reference model.
+// Differential test: the interpreter (ows::run) against the reference model.
 // The model (model.rs) is the specification — read that, not this file.
 // This file only generates programs (support/program.rs, the CORE profile:
 // no fork, wait or timeout), runs each on both and compares:
@@ -9,8 +9,8 @@
 //                       call started (from the call journal)
 //   2. random programs, then the regressions they found, kept as plain tests
 //
-//   cargo test -p owf --test model
-//   PROPERTY_RUNS=2000 cargo test -p owf --test model
+//   cargo test -p ows --test model
+//   PROPERTY_RUNS=2000 cargo test -p ows --test model
 //
 // The model stays at CORE: it does not interpret fork, wait, timeouts,
 // attempt deadlines, emit, extensions, listen, run, secrets or schedules;
@@ -28,7 +28,7 @@ mod model;
 mod properties;
 
 use model::Limits;
-use owf::run::Status;
+use ows::run::Status;
 use proptest::test_runner::{TestCaseError, TestRunner};
 use serde_json::{Value, json};
 use support::host::{Options, calls, execute, limits, pretty, trace};
@@ -74,7 +74,7 @@ fn agree(p: &Program, input: Value) -> Result<(), String> {
         diffs.push(format!("calls: interpreter {:?}\n       model       {:?}", calls(&real.journal), expected.calls));
     }
     // The call journal shows an at-most-once call exactly when one started.
-    let protected = real.outcome.calls.iter().any(|c| c.delivery == owf::durable::Delivery::AtMostOnce);
+    let protected = real.outcome.calls.iter().any(|c| c.delivery == ows::durable::Delivery::AtMostOnce);
     if protected != expected.protected_started {
         diffs.push(format!("at-most-once call started: interpreter {protected}"));
     }

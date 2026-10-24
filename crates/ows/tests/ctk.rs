@@ -11,9 +11,9 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use cucumber::gherkin::Step;
 use cucumber::{World, given, then, when};
-use owf::durable::{Journal, Record};
-use owf::model;
-use owf::run::{self, CallInfo, Clock, Event, Functions, Host, Limits, Observer, Status, WorkflowError};
+use ows::durable::{Journal, Record};
+use ows::model;
+use ows::run::{self, CallInfo, Clock, Event, Functions, Host, Limits, Observer, Status, WorkflowError};
 use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -63,7 +63,7 @@ impl Functions for Services {
     fn emits(&self) -> bool {
         true
     }
-    async fn emit(&self, _: &Value, _: &CallInfo<'_>) -> Result<(), owf::durable::CallFailure> {
+    async fn emit(&self, _: &Value, _: &CallInfo<'_>) -> Result<(), ows::durable::CallFailure> {
         Ok(())
     }
     async fn call(&self, name: &str, args: Value, info: &CallInfo<'_>) -> Result<Value, WorkflowError> {
@@ -256,7 +256,7 @@ async fn executed(world: &mut Ctk) {
         observer: starts.clone(),
         clock: Arc::new(Now),
         limits: Limits::default(),
-        runtime: json!({ "name": "owf-ctk", "version": env!("CARGO_PKG_VERSION"), "metadata": {} }),
+        runtime: json!({ "name": "ows-ctk", "version": env!("CARGO_PKG_VERSION"), "metadata": {} }),
     };
     run::validate(&wf, &*host.functions).unwrap_or_else(|e| panic!("{e}"));
     let journal = Memory::default();

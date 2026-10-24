@@ -42,7 +42,7 @@
 //! trigger, uncounted, and retries it after a capped backoff.
 //!
 //! `on` keeps the events matched so far in its trigger's state and replays
-//! them through the same consumer a `listen` uses (`owf::events`), so `all`,
+//! them through the same consumer a `listen` uses (`ows::events`), so `all`,
 //! correlation and `until` mean what they mean in a listen. An identified
 //! event is taken from ingress once, by the first trigger (in key order)
 //! that wants it, under a tombstone with its own lifetime: one event starts
@@ -58,7 +58,7 @@ use ouro_durable::{
     Admission, Arming, DefinitionTripped, Definitions, Fired, Firing, Overlap, OverlapGuard, Rearm, Refused, RunStore,
     Trigger,
 };
-use owf::{
+use ows::{
     events::{self, Consumer, Offer},
     expr::{self, Args},
     model::{self, Catchup, Schedule, Strategy, Until},

@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use owf::{
+use ows::{
     durable::{CallFailure, Journal, Record, check_transition},
     model,
     run::{self, CallInfo, Clock, Functions, Host, Limits, Silent, Status, WorkflowError},
@@ -223,7 +223,7 @@ async fn unknown_bypasses_catch_but_proven_non_dispatch_can_retry() {
 
 #[tokio::test]
 async fn an_interrupted_call_is_not_recorded_and_is_called_again_on_resume() {
-    use owf::durable::CallState;
+    use ows::durable::CallState;
     let wf = workflow(
         r#"do:
   - first: { call: echo, with: { step: 1 } }
@@ -417,7 +417,7 @@ async fn a_timeout_cannot_turn_an_unknown_dispatch_into_a_catchable_retry() {
 // the host stops instead of answering, as a shutdown cuts a model turn short.
 #[derive(Default)]
 struct PropertyWorld {
-    calls: Mutex<Vec<(String, owf::durable::Delivery)>>,
+    calls: Mutex<Vec<(String, ows::durable::Delivery)>>,
     interrupts: Vec<usize>,
     invocations: AtomicUsize,
     interrupted: AtomicUsize,
@@ -448,7 +448,7 @@ impl Functions for PropertyWorld {
 #[derive(Debug)]
 struct Recovered {
     status: Status,
-    completed: BTreeMap<String, owf::durable::TaskResult>,
+    completed: BTreeMap<String, ows::durable::TaskResult>,
     crashes: usize,
     interrupted: usize,
 }
@@ -460,7 +460,7 @@ fn recover_generated(
     interrupts: &[usize],
     cancelled: bool,
 ) -> Result<Recovered, String> {
-    use owf::durable::{CallState, Delivery};
+    use ows::durable::{CallState, Delivery};
     let rt = tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap();
     rt.block_on(async {
         let time = Arc::new(Time(AtomicI64::new(1_000)));
@@ -1587,7 +1587,7 @@ fn generated_faulty_histories_refine_crash_free_effect_histories() {
                 prop_assert!(
                     evidence
                         .values()
-                        .any(|r| matches!(r, Record::Call { state: owf::durable::CallState::Pending, .. })),
+                        .any(|r| matches!(r, Record::Call { state: ows::durable::CallState::Pending, .. })),
                     "unknown requires an orphan intent"
                 );
                 prop_assert!(expected.starts_with(&effects), "unexpected effects: {effects:?}, ideal {expected:?}");

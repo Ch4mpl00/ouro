@@ -6,7 +6,7 @@ Copyright the Serverless Workflow Specification authors, Apache-2.0
 (https://www.apache.org/licenses/LICENSE-2.0). Update it together with the
 schema and `../spec-examples`.
 
-`../ctk.rs` runs it with cucumber: `cargo test -p owf --test ctk`. The
+`../ctk.rs` runs it with cucumber: `cargo test -p ows --test ctk`. The
 scenarios that call HTTP and OpenAPI services reach local fakes through
 `http` and `openapi` host functions, as a protocol pack would; nothing goes
 over the network. The kit's error filter names the communication error type

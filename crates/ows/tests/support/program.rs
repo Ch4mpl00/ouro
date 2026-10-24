@@ -2,7 +2,7 @@
 // reference model read); 2. its expressions, a grammar small enough that
 // every result is predictable; 3. the generator (proptest, shrinkable) and
 // the fix-up that makes any generated tree valid; 4. rendering to a
-// definition `owf::model::parse` accepts; 5. rewrites the metamorphic tests
+// definition `ows::model::parse` accepts; 5. rewrites the metamorphic tests
 // apply.
 //
 // Beyond the reference model's CORE profile, programs may emit events (with
@@ -509,7 +509,7 @@ fn fix_list(tasks: &mut [Task], scope: &Scope, profile: Profile, calls_functions
 }
 
 /// Where a task may continue in its list, as validation sees it
-/// (`owf::model`'s jump graph): a sibling's index, or `None` for out.
+/// (`ows::model`'s jump graph): a sibling's index, or `None` for out.
 fn successors(tasks: &[Task], i: usize) -> Vec<Option<usize>> {
     let len = tasks.len();
     let to = |f: &Flow| match f {
@@ -734,7 +734,7 @@ fn fix_cond(c: &mut Cond, scope: &Scope) {
 
 // ── 4. rendering ───────────────────────────────────────────────────────────
 
-/// The definition, as `owf::model::parse` takes it.
+/// The definition, as `ows::model::parse` takes it.
 pub fn definition(p: &Program) -> Value {
     let r = Render { bare: p.bare };
     let mut root = Map::new();
