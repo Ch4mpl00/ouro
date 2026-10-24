@@ -419,7 +419,7 @@ module contract {
     val errorQueue = flag(errorAllow,"OverlapQueue",not(eligible and c.overlap == 2 and room and busy) or
       (if (c.queued < 0) buffered and d.queued == r and d.queueInput == value else skipped and d.queued == c.queued))
     val queueStable = c.queued < 0 or d.queued < 0 or
-      (c.queued == d.queued and c.queueSlot == d.queueSlot and c.queueInput == d.queueInput)
+      (c.queued == d.queued and c.queueSlot == d.queueSlot and c.queueInput == d.queueInput and c.queueRefused == d.queueRefused)
     val queueReady = c.queued >= 0 and not(b.db.runs.nth(c.queued).admitted) and d.armed and not(d.tripped) and
       op != "activate" and not(Runs.exists(k => k != c.queued and live(a.db.runs.nth(k)) and a.db.runs.nth(k).scheduled)) and
       Runs.filter(k => k != c.queued and live(a.db.runs.nth(k))).size() < c.maxRuns

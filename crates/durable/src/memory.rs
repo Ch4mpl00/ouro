@@ -2,7 +2,7 @@
 //! limited result as well as point reads, including absence and phantoms.
 use crate::*;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     ops::Bound,
     sync::{Arc, Mutex},
 };
@@ -108,7 +108,15 @@ impl Transaction for MemoryTransaction<'_> {
     }
     fn commit(self: Box<Self>) -> anyhow::Result<()> {
         let mut state = self.backend.state.lock().unwrap();
+        // A range validates every returned key's version below. A point
+        // observation of that same version needs no second lookup; a point
+        // that saw another version must still be checked independently.
+        let ranged: BTreeSet<_> =
+            self.scans.iter().flat_map(|scan| scan.versions.iter().map(|(key, version)| (key, *version))).collect();
         for (key, before) in &self.reads {
+            if before.as_ref().is_some_and(|(version, _)| ranged.contains(&(key, *version))) {
+                continue;
+            }
             let current = state.rows.get(key);
             self.backend.metrics.read(usize::from(current.is_some()));
             if current.map(|(v, _)| v) != before.as_ref().map(|(v, _)| v) {

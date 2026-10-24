@@ -10,7 +10,8 @@
 // try/catch with retry (limit.attempt.duration included), wait;
 // input/output/export transforms and schemas (inline or a host-resolved
 // `resource`); if/then/timeout; schedule (every, cron, after, on; missed
-// slots per `document.metadata.catchup`, an extension: `latest` | `none`);
+// slots per `document.metadata.catchup`: `latest` | `none`; overlap per
+// `document.metadata.overlap`: `skip` | `allow` | `queue` | `replace`);
 // use.functions/errors/retries/timeouts/extensions/secrets; evaluate (jq,
 // strict). Runtime arguments: $context, $input, $output, $task, $workflow,
 // $runtime, $run (an extension: jump and visit counts), and $secrets in

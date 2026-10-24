@@ -1692,3 +1692,39 @@ fn schedule_ceiling_is_supplied_by_the_host() {
         .is_err()
     );
 }
+
+#[tokio::test]
+async fn refused_slots_follow_the_selected_overlap_policy() {
+    for policy in ["skip", "allow", "queue", "replace"] {
+        let f = fixture();
+        let yaml = doc(
+            "refused-overlap",
+            "schedule: { every: PT1M }\ndo: [ { pause: { wait: PT1H } }, { write: { call: write } } ]",
+        )
+        .replace("version: '1.0.0' }", &format!("version: '1.0.0', metadata: {{ overlap: {policy} }} }}"));
+        save(&f.rt, "refused-overlap", &yaml);
+        f.time.set(60_000);
+        let first = f.rt.fire_due().unwrap().pop().unwrap();
+        assert_eq!(settle(&f.rt, &first).await, None);
+        f.rt.set_registry(Arc::new(Registry::new()));
+        f.time.set(120_000);
+        assert!(f.rt.fire_due().unwrap().is_empty());
+        let second = "schedule:refused-overlap:every:120000";
+        if policy == "skip" {
+            assert!(f.rt.get(second).unwrap().is_none());
+            assert_eq!(f.rt.definitions("refused-overlap").unwrap().consecutive_faults, 0);
+            continue;
+        }
+        if policy == "queue" {
+            assert_eq!(f.rt.queued("refused-overlap").unwrap()[0].id, second);
+            assert!(f.rt.get(second).unwrap().is_none());
+            f.rt.cancel(&first).unwrap();
+            assert!(f.rt.queued("refused-overlap").unwrap().is_empty());
+        }
+        assert!(matches!(f.rt.get(second).unwrap().unwrap().outcome, Some(Status::Faulted(_))));
+        assert_eq!(f.rt.definitions("refused-overlap").unwrap().consecutive_faults, 1);
+        if policy == "replace" {
+            assert_eq!(f.rt.get(&first).unwrap().unwrap().outcome, Some(Status::Cancelled));
+        }
+    }
+}

@@ -97,14 +97,27 @@ deadline fixed at admission and epoch.
 - **Schedules** (decision 3). Version 1 has a schedule. Activation, and
   nothing else, starts an epoch and arms its version's trigger (`armed`,
   `due`); a version without a schedule leaves none. `catchup: none` skips a
-  missed slot; a slot whose previous run of the schedule is live is skipped;
-  both advance the slot. The schedule's
-  last run is remembered across epochs, as the store's trigger key does. An
-  `after` trigger re-arms at any end of its run (finish, timeout, conflict,
+  missed slot. `firePolicy` takes the overlap policy and host capacity as
+  parameters: skip=0, allow=1, queue=2, replace=3. `policy` selects these before
+  the first admission (capacity 1–3, default 2; production default 10).
+  Unfinished schedule membership survives epochs. `skip` advances with a
+  skip; `allow` admits concurrently; `queue` pins one run identity, slot,
+  input and refusal flag separately from admission and skips later slots;
+  `replace` uses the normal transitive cancellation transition before
+  admission. Capacity counts all unfinished runs of the definition. A buffer
+  survives `crash`, is promoted with its predecessor's end and starts its
+  deadline then; activation and a trip clear it. Independent policy monitors
+  supplement T1's admitted/skipped/buffered disposition check and check queue
+  stability and promotion. Every policy and the ceiling has a witness and
+  a mutant; every policy's decision/admission crash is in `bridgeSuite`.
+  An `after` trigger re-arms at any end of its run (finish, timeout, conflict,
   cancellation) unless a later epoch replaced it. `refuse` is a firing whose
-  run the host cannot admit (#15): the slot advances as for `fire`, and its
-  run is admitted already ended with an unhandled failure, which the breaker
-  observes in that transition; an `after` trigger is then due two ticks on.
+  run the host cannot admit (#15), subject to the same overlap policy. Its
+  run is admitted already ended with an unhandled failure when the policy
+  admits it (on promotion for a buffer), and the breaker observes that fault.
+  `queuedRefusalTest` checks a predecessor fault and a queued refusal tripping
+  in one transition; `oldCompletionPromotesTest` checks epoch isolation while
+  promoting the new epoch's buffer.
 - **Time** (decision 4). The lease is four ticks; a worker acts only while
   more than ε = 1 is left; takeover only after it ends. The deadline is
   admission + 8; the owner decides a timeout.
@@ -153,8 +166,8 @@ exact matching plus undeclared, without a host-supplied `accepts` list.
 ### Serial
 
 `crates/durable/tests/quint.rs` replays Quint's random traces of `contract.qnt`
-(100 traces × 150 steps per adapter by default, all 30 commands and every fault
-switch) and the `bridgeSuite` run of `contract_witnesses.qnt` (all 34 witness
+(100 traces × 150 steps per adapter by default, all 31 commands and every fault
+switch) and the `bridgeSuite` run of `contract_witnesses.qnt` (all 45 witness
 histories in one trace). After every step it compares a projection of the store
 with the model's state. The model records each command in its `command`
 variable; the driver never sees the model's state.
@@ -184,8 +197,9 @@ ticks), with `Policy { mailbox_ms: 37_500, ingress_ms: 37_500, skew_ms: 7_500 }`
 | `child` | `start_child` of run r + 1 under run r; the child's lease is left to expire |
 | `finish`, `timeout`, `cancel` | `finish` (outcomes 1–5), `cancel` |
 | `activate` | `activate_with`: the version's trigger |
-| `fire` | `fire` with `busy` and `rearm`; a missed or taken slot commits a skip |
-| `refuse` | `fire` with `busy` and `refused` (the model's unhandled failure, threshold 2) instead of `admit`; skips as `fire` |
+| `policy` | Host parameters, recorded by CAS in the model trigger's metadata |
+| `fire` | `fire` with the overlap guard, capacity and `rearm`; a missed or taken slot commits a skip |
+| `refuse` | `fire` with the overlap guard and `refused` (the model's unhandled failure, threshold 2) instead of `admit`; skips as `fire` |
 | `ingress` | `ingested`, then `fire` with the ingress event on a generic trigger |
 
 The projection keeps what both sides state: runs (admission, epoch, version,
@@ -193,6 +207,7 @@ outcome, end, deadline, owner, generation, lease, records and values, frontier,
 continuation, subscription, parent, budget decisions and the counts after
 them), mailbox and broadcast copies per recipient, the catalog with its
 trigger, its trip and the epochs of the stored trip notices (`notices`),
+the buffered admission (identity, epoch, slot, input and refusal marker),
 admissions, fired slots (from the admissions' slot bindings) and live ingress
 tombstones; a stored trip must agree with its definition (version, epoch,
 count). Two representational differences are normalised on both sides: a
@@ -277,6 +292,13 @@ APALACHE_ENDPOINT=localhost:8823 spec/check.sh --only symbolic
 A portable JDK may live under `/private/tmp/ouro-tools`; launch its `java` with
 `-Xmx4g -jar /path/to/apalache.jar server --port=8823`. Set `JAVA` and
 `APALACHE_JAR` to run TLC natively too.
+
+For quick checks of the overlap revision without TLC or Apalache:
+
+```sh
+python3 spec/check.py --only simulation --samples 1000
+python3 spec/contract_mutations.py
+```
 
 The Rust bridges need `npm ci --prefix spec`; without it they skip, and
 `OURO_REQUIRE_QUINT=1` turns the skip into a failure. A child test process gets

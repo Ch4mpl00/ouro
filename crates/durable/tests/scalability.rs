@@ -1003,6 +1003,22 @@ fn memory_transactions_validate_absence_ranges_and_independent_keys() {
     c.put("empty", "phantom", &json!(4)).unwrap();
     c.commit().unwrap();
     assert!(a.commit().unwrap_err().is::<Conflict>());
+    // Point/range validation may share a version check only when both
+    // observations saw the same version. Intervening writes still abort.
+    let mut a = b.begin().unwrap();
+    a.get("test", "one").unwrap();
+    a.scan("test", "one", Some("two"), 1).unwrap();
+    let mut c = b.begin().unwrap();
+    c.put("test", "one", &json!(10)).unwrap();
+    c.commit().unwrap();
+    assert!(a.commit().unwrap_err().is::<Conflict>());
+    let mut a = b.begin().unwrap();
+    a.get("test", "one").unwrap();
+    let mut c = b.begin().unwrap();
+    c.put("test", "one", &json!(11)).unwrap();
+    c.commit().unwrap();
+    a.scan("test", "one", Some("two"), 1).unwrap();
+    assert!(a.commit().unwrap_err().is::<Conflict>());
     let mut a = b.begin().unwrap();
     let mut c = b.begin().unwrap();
     a.scan("test", "", None, 1).unwrap();

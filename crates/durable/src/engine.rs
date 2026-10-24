@@ -252,8 +252,12 @@ fn store_run(rows: &mut dyn Transaction, snapshot: &StoredRun) -> anyhow::Result
     let id = &snapshot.run.admission.id;
     let old = find_run(rows, id)?;
     let before = old.as_ref().map(indexes).unwrap_or_default();
+    store_run_indexed(rows, snapshot, &before)
+}
+fn store_run_indexed(rows: &mut dyn Transaction, snapshot: &StoredRun, before: &Rows) -> anyhow::Result<()> {
+    let id = &snapshot.run.admission.id;
     let after = indexes(snapshot);
-    for ((kind, id), value) in crate::backend::changes(&before, &after) {
+    for ((kind, id), value) in crate::backend::changes(before, &after) {
         if let Some(value) = value {
             rows.put(kind, id, value)?;
         } else {
@@ -873,32 +877,36 @@ fn fire(rows: &mut dyn Transaction, f: &Firing<'_>, now: i64, policy: &Policy) -
         anyhow::ensure!(f.admit.len() <= 1, "overlap policy requires one admission");
         anyhow::ensure!(guard.max_concurrent_runs > 0, "schedule ceiling must be positive");
         anyhow::ensure!(f.next.is_some() && f.busy.is_some(), "overlap firing requires next and busy triggers");
-        let limit = if guard.policy == Overlap::Replace { usize::MAX } else { 1 };
-        let live = rows.scan(&partition("trigger_live", f.key), "", None, limit)?;
-        if guard.policy == Overlap::Replace {
-            for id in live.values() {
-                let id = id.as_str().ok_or_else(|| anyhow::anyhow!("invalid trigger run index"))?;
-                cancel_run(rows, id, now)?;
+        // A slot already admitted is joined, even after its ingress
+        // tombstone expires. Replacement must never cancel its own run.
+        if find_run(rows, &a.id)?.is_none() {
+            let limit = if guard.policy == Overlap::Replace { usize::MAX } else { 1 };
+            let live = rows.scan(&partition("trigger_live", f.key), "", None, limit)?;
+            if guard.policy == Overlap::Replace {
+                for id in live.values() {
+                    let id = id.as_str().ok_or_else(|| anyhow::anyhow!("invalid trigger run index"))?;
+                    cancel_run(rows, id, now)?;
+                }
             }
-        }
-        if !capacity(rows, &a.name, guard.max_concurrent_runs)? {
-            next = Some(guard.ceiling);
-            disposition = Fired::Ceiling;
-        } else if !live.is_empty() && guard.policy != Overlap::Allow && guard.policy != Overlap::Replace {
-            if guard.policy == Overlap::Queue && queued(rows, f.key)?.is_none() {
-                let q = Queued {
-                    version: 1,
-                    admission: a.clone(),
-                    rearm: f.rearm.cloned(),
-                    max_concurrent_runs: guard.max_concurrent_runs,
-                    failure: f.refused.map(|r| (r.error.clone(), r.breaker_threshold)),
-                };
-                put(rows, "trigger_queue", f.key, &q)?;
-                rows.put(&partition("queue_name", &a.name), f.key, &json!(f.key))?;
-                disposition = Fired::Queued;
-            } else {
-                next = f.busy;
-                disposition = Fired::Busy(live.values().next().and_then(Value::as_str).unwrap_or_default().into());
+            if !capacity(rows, &a.name, guard.max_concurrent_runs)? {
+                next = Some(guard.ceiling);
+                disposition = Fired::Ceiling;
+            } else if !live.is_empty() && guard.policy != Overlap::Allow && guard.policy != Overlap::Replace {
+                if guard.policy == Overlap::Queue && queued(rows, f.key)?.is_none() {
+                    let q = Queued {
+                        version: 1,
+                        admission: a.clone(),
+                        rearm: f.rearm.cloned(),
+                        max_concurrent_runs: guard.max_concurrent_runs,
+                        failure: f.refused.map(|r| (r.error.clone(), r.breaker_threshold)),
+                    };
+                    put(rows, "trigger_queue", f.key, &q)?;
+                    rows.put(&partition("queue_name", &a.name), f.key, &json!(f.key))?;
+                    disposition = Fired::Queued;
+                } else {
+                    next = f.busy;
+                    disposition = Fired::Busy(live.values().next().and_then(Value::as_str).unwrap_or_default().into());
+                }
             }
         }
     } else if f.overlap.is_some() && !f.admit.is_empty() {
@@ -1015,6 +1023,9 @@ fn terminate(rows: &mut dyn Transaction, id: &str, status: &Status, now: i64) ->
     let mut parents = vec![id.to_string()];
     while let Some(parent) = parents.pop() {
         for mut child in indexed_runs(rows, &partition("children", &parent), "", None, usize::MAX)? {
+            // The indexed read already holds this child's primary row in
+            // the transaction; reuse its indexes instead of reading it twice.
+            let before = indexes(&child);
             child.run.state = RunState::Cancelled;
             child.run.outcome = Some(Status::Cancelled);
             child.run.ended_ms = Some(now);
@@ -1025,7 +1036,7 @@ fn terminate(rows: &mut dyn Transaction, id: &str, status: &Status, now: i64) ->
             child.subscriptions.clear();
             names.insert(child.run.admission.name.clone());
             parents.push(child.run.admission.id.clone());
-            store_run(rows, &child)?;
+            store_run_indexed(rows, &child, &before)?;
             lifecycle(rows, &child.run.admission.id, &Status::Cancelled, now)?;
         }
     }

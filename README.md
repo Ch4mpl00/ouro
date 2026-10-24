@@ -294,7 +294,9 @@ is bounded by its collection and `retry` by its attempts.
   ```
 
   A slot whose run the host refuses to admit (a `MissingFunction` or an
-  `InvalidDefinition`) never stops the worker: the firing's commit consumes
+  `InvalidDefinition`) follows the same overlap policy. A queued refusal is
+  pinned until promotion; its failed run is recorded and counted then.
+  Otherwise, when the overlap guard permits it, the firing's commit consumes
   the slot, stores the run under the slot's id as ended faulted at its
   admission (`configuration` or `validation`; `get`, `list`) and counts the
   fault toward the definition's breaker, so a definition that stays broken
