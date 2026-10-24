@@ -58,11 +58,12 @@ registry starts a new one); the children it names are resolved on every
 check, since activation may change which version `latest` is.
 
 `worker` recovers due and interrupted runs, renews leases, enforces concurrency
-limits and periodically sweeps retained evidence and expired mailbox events. A
-shutdown token releases work for recovery. `cancel` is terminal and cascades to
-owned descendants. `get`, `list`, `records`, `calls`, `definitions`, `triggers`,
-`deliver`, `sweep` and `recover_once` support embedding applications that own
-their polling and control surface.
+limits, hands the store's notices on (`notify`, below) and periodically sweeps
+retained evidence and expired mailbox events. A shutdown token releases work for
+recovery. `cancel` is terminal and cascades to owned descendants. `get`, `list`,
+`records`, `calls`, `definitions`, `triggers`, `deliver`, `sweep`, `notify` and
+`recover_once` support embedding applications that own their polling and
+control surface.
 
 `calls(id)` is the run's call journal, one `CallEntry` per call and emitted
 event (as `emit`): its record key (where its arguments and result are), the
@@ -87,15 +88,43 @@ targeted `publish` uses the mailbox too; a broadcast `publish` still reaches
 only the runs subscribed at that moment.
 
 Versions are immutable. Every activation, including reactivating the active
-version, starts a new activation epoch; so does a breaker rollback. The breaker
+version, starts a new activation epoch, and nothing else does. The breaker
 counts terminal faults (unhandled errors, timeouts, unknown outcomes) of runs
 admitted in the active version's current epoch; cancellations and interruptions
-(even exhausted ones) do not count, and a success resets the count. N
-consecutive faults (default N = 3) atomically roll back to the prior version in
-a new epoch. With no prior version the definition is `tripped` (visible in
-`definitions`): it admits no new runs and its schedule stops, running runs
-finish, and the next activation clears it. In-flight runs keep their admitted
-YAML, version, input and schema/delivery bindings.
+(even exhausted ones) do not count, and a success resets the count. The breaker
+reports and never rolls back: the runtime does not know which version is the
+safe one. N consecutive faults (`Config::breaker_threshold`, default 3) trip
+the definition in the commit of the Nth fault: `definitions(name).tripped`
+holds the `Trip` (version, epoch, faults, threshold, the run and its error), no
+new runs are admitted, its schedule stops, running runs finish and are no
+longer counted, and a notice is stored with the trip. `notify` (the worker
+calls it on every tick) hands each notice on at least once, as an identified
+CloudEvent of type `ouro.definition.tripped` (`durable::TRIPPED`, source
+`ouro/definitions/<name>`, id `tripped:<epoch>`, the report as `data`): to the
+runs and `on` schedules listening for that type and to the `EventSink`. The
+host decides: activate another version (its own built-in one, an earlier one),
+keep it stopped, alert someone. Only an activation clears the trip. In-flight
+runs keep their admitted YAML, version, input and schema/delivery
+bindings.
+
+```rust
+// "Fall back to my built-in version after N faults", built by the host on
+// the trip: the sink only forwards; the host's own task activates.
+struct Trips(tokio::sync::mpsc::UnboundedSender<String>);
+#[async_trait]
+impl EventSink for Trips {
+    async fn emit(&self, event: &Value) -> Result<(), FunctionError> {
+        if event["type"] == durable::TRIPPED {
+            self.0.send(event["subject"].as_str().unwrap_or_default().to_owned()).ok();
+        }
+        Ok(())
+    }
+}
+// …in the host's task, beside `worker`:
+while let Some(name) = trips.recv().await {
+    runtime.activate(&name, builtin_version(&name))?;
+}
+```
 
 Deadlines are absolute instants fixed when they start: the workflow's
 `timeout` counts from admission, not from the drive that first runs it, and a
@@ -227,9 +256,9 @@ is bounded by its collection and `retry` by its attempts.
   `ResourceResolver` (`with_resources`) and is pinned at admission.
 - `schedule` (`every`, `cron` in UTC, `after`, `on`) keeps generic
   triggers in the store, armed in the commit that activates the version
-  (a version without a schedule removes them) and, for the predecessor, in
-  the commit of a breaker rollback: indexed by the time they are next due
-  and by the event types they react to. A trigger of an older epoch never
+  (a version without a schedule removes them, and so does a breaker trip,
+  in its own commit): indexed by the time they are next due and by the
+  event types they react to. A trigger of an older epoch never
   fires. The `worker` fires due slots on each tick (`fire_due`, a range
   read of the due index); the trigger moves to its next slot in the commit
   that admits the slot's run, whose id derives from the slot, so concurrent
@@ -285,7 +314,8 @@ The engine owns primary and secondary keys in `(kind, id)` order:
 | `pending:<hex run ID>:<hex type>`, `published:<hex run ID>` | sequence | Pending copies of a type, and published ones, oldest first |
 | `live:<hex run ID>:<hex type>`, `live_published:<hex run ID>` | ordered expiry + sequence | The same by expiry, for waking a waiting run |
 | `expiry:<hex run ID>` | ordered expiry + sequence | Pending mailbox copies, for expiry records |
-| `definitions` | definition name | One name's immutable versions, epoch, breaker state and armed trigger keys |
+| `definitions` | definition name | One name's immutable versions, active version, epoch, breaker count and trip, and armed trigger keys |
+| `notice` | ordered time + hex name + epoch | A CloudEvent committed for the host (a breaker trip), until acknowledged |
 | `name:<hex name>` | run ID | Listing by name and run-ID prefix |
 | `due` | ordered time + run ID | Bounded pages of eligible runs; running runs use lease expiry |
 | `due_app:<hex application version>` | ordered time + run ID | The same per declared application version (empty: undeclared) |
@@ -336,7 +366,10 @@ the row shapes above (and the interpreter's durable state version, now 6) can
 change without a migration; nothing persisted before them is converted. Each
 run row records the durable state version it was written under, and a row of
 another version (including the earlier one-aggregate-per-run layout) is
-refused with an error rather than read as a run without evidence.
+refused with an error rather than read as a run without evidence. Likewise a
+`definitions` row records its layout (2); the earlier unversioned layout, which
+kept a predecessor for a breaker rollback, is refused rather than read as a
+definition that never tripped.
 
 The interpreter's persistence seams are synchronous. The Postgres adapter uses
 `tokio-postgres` and `deadpool-postgres` on a dedicated I/O thread with a

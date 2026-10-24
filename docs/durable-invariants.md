@@ -60,6 +60,7 @@ Publish(e,recipients), RejectEvent(e,reason), ExpireEvent(c)
 StartChild(parent,key,child), FinishChild(child,outcome), Notify(parent,child,outcome)
 Finish(r,outcome), Cancel(r), Timeout(r,scope,deadline), Sweep(r,evidence)
 SaveVersion(name,v,content), Activate(name,v,epoch), BreakerObserve(r,outcome)
+Trip(name,v,epoch,report), Notice(e), Acknowledge(e)
 Fire(trigger,epoch,slot,r), Rearm(trigger,epoch,next_slot)
 Crash(worker), StorageFail(operation,definite | ambiguous), ClockRead(worker,t)
 ```
@@ -525,9 +526,10 @@ expiry. Real-time guarantees require section 6's clock and race choices.
 
 #### V1 — Catalog changes cannot rewrite admitted execution [P, safety]
 
-`SaveVersion(n,v,D)` fixes `D`. Activation selects an existing version and records
-its predecessor atomically. Subsequent activation/rollback changes future admission
-selection only; existing `A(r)` and resolved child links remain unchanged.
+`SaveVersion(n,v,D)` fixes `D`. Activation selects an existing version atomically,
+and nothing else selects one: the runtime never rolls back or chooses a version on
+the application's behalf (decision 5). A subsequent activation changes future
+admission selection only; existing `A(r)` and resolved child links remain unchanged.
 
 Activation is not migration. **Source:** [README][README], [I1][I1].
 **Fault:** version change mid-run. **Mutant:** recovery substitutes active YAML but
@@ -538,16 +540,20 @@ recovery; compare executed bindings/arguments as well as stored metadata.
 
 For each activation epoch, serialize qualifying run terminal observations. Each
 run contributes at most once. Fault increments the consecutive-fault count;
-success resets it. On reaching threshold `N`, selecting the remembered predecessor
-and updating breaker state is atomic with the threshold observation. Completions
-outside the chosen epoch cannot alter it. Cancellation/unknown classification and
-the no-predecessor case require explicit policy.
+success resets it. On reaching threshold `N`, the trip is atomic with the threshold
+observation: the definition records its report (version, epoch, count, threshold,
+the run and its error), stops admitting runs and firing its schedule, and commits
+one notice for the host. The active version and the epoch do not change. A tripped
+breaker observes nothing more; only an activation clears it, in a new epoch.
+Completions outside the current epoch cannot alter it. Classification is decision 5.
 
-Concurrency cannot lose counts or roll back a later activation. **Source:**
-[README][README]; epoch interpretation is derived. **Fault:** simultaneous
-finishes, repeated finish, stale-version completions. **Mutant:** increment with
-unprotected read/modify/write. **Check:** race successes/faults/activation; compare
-with every legal serial order, not a presumed wall-clock order.
+Concurrency cannot lose counts, report one trip twice, or change the active
+version. **Source:** [README][README], [#10][I10]; epoch interpretation is
+derived. **Fault:** simultaneous finishes, repeated finish, stale-version
+completions, a crash between the trip and the host's hand-off. **Mutant:**
+increment with unprotected read/modify/write; count an earlier epoch's run.
+**Check:** race successes/faults/activation; compare with every legal serial
+order, not a presumed wall-clock order; the notice and the trip share a commit.
 
 #### V3 — Workers obey declared application compatibility [P, safety]
 
@@ -946,6 +952,7 @@ public runtime exports already implement that rule.
 [I1G]: https://github.com/Ch4mpl00/ouro/issues/1#issuecomment-6372782822
 [I2]: https://github.com/Ch4mpl00/ouro/issues/2
 [I3]: https://github.com/Ch4mpl00/ouro/issues/3
+[I10]: https://github.com/Ch4mpl00/ouro/issues/10
 [RMR]: https://arxiv.org/html/2608.03836
 [DF]: https://www.microsoft.com/en-us/research/uploads/prod/2021/10/DF-Semantics-With-Proofs.pdf
 [DBOS]: https://www.dbos.dev/blog/how-to-test-durable-execution
@@ -955,6 +962,8 @@ public runtime exports already implement that rule.
 
 These settle open decisions 1, 2, 5, 6 and 7 of section 6; the invariants that
 depended on them are to be read under these choices. The others stay open.
+Decision 5 and the epoch rule of decision 3 were revised on 2026-10-24
+([#10][I10]): the breaker reports and never rolls back.
 
 1. **Event identity (W2).** `deliver` requires an event identity (`source` +
    `id`, as in CloudEvents). The same identity with a different payload is a
@@ -968,9 +977,11 @@ depended on them are to be read under these choices. The others stay open.
    reads its mailbox before waiting; per-type FIFO. An expired event is removed
    with an observable record, never silently. Broadcast `publish` still reaches
    only the runs subscribed at that moment.
-3. **Schedules (T1, T2).** Every activation and every breaker rollback starts
-   a new activation epoch. Triggers are re-armed in the same transaction that
-   changes the active version; a trigger of an older epoch never fires.
+3. **Schedules (T1, T2).** Every activation, and nothing else, starts a new
+   activation epoch. Triggers are re-armed in the same transaction that
+   activates a version; a breaker trip removes them in its own transaction,
+   and only the next activation arms any again. A trigger of an older epoch
+   never fires.
    Activating a version without `schedule` removes its triggers in that
    transaction; runs already started finish. Missed slots: `catchup: latest`
    (default, one late run) or `none`. Overlap: a slot whose previous run of the
@@ -981,13 +992,22 @@ depended on them are to be read under these choices. The others stay open.
    by a configured ε: a worker stops acting ε before its lease ends, and a lease
    is taken over only after it ends. Every time-related invariant holds under
    skew ≤ ε. Storage time (e.g. Postgres `now()`) may later replace host time.
-5. **Breaker (V2).** It counts terminal faults of runs of the active version:
-   unhandled errors, timeouts, outcome-unknown that ended the run. It does not
-   count cancellations or infrastructure interruptions (a process or storage
-   failure that a later attempt resumes). Success and a new epoch reset the
-   count. With no predecessor to roll back to, the definition is marked
-   tripped: new runs and its schedule stop, visibly in the runs API; running
-   runs finish; a new activation clears it.
+5. **Breaker (V1, V2): it reports, never rolls back.** The engine does not
+   know which version of a workflow is the "original" or "safe" one, so it
+   never chooses one. The breaker counts terminal faults of runs of the active
+   version admitted in the current epoch: unhandled errors, timeouts,
+   outcome-unknown that ended the run. It does not count cancellations or
+   infrastructure interruptions (a process or storage failure that a later
+   attempt resumes, even when the interruptions run out). Success and a new
+   activation reset the count. At the threshold the definition becomes
+   tripped, with the reason and the counts: new runs and its schedule stop,
+   running runs finish, the state is visible in the runs API, and a notice (a
+   CloudEvent) committed with the trip is handed at least once to the host,
+   which can subscribe to it. The host decides what to do: activate another
+   version (its own built-in one, an earlier one), keep it stopped, alert
+   someone. Only a new activation clears the trip and starts an epoch. There
+   is no automatic rollback and no predecessor bookkeeping for one; an
+   application implements "fall back after N faults" on top of the notice.
 6. **Delivery is declared per function (E2, E5).** The
    default delivery of every call, reads and writes alike, is at-least-once:
    a call whose outcome is unknown after a crash may be dispatched again, with

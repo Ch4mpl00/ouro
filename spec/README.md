@@ -50,10 +50,10 @@ are the bridges in `crates/durable/tests/quint.rs` and `quint/concurrent.rs`.
 | C2 | `C2`: terminal child has notification obligation | Serial MBT audits the parent's one notification; child conformance |
 | C3 | `C3`: cancellation closes the bounded subtree | Serial MBT; handler cancellation tests remain separate |
 | T1 | `T1`: slot disposition, overlap and global ingress identity | Concurrent firings and ingress; serial MBT; `t1_*` runtime regressions |
-| T2 | `T2`: activation epoch, rollback re-arming, dormant rearm | Concurrent firing/activation; serial MBT; `gaps::t2_old_completion_cannot_rearm_new_epoch` |
+| T2 | `T2`: activation epoch (only an activation starts one), dormant rearm | Concurrent firing/activation; serial MBT; `gaps::t2_old_completion_cannot_rearm_new_epoch` |
 | T3 | `T3`: deadline fixed at admission | Serial MBT; `t3_admission_fixes_the_workflow_deadline` |
-| V1 | `V1`: activation and pinned admission | Serial MBT; runtime pinned-version recovery |
-| V2 | `V2`: epoch, fault classification, reset/rollback/trip | Serial MBT; `gaps::v2_old_epoch_fault_does_not_count_after_reactivation` |
+| V1 | `V1`: only an activation selects the active version (no rollback); pinned admission | Serial MBT; runtime pinned-version recovery |
+| V2 | `V2`: epoch, fault classification, reset; a trip reports once (one notice), stops the schedule, ignores later observations, cleared only by activation | Serial MBT; `gaps::v2_old_epoch_fault_does_not_count_after_reactivation` |
 | V3 | `V3`: undeclared/exact-match claim and mutation guards | Serial MBT (`claim_as`, `due_as` per worker version); `gaps::v3_incompatible_worker_cannot_claim` |
 | O1 | `O1`: failed operation stops the attempt | Serial MBT fault switches; generated interrupted journals |
 | O2 | `O2`: terminal-only retention and stable identities | Serial MBT (swept evidence projected away); replay-after-sweep refusal |
@@ -94,22 +94,24 @@ deadline fixed at admission and epoch.
   recipient keeps one copy per identity; another payload under it is refused
   (-1). A take selects the first pending, unexpired copy; `expire` records
   expiry. Ingress identities are global tombstones lasting five ticks.
-- **Schedules** (decision 3). Version 1 has a schedule. Activation starts an
-  epoch, arms its version's trigger (`armed`, `due`) and prepares the
-  predecessor's (`fallback`) for a rollback; a version without a schedule
-  leaves none. `catchup: none` skips a missed slot; a slot whose previous run
-  of the schedule is live is skipped; both advance the slot. The schedule's
+- **Schedules** (decision 3). Version 1 has a schedule. Activation, and
+  nothing else, starts an epoch and arms its version's trigger (`armed`,
+  `due`); a version without a schedule leaves none. `catchup: none` skips a
+  missed slot; a slot whose previous run of the schedule is live is skipped;
+  both advance the slot. The schedule's
   last run is remembered across epochs, as the store's trigger key does. An
   `after` trigger re-arms at any end of its run (finish, timeout, conflict,
   cancellation) unless a later epoch replaced it.
 - **Time** (decision 4). The lease is four ticks; a worker acts only while
   more than ε = 1 is left; takeover only after it ends. The deadline is
   admission + 8; the owner decides a timeout.
-- **Breaker** (decision 5). Threshold two; only runs of the current epoch
-  count; unhandled failures, timeouts, unknown endings and binding conflicts
-  count, cancellations do not; a rollback arms the prepared triggers, no
-  predecessor trips the definition (no admissions, no schedule) until the next
-  activation.
+- **Breaker** (decision 5, revised by #10). Threshold two; only runs of the
+  current epoch count; unhandled failures, timeouts, unknown endings and
+  binding conflicts count, cancellations do not. It reports and never rolls
+  back: the threshold observation trips the definition (no admissions, no
+  schedule, the count frozen) and appends the epoch to `notices`, the trip's
+  committed notice; the active version and the epoch stay. A tripped breaker
+  observes nothing; only the next activation clears it.
 - **Compatibility** (#3). Worker `w` declares version `w + 1`; a run admitted
   with version 0 (undeclared) is compatible with both.
 - **Children, retention.** The parent's host holds a child's first lease. A
@@ -146,7 +148,7 @@ exact matching plus undeclared, without a host-supplied `accepts` list.
 
 `crates/durable/tests/quint.rs` replays Quint's random traces of `contract.qnt`
 (100 traces × 150 steps per adapter by default, all 29 commands and every fault
-switch) and the `bridgeSuite` run of `contract_witnesses.qnt` (all 30 witness
+switch) and the `bridgeSuite` run of `contract_witnesses.qnt` (all 31 witness
 histories in one trace). After every step it compares a projection of the store
 with the model's state. The model records each command in its `command`
 variable; the driver never sees the model's state.
@@ -175,17 +177,19 @@ ticks), with `Policy { mailbox_ms: 37_500, ingress_ms: 37_500, skew_ms: 7_500 }`
 | `expire`, `sweep` | `sweep` without and with five ticks of retention |
 | `child` | `start_child`; the child's lease is left to expire |
 | `finish`, `timeout`, `cancel` | `finish` (outcomes 1–5), `cancel` |
-| `activate` | `activate_with`: the version's trigger and the predecessor's fallback |
+| `activate` | `activate_with`: the version's trigger |
 | `fire` | `fire` with `busy` and `rearm`; a missed or taken slot commits a skip |
 | `ingress` | `ingested`, then `fire` with the ingress event on a generic trigger |
 
 The projection keeps what both sides state: runs (admission, epoch, version,
 outcome, end, deadline, owner, generation, lease, records and values, frontier,
 continuation, subscription, parent, budget decisions and the counts after
-them), mailbox and broadcast copies per recipient,
-the catalog with its trigger and fallback, admissions, fired slots (from the
-admissions' slot bindings) and live ingress tombstones. Two representational
-differences are normalised on both sides: a pending copy past its time counts as
+them), mailbox and broadcast copies per recipient, the catalog with its
+trigger, its trip and the epochs of the stored trip notices (`notices`),
+admissions, fired slots (from the admissions' slot bindings) and live ingress
+tombstones; a stored trip must agree with its definition (version, epoch,
+count). Two representational differences are normalised on both sides: a
+pending copy past its time counts as
 expired (the store records expiry at the next take or sweep, the model at
 `expire`), and swept evidence is absent (the model keeps it, marked). Outside the
 projection, every step audits fenced loads against snapshots, `due` and
@@ -281,8 +285,8 @@ TEST_DATABASE_URL=postgresql://postgres:local-test-password@localhost/postgres \
 
 Folded from the protocol model: release, error responses, proven
 non-execution, binding conflicts, stale fences, readmission, success resetting
-the breaker, rollback and retention, each with a witness the serial bridge also
-replays. Not folded, and checked instead by the conformance suite and the DSL
+the breaker, its trip and reactivation, and retention, each with a witness the
+serial bridge also replays. Not folded, and checked instead by the conformance suite and the DSL
 and runtime tests:
 
 - routing an unaddressed `deliver` to the oldest registration, `register_wait`
