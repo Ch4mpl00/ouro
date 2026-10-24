@@ -462,20 +462,30 @@ Completion cannot strand a live joining parent. **Source:** [README][README],
 **Mutant:** finish commits, notification is only a volatile callback. **Check:**
 kill at completion, reopen both runs, join before/after finish and race cancellation.
 
-#### C3 — Cancellation revokes future work throughout the owned subtree [P/D, safety]
+#### C3 — A run's end revokes future work throughout its owned subtree [P/D, safety]
 
-Successful cancellation fixes a terminal decision and revokes authorization for
-new operations in the run and every owned live descendant at the cancellation
-cut. A racing child start either belongs to that cancelled subtree or loses the
-race; it cannot escape ownership. Cancellation signals active handlers and prevents
+An owned child never outlives its parent ([#14][I14]). Whenever a run's terminal
+decision commits — completion, a fault (a timeout, an unknown outcome and a
+binding conflict included) or cancellation — every owned live descendant,
+transitively, is cancelled in that same transition: its outcome is cancellation,
+its end time the parent's, its C2 notification commits with it, and authorization
+for new operations in the run and the whole subtree is revoked at that cut. A
+descendant that already ended keeps its outcome; ended children cost the cut
+nothing. A racing child start either belongs to that closed subtree or loses the
+race; it cannot escape ownership. Cancelling a descendant this way is not a fault
+of its version (V2). Cancellation signals active handlers and prevents
 dependent progress. Already authorized/in-flight external effects may complete;
 cancellation never asserts they were undone. Independent children are excluded.
 
-Cancellation is a durable stop, not external rollback. **Source:** [README][README],
-[AGENTS][AGENTS]. **Fault:** child-start/cancel races, detached work.
-**Mutant:** enumerate children before cancellation without protecting that cut.
-**Check:** concurrent child admission, dispatch authorization and subtree cancel;
-track signal delivery, new authorizations and late external completions separately.
+A parent that ends without joining its child stops the child; cancellation is a
+durable stop, not external rollback. **Source:** [README][README],
+[AGENTS][AGENTS], [#14][I14]. **Fault:** child-start/cancel races, detached work,
+a crash at the parent's terminal commit. **Mutant:** enumerate children before
+cancellation without protecting that cut; cascade only on cancellation; cascade
+only to direct children. **Check:** concurrent child admission, dispatch
+authorization and subtree cancel; end a parent with each outcome over a
+grandchild and abort that commit; track signal delivery, new authorizations and
+late external completions separately.
 
 ### T. Triggers and time (3)
 
@@ -771,11 +781,15 @@ that cell, not a proved non-implication. `*` marks a conditional/open guarantee.
 The matrix is split horizontally for readability; together the panels contain
 all 38 invariant columns and the same fault rows. B1 (budgets, added for issue
 #8) is predicted in the boundary crash, ambiguous commit, duplicate delivery,
-concurrent racers, lease expiry and storage disconnect rows.
+concurrent racers, lease expiry and storage disconnect rows. Issue #14 widened
+C3 from cancellation to every end of a parent and added no cell: the same rows
+can strand a live owned descendant at the parent's terminal commit, and a
+duplicate or stale finish is refused by the fence before it can end anything.
 
 Boundary crash B means injecting immediately before/after admission, intent,
 dispatch, external effect, response, result/checkpoint commit, event acceptance/
-consumption, child start/finish/notification, trigger advancement/admission/rearm,
+consumption, child start/finish/notification, a parent's end and its subtree's
+cancellation, trigger advancement/admission/rearm,
 activation/breaker update, cancellation and sweep, including lost replies. A kill
 only after whole-run completion does not cover B.
 
@@ -955,6 +969,7 @@ public runtime exports already implement that rule.
 [I2]: https://github.com/Ch4mpl00/ouro/issues/2
 [I3]: https://github.com/Ch4mpl00/ouro/issues/3
 [I10]: https://github.com/Ch4mpl00/ouro/issues/10
+[I14]: https://github.com/Ch4mpl00/ouro/issues/14
 [RMR]: https://arxiv.org/html/2608.03836
 [DF]: https://www.microsoft.com/en-us/research/uploads/prod/2021/10/DF-Semantics-With-Proofs.pdf
 [DBOS]: https://www.dbos.dev/blog/how-to-test-durable-execution
@@ -1036,3 +1051,8 @@ names. A missing one is refused at admission and ends a resumed run with a
 configuration fault before any further step (never a `Dispatch` of a call it
 cannot make); it does not change `A(r)` (A1, V1). Validation also rejects a
 definition with a task list whose end no flow path reaches.
+
+Addendum (2026-10-24, issue #14). An owned child never outlives its parent:
+any terminal end of a run cancels its owned live descendants, transitively, in
+the commit of that end (C3). This was already the stores' behaviour; the model
+had ended them only on cancellation. Independent runs are unaffected.
