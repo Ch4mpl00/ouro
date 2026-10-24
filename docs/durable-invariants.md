@@ -88,7 +88,7 @@ promise survival of a process that owns the only copy.
 
 ### Sources and their limits
 
-- **[README][README], [store API][API], [runtime exports][RAPI], [OWF README][OWF],
+- **[README][README], [store API][API], [runtime exports][RAPI], [OWS README][OWS],
   [repository conventions][AGENTS]** supply ouro's vocabulary and promises.
 - **[Issue #1][I1], all four comments**: [positioning][I1P], [storage and evidence][I1S],
   [scope correction][I1C], [invariant gaps][I1G]. The scope correction supersedes
@@ -256,7 +256,7 @@ distinct logical invocations have distinct keys within the promised deduplicatio
 namespace. Changing a retry ordinal, process or fence does not change `i`.
 
 A retry cannot escape protection by acquiring a new identity. **Source:**
-[README][README], [OWF][OWF], [I1][I1]. **Fault:** takeover, loop/branch collisions,
+[README][README], [OWS][OWS], [I1][I1]. **Fault:** takeover, loop/branch collisions,
 code changes. **Mutant:** incorporate worker generation into the idempotency key.
 **Check:** generated loops/parallel paths and repeated recovery; compare identities
 and bindings, not only output values.
@@ -296,7 +296,7 @@ Once `SaveResult(i,v)` commits, every later use of `i` returns that same result
 or replace `v`. This applies to reads as well as writes. Immutable completed task
 records follow the same rule; retention makes missing evidence an explicit refusal.
 
-Recovery cannot refresh a completed read. **Source:** [README][README], [OWF][OWF].
+Recovery cannot refresh a completed read. **Source:** [README][README], [OWS][OWS].
 **Fault:** recovery with changed external data or record overwrite. **Mutant:**
 refresh only completed read calls. **Check:** change fake read responses after
 checkpoint, recover and audit handler counts and returned values.
@@ -676,7 +676,7 @@ Retry and requested duplication need different meanings on the wire. **Source:**
 [RMR][RMR]; ouro's terminal promise in [README][README]. **Fault:** stale answer
 reuse or payload-based guessing. **Mutant:** serve the first branch's decision to
 every later fork. **Check:** same-value new branches, different-value branches and
-duplicate branch requests. This is not OWF's parallel `fork` construct.
+duplicate branch requests. This is not OWS's parallel `fork` construct.
 
 ### B. Budgets (1)
 
@@ -933,7 +933,7 @@ public runtime exports already implement that rule.
 
 ## 7. Out of scope for the durable layer
 
-- **OWF parsing, `switch`, loops, jq and data transformations:** checked by the OWF
+- **OWS parsing, `switch`, loops, jq and data transformations:** checked by the OWS
   schema, interpreter conformance and independent semantic/differential tests;
   the durable layer must preserve the resulting decisions and values.
 - **Cron arithmetic and DSL schedule interpretation:** checked by scheduler/DSL
@@ -963,7 +963,7 @@ public runtime exports already implement that rule.
 [AGENTS]: ../AGENTS.md
 [API]: ../crates/durable/src/lib.rs
 [RAPI]: ../crates/runtime/src/lib.rs
-[OWF]: ../crates/ows/README.md
+[OWS]: ../crates/ows/README.md
 [I1]: https://github.com/Ch4mpl00/ouro/issues/1
 [I1P]: https://github.com/Ch4mpl00/ouro/issues/1#issuecomment-6368474860
 [I1S]: https://github.com/Ch4mpl00/ouro/issues/1#issuecomment-6368475090

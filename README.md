@@ -33,7 +33,7 @@ reads or writes. That is the host's to judge, from a run's call journal and
 with its own dry-run mock rule (below). Handlers receive arguments and
 `FunctionContext`: a
 cancellation token, run ID, task path, retry attempt, stable idempotency key
-and current OpenTelemetry context. Return JSON or `FunctionError` (OWF Problem
+and current OpenTelemetry context. Return JSON or `FunctionError` (OWS Problem
 Details); YAML `try/catch` handles ordinary function and schema errors.
 Both input and output schemas are checked.
 
