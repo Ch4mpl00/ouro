@@ -669,6 +669,72 @@ async fn a_trip_reports_and_only_an_activation_clears_it() {
     assert_eq!(completed(settle(&rt, "accepted").await), json!({"ok": true}));
 }
 
+// A tripped definition admits no child either: `run: workflow` answers with
+// a typed error, never "no workflow" and never a retry. A parent may catch
+// it; uncaught, it faults the parent, which counts toward the parent's own
+// breaker as an unhandled error.
+#[tokio::test]
+async fn children_of_a_tripped_definition_are_refused_with_a_typed_error() {
+    let f = fixture();
+    let rt = &f.rt;
+    save(rt, "broken", &doc("broken", "do: [ { boom: { raise: { error: { type: 'urn:t:boom', status: 500 } } } } ]"));
+    for n in 0..3 {
+        let id = format!("broken{n}");
+        rt.start(&id, "broken", json!({})).unwrap();
+        settle(rt, &id).await;
+    }
+    let epoch = rt.definitions("broken").unwrap().tripped.expect("tripped").epoch;
+    let refused = rt.start("direct", "broken", json!({})).unwrap_err();
+    let refused = refused.downcast_ref::<durable::DefinitionTripped>().expect("typed");
+    assert_eq!((refused.name.as_str(), refused.epoch), ("broken", epoch));
+    save(
+        rt,
+        "careful",
+        &doc(
+            "careful",
+            r#"do:
+  - owned:
+      try: [ { sub: { run: { workflow: { namespace: test, name: broken, version: latest } } } } ]
+      catch:
+        errors: { with: { type: 'urn:ouro:errors:definition.tripped' } }
+        as: e
+        do: [ { keep: { set: '${ { type: $e.type, status: $e.status, detail: $e.detail } }' } } ]
+  - independent:
+      try: [ { fire: { run: { workflow: { namespace: test, name: broken, version: '1.0.0' }, await: false } } } ]
+      catch:
+        errors: { with: { type: 'urn:ouro:errors:definition.tripped' } }
+        do: [ { keep: { set: '${ . + { independent: "refused" } }' } } ]"#,
+        ),
+    );
+    rt.start("careful", "careful", json!({})).unwrap();
+    let out = completed(settle(rt, "careful").await);
+    assert_eq!(out["type"], durable::TRIPPED_ERROR);
+    assert_eq!(out["status"], 409);
+    let detail = out["detail"].as_str().unwrap();
+    assert!(detail.contains("broken") && detail.contains(&format!("epoch {epoch}")), "{detail}");
+    assert_eq!(out["independent"], "refused");
+    assert_eq!(rt.list(Some("broken"), "").unwrap().len(), 3, "no child was admitted");
+    save(
+        rt,
+        "careless",
+        &doc("careless", "do: [ { sub: { run: { workflow: { namespace: test, name: broken, version: latest } } } } ]"),
+    );
+    rt.start("careless", "careless", json!({})).unwrap();
+    match settle(rt, "careless").await {
+        Some(Status::Faulted(e)) => assert_eq!(e.type_, durable::TRIPPED_ERROR),
+        other => panic!("expected the parent to fault, got {other:?}"),
+    }
+    let parent = rt.definitions("careless").unwrap();
+    assert_eq!((parent.consecutive_faults, parent.tripped.is_none()), (1, true), "an unhandled error of the parent");
+    // The host's activation clears the trip; children are admitted again.
+    rt.activate("broken", 1).unwrap();
+    rt.start("careless-again", "careless", json!({})).unwrap();
+    match settle(rt, "careless-again").await {
+        Some(Status::Faulted(e)) => assert_eq!(e.type_, "urn:t:boom", "the child ran and faulted"),
+        other => panic!("expected the child's own fault, got {other:?}"),
+    }
+}
+
 #[tokio::test]
 async fn catchup_none_skips_missed_slots_with_a_record() {
     let f = fixture();

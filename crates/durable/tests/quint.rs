@@ -14,9 +14,9 @@
 //! deduplication, overlap, breaker, expiry) come from the store under test.
 use anyhow::{Context, ensure};
 use ouro_durable::{
-    Admission, Arming, ChildLink, CommitFault, Compatibility, FaultInjector, Fence, Fired, Firing, IdentityConflict,
-    Policy, Rearm, RunSnapshot, RunState, RunStore, TransactionalStore, Trigger, memory::MemoryBackend,
-    sqlite::SqliteBackend,
+    Admission, Arming, ChildLink, CommitFault, Compatibility, DefinitionTripped, FaultInjector, Fence, Fired, Firing,
+    IdentityConflict, Policy, Rearm, RunSnapshot, RunState, RunStore, TransactionalStore, Trigger,
+    memory::MemoryBackend, sqlite::SqliteBackend,
 };
 use owf::{
     durable::{CallState, Delivery, Record, StepOutcome, TaskResult},
@@ -974,8 +974,16 @@ impl StoreDriver {
                 let mode = parent.runtime["mode"].as_i64().unwrap_or(0);
                 let a = self.admission(1, parent.input.as_i64().context("input")?, app, mode, None)?;
                 let link = ChildLink { parent: run_id(0), key: "child".into(), reference: "child".into() };
-                // The child's first lease stays with the parent's host.
-                let _ = self.write(fault, |s| s.start_child(&f, &a, &link, ms));
+                // The child's first lease stays with the parent's host. A
+                // tripped definition refuses it, typed, in the same commit.
+                let refusal = self.store.definitions(NAME)?.tripped.is_some() && self.valid(&f)?;
+                let (result, _) = self.write(fault, |s| s.start_child(&f, &a, &link, ms));
+                if refusal {
+                    ensure!(
+                        result.err().is_some_and(|e| e.is::<DefinitionTripped>()),
+                        "a tripped definition admitted a child"
+                    );
+                }
             }
             "finish" | "timeout" => {
                 let Some(f) = self.fence(w, r) else { return Ok(()) };

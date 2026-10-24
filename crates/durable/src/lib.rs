@@ -199,8 +199,8 @@ pub struct Definitions {
     /// Only an activation starts an epoch, and only runs admitted in the
     /// current epoch count toward its breaker.
     pub epoch: u64,
-    /// The breaker's report once it reached its threshold: no new runs and
-    /// no schedule until the next activation, which alone clears it. The
+    /// The breaker's report once it reached its threshold: no new runs (any
+    /// path, `DefinitionTripped`) and no schedule until the next activation, which alone clears it. The
     /// engine never chooses another version; the host decides.
     pub tripped: Option<Trip>,
     /// Trigger keys the current activation armed. Activation and tripping
@@ -226,6 +226,10 @@ pub struct Trip {
     pub at_ms: i64,
 }
 impl Trip {
+    /// The refusal of a new run of `name` while this trip stands.
+    pub fn refusal(&self, name: &str) -> DefinitionTripped {
+        DefinitionTripped { name: name.into(), epoch: self.epoch, version: self.version, faults: self.faults }
+    }
     /// The trip as an identified CloudEvent of type `TRIPPED`: its `source`
     /// names the definition and its `id` the epoch (one trip per epoch), so a
     /// repeated hand-off is recognisably the same event.
@@ -293,6 +297,44 @@ pub enum Fired {
     Ingested,
 }
 
+/// The type of the workflow error a tripped definition answers a new run
+/// with (`DefinitionTripped::error`).
+pub const TRIPPED_ERROR: &str = "urn:ouro:errors:definition.tripped";
+
+/// A new run of a tripped definition, refused in the admission's commit
+/// whichever path admits it (a start, a child, a firing). Typed so a host can
+/// tell it apart, and never retried: the trip stands until an activation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DefinitionTripped {
+    pub name: String,
+    pub epoch: u64,
+    pub version: u64,
+    pub faults: u32,
+}
+impl DefinitionTripped {
+    /// As a workflow error of type `TRIPPED_ERROR`: a `run: workflow` task
+    /// answers with it, catchable by `try`/`catch` like any task error.
+    pub fn error(&self) -> WorkflowError {
+        WorkflowError {
+            type_: TRIPPED_ERROR.into(),
+            status: 409,
+            title: Some("Definition Tripped".into()),
+            detail: Some(self.to_string()),
+            instance: None,
+        }
+    }
+}
+impl std::fmt::Display for DefinitionTripped {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} is tripped in epoch {}: version {} faulted {} times in a row; activate a version to resume",
+            self.name, self.epoch, self.version, self.faults
+        )
+    }
+}
+impl std::error::Error for DefinitionTripped {}
+
 /// The same event identity (`source` + `id`) accepted again with another
 /// payload: returned to the caller, never a silent drop or overwrite.
 #[derive(Debug)]
@@ -323,6 +365,9 @@ pub trait RunStore: Send + Sync {
     fn policy(&self) -> Policy {
         Policy::default()
     }
+    /// Admits a run once (`false`: already admitted). A new run of a tripped
+    /// definition is refused with `DefinitionTripped`; so are `start`,
+    /// `start_child` and a firing's admissions.
     fn admit(&self, admission: &Admission, now_ms: i64) -> anyhow::Result<bool>;
     fn start(&self, admission: &Admission, now_ms: i64) -> anyhow::Result<Option<Fence>>;
     /// A claim by an undeclared worker, which resumes every run.

@@ -179,8 +179,9 @@ module contract {
       val copies = s.db.copies.mapped(e => if (e.disposition == 0 and e.expires <= s.now)
         { ...e, disposition:2 } else e)
       { ...s, db: { ...s.db, copies:copies } }
-    } else if (op == "child" and authorized and r == 0 and not(s.db.runs.nth(1).admitted)) {
-      // The parent's host holds the child's first lease, which it may let expire.
+    } else if (op == "child" and authorized and r == 0 and not(s.db.runs.nth(1).admitted) and not(c.tripped)) {
+      // The parent's host holds the child's first lease, which it may let
+      // expire. A tripped definition admits no child (nor any other run).
       val updated = admitRun(s,1,execution.input,execution.app,execution.mode)
       observe(update(updated,1,{ ...updated.db.runs.nth(1), generation:1, lease:s.now+4, parent:r }),op,1,i,execution.input,1)
     } else if ((op == "finish" and authorized and value >= 0) or (op == "timeout" and authorized and s.now >= execution.deadline) or
@@ -371,6 +372,7 @@ module contract {
         not(d.tripped) and d.notices == c.notices
     val error23 = flag(error22,"V2",(d.faults < 2 or d.tripped) and breakerCorrect and
       (not(c.tripped) or d.tripped or op == "activate") and
+      (not(c.tripped) or a.db.admissions == b.db.admissions) and
       (op != "activate" or c == d or (d.faults == 0 and not(d.tripped))))
     val error24 = flag(error23,"V3",(op != "claim" or b.db == a.db or compatible(old.app,w)) and
       (not(workerMutation) or b.db == a.db or compatible(old.app,w)))

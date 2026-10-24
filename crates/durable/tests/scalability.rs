@@ -366,6 +366,16 @@ fn decided(backend: &Arc<dyn AtomicBackend>, metrics: &Metrics) -> anyhow::Resul
     let notices = bounded(metrics, "notices", 1, || s.notices(8))?;
     assert_eq!(notices.len(), 1);
     assert!(bounded(metrics, "acknowledge", 1, || s.acknowledge(&notices[0].0))?);
+    // Tripped, it admits nothing, by a constant number of reads; the host's
+    // activation admits again.
+    let mut refused = a.clone();
+    refused.id = "decided:refused".into();
+    metrics.reset();
+    assert!(s.admit(&refused, 0).unwrap_err().is::<ouro_durable::DefinitionTripped>());
+    let counts = metrics.counts();
+    assert!(counts.rows_read <= 32 && counts.rows_written == 0, "admit_tripped: {counts:?}");
+    let epoch = s.definitions("decided")?.epoch;
+    s.activate_with("decided", v2.version, epoch, &Arming::default())?.unwrap();
     // Version-aware claims page through their own partitions only.
     let mut versioned = a.clone();
     versioned.id = "decided:versioned".into();

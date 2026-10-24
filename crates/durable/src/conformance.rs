@@ -950,6 +950,23 @@ fn decisions(factory: &impl Fn(&str) -> anyhow::Result<TestStore>, report: &mut 
     assert_eq!(notices.len(), 1);
     assert_eq!(notices[0].1, trip.event("w"));
     assert_eq!((notices[0].1["type"].as_str(), notices[0].1["id"].as_str()), (Some(TRIPPED), Some("tripped:2")));
+    // Tripped, no new run is admitted, by any path and of any version, with
+    // a typed refusal in the admission's commit; an existing run is joined.
+    let tripped = |e: anyhow::Error| e.downcast_ref::<DefinitionTripped>().map(|t| (t.name.clone(), t.epoch));
+    let expected = Some(("w".to_string(), 2));
+    assert_eq!(tripped(s.admit(&run_of("refused", two.version), 6).unwrap_err()), expected);
+    assert_eq!(tripped(s.start(&run_of("refused", one.version), 6).unwrap_err()), expected);
+    let parent = s.start(&admission("parent"), 6)?.unwrap();
+    let link = ChildLink { parent: "parent".into(), key: "child".into(), reference: "/child".into() };
+    let before = s.inspect("parent")?;
+    assert_eq!(tripped(s.start_child(&parent, &run_of("refused", two.version), &link, 6).unwrap_err()), expected);
+    assert_eq!(s.inspect("parent")?, before, "the parent's side of a refused child is not committed");
+    let fired = [run_of("refused", two.version)];
+    let firing = Firing { key: "generic", next: Some(&trigger(50)), admit: &fired, ..Firing::default() };
+    assert_eq!(tripped(s.fire(&firing, 6).unwrap_err()), expected);
+    assert!(s.get("refused")?.is_none() && s.trigger("generic")?.is_none());
+    assert!(!s.admit(&run_of("late", two.version), 6)?, "an admitted run is joined, not refused");
+    s.finish(&parent, &Status::Completed(json!(0)), 6, 2)?;
     // Tripped, the breaker observes nothing more until an activation.
     s.finish(&late, &Status::Faulted(WorkflowError::runtime("late")), 6, 2)?;
     s.finish(&late_success, &Status::Completed(json!(0)), 6, 2)?;
@@ -975,7 +992,7 @@ fn decisions(factory: &impl Fn(&str) -> anyhow::Result<TestStore>, report: &mut 
     s.finish(&f, &Status::Completed(json!(0)), 0, 2)?;
     assert_eq!(s.definitions("w")?.consecutive_faults, 0);
     audit(&**s)?;
-    report.operations += 52;
+    report.operations += 60;
     report.witnesses.insert("epochs arm atomically and isolate the breaker");
     report.witnesses.insert("a trip reports with a committed notice and only activation clears it");
 

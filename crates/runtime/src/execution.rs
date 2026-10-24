@@ -15,7 +15,8 @@ use async_trait::async_trait;
 use futures::{StreamExt, future::BoxFuture, stream::FuturesUnordered};
 use opentelemetry::{Context, global::BoxedTracer, trace::FutureExt};
 use ouro_durable::{
-    Admission, ChildLink, Clock, Compatibility, Definition, Fence, Lease, RunStore, SavedRun, Swept, SystemClock,
+    Admission, ChildLink, Clock, Compatibility, Definition, DefinitionTripped, Fence, Lease, RunStore, SavedRun, Swept,
+    SystemClock,
 };
 use owf::{
     durable::{CallEntry, CallFailure, Delivery},
@@ -614,11 +615,7 @@ impl Admitter {
     pub fn active_in(&self, id: &str, name: &str, input: Value, lineage: &Lineage) -> anyhow::Result<Admission> {
         let definitions = self.definitions.definitions(name)?;
         if let Some(trip) = &definitions.tripped {
-            anyhow::bail!(
-                "{name} is tripped: version {} faulted {} times in a row; activate a version to resume",
-                trip.version,
-                trip.faults
-            );
+            return Err(trip.refusal(name).into());
         }
         let d = definitions
             .active
@@ -960,6 +957,12 @@ impl run::Children for ExecutionFunctions {
         owned: bool,
     ) -> Result<Child, CallFailure> {
         let interrupted = |e: anyhow::Error| CallFailure::Interrupted(WorkflowError::runtime(e.to_string()));
+        // A tripped definition admits no child: a definite, typed answer the
+        // parent may catch, never a retry. Other storage errors interrupt.
+        let refused = |e: anyhow::Error| match e.downcast_ref::<DefinitionTripped>() {
+            Some(tripped) => CallFailure::NotExecuted(tripped.error()),
+            None => interrupted(e),
+        };
         let store = &self.lease.store;
         let id = child_id(run_id, key);
         let done = format!("done:{id}");
@@ -992,11 +995,11 @@ impl run::Children for ExecutionFunctions {
         };
         let now = self.lease.clock.now_ms();
         if !owned {
-            store.admit(&a, now).map_err(interrupted)?;
+            store.admit(&a, now).map_err(refused)?;
             return Ok(Child { id, done });
         }
         let link = ChildLink { parent: run_id.into(), key: key.into(), reference: key.into() };
-        if let Some(fence) = store.start_child(&self.lease.fence, &a, &link, now).map_err(interrupted)? {
+        if let Some(fence) = store.start_child(&self.lease.fence, &a, &link, now).map_err(refused)? {
             store.release(&fence, now).map_err(interrupted)?;
         }
         Ok(Child { id, done })

@@ -302,14 +302,19 @@ fn claim_run(snapshot: &mut StoredRun, now: i64, owner: &str) -> anyhow::Result<
     Ok(fence)
 }
 /// Admits a run once. Its admission instant and the activation epoch it
-/// belongs to (when it runs the active version) are fixed here.
+/// belongs to (when it runs the active version) are fixed here. A tripped
+/// definition admits no new run, of any version and by any path, in the
+/// same commit that reads the trip; an existing run is still joined.
 fn insert(rows: &mut dyn Transaction, admission: &Admission, now: i64) -> anyhow::Result<bool> {
     if let Some(existing) = find_run(rows, &admission.id)? {
         anyhow::ensure!(existing.run.admission.name == admission.name, "run already belongs to another definition");
         return Ok(false);
     }
-    let epoch =
-        load_definitions(rows, &admission.name)?.filter(|d| d.active == Some(admission.version)).map(|d| d.epoch);
+    let defs = load_definitions(rows, &admission.name)?;
+    if let Some(trip) = defs.as_ref().and_then(|d| d.tripped.as_ref()) {
+        return Err(trip.refusal(&admission.name).into());
+    }
+    let epoch = defs.filter(|d| d.active == Some(admission.version)).map(|d| d.epoch);
     store_run(
         rows,
         &StoredRun {
