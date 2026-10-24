@@ -1,6 +1,6 @@
 //! Store-only operator commands and bounded observations. Authorization belongs
 //! to the embedding host; request identities make ambiguous commits retryable.
-use crate::{RunSnapshot, RunState, SavedRun, Trigger};
+use crate::{RunSnapshot, RunState, SavedRun, Trigger, Trip};
 use ows::{durable::CallEntry, events::PendingWait};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -83,6 +83,57 @@ pub struct Cursor {
 pub struct Page<T> {
     pub items: Vec<T>,
     pub next: Option<Cursor>,
+}
+/// Catalog metadata only; immutable YAML and run evidence are not returned.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DefinitionSummary {
+    pub name: String,
+    /// Version numbers in ascending order.
+    pub versions: Vec<VersionSummary>,
+    pub active: Option<u64>,
+    pub epoch: u64,
+    pub consecutive_faults: u32,
+    /// Includes the original report and attribution for a manual pause.
+    pub tripped: Option<Trip>,
+    /// One entry per kind configured by the active version (a schedule may
+    /// combine kinds). Paused entries retain their suspended slot and queue;
+    /// an automatic trip disarms them, leaving no next due time or queue.
+    pub schedules: Vec<ScheduleSummary>,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VersionSummary {
+    pub version: u64,
+    /// None when the catalog did not record an activation instant. Existing
+    /// stores retain versions and epochs, but no activation timestamps.
+    pub activated_ms: Option<i64>,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScheduleKind {
+    Every,
+    Cron,
+    After,
+    On,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScheduleCatchup {
+    Latest,
+    None,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueuedSlot {
+    /// The pinned run identity also identifies the buffered schedule slot.
+    pub run: String,
+    pub version: u64,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScheduleSummary {
+    pub kind: ScheduleKind,
+    pub next_due_ms: Option<i64>,
+    pub overlap: crate::Overlap,
+    pub catchup: ScheduleCatchup,
+    pub queued: Option<QueuedSlot>,
 }
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Runs {

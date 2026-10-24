@@ -1237,6 +1237,60 @@ fn operator(id: &str) -> ouro_runtime::control::Request {
 }
 
 #[tokio::test]
+async fn store_only_control_lists_definition_schedules_and_suspended_slots() {
+    use ouro_runtime::control::{Control, ScheduleCatchup, ScheduleKind};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("definitions.sqlite");
+    let clock = Arc::new(Time::default());
+    let rt = runtime(Arc::new(durable::sqlite::open(&path).unwrap()), Registry::new(), clock.clone());
+    let definition = yaml("  - wait: { wait: PT1H }")
+        .replace("version: '1.0.0'", "version: '1.0.0', metadata: { overlap: queue }")
+        .replace("\ndo:", "\nschedule: { every: PT1S, after: PT2S, on: { one: { with: { type: start } } } }\ndo:");
+    save(&rt, &definition).await;
+    let control = Control::new(Arc::new(durable::sqlite::open(&path).unwrap()), clock.clone());
+    assert!(control.definition("missing").await.unwrap().is_none());
+    let summary = control.definition("workflow").await.unwrap().unwrap();
+    assert_eq!((summary.active, summary.epoch), (Some(1), 1));
+    assert_eq!(summary.versions[0].version, 1);
+    assert_eq!(summary.versions[0].activated_ms, None);
+    assert_eq!(
+        summary.schedules.iter().map(|s| s.kind).collect::<Vec<_>>(),
+        [ScheduleKind::Every, ScheduleKind::After, ScheduleKind::On]
+    );
+    assert_eq!(summary.schedules.iter().map(|s| s.next_due_ms).collect::<Vec<_>>(), [Some(1000), Some(0), None]);
+    assert!(
+        summary.schedules.iter().all(|s| s.overlap == durable::Overlap::Queue && s.catchup == ScheduleCatchup::Latest)
+    );
+    assert_eq!(control.definitions(None, 1).await.unwrap().items, [summary]);
+    // The after slot starts immediately. Every then queues behind it at 1000.
+    assert_eq!(rt.fire_due().await.unwrap().len(), 1);
+    clock.0.store(1000, Ordering::SeqCst);
+    assert_eq!(rt.fire_due().await.unwrap().len(), 1);
+    clock.0.store(2000, Ordering::SeqCst);
+    rt.fire_due().await.unwrap();
+    let before_pause = control.definition("workflow").await.unwrap().unwrap();
+    assert_eq!(before_pause.schedules[0].queued.as_ref().unwrap().run, "schedule:workflow:every:2000");
+    control.pause(&operator("pause-definitions"), "workflow", "inspect schedule").await.unwrap();
+    let paused = control.definition("workflow").await.unwrap().unwrap();
+    assert_eq!(paused.schedules, before_pause.schedules);
+    assert_eq!(paused.tripped.as_ref().unwrap().manual.as_ref().unwrap().note, "inspect schedule");
+    assert_eq!(control.definitions(None, 10).await.unwrap().items, [paused]);
+    control.resume(&operator("resume-definitions"), "workflow").await.unwrap();
+    assert_eq!(control.definition("workflow").await.unwrap(), Some(before_pause));
+    // Reactivation replaces the schedules and discards the buffered slot.
+    let replacement = rt.save("workflow", &yaml("  - ok: { set: { ok: true } }")).await.unwrap();
+    rt.activate("workflow", replacement.version).await.unwrap();
+    let summary = control.definition("workflow").await.unwrap().unwrap();
+    assert_eq!((summary.active, summary.epoch, summary.versions.len()), (Some(2), 2, 2));
+    assert!(summary.schedules.is_empty());
+    let page = control.definitions(None, 1).await.unwrap();
+    assert_eq!(page.items, [summary]);
+    assert!(control.definitions(page.next.as_ref(), 1).await.unwrap().items.is_empty());
+    assert!(control.definitions(None, 0).await.is_err());
+    assert!(control.definitions(None, 1001).await.is_err());
+}
+
+#[tokio::test]
 async fn store_only_control_answers_a_multi_event_listen_with_persisted_correlation() {
     use ouro_runtime::control::{Control, Runs, Waits};
     let dir = tempfile::tempdir().unwrap();

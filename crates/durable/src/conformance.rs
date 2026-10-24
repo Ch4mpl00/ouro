@@ -729,9 +729,219 @@ pub async fn run_all(factory: impl AsyncFn(&str) -> anyhow::Result<TestStore>) -
     overlap_policies(&factory, &mut report).await?;
     controls(&factory, &mut report).await?;
     control_overlap(&factory, &mut report).await?;
+    definition_queries(&factory, &mut report).await?;
     heartbeats(&factory, &mut report).await?;
     dropped(&factory, &mut report).await?;
     Ok(report)
+}
+
+/// A combined schedule exercises each kind without a runtime or registry.
+pub fn control_definition_yaml() -> &'static str {
+    "document: { dsl: '1.0.4', namespace: test, name: workflow, version: '1.0.0', metadata: { overlap: queue, catchup: none } }
+schedule:
+  every: PT1S
+  cron: '0 * * * * *'
+  after: PT2S
+  on: { one: { with: { type: start } } }
+do:
+  - ok: { set: { ok: true } }
+"
+}
+async fn definition_queries(
+    factory: &impl AsyncFn(&str) -> anyhow::Result<TestStore>,
+    report: &mut Report,
+) -> anyhow::Result<()> {
+    use control::{Command, QueuedSlot, ScheduleCatchup, ScheduleKind, ScheduleSummary, VersionSummary};
+    let t = factory("control-definitions").await?;
+    report.cases += 1;
+    let s = &t.store;
+    assert!(s.query_definitions(None, 1).await?.items.is_empty());
+    assert!(s.definition_control("missing").await?.is_none());
+    // Unactivated versions need no parsing; summaries never return their YAML.
+    s.save_definition("workflow", "old").await?;
+    s.save_definition("workflow", control_definition_yaml()).await?;
+    for name in ["z", "a:#", "é"] {
+        s.save_definition(name, "unactivated").await?;
+    }
+    let slot = |kind: &str, at_ms| Trigger {
+        at_ms,
+        types: if kind == "on" { vec!["start".into()] } else { vec![] },
+        state: json!({"kind":kind, "epoch":1, "name":"workflow"}),
+    };
+    let every = slot("every", Some(10));
+    let arming = Arming {
+        triggers: BTreeMap::from([
+            ("custom-every".into(), every.clone()),
+            ("custom-cron".into(), slot("cron", Some(20))),
+            ("custom-after".into(), slot("after", Some(30))),
+            ("custom-on".into(), slot("on", None)),
+        ]),
+    };
+    s.activate_with("workflow", 2, 0, &arming).await?.unwrap();
+    let mut first = admission("first");
+    first.version = 2;
+    let mut buffered = first.clone();
+    buffered.id = "buffered-slot".into();
+    let next = slot("every", Some(40));
+    let fire = async |expected: &Trigger, a: &Admission| {
+        s.fire(
+            &Firing {
+                key: "custom-every",
+                expected: Some(expected),
+                next: Some(&next),
+                busy: Some(&next),
+                admit: std::slice::from_ref(a),
+                overlap: Some(OverlapGuard { policy: Overlap::Queue, max_concurrent_runs: 10, ceiling: &next }),
+                ..Firing::default()
+            },
+            0,
+        )
+        .await
+    };
+    assert_eq!(fire(&every, &first).await?, Fired::Committed);
+    assert_eq!(fire(&next, &buffered).await?, Fired::Queued);
+    let mut fault = first.clone();
+    fault.id = "fault".into();
+    let f = s.start(&fault, 0).await?.unwrap();
+    let error = Status::Faulted(WorkflowError::runtime("fault"));
+    s.finish(&f, &error, 1, 3).await?;
+    let fresh = (t.reopen)().await?;
+    let before = t.backend.snapshot().await?;
+    let summary = fresh.definition_control("workflow").await?.unwrap();
+    assert_eq!(summary.name, "workflow");
+    assert_eq!(
+        summary.versions,
+        vec![VersionSummary { version: 1, activated_ms: None }, VersionSummary { version: 2, activated_ms: None },]
+    );
+    assert_eq!((summary.active, summary.epoch, summary.consecutive_faults), (Some(2), 1, 1));
+    assert!(summary.tripped.is_none());
+    assert_eq!(
+        summary.schedules,
+        vec![
+            ScheduleSummary {
+                kind: ScheduleKind::Every,
+                next_due_ms: Some(40),
+                overlap: Overlap::Queue,
+                catchup: ScheduleCatchup::None,
+                queued: Some(QueuedSlot { run: buffered.id.clone(), version: 2 })
+            },
+            ScheduleSummary {
+                kind: ScheduleKind::Cron,
+                next_due_ms: Some(20),
+                overlap: Overlap::Queue,
+                catchup: ScheduleCatchup::None,
+                queued: None
+            },
+            ScheduleSummary {
+                kind: ScheduleKind::After,
+                next_due_ms: Some(30),
+                overlap: Overlap::Queue,
+                catchup: ScheduleCatchup::None,
+                queued: None
+            },
+            ScheduleSummary {
+                kind: ScheduleKind::On,
+                next_due_ms: None,
+                overlap: Overlap::Queue,
+                catchup: ScheduleCatchup::None,
+                queued: None
+            },
+        ]
+    );
+    let mut cursor = None;
+    let mut names = Vec::new();
+    loop {
+        let page = fresh.query_definitions(cursor.as_ref(), 1).await?;
+        for item in page.items {
+            if item.name == "workflow" {
+                assert_eq!(item, summary);
+            } else {
+                assert_eq!((item.active, item.epoch, item.consecutive_faults), (None, 0, 0));
+                assert!(item.schedules.is_empty() && item.tripped.is_none());
+            }
+            names.push(item.name);
+        }
+        cursor = page.next.map(|c| serde_json::from_value(serde_json::to_value(c).unwrap()).unwrap());
+        if cursor.is_none() {
+            break;
+        }
+        assert!(fresh.workers(cursor.as_ref(), 1).await.is_err());
+        assert!(fresh.query_runs(&control::Runs::default(), false, cursor.as_ref(), 1).await.is_err());
+    }
+    assert_eq!(names, ["a:#", "workflow", "z", "é"]);
+    for limit in [0, control::MAX_PAGE + 1, usize::MAX] {
+        assert!(fresh.query_definitions(None, limit).await.is_err());
+    }
+    assert_eq!(fresh.query_definitions(None, control::MAX_PAGE).await?.items.len(), 4);
+    assert_eq!(t.backend.snapshot().await?, before, "observations must not write");
+    for fault in [CommitFault::BeforeCommit, CommitFault::AfterCommit] {
+        t.faults.arm(fault);
+        assert!(fresh.query_definitions(None, 10).await.is_err());
+        t.faults.clear();
+        t.faults.arm(fault);
+        assert!(fresh.definition_control("workflow").await.is_err());
+        t.faults.clear();
+        assert_eq!(t.backend.snapshot().await?, before);
+    }
+    let pause = Command::Pause { definition: "workflow".into(), note: "investigate".into() };
+    s.control(&control_request("pause"), &pause, 2).await?;
+    let paused = fresh.definition_control("workflow").await?.unwrap();
+    assert_eq!(paused.schedules, summary.schedules);
+    assert_eq!((paused.epoch, paused.consecutive_faults), (1, 1));
+    assert_eq!(
+        paused.tripped.as_ref().unwrap().manual,
+        Some(control::ManualTrip {
+            actor: "operator".into(),
+            reason: "maintenance".into(),
+            note: "investigate".into(),
+        })
+    );
+    assert_eq!(fresh.query_definitions(None, 10).await?.items[1], paused);
+    s.control(&control_request("resume"), &Command::Resume { definition: "workflow".into() }, 3).await?;
+    assert_eq!(fresh.definition_control("workflow").await?, Some(summary));
+    let f = s.claim(&first.id, 3).await?.unwrap();
+    s.finish(&f, &error, 4, 3).await?;
+    let promoted = fresh.definition_control("workflow").await?.unwrap();
+    assert!(promoted.schedules.iter().all(|s| s.queued.is_none()));
+    assert_eq!(promoted.consecutive_faults, 2);
+    let f = s.claim(&buffered.id, 4).await?.unwrap();
+    s.finish(&f, &error, 5, 3).await?;
+    let tripped = fresh.definition_control("workflow").await?.unwrap();
+    assert_eq!(tripped.consecutive_faults, 3);
+    assert_eq!(tripped.tripped, fresh.definitions("workflow").await?.tripped);
+    assert!(tripped.tripped.as_ref().unwrap().manual.is_none());
+    assert!(tripped.schedules.iter().all(|s| s.next_due_ms.is_none() && s.queued.is_none()));
+    s.activate_with("workflow", 2, 1, &arming).await?.unwrap();
+    let reactivated = fresh.definition_control("workflow").await?.unwrap();
+    assert_eq!((reactivated.epoch, reactivated.consecutive_faults), (2, 0));
+    assert!(reactivated.tripped.is_none());
+    assert_eq!(reactivated.schedules[0].next_due_ms, Some(10));
+    // A page racing activation must observe the old catalog and its triggers,
+    // or the new catalog and its triggers, never a mixture of the two.
+    let no_schedule = "document: { dsl: '1.0.4', namespace: test, name: workflow, version: '1.0.0' }\ndo:\n  - ok: { set: { ok: true } }\n";
+    s.save_definition("workflow", no_schedule).await?;
+    let old = fresh.definition_control("workflow").await?.unwrap();
+    let unarmed = Arming::default();
+    let (page, activated) =
+        tokio::join!(fresh.query_definitions(None, 10), s.activate_with("workflow", 3, 2, &unarmed),);
+    activated?.unwrap();
+    let new = fresh.definition_control("workflow").await?.unwrap();
+    assert_eq!((new.active, new.epoch), (Some(3), 3));
+    assert!(new.schedules.is_empty());
+    let observed = &page?.items[1];
+    assert!(*observed == old || *observed == new);
+    // Persisted layout validation is shared by point and paged catalog reads.
+    let before = t.backend.snapshot().await?;
+    let mut corrupt = before.rows.clone();
+    corrupt.get_mut(&("definitions".into(), "workflow".into())).unwrap()["version"] = json!(0);
+    assert!(t.backend.compare_exchange(&before, &corrupt).await?);
+    assert!(fresh.definition_control("workflow").await.is_err());
+    assert!(fresh.query_definitions(None, 10).await.is_err());
+    let after = t.backend.snapshot().await?;
+    assert_eq!(after.rows, corrupt);
+    assert!(t.backend.compare_exchange(&after, &before.rows).await?);
+    report.witnesses.insert("bounded definition metadata, suspended queues and breaker reports survive reopen");
+    Ok(())
 }
 
 /// Worker heartbeats: one row per worker id however often it beats, an
@@ -1581,6 +1791,18 @@ impl RunStore for Offloaded {
     ) -> anyhow::Result<control::Page<SavedRun>> {
         let (filter, cursor) = (filter.clone(), cursor.cloned());
         offloaded!(self, |s| s.query_runs(&filter, history, cursor.as_ref(), limit))
+    }
+    async fn query_definitions(
+        &self,
+        cursor: Option<&control::Cursor>,
+        limit: usize,
+    ) -> anyhow::Result<control::Page<control::DefinitionSummary>> {
+        let cursor = cursor.cloned();
+        offloaded!(self, |s| s.query_definitions(cursor.as_ref(), limit))
+    }
+    async fn definition_control(&self, name: &str) -> anyhow::Result<Option<control::DefinitionSummary>> {
+        let name = name.to_owned();
+        offloaded!(self, |s| s.definition_control(&name))
     }
     async fn pending_waits(
         &self,
