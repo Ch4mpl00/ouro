@@ -234,6 +234,7 @@ struct CatalogView {
 #[derive(Debug, PartialEq, Eq, Deserialize)]
 #[serde(from = "Machine")]
 pub struct View {
+    stopped: bool,
     now: i64,
     runs: Vec<RunView>,
     copies: Vec<CopyView>,
@@ -252,6 +253,7 @@ struct Machine {
 }
 #[derive(Deserialize)]
 struct Durable {
+    stopped: bool,
     runs: Vec<ModelRun>,
     copies: Vec<ModelCopy>,
     catalog: ModelCatalog,
@@ -384,6 +386,7 @@ impl From<Machine> for View {
             .map(|i| d.ingress.get(&i).filter(|t| **t > now).and_then(|_| d.ingress_payload.get(&i).copied()))
             .collect();
         View {
+            stopped: d.stopped,
             now,
             runs,
             copies,
@@ -489,6 +492,7 @@ impl State<StoreDriver> for View {
             ingress.push(live);
         }
         Ok(View {
+            stopped: store.stopped()?,
             now: d.now,
             runs,
             copies,
@@ -696,11 +700,12 @@ impl StoreDriver {
     }
     fn valid(&self, f: &Fence) -> anyhow::Result<bool> {
         let skew = self.policy.skew_ms;
-        Ok(self.store.get(&f.run_id)?.is_some_and(|r| {
-            r.fence.as_ref() == Some(f)
-                && r.state == RunState::Running
-                && r.lease_until_ms.is_some_and(|t| t > self.ms() + skew)
-        }))
+        Ok(!self.store.stopped()?
+            && self.store.get(&f.run_id)?.is_some_and(|r| {
+                r.fence.as_ref() == Some(f)
+                    && r.state == RunState::Running
+                    && r.lease_until_ms.is_some_and(|t| t > self.ms() + skew)
+            }))
     }
     /// Runs one store mutation under the step's injected fault. Returns its
     /// answer and whether it committed: an injected failure after the
@@ -834,7 +839,46 @@ impl StoreDriver {
                 _ => Ok(()),
             }
         };
+        if self.store.stopped()?
+            && [
+                "admit",
+                "dry",
+                "replay",
+                "fire",
+                "refuse",
+                "ingress",
+                "renew",
+                "intent",
+                "dispatch",
+                "result",
+                "notExecuted",
+                "recover",
+                "checkpoint",
+                "conflict",
+                "subscribe",
+                "take",
+                "child",
+                "finish",
+                "timeout",
+                "spend",
+            ]
+            .contains(&op)
+        {
+            return Ok(());
+        }
         match op {
+            "stop" => {
+                if value < 0 {
+                    return Ok(());
+                }
+                let request = ouro_durable::control::Request {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    actor: "model".into(),
+                    reason: "contract stop".into(),
+                };
+                let command = ouro_durable::control::Command::Stop { enabled: value != 0 };
+                expect(self.write(fault, |s| s.control(&request, &command, ms)).0.map(drop))?;
+            }
             "admit" | "dry" | "replay" => {
                 let defs = self.store.definitions(NAME)?;
                 if value < 0 || defs.tripped.is_some() || self.store.get(&run_id(r))?.is_some() {
@@ -1371,6 +1415,9 @@ impl StoreDriver {
                 (eligible <= self.ms()).then(|| (eligible, r.admission.id.clone(), app))
             })
             .collect();
+        if self.store.stopped()? {
+            due.clear();
+        }
         due.sort();
         let ids = |w: Option<usize>| -> Vec<String> {
             due.iter()
@@ -1448,7 +1495,7 @@ pub fn with_quint(name: &str, run: impl FnOnce() -> anyhow::Result<()>) {
     assert!(result.success(), "Quint child test failed");
 }
 /// Every command of the contract model, and initialization.
-const COMMANDS: usize = 32;
+const COMMANDS: usize = 33;
 fn simulation(adapter: Adapter) -> anyhow::Result<()> {
     use quint_connect::runner::{self, RunConfig};
     let seed = std::env::var("QUINT_SEED").unwrap_or_else(|_| "20261023".into());

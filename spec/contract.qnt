@@ -31,7 +31,7 @@ module contract {
   type Catalog = { active: int, epoch: int, faults: int, tripped: bool,
     triggerEpoch: int, due: int, slot: int, running: int, catchup: int, rearm: bool,
     armed: bool, notices: List[int], overlap: int, maxRuns: int, queued: int, queueSlot: int, queueInput: int, queueRefused: bool }
-  type Durable = { runs: List[Run], copies: List[Copy], catalog: Catalog,
+  type Durable = { stopped: bool, runs: List[Run], copies: List[Copy], catalog: Catalog,
     admissions: List[int], buffered: Set[(int, int)], fired: Set[(int, int)], skipped: Set[(int, int)], ingress: int -> int, ingressPayload: int -> int,
     budget: List[int] }
   type Local = { fence: int, execution: int, phase: int, invocation: int, stopped: bool, permit: bool }
@@ -44,7 +44,7 @@ module contract {
     records: [0,0,0], values: [0,0,0], frontier: Set(), continuation: 0,
     subscription: false, parent: -1, notified: false, retained: true, spends: [0,0,0], spent: [0,0,0], scheduled: false }
   pure val emptyLocal: Local = { fence: 0, execution: 0, phase: 0, invocation: 0, stopped: false, permit: false }
-  pure val initialDb: Durable = { runs: [emptyRun,emptyRun,emptyRun], copies: [], admissions: [0,0,0], budget: [0,0,0],
+  pure val initialDb: Durable = { stopped:false, runs: [emptyRun,emptyRun,emptyRun], copies: [], admissions: [0,0,0], budget: [0,0,0],
     buffered: Set(), fired: Set(), skipped: Set(), ingress: Map(), ingressPayload:Map(), catalog: { active: 1, epoch: 1,
       faults: 0, tripped: false, triggerEpoch: 1, due: 2, slot: 0, running: -1, catchup: 0, rearm:false,
       armed: true, notices: [], overlap:0, maxRuns:2, queued:-1, queueSlot:-1, queueInput:0, queueRefused:false } }
@@ -86,7 +86,7 @@ module contract {
   // A tree's counter ends with its root (its owned children end with it).
   pure def settle(s: Machine): Machine = {
     val c = s.db.catalog
-    val ready = c.queued >= 0 and c.armed and not(c.tripped) and
+    val ready = not(s.db.stopped) and c.queued >= 0 and c.armed and not(c.tripped) and
       not(Runs.exists(k => live(s.db.runs.nth(k)) and s.db.runs.nth(k).scheduled)) and
       Runs.filter(k => live(s.db.runs.nth(k))).size() < c.maxRuns
     val admitted = if (ready and not(s.db.runs.nth(c.queued).admitted))
@@ -156,7 +156,9 @@ module contract {
       e.recipient == r and e.disposition == 0 and e.expires > s.now
     })
     val first = pending.fold(-1,(a,b) => if (a == -1 or b < a) b else a)
-    if (Set("admit","dry","replay").contains(op) and value >= 0 and not(execution.admitted) and not(c.tripped))
+    if (op == "stop" and value >= 0) { ...s,db:{ ...s.db,stopped:value != 0 } }
+    else if (s.db.stopped and Set("admit","dry","replay","claim","fire","refuse","ingress","renew","intent","dispatch","result","notExecuted","recover","checkpoint","conflict","subscribe","take","child","finish","timeout","spend").contains(op)) s
+    else if (Set("admit","dry","replay").contains(op) and value >= 0 and not(execution.admitted) and not(c.tripped))
       observe(admitRun(s,r,value,i,if (op == "dry") 1 else if (op == "replay") 2 else 0),"admit",r,i,value,1)
     else if (op == "claim" and live(execution) and execution.lease <= s.now and compatible(execution.app,w) and
       not(s.workers.elems().exists(x => x.permit))) {
@@ -485,7 +487,7 @@ module contract {
     // B1: a tree never spends more than the ceiling; a live root's counter
     // is the sum of its tree's granted decisions; a decision never changes;
     // a refusal happens only at the ceiling.
-    flag(error29,"B1",Runs.forall(k => a.db.budget.nth(k) <= ceiling) and
+    val error30 = flag(error29,"B1",Runs.forall(k => a.db.budget.nth(k) <= ceiling) and
       Runs.filter(k => live(a.db.runs.nth(k)) and a.db.runs.nth(k).parent < 0).forall(k =>
         a.db.budget.nth(k) == Runs.filter(j => a.db.runs.nth(j).admitted and rootOf(a,j) == k).fold(0,(sum,j) =>
           sum + Calls.filter(c => a.db.runs.nth(j).spends.nth(c) == 1).size())) and
@@ -495,6 +497,11 @@ module contract {
         (x.spends.nth(c) == 0 or (y.spends.nth(c) == x.spends.nth(c) and y.spent.nth(c) == x.spent.nth(c))) and
           (y.spends.nth(c) != 2 or y.spent.nth(c) == ceiling)
       })))
+    // A stop cannot grant ownership, admit or fire. Clearing it changes no
+    // run identity, journal or schedule slot; resumed work uses its evidence.
+    flag(error30,"S1",not(b.db.stopped) or not(a.db.stopped) or
+      (a.db.admissions == b.db.admissions and a.db.fired == b.db.fired and
+        Runs.forall(k => a.db.runs.nth(k).generation == b.db.runs.nth(k).generation)))
   }
   pure def idealEvent(s: Ideal, e: Observation): Ideal = {
     val key = (e.execution,e.invocation)
@@ -567,7 +574,7 @@ module contract {
   action step = {
     nondet op = Set("admit","dry","replay","claim","renew","release","intent","dispatch","result","notExecuted","recover",
       "checkpoint","conflict","subscribe","address","publish","take","expire","child","finish","timeout","cancel",
-      "activate","fire","refuse","ingress","sweep","crash","tick","spend","policy").oneOf()
+      "activate","fire","refuse","ingress","sweep","crash","tick","spend","policy","stop").oneOf()
     nondet r = Runs.oneOf()
     nondet w = Workers.oneOf()
     nondet i = Calls.oneOf()
@@ -608,8 +615,9 @@ module contract {
   val X2 = not(m.violations.contains("X2"))
   val X3 = not(m.violations.contains("X3"))
   val B1 = not(m.violations.contains("B1"))
+  val S1 = not(m.violations.contains("S1"))
   val overlapPolicies = Set("OverlapSkip","OverlapAllow","OverlapQueue","OverlapReplace","OverlapCeiling").forall(p => not(m.violations.contains(p)))
-  val safety = overlapPolicies and A1 and A2 and A3 and A4 and A5 and E1 and E2 and E3 and E4 and R1 and R2 and R3 and W1 and W2 and W3 and W4 and W5 and C1 and C2 and C3 and T1 and T2 and T3 and V1 and V2 and V3 and O1 and O2 and O3 and X1 and X2 and X3 and B1
+  val safety = S1 and overlapPolicies and A1 and A2 and A3 and A4 and A5 and E1 and E2 and E3 and E4 and R1 and R2 and R3 and W1 and W2 and W3 and W4 and W5 and C1 and C2 and C3 and T1 and T2 and T3 and V1 and V2 and V3 and O1 and O2 and O3 and X1 and X2 and X3 and B1
   val compatibilityWaiting = Runs.filter(r => live(m.db.runs.nth(r)) and not(Workers.exists(w => compatible(m.db.runs.nth(r).app,w))))
   // State correspondence prevents an acknowledged label from fabricating a
   // committed fact. The event checker itself never reads the concrete state.

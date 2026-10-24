@@ -116,7 +116,7 @@ runs and `on` schedules listening for that type and to the `EventSink`; a
 notice the sink refuses is retried after a backoff of its own, from one second
 doubling to five minutes (kept in memory: a restart may retry sooner). The
 host decides: activate another version (its own built-in one, an earlier one),
-keep it stopped, alert someone. Only an activation clears the trip. In-flight
+keep it stopped, alert someone. Only an activation clears an automatic trip; the control API below can resume a manual pause. In-flight
 runs keep their admitted YAML, version, input and schema/delivery
 bindings.
 
@@ -180,6 +180,88 @@ not a deterministic simulation; that is future work.
 The runtime uses the OpenTelemetry API. Hosts inject a tracer and configure
 export/flush/shutdown themselves. `--features otlp` exposes the optional OTLP
 exporter crate; merely enabling it opens no connection.
+
+## Operator control
+
+`ouro_runtime::control::Control::new(store, clock)` needs only an
+`Arc<dyn RunStore>` and an `Arc<dyn Clock>`. A separate console, CLI or server
+can open the same SQLite/Postgres store without installing functions or
+starting a runtime. The host authorizes commands and supplies
+`Request { id, actor, reason }` with nonempty fields. Reuse that request ID
+when retrying an ambiguous reply: the command, attribution and original reply
+commit together. Conflicting reuse is an error. `entry` and the paged
+`journal` expose this durable operator history; run-targeted commands are
+also indexed by run. Operator audit and response identities are retained
+independently of execution-evidence sweeping.
+
+```rust
+use ouro_runtime::control::{Control, Request, Runs, Waits};
+// store and clock are injected by the composition root.
+let control = Control::new(store, clock);
+let request = Request {
+    id: "maintenance-42".into(),
+    actor: "operator".into(),
+    reason: "investigate this run".into(),
+};
+control.cancel_tree(&request, "run-42")?;
+let page = control.list(&Runs::default(), None, 50)?;
+let waits = control.waits(&Waits::default(), None, 50)?;
+```
+
+`cancel` and `cancel_tree` have the same owned-tree semantics: the run and
+its transitive owned descendants end in one commit; independent runs remain
+independent. A lease holder discovers a remote cancel at its next renewal
+and cancels the token given to its function, within one configured heartbeat.
+`Runtime::control(request, command)` additionally cancels local tokens
+synchronously. The existing executor-level `Runtime::cancel` remains
+available. Cancellation cannot retract an effect already dispatched, and
+pending calls retain their declared delivery and unknown-outcome rules.
+
+`pause(request, definition, note)` makes a manual trip (`reason.type =
+"manual"`, with actor, reason and note), stops every admission path and
+suspends the current triggers in that transaction. Existing runs finish.
+`resume` clears a manual trip and restores its exact triggers, epoch and
+previous breaker count. Overdue timers follow their existing catch-up policy.
+Pausing an already tripped definition preserves its first report; an automatic
+breaker trip still requires activation. An activation clears a manual pause
+and replaces its saved triggers in a new epoch.
+
+`emergency_stop(request, true)` sets a store-wide flag. Admissions return
+`control::Stopped`; claim and due queries return no work; firings consume no
+slot or ingress identity. Fenced steps and dispatch boundaries refuse further
+progress. In-flight workers release for recovery on a boundary or heartbeat,
+without spending their interruption budget; clearing the flag resumes from
+the same evidence. New execution can be authorized only while the flag is
+clear. Events may still be accepted into mailboxes while stopped.
+
+`inspect` includes the admitted definition/version, state, lease, waits and
+mailbox copies, call journal, children (including ended children), and tree
+jump budget. A terminal run keeps the tree's spent count at its end. Existing
+host-pinned `trace_id`/`span_id` values are exposed when present; generating
+and persisting tracing context is issue #20.
+
+`list` filters by definition, state, admission time and parent; `history`
+uses end time and includes terminal errors. History requires a bounded
+`[since_ms, before_ms)` window. `counts` requires a definition and counts a
+bounded page by state (by terminal outcome for history). Its continuation
+lets a host accumulate further pages. These are page counts, not an unbounded
+aggregate over the database. Each page examines at most its requested
+1–1,000 candidates, plus one cursor boundary row. Definition, parent and
+age select indexes; residual state/combined filters can produce an empty
+page with a continuation. Follow `next` until absent. Cursors are bound to
+the query; each page is a consistent transaction, not a multi-page snapshot.
+
+`waits` pages open listen positions by definition, run, event type and age,
+with their strategy, filters, correlation expectations, since time and absolute
+timeout. `respond(request, run, wait_key, event)` validates against that exact
+persisted matcher, including already filled `all` filters and correlations,
+and commits a targeted delivery and audit together. It refuses closed,
+timed-out or mismatching waits. A validated wildcard answer is offered to the
+wildcard subscription too; ordinary addressed delivery remains type-only.
+Repeating an event's `source` + `id` returns its original reply even after the
+wait closes; changing its payload or wait is a conflict. Matching contexts
+are redacted before persistence; a response requiring secret values is
+refused rather than guessed without the host's secret resolver.
 
 ## The DSL
 
@@ -392,6 +474,16 @@ The engine owns primary and secondary keys in `(kind, id)` order:
 | `queue_name:<hex name>` | trigger key | Buffers to promote when this definition releases capacity |
 | `ingress`, `ingress_due` | hex identity | Ingress tombstones and their expiry |
 | `budget` | root run ID | The units a run tree has spent, until its root ends |
+| `control` | `stopped` | Emergency-stop flag (absence means clear) |
+| `control_command`, `control_history` | request ID, ordered time + hex request ID | Operator request/reply and chronological journal |
+| `control_history_run:<hex run ID>` | ordered time + hex request ID | Run-targeted operator journal |
+| `control_response:<hex run ID>` | hex event identity | Response identity, original attribution, payload and reply |
+| `paused` | definition name | Manual pause's epoch and suspended triggers |
+| `control_run`, `control_run:<hex name>` | ordered admission time + run ID | Bounded run pages and counts |
+| `control_end`, `control_end:<hex name>` | ordered end time + run ID | Bounded terminal history and outcome counts |
+| `control_parent:<hex parent ID>` | ordered admission time + child ID | Owned children including terminal children |
+| `control_wait`, `control_wait_run:<hex run ID>`, `control_wait_definition:<hex name>` | ordered since time + hex run ID + hex wait key | Current listen matcher and position |
+| `control_wait_type:<hex type>`, `control_wait_definition:<hex name>:type:<hex type>` | same wait key | Current listens by routing type |
 
 Index entries contain the run ID and change in the same transaction as the
 run. Times use sign-adjusted, fixed-width hexadecimal; names and event types
@@ -410,7 +502,7 @@ A take reads one indexed row per listed type and consumes the copy with a
 constant number of writes; expiry reads only the expired copies. A copy's
 identity and type are point lookups. The run row still holds what is bounded by
 the workflow's open listens (waits, listeners, subscriptions, per-type pending
-counts), plus one `waiting:` wait per owned child; JSON work there scales with
+counts and current listen matching contexts), plus one `waiting:` wait per owned child; JSON work there scales with
 those, and with the versions of the affected definition name.
 
 SQLite uses `BEGIN IMMEDIATE`, WAL and `synchronous = FULL`. Postgres uses
@@ -425,12 +517,12 @@ Both initial migrations were replaced before any release or deployment. This
 layout requires a fresh database from the earlier development checkout; there
 is no conversion of that unreleased layout. Applied migrations are immutable
 from the next release onward. The SQL schema is a generic key/value table, so
-the row shapes above (and the interpreter's durable state version, now 7) can
+the row shapes above (and the interpreter's durable state version, now 8) can
 change without a migration; nothing persisted before them is converted. Each
 run row records the durable state version it was written under, and a row of
 another version (including the earlier one-aggregate-per-run layout) is
 refused with an error rather than read as a run without evidence. Likewise a
-`definitions` row records its layout (2); the earlier unversioned layout, which
+`definitions` row records its layout (3); the earlier unversioned layout, which
 kept a predecessor for a breaker rollback, is refused rather than read as a
 definition that never tripped.
 
