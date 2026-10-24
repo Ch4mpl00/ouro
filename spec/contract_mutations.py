@@ -37,9 +37,15 @@ MUTANTS = {
  "W3": ('val recipients = if (op == "address") Set(r).filter(k => live(s.db.runs.nth(k)))','val recipients = if (op == "address") Set(r).filter(k => live(s.db.runs.nth(k)) and s.db.runs.nth(k).subscription)',BOOT+[op("address")]),
  "W4": ('if (a == -1 or b < a) b else a','if (a == -1 or b > a) b else a',BOOT+[op("address"),op("address",i=1,value=1),op("take")]),
  "W5": ('else Runs.filter(k => live(s.db.runs.nth(k)) and s.db.runs.nth(k).subscription)','else Set(0).filter(k => live(s.db.runs.nth(k)) and s.db.runs.nth(k).subscription)', [op("admit",r=1),op("claim",r=1),op("subscribe",r=1),op("publish")]),
- "C1": ('parent:r }),op,1,i,execution.input,1)','parent:1 }),op,1,i,execution.input,1)',BOOT+[op("child")]),
- "C2": ('notified:execution.parent >= 0','notified:false',BOOT+[op("child"),op("finish")]+TICKS+[op("claim",r=1),op("finish",r=1)]),
- "C3": ('if ((k == r or x.parent == r) and live(x))','if (k == r and live(x))',BOOT+[op("child"),op("cancel")]),
+ "C1": ('parent:r }),op,r+1,i,execution.input,1)','parent:r+1 }),op,r+1,i,execution.input,1)',BOOT+[op("child")]),
+ # The child ends on its own: its parent's end would cancel it (#14).
+ "C2": ('notified:execution.parent >= 0','notified:false',BOOT+[op("child")]+TICKS+[op("claim",r=1,w=1),op("finish",r=1,w=1)]),
+ "C3": ('if (closed.contains(k) and live(x))','if (k == r and live(x))',BOOT+[op("child"),op("cancel")]),
+ # An owned child outlives a parent that ends other than by cancellation.
+ "C3/end": ('val owned = descendants(s,r)','val owned = if (outcome == 5) descendants(s,r) else Set()',BOOT+[op("child"),op("finish")]),
+ # Only direct children end with their parent: a grandchild outlives it.
+ "C3/transitive": ('Runs.filter(k => live(s.db.runs.nth(k)) and ancestors(s,k).contains(r))','Runs.filter(k => live(s.db.runs.nth(k)) and s.db.runs.nth(k).parent == r)',
+   BOOT+[op("child")]+TICKS+[op("claim",r=1,w=1),op("child",r=1,w=1),op("release",r=1,w=1),op("claim"),op("finish",value=1)]),
  "T1": ('fired:if (skip) s.db.fired else s.db.fired.union(Set(slot))','fired:s.db.fired',[op("tick"),op("tick"),op("fire")]),
  "T2": ('val epoch = c.epoch+1','val epoch = c.epoch',[op("activate",i=1)]),
  "T3": ('owner:w, generation:execution.generation+1, lease:s.now+4','owner:w, generation:execution.generation+1, lease:s.now+4, deadline:s.now+8',BOOT+TICKS+[op("claim")]),
@@ -72,26 +78,29 @@ def harness(commands):
 ''' % values
 
 def run_case(name, old, new, commands, output):
+    # A name `ID/variant` is a further mutant of one ID's mechanism.
+    target = name.split("/")[0]
+    file = name.replace("/", "-")
     with tempfile.TemporaryDirectory(prefix="ouro-contract-mutant-") as tmp:
         dest = pathlib.Path(tmp)
         source = (ROOT / "contract.qnt").read_text()
         assert source.count(old) == 1, (name, source.count(old))
         (dest / "contract.qnt").write_text(source.replace(old,new))
         (dest / "mutation_trace.qnt").write_text(harness(commands))
-        trace = output / f"contract-mutant-{name}.itf.json"
+        trace = output / f"contract-mutant-{file}.itf.json"
         trace.unlink(missing_ok=True)
         command = [QUINT,"run",str(dest / "mutation_trace.qnt"),"--init","traceInit","--step","traceStep",
             "--invariant","exportTrace","--max-samples","1","--max-steps",str(len(commands)),"--seed","20261023",
             "--out-itf",str(trace),"--verbosity","1"]
         start = time.monotonic()
         result = subprocess.run(command,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True)
-        (output / f"contract-mutant-{name}.log").write_text(result.stdout)
+        (output / f"contract-mutant-{file}.log").write_text(result.stdout)
         if not trace.exists():
             raise RuntimeError(f"{name}: tool failed: {result.stdout}")
         states = json.loads(trace.read_text())["states"]
         assert int(states[-1]["cursor"]["#bigint"]) == len(commands), name
         broken = states[-1]["m"]["violations"]["#set"]
-        return dict(target=name,detected=name in broken,violations=broken,
+        return dict(target=target,mutant=name,detected=target in broken,violations=broken,
                     shadow_rejects=not states[-1]["ideal"]["legal"],seconds=round(time.monotonic()-start,3),
                     steps=len(commands),scope="scripted witness; off-target clean cells are not exhaustive")
 

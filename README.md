@@ -153,6 +153,9 @@ the durable state version, which refuses an incompatible persisted format.
 workflow function, for a parent that starts a child, keeps working and
 joins it later: it returns `id`, `key`, `done` and `waiting` event types; a
 parent joins with `listen`, or reads the owned result with `child_outcome`.
+An owned child never outlives its parent: when the parent ends (completes,
+faults or is cancelled), its live owned descendants are cancelled in the same
+commit, so a parent that finishes without joining stops its child.
 The worker drives children under the same bounds. Native `run: workflow`
 (below) is the DSL's way to run a child and wait for it.
 

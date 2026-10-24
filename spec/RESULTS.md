@@ -1,3 +1,48 @@
+# Contract checking — 2026-10-24, owned children end with their parent (#14)
+
+Decided in #14: an owned child never outlives its parent. Any end of a run
+(completion, fault, timeout, binding conflict, cancellation) cancels its live
+owned descendants, transitively, in the commit of that end. The stores
+already did this; the model had ended them only on cancellation, and the
+witness `childFinish` (`init.then(boot).then(do("child")).then(do("finish"))`)
+diverged on the serial bridge. Quick checks only, same environment as below:
+
+| Check | Scope | Result | Time |
+| --- | --- | --- | --- |
+| Typecheck | all five modules | Pass | |
+| Witnesses | 33 histories (`childFinishTest`, `grandchildTest` added) | Pass | 8 s |
+| Simulation | 10,000 × 150 steps, seed 20261023, invariant `checked` | No violation | 227 s (232 s wall, alongside builds) |
+| Concurrent table | 8 batches, every order | Computed | 5 s |
+| Safety mutants | 35 scripted witnesses (`C3/end`, `C3/transitive` added) | All targets detected; the 33 earlier footprints unchanged | 154 s |
+| Fault rows | 11 switches × 1,000 × 150 steps | No violation | 23–38 s each, 302 s |
+| Fault detection | 11 rows | All detected, same footprints | 54 s |
+| Serial and concurrent MBT | memory and SQLite, 100 × 150 + `bridgeSuite`, 12 rounds × 8 batches | Pass | 54 s |
+| fmt, Clippy, `OURO_REQUIRE_QUINT=1 cargo test --workspace --no-fail-fast` | Postgres conformance and scalability on testcontainers | Pass: 199 passed, 0 failed, 4 ignored (Postgres bridges, throughput); CTK 21 scenarios | 350 s for the tests |
+
+Not run: the Postgres MBT bridges (no `TEST_DATABASE_URL`), Apalache and
+TLC; `contract_progress.qnt` is unchanged and `contract-evidence.json` was
+not regenerated.
+
+Model changes: a third run (run r's child is run r + 1, so run 2 can be a
+grandchild); `ancestors` and `descendants` close the owned relation
+transitively, `rootOf` follows it to the budget's root; `finish`, `timeout`
+and `conflict` cancel the run's live descendants as `cancel` does; C3 is now
+the state property that no live run has an ended owner. The C2 mutant's
+witness ends the child on its own (its parent's end would cancel it first).
+1,000 × 150 simulation took 26 s against 22 s with two runs.
+
+Bridge evidence: with the model's old rule restored, `bridgeSuite` diverges
+(`Specification and implementation states diverge`); with a store that
+cascades only to direct children, the bridge's audit fails (`an owned child
+outlived its parent`) at `grandchildTest` (both tried on memory; the suite
+runs on every adapter). The store
+cascades transitively through the `children` index of live runs inside the
+parent's terminal commit; a parent with 52 live descendants (16 finished
+children skipped) ended in one commit reading 766 / 265 rows and writing
+332 / 333 rows on memory / SQLite (about 15 reads and 6.4 writes per
+descendant; bound 32 + 16n reads, 16 + 8n writes). No implementation bug
+was found.
+
 # Contract checking — 2026-10-24, the breaker reports (#10)
 
 Decision 5 and the epoch rule of decision 3 were revised: a tripped breaker

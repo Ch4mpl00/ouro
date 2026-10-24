@@ -41,7 +41,8 @@ pub const TICK: i64 = 7_500;
 pub fn model_policy() -> Policy {
     Policy { mailbox_ms: 5 * TICK, ingress_ms: 5 * TICK, skew_ms: TICK }
 }
-const RUNS: usize = 2;
+/// Run `r`'s owned child is run `r + 1`, so run 2 can be a grandchild.
+const RUNS: usize = 3;
 const CALLS: usize = 3;
 /// The model's jump budget per run tree (`ceiling`); spend keys are `jump<i>`.
 const CEILING: u64 = 2;
@@ -966,14 +967,14 @@ impl StoreDriver {
             }
             "child" => {
                 let Some(f) = self.fence(w, r) else { return Ok(()) };
-                if r != 0 || self.store.get(&run_id(1))?.is_some() {
+                if r + 1 >= RUNS || self.store.get(&run_id(r + 1))?.is_some() {
                     return Ok(());
                 }
-                let parent = self.store.get(&run_id(0))?.context("leased parent missing")?.admission;
+                let parent = self.store.get(&run_id(r))?.context("leased parent missing")?.admission;
                 let app = parent.application_version().map_or(Ok(0), str::parse)?;
                 let mode = parent.runtime["mode"].as_i64().unwrap_or(0);
-                let a = self.admission(1, parent.input.as_i64().context("input")?, app, mode, None)?;
-                let link = ChildLink { parent: run_id(0), key: "child".into(), reference: "child".into() };
+                let a = self.admission(r + 1, parent.input.as_i64().context("input")?, app, mode, None)?;
+                let link = ChildLink { parent: run_id(r), key: "child".into(), reference: "child".into() };
                 // The child's first lease stays with the parent's host. A
                 // tripped definition refuses it, typed, in the same commit.
                 let refusal = self.store.definitions(NAME)?.tripped.is_some() && self.valid(&f)?;
@@ -1272,9 +1273,11 @@ impl StoreDriver {
         for w in 0..2 {
             ensure!(self.store.due_as(self.ms(), 3, &worker(w))? == ids(Some(w)), "versioned due projection differs");
         }
-        if let (Some(parent), Some(child)) = (&snapshots[0], &snapshots[1])
-            && let Some(link) = &child.run.child
-        {
+        for child in snapshots.iter().flatten() {
+            let Some(link) = &child.run.child else { continue };
+            let parent = run_index(&link.parent)
+                .and_then(|p| snapshots[p].as_ref())
+                .context("an owned child without its parent")?;
             let id = &child.run.admission.id;
             ensure!(
                 self.store.child_outcome(&link.parent, &link.key, id)? == child.run.outcome,
@@ -1290,6 +1293,14 @@ impl StoreDriver {
             {
                 let notified = parent.events.iter().filter(|e| e.type_ == format!("done:{id}")).count();
                 ensure!(notified == 1, "a finished child notified its live parent {notified} times");
+            }
+            // An owned child never outlives its parent (#14).
+            if let Some(end) = parent.run.ended_ms {
+                ensure!(
+                    child.run.ended_ms.is_some_and(|c| c <= end),
+                    "an owned child outlived its parent: {:?}",
+                    child.run.outcome
+                );
             }
         }
         Ok(())
