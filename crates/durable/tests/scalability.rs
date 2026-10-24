@@ -234,6 +234,11 @@ fn long_run(backend: &Arc<dyn AtomicBackend>, metrics: &Metrics, validation: u64
     let counts = metrics.counts();
     assert_eq!((counts.rows_read, counts.rows_written), (validation * (records + 1), 0), "long_load_records");
     eprintln!("BOUND,long_load_records,{},{},records={records}", counts.rows_read, counts.rows_written);
+    // A jump decision of a run holding 10,000 records: its record row and its
+    // tree's counter, nothing that grows with the run.
+    let spent = bounded(metrics, "long_spend", 0, || s.spend(&f, "/do/loop#jump", 100, 1))?;
+    assert_eq!(spent, Record::Budget { granted: true, spent: 1 });
+    bounded(metrics, "long_spend_replayed", 0, || s.spend(&f, "/do/loop#jump", 100, 1))?;
     bounded(metrics, "long_register_wait", 0, || s.register_wait(&f, &types, 1))?;
     let next = event("long-next", "long", json!("next"));
     assert_eq!(bounded(metrics, "long_deliver", 1, || s.deliver(&next, Some(&id), 1))?, Some(id.clone()));
@@ -260,10 +265,10 @@ fn long_run(backend: &Arc<dyn AtomicBackend>, metrics: &Metrics, validation: u64
     assert!(counts.rows_written <= 16 + 5 * expired, "long_take_event_expired: {counts:?}");
     assert_eq!(counts.conflicts, 0);
     eprintln!("BOUND,long_take_event_expired,{},{},matches={expired}", counts.rows_read, counts.rows_written);
-    assert_eq!(s.load_records(&f, 1_000)?.len(), RECORDS + 3 + BACKLOG);
+    assert_eq!(s.load_records(&f, 1_000)?.len(), RECORDS + 4 + BACKLOG);
     assert!(bounded(metrics, "long_cancel", 0, || s.cancel(&id, 1_000))?);
     let swept = sweep_bounded(backend, metrics, "long_sweep", || s.sweep(2_000, 0))?;
-    assert!(swept.records >= RECORDS + 3 + BACKLOG);
+    assert!(swept.records >= RECORDS + 4 + BACKLOG);
     assert!(s.inspect(&id)?.unwrap().records.is_empty());
     Ok(())
 }
