@@ -95,13 +95,22 @@ admitted in the active version's current epoch; cancellations and interruptions
 reports and never rolls back: the runtime does not know which version is the
 safe one. N consecutive faults (`Config::breaker_threshold`, default 3) trip
 the definition in the commit of the Nth fault: `definitions(name).tripped`
-holds the `Trip` (version, epoch, faults, threshold, the run and its error), no
-new runs are admitted, its schedule stops, running runs finish and are no
-longer counted, and a notice is stored with the trip. `notify` (the worker
-calls it on every tick) hands each notice on at least once, as an identified
+holds the `Trip` (version, epoch, faults, threshold, the run and its error),
+its schedule stops, running runs finish and are no longer counted, and a
+notice is stored with the trip. No new run of the definition is admitted by
+any path, of any version: the store refuses it in the admission's commit with
+`durable::DefinitionTripped` (naming the definition and the trip's epoch).
+`start` returns it; a `run: workflow` child, owned or not, fails its task with
+the workflow error of type `urn:ouro:errors:definition.tripped`
+(`durable::TRIPPED_ERROR`, status 409), never retried, which the parent may
+catch like any task error and which, uncaught, faults the parent as an
+unhandled error. `notify` (the worker calls it on every tick) hands each
+notice on at least once, as an identified
 CloudEvent of type `ouro.definition.tripped` (`durable::TRIPPED`, source
 `ouro/definitions/<name>`, id `tripped:<epoch>`, the report as `data`): to the
-runs and `on` schedules listening for that type and to the `EventSink`. The
+runs and `on` schedules listening for that type and to the `EventSink`; a
+notice the sink refuses is retried after a backoff of its own, from one second
+doubling to five minutes (kept in memory: a restart may retry sooner). The
 host decides: activate another version (its own built-in one, an earlier one),
 keep it stopped, alert someone. Only an activation clears the trip. In-flight
 runs keep their admitted YAML, version, input and schema/delivery
@@ -235,7 +244,8 @@ is bounded by its collection and `retry` by its attempts.
   catalog entry named `name`, the active version for `latest`, else the
   saved version whose document has that `version`), owned and joined
   atomically; recovery joins the same child and never reruns a completed
-  one. `await: false` starts an independent run. `run: container | script |
+  one. `await: false` starts an independent run. A tripped definition admits
+  no child (`urn:ouro:errors:definition.tripped`). `run: container | script |
   shell` need a `ProcessRunner` (`with_process_runner`); it is recorded like
   a function call (`run:<kind>`), with the delivery the runner declares per
   kind.

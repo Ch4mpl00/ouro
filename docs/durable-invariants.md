@@ -542,8 +542,10 @@ For each activation epoch, serialize qualifying run terminal observations. Each
 run contributes at most once. Fault increments the consecutive-fault count;
 success resets it. On reaching threshold `N`, the trip is atomic with the threshold
 observation: the definition records its report (version, epoch, count, threshold,
-the run and its error), stops admitting runs and firing its schedule, and commits
-one notice for the host. The active version and the epoch do not change. A tripped
+the run and its error), stops firing its schedule, and commits one notice for the
+host. From then on every admission of a new run of that definition, by any path
+and of any version, is refused in its own commit with a typed, non-retryable
+error; an already admitted run is still joined. The active version and the epoch do not change. A tripped
 breaker observes nothing more; only an activation clears it, in a new epoch.
 Completions outside the current epoch cannot alter it. Classification is decision 5.
 
@@ -1000,10 +1002,13 @@ Decision 5 and the epoch rule of decision 3 were revised on 2026-10-24
    infrastructure interruptions (a process or storage failure that a later
    attempt resumes, even when the interruptions run out). Success and a new
    activation reset the count. At the threshold the definition becomes
-   tripped, with the reason and the counts: new runs and its schedule stop,
-   running runs finish, the state is visible in the runs API, and a notice (a
-   CloudEvent) committed with the trip is handed at least once to the host,
-   which can subscribe to it. The host decides what to do: activate another
+   tripped, with the reason and the counts: its schedule stops and no new run
+   is admitted from any path, child runs included, each refused with a typed,
+   non-retryable error that names the definition and the trip's epoch (a
+   parent may catch it like any task error; uncaught, it is an unhandled error
+   of the parent). Running runs finish, the state is visible in the runs API,
+   and a notice (a CloudEvent) committed with the trip is handed at least once
+   to the host, which can subscribe to it. The host decides what to do: activate another
    version (its own built-in one, an earlier one), keep it stopped, alert
    someone. Only a new activation clears the trip and starts an epoch. There
    is no automatic rollback and no predecessor bookkeeping for one; an

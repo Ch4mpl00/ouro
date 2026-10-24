@@ -53,7 +53,7 @@ are the bridges in `crates/durable/tests/quint.rs` and `quint/concurrent.rs`.
 | T2 | `T2`: activation epoch (only an activation starts one), dormant rearm | Concurrent firing/activation; serial MBT; `gaps::t2_old_completion_cannot_rearm_new_epoch` |
 | T3 | `T3`: deadline fixed at admission | Serial MBT; `t3_admission_fixes_the_workflow_deadline` |
 | V1 | `V1`: only an activation selects the active version (no rollback); pinned admission | Serial MBT; runtime pinned-version recovery |
-| V2 | `V2`: epoch, fault classification, reset; a trip reports once (one notice), stops the schedule, ignores later observations, cleared only by activation | Serial MBT; `gaps::v2_old_epoch_fault_does_not_count_after_reactivation` |
+| V2 | `V2`: epoch, fault classification, reset; a trip reports once (one notice), stops the schedule and every admission, ignores later observations, cleared only by activation | Serial MBT; `gaps::v2_old_epoch_fault_does_not_count_after_reactivation`; refusal on every admission path in conformance (two model runs cannot trip and then admit a child, so the model's clause is not reached by a witness) |
 | V3 | `V3`: undeclared/exact-match claim and mutation guards | Serial MBT (`claim_as`, `due_as` per worker version); `gaps::v3_incompatible_worker_cannot_claim` |
 | O1 | `O1`: failed operation stops the attempt | Serial MBT fault switches; generated interrupted journals |
 | O2 | `O2`: terminal-only retention and stable identities | Serial MBT (swept evidence projected away); replay-after-sweep refusal |
@@ -108,8 +108,8 @@ deadline fixed at admission and epoch.
 - **Breaker** (decision 5, revised by #10). Threshold two; only runs of the
   current epoch count; unhandled failures, timeouts, unknown endings and
   binding conflicts count, cancellations do not. It reports and never rolls
-  back: the threshold observation trips the definition (no admissions, no
-  schedule, the count frozen) and appends the epoch to `notices`, the trip's
+  back: the threshold observation trips the definition (no admissions,
+  children included, no schedule, the count frozen) and appends the epoch to `notices`, the trip's
   committed notice; the active version and the epoch stay. A tripped breaker
   observes nothing; only the next activation clears it.
 - **Compatibility** (#3). Worker `w` declares version `w + 1`; a run admitted
