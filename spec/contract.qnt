@@ -98,6 +98,18 @@ module contract {
     val updated = update(s,r,execution)
     { ...updated, db: { ...updated.db, admissions: updated.db.admissions.replaceAt(r,updated.db.admissions.nth(r)+1) } }
   }
+  // A fired slot's run `r` (admitted in the current epoch, untripped) ends at
+  // its admission with an unhandled failure: one fault for the breaker, which
+  // at the threshold trips and reports as `finish` does. With no run to wait
+  // for, an `after` trigger is due again one delay on.
+  pure def refuseRun(s: Machine, r: int, i: int): Machine = {
+    val c = s.db.catalog
+    val faults = c.faults+1
+    val trip = faults >= 2
+    val ended = update(s,r,{ ...s.db.runs.nth(r), outcome:2, ended:s.now })
+    observe({ ...ended, db:{ ...ended.db, catalog:{ ...c, faults:faults, tripped:trip, armed:c.armed and not(trip),
+      due:if (trip) -1 else s.now+2, notices:if (trip) c.notices.append(c.epoch) else c.notices } } },"finish",r,i,2,1)
+  }
   // Decisions: 0 dispatch afresh, 2 restore the result, 3 unknown, 4 evidence
   // swept, 5 restore the error response, 6 proven not executed (send again).
   pure def recovery(record: int, retained: bool): int =
@@ -237,15 +249,19 @@ module contract {
       val epoch = c.epoch+1
       { ...s,db:{ ...s.db,catalog:{ ...c,active:i+1,epoch:epoch,faults:0,tripped:false,catchup:value % 2,rearm:value >= 2,
         triggerEpoch:epoch,due:if (i == 0) s.now+2 else -1,armed:i == 0,slot:0 } } }
-    } else if (op == "fire" and value >= 0 and c.due >= 0 and c.due <= s.now and c.triggerEpoch == c.epoch and not(c.tripped)) {
+    } else if ((op == "fire" or op == "refuse") and value >= 0 and c.due >= 0 and c.due <= s.now and c.triggerEpoch == c.epoch and not(c.tripped)) {
       val slot = (c.epoch,c.slot)
       val skip = (c.catchup == 1 and c.due < s.now) or
         (c.running >= 0 and live(s.db.runs.nth(c.running))) or execution.admitted
       val updated = if (skip) s else observe(admitRun(s,r,value,0,0),"admit",r,i,value,1)
-      { ...updated, db:{ ...updated.db,
+      val fired = { ...updated, db:{ ...updated.db,
         fired:if (skip) s.db.fired else s.db.fired.union(Set(slot)),
         skipped:if (skip) s.db.skipped.union(Set(slot)) else s.db.skipped,
         catalog:{ ...c,slot:c.slot+1,due:if (c.rearm and not(skip)) -1 else s.now+2,running:if (skip) c.running else r } } }
+      // `refuse`: the host cannot admit the slot's run (#15). The slot is
+      // consumed all the same, its run admitted already ended with an
+      // unhandled failure, which the breaker observes in this transition.
+      if (op == "fire" or skip) fired else refuseRun(fired,r,i)
     } else if (op == "ingress" and s.db.ingress.keys().contains(i) and s.db.ingress.get(i) > s.now and s.db.ingressPayload.get(i) != value)
       observe(s,op,r,i,value,-1)
     else if (op == "ingress" and value >= 0 and not(s.db.ingress.keys().contains(i) and s.db.ingress.get(i) > s.now) and not(execution.admitted) and not(c.tripped)) {
@@ -355,7 +371,7 @@ module contract {
       ancestors(a,k).forall(p => a.db.runs.nth(p).outcome == 0)))
     val fired = a.db.fired.contains((c.epoch,c.slot))
     val skipped = a.db.skipped.contains((c.epoch,c.slot))
-    val error19 = flag(error18,"T1",op != "fire" or c.slot == d.slot or
+    val error19 = flag(error18,"T1",not(Set("fire","refuse").contains(op)) or c.slot == d.slot or
       (fired != skipped and (if (fired) not(old.admitted) and execution.admitted and
         a.db.admissions.nth(r) == b.db.admissions.nth(r)+1 and c.triggerEpoch == c.epoch and
         not(c.tripped) and not(c.running >= 0 and live(b.db.runs.nth(c.running)))
@@ -374,13 +390,14 @@ module contract {
     // Nothing but an activation selects the active version: no rollback.
     val error22 = flag(error21,"V1",admissionStable and (op != "activate" or c == d or d.active == i+1) and
       (op == "activate" or d.active == c.active))
-    val terminalObservation = Set("finish","timeout","conflict").contains(op) and old.outcome == 0 and execution.outcome != 0
+    // A refused slot's run is admitted and ends in one transition (#15).
+    val terminalObservation = Set("finish","timeout","conflict","refuse").contains(op) and old.outcome == 0 and execution.outcome != 0
     val qualifying = execution.outcome >= 2 and execution.outcome <= 4
     // The threshold observation trips and reports it once, stopping the
     // schedule; a tripped breaker ignores later observations; only an
     // activation clears it; notices change only at a trip.
     val breakerCorrect = if (not(terminalObservation)) d.notices == c.notices
-      else if (old.epoch != c.epoch or c.tripped) c == d
+      else if (execution.epoch != c.epoch or c.tripped) c == d
       else if (qualifying and c.faults == 1) d.faults == 2 and d.tripped and d.due == -1 and not(d.armed) and
         d.notices == c.notices.append(c.epoch)
       else d.faults == (if (qualifying) c.faults+1 else if (execution.outcome == 1) 0 else c.faults) and
@@ -485,7 +502,7 @@ module contract {
   action step = {
     nondet op = Set("admit","dry","replay","claim","renew","release","intent","dispatch","result","notExecuted","recover",
       "checkpoint","conflict","subscribe","address","publish","take","expire","child","finish","timeout","cancel",
-      "activate","fire","ingress","sweep","crash","tick","spend").oneOf()
+      "activate","fire","refuse","ingress","sweep","crash","tick","spend").oneOf()
     nondet r = Runs.oneOf()
     nondet w = Workers.oneOf()
     nondet i = Calls.oneOf()

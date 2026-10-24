@@ -15,7 +15,7 @@
 use anyhow::{Context, ensure};
 use ouro_durable::{
     Admission, Arming, ChildLink, CommitFault, Compatibility, DefinitionTripped, FaultInjector, Fence, Fired, Firing,
-    IdentityConflict, Policy, Rearm, RunSnapshot, RunState, RunStore, TransactionalStore, Trigger,
+    IdentityConflict, Policy, Rearm, Refused, RunSnapshot, RunState, RunStore, TransactionalStore, Trigger,
     memory::MemoryBackend, sqlite::SqliteBackend,
 };
 use owf::{
@@ -1028,7 +1028,9 @@ impl StoreDriver {
                     ensure!(result?.is_some(), "the definition changed under a serial activation");
                 }
             }
-            "fire" => {
+            // `refuse`: the host cannot admit the slot's run, so the firing
+            // records it refused (`Firing::refused`) in place of admitting it.
+            "fire" | "refuse" => {
                 let defs = self.store.definitions(NAME)?;
                 let Some(t) = self.store.trigger(SCHEDULE)? else { return Ok(()) };
                 let Some(at) = t.at_ms else { return Ok(()) };
@@ -1050,20 +1052,29 @@ impl StoreDriver {
                     }
                     return Ok(());
                 }
-                let admit = [self.admission(r, value, 0, 0, Some((defs.epoch, slot)))?];
-                let next = moved(if rearm { None } else { Some(self.now + 2) });
+                let admission = self.admission(r, value, 0, 0, Some((defs.epoch, slot)))?;
+                let refused = (op == "refuse").then(|| Refused {
+                    admission: admission.clone(),
+                    // The model's unhandled failure (outcome 2), as `status(2)`.
+                    error: error("unhandled", "model failure"),
+                    breaker_threshold: 2,
+                });
+                let admit = if refused.is_some() { vec![] } else { vec![admission] };
+                // A refused run never ends later to re-arm `after`.
+                let parked = rearm && refused.is_none();
+                let next = moved(if parked { None } else { Some(self.now + 2) });
                 let again = Rearm { trigger: SCHEDULE.into(), delay_ms: 2 * TICK };
                 let firing = Firing {
                     key: SCHEDULE,
                     expected: Some(&t),
                     next: Some(&next),
                     admit: &admit,
-                    rearm: rearm.then_some(&again),
+                    rearm: parked.then_some(&again),
                     ingress: None,
                     // The store skips the slot, in this commit, when the
                     // schedule's last run is unfinished.
                     busy: Some(&skip),
-                    refused: None,
+                    refused: refused.as_ref(),
                 };
                 let (result, _) = self.write(fault, |s| s.fire(&firing, ms));
                 if !injected {
@@ -1340,7 +1351,7 @@ pub fn with_quint(name: &str, run: impl FnOnce() -> anyhow::Result<()>) {
     assert!(result.success(), "Quint child test failed");
 }
 /// Every command of the contract model, and initialization.
-const COMMANDS: usize = 30;
+const COMMANDS: usize = 31;
 fn simulation(adapter: Adapter) -> anyhow::Result<()> {
     use quint_connect::runner::{self, RunConfig};
     let seed = std::env::var("QUINT_SEED").unwrap_or_else(|_| "20261023".into());
