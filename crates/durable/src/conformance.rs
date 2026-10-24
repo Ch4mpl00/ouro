@@ -729,12 +729,109 @@ pub async fn run_all(factory: impl AsyncFn(&str) -> anyhow::Result<TestStore>) -
     overlap_policies(&factory, &mut report).await?;
     controls(&factory, &mut report).await?;
     control_overlap(&factory, &mut report).await?;
+    dropped(&factory, &mut report).await?;
     Ok(report)
 }
 
 /// The persisted budget counter of `root`'s tree.
 async fn counter(t: &TestStore, root: &str) -> anyhow::Result<Option<Value>> {
     Ok(t.backend.snapshot().await?.rows.get(&("budget".to_string(), root.to_string())).cloned())
+}
+
+/// Operations whose future is dropped (#7): mid-transaction, after some of
+/// its writes and before its commit, or while a statement is in flight.
+/// Nothing it wrote is visible, and what it held (SQLite's one connection,
+/// a pooled session) is free for the next operation.
+async fn dropped(factory: &impl AsyncFn(&str) -> anyhow::Result<TestStore>, report: &mut Report) -> anyhow::Result<()> {
+    let t = factory("dropped").await?;
+    report.cases += 1;
+    let f = t.store.start(&admission("r"), 0).await?.unwrap();
+    let before = t.backend.snapshot().await?;
+    let stalling = Arc::new(Stalling { inner: t.backend.clone(), after: 1, reached: tokio::sync::Notify::new() });
+    let s = TransactionalStore::new(stalling.clone());
+    let deadline = std::time::Duration::from_secs(30);
+    let fresh = admission("dropped");
+    for operation in 0..3 {
+        let pending: BoxFuture<'_, anyhow::Result<Option<Fence>>> = match operation {
+            0 => s.start(&fresh, 0),
+            1 => Box::pin(async { s.save_record(&f, "k", &Record::Timer { deadline_ms: 1 }, 1).await.map(|()| None) }),
+            _ => Box::pin(async { s.finish(&f, &Status::Completed(json!(0)), 1, 3).await.map(|_| None) }),
+        };
+        tokio::select! {
+            _ = pending => panic!("a stalled operation completed"),
+            _ = stalling.reached.notified() => {}
+        }
+        assert_eq!(t.backend.snapshot().await?, before, "a dropped operation left writes behind");
+    }
+    // Dropped after its first poll: a statement (a session's wait, BEGIN)
+    // may still be in flight. An operation that completed in that poll
+    // (memory) committed whole instead.
+    let mut first = t.store.save_record(&f, "first", &Record::Timer { deadline_ms: 1 }, 1);
+    let completed = futures::poll!(first.as_mut()).is_ready();
+    drop(first);
+    let records = tokio::time::timeout(deadline, t.store.load_records(&f, 1)).await??;
+    assert_eq!(records.contains_key("first"), completed);
+    let next = tokio::time::timeout(deadline, t.store.save_record(&f, "after", &Record::Timer { deadline_ms: 1 }, 1));
+    next.await.map_err(|_| anyhow::anyhow!("a dropped operation kept its connection"))??;
+    assert!(t.store.get("dropped").await?.is_none());
+    t.store.finish(&f, &Status::Completed(json!(0)), 1, 3).await?;
+    audit(&*t.store).await?;
+    report.operations += 6;
+    report.witnesses.insert("a dropped operation leaves nothing and holds nothing");
+    Ok(())
+}
+/// Suspends every transaction forever before its write number `after`,
+/// signalling `reached` instead of writing.
+struct Stalling {
+    inner: Arc<dyn AtomicBackend>,
+    after: usize,
+    reached: tokio::sync::Notify,
+}
+struct Stalled<'a> {
+    inner: Box<dyn Transaction + 'a>,
+    backend: &'a Stalling,
+    writes: usize,
+}
+impl Stalled<'_> {
+    async fn write(&mut self) {
+        if self.writes == self.backend.after {
+            self.backend.reached.notify_one();
+            std::future::pending::<()>().await;
+        }
+        self.writes += 1;
+    }
+}
+#[async_trait::async_trait]
+impl AtomicBackend for Stalling {
+    async fn begin(&self) -> anyhow::Result<Box<dyn Transaction + '_>> {
+        Ok(Box::new(Stalled { inner: self.inner.begin().await?, backend: self, writes: 0 }))
+    }
+    async fn snapshot(&self) -> anyhow::Result<Snapshot> {
+        self.inner.snapshot().await
+    }
+}
+#[async_trait::async_trait]
+impl Transaction for Stalled<'_> {
+    async fn get(&mut self, kind: &str, id: &str) -> anyhow::Result<Option<Value>> {
+        self.inner.get(kind, id).await
+    }
+    async fn scan(&mut self, kind: &str, start: &str, end: Option<&str>, limit: usize) -> anyhow::Result<Rows> {
+        self.inner.scan(kind, start, end, limit).await
+    }
+    async fn put(&mut self, kind: &str, id: &str, value: &Value) -> anyhow::Result<()> {
+        self.write().await;
+        self.inner.put(kind, id, value).await
+    }
+    async fn delete(&mut self, kind: &str, id: &str) -> anyhow::Result<()> {
+        self.write().await;
+        self.inner.delete(kind, id).await
+    }
+    async fn commit(self: Box<Self>) -> anyhow::Result<()> {
+        self.inner.commit().await
+    }
+    async fn rollback(self: Box<Self>) {
+        self.inner.rollback().await
+    }
 }
 
 /// A run tree's shared budget (issue #8): one counter per root, spent by

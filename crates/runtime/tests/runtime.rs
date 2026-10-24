@@ -1439,3 +1439,120 @@ async fn operator_answers_respect_enclosing_workflow_and_task_deadlines() {
         );
     }
 }
+
+// ── async seams on a current-thread runtime (#7) ───────────────────────────
+
+/// `write` is at most once and counted; `hold` never answers on the first
+/// host (`held`: it signals and waits) and answers at once on the second;
+/// `meet` waits until three calls meet, so it completes only when three runs
+/// are in flight together.
+fn crash_registry(writes: Arc<AtomicUsize>, held: Option<Arc<tokio::sync::Notify>>) -> Registry {
+    let mut registry = Registry::new();
+    registry
+        .register(
+            Function::new("write", json!({}), json!({}), move |_: Value, _: FunctionContext| {
+                writes.fetch_add(1, Ordering::SeqCst);
+                async { Ok(json!({})) }
+            })
+            .with_delivery(Delivery::AtMostOnce),
+        )
+        .unwrap();
+    registry
+        .register(Function::new("hold", json!({}), json!({}), move |_: Value, _: FunctionContext| {
+            let held = held.clone();
+            async move {
+                if let Some(held) = held {
+                    held.notify_one();
+                    std::future::pending::<()>().await;
+                }
+                Ok(json!({}))
+            }
+        }))
+        .unwrap();
+    let meeting = Arc::new(tokio::sync::Barrier::new(3));
+    registry
+        .register(Function::new("meet", json!({}), json!({}), move |_: Value, _: FunctionContext| {
+            let meeting = meeting.clone();
+            async move {
+                meeting.wait().await;
+                Ok(json!({}))
+            }
+        }))
+        .unwrap();
+    registry
+}
+
+/// One thread runs everything. A worker dies mid-run: its `drive` future is
+/// dropped with a call in flight, so nothing releases or renews the lease. The
+/// lease then simply ends: before its expiry no other worker can claim the
+/// run, after it another runtime over the same database resumes it from its
+/// records without sending the at-most-once write again. Then three runs make
+/// progress together under one worker on that same thread.
+fn current_thread_crash_and_resume(open: impl Fn() -> Arc<dyn RunStore>) {
+    let executor = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    executor.block_on(async {
+        let writes = Arc::new(AtomicUsize::new(0));
+        let held = Arc::new(tokio::sync::Notify::new());
+        let clock = Arc::new(Time::default());
+        let first = runtime(open(), crash_registry(writes.clone(), Some(held.clone())), clock.clone());
+        save(&first, &yaml("  - write: { call: write }\n  - hold: { call: hold }\n  - done: { set: { ok: true } }"))
+            .await;
+        first.start("r", "workflow", json!({})).await.unwrap();
+        let crashed = CancellationToken::new();
+        tokio::select! {
+            _ = first.drive("r", &crashed) => panic!("the held run completed"),
+            _ = held.notified() => {}
+        }
+        drop(first);
+        let lease = first_lease(&open, "r").await;
+        assert_eq!(lease, durable::LEASE_MS, "the crashed worker's lease from its claim at 0");
+        // Nothing renews a dropped run's lease, however long its heartbeat waits.
+        clock.0.store(durable::LEASE_MS - 1, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(first_lease(&open, "r").await, lease);
+        let second = runtime(open(), crash_registry(writes.clone(), None), clock.clone());
+        assert_eq!(second.drive("r", &CancellationToken::new()).await.unwrap(), None, "claimed before its lease ended");
+        clock.0.store(durable::LEASE_MS, Ordering::SeqCst);
+        assert_eq!(second.recover_once(&CancellationToken::new()).await.unwrap(), 1);
+        let run = second.get("r").await.unwrap().unwrap();
+        assert_eq!(run.outcome, Some(Status::Completed(json!({"ok": true}))));
+        assert_eq!(writes.load(Ordering::SeqCst), 1, "the at-most-once write was sent again");
+
+        let d =
+            second.save("meeting", &yaml("  - meet: { call: meet }").replace("name: workflow", "name: meeting")).await;
+        second.activate("meeting", d.unwrap().version).await.unwrap();
+        for n in 0..3 {
+            second.start(&format!("m{n}"), "meeting", json!({})).await.unwrap();
+        }
+        let stop = CancellationToken::new();
+        let met = async {
+            for n in 0..3 {
+                while second.get(&format!("m{n}")).await.unwrap().unwrap().outcome.is_none() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }
+            stop.cancel();
+        };
+        let (worker, ()) =
+            tokio::time::timeout(Duration::from_secs(30), async { tokio::join!(second.worker(stop.clone()), met) })
+                .await
+                .expect("three runs did not progress together on one thread");
+        worker.unwrap();
+    });
+}
+async fn first_lease(open: &impl Fn() -> Arc<dyn RunStore>, id: &str) -> i64 {
+    open().get(id).await.unwrap().unwrap().lease_until_ms.expect("a running run holds a lease")
+}
+#[test]
+fn memory_runs_crash_and_resume_on_a_current_thread_runtime() {
+    let store: Arc<dyn RunStore> = Arc::new(durable::memory::memory());
+    current_thread_crash_and_resume(|| store.clone());
+}
+#[test]
+fn sqlite_runs_crash_and_resume_on_a_current_thread_runtime() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("runs.sqlite");
+    // Each runtime opens its own connection to the same file, as a restarted
+    // process would.
+    current_thread_crash_and_resume(|| Arc::new(durable::sqlite::open(&path).unwrap()));
+}

@@ -53,7 +53,9 @@ async fn sqlite_conformance() {
     eprintln!("sqlite: {report:?}");
 }
 
-#[tokio::test(flavor = "multi_thread")]
+// A current-thread runtime: the async store needs no worker threads, and
+// the suite's interpreter cases (crash and resume included) run on it.
+#[tokio::test(flavor = "current_thread")]
 async fn postgres_conformance() {
     use testcontainers::{
         GenericImage, ImageExt,
