@@ -43,6 +43,20 @@ and OpenTelemetry tracer. Call `save`, `activate`, and `start`, then `drive`
 for immediate execution or run `worker` at application startup. Admission
 persists before execution; `start` enqueues and is idempotent by run ID.
 
+Every run starts with a check that each function it can call is registered:
+the functions its calls name, the process runners its `run:` tasks need
+(`run:<kind>`), and, transitively, those of the child workflows its
+`run: workflow` tasks name, as they resolve now. The registry can change
+after a definition was activated: a new release of the host, or
+`set_registry` on a running one. At admission a missing function fails
+`start` (and a child's start, a schedule's or a trigger's admission) with a
+`MissingFunction` error naming it and the definitions that lead to it; a
+resumed run checks again before its next step and faults with a
+`configuration` error instead of failing halfway through. Each definition
+version's own needs are computed once per registry generation (replacing the
+registry starts a new one); the children it names are resolved on every
+check, since activation may change which version `latest` is.
+
 `worker` recovers due and interrupted runs, renews leases, enforces concurrency
 limits and periodically sweeps retained evidence and expired mailbox events. A
 shutdown token releases work for recovery. `cancel` is terminal and cascades to

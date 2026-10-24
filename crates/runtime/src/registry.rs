@@ -1,5 +1,7 @@
-//! User functions: schemas, declared delivery and explicit injected async
-//! handlers.
+//! User functions: 1. functions (schemas, declared delivery and explicit
+//! injected async handlers) and the registry; 2. the registry a runtime has
+//! installed, by generation; 3. the start check: every function a definition
+//! can call is registered, cached per definition version and generation.
 //!
 //! The registry does not say whether a function reads or writes: only the
 //! host can judge that, and it decides from the call journal (what a run
@@ -9,12 +11,20 @@ use async_trait::async_trait;
 use opentelemetry::Context as SpanContext;
 pub use owf::durable::Delivery;
 use owf::{
-    model::{self, Catalog, Workflow},
+    model::{self, Catalog, Process, Workflow},
     run::WorkflowError,
 };
 use serde_json::{Value, json};
-use std::{collections::BTreeMap, future::Future, sync::Arc};
+use std::{
+    collections::{BTreeMap, HashMap},
+    future::Future,
+    hash::{Hash, Hasher},
+    sync::{Arc, Mutex, RwLock},
+};
 use tokio_util::sync::CancellationToken;
+
+// ── 1. functions and the registry ──────────────────────────────────────────
+
 pub type FunctionError = WorkflowError;
 
 #[derive(Clone)]
@@ -188,5 +198,183 @@ fn has_expression(value: &Value) -> bool {
         Value::Array(a) => a.iter().any(has_expression),
         Value::Object(o) => o.values().any(has_expression),
         _ => false,
+    }
+}
+
+// ── 2. the installed registry ──────────────────────────────────────────────
+
+/// The registry a runtime calls through. Replacing it (a host whose function
+/// set changes while it runs) starts a new generation; a start check is valid
+/// for the generation it was made against only.
+pub(crate) struct Installed {
+    current: RwLock<(Arc<Registry>, u64)>,
+    pub checks: Arc<Checks>,
+}
+
+impl Installed {
+    pub fn new(registry: Arc<Registry>) -> Self {
+        Self { current: RwLock::new((registry, 0)), checks: Arc::default() }
+    }
+    /// The registry and its generation, together.
+    pub fn get(&self) -> (Arc<Registry>, u64) {
+        self.current.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+    pub fn replace(&self, registry: Arc<Registry>) {
+        let mut current = self.current.write().unwrap_or_else(|e| e.into_inner());
+        *current = (registry, current.1 + 1);
+        // Checks of older generations can never be read again. One made
+        // concurrently against the old registry is stored under its own
+        // generation, so it cannot stand for the new one either.
+        self.checks.0.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    }
+}
+
+// ── 3. the start check ─────────────────────────────────────────────────────
+
+/// A function a run would call that the registry does not hold, found before
+/// the run's first step (at admission) or its next one (when it resumes).
+/// `path` names the definitions from the checked one down to the one that
+/// calls it, through the `run: workflow` children each names.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MissingFunction {
+    pub function: String,
+    /// `(definition name, version)`, outermost first.
+    pub path: Vec<(String, u64)>,
+}
+
+impl MissingFunction {
+    /// The configuration error a run that cannot resume faults with.
+    pub fn error(&self) -> WorkflowError {
+        WorkflowError::standard("configuration", 400, "Configuration Error", self.to_string())
+    }
+}
+
+impl std::fmt::Display for MissingFunction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "function `{}` is not registered", self.function)?;
+        let mut path = self.path.iter().map(|(name, version)| format!("{name} version {version}"));
+        if let Some(first) = path.next() {
+            write!(f, "; called by {}", path.fold(first, |a, b| format!("{a} > {b}")))?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for MissingFunction {}
+
+/// What one definition version can call, as one registry generation sees it.
+pub(crate) struct Needs {
+    /// The first function it calls (definition order) that is not
+    /// registered: a host function, or a process runner (`run:<kind>`).
+    pub missing: Option<String>,
+    /// The child workflows its `run: workflow` tasks name: namespace, name
+    /// and version, resolved against the catalog when a check walks them.
+    pub children: Vec<(String, String, String)>,
+}
+
+impl Needs {
+    fn of(yaml: &str, registry: &Registry, capabilities: &Capabilities) -> Self {
+        // A definition that does not parse calls nothing: validation, which
+        // follows the check, reports why.
+        let Ok(wf) = model::parse_yaml(yaml) else { return Self { missing: None, children: Vec::new() } };
+        let local = |name: &str| wf.uses.functions.iter().any(|(n, _)| n == name);
+        let mut missing = model::call_sites(&wf)
+            .into_iter()
+            .map(|site| site.function)
+            .find(|name| !local(name) && !registry.has(name));
+        let mut children = Vec::new();
+        for process in model::processes(&wf) {
+            match process {
+                Process::Workflow { namespace, name, version, .. } => children.push((namespace, name, version)),
+                Process::External { kind, .. } => {
+                    if missing.is_none() && !capabilities.processes.as_ref().is_some_and(|p| p.runs(&kind)) {
+                        missing = Some(Process::function(&kind));
+                    }
+                }
+            }
+        }
+        Self { missing, children }
+    }
+}
+
+/// Start checks by definition version and registry generation. A definition
+/// version is immutable, so its direct needs are computed once per
+/// generation; the children it names are resolved on every check, because
+/// activation may change which version `latest` is.
+#[derive(Default)]
+pub(crate) struct Checks(Mutex<HashMap<CheckKey, Arc<Needs>>>);
+
+/// Definition name, version, digest of its text, registry generation.
+type CheckKey = (String, u64, u64, u64);
+
+impl Checks {
+    /// `name`/`version` identify the definition in its catalog; the digest of
+    /// its text keeps definitions of two catalogs apart (a dry run's own and
+    /// the host's children).
+    pub fn needs(
+        &self,
+        (name, version, yaml): (&str, u64, &str),
+        (registry, generation): (&Registry, u64),
+        capabilities: &Capabilities,
+    ) -> Arc<Needs> {
+        let mut digest = std::collections::hash_map::DefaultHasher::new();
+        yaml.hash(&mut digest);
+        let key = (name.to_owned(), version, digest.finish(), generation);
+        if let Some(needs) = self.0.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
+            return needs.clone();
+        }
+        // Computed outside the lock; a concurrent check may compute it too.
+        let needs = Arc::new(Needs::of(yaml, registry, capabilities));
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).entry(key).or_insert(needs).clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const WF: &str = "document: { dsl: '1.0.4', namespace: t, name: w, version: '0.1.0' }\ndo:\n  - a: { call: a }\n  - b: { call: b }\n  - kid: { run: { workflow: { namespace: t, name: kid, version: latest } } }\n";
+
+    fn registry(names: &[&str]) -> Arc<Registry> {
+        let mut r = Registry::new();
+        for name in names {
+            r.register(Function::new(*name, json!({}), json!({}), |_: Value, _: FunctionContext| async {
+                Ok(Value::Null)
+            }))
+            .unwrap();
+        }
+        Arc::new(r)
+    }
+
+    #[test]
+    fn a_check_is_cached_per_definition_version_and_registry_generation() {
+        let installed = Installed::new(registry(&["a"]));
+        let none = Capabilities::default();
+        let check = |installed: &Installed| {
+            let (r, generation) = installed.get();
+            installed.checks.needs(("w", 1, WF), (&r, generation), &none)
+        };
+        let first = check(&installed);
+        assert_eq!(first.missing.as_deref(), Some("b"));
+        assert_eq!(first.children, [("t".to_owned(), "kid".to_owned(), "latest".to_owned())]);
+        // The same version against the same generation: the cached check.
+        assert!(Arc::ptr_eq(&first, &check(&installed)));
+        // A new registry is a new generation: the check is made again.
+        installed.replace(registry(&["a", "b"]));
+        let second = check(&installed);
+        assert!(!Arc::ptr_eq(&first, &second));
+        assert_eq!(second.missing, None);
+        assert!(Arc::ptr_eq(&second, &check(&installed)));
+        // Another text under the same name and version is another entry.
+        let other = WF.replace("call: b", "call: c");
+        let (r, generation) = installed.get();
+        assert_eq!(installed.checks.needs(("w", 1, &other), (&r, generation), &none).missing.as_deref(), Some("c"));
+    }
+
+    #[test]
+    fn a_missing_function_names_itself_and_who_calls_it() {
+        let m = MissingFunction { function: "c".into(), path: vec![("parent".into(), 2), ("kid".into(), 1)] };
+        assert_eq!(m.to_string(), "function `c` is not registered; called by parent version 2 > kid version 1");
+        assert!(m.error().is("configuration"));
     }
 }

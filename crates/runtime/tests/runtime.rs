@@ -1,5 +1,5 @@
 use ouro_runtime::{
-    CallStatus, Config, Function, FunctionContext, Mock, Registry, Runtime,
+    CallStatus, Config, Function, FunctionContext, MissingFunction, Mock, Registry, Runtime,
     durable::{self, Clock, RunStore},
     owf::{
         durable::{CallState, Delivery, Record},
@@ -682,6 +682,134 @@ async fn t1_live_schedule_run_prevents_overlap() {
     clock.0.store(2000, Ordering::SeqCst);
     assert!(rt.fire_due().unwrap().is_empty(), "overlap admitted a second live run");
     assert_eq!(rt.list(None, "").unwrap().len(), 1);
+}
+
+// ── the start check: every function a run can call is registered ──────────
+
+fn missing(e: &anyhow::Error) -> &MissingFunction {
+    e.downcast_ref::<MissingFunction>().unwrap_or_else(|| panic!("not a missing function: {e:#}"))
+}
+
+/// A run admitted under one registry, resumed by a host whose release no
+/// longer has `read`: new admissions fail with the typed error, and the
+/// resumed run fails before its next step, never halfway through it.
+#[tokio::test]
+async fn a_function_removed_after_activation_stops_admission_and_the_resumed_run_before_its_next_step() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("runs.sqlite");
+    let time = Arc::new(Time::default());
+    let (reads, writes) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+    let rt = runtime(
+        Arc::new(durable::sqlite::open(&path).unwrap()),
+        counter_registry(reads.clone(), writes.clone()),
+        time.clone(),
+    );
+    save(
+        &rt,
+        &yaml("  - send: { call: write, with: {} }\n  - pause: { wait: PT1S }\n  - fetch: { call: read, with: {} }"),
+    );
+    rt.start("r", "workflow", json!({})).unwrap();
+    assert!(matches!(rt.drive("r", &CancellationToken::new()).await.unwrap(), Some(Status::Waiting { .. })));
+    drop(rt);
+    // The next release registers `write` only.
+    let mut release = Registry::new();
+    let w = writes.clone();
+    release
+        .register(Function::new(
+            "write",
+            json!({"type":"object"}),
+            json!({"type":"object"}),
+            move |a: Value, _: FunctionContext| {
+                w.fetch_add(1, Ordering::SeqCst);
+                async move { Ok(a) }
+            },
+        ))
+        .unwrap();
+    time.0.store(1000, Ordering::SeqCst);
+    let rt = runtime(Arc::new(durable::sqlite::open(&path).unwrap()), release, time);
+    let e = rt.start("new", "workflow", json!({})).unwrap_err();
+    assert_eq!(missing(&e), &MissingFunction { function: "read".into(), path: vec![("workflow".into(), 1)] });
+    assert!(rt.get("new").unwrap().is_none(), "nothing was admitted");
+    let outcome = rt.drive("r", &CancellationToken::new()).await.unwrap();
+    let Some(Status::Faulted(error)) = outcome else { panic!("{outcome:?}") };
+    assert!(error.is("configuration"), "{error:?}");
+    assert!(error.detail.as_deref().is_some_and(|d| d.contains("`read`")), "{error:?}");
+    assert_eq!(rt.get("r").unwrap().unwrap().outcome, Some(Status::Faulted(error)));
+    assert_eq!((writes.load(Ordering::SeqCst), reads.load(Ordering::SeqCst)), (1, 0));
+    // The journal shows where the run stopped: one completed call.
+    let journal: Vec<_> = rt.calls("r").unwrap().into_iter().map(|c| (c.function, c.state)).collect();
+    assert_eq!(journal, [("write".to_owned(), CallStatus::Completed)]);
+}
+
+/// The check is cached per definition version and registry generation:
+/// replacing the registry invalidates it, in either direction.
+#[tokio::test]
+async fn replacing_the_registry_invalidates_the_start_check() {
+    let (reads, writes) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+    let full = Arc::new(counter_registry(reads.clone(), writes.clone()));
+    let rt = Runtime::new(
+        Arc::new(durable::memory::memory()),
+        full.clone(),
+        Config::default(),
+        Arc::new(Time::default()),
+        tracer(),
+    )
+    .unwrap();
+    save(&rt, &yaml("  - fetch: { call: read, with: {} }"));
+    rt.start("before", "workflow", json!({})).unwrap();
+    rt.set_registry(Arc::new(Registry::new()));
+    assert_eq!(missing(&rt.start("without", "workflow", json!({})).unwrap_err()).function, "read");
+    let outcome = rt.drive("before", &CancellationToken::new()).await.unwrap();
+    assert!(matches!(outcome, Some(Status::Faulted(ref e)) if e.is("configuration")), "{outcome:?}");
+    rt.set_registry(full);
+    rt.start("after", "workflow", json!({})).unwrap();
+    assert_eq!(rt.drive("after", &CancellationToken::new()).await.unwrap(), Some(Status::Completed(json!({}))));
+    assert_eq!(reads.load(Ordering::SeqCst), 1);
+}
+
+/// A function missing in a child definition (`run: workflow`, through any
+/// depth) fails the parent's admission and names the way to it; the child
+/// `latest` names is resolved on every check, not cached.
+#[tokio::test]
+async fn a_missing_function_in_a_child_definition_fails_the_parent_before_it_starts() {
+    let (reads, writes) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+    let full = Arc::new(counter_registry(reads.clone(), writes.clone()));
+    let rt =
+        Runtime::new(Arc::new(durable::memory::memory()), full, Config::default(), Arc::new(Time::default()), tracer())
+            .unwrap();
+    let child = |name: &str, body: &str| {
+        let d = rt.save(name, &yaml(body).replace("name: workflow", &format!("name: {name}"))).unwrap();
+        rt.activate(name, d.version).unwrap();
+    };
+    child("leaf", "  - fetch: { call: read, with: {} }");
+    child("middle", "  - leaf: { run: { workflow: { namespace: test, name: leaf, version: latest } } }");
+    // A child that runs itself: the check visits it once.
+    child(
+        "workflow",
+        "  - first: { set: { n: 1 } }\n  - middle: { run: { workflow: { namespace: test, name: middle, version: latest } } }\n  - again: { if: '${ false }', run: { workflow: { namespace: test, name: workflow, version: latest } } }",
+    );
+    rt.start("ok", "workflow", json!({})).unwrap();
+    let mut without_read = Registry::new();
+    without_read
+        .register(Function::new("write", json!({}), json!({}), |a: Value, _: FunctionContext| async move { Ok(a) }))
+        .unwrap();
+    rt.set_registry(Arc::new(without_read));
+    let e = rt.start("parent", "workflow", json!({})).unwrap_err();
+    assert_eq!(
+        missing(&e),
+        &MissingFunction {
+            function: "read".into(),
+            path: vec![("workflow".into(), 1), ("middle".into(), 1), ("leaf".into(), 1)],
+        }
+    );
+    assert!(e.to_string().contains("called by workflow version 1 > middle version 1 > leaf version 1"), "{e}");
+    // The parent admitted before the change fails before its first step.
+    let outcome = rt.drive("ok", &CancellationToken::new()).await.unwrap();
+    assert!(matches!(outcome, Some(Status::Faulted(ref e)) if e.is("configuration")), "{outcome:?}");
+    assert!(rt.records("ok").unwrap().values().all(|r| !matches!(r, Record::Task { .. })), "no step ran");
+    // A new `leaf` version without the call: the parent resolves it anew.
+    child("leaf", "  - done: { set: { leaf: true } }");
+    rt.start("later", "workflow", json!({})).unwrap();
 }
 
 /// The mock rule sees each call's name and arguments: a dry run dispatches

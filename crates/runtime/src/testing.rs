@@ -110,7 +110,7 @@ impl Runtime {
         config.limits.max_listen = Some(Duration::ZERO);
         let mut runtime = Runtime::new(
             store.clone(),
-            self.registry.clone(),
+            self.registry(),
             config,
             clock.clone(),
             opentelemetry::global::BoxedTracer::new(Box::new(opentelemetry::trace::noop::NoopTracer::new())),
@@ -158,7 +158,7 @@ impl Runtime {
         if let Some(yaml) = yaml {
             let wf = self.validate(yaml)?;
             original.run.admission.definition = yaml.into();
-            original.run.admission.runtime["bindings"] = self.registry.bindings(&wf);
+            original.run.admission.runtime["bindings"] = self.registry().bindings(&wf);
         }
         for (key, record) in original.records {
             if let Record::Call { logical, function, arguments, delivery, state: CallState::Done(result) } = record {
@@ -182,7 +182,7 @@ impl Runtime {
         store.admit(&original.run.admission, started)?;
         let mut runtime = Runtime::new(
             store,
-            self.registry.clone(),
+            self.registry(),
             self.config.clone(),
             clock.clone(),
             opentelemetry::global::BoxedTracer::new(Box::new(opentelemetry::trace::noop::NoopTracer::new())),

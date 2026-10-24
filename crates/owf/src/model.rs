@@ -2143,6 +2143,19 @@ pub fn call_sites(wf: &Workflow) -> Vec<CallSite> {
     out
 }
 
+/// Every `run` task's process (child workflows and external processes),
+/// including those inside reusable functions and extensions, in definition
+/// order. With the call sites, what a run of the definition can call.
+pub fn processes(wf: &Workflow) -> Vec<Process> {
+    let mut out = Vec::new();
+    lists(wf, &mut |t, _| {
+        if let Kind::Run(r) = &t.kind {
+            out.push(r.process.clone());
+        }
+    });
+    out
+}
+
 /// Every external schema the definition refers to, for a host to resolve
 /// and pin before admitting a run.
 pub fn schema_resources(wf: &Workflow) -> Vec<String> {

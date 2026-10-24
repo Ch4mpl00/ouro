@@ -1002,3 +1002,12 @@ depended on them are to be read under these choices. The others stay open.
    pending, completed, failed, not executed, unknown) to decide whether a
    failed run changed the world. A run without a journal keeps no results, so
    it never retries an attempt that started an at-most-once call.
+
+Addendum (2026-10-24, issue #11). The registry a run calls through may change
+after its admission (a new release of the host). At admission, and before a
+resumed run's next step, the runtime checks that every function the definition
+can call is registered, transitively through the `run: workflow` children it
+names. A missing one is refused at admission and ends a resumed run with a
+configuration fault before any further step (never a `Dispatch` of a call it
+cannot make); it does not change `A(r)` (A1, V1). Validation also rejects a
+definition with a task list whose end no flow path reaches.
