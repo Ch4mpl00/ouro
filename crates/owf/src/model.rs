@@ -2585,7 +2585,7 @@ do:
             assert_eq!(parse_yaml(&yaml(name, "schedule: { every: PT1S }")).unwrap().schedule.unwrap().overlap, policy);
         }
         assert_eq!(
-            wf("schedule: { after: PT1S }\ndo: [ { a: { set: {} } } ]").unwrap().schedule.unwrap().overlap,
+            wf("schedule: { after: PT1S }\ndo: [ { a: { set: { ok: true } } } ]").unwrap().schedule.unwrap().overlap,
             Overlap::Skip
         );
         for (policy, schedule) in
