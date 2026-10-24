@@ -40,7 +40,7 @@ pub fn is_embedded(text: &str) -> bool {
 const WITHHELD: &[&str] = &["env", "now", "input"];
 
 /// The variables an expression sees, in declaration order.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Args {
     names: Vec<String>,
     values: Vec<Value>,

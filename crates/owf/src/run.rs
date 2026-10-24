@@ -215,6 +215,11 @@ impl Drop for TaskSpan<'_> {
 /// Registration is idempotent, including registration before a question is sent.
 /// A type `*` in `take` and `subscribe` stands for every published event.
 pub trait Events: Send + Sync {
+    /// Persist the currently unfilled listen position for external control.
+    fn waiting(&self, _run_id: &str, _key: &str, _wait: &events::PendingWait) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     /// Opens (idempotently) a subscription under `key` that keeps receiving
     /// published events of `types` until `unsubscribe`, across takes, so a
     /// listen consuming several events misses none in between.
@@ -2116,6 +2121,23 @@ impl Run<'_> {
                         events.subscribe(self.run_id, reference, &routes).map_err(storage)?;
                         subscribed = true;
                     }
+                    let wait = events::PendingWait {
+                        types: routes.clone(),
+                        strategy: listen.to.clone(),
+                        input: input.clone(),
+                        args: self.args(ctx, input, &Value::Null, desc, scope),
+                        progress: consumer.progress(),
+                        position: key.clone(),
+                        since_ms: self.host.clock.now().timestamp_millis(),
+                        timeout_ms: deadline,
+                        redacted: false,
+                    };
+                    let raw = serde_json::to_value(&wait).map_err(|e| storage(e.into()))?;
+                    let redacted = self.secrets.value(&raw);
+                    let mut wait: events::PendingWait =
+                        serde_json::from_value(redacted.clone()).map_err(|e| storage(e.into()))?;
+                    wait.redacted = raw != redacted;
+                    events.waiting(self.run_id, reference, &wait).map_err(storage)?;
                     self.next_event(events, task, reference, &key, &routes, input, ctx, scope, desc, deadline).await?
                 }
             };

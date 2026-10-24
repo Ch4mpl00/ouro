@@ -1182,3 +1182,48 @@ async fn a_failing_schema_resolver_retries_the_slot_without_consuming_or_countin
     assert_eq!(rt.notify(&stop).await.unwrap(), 1);
     assert_eq!(rt.list(Some("watch"), "").unwrap().len(), 1);
 }
+
+#[tokio::test(start_paused = true)]
+async fn independent_store_cancel_fires_in_flight_token_within_one_heartbeat() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("cancel.sqlite");
+    let store = Arc::new(durable::sqlite::open(&path).unwrap());
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let token = Arc::new(Mutex::new(None));
+    let mut registry = Registry::new();
+    let observed = token.clone();
+    let ready = entered.clone();
+    registry
+        .register(Function::new("hold", json!({}), json!({}), move |_: Value, ctx: FunctionContext| {
+            *observed.lock().unwrap() = Some(ctx.cancel.clone());
+            ready.notify_one();
+            async move { std::future::pending().await }
+        }))
+        .unwrap();
+    let heartbeat = Duration::from_secs(1);
+    let rt = Runtime::new(
+        store,
+        Arc::new(registry),
+        Config { heartbeat_interval: heartbeat, ..Config::default() },
+        Arc::new(Time::default()),
+        tracer(),
+    )
+    .unwrap();
+    save(&rt, &yaml("  - hold: { call: hold }"));
+    rt.start("r", "workflow", Value::Null).unwrap();
+    let remote = durable::sqlite::open(path).unwrap();
+    let stop = CancellationToken::new();
+    let drive = rt.drive("r", &stop);
+    let cancel = async {
+        entered.notified().await;
+        let token = token.lock().unwrap().clone().unwrap();
+        assert!(!token.is_cancelled());
+        remote.cancel("r", 0).unwrap();
+        let started = tokio::time::Instant::now();
+        tokio::time::timeout(heartbeat + Duration::from_millis(1), token.cancelled()).await.unwrap();
+        assert!(started.elapsed() <= heartbeat);
+    };
+    let (result, ()) = tokio::join!(drive, cancel);
+    assert_eq!(result.unwrap(), Some(Status::Cancelled));
+    assert_eq!(rt.calls("r").unwrap()[0].state, CallStatus::Pending);
+}
