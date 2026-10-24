@@ -2,9 +2,14 @@
 //! 2. admission, leases and compatibility; 3. events: delivery, the mailbox,
 //! publication and expiry; 4. triggers, ingress tombstones and activation
 //! epochs; 5. termination and the breaker; 6. the `RunStore` implementation.
+//!
+//! A run tree's budget is one counter row (`budget`, keyed by the root's
+//! id) next to the runs: a spend checks the spending run's fence, writes its
+//! decision's record row and moves that counter, so a child's unit and the
+//! root's count commit together without touching the root's run row.
 use crate::*;
 use owf::{
-    durable::{VERSION, check_transition},
+    durable::{EXCEEDED, VERSION, check_transition},
     run::WorkflowError,
 };
 use serde::{Deserialize, de::DeserializeOwned};
@@ -301,6 +306,7 @@ fn insert(rows: &mut dyn Transaction, admission: &Admission, now: i64) -> anyhow
                 child: None,
                 admitted_ms: now,
                 epoch,
+                root: None,
             },
             version: VERSION,
             awaits: BTreeMap::new(),
@@ -832,6 +838,11 @@ fn terminate(rows: &mut dyn Transaction, id: &str, status: &Status, now: i64) ->
     snapshot.listeners.clear();
     snapshot.subscriptions.clear();
     store_run(rows, &snapshot)?;
+    // The tree ends with its root (its owned descendants are cancelled
+    // below, in this commit): nothing can spend its budget any more.
+    if snapshot.run.root.is_none() && rows.get("budget", id)?.is_some() {
+        rows.delete("budget", id)?;
+    }
     // Only the trigger the firing stored is re-armed: a later activation
     // (a new epoch) replaced it, and an old run cannot move the new one.
     if let Some((rearm, armed)) = &snapshot.rearm
@@ -971,6 +982,9 @@ impl RunStore for TransactionalStore {
             let value = serde_json::to_value(r)?;
             if matches!(r, Record::Event { .. } | Record::Expired { .. }) {
                 anyhow::ensure!(old.as_ref() == Some(&value), "event records must be committed by take_event");
+            }
+            if matches!(r, Record::Budget { .. } | Record::Exceeded { .. }) {
+                anyhow::ensure!(old.as_ref() == Some(&value), "budget records must be committed by spend");
             }
             if let Some(old) = &old {
                 check_transition(&serde_json::from_value(old.clone())?, r)?;
@@ -1160,6 +1174,7 @@ impl RunStore for TransactionalStore {
             let mut c = run(rows, &a.id)?;
             if inserted {
                 c.run.child = Some(link.clone());
+                c.run.root = Some(p.run.root.clone().unwrap_or_else(|| parent.run_id.clone()));
             }
             anyhow::ensure!(c.run.child.as_ref() == Some(link), "child belongs to another invocation");
             let fence = if inserted { Some(claim_run(&mut c, now, &owner)?) } else { None };
@@ -1180,6 +1195,50 @@ impl RunStore for TransactionalStore {
                 "child belongs to another parent or key"
             );
             Ok(s.run.outcome)
+        })
+    }
+    // The fence check reads the run row, the decision is the record's row and
+    // the count the tree's `budget` row: one commit, three rows (the run row
+    // again only for a run's first evidence).
+    fn spend(&self, f: &Fence, k: &str, limit: u64, now: i64) -> anyhow::Result<Record> {
+        self.update(|rows| {
+            let mut s = checked(rows, f, now, self.policy.skew_ms)?;
+            let kind = records_of(&f.run_id);
+            if let Some(saved) = rows.get(&kind, k)? {
+                let record: Record = serde_json::from_value(saved)?;
+                anyhow::ensure!(matches!(record, Record::Budget { .. }), "invalid budget record at {k}");
+                return Ok(record);
+            }
+            let root = s.run.root.clone().unwrap_or_else(|| f.run_id.clone());
+            let spent: u64 = get(rows, "budget", &root)?.unwrap_or(0);
+            let granted = spent < limit;
+            let spent = spent + u64::from(granted);
+            if granted {
+                put(rows, "budget", &root, &spent)?;
+            }
+            // A refusal names the run's first one, decided in the commit
+            // that refused it.
+            let first = if granted {
+                None
+            } else {
+                match rows.get(&kind, EXCEEDED)? {
+                    Some(saved) => match serde_json::from_value(saved)? {
+                        Record::Exceeded { by } => Some(by),
+                        _ => anyhow::bail!("invalid first refusal record"),
+                    },
+                    None => {
+                        rows.put(&kind, EXCEEDED, &serde_json::to_value(Record::Exceeded { by: k.into() })?)?;
+                        Some(k.to_string())
+                    }
+                }
+            };
+            let record = Record::Budget { granted, spent, first };
+            rows.put(&kind, k, &serde_json::to_value(&record)?)?;
+            if !s.evidence {
+                s.evidence = true;
+                store_run(rows, &s)?;
+            }
+            Ok(record)
         })
     }
     fn due_as(&self, now: i64, limit: usize, worker: &Compatibility) -> anyhow::Result<Vec<String>> {

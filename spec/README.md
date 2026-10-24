@@ -21,7 +21,7 @@ simulated and its histories replayed against memory, SQLite and Postgres.
 
 ## Contract coverage
 
-`contract_progress.qnt` supplies E5 and the five temporal obligations. All 38 IDs
+`contract_progress.qnt` supplies E5 and the five temporal obligations. All 39 IDs
 have named predicates, but the scopes below matter: naming a predicate does not
 prove every clause of its English contract. "Serial MBT" and "concurrent MBT"
 are the bridges in `crates/durable/tests/quint.rs` and `quint/concurrent.rs`.
@@ -61,6 +61,7 @@ are the bridges in `crates/durable/tests/quint.rs` and `quint/concurrent.rs`.
 | X1 | `X1`: dry runs dispatch no write (effect, not delivery) | `x1_x2_generated_dry_runs_and_replays_are_isolated` |
 | X2 | `X2`: replay dispatches nothing | Same property |
 | X3 | `X3`: no silent readmission/reopening | Terminal/admission checks |
+| B1 | `B1`: tree counter within the ceiling, equal to a live root's granted decisions; immutable decisions; refusal only at the ceiling | Serial MBT (`spend`, decisions projected); `budgetTest` witness; budget conformance; generated interpreter budgets |
 | L1 | `contract_progress::L1`: ready work eventually completes under F | Finite drains; temporal quotient |
 | L2 | `L2`: abandoned ownership eventually claimed/completed under F | Temporal quotient |
 | L3 | `L3`: accepted event eventually consumed under F | Temporal quotient; event/recovery conformance |
@@ -112,6 +113,10 @@ deadline fixed at admission and epoch.
   with version 0 (undeclared) is compatible with both.
 - **Children, retention.** The parent's host holds a child's first lease. A
   sweep clears the evidence of every finished run past five ticks.
+- **Budgets** (issue #8). A run tree's counter belongs to its root; an owned
+  child spends it. `spend` at key `i` is granted below `ceiling` = 2 and
+  refused at it, the decision and the counter in one commit; the counter ends
+  with its root. The model has no notion of what a unit stands for.
 
 Model encodings are not persisted Rust formats. The time units and horizons are
 representatives (production mailbox default: one day).
@@ -139,8 +144,8 @@ exact matching plus undeclared, without a host-supplied `accepts` list.
 ### Serial
 
 `crates/durable/tests/quint.rs` replays Quint's random traces of `contract.qnt`
-(100 traces × 150 steps per adapter by default, all 28 commands and every fault
-switch) and the `bridgeSuite` run of `contract_witnesses.qnt` (all 29 witness
+(100 traces × 150 steps per adapter by default, all 29 commands and every fault
+switch) and the `bridgeSuite` run of `contract_witnesses.qnt` (all 30 witness
 histories in one trace). After every step it compares a projection of the store
 with the model's state. The model records each command in its `command`
 variable; the driver never sees the model's state.
@@ -164,6 +169,7 @@ ticks), with `Policy { mailbox_ms: 37_500, ingress_ms: 37_500, skew_ms: 7_500 }`
 | `conflict` | four changed bindings refused by `save_record`, then `finish` faulted |
 | `dispatch`, `crash`, `tick` | host only (ghost counter, a reopened SQLite handle, the clock) |
 | `subscribe`, `take` | `subscribe`, `take_event` |
+| `spend` | `spend` at `jump<i>` with limit 2 |
 | `address`, `publish` | `publish` with and without a target |
 | `expire`, `sweep` | `sweep` without and with five ticks of retention |
 | `child` | `start_child`; the child's lease is left to expire |
@@ -174,7 +180,8 @@ ticks), with `Policy { mailbox_ms: 37_500, ingress_ms: 37_500, skew_ms: 7_500 }`
 
 The projection keeps what both sides state: runs (admission, epoch, version,
 outcome, end, deadline, owner, generation, lease, records and values, frontier,
-continuation, subscription, parent), mailbox and broadcast copies per recipient,
+continuation, subscription, parent, budget decisions and the counts after
+them), mailbox and broadcast copies per recipient,
 the catalog with its trigger and fallback, admissions, fired slots (from the
 admissions' slot bindings) and live ingress tombstones. Two representational
 differences are normalised on both sides: a pending copy past its time counts as
@@ -281,7 +288,16 @@ and runtime tests:
   and `unregister_wait`, and several registrations of one type;
 - waiting runs and their wake-ups, interruption backoff and its exhaustion;
 - the child's `waiting` notification and descendants deeper than one level;
-- event-triggered (`on`) strategies, cron arithmetic, `accepts` lists.
+- event-triggered (`on`) strategies, cron arithmetic, `accepts` lists;
+- concurrent spenders of one budget (the model's single permit excludes two
+  owners at once; conformance races three handles at the last unit), a
+  budget counter itself (the bridge reads only `RunStore`, so it compares the
+  count each decision returns) and grandchildren.
+
+The model ends a parent's owned child only on cancellation, while the stores
+cancel owned descendants at every terminal end of the parent. Random traces
+have not reached it; the witness `init.then(boot).then(do("child")).then(do("finish"))`
+diverges on the bridge. It predates the budget and is left for a decision.
 
 The symbolic contract check and the TLC progress quotient need Apalache and a
 JVM; whether they were run for this revision is in [RESULTS.md](RESULTS.md).

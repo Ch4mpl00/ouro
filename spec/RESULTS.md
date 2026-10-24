@@ -13,6 +13,21 @@ quint-connect 0.1.2, Docker `postgres:16` for the opt-in Postgres bridges.
 Times are elapsed wall times on this machine, with other checks sometimes
 running alongside.
 
+## The jump budget (issue #8), quick checks only
+
+`contract.qnt` gained `spend` and the B1 monitor; no TLC or Apalache run was
+made for this revision, so the symbolic and temporal rows below describe the
+model before it and `contract-evidence.json` was not regenerated.
+
+| Check | Scope | Result | Time |
+| --- | --- | --- | --- |
+| Typecheck | all five modules | Pass | under 5 s each |
+| Witnesses | 30 histories, `budgetTest` included | Pass | 3.0 s |
+| Simulation | 2,000 × 150 steps, seed 20261023, invariant `checked` | No violation | 33.5 s |
+| Safety mutants | 33 (B1: grant past the ceiling) | All targets detected | 147.8 s |
+| Serial MBT, memory and SQLite | 100 × 150 steps + `bridgeSuite` (30 witnesses), `spend` in every trace | Pass | ≈37 s / ≈43 s |
+| Serial MBT, memory, two more seeds | seeds 7 and 20261024 | Pass | ≈37 s each |
+
 ## Results
 
 | Check | Scope | Result | Time |

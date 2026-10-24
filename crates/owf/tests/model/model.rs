@@ -36,6 +36,8 @@ pub struct Outcome {
     pub trace: Vec<String>,
     /// Task executions, skipped ones included: what the ceiling counts.
     pub tasks_run: usize,
+    /// Jumps taken to a named task: what the budget counts.
+    pub jumps: u64,
     pub calls: Vec<(String, Value)>,
     pub effects_started: bool,
 }
@@ -43,6 +45,9 @@ pub struct Outcome {
 pub struct Limits {
     pub max_tasks: usize,
     pub max_attempts: u32,
+    /// Jumps to a named task (`then: <task>` on a task, a switch case or a
+    /// catch) per run: a `for` pass or a retry is no jump.
+    pub max_jumps: u64,
 }
 
 // ── 2. errors ──────────────────────────────────────────────────────────────
@@ -114,6 +119,7 @@ struct Machine<'p> {
     /// replaces it.
     context: Value,
     tasks_run: usize,
+    jumps: u64,
     /// Host calls so far, per function (the fakes answer by call count).
     counts: HashMap<String, usize>,
     writes: usize,
@@ -127,6 +133,7 @@ pub fn run(program: &Program, input: Value, limits: &Limits) -> Outcome {
         limits,
         context: Value::Null,
         tasks_run: 0,
+        jumps: 0,
         counts: HashMap::new(),
         writes: 0,
         trace: Vec::new(),
@@ -135,7 +142,14 @@ pub fn run(program: &Program, input: Value, limits: &Limits) -> Outcome {
     let result = m.workflow(input).map_err(|s| match s {
         Stop::Error(e) | Stop::Ceiling(e) => e,
     });
-    Outcome { result, trace: m.trace, tasks_run: m.tasks_run, calls: m.calls, effects_started: m.writes > 0 }
+    Outcome {
+        result,
+        trace: m.trace,
+        tasks_run: m.tasks_run,
+        jumps: m.jumps,
+        calls: m.calls,
+        effects_started: m.writes > 0,
+    }
 }
 
 impl Machine<'_> {
@@ -224,6 +238,15 @@ impl Machine<'_> {
         // from a nested list) wins over the task's own `then`, which
         // "defaults to continue".
         let flow = directive.or_else(|| t.then.clone()).unwrap_or(Flow::Continue);
+        // CHOICE (the host's budget, an extension): a task whose jump would
+        // go past the budget faults with an error a `try` can catch instead
+        // of jumping; every later jump is refused too.
+        if let Flow::Goto(_) = flow {
+            if self.jumps >= self.limits.max_jumps {
+                return Err(Stop::Error(Error::standard("budget.exhausted", 508)));
+            }
+            self.jumps += 1;
+        }
         Ok((out, flow))
     }
 

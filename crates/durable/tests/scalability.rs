@@ -120,12 +120,26 @@ fn bounds(backend: Arc<dyn AtomicBackend>, metrics: Arc<Metrics>, validation: u6
     let f = bounded(&metrics, "claim_waiting", 0, || s.claim(&a.id, 1))?.unwrap();
     bounded(&metrics, "release", 0, || s.release(&f, 1))?;
     let f = s.claim(&a.id, 1)?.unwrap();
+    assert_eq!(
+        bounded(&metrics, "spend", 0, || s.spend(&f, "loop#jump", 100, 1))?,
+        Record::Budget { granted: true, spent: 1, first: None }
+    );
+    bounded(&metrics, "spend_replayed", 0, || s.spend(&f, "loop#jump", 100, 1))?;
+    assert!(matches!(
+        bounded(&metrics, "spend_refused", 0, || s.spend(&f, "late#jump", 1, 1))?,
+        Record::Budget { granted: false, .. }
+    ));
     for id in ["target:c", "target:live"] {
         let mut child = a.clone();
         child.id = id.into();
         let link = ouro_durable::ChildLink { parent: a.id.clone(), key: id.into(), reference: "/child".into() };
         let c = bounded(&metrics, "start_child", 1, || s.start_child(&f, &child, &link, 1))?.unwrap();
         assert!(bounded(&metrics, "child_outcome", 0, || s.child_outcome(&a.id, id, id))?.is_none());
+        // A child's unit commits with its root's counter: two runs' rows.
+        let unit = format!("{id}#jump");
+        let spent = bounded(&metrics, "spend_child", 0, || s.spend(&c, &unit, 100, 1))?;
+        assert!(matches!(spent, Record::Budget { granted: true, .. }));
+        bounded(&metrics, "spend_child_replayed", 0, || s.spend(&c, &unit, 100, 1))?;
         if id == "target:c" {
             bounded(&metrics, "finish_child", 1, || s.finish(&c, &Status::Completed(json!(42)), 1, 3))?;
         }
@@ -220,6 +234,11 @@ fn long_run(backend: &Arc<dyn AtomicBackend>, metrics: &Metrics, validation: u64
     let counts = metrics.counts();
     assert_eq!((counts.rows_read, counts.rows_written), (validation * (records + 1), 0), "long_load_records");
     eprintln!("BOUND,long_load_records,{},{},records={records}", counts.rows_read, counts.rows_written);
+    // A jump decision of a run holding 10,000 records: its record row and its
+    // tree's counter, nothing that grows with the run.
+    let spent = bounded(metrics, "long_spend", 0, || s.spend(&f, "/do/loop#jump", 100, 1))?;
+    assert_eq!(spent, Record::Budget { granted: true, spent: 1, first: None });
+    bounded(metrics, "long_spend_replayed", 0, || s.spend(&f, "/do/loop#jump", 100, 1))?;
     bounded(metrics, "long_register_wait", 0, || s.register_wait(&f, &types, 1))?;
     let next = event("long-next", "long", json!("next"));
     assert_eq!(bounded(metrics, "long_deliver", 1, || s.deliver(&next, Some(&id), 1))?, Some(id.clone()));
@@ -246,10 +265,10 @@ fn long_run(backend: &Arc<dyn AtomicBackend>, metrics: &Metrics, validation: u64
     assert!(counts.rows_written <= 16 + 5 * expired, "long_take_event_expired: {counts:?}");
     assert_eq!(counts.conflicts, 0);
     eprintln!("BOUND,long_take_event_expired,{},{},matches={expired}", counts.rows_read, counts.rows_written);
-    assert_eq!(s.load_records(&f, 1_000)?.len(), RECORDS + 3 + BACKLOG);
+    assert_eq!(s.load_records(&f, 1_000)?.len(), RECORDS + 4 + BACKLOG);
     assert!(bounded(metrics, "long_cancel", 0, || s.cancel(&id, 1_000))?);
     let swept = sweep_bounded(backend, metrics, "long_sweep", || s.sweep(2_000, 0))?;
-    assert!(swept.records >= RECORDS + 3 + BACKLOG);
+    assert!(swept.records >= RECORDS + 4 + BACKLOG);
     assert!(s.inspect(&id)?.unwrap().records.is_empty());
     Ok(())
 }

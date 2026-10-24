@@ -185,9 +185,10 @@ impl Default for Options {
     }
 }
 
-/// Small enough that a cycle ends fast, large enough for real programs.
+/// Small enough that a cycle ends fast, large enough for real programs. The
+/// jump budget binds before the task ceiling in a loop of a few tasks.
 pub fn limits() -> Limits {
-    Limits { max_tasks: 60, max_attempts: 3, max_sleep: None, max_listen: None }
+    Limits { max_tasks: 60, max_jumps: 12, max_attempts: 3, max_sleep: None, max_listen: None, ..Limits::default() }
 }
 
 #[derive(Debug)]

@@ -111,6 +111,65 @@ protocol clients, processes, authentication and catalogs, which are host
 functions or packs. `src/model.rs` in `owf` lists the supported subset and
 the choices made where the specification is silent (`CHOICE` comments).
 
+### The jump budget (an ouro extension)
+
+OWS puts no limit on `then:` jumps, so a `switch` that jumps back can loop
+forever. Only jumps to a named task count: `then: <task>` on a task, a
+`switch` case or a `catch`. `continue`, `exit` and `end` are not jumps; `for`
+is bounded by its collection and `retry` by its attempts.
+
+- **One budget per run tree.** A child started with `run: workflow` (or
+  `start_child`) and its descendants spend their root's budget, so starting a
+  fresh child on every pass multiplies nothing. An independent child
+  (`await: false`) starts a tree of its own. Nesting is capped separately:
+  a child deeper than `Config.limits.max_depth` (default 10) is refused with
+  a catchable `budget.exhausted`, which ends recursion through either kind.
+- **The ceiling is the host's.** `Config.limits.max_jumps` (default 100) is
+  set only by the embedding application; each run is admitted with its budget
+  pinned in its runtime bindings (the ceiling for a root, its parent's budget
+  for an owned child).
+- **A definition may only tighten it**, in `document.metadata.limits` (the
+  OWS document admits no other property; `metadata` is free-form):
+
+  ```yaml
+  document:
+    metadata:
+      limits:
+        max_jumps: 30            # above the host's ceiling: rejected at validation
+        on_exceeded:             # optional
+          call: report_stuck     # a task (typically a call); the run ends with its output
+          with: { state: '${ . }' }
+        # on_exceeded: end       # end now, with the jumping task's output
+        # omitted: the jumping task raises budget.exhausted (catchable)
+  ```
+
+  The error is `https://open-workflow-specification.org/spec/1.0.0/errors/budget.exhausted`
+  (status 508), located at the task whose jump was refused; every later jump
+  of the tree is refused too. An `on_exceeded` task runs under the jumping
+  task, may run at most ten tasks, cannot jump and cannot be caught: its
+  output or its fault ends the run. A run that ended through its budget says
+  so: `Outcome::limit_exceeded`, the `ouro.limit_exceeded` attribute of its
+  span, and the refused decision in its records.
+- **Expressions read the counts:** `$run.jumps` (the jumps this run took),
+  `$run.maxJumps` (its budget) and `$run.visits.<task>` (how often a task of
+  the enclosing lists was entered), so a workflow can leave before the
+  budget: `when: '${ .choice == "rewrite" and $run.visits.compose < 3 }'`.
+  `run` is reserved: no loop or catch variable takes the name.
+- **Validation rejects a loop that can never end:** every jump cycle (a
+  strongly connected component of a list's flow graph) needs a conditional
+  edge out of it (a switch case, an `if`, a catch's `then`) or a task inside
+  that can leave it (a nested `raise` or `end`). This proves nothing about
+  termination; the budget does that at runtime.
+- **Durable.** Each jump spends one unit under `<task>#jump` with
+  `RunStore::spend`, which saves the decision (`Record::Budget`) and moves the
+  tree's counter in one fenced commit; a child's unit updates its root's
+  counter in that same commit. A restart neither resets the count nor spends
+  a unit twice, and replay restores the recorded decisions. A run's first
+  refusal is decided in the commit that refuses it (`Record::Exceeded`), and
+  every refusal names it: only that jump acts on `on_exceeded`, while fork
+  branches refused at the same moment end as it does, so the handler runs
+  once and recovery and replay pick the same branch.
+
 - `run: workflow` starts a durable child run of a saved definition (the
   catalog entry named `name`, the active version for `latest`, else the
   saved version whose document has that `version`), owned and joined
@@ -206,6 +265,7 @@ The engine owns primary and secondary keys in `(kind, id)` order:
 | `trigger`, `trigger_due`, `trigger_type:<hex type>` | trigger key | Triggers by key, next due time and event type |
 | `trigger_run` | trigger key | The run a trigger admitted last, for exclusive firing |
 | `ingress`, `ingress_due` | hex identity | Ingress tombstones and their expiry |
+| `budget` | root run ID | The units a run tree has spent, until its root ends |
 
 Index entries contain the run ID and change in the same transaction as the
 run. Times use sign-adjusted, fixed-width hexadecimal; names and event types
@@ -239,7 +299,7 @@ Both initial migrations were replaced before any release or deployment. This
 layout requires a fresh database from the earlier development checkout; there
 is no conversion of that unreleased layout. Applied migrations are immutable
 from the next release onward. The SQL schema is a generic key/value table, so
-the row shapes above (and the interpreter's durable state version, now 4) can
+the row shapes above (and the interpreter's durable state version, now 5) can
 change without a migration; nothing persisted before them is converted. Each
 run row records the durable state version it was written under, and a row of
 another version (including the earlier one-aggregate-per-run layout) is
@@ -275,7 +335,8 @@ fakes registered as `http` and `openapi` functions.
 `ouro_durable::conformance::run_all(factory)` is public. It checks admission,
 fencing, immutable evidence, event histories, held listens, every interpreter
 checkpoint boundary, child notifications, rollback and ambiguous commits,
-corruption, concurrent claims, retention and liveness drains. Factories supply
+corruption, concurrent claims, retention, liveness drains and a run tree's
+shared budget (restarts, failed commits, children, a race at the last unit). Factories supply
 an independent reopen handle, persisted-row inspection and failure injection.
 
 `cargo test -p ouro-durable --test scalability -- --nocapture` checks every

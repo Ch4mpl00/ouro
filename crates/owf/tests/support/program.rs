@@ -505,6 +505,88 @@ fn fix_list(tasks: &mut [Task], scope: &Scope, profile: Profile, calls_functions
         t.name = format!("t{i}");
         fix_task(t, len, scope, profile, calls_functions);
     }
+    open_cycles(tasks);
+}
+
+/// Where a task may continue in its list, as validation sees it
+/// (`owf::model`'s jump graph): a sibling's index, or `None` for out.
+fn successors(tasks: &[Task], i: usize) -> Vec<Option<usize>> {
+    let len = tasks.len();
+    let to = |f: &Flow| match f {
+        Flow::Continue => Some(i + 1).filter(|k| *k < len),
+        Flow::Goto(k) => Some(*k),
+        Flow::Named(n) => n.strip_prefix('t').and_then(|k| k.parse().ok()).filter(|k| *k < len),
+        Flow::Exit | Flow::End => None,
+    };
+    let t = &tasks[i];
+    let own = t.then.as_ref().map_or_else(|| to(&Flow::Continue), to);
+    let mut out = match &t.body {
+        Body::Raise(_) => vec![None],
+        Body::Switch(cases) => {
+            let mut out: Vec<_> = cases.iter().map(|c| to(&c.then)).collect();
+            if cases.iter().all(|c| c.when.is_some()) {
+                out.push(own);
+            }
+            out
+        }
+        Body::Try { catch, .. } => vec![own, catch.then.as_ref().map_or(own, to)],
+        _ => vec![own],
+    };
+    if t.when.is_some() {
+        out.push(to(&Flow::Continue));
+    }
+    out.dedup();
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Validation rejects a jump cycle with no conditional edge out of it. Such
+/// a cycle's jumps among its own tasks become `exit`, which leaves only
+/// forward steps between them. Ignoring what validation also accepts (a
+/// nested `raise` or `end`) only opens more cycles than needed.
+fn open_cycles(tasks: &mut [Task]) {
+    let n = tasks.len();
+    let edges: Vec<_> = (0..n).map(|i| successors(tasks, i)).collect();
+    let mut reach = vec![vec![false; n]; n];
+    for (i, row) in reach.iter_mut().enumerate() {
+        let mut stack: Vec<usize> = edges[i].iter().flatten().copied().collect();
+        while let Some(j) = stack.pop() {
+            if !row[j] {
+                row[j] = true;
+                stack.extend(edges[j].iter().flatten().copied());
+            }
+        }
+    }
+    let mut seen = vec![false; n];
+    for i in 0..n {
+        if seen[i] || !reach[i][i] {
+            continue;
+        }
+        let cycle: Vec<usize> = (0..n).filter(|j| *j == i || (reach[i][*j] && reach[*j][i])).collect();
+        cycle.iter().for_each(|j| seen[*j] = true);
+        let inside = |e: &Option<usize>| e.is_some_and(|k| cycle.contains(&k));
+        if cycle.iter().any(|j| edges[*j].len() > 1 && edges[*j].iter().any(|e| !inside(e))) {
+            continue;
+        }
+        let inward = |f: &Flow| match f {
+            Flow::Goto(k) => cycle.contains(k),
+            Flow::Named(n) => n.strip_prefix('t').and_then(|k| k.parse().ok()).is_some_and(|k| cycle.contains(&k)),
+            _ => false,
+        };
+        for j in &cycle {
+            let t = &mut tasks[*j];
+            let mut flows: Vec<&mut Flow> = t.then.iter_mut().collect();
+            match &mut t.body {
+                Body::Switch(cases) => flows.extend(cases.iter_mut().map(|c| &mut c.then)),
+                Body::Try { catch, .. } => flows.extend(catch.then.iter_mut()),
+                _ => {}
+            }
+            for f in flows.into_iter().filter(|f| inward(f)) {
+                *f = Flow::Exit;
+            }
+        }
+    }
 }
 
 fn fix_flow(f: &mut Flow, len: usize, profile: Profile) {

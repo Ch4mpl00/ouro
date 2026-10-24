@@ -13,7 +13,9 @@
 // slots per `document.metadata.catchup`, an extension: `latest` | `none`);
 // use.functions/errors/retries/timeouts/extensions/secrets; evaluate (jq,
 // strict). Runtime arguments: $context, $input, $output, $task, $workflow,
-// $runtime, and $secrets in `input.from` only.
+// $runtime, $run (an extension: jump and visit counts), and $secrets in
+// `input.from` only. The jump budget's tightening and its `on_exceeded`
+// handling live in `document.metadata.limits` (an extension).
 //
 // Not the core's, rejected here: use.authentications and use.catalogs
 // (protocol functions and packs carry credentials and resolve their own
@@ -39,8 +41,44 @@ pub struct Workflow {
     pub timeout: Option<DurationSpec>,
     /// When a host's scheduler starts runs; the interpreter ignores it.
     pub schedule: Option<Schedule>,
+    /// `document.metadata.limits`: a tighter jump budget, and what happens
+    /// when it runs out.
+    pub budget: Budget,
     /// The definition as parsed, exposed as `$workflow.definition`.
     pub definition: Value,
+}
+
+/// `document.metadata.limits` (an extension: the OWS document admits no other
+/// property, and `metadata` is free-form). Only jumps to a named task count
+/// (`then: <task>` on a task, a switch case or a catch): `for` is bounded by
+/// its collection and `retry` by its attempts. The host's ceiling
+/// (`run::Limits::max_jumps`) bounds the whole run tree; a definition may
+/// only tighten it.
+#[derive(Clone, Debug, Default)]
+pub struct Budget {
+    /// At most this many jumps; above the host's ceiling fails validation.
+    pub max_jumps: Option<u64>,
+    pub on_exceeded: Exceeded,
+}
+
+impl Budget {
+    /// The budget a run of this definition gets under `ceiling`.
+    pub fn max_jumps(&self, ceiling: u64) -> u64 {
+        self.max_jumps.map_or(ceiling, |n| n.min(ceiling))
+    }
+}
+
+/// What a refused jump does.
+#[derive(Clone, Debug, Default)]
+pub enum Exceeded {
+    /// Raise `budget.exhausted`, which `try` can catch (omitted).
+    #[default]
+    Raise,
+    /// End the run normally; its output is the jumping task's (`end`).
+    End,
+    /// Run this task (typically a `call`); the run ends with its output. It
+    /// may run a few tasks (`run::HANDLER_TASKS`) and cannot jump.
+    Task(Box<Task>),
 }
 
 #[derive(Clone, Debug)]
@@ -553,7 +591,51 @@ impl Parser {
                 _ => self.fail("/document/metadata/catchup", "expected latest or none"),
             },
         }
-        Some(Workflow { document: document?, input, output, uses, tasks, timeout, schedule, definition: v.clone() })
+        let budget = match m.get("document").and_then(|d| d.get("metadata")).and_then(|d| d.get("limits")) {
+            Some(l) => self.budget(l),
+            None => Budget::default(),
+        };
+        Some(Workflow {
+            document: document?,
+            input,
+            output,
+            uses,
+            tasks,
+            timeout,
+            schedule,
+            budget,
+            definition: v.clone(),
+        })
+    }
+
+    fn budget(&mut self, v: &Value) -> Budget {
+        const AT: &str = "/document/metadata/limits";
+        let Some(m) = self.object(v, AT) else {
+            return Budget::default();
+        };
+        self.only(m, AT, &["max_jumps", "on_exceeded"]);
+        let max_jumps = match m.get("max_jumps") {
+            None => None,
+            Some(n) => {
+                if n.as_u64().is_none() {
+                    self.fail(&format!("{AT}/max_jumps"), "expected a non-negative integer");
+                }
+                n.as_u64()
+            }
+        };
+        let on_exceeded = match m.get("on_exceeded") {
+            None => Exceeded::Raise,
+            Some(Value::String(s)) if s == "end" => Exceeded::End,
+            Some(t @ Value::Object(_)) => match self.task(t, &format!("{AT}/on_exceeded")) {
+                Some(t) => Exceeded::Task(Box::new(t)),
+                None => Exceeded::Raise,
+            },
+            Some(_) => {
+                self.fail(&format!("{AT}/on_exceeded"), "expected `end` or a task (e.g. `call: report`)");
+                Exceeded::Raise
+            }
+        };
+        Budget { max_jumps, on_exceeded }
     }
 
     fn document(&mut self, v: &Value) -> Option<Document> {
@@ -1479,7 +1561,12 @@ pub fn function_name(call: &str) -> &str {
 /// The runtime arguments every expression may use. `$secrets` is bound only
 /// in `input.from` (see `SECRETS`); `$authorization` describes a call's
 /// resolved authentication, which this runtime leaves to functions.
-pub const BASE_VARS: &[&str] = &["context", "input", "output", "task", "workflow", "runtime"];
+pub const BASE_VARS: &[&str] = &["context", "input", "output", "task", "workflow", "runtime", RUN];
+
+/// `$run` (an extension): `{ jumps, maxJumps, visits }`, the jumps this run
+/// took to a named task, its budget, and how often each task of the
+/// enclosing lists was entered. Reserved: no loop or catch variable takes it.
+pub const RUN: &str = "run";
 
 /// The argument holding the declared secrets. CHOICE: the DSL's argument
 /// table ticks `$secrets` for every expression, but its description says
@@ -1551,6 +1638,10 @@ pub fn validate(wf: &Workflow, catalog: &dyn Catalog) -> Result<(), Invalid> {
     }
     if let Some(on) = wf.schedule.as_ref().and_then(|s| s.on.as_ref()) {
         v.strategy(on, "/schedule/on", &args);
+    }
+    if let Exceeded::Task(handler) = &wf.budget.on_exceeded {
+        // Alone in its scope: it cannot jump back into the workflow's lists.
+        v.task(handler, "/document/metadata/limits/on_exceeded", &args, &[]);
     }
     v.list(&wf.tasks, "/do", &args);
     if v.problems.is_empty() { Ok(()) } else { Err(Invalid(v.problems)) }
@@ -1648,6 +1739,29 @@ impl Validator<'_> {
         for (i, (name, t)) in tasks.iter().enumerate() {
             self.task(t, &format!("{at}/{i}/{name}"), args, &names);
         }
+        let exits = self.wf.uses.extensions.iter().any(|(_, e)| {
+            [&e.before, &e.after].into_iter().flatten().flatten().any(|(_, t)| can_leave(t, &self.wf.uses.functions))
+        });
+        if !exits {
+            for cycle in closed_cycles(tasks, &self.wf.uses.functions) {
+                let (first, _) = &tasks[cycle[0]];
+                let names: Vec<&str> = cycle.iter().map(|i| tasks[*i].0.as_str()).collect();
+                self.fail(
+                    &format!("{at}/{}/{first}", cycle[0]),
+                    format!(
+                        "the tasks {} jump in a cycle with no conditional way out (add a switch case or an `if` that leaves it)",
+                        names.join(", ")
+                    ),
+                );
+            }
+        }
+    }
+
+    /// A loop or catch variable must not hide `$run`.
+    fn variable(&mut self, name: &str, at: &str) {
+        if name == RUN {
+            self.fail(at, "`run` is reserved for the runtime argument `$run`");
+        }
     }
 
     fn filter(&mut self, f: &EventFilter, at: &str, args: &Args) {
@@ -1723,6 +1837,8 @@ impl Validator<'_> {
             }
             Kind::Do(tasks) => self.list(tasks, &format!("{at}/do"), args),
             Kind::For { each, at: index, items, condition, tasks, .. } => {
+                self.variable(each, &format!("{at}/for/each"));
+                self.variable(index, &format!("{at}/for/at"));
                 let inner = args.clone().with(each, Value::Null).with(index, Value::Null);
                 if let Items::Expr(e) = items {
                     self.expr(e, &format!("{at}/for/in"), args);
@@ -1753,6 +1869,7 @@ impl Validator<'_> {
             }
             Kind::Try { tasks, catch } => {
                 self.list(tasks, &format!("{at}/try"), args);
+                self.variable(&catch.as_, &format!("{at}/catch/as"));
                 let caught = args.clone().with(&catch.as_, Value::Null);
                 for (code, key) in [(&catch.when, "when"), (&catch.except_when, "exceptWhen")] {
                     if let Some(c) = code {
@@ -1802,6 +1919,8 @@ impl Validator<'_> {
                 }
                 self.strategy(&listen.to, &format!("{at}/listen/to"), args);
                 if let Some(f) = &listen.foreach {
+                    self.variable(&f.item, &format!("{at}/foreach/item"));
+                    self.variable(&f.at, &format!("{at}/foreach/at"));
                     let inner = args.clone().with(&f.item, Value::Null).with(&f.at, Value::Null);
                     self.list(&f.tasks, &format!("{at}/foreach/do"), &inner);
                     if let Some(o) = &f.output {
@@ -1844,6 +1963,108 @@ impl Validator<'_> {
             }
         }
     }
+}
+
+/// Where a task's flow may go next within its list: a sibling, or out of
+/// the list (`exit`, `end`, past the last task, a raised error).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Next {
+    Task(usize),
+    Out,
+}
+
+/// Every way the task at `i` may continue in its list. The edges are
+/// conditional when they lead to more than one place: an `if` (a skipped
+/// task continues with the next one), a switch, a catch's own `then`.
+fn successors(tasks: &TaskList, i: usize) -> Vec<Next> {
+    let t = &tasks[i].1;
+    let to = |f: &Flow| match f {
+        Flow::Continue if i + 1 < tasks.len() => Next::Task(i + 1),
+        Flow::Goto(name) => tasks.iter().position(|(n, _)| n == name).map_or(Next::Out, Next::Task),
+        _ => Next::Out,
+    };
+    let own = t.then.as_ref().map_or_else(|| to(&Flow::Continue), to);
+    let mut out = match &t.kind {
+        Kind::Raise(_) => vec![Next::Out],
+        Kind::Switch(cases) => {
+            let mut out: Vec<Next> = cases.iter().map(|(_, c)| to(&c.then)).collect();
+            if !cases.iter().any(|(_, c)| c.when.is_none()) {
+                out.push(own);
+            }
+            out
+        }
+        Kind::Try { catch, .. } => vec![own, catch.then.as_ref().map_or(own, to)],
+        _ => vec![own],
+    };
+    if t.when.is_some() {
+        out.push(to(&Flow::Continue));
+    }
+    let mut distinct = Vec::new();
+    for n in out {
+        if !distinct.contains(&n) {
+            distinct.push(n);
+        }
+    }
+    distinct
+}
+
+/// Whether running the task can leave an enclosing cycle from inside: some
+/// nested task raises or ends the workflow, or it calls a reusable function
+/// (whose body is not followed). Permissive on purpose: the check rejects
+/// only loops that can never end.
+fn can_leave(t: &Task, functions: &[(String, Task)]) -> bool {
+    let ends = |f: &Option<Flow>| matches!(f, Some(Flow::End));
+    let list = |tasks: &TaskList| tasks.iter().any(|(_, t)| ends(&t.then) || can_leave(t, functions));
+    match &t.kind {
+        Kind::Raise(_) => true,
+        Kind::Call { function, .. } => functions.iter().any(|(n, _)| n == function_name(function)),
+        Kind::Do(tasks) | Kind::For { tasks, .. } => list(tasks),
+        Kind::Fork { branches, .. } => list(branches),
+        Kind::Switch(cases) => cases.iter().any(|(_, c)| c.then == Flow::End),
+        Kind::Try { tasks, catch } => list(tasks) || ends(&catch.then) || catch.tasks.as_ref().is_some_and(&list),
+        Kind::Listen(l) => l.foreach.as_ref().is_some_and(|f| list(&f.tasks)),
+        Kind::Set(_) | Kind::Wait(_) | Kind::Emit(_) | Kind::Run(_) => false,
+    }
+}
+
+/// The jump cycles of a list (its strongly connected components with an
+/// edge back) that have no conditional edge out and no task that can leave
+/// them from inside, each as its task indices in order. Such a loop can
+/// never end; one with a way out is not proven to end either, which the
+/// jump budget covers at runtime.
+pub(crate) fn closed_cycles(tasks: &TaskList, functions: &[(String, Task)]) -> Vec<Vec<usize>> {
+    let n = tasks.len();
+    let edges: Vec<Vec<Next>> = (0..n).map(|i| successors(tasks, i)).collect();
+    // reach[i][j]: j is reachable from i in one or more steps.
+    let mut reach = vec![vec![false; n]; n];
+    for (i, row) in reach.iter_mut().enumerate() {
+        let mut stack: Vec<usize> =
+            edges[i].iter().filter_map(|e| if let Next::Task(j) = e { Some(*j) } else { None }).collect();
+        while let Some(j) = stack.pop() {
+            if !row[j] {
+                row[j] = true;
+                stack.extend(edges[j].iter().filter_map(|e| if let Next::Task(k) = e { Some(*k) } else { None }));
+            }
+        }
+    }
+    let mut seen = vec![false; n];
+    let mut out = Vec::new();
+    for i in 0..n {
+        if seen[i] || !reach[i][i] {
+            continue;
+        }
+        let component: Vec<usize> = (0..n).filter(|j| *j == i || (reach[i][*j] && reach[*j][i])).collect();
+        component.iter().for_each(|j| seen[*j] = true);
+        let leaves = component.iter().any(|j| {
+            can_leave(&tasks[*j].1, functions)
+                || (edges[*j].len() > 1
+                    && edges[*j].iter().any(|e| !matches!(e, Next::Task(k) if component.contains(k))))
+        });
+        if !leaves {
+            out.push(component);
+        }
+    }
+    out
 }
 
 // ── 4. static analysis ─────────────────────────────────────────────────────
@@ -2212,6 +2433,72 @@ do:
         assert!(
             matches!(catch.retry.as_ref().and_then(|r| r.attempt_duration.clone()), Some(DurationSpec::Fixed(d)) if d.as_secs() == 1)
         );
+    }
+
+    #[test]
+    fn jump_cycles_need_a_conditional_way_out() {
+        let cycle = |p: &[String]| p.iter().any(|p| p.contains("jump in a cycle"));
+        // Rejected: a self-loop, a two-task loop, a loop whose only branch
+        // stays inside, a loop inside a try body.
+        for body in [
+            "do: [ { a: { set: { x: 1 }, then: a } } ]\n",
+            "do: [ { a: { set: { x: 1 } } }, { b: { set: { x: 2 }, then: a } } ]\n",
+            "do: [ { a: { set: { x: 1 } } }, { b: { switch: [ { x: { when: .x, then: a } }, { y: { then: a } } ] } } ]\n",
+            "do: [ { t: { try: [ { a: { call: f, then: b } }, { b: { call: f, then: a } } ], catch: {} } } ]\n",
+        ] {
+            assert!(cycle(&checked(body)), "{body}: {:?}", checked(body));
+        }
+        // Accepted: a conditional exit (a switch case, an `if`, a default
+        // that leaves, a catch's `then`), a nested raise or end, a forward
+        // jump, a reusable function that may leave.
+        for body in [
+            "do: [ { a: { set: { x: 1 } } }, { b: { switch: [ { done: { when: .x, then: exit } }, { more: { then: a } } ] } } ]\n",
+            "do: [ { a: { set: { x: 1 } } }, { b: { set: { x: 2 }, then: a, if: .more } } ]\n",
+            "do: [ { a: { switch: [ { again: { when: .x, then: a } } ] } } ]\n",
+            "do: [ { a: { try: [ { c: { call: f } } ], catch: { then: end }, then: a } } ]\n",
+            "do: [ { a: { do: [ { r: { raise: { error: { type: x, status: 400 } } } } ], then: a } } ]\n",
+            "do: [ { a: { do: [ { s: { switch: [ { stop: { when: .x, then: end } } ] } } ], then: a } } ]\n",
+            "do: [ { a: { set: { x: 1 }, then: c } }, { b: { set: { x: 2 } } }, { c: { set: { x: 3 } } } ]\n",
+            "use: { functions: { g: { call: f } } }\ndo: [ { a: { call: g, then: a } } ]\n",
+        ] {
+            assert!(checked(body).is_empty(), "{body}: {:?}", checked(body));
+        }
+        let p = checked("do: [ { a: { set: { x: 1 } } }, { b: { set: { x: 2 }, then: a } } ]\n");
+        assert!(p[0].starts_with("/do/0/a:") && p[0].contains("a, b"), "{p:?}");
+    }
+
+    #[test]
+    fn limits_parse_and_the_handler_validates_alone() {
+        let w = wf("do: [ { a: { set: { x: 1 } } } ]\n").unwrap();
+        assert!(w.budget.max_jumps.is_none() && matches!(w.budget.on_exceeded, Exceeded::Raise));
+        assert_eq!(w.budget.max_jumps(100), 100);
+        let limited = |limits: &str| {
+            format!(
+                "document: {{ dsl: '1.0.4', namespace: t, name: w, version: '0.1.0', metadata: {{ limits: {limits} }} }}\ndo: [ {{ a: {{ set: {{ x: 1 }} }} }} ]\n"
+            )
+        };
+        let w = parse_yaml(&limited("{ max_jumps: 30, on_exceeded: end }")).unwrap();
+        assert_eq!((w.budget.max_jumps, w.budget.max_jumps(10)), (Some(30), 10));
+        assert!(matches!(w.budget.on_exceeded, Exceeded::End));
+        let w = parse_yaml(&limited("{ on_exceeded: { call: report, with: { s: '${ . }' } } }")).unwrap();
+        assert!(matches!(&w.budget.on_exceeded, Exceeded::Task(t) if matches!(t.kind, Kind::Call { .. })));
+        assert!(validate(&w, &Names(&["report"])).is_ok());
+        let p = validate(&w, &Names(&[])).unwrap_err().to_string();
+        assert!(p.contains("/document/metadata/limits/on_exceeded/call"), "{p}");
+        for (limits, expected) in [
+            ("{ max_jumps: -1 }", "non-negative integer"),
+            ("{ max_jumps: 3, every: 1 }", "unknown property"),
+            ("{ on_exceeded: stop }", "expected `end` or a task"),
+        ] {
+            let p = parse_yaml(&limited(limits)).unwrap_err().to_string();
+            assert!(p.contains(expected), "{limits}: {p}");
+        }
+        let w = parse_yaml(&limited("{ on_exceeded: { set: { x: 1 }, then: a } }")).unwrap();
+        assert!(validate(&w, &Names(&[])).unwrap_err().to_string().contains("same list"));
+        // `$run` is a runtime argument no loop or catch variable hides.
+        assert!(checked("do: [ { a: { set: { v: '${ $run.visits.a }' } } } ]\n").is_empty());
+        let p = checked("do: [ { l: { for: { each: run, in: '.xs' }, do: [] } } ]\n");
+        assert!(p.iter().any(|p| p.contains("/do/0/l/for/each") && p.contains("reserved")), "{p:?}");
     }
 
     #[test]

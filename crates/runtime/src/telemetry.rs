@@ -60,6 +60,10 @@ impl Spans {
         ]);
         ActiveSpan { context, finished: false }
     }
+    /// The run ended through its jump budget (`Outcome::limit_exceeded`).
+    pub fn limit_exceeded(&self) {
+        self.root.span().set_attribute(KeyValue::new("ouro.limit_exceeded", true));
+    }
     pub fn finish(&self, outcome: &str) {
         self.root.span().set_attribute(KeyValue::new("ouro.outcome", outcome.to_string()));
         self.close_tasks();

@@ -672,7 +672,106 @@ pub fn run_all(factory: impl Fn(&str) -> anyhow::Result<TestStore>) -> anyhow::R
     report
         .witnesses
         .extend(["listen recovery before and after every interpreter commit", "held delivery and catchable timeout"]);
+    budgets(&factory, &mut report)?;
     Ok(report)
+}
+
+/// The persisted budget counter of `root`'s tree.
+fn counter(t: &TestStore, root: &str) -> anyhow::Result<Option<Value>> {
+    Ok(t.backend.snapshot()?.rows.get(&("budget".to_string(), root.to_string())).cloned())
+}
+
+/// A run tree's shared budget (issue #8): one counter per root, spent by
+/// the root and its owned descendants in the commit that saves each
+/// decision, never reset by a restart, refused past the limit, and gone
+/// with the root.
+fn budgets(factory: &impl Fn(&str) -> anyhow::Result<TestStore>, report: &mut Report) -> anyhow::Result<()> {
+    // A refusal names the run's first refused key, decided once.
+    let budget =
+        |granted: bool, spent: u64| Record::Budget { granted, spent, first: (!granted).then(|| "c#jump".to_string()) };
+    let t = factory("budget")?;
+    report.cases += 1;
+    let s = &t.store;
+    let f = s.start(&admission("root"), 0)?.unwrap();
+    assert_eq!(s.spend(&f, "a#jump", 2, 1)?, budget(true, 1));
+    assert_eq!(s.spend(&f, "a#jump", 2, 1)?, budget(true, 1), "repeating returns the saved decision");
+    assert_eq!(s.spend(&f, "b#jump", 2, 1)?, budget(true, 2));
+    assert_eq!(s.spend(&f, "c#jump", 2, 1)?, budget(false, 2));
+    assert_eq!(s.spend(&f, "c2#jump", 2, 1)?, budget(false, 2), "a later refusal names the first");
+    assert_eq!(s.load_records(&f, 1)?.get(owf::durable::EXCEEDED), Some(&Record::Exceeded { by: "c#jump".into() }));
+    assert!(s.save_record(&f, owf::durable::EXCEEDED, &Record::Exceeded { by: "a#jump".into() }, 1).is_err());
+    assert_eq!(counter(&t, "root")?, Some(json!(2)));
+    // Only `spend` commits a decision: a forged one is refused.
+    assert!(s.save_record(&f, "d#jump", &budget(true, 0), 1).is_err());
+    assert!(s.save_record(&f, "a#jump", &budget(true, 1), 1).is_ok(), "saving the same decision is a no-op");
+    // A failed commit changes neither the record nor the counter.
+    let before = t.backend.snapshot()?;
+    t.faults.arm(CommitFault::BeforeCommit);
+    assert!(s.spend(&f, "e#jump", 5, 1).is_err());
+    t.faults.clear();
+    assert_eq!(t.backend.snapshot()?, before);
+    // A restart keeps the count: another worker resumes the run after the
+    // lease ended; a stale owner cannot spend.
+    let reopened = (t.reopen)()?;
+    let now = LEASE_MS + 2;
+    let g = reopened.claim("root", now)?.unwrap();
+    assert!(s.spend(&f, "e#jump", 5, now).is_err(), "a replaced owner cannot spend");
+    assert_eq!(reopened.load_records(&g, now)?.get("b#jump"), Some(&budget(true, 2)));
+    assert_eq!(reopened.spend(&g, "c#jump", 5, now)?, budget(false, 2), "a refusal stays refused");
+    assert_eq!(reopened.spend(&g, "e#jump", 3, now)?, budget(true, 3), "the count resumes, not restarts");
+    report.operations += 11;
+    report.witnesses.insert("budget decisions survive restarts and failed commits");
+
+    // Parent, child and grandchild spend the root's one counter.
+    let child = |id: &str, parent: &str| {
+        (admission(id), ChildLink { parent: parent.into(), key: id.into(), reference: format!("/{id}") })
+    };
+    let (a, link) = child("child", "root");
+    let c = reopened.start_child(&g, &a, &link, now)?.unwrap();
+    assert_eq!(reopened.get("child")?.unwrap().root.as_deref(), Some("root"));
+    let (a, link) = child("grandchild", "child");
+    let gc = reopened.start_child(&c, &a, &link, now)?.unwrap();
+    assert_eq!(reopened.get("grandchild")?.unwrap().root.as_deref(), Some("root"));
+    assert_eq!(reopened.spend(&c, "x#jump", 5, now)?, budget(true, 4));
+    assert_eq!(reopened.spend(&gc, "x#jump", 5, now)?, budget(true, 5));
+    assert_eq!(reopened.spend(&g, "f#jump", 5, now)?, budget(false, 5), "the children spent the root's budget");
+    assert_eq!(reopened.spend(&c, "y#jump", 9, now)?, budget(true, 6), "each spender passes its own limit");
+    assert_eq!(counter(&t, "root")?, Some(json!(6)));
+    assert_eq!(counter(&t, "child")?, None, "a child keeps no counter of its own");
+    // A child's unit and the root's count are one commit.
+    let before = t.backend.snapshot()?;
+    t.faults.arm(CommitFault::BeforeCommit);
+    assert!(reopened.spend(&gc, "z#jump", 9, now).is_err());
+    t.faults.clear();
+    assert_eq!(t.backend.snapshot()?, before);
+    // Concurrent spenders of one tree at its last unit: exactly one wins.
+    let barrier = Arc::new(std::sync::Barrier::new(3));
+    let workers: Vec<_> = [(g.clone(), "race-root"), (c.clone(), "race-child"), (gc.clone(), "race-grandchild")]
+        .into_iter()
+        .map(|(fence, key)| {
+            let reopen = t.reopen.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || -> anyhow::Result<bool> {
+                let store = reopen()?;
+                barrier.wait();
+                Ok(matches!(store.spend(&fence, key, 7, now)?, Record::Budget { granted: true, .. }))
+            })
+        })
+        .collect();
+    let mut granted = 0;
+    for worker in workers {
+        granted += usize::from(worker.join().expect("spend worker panicked")?);
+    }
+    assert_eq!(granted, 1);
+    assert_eq!(counter(&t, "root")?, Some(json!(7)));
+    // The counter ends with the root, whose descendants end with it.
+    reopened.finish(&g, &Status::Completed(json!(0)), now, 3)?;
+    assert_eq!(counter(&t, "root")?, None);
+    assert!(reopened.spend(&c, "late#jump", 99, now).is_err(), "a cancelled child cannot spend");
+    audit(&*reopened)?;
+    report.operations += 12;
+    report.witnesses.insert("a run tree spends one budget, atomically");
+    Ok(())
 }
 
 /// The settled decisions of `docs/durable-invariants.md` §8 and issue #3:

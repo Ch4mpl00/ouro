@@ -964,3 +964,406 @@ async fn schedule_on_all_starts_once_every_filter_has_matched() {
     assert_eq!(completed(settle(&f.rt, &started[0]).await), json!(["a", "b"]));
     assert!(f.rt.publish(event("4", "b", json!(4))).unwrap().is_empty(), "the next pair starts afresh");
 }
+
+// ── the jump budget (issue #8) ─────────────────────────────────────────────
+
+/// Three jumps, then the budget ends the run with the jumping task's output.
+const BUDGETED: &str = r#"do:
+  - tick: { call: read, with: { n: '${ .n + 1 }' } }
+  - again:
+      switch:
+        - stop: { when: '${ .n < 0 }', then: exit }
+        - more: { then: tick }"#;
+
+fn budgeted() -> String {
+    format!(
+        "document: {{ dsl: '1.0.4', namespace: test, name: loop, version: '1.0.0', metadata: {{ limits: {{ max_jumps: 3, on_exceeded: end }} }} }}\n{BUDGETED}\n"
+    )
+}
+
+fn decisions(records: &BTreeMap<String, owf::durable::Record>) -> Vec<(String, bool, u64)> {
+    records
+        .iter()
+        .filter_map(|(k, r)| match r {
+            owf::durable::Record::Budget { granted, spent, .. } => Some((k.clone(), *granted, *spent)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The budgeted loop to its end with a crash at commit `fail_at`.
+async fn budget_crash(fail_at: usize, after: bool) -> (Option<Status>, Vec<(String, bool, u64)>, usize) {
+    let backend = Arc::new(Crashing {
+        inner: durable::memory::MemoryBackend::default(),
+        commits: AtomicUsize::new(0),
+        fail_at,
+        after,
+    });
+    let store = Arc::new(durable::TransactionalStore::new(backend.clone()));
+    let f = fixture_on(store.clone(), Arc::default(), Arc::default(), Arc::default());
+    let setup = |rt: &Runtime| -> anyhow::Result<()> {
+        let d = rt.save("loop", &budgeted())?;
+        rt.activate("loop", d.version)?;
+        rt.start("l", "loop", json!({ "n": 0 }))?;
+        Ok(())
+    };
+    while setup(&f.rt).is_err() {}
+    for step in 1..200 {
+        if let Some(status) = store.get("l").ok().flatten().and_then(|r| r.outcome) {
+            let records = loop {
+                if let Ok(Some(s)) = store.inspect("l") {
+                    break s.records;
+                }
+            };
+            return (Some(status), decisions(&records), backend.commits.load(Ordering::SeqCst));
+        }
+        let _ = f.rt.recover_once(&CancellationToken::new()).await;
+        f.time.set(step * (durable::LEASE_MS + 600_001));
+    }
+    (None, Vec::new(), 0)
+}
+
+#[tokio::test]
+async fn the_jump_count_survives_crashes_at_every_commit() {
+    let (status, baseline, commits) = budget_crash(usize::MAX, false).await;
+    let expected = Status::Completed(json!({ "n": 4 }));
+    assert_eq!(status.as_ref(), Some(&expected));
+    let keys = ["/do/1/again#jump", "/do/1/again[1]#jump", "/do/1/again[2]#jump", "/do/1/again[3]#jump"];
+    assert_eq!(
+        baseline,
+        keys.iter()
+            .zip([(true, 1), (true, 2), (true, 3), (false, 3)])
+            .map(|(k, (g, s))| (k.to_string(), g, s))
+            .collect::<Vec<_>>()
+    );
+    for after in [false, true] {
+        for fail_at in 1..=commits {
+            let (status, recovered, _) = budget_crash(fail_at, after).await;
+            // A restart neither resets the count nor spends a unit twice.
+            assert_eq!(status.as_ref(), Some(&expected), "crash at commit {fail_at}, after={after}");
+            assert_eq!(recovered, baseline, "crash at commit {fail_at}, after={after}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_restarted_process_resumes_the_count_and_replay_repeats_the_decisions() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("runs.sqlite");
+    let time = Arc::new(Time::default());
+    let f = fixture_on(Arc::new(durable::sqlite::open(&path).unwrap()), time.clone(), Arc::default(), Arc::default());
+    // The loop pauses after every jump, so a process can stop between them.
+    let paused = budgeted().replace("- tick: { call: read", "- pause: { wait: PT1S }\n  - tick: { call: read");
+    let paused = paused.replace("then: tick", "then: pause");
+    save(&f.rt, "loop", &paused);
+    f.rt.start("l", "loop", json!({ "n": 0 })).unwrap();
+    for at in [0, 1_000] {
+        time.set(at);
+        assert!(matches!(f.rt.drive("l", &CancellationToken::new()).await.unwrap(), Some(Status::Waiting { .. })));
+    }
+    assert_eq!(decisions(&f.rt.records("l").unwrap()).len(), 1);
+    drop(f);
+    let f = fixture_on(Arc::new(durable::sqlite::open(&path).unwrap()), time.clone(), Arc::default(), Arc::default());
+    for at in 2..6 {
+        time.set(at * 1_000);
+        f.rt.drive("l", &CancellationToken::new()).await.unwrap();
+    }
+    let status = f.rt.get("l").unwrap().and_then(|r| r.outcome);
+    assert_eq!(status, Some(Status::Completed(json!({ "n": 4 }))));
+    let made = decisions(&f.rt.records("l").unwrap());
+    assert_eq!(
+        made.iter().map(|(_, g, s)| (*g, *s)).collect::<Vec<_>>(),
+        [(true, 1), (true, 2), (true, 3), (false, 3)]
+    );
+    // Replay restores every decision, the refusal included.
+    let replay = f.rt.replay("l", &CancellationToken::new()).await.unwrap();
+    assert_eq!(replay.status, Status::Completed(json!({ "n": 4 })));
+}
+
+#[tokio::test]
+async fn children_spend_their_roots_budget_and_nesting_is_capped() {
+    let store: Arc<dyn RunStore> = Arc::new(durable::memory::memory());
+    let mut config = Config::default();
+    config.limits.max_jumps = 6;
+    config.limits.max_depth = 3;
+    let rt = Runtime::new(
+        store.clone(),
+        Arc::new(registry(Arc::default(), Arc::default())),
+        config,
+        Arc::new(Time::default()),
+        tracer(),
+    )
+    .unwrap();
+    // A child jumps twice; the parent starts a fresh child on every pass.
+    let child = "do:\n  - step: { set: { k: '${ (.k // 0) + 1 }' } }\n  - again: { switch: [ { stop: { when: '${ .k >= 3 }', then: exit } }, { more: { then: step } } ] }";
+    save(&rt, "child", &doc("child", child));
+    let parent = "do:\n  - spawn: { run: { workflow: { namespace: test, name: child, version: latest, input: {} } }, output: { as: '${ $input }' } }\n  - count: { set: { i: '${ .i + 1 }' } }\n  - loop: { switch: [ { stop: { when: '${ .i >= 100 }', then: exit } }, { more: { then: spawn } } ] }";
+    save(&rt, "parent", &doc("parent", parent));
+    rt.start("p", "parent", json!({ "i": 0 })).unwrap();
+    let Some(Status::Faulted(e)) = settle(&rt, "p").await else { panic!("the tree did not run out of budget") };
+    // Two passes spend 2 + 1 jumps each; the third child is refused.
+    assert!(e.is("budget.exhausted"), "{e:?}");
+    assert_eq!(e.instance.as_deref(), Some("/do/0/spawn[2]"));
+    let mut granted = 0;
+    let runs = rt.list(None, "").unwrap();
+    for r in &runs {
+        let made = decisions(&rt.records(&r.admission.id).unwrap());
+        granted += made.iter().filter(|(_, g, _)| *g).count();
+        assert!(made.iter().all(|(_, _, spent)| *spent <= 6));
+        if r.admission.name == "child" {
+            assert_eq!(r.root.as_deref(), Some("p"));
+            assert_eq!(r.admission.runtime["limits"], json!({ "max_jumps": 6, "depth": 1 }));
+        }
+    }
+    assert_eq!((granted, runs.len()), (6, 4));
+    // Replayed alone, the refused child is refused again: replay restores the
+    // tree's decision, not a count of its own.
+    let refused = runs.iter().find(|r| r.admission.name == "child" && matches!(r.outcome, Some(Status::Faulted(_))));
+    let replay = rt.replay(&refused.unwrap().admission.id, &CancellationToken::new()).await.unwrap();
+    assert!(matches!(&replay.status, Status::Faulted(e) if e.is("budget.exhausted")), "{:?}", replay.status);
+    // Self-recursion through `run: workflow` stops at the nesting depth.
+    save(
+        &rt,
+        "rec",
+        &doc("rec", "do:\n  - deeper: { run: { workflow: { namespace: test, name: rec, version: latest } } }"),
+    );
+    rt.start("r", "rec", json!({})).unwrap();
+    let Some(Status::Faulted(e)) = settle(&rt, "r").await else { panic!("recursion did not stop") };
+    assert!(e.is("budget.exhausted"), "{e:?}");
+    assert_eq!(rt.list(Some("rec"), "").unwrap().len(), 4, "the root and three nested children");
+}
+
+#[tokio::test]
+async fn definitions_only_tighten_the_budget_and_cannot_loop_without_a_way_out() {
+    let f = fixture();
+    let limited = |n: u64| {
+        format!(
+            "document: {{ dsl: '1.0.4', namespace: test, name: l, version: '1.0.0', metadata: {{ limits: {{ max_jumps: {n} }} }} }}\n{BUDGETED}\n"
+        )
+    };
+    assert!(f.rt.validate(&limited(100)).is_ok());
+    let e = f.rt.save("l", &limited(101)).unwrap_err().to_string();
+    assert!(e.contains("ceiling of 100"), "{e}");
+    let e =
+        f.rt.save("c", &doc("c", "do:\n  - a: { call: read }\n  - b: { call: read, then: a }"))
+            .unwrap_err()
+            .to_string();
+    assert!(e.contains("jump in a cycle"), "{e}");
+}
+
+#[tokio::test]
+async fn a_run_ended_by_its_budget_says_so_on_its_span() {
+    use opentelemetry::trace::TracerProvider;
+    let exporter = opentelemetry_sdk::trace::InMemorySpanExporter::default();
+    let provider =
+        opentelemetry_sdk::trace::SdkTracerProvider::builder().with_simple_exporter(exporter.clone()).build();
+    let rt = Runtime::new(
+        Arc::new(durable::memory::memory()),
+        Arc::new(registry(Arc::default(), Arc::default())),
+        Config::default(),
+        Arc::new(Time::default()),
+        opentelemetry::global::BoxedTracer::new(Box::new(provider.tracer("budget"))),
+    )
+    .unwrap();
+    save(&rt, "loop", &budgeted());
+    save(&rt, "plain", &doc("plain", "do: [ { a: { set: { x: 1 } } } ]"));
+    for (id, name) in [("l", "loop"), ("p", "plain")] {
+        rt.start(id, name, json!({ "n": 0 })).unwrap();
+        settle(&rt, id).await;
+    }
+    let flagged = |definition: &str| {
+        exporter.get_finished_spans().unwrap().iter().any(|s| {
+            s.name == format!("workflow {definition}")
+                && s.attributes.iter().any(|kv| kv.key.as_str() == "ouro.limit_exceeded" && kv.value.as_str() == "true")
+        })
+    };
+    assert!(flagged("loop"));
+    assert!(!flagged("plain"));
+}
+
+/// A memory backend whose `n`th commit fails (before or after it lands),
+/// noting the commit that saved a run's first refusal.
+struct Claiming {
+    inner: durable::memory::MemoryBackend,
+    commits: AtomicUsize,
+    claimed: AtomicUsize,
+    fail_at: usize,
+    after: bool,
+}
+impl AtomicBackend for Claiming {
+    fn begin(&self) -> anyhow::Result<Box<dyn durable::Transaction + '_>> {
+        Ok(Box::new(ClaimingTx { inner: self.inner.begin()?, backend: self, claims: false }))
+    }
+    fn snapshot(&self) -> anyhow::Result<durable::Snapshot> {
+        self.inner.snapshot()
+    }
+}
+struct ClaimingTx<'a> {
+    inner: Box<dyn durable::Transaction + 'a>,
+    backend: &'a Claiming,
+    claims: bool,
+}
+impl durable::Transaction for ClaimingTx<'_> {
+    fn get(&mut self, kind: &str, id: &str) -> anyhow::Result<Option<Value>> {
+        self.inner.get(kind, id)
+    }
+    fn scan(&mut self, kind: &str, start: &str, end: Option<&str>, limit: usize) -> anyhow::Result<durable::Rows> {
+        self.inner.scan(kind, start, end, limit)
+    }
+    fn put(&mut self, kind: &str, id: &str, value: &Value) -> anyhow::Result<()> {
+        self.claims |= kind.starts_with("record:") && id == owf::durable::EXCEEDED;
+        self.inner.put(kind, id, value)
+    }
+    fn delete(&mut self, kind: &str, id: &str) -> anyhow::Result<()> {
+        self.inner.delete(kind, id)
+    }
+    fn commit(self: Box<Self>) -> anyhow::Result<()> {
+        let b = self.backend;
+        let n = b.commits.fetch_add(1, Ordering::SeqCst) + 1;
+        if n == b.fail_at && !b.after {
+            anyhow::bail!("injected crash before commit {n}");
+        }
+        self.inner.commit()?;
+        if self.claims {
+            b.claimed.store(n, Ordering::SeqCst);
+        }
+        if n == b.fail_at && b.after {
+            anyhow::bail!("injected crash after commit {n}");
+        }
+        Ok(())
+    }
+}
+
+/// Two fork branches loop on one budget; `tick` yields, so they take turns
+/// and both are refused. The handler reports which branch acted.
+const RACING: &str = r#"document:
+  dsl: '1.0.4'
+  namespace: test
+  name: race
+  version: '1.0.0'
+  metadata: { limits: { max_jumps: 3, on_exceeded: { call: report, with: { by: '${ .b }' } } } }
+do:
+  - both:
+      fork:
+        branches:
+          - a:
+              do:
+                - tick: { call: tick, with: { b: a } }
+                - again: { switch: [ { stop: { when: '${ .b == "none" }', then: exit } }, { more: { then: tick } } ] }
+          - b:
+              do:
+                - tick: { call: tick, with: { b: b } }
+                - again: { switch: [ { stop: { when: '${ .b == "none" }', then: exit } }, { more: { then: tick } } ] }
+"#;
+
+/// The racing run to its end with a crash at commit `fail_at`: its status,
+/// the task paths `report` was called at, its refusals, the commits made and
+/// the commit that saved the first refusal.
+async fn race_crash(fail_at: usize, after: bool) -> (Option<Status>, Vec<String>, usize, usize, usize) {
+    let backend = Arc::new(Claiming {
+        inner: durable::memory::MemoryBackend::default(),
+        commits: AtomicUsize::new(0),
+        claimed: AtomicUsize::new(0),
+        fail_at,
+        after,
+    });
+    let store = Arc::new(durable::TransactionalStore::new(backend.clone()));
+    let reports = Arc::new(Mutex::new(Vec::new()));
+    let mut registry = Registry::new();
+    registry
+        .register(Function::new(
+            "tick",
+            json!({}),
+            json!({}),
+            Effect::Read,
+            |a: Value, _: FunctionContext| async move {
+                tokio::task::yield_now().await;
+                Ok(a)
+            },
+        ))
+        .unwrap();
+    let seen = reports.clone();
+    registry
+        .register(Function::new("report", json!({}), json!({}), Effect::Write, move |a: Value, c: FunctionContext| {
+            seen.lock().unwrap().push(c.task_path.clone());
+            async move {
+                // Long enough for the other branch to be refused meanwhile.
+                for _ in 0..8 {
+                    tokio::task::yield_now().await;
+                }
+                Ok(json!({ "reported": a["by"] }))
+            }
+        }))
+        .unwrap();
+    let time = Arc::new(Time::default());
+    let rt = Runtime::new(store.clone(), Arc::new(registry), Config::default(), time.clone(), tracer()).unwrap();
+    let setup = |rt: &Runtime| -> anyhow::Result<()> {
+        let d = rt.save("race", RACING)?;
+        rt.activate("race", d.version)?;
+        rt.start("r", "race", json!({}))?;
+        Ok(())
+    };
+    while setup(&rt).is_err() {}
+    for step in 1..200 {
+        if let Some(status) = store.get("r").ok().flatten().and_then(|r| r.outcome) {
+            let records = loop {
+                if let Ok(Some(s)) = store.inspect("r") {
+                    break s.records;
+                }
+            };
+            let refused = decisions(&records).iter().filter(|(_, granted, _)| !granted).count();
+            let reports = reports.lock().unwrap().clone();
+            if fail_at == usize::MAX {
+                // Replay takes no turns (recorded calls answer at once), yet
+                // the recorded first refusal acts again.
+                let replay = rt.replay("r", &CancellationToken::new()).await.unwrap();
+                assert_eq!(Some(&replay.status), Some(&status));
+            }
+            return (
+                Some(status),
+                reports,
+                refused,
+                backend.commits.load(Ordering::SeqCst),
+                backend.claimed.load(Ordering::SeqCst),
+            );
+        }
+        let _ = rt.recover_once(&CancellationToken::new()).await;
+        time.set(step * (durable::LEASE_MS + 600_001));
+    }
+    (None, Vec::new(), 0, 0, 0)
+}
+
+#[tokio::test]
+async fn branches_refused_together_follow_the_first_refusal_across_crashes() {
+    let (status, baseline_reports, refused, commits, claimed) = race_crash(usize::MAX, false).await;
+    let reports = baseline_reports;
+    let Some(Status::Completed(baseline)) = status else { panic!("{status:?}") };
+    // Both branches were refused; one handler ran, for the first refusal.
+    assert_eq!(refused, 2, "both branches were refused");
+    assert_eq!(reports.len(), 1, "{reports:?}");
+    assert!(claimed > 0 && claimed < commits);
+    let either = [json!({ "reported": "a" }), json!({ "reported": "b" })];
+    assert!(either.contains(&baseline), "{baseline}");
+    let mut decided = 0;
+    for after in [false, true] {
+        for fail_at in 1..=commits {
+            let (status, calls, _, _, _) = race_crash(fail_at, after).await;
+            let label = format!("crash at commit {fail_at}, after={after}: {status:?} {calls:?}");
+            let Some(Status::Completed(output)) = status else { panic!("{label}") };
+            // One handler: every call (a lost answer resends the same call)
+            // has one identity.
+            let mut paths = calls.clone();
+            paths.dedup();
+            assert_eq!(paths.len(), 1, "{label}");
+            assert!(either.contains(&output), "{label}");
+            // Once the first refusal is saved, recovery follows it: the same
+            // branch acts and the run ends with the same output.
+            if fail_at > claimed || (fail_at == claimed && after) {
+                decided += 1;
+                assert_eq!(output, baseline, "{label}");
+                assert_eq!(paths, reports, "{label}");
+            }
+        }
+    }
+    assert!(decided > 2, "crash points after the first refusal: {decided}");
+}
