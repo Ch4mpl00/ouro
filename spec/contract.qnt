@@ -4,7 +4,14 @@ module contract {
   pure def elems(xs: List[a]): Set[a] = xs.foldl(Set(),(a,x) => a.union(Set(x)))
   pure def mapped(xs: List[a], f: a => b): List[b] = xs.foldl([],(a,x) => a.append(f(x)))
   pure val Runs = Set(0, 1)
-  pure val Calls = Set(0, 1)
+  // Invocation 0 is an at-most-once write, 1 an at-least-once read, 2 an
+  // at-least-once write. Protection follows the declared delivery alone; the
+  // effect only decides what a dry run may dispatch (decision 6).
+  pure val Calls = Set(0, 1, 2)
+  pure def protected(i: int): bool = i == 0
+  pure def writes(i: int): bool = i != 1
+  // A broadcast copy never expires; only an addressed (mailbox) copy does.
+  pure val never = 1000000000
   pure val Workers = Set(0, 1)
   pure val epsilon = 1
   type Run = {
@@ -15,7 +22,8 @@ module contract {
   }
   type Copy = { id: int, recipient: int, payload: int, expires: int, disposition: int, key: int }
   type Catalog = { active: int, previous: int, epoch: int, faults: int, tripped: bool,
-    triggerEpoch: int, due: int, slot: int, running: int, catchup: int, rearm: bool }
+    triggerEpoch: int, due: int, slot: int, running: int, catchup: int, rearm: bool,
+    armed: bool, fallback: int }
   type Durable = { runs: List[Run], copies: List[Copy], catalog: Catalog,
     admissions: List[int], fired: Set[(int, int)], skipped: Set[(int, int)], ingress: int -> int, ingressPayload: int -> int }
   type Local = { fence: int, execution: int, phase: int, invocation: int, stopped: bool, permit: bool }
@@ -25,15 +33,19 @@ module contract {
     violations: Set[str], faultsSeen: Set[int] }
   pure val emptyRun: Run = { admitted: false, input: 0, version: 0, epoch: 0, app: 0, mode: 0,
     outcome: 0, ended: -1, deadline: -1, owner: -1, generation: 0, lease: -1,
-    records: [0,0], values: [0,0], frontier: Set(), continuation: 0,
+    records: [0,0,0], values: [0,0,0], frontier: Set(), continuation: 0,
     subscription: false, parent: -1, notified: false, retained: true }
   pure val emptyLocal: Local = { fence: 0, execution: 0, phase: 0, invocation: 0, stopped: false, permit: false }
   pure val initialDb: Durable = { runs: [emptyRun,emptyRun], copies: [], admissions: [0,0],
     fired: Set(), skipped: Set(), ingress: Map(), ingressPayload:Map(), catalog: { active: 1, previous: 0, epoch: 1,
-      faults: 0, tripped: false, triggerEpoch: 1, due: 2, slot: 0, running: -1, catchup: 0, rearm:false } }
+      faults: 0, tripped: false, triggerEpoch: 1, due: 2, slot: 0, running: -1, catchup: 0, rearm:false,
+      armed: true, fallback: -1 } }
   pure val initial: Machine = { db: initialDb, workers: [emptyLocal,emptyLocal], now: 0,
-    sends: [[0,0],[0,0]], effects: [[0,0],[0,0]], observations: [], violations: Set(), faultsSeen: Set() }
+    sends: [[0,0,0],[0,0,0]], effects: [[0,0,0],[0,0,0]], observations: [], violations: Set(), faultsSeen: Set() }
   var m: Machine
+  // The command just executed and its choices, for the model-based tests.
+  type Command = { r: int, w: int, i: int, value: int, fault: int }
+  var command: { tag: str, value: Command }
   // The shadow has no leases, workers, storage retries or crashes. Its step
   // relation below consumes visible labels, not the concrete post-state.
   type Ideal = { admitted: Set[int], intents: Set[(int,int)], dispatched: Set[(int,int)],
@@ -61,10 +73,12 @@ module contract {
     val updated = update(s,r,execution)
     { ...updated, db: { ...updated.db, admissions: updated.db.admissions.replaceAt(r,updated.db.admissions.nth(r)+1) } }
   }
+  // Decisions: 0 dispatch afresh, 2 restore the result, 3 unknown, 4 evidence
+  // swept, 5 restore the error response, 6 proven not executed (send again).
   pure def recovery(record: int, retained: bool): int =
-    if (not(retained)) 4 else if (record == 2) 2 else if (record == 1) 3 else 0
-  // Values 0/1/2 are absent/intent/result. Invocation 0 is a protected write,
-  // invocation 1 a read. Values are admitted-input + invocation, not live inputs.
+    if (not(retained)) 4 else if (record == 2) 2 else if (record == 3) 5 else if (record == 4) 6 else if (record == 1) 3 else 0
+  // Records 0/1/2/3/4 are absent/intent/result/error response/proven not
+  // executed. Values are admitted-input + invocation, not live inputs.
   pure def transition(s: Machine, op: str, r: int, w: int, i: int, value: int): Machine = {
     val execution = s.db.runs.nth(r)
     val local = s.workers.nth(w)
@@ -83,21 +97,30 @@ module contract {
       { ...updated, workers: updated.workers.replaceAt(w,{ ...emptyLocal, execution:r, fence:execution.generation+1, permit:true }) }
     } else if (op == "renew" and authorized)
       update(s,r,{ ...execution, lease:s.now+4 })
-    else if (op == "intent" and authorized and execution.records.nth(i) == 0 and
-      execution.mode != 2 and not(execution.mode == 1 and i == 0) and s.now < execution.deadline) {
+    else if (op == "intent" and authorized and Set(0,4).contains(execution.records.nth(i)) and
+      execution.mode != 2 and not(execution.mode == 1 and writes(i)) and s.now < execution.deadline) {
       val updated = update(s,r,{ ...execution, records:execution.records.replaceAt(i,1) })
       observe({ ...updated, workers: updated.workers.replaceAt(w,{ ...local, phase:1, invocation:i }) },op,r,i,execution.input+i,1)
-    } else if (op == "dispatch" and not(local.stopped) and local.phase == 1 and local.execution == r and local.invocation == i) {
+    } else if (op == "dispatch" and not(local.stopped) and Set(1,4).contains(local.phase) and local.execution == r and local.invocation == i) {
       val updated = { ...s, workers:s.workers.replaceAt(w,{ ...local, phase:2 }),
         sends:s.sends.replaceAt(r,s.sends.nth(r).replaceAt(i,s.sends.nth(r).nth(i)+1)),
-        effects:if (i == 0) s.effects.replaceAt(r,s.effects.nth(r).replaceAt(i,s.effects.nth(r).nth(i)+1)) else s.effects }
+        effects:if (writes(i)) s.effects.replaceAt(r,s.effects.nth(r).replaceAt(i,s.effects.nth(r).nth(i)+1)) else s.effects }
       observe(updated,op,r,i,execution.input+i,1)
     } else if (op == "result" and authorized and local.phase == 2 and local.invocation == i and value >= 0) {
-      val updated = update(s,r,{ ...execution, records:execution.records.replaceAt(i,2), values:execution.values.replaceAt(i,execution.input+i) })
+      // Value 1: the function answered with an error, itself a result.
+      val record = if (value == 1) 3 else 2
+      val updated = update(s,r,{ ...execution, records:execution.records.replaceAt(i,record), values:execution.values.replaceAt(i,execution.input+i) })
+      observe({ ...updated, workers: updated.workers.replaceAt(w,{ ...local, phase:0 }) },op,r,i,execution.input+i,1)
+    } else if (op == "notExecuted" and authorized and local.phase == 1 and local.invocation == i) {
+      // Proof, before any dispatch, that the call was not sent: it may be sent later.
+      val updated = update(s,r,{ ...execution, records:execution.records.replaceAt(i,4) })
       observe({ ...updated, workers: updated.workers.replaceAt(w,{ ...local, phase:0 }) },op,r,i,execution.input+i,1)
     } else if (op == "recover" and authorized) {
       val decision = recovery(execution.records.nth(i),execution.retained)
-      observe(s,op,r,i,execution.values.nth(i),decision)
+      // An unknown at-least-once call may be sent again, under the same key.
+      val resend = decision == 3 and not(protected(i))
+      val recovered = if (resend) { ...s, workers:s.workers.replaceAt(w,{ ...local, phase:4, invocation:i }) } else s
+      observe(recovered,op,r,i,execution.values.nth(i),decision)
     } else if (op == "checkpoint" and authorized and execution.records.nth(i) == 2) {
       val frontier = execution.frontier.union(Set(i))
       val updated = update(s,r,{ ...execution, frontier:frontier,
@@ -112,7 +135,7 @@ module contract {
       if (conflict) observe(s,op,r,i,value,-1) else {
         val copies = recipients.fold(s.db.copies,(a,k) =>
           if (a.elems().exists(e => e.recipient == k and e.id == i)) a else
-            a.append({id:i,recipient:k,payload:value,expires:s.now+5,disposition:0,key:-1}))
+            a.append({id:i,recipient:k,payload:value,expires:if (op == "address") s.now+5 else never,disposition:0,key:-1}))
         val accepted = copies.indices().filter(k => k >= s.db.copies.length()).fold({ ...s, db: { ...s.db, copies:copies } },(a,k) => {
           val e = copies.nth(k)
           observe(a,"accept",e.recipient,e.id,e.payload,1)
@@ -129,19 +152,24 @@ module contract {
         { ...e, disposition:2 } else e)
       { ...s, db: { ...s.db, copies:copies } }
     } else if (op == "child" and authorized and r == 0 and not(s.db.runs.nth(1).admitted)) {
+      // The parent's host holds the child's first lease, which it may let expire.
       val updated = admitRun(s,1,execution.input,execution.app,execution.mode)
-      observe(update(updated,1,{ ...updated.db.runs.nth(1), parent:r }),op,1,i,execution.input,1)
-    } else if ((op == "finish" and authorized and value >= 0) or (op == "timeout" and live(execution) and s.now >= execution.deadline)) {
-      // 1 success, 2 unhandled failure, 3 timeout, 4 unknown, 5 cancellation.
-      val outcome = if (op == "timeout") 3 else value + 1
+      observe(update(updated,1,{ ...updated.db.runs.nth(1), generation:1, lease:s.now+4, parent:r }),op,1,i,execution.input,1)
+    } else if ((op == "finish" and authorized and value >= 0) or (op == "timeout" and authorized and s.now >= execution.deadline) or
+      (op == "conflict" and authorized and execution.records.nth(i) != 0)) {
+      // 1 success, 2 unhandled failure (a changed binding too), 3 timeout,
+      // 4 unknown, 5 cancellation. The owner decides a timeout.
+      val outcome = if (op == "timeout") 3 else if (op == "conflict") 2 else value + 1
       val faults = if (outcome == 1) 0 else if (outcome >= 2 and outcome <= 4) c.faults+1 else c.faults
       val counted = execution.epoch == c.epoch
       val trip = counted and faults >= 2
+      // A rollback arms the predecessor's triggers its activation prepared; a
+      // trip removes them. Neither forgets the schedule's last run.
       val catalog = if (not(counted)) c else if (trip and c.previous > 0)
-        { ...c, active:c.previous, previous:0, epoch:c.epoch+1, faults:0,
-          triggerEpoch:c.epoch+1, due:if (c.previous == 1) s.now+2 else -1, running:-1 }
-        else { ...c, faults:if (trip) 0 else faults, tripped:c.tripped or trip,
-          due:if (trip) -1 else if (c.rearm and c.due < 0 and c.running == r and execution.epoch == c.triggerEpoch) s.now+2 else c.due,
+        { ...c, active:c.previous, previous:0, epoch:c.epoch+1, faults:0, slot:0,
+          triggerEpoch:c.epoch+1, due:c.fallback, armed:c.fallback >= 0, fallback:-1, running:if (c.running == r) -1 else c.running }
+        else { ...c, faults:if (trip) 0 else faults, tripped:c.tripped or trip, armed:c.armed and not(trip),
+          due:if (trip) -1 else if (c.armed and c.rearm and c.due < 0 and c.running == r and execution.epoch == c.triggerEpoch) s.now+2 else c.due,
           running:if (c.running == r) -1 else c.running }
       val updated = update(s,r,{ ...execution,outcome:outcome,ended:s.now,owner:-1,lease:-1,subscription:false,
         notified:execution.parent >= 0 })
@@ -151,15 +179,23 @@ module contract {
         workers:stoppedChildren.workers.mapped(x => if (x.execution == r or descendants.contains(x.execution)) { ...x,stopped:true,permit:false } else x) },op,r,i,outcome,1)
       descendants.fold(finished,(a,k) => observe(a,"finish",k,0,5,1))
     } else if (op == "cancel" and live(execution)) {
-      val runs = s.db.runs.mapped(x => if (x == execution or x.parent == r)
-        if (live(x)) { ...x,outcome:5,ended:s.now,owner:-1,lease:-1,subscription:false,notified:x.parent >= 0 } else x else x)
-      val cancelled = { ...s, db:{ ...s.db,runs:runs }, workers:s.workers.mapped(x =>
+      // By position: two runs with equal fields are still two runs.
+      val runs = Runs.fold(s.db.runs,(a,k) => { val x = a.nth(k)
+        if ((k == r or x.parent == r) and live(x))
+          a.replaceAt(k,{ ...x,outcome:5,ended:s.now,owner:-1,lease:-1,subscription:false,notified:x.parent >= 0 }) else a })
+      // A cancelled schedule run re-arms an `after` trigger like any other end.
+      val rearmed = c.armed and c.rearm and c.due < 0 and c.running == r and execution.epoch == c.triggerEpoch
+      val catalog = { ...c, due:if (rearmed) s.now+2 else c.due, running:if (c.running == r) -1 else c.running }
+      val cancelled = { ...s, db:{ ...s.db,runs:runs,catalog:catalog }, workers:s.workers.mapped(x =>
         if (runs.nth(x.execution).outcome != 0) { ...x,stopped:true,permit:false } else x) }
       Runs.filter(k => s.db.runs.nth(k).outcome == 0 and runs.nth(k).outcome == 5).fold(cancelled,(a,k) => observe(a,"finish",k,0,5,1))
-    } else if (op == "activate") {
+    } else if (op == "activate" and value >= 0) {
+      // Version 1 has a schedule. Reactivating the active version keeps its
+      // predecessor, whose triggers this commit prepares for a rollback.
       val epoch = c.epoch+1
-      { ...s,db:{ ...s.db,catalog:{ ...c,active:i+1,previous:c.active,epoch:epoch,faults:0,tripped:false,catchup:value % 2,rearm:value >= 2,
-        triggerEpoch:epoch,due:if (i == 0) s.now+2 else -1,running:-1 } } }
+      val predecessor = if (i+1 == c.active) c.previous else c.active
+      { ...s,db:{ ...s.db,catalog:{ ...c,active:i+1,previous:predecessor,epoch:epoch,faults:0,tripped:false,catchup:value % 2,rearm:value >= 2,
+        triggerEpoch:epoch,due:if (i == 0) s.now+2 else -1,armed:i == 0,slot:0,fallback:if (predecessor == 1) s.now+2 else -1 } } }
     } else if (op == "fire" and value >= 0 and c.due >= 0 and c.due <= s.now and c.triggerEpoch == c.epoch and not(c.tripped)) {
       val slot = (c.epoch,c.slot)
       val skip = (c.catchup == 1 and c.due < s.now) or
@@ -174,8 +210,12 @@ module contract {
     else if (op == "ingress" and value >= 0 and not(s.db.ingress.keys().contains(i) and s.db.ingress.get(i) > s.now) and not(execution.admitted) and not(c.tripped)) {
       val updated = observe(admitRun(s,r,value,0,0),"admit",r,i,value,1)
       { ...updated, db:{ ...updated.db,ingress:s.db.ingress.put(i,s.now+5),ingressPayload:s.db.ingressPayload.put(i,value) } }
-    } else if (op == "sweep" and execution.outcome != 0 and s.now >= execution.ended+5)
-      update(s,r,{ ...execution,retained:false })
+    } else if (op == "sweep")
+      { ...s,db:{ ...s.db,runs:s.db.runs.mapped(x => if (x.outcome != 0 and s.now >= x.ended+5) { ...x,retained:false } else x) } }
+    else if (op == "release" and authorized) {
+      val updated = update(s,r,{ ...execution,owner:-1,lease:-1 })
+      { ...updated,workers:updated.workers.replaceAt(w,{ ...local,stopped:true,phase:0,permit:false }) }
+    }
     else if (op == "crash")
       { ...s,workers:s.workers.replaceAt(w,{ ...local,stopped:true,phase:0,permit:false }) }
     else if (op == "tick")
@@ -191,11 +231,12 @@ module contract {
     val execution = a.db.runs.nth(r)
     val c = b.db.catalog
     val d = a.db.catalog
-    val workerMutation = Set("renew","intent","result","checkpoint","subscribe","take","child","finish").contains(op)
+    val workerMutation = Set("renew","intent","result","notExecuted","checkpoint","subscribe","take","child","finish",
+      "timeout","conflict","release").contains(op)
     val callsStable = Runs.forall(k => Calls.forall(j => {
       val x = b.db.runs.nth(k)
       val y = a.db.runs.nth(k)
-      x.records.nth(j) != 2 or (y.records.nth(j) == 2 and x.values.nth(j) == y.values.nth(j))
+      not(Set(2,3).contains(x.records.nth(j))) or (y.records.nth(j) == x.records.nth(j) and x.values.nth(j) == y.values.nth(j))
     }))
     val admissionStable = Runs.forall(k => {
       val x = b.db.runs.nth(k)
@@ -220,22 +261,23 @@ module contract {
     val error1 = flag(error0,"A3",terminalStable)
     val error2 = flag(error1,"A4",Runs.forall(k => Calls.forall(j => {
       val x = a.db.runs.nth(k)
-      x.records.nth(j) != 2 or x.values.nth(j) >= 0
+      not(Set(2,3).contains(x.records.nth(j))) or x.values.nth(j) >= 0
     })))
     val error3 = flag(error2,"A5",not(workerMutation) or b.db == a.db or authority(b,r,w))
     val error4 = flag(error3,"E1",op != "dispatch" or a.observations == b.observations or
       a.observations.nth(a.observations.length()-1).value == old.input+i)
-    val error5 = flag(error4,"E2",Runs.forall(k => a.sends.nth(k).nth(0) <= 1) and
+    val error5 = flag(error4,"E2",Runs.forall(k => Calls.forall(j => not(protected(j)) or a.sends.nth(k).nth(j) <= 1)) and
       (op != "dispatch" or a.sends == b.sends or old.records.nth(i) == 1))
     val error6 = flag(error5,"E3",op != "recover" or a.observations == b.observations or
       old.records.nth(i) != 1 or a.observations.nth(a.observations.length()-1).result == 3)
-    val error7 = flag(error6,"E4",callsStable and (op != "dispatch" or a.sends == b.sends or old.records.nth(i) != 2))
+    val error7 = flag(error6,"E4",callsStable and (op != "dispatch" or a.sends == b.sends or not(Set(2,3).contains(old.records.nth(i)))))
     val error8 = flag(error7,"R1",Runs.forall(k => {
       val x = a.db.runs.nth(k)
       x.continuation == x.frontier.fold(0,(sum,j) => sum+x.values.nth(j))
     }))
     val error9 = flag(error8,"R2",op != "recover" or a.observations == b.observations or
-      a.observations.nth(a.observations.length()-1).result == (if (not(old.retained)) 4 else if (old.records.nth(i) == 2) 2 else if (old.records.nth(i) == 1) 3 else 0))
+      a.observations.nth(a.observations.length()-1).result == (if (not(old.retained)) 4 else if (old.records.nth(i) == 2) 2 else
+        if (old.records.nth(i) == 3) 5 else if (old.records.nth(i) == 4) 6 else if (old.records.nth(i) == 1) 3 else 0))
     val error10 = flag(error9,"R3",Runs.forall(k => a.db.runs.nth(k).frontier.forall(j => a.db.runs.nth(k).records.nth(j) == 2)))
     val error11 = flag(error10,"W1",copyStable and a.db.copies.indices().forall(k => {
       val e = a.db.copies.nth(k)
@@ -275,25 +317,25 @@ module contract {
         a.db.admissions.nth(r) == b.db.admissions.nth(r)+1 and c.triggerEpoch == c.epoch and
         not(c.tripped) and not(c.running >= 0 and live(b.db.runs.nth(c.running)))
         else a.db.admissions == b.db.admissions)))
-    val rearmDue = Set("finish","timeout").contains(op) and old.outcome == 0 and execution.outcome != 0 and
+    val rearmDue = Set("finish","timeout","conflict","cancel").contains(op) and old.outcome == 0 and execution.outcome != 0 and
       old.epoch == c.triggerEpoch and c.rearm and c.due < 0 and c.running == r and not(c.tripped)
     val error20 = flag(error19,"T2",d.triggerEpoch == d.epoch and
       (not(rearmDue) or d.epoch != c.epoch or d.tripped or d.due == b.now+2) and
-      (op != "activate" or (d.epoch == c.epoch+1 and d.due == (if (i == 0) b.now+2 else -1))))
+      (op != "activate" or c == d or (d.epoch == c.epoch+1 and d.due == (if (i == 0) b.now+2 else -1))))
     val error21 = flag(error20,"T3",Runs.forall(k => {
       val x = b.db.runs.nth(k)
       val y = a.db.runs.nth(k)
       not(x.admitted) or x.deadline == y.deadline
     }) and (op != "intent" or a.db == b.db or b.now < old.deadline))
-    val error22 = flag(error21,"V1",admissionStable and (op != "activate" or d.active == i+1))
-    val terminalObservation = Set("finish","timeout").contains(op) and old.outcome == 0 and execution.outcome != 0
+    val error22 = flag(error21,"V1",admissionStable and (op != "activate" or c == d or d.active == i+1))
+    val terminalObservation = Set("finish","timeout","conflict").contains(op) and old.outcome == 0 and execution.outcome != 0
     val qualifying = execution.outcome >= 2 and execution.outcome <= 4
     val breakerCorrect = if (not(terminalObservation)) true else if (old.epoch != c.epoch) c == d
       else if (qualifying and c.faults == 1) d.faults == 0 and
         (if (c.previous > 0) d.active == c.previous and d.epoch == c.epoch+1 else d.tripped and d.due == -1)
       else d.faults == (if (qualifying) c.faults+1 else if (execution.outcome == 1) 0 else c.faults)
     val error23 = flag(error22,"V2",d.faults < 2 and breakerCorrect and
-      (op != "activate" or (d.faults == 0 and not(d.tripped))))
+      (op != "activate" or c == d or (d.faults == 0 and not(d.tripped))))
     val error24 = flag(error23,"V3",(op != "claim" or b.db == a.db or compatible(old.app,w)) and
       (not(workerMutation) or b.db == a.db or compatible(old.app,w)))
     val error25 = flag(error24,"O2",Runs.forall(k => {
@@ -302,8 +344,8 @@ module contract {
       not(x.retained) or y.retained or (x.outcome != 0 and b.now >= x.ended+5)
     }) and admissionStable)
     val error26 = flag(error25,"O3",a.workers.select(x => x.permit).length() <= 1)
-    val error27 = flag(error26,"X1",Runs.forall(k => a.db.runs.nth(k).mode != 1 or a.sends.nth(k).nth(0) == 0))
-    val error28 = flag(error27,"X2",Runs.forall(k => a.db.runs.nth(k).mode != 2 or a.sends.nth(k) == [0,0]))
+    val error27 = flag(error26,"X1",Runs.forall(k => a.db.runs.nth(k).mode != 1 or Calls.forall(j => not(writes(j)) or a.sends.nth(k).nth(j) == 0)))
+    val error28 = flag(error27,"X2",Runs.forall(k => a.db.runs.nth(k).mode != 2 or a.sends.nth(k) == [0,0,0]))
     flag(error28,"X3",admissionStable and terminalStable)
   }
   pure def idealEvent(s: Ideal, e: Observation): Ideal = {
@@ -313,15 +355,19 @@ module contract {
     else if (e.op == "intent")
       { ...s,intents:s.intents.union(Set(key)),legal:s.legal and s.admitted.contains(e.execution) and not(s.intents.contains(key)) }
     else if (e.op == "dispatch")
-      { ...s,dispatched:s.dispatched.union(Set(key)),legal:s.legal and s.intents.contains(key) and not(s.dispatched.contains(key)) and s.inputs.get(e.execution)+e.invocation == e.value }
+      { ...s,dispatched:s.dispatched.union(Set(key)),legal:s.legal and s.intents.contains(key) and
+        (not(s.dispatched.contains(key)) or not(protected(e.invocation))) and s.inputs.get(e.execution)+e.invocation == e.value }
+    else if (e.op == "notExecuted")
+      { ...s,intents:s.intents.exclude(Set(key)),legal:s.legal and s.intents.contains(key) and not(s.dispatched.contains(key)) and not(s.results.keys().contains(key)) }
     else if (e.op == "result")
       { ...s,results:s.results.put(key,e.value),legal:s.legal and s.dispatched.contains(key) and not(s.results.keys().contains(key)) }
     else if (e.op == "checkpoint")
       { ...s,checkpoints:s.checkpoints.union(Set(key)),legal:s.legal and s.results.keys().contains(key) and s.results.get(key) == e.value }
     else if (e.op == "recover")
-      { ...s,legal:s.legal and (if (e.result == 2) s.results.keys().contains(key) and s.results.get(key) == e.value
-        else if (e.result == 3) s.intents.contains(key) and not(s.results.keys().contains(key)) else true) }
-    else if (e.op == "finish" or e.op == "timeout")
+      { ...s,legal:s.legal and (if (e.result == 2 or e.result == 5) s.results.keys().contains(key) and s.results.get(key) == e.value
+        else if (e.result == 3) s.intents.contains(key) and not(s.results.keys().contains(key))
+        else if (e.result == 6) not(s.intents.contains(key)) and not(s.results.keys().contains(key)) else true) }
+    else if (e.op == "finish" or e.op == "timeout" or e.op == "conflict")
       { ...s,terminal:s.terminal.put(e.execution,e.value),legal:s.legal and not(s.terminal.keys().contains(e.execution)) }
     else if (e.op == "accept")
       { ...s,accepted:s.accepted.put(key,e.value),legal:s.legal and not(s.accepted.keys().contains(key)) and s.admitted.contains(e.execution) }
@@ -331,7 +377,8 @@ module contract {
         s.accepted.keys().contains(copy) and s.accepted.get(copy) == e.value and not(s.consumed.contains(copy)) and not(s.takes.keys().contains(key)) }
     } else s
   }
-  action init = all { m' = initial, ideal' = emptyIdeal }
+  pure val noCommand: Command = { r: 0, w: 0, i: 0, value: 0, fault: 0 }
+  action init = all { m' = initial, ideal' = emptyIdeal, command' = { tag: "init", value: noCommand } }
   // Fault: 0 none; 1 boundary crash; 2 ambiguous commit; 3 duplicate delivery;
   // 4 reordering; 5 racers; 6 expiry; 7 bounded clock jump; 8 disconnect;
   // 9 invalid data; 10 activation; 11 mixed deployment. Concurrent operations
@@ -353,19 +400,21 @@ module contract {
     val errors = if (fault == 3 and commits) audit({ ...first,violations:errorsFirst },persisted,operation,r,actor,i,value) else errorsFirst
     val atomic = (commits or persisted.db == before.db) and persisted.observations.slice(before.observations.length(),persisted.observations.length()).elems().forall(e =>
       if (e.op == "intent") persisted.db.runs.nth(e.execution).records.nth(e.invocation) >= 1
-      else if (e.op == "result") persisted.db.runs.nth(e.execution).records.nth(e.invocation) == 2
+      else if (e.op == "result") Set(2,3).contains(persisted.db.runs.nth(e.execution).records.nth(e.invocation))
+      else if (e.op == "notExecuted") persisted.db.runs.nth(e.execution).records.nth(e.invocation) == 4
       else if (e.op == "checkpoint") persisted.db.runs.nth(e.execution).frontier.contains(e.invocation)
       else if (e.op == "admit") persisted.db.runs.nth(e.execution).admitted else true)
     val stoppedOnError = (not(Set(1,2,8).contains(fault)) or stopped.workers.nth(actor).stopped) and (op != "dispatch" or persisted.sends == before.sends or not(before.workers.nth(actor).stopped))
     val observations = persisted.observations.slice(before.observations.length(),persisted.observations.length())
     all {
       m' = { ...stopped, violations:flag(flag(errors,"A2",atomic),"O1",stoppedOnError),faultsSeen:m.faultsSeen.union(Set(fault)) },
-      ideal' = observations.foldl(ideal,(a,e) => idealEvent(a,e))
+      ideal' = observations.foldl(ideal,(a,e) => idealEvent(a,e)),
+      command' = { tag: op, value: { r: r, w: w, i: i, value: value, fault: fault } }
     }
   }
   action step = {
-    nondet op = Set("admit","dry","replay","claim","renew","intent","dispatch","result","recover","checkpoint",
-      "subscribe","address","publish","take","expire","child","finish","timeout","cancel",
+    nondet op = Set("admit","dry","replay","claim","renew","release","intent","dispatch","result","notExecuted","recover",
+      "checkpoint","conflict","subscribe","address","publish","take","expire","child","finish","timeout","cancel",
       "activate","fire","ingress","sweep","crash","tick").oneOf()
     nondet r = Runs.oneOf()
     nondet w = Workers.oneOf()
@@ -417,11 +466,11 @@ module contract {
       (x.outcome == 0 or (ideal.terminal.keys().contains(r) and ideal.terminal.get(r) == x.outcome)) and
       Calls.forall(i => {
         val k = (r,i)
-        (x.records.nth(i) > 0 == ideal.intents.contains(k)) and
-        (x.records.nth(i) == 2 == ideal.results.keys().contains(k)) and
-        (x.records.nth(i) != 2 or ideal.results.get(k) == x.values.nth(i)) and
+        (Set(1,2,3).contains(x.records.nth(i)) == ideal.intents.contains(k)) and
+        (Set(2,3).contains(x.records.nth(i)) == ideal.results.keys().contains(k)) and
+        (not(Set(2,3).contains(x.records.nth(i))) or ideal.results.get(k) == x.values.nth(i)) and
         (x.frontier.contains(i) == ideal.checkpoints.contains(k)) and
-        (m.sends.nth(r).nth(i) == (if (ideal.dispatched.contains(k)) 1 else 0))
+        (m.sends.nth(r).nth(i) > 0 == ideal.dispatched.contains(k))
       })
     }) and m.db.copies.elems().forall(e => {
       val k = (e.recipient,e.id)
