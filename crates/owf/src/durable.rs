@@ -138,7 +138,9 @@ use std::collections::BTreeMap;
 /// 3: the workflow deadline counts from admission (`Execution::started_ms`
 /// is the admission instant), and a mailbox copy that expired before a listen
 /// took it leaves `Record::Expired` at `mailbox#expired[i]`.
-pub const VERSION: u32 = 3;
+/// 4: the store keeps one row per record and per event copy instead of one
+/// aggregate per run; a run row of an earlier version is refused.
+pub const VERSION: u32 = 4;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

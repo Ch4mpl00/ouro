@@ -348,7 +348,7 @@ pub fn run_all(factory: impl Fn(&str) -> anyhow::Result<TestStore>) -> anyhow::R
     report.witnesses.insert("breaker rolls back without changing pinned runs");
     decisions(&factory, &mut report)?;
 
-    // Inject before every aggregate write, before commit, and after commit.
+    // Inject before each of the first row writes, before commit, and after commit.
     // Child start touches both parent and child. Terminal finish may also
     // touch definitions and every live descendant; each point gets a fresh DB.
     for operation in [
@@ -526,7 +526,7 @@ pub fn run_all(factory: impl Fn(&str) -> anyhow::Result<TestStore>) -> anyhow::R
     }
     report.witnesses.insert("rollback at each write and ambiguous committed error");
 
-    // Generated overlapping event histories. Check actual stored aggregates
+    // Generated overlapping event histories. Check actual stored runs
     // after EVERY operation, then drain surviving listeners to completion.
     for seed in 1..=24u64 {
         let t = factory("history")?;
@@ -637,7 +637,8 @@ pub fn run_all(factory: impl Fn(&str) -> anyhow::Result<TestStore>) -> anyhow::R
     t.store.start(&admission("r"), 0)?;
     let before = t.backend.snapshot()?;
     let mut corrupt = before.rows.clone();
-    corrupt.get_mut(&("run".into(), "r".into())).unwrap()["records"]["bad"] = json!("invalid record");
+    let bad = (crate::engine::records_of("r"), "bad".to_string());
+    corrupt.insert(bad.clone(), json!("invalid record"));
     assert!(t.backend.compare_exchange(&before, &corrupt)?);
     let reopened = (t.reopen)()?;
     let fence = reopened.claim("r", LEASE_MS + 1)?.unwrap();
@@ -645,10 +646,7 @@ pub fn run_all(factory: impl Fn(&str) -> anyhow::Result<TestStore>) -> anyhow::R
     assert!(reopened.save_record(&fence, "bad", &Record::Timer { deadline_ms: 1 }, LEASE_MS + 1).is_err());
     assert!(reopened.cancel("r", LEASE_MS + 1)?);
     assert_eq!(reopened.get("r")?.unwrap().outcome, Some(Status::Cancelled));
-    assert_eq!(
-        t.backend.snapshot()?.rows[&("run".into(), "r".into())]["records"],
-        corrupt[&("run".into(), "r".into())]["records"]
-    );
+    assert_eq!(t.backend.snapshot()?.rows[&bad], corrupt[&bad]);
     report.witnesses.insert("corruption fails closed without erasure");
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().start_paused(true).build()?;
     for mode in 0..4 {

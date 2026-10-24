@@ -35,7 +35,7 @@ fn bounded<T>(
 fn bounds(backend: Arc<dyn AtomicBackend>, metrics: Arc<Metrics>) -> anyhow::Result<()> {
     support::seed(&backend, 10_000)?;
     decided(&backend, &metrics)?;
-    let s = TransactionalStore::new(backend);
+    let s = TransactionalStore::new(backend.clone());
     let mut a = admission("target:r");
     a.name = "target".into();
     bounded(&metrics, "save_definition", 0, || s.save_definition("target", "one"))?;
@@ -140,10 +140,31 @@ fn bounds(backend: Arc<dyn AtomicBackend>, metrics: Arc<Metrics>) -> anyhow::Res
     assert_eq!(bounded(&metrics, "due_page", 7, || s.due(1, 7))?.len(), 7);
     assert!(bounded(&metrics, "due_empty", 0, || s.due(-1, 7))?.is_empty());
     assert!(bounded(&metrics, "due_zero_limit", 0, || s.due(i64::MAX, 0))?.is_empty());
-    bounded(&metrics, "sweep", 6, || s.sweep(1, 0))?;
+    sweep_bounded(&backend, &metrics, "sweep", || s.sweep(1, 0))?;
     assert_eq!(bounded(&metrics, "sweep_already_swept", 0, || s.sweep(1, 0))?, ouro_durable::Swept::default());
     assert_eq!(s.list(None, "seed").unwrap().len(), 10_000);
     Ok(())
+}
+
+/// Retention reads what it removes: the swept runs' records, copies and their
+/// index rows, one row apiece, counted from persisted rows outside the
+/// measurement.
+fn sweep_bounded(
+    backend: &Arc<dyn AtomicBackend>,
+    metrics: &Metrics,
+    label: &str,
+    sweep: impl FnOnce() -> anyhow::Result<ouro_durable::Swept>,
+) -> anyhow::Result<ouro_durable::Swept> {
+    let kept = backend.snapshot()?.rows.len();
+    metrics.reset();
+    let swept = sweep()?;
+    let counts = metrics.counts();
+    let removed = u64::try_from(kept - backend.snapshot()?.rows.len())?;
+    assert!(removed > 0, "{label}: nothing swept");
+    assert!(counts.rows_read <= 32 + 4 * removed && counts.rows_written <= 16 + 4 * removed, "{label}: {counts:?}");
+    assert_eq!(counts.conflicts, 0);
+    eprintln!("BOUND,{label},{},{},matches={removed}", counts.rows_read, counts.rows_written);
+    Ok(swept)
 }
 
 /// The paths the #3/#4 decisions added or changed, against the same 10,000

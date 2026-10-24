@@ -23,6 +23,7 @@ pub fn seed(backend: &Arc<dyn AtomicBackend>, size: usize) -> anyhow::Result<()>
         store.finish(&f, &outcome, if mode == 1 { 1_000_000 } else { 0 }, 3)?;
     }
     let templates = backend.snapshot()?.rows;
+    let hex = |id: &str| id.bytes().map(|b| format!("{b:02x}")).collect::<String>();
     // Chunked transactions also respect the Postgres session deadline.
     for first in (0..size).step_by(200) {
         let mut tx = backend.begin()?;
@@ -34,6 +35,9 @@ pub fn seed(backend: &Arc<dyn AtomicBackend>, size: usize) -> anyhow::Result<()>
                     let mut value = value.clone();
                     value["run"]["admission"]["id"] = json!(id);
                     tx.put(kind, &id, &value)?;
+                } else if kind.contains(&hex(&original)) {
+                    // The run's own rows (its records), partitioned by its id.
+                    tx.put(&kind.replace(&hex(&original), &hex(&id)), key, value)?;
                 } else if value == &json!(original) {
                     tx.put(kind, &key.replace(&original, &id), &json!(id))?;
                 }
