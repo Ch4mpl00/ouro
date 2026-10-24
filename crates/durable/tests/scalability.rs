@@ -32,7 +32,7 @@ fn bounded<T>(
     eprintln!("BOUND,{label},{},{},matches={matches}", counts.rows_read, counts.rows_written);
     Ok(result)
 }
-fn bounds(backend: Arc<dyn AtomicBackend>, metrics: Arc<Metrics>) -> anyhow::Result<()> {
+fn bounds(backend: Arc<dyn AtomicBackend>, metrics: Arc<Metrics>, validation: u64) -> anyhow::Result<()> {
     support::seed(&backend, 10_000)?;
     decided(&backend, &metrics)?;
     let s = TransactionalStore::new(backend.clone());
@@ -143,6 +143,7 @@ fn bounds(backend: Arc<dyn AtomicBackend>, metrics: Arc<Metrics>) -> anyhow::Res
     sweep_bounded(&backend, &metrics, "sweep", || s.sweep(1, 0))?;
     assert_eq!(bounded(&metrics, "sweep_already_swept", 0, || s.sweep(1, 0))?, ouro_durable::Swept::default());
     assert_eq!(s.list(None, "seed").unwrap().len(), 10_000);
+    long_run(&backend, &metrics, validation)?;
     Ok(())
 }
 
@@ -165,6 +166,92 @@ fn sweep_bounded(
     assert_eq!(counts.conflicts, 0);
     eprintln!("BOUND,{label},{},{},matches={removed}", counts.rows_read, counts.rows_written);
     Ok(swept)
+}
+
+/// One run holding 10,000 records (1,000 of them consumed events) and a
+/// backlog of pending mailbox copies, among the 10,000 seeded runs: every
+/// per-record operation reads and writes a constant number of rows, and
+/// `load_records` reads exactly the run's row and its records. `validation`
+/// is how often the adapter counts one read (memory validates every read at
+/// commit).
+fn long_run(backend: &Arc<dyn AtomicBackend>, metrics: &Metrics, validation: u64) -> anyhow::Result<()> {
+    const RECORDS: usize = 10_000;
+    const EVENTS: usize = 1_000;
+    const BACKLOG: usize = 100;
+    let s = TransactionalStore::new(backend.clone()).with_policy(Policy { mailbox_ms: 1_000, ..Policy::default() });
+    let mut a = admission("long:r");
+    a.name = "long".into();
+    let id = a.id.clone();
+    let f = s.start(&a, 0)?.unwrap();
+    let types = vec!["long".to_string()];
+    for n in 0..EVENTS {
+        s.deliver(&event(&format!("long{n}"), "long", json!(n)), Some(&id), 0)?;
+        s.take_event(&f, &format!("/do/{n}/listen#event[0]"), &types, 0)?.unwrap();
+    }
+    for n in EVENTS..RECORDS {
+        s.save_record(&f, &format!("/do/{n}/step#wait"), &Record::Timer { deadline_ms: 42 }, 0)?;
+    }
+    // Pending copies of a type nobody listens for, expiring at 1,000.
+    for n in 0..BACKLOG {
+        s.deliver(&event(&format!("backlog{n}"), "backlog", json!(n)), Some(&id), 0)?;
+    }
+    let timer = Record::Timer { deadline_ms: 42 };
+    bounded(metrics, "long_save_record", 0, || s.save_record(&f, "/do/new/step#wait", &timer, 1))?;
+    bounded(metrics, "long_save_record_again", 0, || s.save_record(&f, "/do/new/step#wait", &timer, 1))?;
+    let call = |state| Record::Call {
+        logical: "/do/call".into(),
+        function: "f".into(),
+        arguments: json!({}),
+        effect: owf::run::Effect::Write,
+        delivery: owf::durable::Delivery::AtMostOnce,
+        state,
+    };
+    bounded(metrics, "long_save_record_intent", 0, || {
+        s.save_record(&f, "/do/call#call", &call(owf::durable::CallState::Pending), 1)
+    })?;
+    bounded(metrics, "long_save_record_result", 0, || {
+        s.save_record(&f, "/do/call#call", &call(owf::durable::CallState::Done(Ok(json!(1)))), 1)
+    })?;
+    assert!(s.save_record(&f, "/do/1000/step#wait", &Record::Timer { deadline_ms: 43 }, 1).is_err());
+    // Exactly the run's row and its records: nothing of other runs.
+    let records = u64::try_from(RECORDS + 2)?;
+    metrics.reset();
+    assert_eq!(s.load_records(&f, 1)?.len(), RECORDS + 2);
+    let counts = metrics.counts();
+    assert_eq!((counts.rows_read, counts.rows_written), (validation * (records + 1), 0), "long_load_records");
+    eprintln!("BOUND,long_load_records,{},{},records={records}", counts.rows_read, counts.rows_written);
+    bounded(metrics, "long_register_wait", 0, || s.register_wait(&f, &types, 1))?;
+    let next = event("long-next", "long", json!("next"));
+    assert_eq!(bounded(metrics, "long_deliver", 1, || s.deliver(&next, Some(&id), 1))?, Some(id.clone()));
+    assert_eq!(bounded(metrics, "long_deliver_again", 1, || s.deliver(&next, Some(&id), 1))?, Some(id.clone()));
+    let taken = bounded(metrics, "long_take_event", 0, || s.take_event(&f, "/do/next#event[0]", &types, 1))?;
+    assert_eq!(taken.unwrap()["data"], "next");
+    bounded(metrics, "long_take_event_replay", 0, || s.take_event(&f, "/do/next#event[0]", &types, 1))?;
+    assert!(
+        bounded(metrics, "long_take_event_pending", 0, || s.take_event(&f, "/do/wait#event[0]", &types, 1))?.is_none()
+    );
+    bounded(metrics, "long_renew", 0, || s.renew(&f, 1))?;
+    bounded(metrics, "long_finish_waiting", 0, || s.finish(&f, &Status::Waiting { wake_at_ms: 500 }, 1, 3))?;
+    assert_eq!(s.get(&id)?.unwrap().wake_at_ms, 500, "the backlog is not waited for");
+    let f = bounded(metrics, "long_claim", 0, || s.claim(&id, 1_000))?.unwrap();
+    // The backlog's time is over: a take consumes it with expiry records,
+    // reading the expired copies only.
+    let expired = u64::try_from(BACKLOG)?;
+    metrics.reset();
+    assert!(s.take_event(&f, "/do/late#event[0]", &types, 1_000)?.is_none());
+    let counts = metrics.counts();
+    // Per expired copy: its index row and copy are read, its expiry record
+    // and copy written and its three pending rows dropped.
+    assert!(counts.rows_read <= 32 + 6 * validation * expired, "long_take_event_expired: {counts:?}");
+    assert!(counts.rows_written <= 16 + 5 * expired, "long_take_event_expired: {counts:?}");
+    assert_eq!(counts.conflicts, 0);
+    eprintln!("BOUND,long_take_event_expired,{},{},matches={expired}", counts.rows_read, counts.rows_written);
+    assert_eq!(s.load_records(&f, 1_000)?.len(), RECORDS + 3 + BACKLOG);
+    assert!(bounded(metrics, "long_cancel", 0, || s.cancel(&id, 1_000))?);
+    let swept = sweep_bounded(backend, metrics, "long_sweep", || s.sweep(2_000, 0))?;
+    assert!(swept.records >= RECORDS + 3 + BACKLOG);
+    assert!(s.inspect(&id)?.unwrap().records.is_empty());
+    Ok(())
 }
 
 /// The paths the #3/#4 decisions added or changed, against the same 10,000
@@ -438,8 +525,15 @@ fn ordering(store: &dyn RunStore) -> anyhow::Result<()> {
     }
     Ok(())
 }
-/// Every range-scanned index kind, the #3/#4 ones included.
-const INDEX_KINDS: [&str; 10] = [
+/// Every range-scanned index kind, the #3/#4 ones and a run's own rows included.
+const INDEX_KINDS: [&str; 17] = [
+    "record:72",
+    "event:72",
+    "event_type:72",
+    "pending:72:616e73776572",
+    "live:72:616e73776572",
+    "published:72",
+    "expiry:72",
     "due",
     "due_app:",
     "wait:616e73776572",
@@ -635,7 +729,7 @@ fn index_atomicity(
 fn memory_scoped_bounds_and_concurrency() {
     let b = Arc::new(MemoryBackend::default());
     index_atomicity(b.clone(), b.metrics.clone(), b.faults.clone()).unwrap();
-    bounds(b.clone(), b.metrics.clone()).unwrap();
+    bounds(b.clone(), b.metrics.clone(), 2).unwrap();
     ordering(&TransactionalStore::new(b.clone())).unwrap();
     workers(
         Arc::new(TransactionalStore::new(b.clone())),
@@ -653,7 +747,7 @@ fn sqlite_scoped_bounds_and_concurrency() {
     let path = dir.path().join("scale.sqlite");
     let b = Arc::new(SqliteBackend::open(&path).unwrap());
     index_atomicity(b.clone(), b.metrics.clone(), b.faults.clone()).unwrap();
-    bounds(b.clone(), b.metrics.clone()).unwrap();
+    bounds(b.clone(), b.metrics.clone(), 1).unwrap();
     ordering(&TransactionalStore::new(b.clone())).unwrap();
     sqlite_query_plans(&path).unwrap();
     workers(Arc::new(TransactionalStore::new(b)), Arc::new(move || Ok(Arc::new(ouro_durable::sqlite::open(&path)?))))
@@ -664,7 +758,7 @@ async fn postgres_scoped_bounds_and_concurrency() {
     support::postgres(|config| {
         let b = Arc::new(PostgresBackend::connect_config(config.clone())?);
         index_atomicity(b.clone(), b.metrics.clone(), b.faults.clone())?;
-        bounds(b.clone(), b.metrics.clone())?;
+        bounds(b.clone(), b.metrics.clone(), 1)?;
         ordering(&TransactionalStore::new(b.clone()))?;
         postgres_query_plans(&config)?;
         workers(
