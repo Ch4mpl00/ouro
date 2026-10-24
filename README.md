@@ -186,12 +186,19 @@ The engine owns primary and secondary keys in `(kind, id)` order:
 
 | Kind | ID | Purpose |
 | --- | --- | --- |
-| `run` | run ID | One run's admission, lease, records, waits and events |
+| `run` | run ID | One run's admission, lease, waits, subscriptions and copy counters |
+| `record:<hex run ID>` | record key | One journal record |
+| `event:<hex run ID>` | sequence | One accepted event copy, pending or consumed, in arrival order |
+| `event_id:<hex run ID>`, `event_type:<hex run ID>` | hex identity, hex type | The copy holding an identity; the first copy of a type |
+| `pending:<hex run ID>:<hex type>`, `published:<hex run ID>` | sequence | Pending copies of a type, and published ones, oldest first |
+| `live:<hex run ID>:<hex type>`, `live_published:<hex run ID>` | ordered expiry + sequence | The same by expiry, for waking a waiting run |
+| `expiry:<hex run ID>` | ordered expiry + sequence | Pending mailbox copies, for expiry records |
 | `definitions` | definition name | One name's immutable versions, epoch, breaker state and armed trigger keys |
 | `name:<hex name>` | run ID | Listing by name and run-ID prefix |
 | `due` | ordered time + run ID | Bounded pages of eligible runs; running runs use lease expiry |
 | `due_app:<hex application version>` | ordered time + run ID | The same per declared application version (empty: undeclared) |
 | `wait:<hex event type>` | ordered registration time + run ID | Oldest eligible delivery, excluding pending copies |
+| `subs:<hex event type>` | run ID | Runs subscribed to published events of a type (or `*`) |
 | `delivered:<hex source, id>` | run ID | A delivered identity's recipient, while it keeps the evidence |
 | `mailbox` | ordered earliest expiry + run ID | Mailbox copies due to expire |
 | `children:<hex parent ID>` | child ID | Live descendants for atomic cancellation |
@@ -205,8 +212,20 @@ run. Times use sign-adjusted, fixed-width hexadecimal; names and event types
 use hexadecimal UTF-8 so delimiters cannot collide. Database composite primary
 keys are B-tree indexes with binary ordering. Point operations touch a constant
 number of rows; listing, cancellation and retention read their matches, and
-`due` reads at most its requested page. JSON work still scales with the evidence
-inside the affected run or the versions of the affected definition name.
+`due` reads at most its requested page.
+
+The run row keeps lifecycle and fencing; what grows with a run's life, its
+records and event copies, are rows of their own, written one key per change
+in the serializable commit that checks the fence. `save_record` reads the run
+row and its record and writes the record (a run's first record also marks
+the run row for retention), so its cost does not depend on how many records
+the run holds. `load_records` is one ordered range read of the run's records.
+A take reads one indexed row per listed type and consumes the copy with a
+constant number of writes; expiry reads only the expired copies. A copy's
+identity and type are point lookups. The run row still holds what is bounded by
+the workflow's open listens (waits, listeners, subscriptions, per-type pending
+counts), plus one `waiting:` wait per owned child; JSON work there scales with
+those, and with the versions of the affected definition name.
 
 SQLite uses `BEGIN IMMEDIATE`, WAL and `synchronous = FULL`. Postgres uses
 `SERIALIZABLE`; memory validates per-key versions and limited range results,
@@ -220,8 +239,11 @@ Both initial migrations were replaced before any release or deployment. This
 layout requires a fresh database from the earlier development checkout; there
 is no conversion of that unreleased layout. Applied migrations are immutable
 from the next release onward. The SQL schema is a generic key/value table, so
-the row shapes above (and the interpreter's durable state version, now 3) can
-change without a migration; nothing persisted before them is converted.
+the row shapes above (and the interpreter's durable state version, now 4) can
+change without a migration; nothing persisted before them is converted. Each
+run row records the durable state version it was written under, and a row of
+another version (including the earlier one-aggregate-per-run layout) is
+refused with an error rather than read as a run without evidence.
 
 The interpreter's persistence seams are synchronous. The Postgres adapter uses
 `tokio-postgres` and `deadpool-postgres` on a dedicated I/O thread with a
@@ -257,12 +279,14 @@ corruption, concurrent claims, retention and liveness drains. Factories supply
 an independent reopen handle, persisted-row inspection and failure injection.
 
 `cargo test -p ouro-durable --test scalability -- --nocapture` checks every
-operation's row bound with 10,000 unrelated persisted runs, full inboxes,
-index rollback boundaries, eight contending workers, lease replacement and
-an exact shared breaker count on all three adapters. Backend `Metrics` expose
+operation's row bound with 10,000 unrelated persisted runs, a run holding
+10,000 records and a mailbox backlog (`load_records` reads exactly its rows),
+full inboxes, index rollback boundaries, eight contending workers, lease
+replacement and an exact shared breaker count on all three adapters. Backend `Metrics` expose
 returned rows, attempted row mutations and definite conflicts; memory also
-counts its validation reads. The ignored local benchmark reports start,
-claim, save-record and finish operations per second at 1,000 and 10,000 runs:
+counts its validation reads. The ignored local benchmarks report start,
+claim, save-record and finish operations per second at 1,000 and 10,000 runs,
+and a run's save rate over the first and last tenth of 5,000 records:
 
 ```sh
 cargo test -p ouro-durable --test throughput -- --ignored --nocapture

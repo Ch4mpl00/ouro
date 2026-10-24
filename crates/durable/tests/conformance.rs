@@ -1,5 +1,5 @@
 use ouro_durable::{
-    AtomicBackend, TransactionalStore,
+    AtomicBackend, Snapshot, TransactionalStore,
     conformance::{self, TestStore},
     memory::MemoryBackend,
     postgres::PostgresBackend,
@@ -145,4 +145,32 @@ fn concurrent_claims_and_cas_writes_have_one_winner() {
         })
         .collect();
     assert_eq!(workers.into_iter().map(|w| usize::from(w.join().unwrap())).sum::<usize>(), 1);
+}
+
+#[test]
+fn run_rows_of_another_state_version_are_refused() {
+    use ouro_durable::RunStore;
+    let backend = Arc::new(MemoryBackend::default());
+    let s = TransactionalStore::new(backend.clone());
+    s.start(&conformance::admission("r"), 0).unwrap();
+    let key = ("run".to_string(), "r".to_string());
+    for version in [None, Some(3)] {
+        let before = backend.snapshot().unwrap();
+        let mut rows = before.rows.clone();
+        let run = rows.get_mut(&key).unwrap().as_object_mut().unwrap();
+        // The earlier layout: one aggregate holding the records, no version.
+        run.insert("records".into(), serde_json::json!({ "wait": { "kind": "timer", "deadline_ms": 1 } }));
+        match version {
+            Some(v) => run.insert("version".into(), serde_json::json!(v)),
+            None => run.remove("version"),
+        };
+        assert!(backend.compare_exchange(&before, &rows).unwrap());
+        let refused = s.get("r").unwrap_err().to_string();
+        assert!(refused.contains("unsupported durable state version"), "{refused}");
+        assert!(s.claim("r", ouro_durable::LEASE_MS + 1).is_err());
+        assert!(s.inspect("r").is_err() && s.list(None, "").is_err() && s.cancel("r", 0).is_err());
+        assert_eq!(backend.snapshot().unwrap(), Snapshot { rows }, "a refused row is left as it is");
+        let current = backend.snapshot().unwrap();
+        assert!(backend.compare_exchange(&current, &before.rows).unwrap());
+    }
 }

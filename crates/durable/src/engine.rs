@@ -3,27 +3,70 @@
 //! publication and expiry; 4. triggers, ingress tombstones and activation
 //! epochs; 5. termination and the breaker; 6. the `RunStore` implementation.
 use crate::*;
-use owf::{durable::check_transition, run::WorkflowError};
+use owf::{
+    durable::{VERSION, check_transition},
+    run::WorkflowError,
+};
 use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::json;
 
 // ── 1. rows and index keys ─────────────────────────────────────────────────
 
+// The run row holds lifecycle and fencing and the run's state bounded by its
+// open listens: waits, listeners, subscriptions, plus counters summarising
+// its copies. What grows with the run's life has rows of its own, partitioned
+// by the run (`<family>:<hex run id>`), read by ordered range scans and
+// written one key per change in the commit that checks the fence:
+//
+// | Family | ID | Value |
+// | --- | --- | --- |
+// | `record` | record key | One journal record, decoded only by journal operations |
+// | `event` | sequence | One accepted copy (`StoredEvent`), pending or consumed |
+// | `event_id` | hex identity | The sequence of the copy holding a `source` + `id` |
+// | `event_type` | hex type | The sequence of the first copy of a type |
+// | `pending:<hex type>` | sequence | A pending copy of the type, in arrival order |
+// | `live:<hex type>` | expiry + sequence | The same by expiry (none: never), whether it is a CloudEvent |
+// | `published` | sequence | A pending published copy, for wildcard takes |
+// | `live_published` | expiry + sequence | The same by expiry |
+// | `expiry` | expiry + sequence | A pending mailbox copy, until it is taken or expires |
+//
+// Consumed copies keep only their `event`, `event_id` and `event_type` rows;
+// `sweep` removes every row of a finished run's evidence. A save therefore
+// touches the run row, its record and nothing that grows with the run.
 // Journal bytes are decoded only by journal operations. Corrupt evidence
 // prevents replay but must not prevent terminal cancellation or erase itself.
 #[derive(Serialize, Deserialize)]
 struct StoredRun {
+    /// The durable state version this row was written under. A row of another
+    /// version (or none: the earlier per-run aggregate) is refused, never
+    /// read as a run without evidence.
+    version: u32,
     run: SavedRun,
-    records: BTreeMap<String, Value>,
     awaits: BTreeMap<String, i64>,
     listeners: BTreeMap<String, Vec<String>>,
-    events: Vec<StoredEvent>,
-    #[serde(default)]
     subscriptions: BTreeMap<String, Vec<String>>,
     /// The rearm a firing attached and the trigger that firing stored: a
     /// trigger that differs at the run's end was replaced (a later epoch).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     rearm: Option<(Rearm, Trigger)>,
+    /// Copies accepted so far, the next copy's sequence number. Never reset,
+    /// so a copy's sequence is also its position (`mailbox#expired[i]`).
+    accepted: u64,
+    /// Pending copies (expired ones included until consumed) per type.
+    pending: BTreeMap<String, Pending>,
+    /// Pending published copies, which a wildcard takes.
+    published: u64,
+    /// The earliest expiry among pending mailbox copies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mailbox: Option<i64>,
+    /// Records or copies are stored: `sweep` has evidence to remove.
+    evidence: bool,
+}
+#[derive(Clone, Copy, Default, Serialize, Deserialize)]
+struct Pending {
+    copies: u64,
+    /// Of them, accepted CloudEvents (not lifecycle notifications).
+    cloud: u64,
 }
 
 /// An ingress identity a trigger took, until `expires_at_ms`.
@@ -42,8 +85,20 @@ fn get<T: DeserializeOwned>(rows: &mut dyn Transaction, kind: &str, id: &str) ->
 fn put(rows: &mut dyn Transaction, kind: &str, id: &str, value: &impl Serialize) -> anyhow::Result<()> {
     rows.put(kind, id, &serde_json::to_value(value)?)
 }
+fn stored_run(value: Value) -> anyhow::Result<StoredRun> {
+    let version = value.get("version").and_then(Value::as_u64);
+    anyhow::ensure!(
+        version == Some(u64::from(VERSION)),
+        "unsupported durable state version {} of a run row (expected {VERSION}); earlier layouts are not converted",
+        version.map_or_else(|| "none".into(), |v| v.to_string())
+    );
+    Ok(serde_json::from_value(value)?)
+}
+fn find_run(rows: &mut dyn Transaction, id: &str) -> anyhow::Result<Option<StoredRun>> {
+    rows.get("run", id)?.map(stored_run).transpose()
+}
 fn run(rows: &mut dyn Transaction, id: &str) -> anyhow::Result<StoredRun> {
-    get(rows, "run", id)?.ok_or_else(|| anyhow::anyhow!("unknown run {id}"))
+    find_run(rows, id)?.ok_or_else(|| anyhow::anyhow!("unknown run {id}"))
 }
 fn component(value: &str) -> String {
     value.as_bytes().iter().map(|b| format!("{b:02x}")).collect()
@@ -61,6 +116,38 @@ fn until(ms: i64) -> String {
 }
 fn partition(kind: &str, value: &str) -> String {
     format!("{kind}:{}", component(value))
+}
+/// A run's records, one row each, keyed by record key.
+pub(crate) fn records_of(run: &str) -> String {
+    partition("record", run)
+}
+fn events_of(run: &str) -> String {
+    partition("event", run)
+}
+fn identities_of(run: &str) -> String {
+    partition("event_id", run)
+}
+fn types_of(run: &str) -> String {
+    partition("event_type", run)
+}
+fn pending_of(run: &str, type_: &str) -> String {
+    format!("{}:{}", partition("pending", run), component(type_))
+}
+fn live_of(run: &str, type_: &str) -> String {
+    format!("{}:{}", partition("live", run), component(type_))
+}
+fn published_of(run: &str) -> String {
+    partition("published", run)
+}
+fn live_published_of(run: &str) -> String {
+    partition("live_published", run)
+}
+fn expiring_of(run: &str) -> String {
+    partition("expiry", run)
+}
+/// Copies are keyed by their fixed-width sequence, so ranges keep arrival order.
+fn sequence(n: u64) -> String {
+    format!("{n:016x}")
 }
 fn prefix_end(prefix: &str) -> Option<String> {
     let mut chars: Vec<_> = prefix.chars().collect();
@@ -92,6 +179,8 @@ fn payload(event: &Value) -> Value {
 }
 // Index only eligible waits and unswept evidence: a full inbox or an already
 // swept run must not make subsequent lookups walk historical registrations.
+// Everything here derives from the run row; the copies' own index rows and
+// `delivered` change with the copy, in the same commit.
 fn indexes(s: &StoredRun) -> Rows {
     let mut keys = Rows::new();
     let id = &s.run.admission.id;
@@ -110,7 +199,7 @@ fn indexes(s: &StoredRun) -> Rows {
             keys.insert(key(&partition("children", &link.parent), id), value.clone());
         }
         for (t, at) in &s.awaits {
-            if !s.events.iter().any(|e| e.type_ == *t && e.consumed_key.is_none()) {
+            if !s.pending.contains_key(t) {
                 keys.insert(key(&partition("wait", t), &timed(*at, id)), value.clone());
             }
         }
@@ -119,24 +208,17 @@ fn indexes(s: &StoredRun) -> Rows {
             keys.insert(key(&partition("subs", t), id), value.clone());
         }
         // The earliest mailbox expiry, for `sweep`.
-        if let Some(at) = s.events.iter().filter(|e| e.consumed_key.is_none()).filter_map(|e| e.expires_at_ms).min() {
+        if let Some(at) = s.mailbox {
             keys.insert(key("mailbox", &timed(at, id)), value.clone());
         }
-    } else if !s.records.is_empty() || !s.events.is_empty() {
+    } else if s.evidence {
         keys.insert(key("finished", &timed(s.run.ended_ms.unwrap(), id)), value.clone());
-    }
-    // A delivered identity leads a redelivery back to its recipient for as
-    // long as the recipient keeps that evidence.
-    for e in s.events.iter().filter(|e| e.delivered) {
-        if let Some(identity) = e.envelope.as_ref().and_then(identity) {
-            keys.insert(key(&partition("delivered", &identity), id), value.clone());
-        }
     }
     keys
 }
 fn store_run(rows: &mut dyn Transaction, snapshot: &StoredRun) -> anyhow::Result<()> {
     let id = &snapshot.run.admission.id;
-    let old: Option<StoredRun> = get(rows, "run", id)?;
+    let old = find_run(rows, id)?;
     let before = old.as_ref().map(indexes).unwrap_or_default();
     let after = indexes(snapshot);
     for ((kind, id), value) in crate::backend::changes(&before, &after) {
@@ -196,7 +278,7 @@ fn claim_run(snapshot: &mut StoredRun, now: i64, owner: &str) -> anyhow::Result<
 /// Admits a run once. Its admission instant and the activation epoch it
 /// belongs to (when it runs the active version) are fixed here.
 fn insert(rows: &mut dyn Transaction, admission: &Admission, now: i64) -> anyhow::Result<bool> {
-    if let Some(existing) = get::<StoredRun>(rows, "run", &admission.id)? {
+    if let Some(existing) = find_run(rows, &admission.id)? {
         anyhow::ensure!(existing.run.admission.name == admission.name, "run already belongs to another definition");
         return Ok(false);
     }
@@ -220,12 +302,16 @@ fn insert(rows: &mut dyn Transaction, admission: &Admission, now: i64) -> anyhow
                 admitted_ms: now,
                 epoch,
             },
-            records: BTreeMap::new(),
+            version: VERSION,
             awaits: BTreeMap::new(),
             listeners: BTreeMap::new(),
-            events: Vec::new(),
             subscriptions: BTreeMap::new(),
             rearm: None,
+            accepted: 0,
+            pending: BTreeMap::new(),
+            published: 0,
+            mailbox: None,
+            evidence: false,
         },
     )?;
     Ok(true)
@@ -247,12 +333,12 @@ fn expired(e: &StoredEvent, now: i64) -> bool {
 fn published(e: &StoredEvent) -> bool {
     e.envelope.is_some() && !e.delivered
 }
-/// Whether a pending event may be taken by `types` (`*` takes published ones).
-fn takes(types: &[String], event: &StoredEvent) -> bool {
-    types.contains(&event.type_) || (published(event) && types.iter().any(|t| t == "*"))
-}
 fn subscribed(snapshot: &StoredRun, event: &StoredEvent) -> bool {
-    event.envelope.is_some() && snapshot.subscriptions.values().any(|types| takes(types, event))
+    event.envelope.is_some()
+        && snapshot
+            .subscriptions
+            .values()
+            .any(|types| types.contains(&event.type_) || (published(event) && types.iter().any(|t| t == "*")))
 }
 /// A pending, unexpired copy the run is waiting or subscribed for.
 fn wanted(snapshot: &StoredRun, event: &StoredEvent, now: i64) -> bool {
@@ -276,30 +362,145 @@ fn envelope(event: &StoredEvent) -> anyhow::Result<Value> {
         None => json!({"type":event.type_, "data":event.data, "time":time}),
     })
 }
-/// Consumes every pending copy whose mailbox time is over with an observable
-/// `Record::Expired`, keyed by its position. Returns how many expired.
-fn expire(snapshot: &mut StoredRun, now: i64) -> anyhow::Result<usize> {
-    let mut count = 0;
-    for i in 0..snapshot.events.len() {
-        if snapshot.events[i].consumed_key.is_none() && expired(&snapshot.events[i], now) {
-            let k = format!("mailbox#expired[{i}]");
-            let event = envelope(&snapshot.events[i])?;
-            snapshot.records.insert(k.clone(), serde_json::to_value(Record::Expired { event })?);
-            snapshot.events[i].consumed_key = Some(k);
-            count += 1;
+fn copy(rows: &mut dyn Transaction, run: &str, n: u64) -> anyhow::Result<StoredEvent> {
+    get(rows, &events_of(run), &sequence(n))?.ok_or_else(|| anyhow::anyhow!("dangling event index {run}/{n}"))
+}
+/// The index rows of a pending copy: by type in arrival order and by expiry,
+/// the same for published copies, and the mailbox expiry.
+fn pending_rows(run: &str, n: u64, e: &StoredEvent) -> Vec<(String, String, Value)> {
+    // A copy that never expires sorts after every instant, `i64::MAX` included.
+    let live = e.expires_at_ms.map_or_else(|| format!("~:{}", sequence(n)), |at| timed(at, &sequence(n)));
+    let mut keys = vec![
+        (pending_of(run, &e.type_), sequence(n), json!(n)),
+        (live_of(run, &e.type_), live.clone(), json!(e.envelope.is_some())),
+    ];
+    if published(e) {
+        keys.push((published_of(run), sequence(n), json!(n)));
+        keys.push((live_published_of(run), live, json!(n)));
+    }
+    if let Some(at) = e.expires_at_ms {
+        keys.push((expiring_of(run), timed(at, &sequence(n)), json!([at, n])));
+    }
+    keys
+}
+/// Stores a new copy with its rows and counters; the caller stores the run.
+fn push(rows: &mut dyn Transaction, s: &mut StoredRun, event: StoredEvent) -> anyhow::Result<()> {
+    let id = s.run.admission.id.clone();
+    let n = s.accepted;
+    s.accepted = n.checked_add(1).ok_or_else(|| anyhow::anyhow!("event sequence overflow"))?;
+    put(rows, &events_of(&id), &sequence(n), &event)?;
+    if let Some(identity) = event.envelope.as_ref().and_then(identity) {
+        rows.put(&identities_of(&id), &component(&identity), &json!(n))?;
+        // A delivered identity leads a redelivery back to its recipient for
+        // as long as the recipient keeps that evidence.
+        if event.delivered {
+            rows.put(&partition("delivered", &identity), &id, &json!(id))?;
         }
     }
-    Ok(count)
+    if rows.get(&types_of(&id), &component(&event.type_))?.is_none() {
+        rows.put(&types_of(&id), &component(&event.type_), &json!(n))?;
+    }
+    for (kind, k, value) in pending_rows(&id, n, &event) {
+        rows.put(&kind, &k, &value)?;
+    }
+    let pending = s.pending.entry(event.type_.clone()).or_default();
+    pending.copies += 1;
+    pending.cloud += u64::from(event.envelope.is_some());
+    s.published += u64::from(published(&event));
+    if let Some(at) = event.expires_at_ms {
+        s.mailbox = Some(s.mailbox.map_or(at, |m| m.min(at)));
+    }
+    s.evidence = true;
+    Ok(())
+}
+/// Marks a pending copy consumed under `k` and drops its pending rows and
+/// counters. The caller refreshes `mailbox` when it consumed a mailbox copy.
+fn consume(
+    rows: &mut dyn Transaction,
+    s: &mut StoredRun,
+    n: u64,
+    mut event: StoredEvent,
+    k: &str,
+) -> anyhow::Result<()> {
+    let id = s.run.admission.id.clone();
+    for (kind, key, _) in pending_rows(&id, n, &event) {
+        rows.delete(&kind, &key)?;
+    }
+    if let Some(pending) = s.pending.get_mut(&event.type_) {
+        pending.copies = pending.copies.saturating_sub(1);
+        pending.cloud = pending.cloud.saturating_sub(u64::from(event.envelope.is_some()));
+        if pending.copies == 0 {
+            s.pending.remove(&event.type_);
+        }
+    }
+    s.published = s.published.saturating_sub(u64::from(published(&event)));
+    event.consumed_key = Some(k.into());
+    put(rows, &events_of(&id), &sequence(n), &event)
+}
+/// The earliest expiry left among pending mailbox copies: one indexed row.
+fn refresh_mailbox(rows: &mut dyn Transaction, s: &mut StoredRun) -> anyhow::Result<()> {
+    s.mailbox = match rows.scan(&expiring_of(&s.run.admission.id), "", None, 1)?.into_values().next() {
+        Some(v) => Some(serde_json::from_value::<(i64, u64)>(v)?.0),
+        None => None,
+    };
+    Ok(())
+}
+/// Consumes every pending copy whose mailbox time is over with an observable
+/// `Record::Expired`, keyed by its position. Reads only the expired copies.
+fn expire(rows: &mut dyn Transaction, s: &mut StoredRun, now: i64) -> anyhow::Result<usize> {
+    if s.mailbox.is_none_or(|at| at > now) {
+        return Ok(0);
+    }
+    let id = s.run.admission.id.clone();
+    let due = rows.scan(&expiring_of(&id), "", Some(&until(now)), usize::MAX)?;
+    for value in due.values() {
+        let (_, n) = serde_json::from_value::<(i64, u64)>(value.clone())?;
+        let event = copy(rows, &id, n)?;
+        let k = format!("mailbox#expired[{n}]");
+        put(rows, &records_of(&id), &k, &Record::Expired { event: envelope(&event)? })?;
+        consume(rows, s, n, event, &k)?;
+    }
+    refresh_mailbox(rows, s)?;
+    Ok(due.len())
+}
+/// Whether a pending, unexpired copy is one the run waits or is subscribed
+/// for. The counters answer unless a copy has expired unconsumed; then one
+/// bounded read per waited or subscribed type with pending copies.
+fn pending_wanted(rows: &mut dyn Transaction, s: &StoredRun, now: i64) -> anyhow::Result<bool> {
+    let id = &s.run.admission.id;
+    let fresh = s.mailbox.is_none_or(|at| at > now);
+    // Copies expiring after `now` (or never), at most `limit` of them.
+    let mut live = |kind: String, limit: usize| -> anyhow::Result<Vec<Value>> {
+        Ok(rows.scan(&kind, &until(now), None, limit)?.into_values().collect())
+    };
+    for t in s.awaits.keys() {
+        if s.pending.contains_key(t) && (fresh || !live(live_of(id, t), 1)?.is_empty()) {
+            return Ok(true);
+        }
+    }
+    for t in s.subscriptions.values().flatten() {
+        if t == "*" && s.published > 0 && (fresh || !live(live_published_of(id), 1)?.is_empty()) {
+            return Ok(true);
+        }
+        // A type keeps at most one pending lifecycle notification, so two
+        // live copies include a CloudEvent if one is live.
+        if s.pending.get(t).is_some_and(|p| p.cloud > 0)
+            && (fresh || live(live_of(id, t), 2)?.iter().any(|cloud| cloud == &json!(true)))
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 /// Accepts `event` into the run, unless the run already holds its identity
 /// (pending, taken or expired): `false` for the same payload, an
 /// `IdentityConflict` for another. Wakes a run that waits for it.
-fn accept(snapshot: &mut StoredRun, event: StoredEvent, now: i64) -> anyhow::Result<bool> {
+fn accept(rows: &mut dyn Transaction, snapshot: &mut StoredRun, event: StoredEvent, now: i64) -> anyhow::Result<bool> {
     if let Some(id) = event.envelope.as_ref().and_then(identity) {
-        let held =
-            snapshot.events.iter().find_map(|e| e.envelope.as_ref().filter(|v| identity(v).as_ref() == Some(&id)));
-        if let Some(held) = held {
-            if event.envelope.as_ref().map(payload) != Some(payload(held)) {
+        let run = snapshot.run.admission.id.clone();
+        if let Some(n) = get::<u64>(rows, &identities_of(&run), &component(&id))? {
+            let held = copy(rows, &run, n)?;
+            if event.envelope.as_ref().map(payload) != held.envelope.as_ref().map(payload) {
                 return Err(IdentityConflict(id.replace('\u{0}', "/")).into());
             }
             return Ok(false);
@@ -308,7 +509,7 @@ fn accept(snapshot: &mut StoredRun, event: StoredEvent, now: i64) -> anyhow::Res
     if wanted(snapshot, &event, now) {
         snapshot.run.wake_at_ms = snapshot.run.wake_at_ms.min(now);
     }
-    snapshot.events.push(event);
+    push(rows, snapshot, event)?;
     Ok(true)
 }
 fn deliver(
@@ -334,7 +535,7 @@ fn deliver(
         expires_at_ms: Some(now.saturating_add(policy.mailbox_ms)),
     };
     let candidate = match target {
-        Some(target) => get::<StoredRun>(rows, "run", target)?,
+        Some(target) => find_run(rows, target)?,
         // A redelivery goes back to the run that accepted it first; a new
         // event to the oldest eligible registration of its type.
         None => match indexed_runs(rows, &partition("delivered", &id), "", None, 1)?.pop() {
@@ -346,11 +547,10 @@ fn deliver(
         return Ok(None);
     };
     let recipient = snapshot.run.admission.id.clone();
-    let holds = snapshot.events.iter().any(|e| e.envelope.as_ref().and_then(identity).as_ref() == Some(&id));
-    if snapshot.run.ended_ms.is_some() && !holds {
+    if snapshot.run.ended_ms.is_some() && rows.get(&identities_of(&recipient), &component(&id))?.is_none() {
         return Ok(None);
     }
-    if accept(&mut snapshot, stored, now)? {
+    if accept(rows, &mut snapshot, stored, now)? {
         store_run(rows, &snapshot)?;
     }
     Ok(Some(recipient))
@@ -359,13 +559,10 @@ fn deliver(
 /// when it started the child: one pending copy per type, no identity.
 fn notify(rows: &mut dyn Transaction, parent: &str, t: &str, data: &Value, now: i64) -> anyhow::Result<()> {
     let mut snapshot = run(rows, parent)?;
-    if snapshot.run.ended_ms.is_some()
-        || !snapshot.awaits.contains_key(t)
-        || snapshot.events.iter().any(|e| e.type_ == t && e.consumed_key.is_none())
-    {
+    if snapshot.run.ended_ms.is_some() || !snapshot.awaits.contains_key(t) || snapshot.pending.contains_key(t) {
         return Ok(());
     }
-    snapshot.events.push(StoredEvent {
+    let event = StoredEvent {
         type_: t.into(),
         data: data.clone(),
         delivered_at_ms: now,
@@ -373,7 +570,8 @@ fn notify(rows: &mut dyn Transaction, parent: &str, t: &str, data: &Value, now: 
         envelope: None,
         delivered: false,
         expires_at_ms: None,
-    });
+    };
+    push(rows, &mut snapshot, event)?;
     snapshot.run.wake_at_ms = now;
     store_run(rows, &snapshot)
 }
@@ -402,7 +600,7 @@ fn publish(
         expires_at_ms: target.map(|_| now.saturating_add(policy.mailbox_ms)),
     };
     let candidates = match target {
-        Some(id) => get::<StoredRun>(rows, "run", id)?.into_iter().collect(),
+        Some(id) => find_run(rows, id)?.into_iter().collect(),
         None => {
             let mut runs = indexed_runs(rows, &partition("subs", t), "", None, usize::MAX)?;
             for s in indexed_runs(rows, &partition("subs", "*"), "", None, usize::MAX)? {
@@ -417,12 +615,45 @@ fn publish(
     let mut receivers = Vec::new();
     for mut snapshot in candidates {
         let eligible = snapshot.run.ended_ms.is_none() && (target.is_some() || subscribed(&snapshot, &stored));
-        if eligible && accept(&mut snapshot, stored.clone(), now)? {
+        if eligible && accept(rows, &mut snapshot, stored.clone(), now)? {
             receivers.push(snapshot.run.admission.id.clone());
             store_run(rows, &snapshot)?;
         }
     }
     Ok(receivers)
+}
+/// Removes a finished run's evidence: its records and copies with all their
+/// rows. Reads only that run's rows; returns how many records it held.
+fn forget(rows: &mut dyn Transaction, s: &mut StoredRun) -> anyhow::Result<usize> {
+    let id = s.run.admission.id.clone();
+    let records = rows.scan(&records_of(&id), "", None, usize::MAX)?;
+    for (kind, k) in records.keys() {
+        rows.delete(kind, k)?;
+    }
+    for ((kind, k), value) in rows.scan(&events_of(&id), "", None, usize::MAX)? {
+        let event: StoredEvent = serde_json::from_value(value)?;
+        let n = u64::from_str_radix(&k, 16)?;
+        if event.consumed_key.is_none() {
+            for (kind, key, _) in pending_rows(&id, n, &event) {
+                rows.delete(&kind, &key)?;
+            }
+        }
+        if let Some(identity) = event.envelope.as_ref().and_then(identity) {
+            rows.delete(&identities_of(&id), &component(&identity))?;
+            if event.delivered {
+                rows.delete(&partition("delivered", &identity), &id)?;
+            }
+        }
+        rows.delete(&kind, &k)?;
+    }
+    for (kind, k) in rows.scan(&types_of(&id), "", None, usize::MAX)?.into_keys() {
+        rows.delete(&kind, &k)?;
+    }
+    s.pending.clear();
+    s.published = 0;
+    s.mailbox = None;
+    s.evidence = false;
+    Ok(records.len())
 }
 
 // ── 4. triggers, ingress and activation epochs ─────────────────────────────
@@ -510,7 +741,7 @@ fn fire(rows: &mut dyn Transaction, f: &Firing<'_>, now: i64, policy: &Policy) -
     if let Some(busy) = f.busy
         && !f.admit.is_empty()
         && let Some(last) = get::<String>(rows, "trigger_run", f.key)?
-        && get::<StoredRun>(rows, "run", &last)?.is_some_and(|s| s.run.ended_ms.is_none())
+        && find_run(rows, &last)?.is_some_and(|s| s.run.ended_ms.is_none())
     {
         store_trigger(rows, f.key, current.as_ref(), Some(busy))?;
         return Ok(Fired::Busy(last));
@@ -581,7 +812,7 @@ fn lifecycle(rows: &mut dyn Transaction, id: &str, status: &Status, now: i64) ->
         Status::Interrupted(_) => return Ok(()),
     };
     let t = format!("{kind}:{id}");
-    if kind == "done" && run(rows, &link.parent)?.events.iter().any(|e| e.type_ == t) {
+    if kind == "done" && rows.get(&types_of(&link.parent), &component(&t))?.is_some() {
         return Ok(());
     }
     notify(rows, &link.parent, &t, &data, now)
@@ -689,7 +920,7 @@ impl RunStore for TransactionalStore {
     fn claim_as(&self, id: &str, now: i64, worker: &Compatibility) -> anyhow::Result<Option<Fence>> {
         let owner = uuid::Uuid::new_v4().to_string();
         self.update(|rows| {
-            let Some(mut s) = get::<StoredRun>(rows, "run", id)? else {
+            let Some(mut s) = find_run(rows, id)? else {
                 return Ok(None);
             };
             if !claimable(&s.run, now) || !worker.admits(s.run.admission.application_version()) {
@@ -717,30 +948,41 @@ impl RunStore for TransactionalStore {
             store_run(rows, &s)
         })
     }
+    // One ordered range read of the run's own record rows.
     fn load_records(&self, f: &Fence, now: i64) -> anyhow::Result<BTreeMap<String, Record>> {
         self.update(|rows| {
-            checked(rows, f, now, self.policy.skew_ms)?
-                .records
+            checked(rows, f, now, self.policy.skew_ms)?;
+            rows.scan(&records_of(&f.run_id), "", None, usize::MAX)?
                 .into_iter()
-                .map(|(key, value)| Ok((key, serde_json::from_value(value)?)))
+                .map(|((_, key), value)| Ok((key, serde_json::from_value(value)?)))
                 .collect()
         })
     }
 
+    // The fence check reads the run row and the save writes only the record's
+    // row, in one serializable commit: an owner replaced before the commit
+    // conflicts and fails the check on retry. Only a run's first record also
+    // writes the run row, to mark evidence for `sweep`.
     fn save_record(&self, f: &Fence, k: &str, r: &Record, now: i64) -> anyhow::Result<()> {
         self.update(|rows| {
             let mut s = checked(rows, f, now, self.policy.skew_ms)?;
+            let kind = records_of(&f.run_id);
+            let old = rows.get(&kind, k)?;
+            let value = serde_json::to_value(r)?;
             if matches!(r, Record::Event { .. } | Record::Expired { .. }) {
-                anyhow::ensure!(
-                    s.records.get(k) == Some(&serde_json::to_value(r)?),
-                    "event records must be committed by take_event"
-                );
+                anyhow::ensure!(old.as_ref() == Some(&value), "event records must be committed by take_event");
             }
-            if let Some(old) = s.records.get(k) {
+            if let Some(old) = &old {
                 check_transition(&serde_json::from_value(old.clone())?, r)?;
             }
-            s.records.insert(k.into(), serde_json::to_value(r)?);
-            store_run(rows, &s)
+            if old.as_ref() != Some(&value) {
+                rows.put(&kind, k, &value)?;
+            }
+            if !s.evidence {
+                s.evidence = true;
+                store_run(rows, &s)?;
+            }
+            Ok(())
         })
     }
     fn register_wait(&self, f: &Fence, types: &[String], now: i64) -> anyhow::Result<()> {
@@ -766,25 +1008,43 @@ impl RunStore for TransactionalStore {
     fn take_event(&self, f: &Fence, k: &str, types: &[String], now: i64) -> anyhow::Result<Option<Value>> {
         self.update(|rows| {
             let mut s = checked(rows, f, now, self.policy.skew_ms)?;
-            if let Some(saved) = s.records.get(k) {
-                let Record::Event { event } = serde_json::from_value(saved.clone())? else {
+            let id = f.run_id.as_str();
+            if let Some(saved) = rows.get(&records_of(id), k)? {
+                let Record::Event { event } = serde_json::from_value(saved)? else {
                     anyhow::bail!("invalid event checkpoint")
                 };
-                return Ok(Some(event.clone()));
+                return Ok(Some(event));
             }
             // A copy past its mailbox time is consumed by its expiry record,
             // never by this listen.
-            expire(&mut s, now)?;
-            let candidate = s.events.iter().position(|e| e.consumed_key.is_none() && takes(types, e));
-            let result = if let Some(i) = candidate {
-                let event = envelope(&s.events[i])?;
-                s.events[i].consumed_key = Some(k.into());
-                if let Some(child) = s.events[i].type_.strip_prefix("done:") {
+            expire(rows, &mut s, now)?;
+            // The first pending copy, in arrival order, of a listed type or,
+            // for `*`, published: one indexed row per listed type.
+            let mut kinds: Vec<String> = types.iter().map(|t| pending_of(id, t)).collect();
+            if types.iter().any(|t| t == "*") {
+                kinds.push(published_of(id));
+            }
+            let mut candidate: Option<u64> = None;
+            for kind in kinds {
+                if let Some(n) = rows.scan(&kind, "", None, 1)?.into_values().next() {
+                    let n = n.as_u64().ok_or_else(|| anyhow::anyhow!("invalid pending event index"))?;
+                    candidate = Some(candidate.map_or(n, |c| c.min(n)));
+                }
+            }
+            let result = if let Some(n) = candidate {
+                let stored = copy(rows, id, n)?;
+                let event = envelope(&stored)?;
+                if let Some(child) = stored.type_.strip_prefix("done:") {
                     s.listeners.remove(&format!("child:{child}"));
+                }
+                let mailbox = stored.expires_at_ms.is_some();
+                consume(rows, &mut s, n, stored, k)?;
+                if mailbox {
+                    refresh_mailbox(rows, &mut s)?;
                 }
                 s.listeners.remove(k);
                 close(&mut s, types);
-                s.records.insert(k.into(), serde_json::to_value(Record::Event { event: event.clone() })?);
+                put(rows, &records_of(id), k, &Record::Event { event: event.clone() })?;
                 Some(event)
             } else {
                 s.listeners.insert(k.into(), types.to_vec());
@@ -844,7 +1104,7 @@ impl RunStore for TransactionalStore {
                     s.run.state = RunState::Waiting;
                     s.run.interruptions = 0;
                     s.run.wake_at_ms = *wake_at_ms;
-                    if s.events.iter().any(|e| wanted(&s, e, now)) {
+                    if pending_wanted(rows, &s, now)? {
                         s.run.wake_at_ms = now;
                     }
                 }
@@ -951,7 +1211,7 @@ impl RunStore for TransactionalStore {
 
     fn cancel(&self, id: &str, now: i64) -> anyhow::Result<bool> {
         self.update(|rows| {
-            let Some(s) = get::<StoredRun>(rows, "run", id)? else {
+            let Some(s) = find_run(rows, id)? else {
                 return Ok(false);
             };
             if s.run.ended_ms.is_some() {
@@ -968,15 +1228,13 @@ impl RunStore for TransactionalStore {
             let horizon = now.saturating_sub(kept);
             for mut s in indexed_runs(rows, "finished", "", Some(&until(horizon)), usize::MAX)? {
                 if s.run.ended_ms.is_some_and(|at| at <= horizon) {
-                    swept.records += s.records.len();
-                    s.records.clear();
-                    s.events.clear();
+                    swept.records += forget(rows, &mut s)?;
                     store_run(rows, &s)?;
                 }
             }
             // Unfinished runs whose mailbox holds a copy past its time.
             for mut s in indexed_runs(rows, "mailbox", "", Some(&until(now)), usize::MAX)? {
-                swept.expired += expire(&mut s, now)?;
+                swept.expired += expire(rows, &mut s, now)?;
                 store_run(rows, &s)?;
             }
             for ((_, k), id) in rows.scan("ingress_due", "", Some(&until(now)), usize::MAX)? {
@@ -989,7 +1247,7 @@ impl RunStore for TransactionalStore {
         })
     }
     fn get(&self, id: &str) -> anyhow::Result<Option<SavedRun>> {
-        self.update(|rows| Ok(get::<StoredRun>(rows, "run", id)?.map(|s| s.run)))
+        self.update(|rows| Ok(find_run(rows, id)?.map(|s| s.run)))
     }
     fn list(&self, name: Option<&str>, prefix: &str) -> anyhow::Result<Vec<SavedRun>> {
         self.update(|rows| {
@@ -1002,13 +1260,35 @@ impl RunStore for TransactionalStore {
             } else {
                 rows.scan("run", prefix, end.as_deref(), usize::MAX)?
                     .into_values()
-                    .map(|v| Ok(serde_json::from_value::<StoredRun>(v)?.run))
+                    .map(|v| Ok(stored_run(v)?.run))
                     .collect()
             }
         })
     }
     fn inspect(&self, id: &str) -> anyhow::Result<Option<RunSnapshot>> {
-        self.update(|rows| get(rows, "run", id))
+        self.update(|rows| {
+            let Some(s) = find_run(rows, id)? else {
+                return Ok(None);
+            };
+            let records = rows
+                .scan(&records_of(id), "", None, usize::MAX)?
+                .into_iter()
+                .map(|((_, k), v)| Ok((k, serde_json::from_value(v)?)))
+                .collect::<anyhow::Result<_>>()?;
+            let events = rows
+                .scan(&events_of(id), "", None, usize::MAX)?
+                .into_values()
+                .map(|v| Ok(serde_json::from_value(v)?))
+                .collect::<anyhow::Result<_>>()?;
+            Ok(Some(RunSnapshot {
+                run: s.run,
+                records,
+                awaits: s.awaits,
+                listeners: s.listeners,
+                events,
+                subscriptions: s.subscriptions,
+            }))
+        })
     }
 
     fn save_definition(&self, name: &str, yaml: &str) -> anyhow::Result<Definition> {

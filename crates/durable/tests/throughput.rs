@@ -1,7 +1,7 @@
 //! Opt-in local database throughput measurement; no handlers or external APIs.
 use ouro_durable::{
-    AtomicBackend, RunStore, TransactionalStore, conformance::admission, postgres::PostgresBackend,
-    sqlite::SqliteBackend,
+    AtomicBackend, RunStore, TransactionalStore, conformance::admission, memory::MemoryBackend,
+    postgres::PostgresBackend, sqlite::SqliteBackend,
 };
 use owf::{durable::Record, run::Status};
 use serde_json::json;
@@ -50,6 +50,47 @@ fn measure(label: &str, size: usize, backend: Arc<dyn AtomicBackend>) -> anyhow:
         f64::from(samples) / started.elapsed().as_secs_f64()
     );
     Ok(())
+}
+
+/// One run accumulating `records` records, as a long agent loop or a large
+/// `for` does: save rates over the first and the last slices of its life, and
+/// the final load. A layout that rewrites the run on every save slows down as
+/// the run grows; one row per record keeps both slices alike.
+fn long_run(label: &str, records: usize, backend: Arc<dyn AtomicBackend>) -> anyhow::Result<()> {
+    let store = TransactionalStore::new(backend);
+    let f = store.start(&admission("long"), 0)?.unwrap();
+    let slice = records / 10;
+    let report = |part: &str, n: usize, seconds: f64| {
+        eprintln!("BENCH,{label},{records},{part},{n},{seconds:.6},{:.2}", n as f64 / seconds);
+    };
+    let started = Instant::now();
+    let mut slice_started = started;
+    for n in 0..records {
+        if n == records - slice {
+            slice_started = Instant::now();
+        }
+        store.save_record(&f, &format!("/do/{n}/step#wait"), &Record::Timer { deadline_ms: 42 }, 0)?;
+        if n + 1 == slice {
+            report("save_record_first_tenth", slice, slice_started.elapsed().as_secs_f64());
+        }
+    }
+    report("save_record_last_tenth", slice, slice_started.elapsed().as_secs_f64());
+    report("save_record_all", records, started.elapsed().as_secs_f64());
+    let started = Instant::now();
+    assert_eq!(store.load_records(&f, 0)?.len(), records);
+    report("load_records", 1, started.elapsed().as_secs_f64());
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "local throughput measurement: cargo test -p ouro-durable --test throughput -- --ignored --nocapture"]
+async fn long_run_throughput() {
+    const RECORDS: usize = 5_000;
+    long_run("memory", RECORDS, Arc::new(MemoryBackend::default())).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    long_run("sqlite", RECORDS, Arc::new(SqliteBackend::open(dir.path().join("long.sqlite")).unwrap())).unwrap();
+    support::postgres(move |config| long_run("postgres", RECORDS, Arc::new(PostgresBackend::connect_config(config)?)))
+        .await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
