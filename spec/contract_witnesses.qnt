@@ -20,6 +20,19 @@ module contract_witnesses {
   run expiryTest = expiry.expect(checked and m.db.copies.nth(0).disposition == 2)
   action child = init.then(boot).then(do("child")).then(do("cancel"))
   run childTest = child.expect(checked and m.db.runs.nth(1).notified and m.db.runs.nth(1).outcome == 5)
+  // An owned child never outlives its parent (#14): the parent's success
+  // cancels it, and a fault of the root cancels its grandchild too. Run 1
+  // (claimed after its first lease, held by the parent's host, expires)
+  // starts run 2.
+  action childFinish = init.then(boot).then(do("child")).then(do("finish"))
+  run childFinishTest = childFinish.expect(checked and m.db.runs.nth(0).outcome == 1 and
+    m.db.runs.nth(1).outcome == 5 and m.db.runs.nth(1).notified and m.db.runs.nth(1).ended == 0)
+  action grandchild = init.then(boot).then(do("child")).then(ticks(4)).then(execute("claim",1,1,0,0,0))
+    .then(execute("child",1,1,0,0,0)).then(execute("release",1,1,0,0,0)).then(do("claim"))
+    .then(execute("finish",0,0,0,1,0))
+  run grandchildTest = grandchild.expect(checked and m.db.runs.nth(0).outcome == 2 and
+    m.db.runs.nth(2).parent == 1 and m.db.runs.nth(1).outcome == 5 and m.db.runs.nth(2).outcome == 5 and
+    m.db.runs.nth(1).ended == 4 and m.db.runs.nth(2).ended == 4 and m.db.runs.nth(2).notified)
   action activation = init.then(boot).then(do("activate")).then(do("finish"))
   run activationTest = activation.expect(checked and m.db.catalog.epoch == 2 and m.db.runs.nth(0).epoch == 1)
   action deadline = init.then(boot).then(do("crash")).then(do("tick")).then(do("tick")).then(do("tick"))
@@ -30,11 +43,11 @@ module contract_witnesses {
   action compatibility = init.then(execute("admit",0,0,1,0,0)).then(execute("claim",0,1,0,0,0))
   run compatibilityTest = compatibility.expect(checked and m.db.runs.nth(0).owner == -1)
   action dry = init.then(do("dry")).then(do("claim")).then(call)
-  run dryTest = dry.expect(checked and m.sends == [[0,0,0],[0,0,0]])
+  run dryTest = dry.expect(checked and m.sends == [[0,0,0],[0,0,0],[0,0,0]])
   action replay = init.then(do("replay")).then(do("claim")).then(call)
-  run replayTest = replay.expect(checked and m.sends == [[0,0,0],[0,0,0]])
+  run replayTest = replay.expect(checked and m.sends == [[0,0,0],[0,0,0],[0,0,0]])
   action schedule = init.then(do("tick")).then(do("tick")).then(do("fire")).then(do("fire"))
-  run scheduleTest = schedule.expect(checked and m.db.admissions == [1,0] and m.db.fired == Set((1,0)))
+  run scheduleTest = schedule.expect(checked and m.db.admissions == [1,0,0] and m.db.fired == Set((1,0)))
   action breaker = init.then(boot).then(execute("finish",0,0,0,1,0)).then(execute("admit",1,0,0,0,0))
     .then(execute("claim",1,0,0,0,0)).then(execute("finish",1,0,0,3,0))
   run breakerTest = breaker.expect(checked and m.db.catalog.tripped and m.db.catalog.notices == [1] and
@@ -44,17 +57,17 @@ module contract_witnesses {
   run rearmTest = rearm.expect(checked and m.db.catalog.due == 4 and m.db.catalog.rearm)
   action noCatchup = init.then(execute("activate",0,0,0,1,0)).then(do("tick")).then(do("tick"))
     .then(do("tick")).then(do("fire"))
-  run noCatchupTest = noCatchup.expect(checked and m.db.admissions == [0,0] and m.db.skipped == Set((2,0)))
+  run noCatchupTest = noCatchup.expect(checked and m.db.admissions == [0,0,0] and m.db.skipped == Set((2,0)))
   action overlap = init.then(do("tick")).then(do("tick")).then(do("fire")).then(do("tick")).then(do("tick"))
     .then(execute("fire",1,0,0,0,0))
-  run overlapTest = overlap.expect(checked and m.db.admissions == [1,0] and m.db.skipped == Set((1,1)))
+  run overlapTest = overlap.expect(checked and m.db.admissions == [1,0,0] and m.db.skipped == Set((1,1)))
   action ingress = init.then(do("ingress")).then(execute("ingress",1,0,0,0,0))
     .then(execute("ingress",1,0,0,1,0))
   run ingressTest = ingress
-    .expect(checked and m.db.admissions == [1,0] and m.observations.nth(m.observations.length()-1).result == -1)
+    .expect(checked and m.db.admissions == [1,0,0] and m.observations.nth(m.observations.length()-1).result == -1)
   action ingressExpiry = init.then(do("ingress")).then(do("tick")).then(do("tick")).then(do("tick"))
     .then(do("tick")).then(do("tick")).then(execute("ingress",1,0,0,0,0))
-  run ingressExpiryTest = ingressExpiry.expect(checked and m.db.admissions == [1,1])
+  run ingressExpiryTest = ingressExpiry.expect(checked and m.db.admissions == [1,1,0])
   // An at-least-once write whose outcome is unknown is sent again, under its
   // invocation's identity; the at-most-once write is not (unknownTest).
   action redispatch = init.then(boot).then(at("intent",2)).then(at("dispatch",2)).then(do("crash"))
@@ -115,10 +128,10 @@ module contract_witnesses {
     .then(execute("claim",1,1,0,0,0)).then(execute("spend",1,1,0,0,0)).then(execute("release",1,1,0,0,0))
     .then(do("claim")).then(at("spend",1)).then(at("spend",1)).then(do("cancel"))
   run budgetTest = budget.expect(checked and m.db.runs.nth(0).spends == [1,2,0] and
-    m.db.runs.nth(1).spends == [1,0,0] and m.db.runs.nth(1).spent == [2,0,0] and m.db.budget == [0,0])
+    m.db.runs.nth(1).spends == [1,0,0] and m.db.runs.nth(1).spent == [2,0,0] and m.db.budget == [0,0,0])
   // Every history above in one trace (each starts with init), replayed
   // against the stores by crates/durable/tests/quint.rs.
-  run bridgeSuite = continuation.then(unknown).then(mailbox).then(expiry).then(child).then(activation)
+  run bridgeSuite = continuation.then(unknown).then(mailbox).then(expiry).then(child).then(childFinish).then(grandchild).then(activation)
     .then(deadline).then(compatibility).then(dry).then(replay).then(schedule).then(breaker).then(rearm)
     .then(noCatchup).then(overlap).then(ingress).then(ingressExpiry).then(redispatch).then(protectedUnknown)
     .then(notExecuted).then(errorResponse).then(conflict).then(release).then(staleFence).then(admission)

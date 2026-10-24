@@ -3,7 +3,8 @@
 module contract {
   pure def elems(xs: List[a]): Set[a] = xs.foldl(Set(),(a,x) => a.union(Set(x)))
   pure def mapped(xs: List[a], f: a => b): List[b] = xs.foldl([],(a,x) => a.append(f(x)))
-  pure val Runs = Set(0, 1)
+  // Run r's owned child is run r + 1, so run 2 can be a grandchild.
+  pure val Runs = Set(0, 1, 2)
   // Invocation 0 is at most once, 1 and 2 at least once: protection follows
   // the declared delivery alone (decision 6). The engine does not classify
   // calls as reads or writes; a dry run's host supplies a mock rule, here
@@ -43,12 +44,12 @@ module contract {
     records: [0,0,0], values: [0,0,0], frontier: Set(), continuation: 0,
     subscription: false, parent: -1, notified: false, retained: true, spends: [0,0,0], spent: [0,0,0] }
   pure val emptyLocal: Local = { fence: 0, execution: 0, phase: 0, invocation: 0, stopped: false, permit: false }
-  pure val initialDb: Durable = { runs: [emptyRun,emptyRun], copies: [], admissions: [0,0], budget: [0,0],
+  pure val initialDb: Durable = { runs: [emptyRun,emptyRun,emptyRun], copies: [], admissions: [0,0,0], budget: [0,0,0],
     fired: Set(), skipped: Set(), ingress: Map(), ingressPayload:Map(), catalog: { active: 1, epoch: 1,
       faults: 0, tripped: false, triggerEpoch: 1, due: 2, slot: 0, running: -1, catchup: 0, rearm:false,
       armed: true, notices: [] } }
   pure val initial: Machine = { db: initialDb, workers: [emptyLocal,emptyLocal], now: 0,
-    sends: [[0,0,0],[0,0,0]], observations: [], violations: Set(), faultsSeen: Set() }
+    sends: [[0,0,0],[0,0,0],[0,0,0]], observations: [], violations: Set(), faultsSeen: Set() }
   var m: Machine
   // The command just executed and its choices, for the model-based tests.
   type Command = { r: int, w: int, i: int, value: int, fault: int }
@@ -71,10 +72,18 @@ module contract {
     live(execution) and execution.owner == w and worker.execution == r and worker.fence == execution.generation and
       not(worker.stopped) and s.now + epsilon < execution.lease and compatible(execution.app,w)
   }
-  // The run whose counter `r` spends: its parent for an owned child.
+  // The runs that own `r`, transitively: its parent, the parent's parent, …
+  // (an owned chain is shorter than the number of runs).
+  pure def ancestors(s: Machine, r: int): Set[int] =
+    Runs.fold((s.db.runs.nth(r).parent, Set()),(a,_) =>
+      if (a._1 < 0) a else (s.db.runs.nth(a._1).parent, a._2.union(Set(a._1))))._2
+  // The live runs `r` owns, transitively.
+  pure def descendants(s: Machine, r: int): Set[int] =
+    Runs.filter(k => live(s.db.runs.nth(k)) and ancestors(s,k).contains(r))
+  // The run whose counter `r` spends: the root of its owned tree.
   pure def rootOf(s: Machine, r: int): int =
-    if (s.db.runs.nth(r).parent >= 0) s.db.runs.nth(r).parent else r
-  // A tree's counter ends with its root (its owned children end with it).
+    Runs.fold(r,(a,_) => if (s.db.runs.nth(a).parent >= 0) s.db.runs.nth(a).parent else a)
+  // A tree's counter ends with its root (its owned descendants end with it).
   pure def settle(s: Machine): Machine =
     { ...s, db: { ...s.db, budget: Runs.fold(s.db.budget,(a,k) =>
       if (s.db.runs.nth(k).outcome != 0 and s.db.runs.nth(k).parent < 0) a.replaceAt(k,0) else a) } }
@@ -179,11 +188,12 @@ module contract {
       val copies = s.db.copies.mapped(e => if (e.disposition == 0 and e.expires <= s.now)
         { ...e, disposition:2 } else e)
       { ...s, db: { ...s.db, copies:copies } }
-    } else if (op == "child" and authorized and r == 0 and not(s.db.runs.nth(1).admitted) and not(c.tripped)) {
-      // The parent's host holds the child's first lease, which it may let
-      // expire. A tripped definition admits no child (nor any other run).
-      val updated = admitRun(s,1,execution.input,execution.app,execution.mode)
-      observe(update(updated,1,{ ...updated.db.runs.nth(1), generation:1, lease:s.now+4, parent:r }),op,1,i,execution.input,1)
+    } else if (op == "child" and authorized and Runs.contains(r+1) and not(s.db.runs.nth(r+1).admitted) and not(c.tripped)) {
+      // Run r's child is run r + 1. The parent's host holds the child's first
+      // lease, which it may let expire. A tripped definition admits no child
+      // (nor any other run).
+      val updated = admitRun(s,r+1,execution.input,execution.app,execution.mode)
+      observe(update(updated,r+1,{ ...updated.db.runs.nth(r+1), generation:1, lease:s.now+4, parent:r }),op,r+1,i,execution.input,1)
     } else if ((op == "finish" and authorized and value >= 0) or (op == "timeout" and authorized and s.now >= execution.deadline) or
       (op == "conflict" and authorized and execution.records.nth(i) != 0)) {
       // 1 success, 2 unhandled failure (a changed binding too), 3 timeout,
@@ -202,15 +212,18 @@ module contract {
           running:if (c.running == r) -1 else c.running, notices:if (trip) c.notices.append(c.epoch) else c.notices }
       val updated = update(s,r,{ ...execution,outcome:outcome,ended:s.now,owner:-1,lease:-1,subscription:false,
         notified:execution.parent >= 0 })
-      val descendants = if (outcome == 5) Runs.filter(k => live(s.db.runs.nth(k)) and s.db.runs.nth(k).parent == r) else Set()
-      val stoppedChildren = descendants.fold(updated,(a,k) => update(a,k,{ ...a.db.runs.nth(k),outcome:5,ended:s.now,owner:-1,lease:-1,subscription:false,notified:true }))
+      // An owned child never outlives its parent (#14): any end of the run
+      // cancels its live descendants, transitively, in this transition.
+      val owned = descendants(s,r)
+      val stoppedChildren = owned.fold(updated,(a,k) => update(a,k,{ ...a.db.runs.nth(k),outcome:5,ended:s.now,owner:-1,lease:-1,subscription:false,notified:true }))
       val finished = observe({ ...stoppedChildren, db:{ ...stoppedChildren.db,catalog:catalog },
-        workers:stoppedChildren.workers.mapped(x => if (x.execution == r or descendants.contains(x.execution)) { ...x,stopped:true,permit:false } else x) },op,r,i,outcome,1)
-      descendants.fold(finished,(a,k) => observe(a,"finish",k,0,5,1))
+        workers:stoppedChildren.workers.mapped(x => if (x.execution == r or owned.contains(x.execution)) { ...x,stopped:true,permit:false } else x) },op,r,i,outcome,1)
+      owned.fold(finished,(a,k) => observe(a,"finish",k,0,5,1))
     } else if (op == "cancel" and live(execution)) {
       // By position: two runs with equal fields are still two runs.
+      val closed = Set(r).union(descendants(s,r))
       val runs = Runs.fold(s.db.runs,(a,k) => { val x = a.nth(k)
-        if ((k == r or x.parent == r) and live(x))
+        if (closed.contains(k) and live(x))
           a.replaceAt(k,{ ...x,outcome:5,ended:s.now,owner:-1,lease:-1,subscription:false,notified:x.parent >= 0 }) else a })
       // A cancelled schedule run re-arms an `after` trigger like any other end.
       val rearmed = c.armed and c.rearm and c.due < 0 and c.running == r and execution.epoch == c.triggerEpoch
@@ -336,8 +349,10 @@ module contract {
       val x = a.db.runs.nth(k)
       x.parent < 0 or x.outcome == 0 or x.notified
     }))
-    val error18 = flag(error17,"C3",not(op == "cancel" or (op == "finish" and execution.outcome == 5)) or not(live(old)) or
-      a.db.runs.elems().forall(x => x.parent != r or x.outcome != 0))
+    // An owned run never outlives any run that owns it, transitively: the
+    // end of a run (any outcome) closes its owned subtree in that transition.
+    val error18 = flag(error17,"C3",Runs.forall(k => not(live(a.db.runs.nth(k))) or
+      ancestors(a,k).forall(p => a.db.runs.nth(p).outcome == 0)))
     val fired = a.db.fired.contains((c.epoch,c.slot))
     val skipped = a.db.skipped.contains((c.epoch,c.slot))
     val error19 = flag(error18,"T1",op != "fire" or c.slot == d.slot or
