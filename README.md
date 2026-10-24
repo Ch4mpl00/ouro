@@ -347,6 +347,8 @@ let request = Request {
 control.cancel_tree(&request, "run-42").await?;
 let page = control.list(&Runs::default(), None, 50).await?;
 let waits = control.waits(&Waits::default(), None, 50).await?;
+let definitions = control.definitions(None, 50).await?;
+let definition = control.definition("workflow").await?;
 ```
 
 `cancel` and `cancel_tree` have the same owned-tree semantics: the run and
@@ -393,6 +395,26 @@ aggregate over the database. Each page examines at most its requested
 age select indexes; residual state/combined filters can produce an empty
 page with a continuation. Follow `next` until absent. Cursors are bound to
 the query; each page is a consistent transaction, not a multi-page snapshot.
+
+`definitions(cursor, limit)` pages `DefinitionSummary` values in binary name
+order through `RunStore::query_definitions`; `definition(name)` returns the
+same summary, or `None` for an unknown name. Neither needs a registry or raw
+backend access. A summary includes ascending version numbers, the active
+version, epoch, consecutive faults and the original trip report (including a
+manual pause's actor, reason and note). `VersionSummary::activated_ms` is
+`None`: the current catalog does not persist activation timestamps.
+`schedules` has one entry per kind configured by the active version (`every`,
+`cron`, `after`, `on`), with its next due time, overlap policy, catch-up policy
+and buffered slot's pinned run identity/version when present. An `on` trigger
+normally has no next due time; an `after` trigger has none while waiting for
+its run to end. Manual pauses expose the suspended due times and queues;
+the trip report identifies that they are paused. Automatic trips leave the
+configured kinds with no due time or queue. Activation replaces this state.
+Each page reads only its bounded `definitions` range and those definitions'
+owned trigger/queue rows in one transaction, using the same 1–1,000 limit and
+query-bound cursor rules. YAML and run evidence are not returned. Unfinished-run
+counts are omitted because the existing live-run indexes do not maintain an
+aggregate; counting them would require reading every matching run.
 
 `waits` pages open listen positions by definition, run, event type and age,
 with their strategy, filters, correlation expectations, since time and absolute
@@ -771,6 +793,7 @@ an independent reopen handle, persisted-row inspection and failure injection.
 `cargo test -p ouro-durable --test scalability -- --nocapture` checks every
 operation's row bound with 10,000 unrelated persisted runs, a run holding
 10,000 records and a mailbox backlog (`load_records` reads exactly its rows),
+1,000 armed definitions (including bounded control pages and point summaries),
 full inboxes, index rollback boundaries, eight contending workers, lease
 replacement and an exact shared breaker count on all three adapters. Backend `Metrics` expose
 returned rows, attempted row mutations and definite conflicts; memory also

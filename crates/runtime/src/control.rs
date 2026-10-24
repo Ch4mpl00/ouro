@@ -60,6 +60,14 @@ impl Control {
         );
         self.store.query_runs(filter, true, cursor, limit).await
     }
+    /// Definition metadata in binary name order. Each bounded page observes
+    /// catalog, breaker, schedules and queued slots in one transaction.
+    pub async fn definitions(&self, cursor: Option<&Cursor>, limit: usize) -> anyhow::Result<Page<DefinitionSummary>> {
+        self.store.query_definitions(cursor, limit).await
+    }
+    pub async fn definition(&self, name: &str) -> anyhow::Result<Option<DefinitionSummary>> {
+        self.store.definition_control(name).await
+    }
     pub async fn waits(&self, filter: &Waits, cursor: Option<&Cursor>, limit: usize) -> anyhow::Result<Page<Wait>> {
         self.store.pending_waits(filter, cursor, limit).await
     }

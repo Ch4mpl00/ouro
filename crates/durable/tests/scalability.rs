@@ -32,6 +32,7 @@ async fn bounded<T>(
 }
 async fn bounds(backend: Arc<dyn AtomicBackend>, metrics: Arc<Metrics>, validation: u64) -> anyhow::Result<()> {
     support::seed(&backend, 10_000).await?;
+    definition_bounds(&backend, &metrics).await?;
     control_bounds(&backend, &metrics).await?;
     heartbeat_bounds(&backend, &metrics).await?;
     decided(&backend, &metrics).await?;
@@ -366,6 +367,85 @@ async fn sweep_bounded(
 /// a beat reads the worker's row and writes it with its expiry entry, a page
 /// reads its rows, and `sweep` reads only the expiry entries of workers
 /// stale for long enough.
+/// Catalog pages depend only on their candidates and owned trigger/queue
+/// rows, even with 10,000 unrelated runs and 1,000 armed definitions.
+async fn definition_bounds(backend: &Arc<dyn AtomicBackend>, metrics: &Metrics) -> anyhow::Result<()> {
+    use ouro_durable::{
+        conformance::control_definition_yaml,
+        control::{Command, Request},
+    };
+    let s = TransactionalStore::new(backend.clone());
+    for n in 0..1_000 {
+        let name = format!("catalog{n:04}");
+        s.save_definition(&name, control_definition_yaml()).await?;
+        let mut triggers = BTreeMap::new();
+        for kind in ["every", "cron", "after", "on"] {
+            triggers.insert(
+                format!("{name}#{kind}"),
+                Trigger {
+                    at_ms: if kind == "on" { None } else { Some(9_000_000) },
+                    types: if kind == "on" { vec!["catalog-event".into()] } else { vec![] },
+                    state: json!({"name":name, "kind":kind, "epoch":1}),
+                },
+            );
+        }
+        s.activate_with(&name, 1, 0, &Arming { triggers }).await?.unwrap();
+    }
+    let a = ouro_durable::Admission { name: "catalog0000".into(), ..admission("catalog:first") };
+    let b = ouro_durable::Admission { id: "catalog:buffered".into(), ..a.clone() };
+    let slot = s.trigger("catalog0000#every").await?.unwrap();
+    for (a, result) in [(&a, Fired::Committed), (&b, Fired::Queued)] {
+        assert_eq!(
+            s.fire(
+                &Firing {
+                    key: "catalog0000#every",
+                    expected: Some(&slot),
+                    next: Some(&slot),
+                    busy: Some(&slot),
+                    admit: std::slice::from_ref(a),
+                    overlap: Some(OverlapGuard { policy: Overlap::Queue, max_concurrent_runs: 2, ceiling: &slot }),
+                    ..Firing::default()
+                },
+                0
+            )
+            .await?,
+            result
+        );
+    }
+    // Four owned triggers per candidate, and one queue on the first name.
+    let page = bounded(metrics, "control_definitions", 36, async || s.query_definitions(None, 7).await).await?;
+    assert_eq!(page.items.len(), 7);
+    assert!(page.items[0].schedules[0].queued.is_some());
+    assert_eq!(metrics.counts().rows_written, 0);
+    bounded(metrics, "control_definitions_cursor", 35, async || s.query_definitions(page.next.as_ref(), 7).await)
+        .await?;
+    let item = bounded(metrics, "control_definition", 6, async || s.definition_control("catalog0000").await).await?;
+    assert_eq!(item.as_ref(), page.items.first());
+    assert!(
+        bounded(metrics, "control_definition_absent", 0, async || s.definition_control("absent").await)
+            .await?
+            .is_none()
+    );
+    let req = |id: &str| Request { id: id.into(), actor: "operator".into(), reason: "row bounds".into() };
+    s.control(&req("catalog-pause"), &Command::Pause { definition: "catalog0000".into(), note: "pause".into() }, 1)
+        .await?;
+    let paused = bounded(metrics, "control_definition_paused", 2, async || s.definition_control("catalog0000").await)
+        .await?
+        .unwrap();
+    assert_eq!(paused.schedules, item.unwrap().schedules);
+    bounded(metrics, "control_definitions_paused", 33, async || s.query_definitions(None, 7).await).await?;
+    s.control(&req("catalog-resume"), &Command::Resume { definition: "catalog0000".into() }, 2).await?;
+    // Maximum-size pages still cost a constant number of rows per definition.
+    assert_eq!(
+        bounded(metrics, "control_definitions_max", 5_001, async || s.query_definitions(None, 1_000).await)
+            .await?
+            .items
+            .len(),
+        1_000
+    );
+    Ok(())
+}
+
 async fn heartbeat_bounds(backend: &Arc<dyn AtomicBackend>, metrics: &Metrics) -> anyhow::Result<()> {
     use ouro_durable::control::{WORKERS_KEPT_MS, Worker};
     let s = TransactionalStore::new(backend.clone());
