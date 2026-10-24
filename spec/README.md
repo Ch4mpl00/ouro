@@ -48,12 +48,12 @@ are the bridges in `crates/durable/tests/quint.rs` and `quint/concurrent.rs`.
 | W5 | `W5`: publication recipients and subscription survival | Concurrent publish/finish; existing multi-take DSL tests |
 | C1 | `C1`: acyclic owned link and one child admission | Serial MBT; native-child recovery tests |
 | C2 | `C2`: terminal child has notification obligation | Serial MBT audits the parent's one notification; child conformance |
-| C3 | `C3`: cancellation closes the bounded subtree | Serial MBT; handler cancellation tests remain separate |
+| C3 | `C3`: any end of a run (completion, fault, cancellation) closes its owned subtree, transitively, in that transition | Serial MBT (`childTest`, `childFinishTest`, `grandchildTest`; the bridge audits that no owned child outlives its parent); conformance audit and commit faults; handler cancellation tests remain separate |
 | T1 | `T1`: slot disposition, overlap and global ingress identity | Concurrent firings and ingress; serial MBT; `t1_*` runtime regressions |
 | T2 | `T2`: activation epoch (only an activation starts one), dormant rearm | Concurrent firing/activation; serial MBT; `gaps::t2_old_completion_cannot_rearm_new_epoch` |
 | T3 | `T3`: deadline fixed at admission | Serial MBT; `t3_admission_fixes_the_workflow_deadline` |
 | V1 | `V1`: only an activation selects the active version (no rollback); pinned admission | Serial MBT; runtime pinned-version recovery |
-| V2 | `V2`: epoch, fault classification, reset; a trip reports once (one notice), stops the schedule and every admission, ignores later observations, cleared only by activation | Serial MBT; `gaps::v2_old_epoch_fault_does_not_count_after_reactivation`; refusal on every admission path in conformance (two model runs cannot trip and then admit a child, so the model's clause is not reached by a witness) |
+| V2 | `V2`: epoch, fault classification, reset; a trip reports once (one notice), stops the schedule and every admission, ignores later observations, cleared only by activation | Serial MBT; `gaps::v2_old_epoch_fault_does_not_count_after_reactivation`; refusal on every admission path in conformance (a trip then a child needs two faulted runs besides a live parent and its unadmitted child, more than the model's three, so the model's clause is not reached) |
 | V3 | `V3`: undeclared/exact-match claim and mutation guards | Serial MBT (`claim_as`, `due_as` per worker version); `gaps::v3_incompatible_worker_cannot_claim` |
 | O1 | `O1`: failed operation stops the attempt | Serial MBT fault switches; generated interrupted journals |
 | O2 | `O2`: terminal-only retention and stable identities | Serial MBT (swept evidence projected away); replay-after-sweep refusal |
@@ -75,7 +75,7 @@ earlier property names.
 
 ## The model
 
-Two runs, two workers, three invocations, three event identities of one type
+Three runs, two workers, three invocations, three event identities of one type
 and three definition versions; time, generations, epochs and observation lists
 grow with the trace. A run carries its admission, application version, mode,
 deadline fixed at admission and epoch.
@@ -114,10 +114,13 @@ deadline fixed at admission and epoch.
   observes nothing; only the next activation clears it.
 - **Compatibility** (#3). Worker `w` declares version `w + 1`; a run admitted
   with version 0 (undeclared) is compatible with both.
-- **Children, retention.** The parent's host holds a child's first lease. A
-  sweep clears the evidence of every finished run past five ticks.
+- **Children, retention.** Run r's owned child is run r + 1, so run 2 can be
+  a grandchild. The parent's host holds a child's first lease. An owned child
+  never outlives its parent (#14): any end of a run cancels its live
+  descendants, transitively, in that transition. A sweep clears the evidence of
+  every finished run past five ticks.
 - **Budgets** (issue #8). A run tree's counter belongs to its root; an owned
-  child spends it. `spend` at key `i` is granted below `ceiling` = 2 and
+  descendant spends it. `spend` at key `i` is granted below `ceiling` = 2 and
   refused at it, the decision and the counter in one commit; the counter ends
   with its root. The model has no notion of what a unit stands for.
 
@@ -148,7 +151,7 @@ exact matching plus undeclared, without a host-supplied `accepts` list.
 
 `crates/durable/tests/quint.rs` replays Quint's random traces of `contract.qnt`
 (100 traces × 150 steps per adapter by default, all 29 commands and every fault
-switch) and the `bridgeSuite` run of `contract_witnesses.qnt` (all 31 witness
+switch) and the `bridgeSuite` run of `contract_witnesses.qnt` (all 33 witness
 histories in one trace). After every step it compares a projection of the store
 with the model's state. The model records each command in its `command`
 variable; the driver never sees the model's state.
@@ -175,7 +178,7 @@ ticks), with `Policy { mailbox_ms: 37_500, ingress_ms: 37_500, skew_ms: 7_500 }`
 | `spend` | `spend` at `jump<i>` with limit 2 |
 | `address`, `publish` | `publish` with and without a target |
 | `expire`, `sweep` | `sweep` without and with five ticks of retention |
-| `child` | `start_child`; the child's lease is left to expire |
+| `child` | `start_child` of run r + 1 under run r; the child's lease is left to expire |
 | `finish`, `timeout`, `cancel` | `finish` (outcomes 1–5), `cancel` |
 | `activate` | `activate_with`: the version's trigger |
 | `fire` | `fire` with `busy` and `rearm`; a missed or taken slot commits a skip |
@@ -194,7 +197,8 @@ expired (the store records expiry at the next take or sweep, the model at
 `expire`), and swept evidence is absent (the model keeps it, marked). Outside the
 projection, every step audits fenced loads against snapshots, `due` and
 `due_as` per worker version, owned child outcomes, the parent's single terminal
-notification, and the take/expiry record bijection.
+notification, that no owned child outlives its parent, and the take/expiry
+record bijection.
 
 ### Concurrent
 
@@ -226,7 +230,8 @@ APALACHE_ENDPOINT=localhost:8823 python3 spec/deeper.py --contract-depth 3
 APALACHE_ENDPOINT=localhost:8823 JAVA=/path/to/java APALACHE_JAR=/path/to/apalache.jar python3 spec/contract_temporal.py
 ```
 
-`contract_mutations.py` changes one mechanism per safety ID in a temporary copy,
+`contract_mutations.py` changes one mechanism per safety ID (C3 has two more,
+`C3/end` and `C3/transitive`, for #14) in a temporary copy,
 then executes a reachable scripted witness and records **all** sticky monitor
 violations at its end; the target property must be violated, not merely a
 nonzero CLI exit. Off-target clean cells are sampled witness observations, not
@@ -292,17 +297,13 @@ and runtime tests:
 - routing an unaddressed `deliver` to the oldest registration, `register_wait`
   and `unregister_wait`, and several registrations of one type;
 - waiting runs and their wake-ups, interruption backoff and its exhaustion;
-- the child's `waiting` notification and descendants deeper than one level;
+- the child's `waiting` notification and descendants deeper than two levels;
 - event-triggered (`on`) strategies, cron arithmetic, `accepts` lists;
 - concurrent spenders of one budget (the model's single permit excludes two
   owners at once; conformance races three handles at the last unit), a
   budget counter itself (the bridge reads only `RunStore`, so it compares the
-  count each decision returns) and grandchildren.
-
-The model ends a parent's owned child only on cancellation, while the stores
-cancel owned descendants at every terminal end of the parent. Random traces
-have not reached it; the witness `init.then(boot).then(do("child")).then(do("finish"))`
-diverges on the bridge. It predates the budget and is left for a decision.
+  count each decision returns) and a grandchild's spending, which only random
+  traces reach (no witness).
 
 The symbolic contract check and the TLC progress quotient need Apalache and a
 JVM; whether they were run for this revision is in [RESULTS.md](RESULTS.md).
