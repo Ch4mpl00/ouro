@@ -325,6 +325,7 @@ and runtime tests:
 - waiting runs and their wake-ups, interruption backoff and its exhaustion;
 - the child's `waiting` notification and descendants deeper than two levels;
 - event-triggered (`on`) strategies, cron arithmetic, `accepts` lists;
+- transient resource-resolution interruptions and their admission backoff (#15);
 - concurrent spenders of one budget (the model's single permit excludes two
   owners at once; conformance races three handles at the last unit), a
   budget counter itself (the bridge reads only `RunStore`, so it compares the

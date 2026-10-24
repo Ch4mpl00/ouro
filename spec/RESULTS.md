@@ -16,6 +16,9 @@ actual buffer through `RunStore::queued` and replays policy and crash histories.
 | Concurrent table | 8 batches, every order | Computed | 5.242 s |
 | Safety mutants | 40 (35 existing, 4 policies and the ceiling) | All targets detected | 199.125 s |
 | Serial MBT, memory, targeted | 100 × 150 + all 45 `bridgeSuite` histories | Pass | 41.88 s |
+| fmt, Clippy, workspace tests after rebasing onto main `166cfd4` | `OURO_REQUIRE_QUINT=1`; 206 Rust tests and 21 CTK scenarios passed; Postgres conformance/scalability included | Pass | 0.356 s, 4.529 s, 304.965 s |
+| Restart example | Real local worker killed/recovered, value 42, one write | Pass | 5.476 s |
+| Prohibited-name scan | `crates`, `examples` | Empty | |
 
 The V2 monitor permits only the specified queue-field changes during an
 old-epoch completion, leaving its breaker observations unchanged, and checks
@@ -26,7 +29,11 @@ old epoch. No contract ID, fault switch or prior witness was removed.
 Not run for this revision: TLC, Apalache, the temporal quotient or symbolic
 checks. `contract_progress.qnt` is unchanged. Earlier symbolic/temporal results
 below concern earlier revisions; no updated unbounded or temporal proof is
-claimed. Exact Rust results are recorded with the overlap implementation report.
+claimed. The four ignored Rust tests are the opt-in Postgres MBT bridges and throughput
+benchmarks; the required adapter conformance and scalability suites ran on all
+three adapters. An initial full run exposed an invalid empty task in the new
+parser test; its task was corrected without changing any assertion. The final
+required checks above ran after both dependency merges and that correction.
 
 # Contract checking — 2026-10-24, refused trigger admissions (#15)
 

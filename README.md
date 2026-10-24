@@ -388,7 +388,7 @@ The engine owns primary and secondary keys in `(kind, id)` order:
 | `trigger_run` | trigger key | The run a trigger admitted last (legacy exclusive firing) |
 | `live_name:<hex name>` | run ID | Unfinished runs for a limited definition-capacity lookup |
 | `trigger_live:<hex trigger key>` | run ID | Unfinished runs admitted by a trigger, across epochs |
-| `trigger_queue` | trigger key | One pinned buffered admission, optional rearm and captured ceiling (layout 1) |
+| `trigger_queue` | trigger key | One pinned buffered admission, optional refusal/rearm and captured ceiling (layout 1) |
 | `queue_name:<hex name>` | trigger key | Buffers to promote when this definition releases capacity |
 | `ingress`, `ingress_due` | hex identity | Ingress tombstones and their expiry |
 | `budget` | root run ID | The units a run tree has spent, until its root ends |
