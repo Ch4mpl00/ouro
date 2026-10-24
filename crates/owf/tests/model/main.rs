@@ -5,7 +5,8 @@
 //
 //   1. the comparison — outcome (value, or error type/status/instance), the
 //                       steps (start/skip/retry by reference), the tasks
-//                       counted, the host calls and effects_started
+//                       counted, the host calls and whether an at-most-once
+//                       call started (from the call journal)
 //   2. random programs, then the regressions they found, kept as plain tests
 //
 //   cargo test -p owf --test model
@@ -72,8 +73,10 @@ fn agree(p: &Program, input: Value) -> Result<(), String> {
     if calls(&real.journal) != expected.calls {
         diffs.push(format!("calls: interpreter {:?}\n       model       {:?}", calls(&real.journal), expected.calls));
     }
-    if real.outcome.effects_started != expected.effects_started {
-        diffs.push(format!("effects_started: interpreter {}", real.outcome.effects_started));
+    // The call journal shows an at-most-once call exactly when one started.
+    let protected = real.outcome.calls.iter().any(|c| c.delivery == owf::durable::Delivery::AtMostOnce);
+    if protected != expected.protected_started {
+        diffs.push(format!("at-most-once call started: interpreter {protected}"));
     }
     if diffs.is_empty() {
         Ok(())

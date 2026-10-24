@@ -49,7 +49,7 @@ MUTANTS = {
  "O1": ('{ ...persisted.workers.nth(actor),stopped:true,phase:0,permit:false }','{ ...persisted.workers.nth(actor),stopped:false,phase:1,permit:false }',BOOT+[op("intent",fault=2),op("dispatch")]),
  "O2": ('x.outcome != 0 and s.now >= x.ended+5','true',BOOT+[op("sweep")]),
  "O3": ('not(s.workers.elems().exists(x => x.permit))','true',BOOT+[op("admit",r=1),op("claim",r=1,w=1)]),
- "X1": ('not(execution.mode == 1 and writes(i))','true',[op("dry"),op("claim")]+CALL),
+ "X1": ('not(execution.mode == 1 and mocked(i))','true',[op("dry"),op("claim")]+CALL),
  "X2": ('execution.mode != 2','true',[op("replay"),op("claim")]+CALL),
  "X3": ('Set("admit","dry","replay").contains(op) and value >= 0 and not(execution.admitted)','Set("admit","dry","replay").contains(op) and value >= 0',BOOT+[op("finish"),op("admit",value=1)]),
  "B1": ('val granted = count < ceiling','val granted = true',BOOT+[op("spend"),op("spend",i=1),op("spend",i=2)]),

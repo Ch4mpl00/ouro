@@ -10,7 +10,7 @@
 // external schemas reach the host through its seams; the DSL's semantics
 // (flow, data, errors, retries, timers, event matching and consumption,
 // extensions) are evaluated here.
-use crate::durable::{self, CallFailure, CallState, Delivery, Journal, Record, StepOutcome, TaskResult};
+use crate::durable::{self, CallEntry, CallFailure, CallState, Delivery, Journal, Record, StepOutcome, TaskResult};
 use crate::events::{self, Offer};
 use crate::expr::{self, Args};
 use crate::model::{
@@ -31,13 +31,6 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 // ── 1. host seams and outcome ──────────────────────────────────────────────
-
-/// What a host function does to the world.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Effect {
-    Read,
-    Write,
-}
 
 /// Where a call comes from, for the host's tracing and cancellation.
 pub struct CallInfo<'a> {
@@ -89,21 +82,21 @@ pub trait Functions: Send + Sync {
     async fn emit(&self, _event: &Value, _info: &CallInfo<'_>) -> Result<(), CallFailure> {
         Err(CallFailure::NotExecuted(WorkflowError::runtime("emitting events is not supported by this host")))
     }
-    /// The effect of `run: <kind>` (`container`, `script`, `shell`) here;
-    /// `None`: this host has no runner for it.
-    fn process(&self, _kind: &str) -> Option<Effect> {
-        None
+    /// Whether this host runs `run: <kind>` (`container`, `script`, `shell`).
+    fn process(&self, _kind: &str) -> bool {
+        false
     }
     /// Runs a process: `definition` is the rendered `run.<kind>` with
     /// `await` added. The result is a process result `{ code, stdout,
     /// stderr }`; a process that is not awaited may return anything.
-    /// Recorded and delivered like a call to a function of its effect.
+    /// Recorded and delivered like a function call (`run:<kind>`).
     async fn run_process(&self, kind: &str, _definition: Value, _info: &CallInfo<'_>) -> Result<Value, CallFailure> {
         Err(CallFailure::NotExecuted(WorkflowError::runtime(format!("no process runner for `{kind}`"))))
     }
 
-    /// The function's effect class; `None` when the host has no such function.
-    fn effect(&self, name: &str) -> Option<Effect>;
+    /// Whether the host has a function `name`. The engine does not know
+    /// whether a function reads or writes: that is the host's to judge.
+    fn has(&self, name: &str) -> bool;
     /// Durable entry point. Adapters must honor delivery at every internal
     /// retry boundary; only proven non-execution permits an at-most-once retry.
     async fn invoke(&self, name: &str, args: Value, info: &CallInfo<'_>) -> Result<Value, CallFailure> {
@@ -116,14 +109,9 @@ pub trait Functions: Send + Sync {
         self.call(name, args, info).await.map_err(CallFailure::Response)
     }
     async fn call(&self, name: &str, args: Value, info: &CallInfo<'_>) -> Result<Value, WorkflowError>;
-    /// This invocation's effect: a function that dispatches by an argument
-    /// (a tool by name) may differ per call. The function's by default.
-    fn effect_of(&self, name: &str, _args: &Value) -> Option<Effect> {
-        self.effect(name)
-    }
     /// Whether this invocation is at most once whatever its task says: the
     /// function's declared delivery. A task's `metadata.delivery` can only
-    /// tighten it; the effect never implies it.
+    /// tighten it.
     fn at_most_once(&self, _name: &str, _args: &Value) -> bool {
         false
     }
@@ -353,9 +341,12 @@ pub enum Status {
 #[derive(Debug)]
 pub struct Outcome {
     pub status: Status,
-    /// Whether a `Write` call started. Until one has, a failed run changed
-    /// nothing and can be handed over or rerun as if it had never happened.
-    pub effects_started: bool,
+    /// The run's calls (and emitted events), in record-key order: what was
+    /// called, its delivery and how far it got. The host decides from it
+    /// whether the run changed the world, e.g. whether a failed run can be
+    /// handed over or rerun as if it had never happened. Empty when the
+    /// run's records could not be loaded (an interrupted outcome).
+    pub calls: Vec<CallEntry>,
     pub tasks_run: usize,
     /// The run ran out of jump budget and that ended it: its `on_exceeded`
     /// ended it (`end`, or a handler's output or fault), or an uncaught
@@ -368,7 +359,7 @@ pub fn validate(wf: &Workflow, functions: &dyn Functions) -> Result<(), Invalid>
     struct Known<'a>(&'a dyn Functions);
     impl Catalog for Known<'_> {
         fn has(&self, name: &str) -> bool {
-            self.0.effect(name).is_some()
+            self.0.has(name)
         }
         fn events(&self) -> bool {
             self.0.events().is_some()
@@ -380,7 +371,7 @@ pub fn validate(wf: &Workflow, functions: &dyn Functions) -> Result<(), Invalid>
             self.0.children().is_some() && self.0.events().is_some()
         }
         fn processes(&self, kind: &str) -> bool {
-            self.0.process(kind).is_some()
+            self.0.process(kind)
         }
         fn secrets(&self) -> bool {
             self.0.secrets().is_some()
@@ -570,7 +561,7 @@ const NO_DEADLINE: i64 = 253_402_300_799_000;
 /// `after` list; those tasks are not extended themselves.
 const EXTENSION_TASKS: &str = "/use/extensions/";
 
-/// The effect a call record names: a function, or a process run.
+/// What a call record names: a function, or a process run.
 #[derive(Clone, Copy)]
 enum Target<'a> {
     Function(&'a str),
@@ -630,7 +621,7 @@ async fn execute(
 ) -> Outcome {
     let interrupted = |e: String| Outcome {
         status: Status::Interrupted(WorkflowError::runtime(e)),
-        effects_started: true,
+        calls: Vec::new(),
         tasks_run: 0,
         limit_exceeded: false,
     };
@@ -656,19 +647,17 @@ async fn execute(
         Err(e) => return interrupted(secrets.text(&e)),
     };
     let tasks = records.values().filter(|r| matches!(r, Record::Task { .. })).count();
-    let writes = records.values().filter(|r| matches!(r, Record::Call { effect: Effect::Write, .. })).count();
+    let calls = durable::call_journal(&records);
+    let stopped = |status: Status| Outcome { status, calls: calls.clone(), tasks_run: tasks, limit_exceeded: false };
     let (started_ms, runtime) = match records.get("execution") {
         Some(Record::Execution { version, max_tasks, max_attempts, .. })
             if *version != durable::VERSION
                 || *max_tasks != host.limits.max_tasks
                 || *max_attempts != host.limits.max_attempts =>
         {
-            return Outcome {
-                status: Status::Interrupted(WorkflowError::runtime("incompatible durable version or execution limits")),
-                effects_started: true,
-                tasks_run: tasks,
-                limit_exceeded: false,
-            };
+            return stopped(Status::Interrupted(WorkflowError::runtime(
+                "incompatible durable version or execution limits",
+            )));
         }
         Some(Record::Execution {
             version,
@@ -688,25 +677,11 @@ async fn execute(
         {
             (*started_ms, runtime.clone())
         }
-        Some(_) => {
-            return Outcome {
-                status: Status::Faulted(WorkflowError::runtime("a run's definition or input changed")),
-                effects_started: writes > 0,
-                tasks_run: tasks,
-                limit_exceeded: false,
-            };
-        }
+        Some(_) => return stopped(Status::Faulted(WorkflowError::runtime("a run's definition or input changed"))),
         None if records.is_empty() => {
             (admitted_ms.unwrap_or_else(|| host.clock.now().timestamp_millis()), host.runtime.clone())
         }
-        None => {
-            return Outcome {
-                status: Status::Interrupted(WorkflowError::runtime("missing execution record")),
-                effects_started: true,
-                tasks_run: tasks,
-                limit_exceeded: false,
-            };
-        }
+        None => return stopped(Status::Interrupted(WorkflowError::runtime("missing execution record"))),
     };
     if records.iter().any(|(key, record)| !match record {
         Record::Execution { .. } => key == "execution",
@@ -723,12 +698,7 @@ async fn execute(
         Record::Budget { .. } => key.ends_with("#jump"),
         Record::Exceeded { .. } => key == durable::EXCEEDED,
     }) {
-        return Outcome {
-            status: Status::Interrupted(WorkflowError::runtime("invalid durable record key or terminal state")),
-            effects_started: true,
-            tasks_run: tasks,
-            limit_exceeded: false,
-        };
+        return stopped(Status::Interrupted(WorkflowError::runtime("invalid durable record key or terminal state")));
     }
     if records.values().any(|record| match record {
         Record::Execution { started_ms, .. } | Record::Task { started_ms, .. } => {
@@ -736,12 +706,7 @@ async fn execute(
         }
         _ => false,
     }) {
-        return Outcome {
-            status: Status::Interrupted(WorkflowError::runtime("invalid saved timestamp")),
-            effects_started: true,
-            tasks_run: tasks,
-            limit_exceeded: false,
-        };
+        return stopped(Status::Interrupted(WorkflowError::runtime("invalid saved timestamp")));
     }
     let jumps = records.values().filter(|r| matches!(r, Record::Budget { granted: true, .. })).count();
     let run = Run {
@@ -756,7 +721,8 @@ async fn execute(
         handlers: Mutex::default(),
         handler_failed: AtomicBool::new(false),
         exceeded: tokio::sync::watch::channel(None).0,
-        writes: AtomicUsize::new(writes),
+        calls: Mutex::new(calls.iter().map(|c| (c.key.clone(), c.clone())).collect()),
+        protected: AtomicUsize::new(0),
         workflow: json!({ "id": run_id, "definition": wf.definition, "input": input, "startedAt": datetime(DateTime::from_timestamp_millis(started_ms).expect("stored timestamp")) }),
         runtime: runtime.clone(),
         journal,
@@ -771,12 +737,7 @@ async fn execute(
             matches!(r, Record::Budget { granted: false, .. }) && !matches!(run.wf.budget.on_exceeded, Exceeded::Raise)
         });
         let limit_exceeded = refused || matches!(&status, Status::Faulted(e) if e.is("budget.exhausted"));
-        return Outcome {
-            status: run.secrets.status(&status),
-            effects_started: writes > 0,
-            tasks_run: tasks,
-            limit_exceeded,
-        };
+        return Outcome { status: run.secrets.status(&status), calls, tasks_run: tasks, limit_exceeded };
     }
     let result = async {
         if run.record("execution").is_none() {
@@ -845,7 +806,7 @@ async fn execute(
     }
     Outcome {
         status: run.secrets.status(&status),
-        effects_started: run.writes.load(Ordering::SeqCst) > 0,
+        calls: run.calls.lock().unwrap_or_else(|e| e.into_inner()).values().cloned().collect(),
         tasks_run: run.tasks_run.load(Ordering::SeqCst),
         limit_exceeded: limit_exceeded && matches!(status, Status::Completed(_) | Status::Faulted(_)),
     }
@@ -872,8 +833,11 @@ struct Run<'a> {
     /// How the run's first refused jump ended this execution, for the
     /// branches refused at the same moment, which follow it.
     exceeded: tokio::sync::watch::Sender<Option<Fault>>,
-    /// `Write` calls started so far.
-    writes: AtomicUsize,
+    /// The call journal by record key, kept for runs without a journal too.
+    calls: Mutex<BTreeMap<String, CallEntry>>,
+    /// At-most-once calls started so far, for runs without a journal: they
+    /// keep no results, so an attempt that started one is never retried.
+    protected: AtomicUsize,
     /// `$workflow`.
     workflow: Value,
     runtime: Value,
@@ -891,6 +855,9 @@ impl Run<'_> {
     }
 
     fn save(&self, key: &str, record: Record) -> Result<(), Fault> {
+        if self.journal.is_none() {
+            self.note(key, &record);
+        }
         if let Some(journal) = self.journal {
             if let Some(old) = self.record(key) {
                 durable::check_transition(&old, &record)
@@ -902,9 +869,18 @@ impl Run<'_> {
                     self.secrets.text(&e.to_string())
                 )))
             })?;
+            self.note(key, &record);
             self.records.lock().unwrap_or_else(|e| e.into_inner()).insert(key.to_owned(), record);
         }
         Ok(())
+    }
+
+    /// Keeps the call journal current; only after a durable save when the
+    /// run has a journal.
+    fn note(&self, key: &str, record: &Record) {
+        if let Some(entry) = CallEntry::of(key, record) {
+            self.calls.lock().unwrap_or_else(|e| e.into_inner()).insert(key.to_owned(), entry);
+        }
     }
 
     fn remaining(&self, duration: Duration, started_ms: i64) -> Result<(Duration, i64), Fault> {
@@ -1765,14 +1741,7 @@ impl Run<'_> {
         let key = format!("{reference}#call");
         let logical = self.logical(reference);
         let prior = self.record(&key);
-        if let Some(Record::Call {
-            logical: old_logical,
-            function,
-            arguments,
-            effect: _,
-            delivery: old_delivery,
-            state,
-        }) = &prior
+        if let Some(Record::Call { logical: old_logical, function, arguments, delivery: old_delivery, state }) = &prior
         {
             if old_logical != &logical || function != name || arguments != &args || *old_delivery != delivery {
                 return Err(Fault::Fatal(WorkflowError::runtime(format!("{reference}: call bindings changed"))));
@@ -1787,19 +1756,16 @@ impl Run<'_> {
         } else if prior.is_some() {
             return Err(Fault::Interrupted(WorkflowError::runtime("invalid call record")));
         }
-        let effect = match target {
-            Target::Function(_) => self.host.functions.effect_of(name, &args),
+        let known = match target {
+            Target::Function(_) => self.host.functions.has(name),
             Target::Process(kind) => self.host.functions.process(kind),
-        }
-        .ok_or_else(|| Fault::Fatal(WorkflowError::runtime(format!("unknown function `{name}`"))))?;
-        if let Some(Record::Call { effect: original, .. }) = &prior
-            && *original != effect
-        {
-            return Err(Fault::Fatal(WorkflowError::runtime("function effect classification changed")));
+        };
+        if !known {
+            return Err(Fault::Fatal(WorkflowError::runtime(format!("unknown function `{name}`"))));
         }
         // A retry attempt of a protected (at-most-once) call: an earlier
-        // attempt's success stands, so the call is not sent again. The effect
-        // plays no part: an at-least-once write runs again like a read.
+        // attempt's success stands, so the call is not sent again. Any
+        // at-least-once call runs again, whatever it does to the world.
         if prior.is_none()
             && logical != reference
             && delivery == Delivery::AtMostOnce
@@ -1813,13 +1779,12 @@ impl Run<'_> {
                 logical: logical.clone(),
                 function: name.into(),
                 arguments: args.clone(),
-                effect,
                 delivery,
                 state: CallState::Pending,
             },
         )?;
-        if effect == Effect::Write && prior.is_none() {
-            self.writes.fetch_add(1, Ordering::SeqCst);
+        if delivery == Delivery::AtMostOnce {
+            self.protected.fetch_add(1, Ordering::SeqCst);
         }
         let attempt = self
             .attempts
@@ -1863,6 +1828,18 @@ impl Run<'_> {
             if self.cancel.is_cancelled() {
                 return Err(Fault::Cancelled);
             }
+            // No journal, so no record to save: the call journal still
+            // learns how the call ended.
+            let state = match &result {
+                Ok(value) => Some(CallState::Done(Ok(value.clone()))),
+                Err(CallFailure::Response(error)) => Some(CallState::Done(Err(error.clone()))),
+                Err(CallFailure::NotExecuted(error)) => Some(CallState::NotExecuted(error.clone())),
+                Err(CallFailure::Unknown(_) | CallFailure::Interrupted(_)) => None,
+            };
+            if let Some(state) = state {
+                let record = Record::Call { logical, function: name.into(), arguments: Value::Null, delivery, state };
+                self.note(&key, &record);
+            }
             return result.map_err(|failure| match failure {
                 CallFailure::Interrupted(error) => Fault::Interrupted(error),
                 CallFailure::Response(error) | CallFailure::NotExecuted(error) | CallFailure::Unknown(error) => {
@@ -1903,7 +1880,7 @@ impl Run<'_> {
                 return Err(Fault::Interrupted(error));
             }
         };
-        self.save(&key, Record::Call { logical, function: name.into(), arguments: args, effect, delivery, state })?;
+        self.save(&key, Record::Call { logical, function: name.into(), arguments: args, delivery, state })?;
         result
     }
 
@@ -1972,16 +1949,15 @@ impl Run<'_> {
         let Some(marker) = self.host.functions.unknown_outcome(name, &args) else {
             return Err(self.unknown(reference));
         };
-        let Some(Record::Call { effect, .. }) = self.record(key) else {
+        if !matches!(self.record(key), Some(Record::Call { .. })) {
             return Err(Fault::Interrupted(WorkflowError::runtime("missing call record")));
-        };
+        }
         self.save(
             key,
             Record::Call {
                 logical,
                 function: name.into(),
                 arguments: args,
-                effect,
                 delivery: Delivery::AtMostOnce,
                 state: CallState::Done(Ok(marker.clone())),
             },
@@ -2339,14 +2315,10 @@ impl Run<'_> {
             logical: logical.clone(),
             function: EMIT.into(),
             arguments: envelope.clone(),
-            effect: Effect::Write,
             delivery: Delivery::AtLeastOnce,
             state,
         };
         self.save(&key, pending(CallState::Pending))?;
-        if prior.is_none() {
-            self.writes.fetch_add(1, Ordering::SeqCst);
-        }
         let info = CallInfo {
             run_id: self.run_id,
             reference,
@@ -2388,7 +2360,7 @@ impl Run<'_> {
     // ── 6. child workflows and processes ───────────────────────────────────
 
     /// `run`: a child workflow through `Children`, or a process through the
-    /// host's runner, recorded like a call of the runner's effect. Without
+    /// host's runner, recorded like a function call. Without
     /// `await` the task outputs its input.
     async fn run_process(
         &self,
@@ -2499,8 +2471,8 @@ impl Run<'_> {
 
     /// A retry restores the original context and gets its own invocation path.
     /// In a durable run a protected call keeps the first attempt's identity
-    /// (`logical`), so a write that succeeded is not repeated; ephemeral runs
-    /// keep no results and so never retry an attempt that started a write.
+    /// (`logical`), so one that succeeded is not repeated; ephemeral runs
+    /// keep no results and so never retry an attempt that started one.
     #[allow(clippy::too_many_arguments)]
     async fn attempt(
         &self,
@@ -2518,7 +2490,7 @@ impl Run<'_> {
         let snapshot = ctx.clone();
         let mut attempt: u32 = 1;
         loop {
-            let writes = self.writes.load(Ordering::SeqCst);
+            let protected = self.protected.load(Ordering::SeqCst);
             let attempt_ref = if self.journal.is_none() || attempt == 1 {
                 format!("{reference}/try")
             } else {
@@ -2559,7 +2531,7 @@ impl Run<'_> {
                     let safe = if self.journal.is_some() {
                         !self.blocks_retry(&attempt_ref)
                     } else {
-                        self.writes.load(Ordering::SeqCst) == writes
+                        self.protected.load(Ordering::SeqCst) == protected
                     };
                     let delay = match &catch.retry {
                         Some(retry) if safe => self.retry_delay(retry, attempt, began, input, &args)?,
@@ -2760,11 +2732,11 @@ mod tests {
 
     type Behaviour = Box<dyn Fn(&Value, usize) -> Result<Value, WorkflowError> + Send + Sync>;
 
-    /// Functions by name: an effect and a behaviour given the arguments and
-    /// how many times the function was called before.
+    /// Functions by name: a declared delivery and a behaviour given the
+    /// arguments and how many times the function was called before.
     #[derive(Default)]
     struct Fake {
-        functions: HashMap<&'static str, (Effect, Behaviour)>,
+        functions: HashMap<&'static str, (Delivery, Behaviour)>,
         calls: Mutex<Vec<(String, Value, String)>>,
     }
 
@@ -2772,18 +2744,21 @@ mod tests {
         fn with(
             mut self,
             name: &'static str,
-            effect: Effect,
+            delivery: Delivery,
             f: impl Fn(&Value, usize) -> Result<Value, WorkflowError> + Send + Sync + 'static,
         ) -> Self {
-            self.functions.insert(name, (effect, Box::new(f)));
+            self.functions.insert(name, (delivery, Box::new(f)));
             self
         }
     }
 
     #[async_trait]
     impl Functions for Fake {
-        fn effect(&self, name: &str) -> Option<Effect> {
-            self.functions.get(name).map(|(e, _)| *e)
+        fn has(&self, name: &str) -> bool {
+            self.functions.contains_key(name)
+        }
+        fn at_most_once(&self, name: &str, _: &Value) -> bool {
+            self.functions.get(name).is_some_and(|(d, _)| *d == Delivery::AtMostOnce)
         }
         async fn call(&self, name: &str, args: Value, info: &CallInfo<'_>) -> Result<Value, WorkflowError> {
             let before = {
@@ -2963,7 +2938,7 @@ do:
     }
 
     fn petstore() -> Fake {
-        Fake::default().with("http", Effect::Read, |args, _| {
+        Fake::default().with("http", Delivery::AtLeastOnce, |args, _| {
             let uri = args["endpoint"]["uri"].as_str().unwrap_or_default();
             Ok(json!({ "id": if uri.ends_with("/2") { 2 } else { 1 } }))
         })
@@ -3018,7 +2993,8 @@ do:
     #[tokio::test]
     async fn ctk_try_catches_a_matching_error_and_faults_on_another() {
         let s = setup(
-            Fake::default().with("http", Effect::Read, |_, _| Err(WorkflowError::communication(404, "no such pet"))),
+            Fake::default()
+                .with("http", Delivery::AtLeastOnce, |_, _| Err(WorkflowError::communication(404, "no such pet"))),
         );
         let o = exec(&s, TRY_PET, json!({"petName": "Milou"})).await;
         let error = &completed(&o)["error"];
@@ -3026,8 +3002,9 @@ do:
         assert_eq!(error["status"], 404);
         assert!(error["type"].is_string() && error["title"].is_string());
 
-        let s =
-            setup(Fake::default().with("http", Effect::Read, |_, _| Err(WorkflowError::communication(503, "down"))));
+        let s = setup(
+            Fake::default().with("http", Delivery::AtLeastOnce, |_, _| Err(WorkflowError::communication(503, "down"))),
+        );
         let o = exec(&s, TRY_PET, json!({"petName": "Milou"})).await;
         let e = faulted(&o);
         assert_eq!((e.status, e.instance.as_deref()), (503, Some("/do/0/tryGetPet/try/0/getPet")));
@@ -3094,10 +3071,13 @@ do:
 
     #[tokio::test]
     async fn reusable_functions_run_as_tasks_on_the_call_arguments() {
-        let s = setup(Fake::default().with("send", Effect::Write, |args, _| Ok(json!({ "sent": args["text"] }))));
+        let s =
+            setup(Fake::default().with("send", Delivery::AtLeastOnce, |args, _| Ok(json!({ "sent": args["text"] }))));
         let o = exec(&s, "use:\n  functions:\n    notify: { call: send, with: { text: '${ \"hi \" + .name }' } }\ndo:\n  - greet: { call: notify, with: { name: '${ .user }' } }\n", json!({"user": "ann"})).await;
         assert_eq!(completed(&o), &json!({"sent": "hi ann"}));
-        assert!(o.effects_started);
+        // The journal names the host call, under the function's reference.
+        let journal: Vec<_> = o.calls.iter().map(|c| (c.key.as_str(), c.function.as_str(), c.state)).collect();
+        assert_eq!(journal, [("/do/0/greet/use/functions/notify#call", "send", durable::CallStatus::Completed)]);
         assert_eq!(s.fake.calls.lock().unwrap()[0].2, "/do/0/greet/use/functions/notify");
     }
 
@@ -3111,23 +3091,27 @@ do:
 
     #[tokio::test(start_paused = true)]
     async fn retries_back_off_and_stop_at_the_attempt_limit() {
-        let s = setup(Fake::default().with("flaky", Effect::Read, |_, n| {
+        let s = setup(Fake::default().with("flaky", Delivery::AtLeastOnce, |_, n| {
             if n < 2 { Err(WorkflowError::communication(503, "busy")) } else { Ok(json!("ok")) }
         }));
         assert_eq!(completed(&exec(&s, RETRYING, Value::Null).await), &json!("ok"));
         assert_eq!(s.log.lines("retry "), ["/do/0/fetch #1 after 1s", "/do/0/fetch #2 after 2s"]);
 
         // Three attempts fail: the error is handled (no catch.do), the input passes through.
-        let s =
-            setup(Fake::default().with("flaky", Effect::Read, |_, _| Err(WorkflowError::communication(503, "busy"))));
+        let s = setup(
+            Fake::default().with("flaky", Delivery::AtLeastOnce, |_, _| Err(WorkflowError::communication(503, "busy"))),
+        );
         assert_eq!(completed(&exec(&s, RETRYING, json!("in")).await), &json!("in"));
         assert_eq!(s.fake.calls.lock().unwrap().len(), 3);
     }
 
     #[tokio::test(start_paused = true)]
-    async fn an_attempt_that_started_a_write_is_not_retried() {
-        let s =
-            setup(Fake::default().with("flaky", Effect::Write, |_, _| Err(WorkflowError::communication(503, "busy"))));
+    async fn an_attempt_that_started_an_at_most_once_call_is_not_retried() {
+        // Without a journal there is no saved result to stand for an earlier
+        // attempt, so a protected call's attempt never runs again.
+        let s = setup(
+            Fake::default().with("flaky", Delivery::AtMostOnce, |_, _| Err(WorkflowError::communication(503, "busy"))),
+        );
         exec(&s, RETRYING, Value::Null).await;
         assert_eq!(s.fake.calls.lock().unwrap().len(), 1);
         assert!(s.log.lines("retry ").is_empty());
@@ -3193,7 +3177,9 @@ do:
 
     #[tokio::test]
     async fn on_exceeded_end_or_a_handler_ends_the_run() {
-        let s = setup(Fake::default().with("report", Effect::Write, |args, _| Ok(json!({ "reported": args["n"] }))));
+        let s = setup(
+            Fake::default().with("report", Delivery::AtLeastOnce, |args, _| Ok(json!({ "reported": args["n"] }))),
+        );
         let o = exec(&s, &limited(", on_exceeded: end", 2), json!({"n": 0})).await;
         assert_eq!(completed(&o), &json!({"n": 3}));
         assert!(o.limit_exceeded);
@@ -3246,8 +3232,8 @@ do:
     }
 
     #[tokio::test]
-    async fn cancellation_stops_a_run_and_reports_started_effects() {
-        let s = setup(Fake::default().with("send", Effect::Write, |_, _| Ok(Value::Null)));
+    async fn cancellation_stops_a_run_and_reports_its_calls() {
+        let s = setup(Fake::default().with("send", Delivery::AtLeastOnce, |_, _| Ok(Value::Null)));
         let wf = model::parse_yaml(&format!(
             "{HEAD}do:\n  - a: {{ call: send }}\n  - b: {{ wait: PT1H }}\n  - c: {{ call: send }}\n"
         ))
@@ -3260,7 +3246,8 @@ do:
         });
         let o = run(&s.host, &wf, "run-1", Value::Null, &cancel).await;
         assert!(matches!(o.status, Status::Cancelled), "{o:?}");
-        assert!(o.effects_started);
+        let journal: Vec<_> = o.calls.iter().map(|c| (c.key.as_str(), c.function.as_str(), c.state)).collect();
+        assert_eq!(journal, [("/do/0/a#call", "send", durable::CallStatus::Completed)]);
         assert_eq!(s.fake.calls.lock().unwrap().len(), 1);
     }
 

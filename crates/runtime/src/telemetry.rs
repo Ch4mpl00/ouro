@@ -44,18 +44,16 @@ impl Spans {
     pub fn task(&self, path: &str) -> Context {
         self.tasks.lock().unwrap().get(path).cloned().unwrap_or_else(|| self.root.clone())
     }
-    pub fn function(&self, name: &str, path: &str, effect: &str, attempt: u32) -> ActiveSpan {
+    /// A function call's span. The engine adds no read/write attribute: a
+    /// host that classifies its functions adds its own through the context.
+    pub fn function(&self, name: &str, path: &str, attempt: u32) -> ActiveSpan {
         let parent = self.task(path);
-        parent.span().set_attributes([
-            KeyValue::new("ouro.effect", effect.to_string()),
-            KeyValue::new("ouro.attempt", i64::from(attempt)),
-        ]);
+        parent.span().set_attribute(KeyValue::new("ouro.attempt", i64::from(attempt)));
         let context = parent.with_span(self.tracer.start_with_context(format!("function {name}"), &parent));
         context.span().set_attributes(self.attributes.clone());
         context.span().set_attributes([
             KeyValue::new("ouro.task.path", path.to_string()),
             KeyValue::new("ouro.function.name", name.to_string()),
-            KeyValue::new("ouro.effect", effect.to_string()),
             KeyValue::new("ouro.attempt", i64::from(attempt)),
         ]);
         ActiveSpan { context, finished: false }

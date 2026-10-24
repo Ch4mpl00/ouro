@@ -20,11 +20,10 @@ use owf::expr::{self, Args};
 use serde_json::{Map, Value, json};
 use std::collections::HashMap;
 
-use crate::support::host::{behave, effect};
+use crate::support::host::{at_most_once, behave};
 use crate::support::program::{
     Body, Catch, Cond, DEFAULT_AT, DEFAULT_EACH, DEFAULT_ERROR, Data, Flow, Items, Num, Program, RAISED, Task, Template,
 };
-use owf::run::Effect;
 
 // ── 1. outcome ─────────────────────────────────────────────────────────────
 
@@ -39,7 +38,8 @@ pub struct Outcome {
     /// Jumps taken to a named task: what the budget counts.
     pub jumps: u64,
     pub calls: Vec<(String, Value)>,
-    pub effects_started: bool,
+    /// Whether an at-most-once call started.
+    pub protected_started: bool,
 }
 
 pub struct Limits {
@@ -122,7 +122,8 @@ struct Machine<'p> {
     jumps: u64,
     /// Host calls so far, per function (the fakes answer by call count).
     counts: HashMap<String, usize>,
-    writes: usize,
+    /// At-most-once calls started so far.
+    protected: usize,
     trace: Vec<String>,
     calls: Vec<(String, Value)>,
 }
@@ -135,7 +136,7 @@ pub fn run(program: &Program, input: Value, limits: &Limits) -> Outcome {
         tasks_run: 0,
         jumps: 0,
         counts: HashMap::new(),
-        writes: 0,
+        protected: 0,
         trace: Vec::new(),
         calls: Vec::new(),
     };
@@ -148,7 +149,7 @@ pub fn run(program: &Program, input: Value, limits: &Limits) -> Outcome {
         tasks_run: m.tasks_run,
         jumps: m.jumps,
         calls: m.calls,
-        effects_started: m.writes > 0,
+        protected_started: m.protected > 0,
     }
 }
 
@@ -319,8 +320,8 @@ impl Machine<'_> {
         let before = self.counts.entry(name.to_string()).or_default();
         let n = *before;
         *before += 1;
-        if effect(name) == Some(Effect::Write) {
-            self.writes += 1;
+        if at_most_once(name) {
+            self.protected += 1;
         }
         self.calls.push((name.to_string(), args.clone()));
         behave(name, &args, n).map_err(|e| Stop::Error(Error { type_: e.type_, status: e.status, instance: None }))
@@ -340,7 +341,7 @@ impl Machine<'_> {
         let context = self.context.clone();
         let mut attempt: u32 = 1;
         loop {
-            let writes = self.writes;
+            let protected = self.protected;
             let error = match self.list(body, &format!("{reference}/try"), input.clone(), scope) {
                 Ok(e) => return Ok(ended(e)),
                 Err(Stop::Error(e)) => e,
@@ -356,12 +357,13 @@ impl Machine<'_> {
                 return Err(Stop::Error(error));
             }
             if let Some(retry) = &catch.retry {
-                // CHOICE: an attempt that started a Write is never
-                // replayed; the count includes the first attempt and the
+                // CHOICE: an attempt that started an at-most-once call is
+                // never replayed (a run without a journal keeps no result
+                // to stand for it); the count includes the first attempt and the
                 // host caps it; a retry starts from the context the body
                 // began with. The policy's `when` is read before the count.
                 let cap = retry.count.unwrap_or(self.limits.max_attempts).min(self.limits.max_attempts);
-                if self.writes == writes
+                if self.protected == protected
                     && retry.when.as_ref().map_or(Ok(true), |w| self.cond(w, input, &caught))?
                     && attempt < cap
                 {

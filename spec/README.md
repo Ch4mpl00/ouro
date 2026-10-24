@@ -58,7 +58,7 @@ are the bridges in `crates/durable/tests/quint.rs` and `quint/concurrent.rs`.
 | O1 | `O1`: failed operation stops the attempt | Serial MBT fault switches; generated interrupted journals |
 | O2 | `O2`: terminal-only retention and stable identities | Serial MBT (swept evidence projected away); replay-after-sweep refusal |
 | O3 | `O3`: one authorized permit | Serial MBT host; runtime ownership/concurrency tests |
-| X1 | `X1`: dry runs dispatch no write (effect, not delivery) | `x1_x2_generated_dry_runs_and_replays_are_isolated` |
+| X1 | `X1`: dry runs dispatch nothing the host's mock rule (`mocked(i)`) marks | `x1_x2_generated_dry_runs_and_replays_are_isolated`, `a_dry_run_dispatches_no_call_the_rule_marks`, `dry_runs_dispatch_no_process_the_rule_marks` |
 | X2 | `X2`: replay dispatches nothing | Same property |
 | X3 | `X3`: no silent readmission/reopening | Terminal/admission checks |
 | B1 | `B1`: tree counter within the ceiling, equal to a live root's granted decisions; immutable decisions; refusal only at the ceiling | Serial MBT (`spend`, decisions projected); `budgetTest` witness; budget conformance; generated interpreter budgets |
@@ -80,10 +80,11 @@ and three definition versions; time, generations, epochs and observation lists
 grow with the trace. A run carries its admission, application version, mode,
 deadline fixed at admission and epoch.
 
-- **Delivery decides protection** (decision 6). Invocation 0 is an at-most-once
-  write, 1 an at-least-once read, 2 an at-least-once write. `protected(i)` is
-  the declared delivery alone; the effect (`writes(i)`) only decides what a dry
-  run may dispatch (X1). Records are absent/intent/result/error
+- **Delivery decides protection** (decision 6). Invocation 0 is at most once,
+  1 and 2 at least once; `protected(i)` is the declared delivery alone. The
+  engine does not classify calls as reads or writes: a dry run's host supplies
+  a mock rule, `mocked(i)` (it marks 0 and 2), and a dry run dispatches none it
+  marks (X1). Records are absent/intent/result/error
   response/proven not executed (0–4). Recovery reports unknown for an orphan
   intent; an at-least-once one may then be sent again under the same identity
   (worker phase 4), an at-most-once one never (`redispatchTest`,

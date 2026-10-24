@@ -7,7 +7,7 @@
 //! credentials and remote resources belong to the embedding application.
 use crate::{FunctionContext, FunctionError, Registry};
 use async_trait::async_trait;
-use owf::{durable::Delivery, model::Catalog, run::Effect};
+use owf::{durable::Delivery, model::Catalog};
 use serde_json::Value;
 use std::sync::Arc;
 
@@ -16,9 +16,9 @@ use std::sync::Arc;
 /// Runs `run: container | script | shell` processes.
 #[async_trait]
 pub trait ProcessRunner: Send + Sync {
-    /// The effect of running a `kind` process, or `None` when this runner
-    /// does not run that kind. Dry runs mock writes.
-    fn effect(&self, kind: &str) -> Option<Effect>;
+    /// Whether this runner runs `kind` processes. A dry run dispatches a
+    /// process (`run:<kind>`) unless its host's mock rule marks it.
+    fn runs(&self, kind: &str) -> bool;
     /// The delivery of a `kind` process, like a function's declaration: at
     /// least once unless the runner declares it at most once.
     fn delivery(&self, _kind: &str) -> Delivery {
@@ -82,7 +82,7 @@ impl Catalog for HostCatalog<'_> {
         true
     }
     fn processes(&self, kind: &str) -> bool {
-        self.capabilities.processes.as_ref().is_some_and(|p| p.effect(kind).is_some())
+        self.capabilities.processes.as_ref().is_some_and(|p| p.runs(kind))
     }
     fn secrets(&self) -> bool {
         self.capabilities.secrets.is_some()

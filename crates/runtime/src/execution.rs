@@ -1,12 +1,13 @@
 //! Run driver: 1. configuration and the runtime; 2. admission (definitions,
-//! versions, pinned bindings, schemas and the run tree's limits); 3. bounded
-//! execution, shutdown/recovery; 4. the interpreter's host: functions,
-//! processes, events, emitted events, child runs, secrets and resources. A
-//! process stop releases work; explicit cancellation is a terminal storage
-//! transaction. Lease loss always stops forward progress.
+//! versions, the start check, pinned bindings, schemas and the run tree's
+//! limits); 3. bounded execution, shutdown/recovery; 4. the interpreter's
+//! host: functions, processes, events, emitted events, child runs, secrets
+//! and resources. A process stop releases work; explicit cancellation is a
+//! terminal storage transaction. Lease loss always stops forward progress.
 use crate::{
     FunctionContext, Registry,
     capabilities::{Capabilities, EventSink, ProcessRunner, ResourceResolver, SecretResolver},
+    registry::{Checks, Installed, MissingFunction},
     telemetry::Spans,
     testing::{Mode, RecordedCall},
 };
@@ -17,13 +18,13 @@ use ouro_durable::{
     Admission, ChildLink, Clock, Compatibility, Definition, Fence, Lease, RunStore, SavedRun, Swept, SystemClock,
 };
 use owf::{
-    durable::{CallFailure, Delivery},
+    durable::{CallEntry, CallFailure, Delivery},
     model::{self, Process, Workflow},
-    run::{self, CallInfo, Child, ChildTarget, Effect, Functions, Host, Limits, Status, WorkflowError},
+    run::{self, CallInfo, Child, ChildTarget, Functions, Host, Limits, Status, WorkflowError},
 };
 use serde_json::{Value, json};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -83,7 +84,7 @@ impl Drop for ExecutionGuard<'_> {
 
 pub struct Runtime {
     pub(crate) store: Arc<dyn RunStore>,
-    pub(crate) registry: Arc<Registry>,
+    pub(crate) installed: Installed,
     pub(crate) definition_source: Arc<dyn RunStore>,
     pub(crate) clock: Arc<dyn Clock>,
     pub(crate) tracer: Arc<BoxedTracer>,
@@ -120,7 +121,7 @@ impl Runtime {
         Ok(Self {
             definition_source: store.clone(),
             store,
-            registry,
+            installed: Installed::new(registry),
             clock,
             tracer: Arc::new(tracer),
             capabilities: Capabilities::default(),
@@ -138,6 +139,16 @@ impl Runtime {
             Arc::new(SystemClock),
             opentelemetry::global::tracer("ouro-runtime"),
         )
+    }
+    /// The registry runs call through now.
+    pub fn registry(&self) -> Arc<Registry> {
+        self.installed.get().0
+    }
+    /// Replaces the registry (a host whose functions change while it runs).
+    /// Admissions and resumed runs check against the new one from now on;
+    /// a run being driven keeps the registry it started its drive with.
+    pub fn set_registry(&self, registry: Arc<Registry>) {
+        self.installed.replace(registry);
     }
     /// Runs `run: container | script | shell` with this runner.
     pub fn with_process_runner(mut self, runner: Arc<dyn ProcessRunner>) -> Self {
@@ -178,9 +189,12 @@ impl Runtime {
         self.activate_armed(name, version)
     }
     pub(crate) fn admitter(&self) -> Admitter {
+        let (registry, generation) = self.installed.get();
         Admitter {
             definitions: self.definition_source.clone(),
-            registry: self.registry.clone(),
+            registry,
+            generation,
+            checks: self.installed.checks.clone(),
             capabilities: self.capabilities.clone(),
             metadata: self.config.metadata.clone(),
             application: self.config.application.version.clone(),
@@ -212,6 +226,13 @@ impl Runtime {
     }
     pub fn records(&self, id: &str) -> anyhow::Result<BTreeMap<String, owf::durable::Record>> {
         Ok(self.store.inspect(id)?.ok_or_else(|| anyhow::anyhow!("unknown run"))?.records)
+    }
+    /// The run's call journal: every call (and emitted event) it made, with
+    /// its delivery and how far it got. The engine does not know whether a
+    /// call changed the world; the host decides that from this journal (to
+    /// rerun a failed run, hand it over, or reconcile it).
+    pub fn calls(&self, id: &str) -> anyhow::Result<Vec<CallEntry>> {
+        Ok(owf::durable::call_journal(&self.records(id)?))
     }
     /// Delivers an identified CloudEvent (`id`, `source`, `type`; the
     /// `specversion` and `time` are filled in when absent): to `target`'s
@@ -327,9 +348,25 @@ impl Runtime {
         stop: &CancellationToken,
         mode: Mode,
     ) -> anyhow::Result<Status> {
-        let checked = self.registry.validate_with(&saved.admission.definition, &self.capabilities).and_then(|wf| {
+        // Before the run's next step: every function it can call is still
+        // registered (the registry may have changed since admission, by a
+        // new release of the host or `set_registry`). A run that cannot
+        // proceed fails now, never halfway through.
+        let admitter = self.admitter();
+        let a = &saved.admission;
+        if let Err(e) = admitter.check(&a.name, a.version, &a.definition) {
+            let missing = e.downcast::<MissingFunction>()?;
+            return self.store.finish(
+                &lease.fence,
+                &Status::Faulted(missing.error()),
+                self.clock.now_ms(),
+                self.config.breaker_threshold,
+            );
+        }
+        let registry = admitter.registry.clone();
+        let checked = registry.validate_with(&a.definition, &self.capabilities).and_then(|wf| {
             anyhow::ensure!(
-                saved.admission.runtime["bindings"] == self.registry.bindings(&wf),
+                a.runtime["bindings"] == registry.bindings(&wf),
                 "function bindings changed since admission"
             );
             Ok(wf)
@@ -358,8 +395,8 @@ impl Runtime {
         let runtime = &saved.admission.runtime;
         let host = Host {
             functions: Arc::new(ExecutionFunctions {
-                registry: self.registry.clone(),
-                admitter: self.admitter(),
+                registry,
+                admitter,
                 schemas: Pinned(
                     runtime["schemas"].as_object().map(|m| m.clone().into_iter().collect()).unwrap_or_default(),
                 ),
@@ -480,11 +517,14 @@ impl Runtime {
 // ── 2. admission ───────────────────────────────────────────────────────────
 
 /// Builds admissions: the definition version, its input, and the bindings
-/// (function schemas and effects, external schemas) the run keeps.
+/// (function schemas and delivery, external schemas) the run keeps.
 #[derive(Clone)]
 pub(crate) struct Admitter {
     pub definitions: Arc<dyn RunStore>,
     pub registry: Arc<Registry>,
+    /// The registry's generation, for the start checks made against it.
+    pub generation: u64,
+    pub checks: Arc<Checks>,
     pub capabilities: Capabilities,
     pub metadata: Value,
     /// The declared application version, recorded in every admission.
@@ -571,6 +611,7 @@ impl Admitter {
         self.of(id, d, input, lineage)
     }
     pub fn of(&self, id: &str, d: &Definition, input: Value, lineage: &Lineage) -> anyhow::Result<Admission> {
+        self.check(&d.name, d.version, &d.yaml)?;
         let wf = self.validate(&d.yaml)?;
         let mut runtime = json!({
             "name": "ouro-runtime",
@@ -591,6 +632,41 @@ impl Admitter {
             input,
             runtime,
         })
+    }
+    /// The start check: every function the definition can call is
+    /// registered, directly or in the child workflows its `run: workflow`
+    /// tasks name, transitively, as they resolve now. A missing one is a
+    /// `MissingFunction` (inside the error) naming it and the definitions
+    /// that lead to it; a child that does not resolve is left to the run,
+    /// which faults on it as it always has. Each definition version's own
+    /// needs are cached per registry generation; resolving its children
+    /// reads their names' catalog entries.
+    pub fn check(&self, name: &str, version: u64, yaml: &str) -> anyhow::Result<()> {
+        let mut path = Vec::new();
+        self.check_tree((name, version, yaml), &mut path, &mut BTreeSet::new())
+    }
+    fn check_tree(
+        &self,
+        (name, version, yaml): (&str, u64, &str),
+        path: &mut Vec<(String, u64)>,
+        seen: &mut BTreeSet<(String, u64)>,
+    ) -> anyhow::Result<()> {
+        // A definition reached twice (a recursive child) was checked already.
+        if !seen.insert((name.to_owned(), version)) {
+            return Ok(());
+        }
+        path.push((name.to_owned(), version));
+        let needs = self.checks.needs((name, version, yaml), (&self.registry, self.generation), &self.capabilities);
+        if let Some(function) = &needs.missing {
+            return Err(MissingFunction { function: function.clone(), path: path.clone() }.into());
+        }
+        for (namespace, child, version) in &needs.children {
+            if let Some(d) = self.target(&ChildTarget { namespace, name: child, version })? {
+                self.check_tree((&d.name, d.version, &d.yaml), path, seen)?;
+            }
+        }
+        path.pop();
+        Ok(())
     }
     /// `run.workflow`'s target. CHOICE: the catalog entry named `name`
     /// holds the workflow; the version is the active one for `latest`, else
@@ -643,7 +719,8 @@ pub(crate) struct ExecutionFunctions {
 }
 impl ExecutionFunctions {
     /// A function call or, with `process`, a process run: replayed, mocked
-    /// (a dry run's writes) or dispatched, inside its span.
+    /// (in a dry run, what the host's mock rule marks) or dispatched, inside
+    /// its span.
     async fn invoke_function(
         &self,
         name: &str,
@@ -652,17 +729,14 @@ impl ExecutionFunctions {
         info: &CallInfo<'_>,
     ) -> Result<Value, CallFailure> {
         let runner = self.admitter.capabilities.processes.as_ref();
-        let effect = match process {
-            Some(kind) => runner.and_then(|r| r.effect(kind)),
-            None => self.effect(name),
+        let known = match process {
+            Some(kind) => runner.is_some_and(|r| r.runs(kind)),
+            None => self.has(name),
+        };
+        if !known {
+            return Err(CallFailure::NotExecuted(WorkflowError::validation(format!("unknown function {name}"))));
         }
-        .ok_or_else(|| CallFailure::NotExecuted(WorkflowError::validation(format!("unknown function {name}"))))?;
-        let mut span = self.spans.function(
-            name,
-            info.reference,
-            if effect == Effect::Read { "read" } else { "write" },
-            info.attempt,
-        );
+        let mut span = self.spans.function(name, info.reference, info.attempt);
         let context = FunctionContext {
             cancel: info.cancel.clone(),
             run_id: info.run_id.into(),
@@ -674,7 +748,7 @@ impl ExecutionFunctions {
         };
         let result = async {
             if let Mode::Replay { .. } = &self.mode {
-                return self.replayed(name, &args, effect, info);
+                return self.replayed(name, &args, info);
             }
             if crate::registry::builtin(name) {
                 return self.builtin(name, args, info).map_err(|e| match e.downcast::<Refused>() {
@@ -699,14 +773,15 @@ impl ExecutionFunctions {
                     CallFailure::Interrupted(WorkflowError::runtime(e.to_string())))?
             };
             let result = match &self.mode {
-                Mode::Dry { mock, writes } if effect == Effect::Write => {
+                // The dry run's guarantee: a call the host's rule marks is
+                // answered here and never reaches its handler or runner.
+                Mode::Dry { mock, mocked } if mock.mocks(name, &args) => {
                     let result = mock.response(name, &args, &context);
-                    writes.lock().unwrap().push(RecordedCall {
+                    mocked.lock().unwrap().push(RecordedCall {
                         task_path: info.reference.into(),
                         logical: info.logical.into(),
                         function: name.into(),
                         arguments: args.clone(),
-                        effect,
                         delivery: info.delivery,
                         result: result.clone(),
                     });
@@ -741,7 +816,7 @@ impl ExecutionFunctions {
     /// A recorded call's result. Records hold redacted values, so the
     /// comparison is between redacted forms and the result gets its
     /// secrets back.
-    fn replayed(&self, name: &str, args: &Value, effect: Effect, info: &CallInfo<'_>) -> Result<Value, CallFailure> {
+    fn replayed(&self, name: &str, args: &Value, info: &CallInfo<'_>) -> Result<Value, CallFailure> {
         let Mode::Replay { calls, used, .. } = &self.mode else { unreachable!("only replay mode has recorded calls") };
         let call = calls.get(info.reference).ok_or_else(|| {
             CallFailure::NotExecuted(WorkflowError::runtime(format!("missing replay result at {}", info.reference)))
@@ -749,7 +824,6 @@ impl ExecutionFunctions {
         if call.function != name
             || call.arguments != info.secrets.value(args)
             || call.logical != info.logical
-            || call.effect != effect
             || call.delivery != info.delivery
         {
             return Err(CallFailure::NotExecuted(WorkflowError::runtime("replay call bindings differ")));
@@ -931,13 +1005,14 @@ impl Functions for ExecutionFunctions {
     }
     async fn emit(&self, event: &Value, info: &CallInfo<'_>) -> Result<(), CallFailure> {
         match &self.mode {
-            Mode::Dry { writes, .. } => {
-                writes.lock().unwrap().push(RecordedCall {
+            // An emitted event leaves the dry run only as a record: it is
+            // neither published nor handed to the sink.
+            Mode::Dry { mocked, .. } => {
+                mocked.lock().unwrap().push(RecordedCall {
                     task_path: info.reference.into(),
                     logical: info.logical.into(),
                     function: "emit".into(),
                     arguments: event.clone(),
-                    effect: Effect::Write,
                     delivery: info.delivery,
                     result: Ok(event.clone()),
                 });
@@ -977,22 +1052,18 @@ impl Functions for ExecutionFunctions {
             }
         }
     }
-    fn process(&self, kind: &str) -> Option<Effect> {
-        self.admitter.capabilities.processes.as_ref().and_then(|p| p.effect(kind))
+    fn process(&self, kind: &str) -> bool {
+        self.admitter.capabilities.processes.as_ref().is_some_and(|p| p.runs(kind))
     }
     async fn run_process(&self, kind: &str, definition: Value, info: &CallInfo<'_>) -> Result<Value, CallFailure> {
         self.invoke_function(&Process::function(kind), Some(kind), definition, info).await
     }
-    fn effect(&self, name: &str) -> Option<Effect> {
-        if crate::registry::builtin(name) {
-            Some(Effect::Read)
-        } else {
-            self.registry.get(name).map(|f| f.function.effect)
-        }
+    fn has(&self, name: &str) -> bool {
+        crate::registry::builtin(name) || self.registry.get(name).is_some()
     }
     fn at_most_once(&self, name: &str, _: &Value) -> bool {
-        // The declared delivery, never the effect; the interpreter applies a
-        // task's `metadata.delivery` on top, which can only tighten it.
+        // The declared delivery; the interpreter applies a task's
+        // `metadata.delivery` on top, which can only tighten it.
         let delivery = match name.strip_prefix(&Process::function("")) {
             Some(kind) => self.admitter.capabilities.processes.as_ref().map(|p| p.delivery(kind)),
             None => self.registry.get(name).map(|f| f.function.delivery),

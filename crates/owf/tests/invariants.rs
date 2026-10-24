@@ -1,6 +1,6 @@
 // Invariants of the interpreter over random valid workflows
 // (support/program.rs): 1. termination and the task ceiling; 2. events are
-// well-formed spans; 3. effects and retries; 4. cancellation; 5. validation
+// well-formed spans; 3. calls and retries; 4. cancellation; 5. validation
 // soundness; 6. determinism; 7. the parser never panics.
 //
 //   cargo test -p owf --test invariants
@@ -16,7 +16,7 @@ use proptest::prelude::*;
 use proptest::strategy::ValueTree;
 use proptest::test_runner::{TestCaseError, TestRunner};
 use serde_json::{Map, Value, json};
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::time::Duration;
 use support::host::{
     Entry, Known, Options, execute, execute_workflow, hit_limit, is_limit, limits, observed, pretty,
@@ -229,7 +229,22 @@ fn events_are_well_formed_spans() {
     });
 }
 
-// ── 3. effects and retries ─────────────────────────────────────────────────
+// ── 3. calls and retries ───────────────────────────────────────────────────
+
+/// Whether the outcome's call journal names exactly the functions the host
+/// was called with (emitted events as `emit`).
+fn journal_names_the_calls(ran: &support::host::Ran) -> bool {
+    let called: BTreeSet<&str> = ran
+        .journal
+        .iter()
+        .filter_map(|e| match e {
+            Entry::Call { name, .. } => Some(name.as_str()),
+            _ => None,
+        })
+        .collect();
+    let journal: BTreeSet<&str> = ran.outcome.calls.iter().map(|c| c.function.as_str()).collect();
+    called == journal
+}
 
 /// For each call, the references of the open tasks it runs inside,
 /// innermost first (a function's caller included, through `parent`).
@@ -244,14 +259,14 @@ fn ancestry(journal: &[Entry]) -> Vec<(usize, bool, Vec<String>)> {
                     open.remove(at);
                 }
             }
-            Entry::Call { reference, write, .. } => {
+            Entry::Call { reference, protected, .. } => {
                 let mut chain = Vec::new();
                 let mut at = Some(reference.clone());
                 while let Some(r) = at {
                     at = open.iter().rev().find(|(o, _)| *o == r).and_then(|(_, p)| p.clone());
                     chain.push(r);
                 }
-                out.push((i, *write, chain));
+                out.push((i, *protected, chain));
             }
             _ => {}
         }
@@ -260,11 +275,10 @@ fn ancestry(journal: &[Entry]) -> Vec<(usize, bool, Vec<String>)> {
 }
 
 #[test]
-fn effects_started_means_a_write_was_called_and_no_retry_replays_one() {
+fn the_call_journal_names_every_call_and_no_retry_replays_an_at_most_once_one() {
     check(30, (program(Profile::FULL), input()), |(p, input)| {
         let ran = execute(&p, input, &Options::default());
-        let wrote = ran.journal.iter().any(|e| matches!(e, Entry::Call { write: true, .. }));
-        ensure(ran.outcome.effects_started == wrote, &p, format!("effects_started {}", ran.outcome.effects_started))?;
+        ensure(journal_names_the_calls(&ran), &p, format!("call journal {:?}", ran.outcome.calls))?;
         let calls = ancestry(&ran.journal);
         for (k, e) in ran.journal.iter().enumerate() {
             let Entry::Retrying { reference, .. } = e else {
@@ -277,9 +291,14 @@ fn effects_started_means_a_write_was_called_and_no_retry_replays_one() {
                     matches!(e, Entry::Started { reference: r, .. } | Entry::Retrying { reference: r, .. } if r == reference)
                 })
                 .unwrap_or(0);
-            let replayed =
-                calls.iter().find(|(i, write, chain)| *i > began && *i < k && *write && chain.contains(reference));
-            ensure(replayed.is_none(), &p, format!("{reference} retries an attempt that wrote: {replayed:?}"))?;
+            let replayed = calls
+                .iter()
+                .find(|(i, protected, chain)| *i > began && *i < k && *protected && chain.contains(reference));
+            ensure(
+                replayed.is_none(),
+                &p,
+                format!("{reference} retries an attempt that started an at-most-once call: {replayed:?}"),
+            )?;
         }
         Ok(())
     });
@@ -307,8 +326,7 @@ fn cancelling_stops_the_run_and_no_call_starts_after() {
         ensure(late.is_none(), &p, format!("a call started after the cancel: {late:?}"))?;
         let spans = well_formed(&ran.journal, &ran.outcome.status);
         ensure(spans.is_ok(), &p, spans.err().unwrap_or_default())?;
-        let wrote = ran.journal.iter().any(|e| matches!(e, Entry::Call { write: true, .. }));
-        ensure(ran.outcome.effects_started == wrote, &p, "effects_started disagrees with the calls")
+        ensure(journal_names_the_calls(&ran), &p, "the call journal disagrees with the calls")
     });
 }
 

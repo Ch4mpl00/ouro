@@ -154,7 +154,8 @@ fn run_rows_of_another_state_version_are_refused() {
     let s = TransactionalStore::new(backend.clone());
     s.start(&conformance::admission("r"), 0).unwrap();
     let key = ("run".to_string(), "r".to_string());
-    for version in [None, Some(3)] {
+    // 3 and earlier: one aggregate per run; 4 and 5: call records with an effect.
+    for version in [None, Some(3), Some(4), Some(5)] {
         let before = backend.snapshot().unwrap();
         let mut rows = before.rows.clone();
         let run = rows.get_mut(&key).unwrap().as_object_mut().unwrap();

@@ -216,7 +216,6 @@ fn long_run(backend: &Arc<dyn AtomicBackend>, metrics: &Metrics, validation: u64
         logical: "/do/call".into(),
         function: "f".into(),
         arguments: json!({}),
-        effect: owf::run::Effect::Write,
         delivery: owf::durable::Delivery::AtMostOnce,
         state,
     };

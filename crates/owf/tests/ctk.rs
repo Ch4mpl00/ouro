@@ -13,7 +13,7 @@ use cucumber::gherkin::Step;
 use cucumber::{World, given, then, when};
 use owf::durable::{Journal, Record};
 use owf::model;
-use owf::run::{self, CallInfo, Clock, Effect, Event, Functions, Host, Limits, Observer, Status, WorkflowError};
+use owf::run::{self, CallInfo, Clock, Event, Functions, Host, Limits, Observer, Status, WorkflowError};
 use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -56,8 +56,8 @@ impl Clock for Now {
 struct Services;
 #[async_trait]
 impl Functions for Services {
-    fn effect(&self, name: &str) -> Option<Effect> {
-        matches!(name, "http" | "openapi").then_some(Effect::Read)
+    fn has(&self, name: &str) -> bool {
+        matches!(name, "http" | "openapi")
     }
     fn emits(&self) -> bool {
         true

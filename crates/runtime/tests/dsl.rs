@@ -4,9 +4,10 @@
 // schedules. Durability cases restart the runtime on the same SQLite file.
 use async_trait::async_trait;
 use ouro_runtime::{
-    Config, Delivery, Effect, EventSink, Function, FunctionContext, FunctionError, ProcessRunner, Registry,
-    ResourceResolver, Runtime, SecretResolver,
+    Config, Delivery, EventSink, Function, FunctionContext, FunctionError, ProcessRunner, Registry, ResourceResolver,
+    Runtime, SecretResolver,
     durable::{self, AtomicBackend, Clock, RunStore},
+    mock,
     owf::{
         self,
         run::{Status, WorkflowError},
@@ -51,7 +52,7 @@ fn registry(writes: Arc<AtomicUsize>, seen: Arc<Mutex<Vec<Value>>>) -> Registry 
     let s = seen.clone();
     registry
         .register(
-            Function::new("write", json!({}), json!({}), Effect::Write, move |a: Value, _: FunctionContext| {
+            Function::new("write", json!({}), json!({}), move |a: Value, _: FunctionContext| {
                 w.fetch_add(1, Ordering::SeqCst);
                 s.lock().unwrap().push(a.clone());
                 async move { Ok(a) }
@@ -60,13 +61,7 @@ fn registry(writes: Arc<AtomicUsize>, seen: Arc<Mutex<Vec<Value>>>) -> Registry 
         )
         .unwrap();
     registry
-        .register(Function::new(
-            "read",
-            json!({}),
-            json!({}),
-            Effect::Read,
-            |a: Value, _: FunctionContext| async move { Ok(a) },
-        ))
+        .register(Function::new("read", json!({}), json!({}), |a: Value, _: FunctionContext| async move { Ok(a) }))
         .unwrap();
     registry
 }
@@ -402,8 +397,8 @@ async fn an_attempt_deadline_is_a_retried_timeout() {
 struct Shell(AtomicUsize);
 #[async_trait]
 impl ProcessRunner for Shell {
-    fn effect(&self, kind: &str) -> Option<Effect> {
-        (kind == "shell").then_some(Effect::Write)
+    fn runs(&self, kind: &str) -> bool {
+        kind == "shell"
     }
     async fn run(&self, _: &str, definition: Value, _: FunctionContext) -> Result<Value, FunctionError> {
         self.0.fetch_add(1, Ordering::SeqCst);
@@ -454,21 +449,12 @@ async fn secret_values_never_reach_records_spans_errors_or_outcomes() {
     let r = received.clone();
     let mut registry = Registry::new();
     registry
-        .register(Function::new(
-            "call_api",
-            json!({}),
-            json!({}),
-            Effect::Write,
-            move |a: Value, _: FunctionContext| {
-                r.lock().unwrap().push(a.clone());
-                async move {
-                    Err(WorkflowError::communication(
-                        401,
-                        format!("rejected header {}", a["auth"].as_str().unwrap_or("")),
-                    ))
-                }
-            },
-        ))
+        .register(Function::new("call_api", json!({}), json!({}), move |a: Value, _: FunctionContext| {
+            r.lock().unwrap().push(a.clone());
+            async move {
+                Err(WorkflowError::communication(401, format!("rejected header {}", a["auth"].as_str().unwrap_or(""))))
+            }
+        }))
         .unwrap();
     let rt = Runtime::new(
         Arc::new(durable::TransactionalStore::new(backend.clone())),
@@ -934,16 +920,43 @@ async fn dry_runs_record_emits_and_run_children_from_the_catalog() {
         f.rt.dry_run(
             &definition,
             json!({}),
-            Arc::new(|_: &str, a: &Value, _: &FunctionContext| Ok(a.clone())),
+            mock(
+                |function: &str, _: &Value| function == "write",
+                |_: &str, a: &Value, _: &FunctionContext| Ok(a.clone()),
+            ),
             &CancellationToken::new(),
         )
         .await
         .unwrap();
     assert!(matches!(dry.status, Status::Completed(_)), "{:?}", dry.status);
-    let functions: Vec<&str> = dry.writes.iter().map(|w| w.function.as_str()).collect();
+    let functions: Vec<&str> = dry.mocked.iter().map(|w| w.function.as_str()).collect();
     assert_eq!(functions, ["write", "emit"]);
     assert_eq!(f.seen.lock().unwrap().len(), 0, "nothing reached the real write");
     assert!(f.rt.list(None, "").unwrap().is_empty(), "nothing was admitted for real");
+}
+
+// The host's mock rule covers process runs too: a dry run dispatches no
+// `run:<kind>` the rule marks, and runs the others.
+#[tokio::test]
+async fn dry_runs_dispatch_no_process_the_rule_marks() {
+    let shell = Arc::new(Shell(AtomicUsize::new(0)));
+    let rt = fixture().rt.with_process_runner(shell.clone());
+    let definition = doc("p", "do: [ { s: { run: { shell: { command: '${ .cmd }' }, return: all } } } ]");
+    let marked = |cmd: &'static str| {
+        mock(
+            move |function: &str, a: &Value| function == "run:shell" && a["command"] == cmd,
+            |_: &str, _: &Value, _: &FunctionContext| Ok(json!({ "code": 0, "stdout": "mocked", "stderr": "" })),
+        )
+    };
+    let stop = CancellationToken::new();
+    let dry = rt.dry_run(&definition, json!({"cmd": "rm"}), marked("rm"), &stop).await.unwrap();
+    assert_eq!(completed(Some(dry.status)), json!({ "code": 0, "stdout": "mocked", "stderr": "" }));
+    assert_eq!(dry.mocked.len(), 1);
+    assert_eq!(shell.0.load(Ordering::SeqCst), 0, "a marked process never ran");
+    let dry = rt.dry_run(&definition, json!({"cmd": "ls"}), marked("rm"), &stop).await.unwrap();
+    assert_eq!(completed(Some(dry.status)), json!({ "code": 3, "stdout": "ls", "stderr": "warn" }));
+    assert!(dry.mocked.is_empty());
+    assert_eq!(shell.0.load(Ordering::SeqCst), 1, "an unmarked process ran for real");
 }
 
 #[tokio::test]
@@ -1271,20 +1284,14 @@ async fn race_crash(fail_at: usize, after: bool) -> (Option<Status>, Vec<String>
     let reports = Arc::new(Mutex::new(Vec::new()));
     let mut registry = Registry::new();
     registry
-        .register(Function::new(
-            "tick",
-            json!({}),
-            json!({}),
-            Effect::Read,
-            |a: Value, _: FunctionContext| async move {
-                tokio::task::yield_now().await;
-                Ok(a)
-            },
-        ))
+        .register(Function::new("tick", json!({}), json!({}), |a: Value, _: FunctionContext| async move {
+            tokio::task::yield_now().await;
+            Ok(a)
+        }))
         .unwrap();
     let seen = reports.clone();
     registry
-        .register(Function::new("report", json!({}), json!({}), Effect::Write, move |a: Value, c: FunctionContext| {
+        .register(Function::new("report", json!({}), json!({}), move |a: Value, c: FunctionContext| {
             seen.lock().unwrap().push(c.task_path.clone());
             async move {
                 // Long enough for the other branch to be refused meanwhile.
