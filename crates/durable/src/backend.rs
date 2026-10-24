@@ -131,10 +131,16 @@ pub trait AtomicBackend: Send + Sync {
 
 pub struct TransactionalStore {
     pub(crate) backend: Arc<dyn AtomicBackend>,
+    pub(crate) policy: crate::Policy,
 }
 impl TransactionalStore {
     pub fn new(backend: Arc<dyn AtomicBackend>) -> Self {
-        Self { backend }
+        Self { backend, policy: crate::Policy::default() }
+    }
+    /// The mailbox and tombstone lifetimes and the clock skew bound.
+    pub fn with_policy(mut self, policy: crate::Policy) -> Self {
+        self.policy = policy;
+        self
     }
     pub(crate) fn update<T>(&self, operation: impl Fn(&mut dyn Transaction) -> anyhow::Result<T>) -> anyhow::Result<T> {
         for attempt in 0..128 {

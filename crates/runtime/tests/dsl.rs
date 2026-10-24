@@ -4,10 +4,13 @@
 // schedules. Durability cases restart the runtime on the same SQLite file.
 use async_trait::async_trait;
 use ouro_runtime::{
-    Config, Effect, EventSink, Function, FunctionContext, FunctionError, ProcessRunner, Registry, ResourceResolver,
-    Runtime, SecretResolver,
+    Config, Delivery, Effect, EventSink, Function, FunctionContext, FunctionError, ProcessRunner, Registry,
+    ResourceResolver, Runtime, SecretResolver,
     durable::{self, AtomicBackend, Clock, RunStore},
-    owf::run::{Status, WorkflowError},
+    owf::{
+        self,
+        run::{Status, WorkflowError},
+    },
 };
 use serde_json::{Value, json};
 use std::{
@@ -40,17 +43,21 @@ fn doc(name: &str, body: &str) -> String {
     format!("document: {{ dsl: '1.0.4', namespace: test, name: {name}, version: '1.0.0' }}\n{body}\n")
 }
 
-/// Functions every test may call: `write` counts and echoes, `read` echoes.
+/// Functions every test may call: `write` counts and echoes, and is declared
+/// at most once (it must never be repeated); `read` echoes.
 fn registry(writes: Arc<AtomicUsize>, seen: Arc<Mutex<Vec<Value>>>) -> Registry {
     let mut registry = Registry::new();
     let w = writes.clone();
     let s = seen.clone();
     registry
-        .register(Function::new("write", json!({}), json!({}), Effect::Write, move |a: Value, _: FunctionContext| {
-            w.fetch_add(1, Ordering::SeqCst);
-            s.lock().unwrap().push(a.clone());
-            async move { Ok(a) }
-        }))
+        .register(
+            Function::new("write", json!({}), json!({}), Effect::Write, move |a: Value, _: FunctionContext| {
+                w.fetch_add(1, Ordering::SeqCst);
+                s.lock().unwrap().push(a.clone());
+                async move { Ok(a) }
+            })
+            .with_delivery(Delivery::AtMostOnce),
+        )
         .unwrap();
     registry
         .register(Function::new(
@@ -550,23 +557,25 @@ async fn every_cron_and_after_start_each_slot_once() {
     save(&f.rt, "after", &doc("after", "schedule: { after: PT10S }\ndo: [ { a: { set: { ok: true } } } ]"));
     // Activation at 0 arms the first `after` run at once and the others at
     // their next slots.
-    assert_eq!(f.rt.fire_due().unwrap(), vec!["schedule:after:after:0000000001".to_string()]);
+    assert_eq!(f.rt.fire_due().unwrap(), vec!["schedule:after:after:1:0000000001".to_string()]);
     f.time.set(60_000);
     assert_eq!(f.rt.fire_due().unwrap(), vec!["schedule:every:every:60000".to_string()]);
     // A second scheduler at the same time starts nothing more.
     assert!(f.rt.fire_due().unwrap().is_empty());
-    // Down until 10 minutes: each missed schedule starts once, late.
+    // Down until 10 minutes: each missed schedule starts once, late. (The
+    // previous `every` run ends first: an unfinished one would skip the slot.)
+    f.rt.drive("schedule:every:every:60000", &CancellationToken::new()).await.unwrap();
     f.time.set(600_000);
     let mut started = f.rt.fire_due().unwrap();
     started.sort();
     assert_eq!(started, vec!["schedule:cron:cron:300000".to_string(), "schedule:every:every:120000".into()]);
     assert!(f.rt.fire_due().unwrap().is_empty());
     // The next `after` run waits for the previous one to end, plus the delay.
-    settle(&f.rt, "schedule:after:after:0000000001").await;
+    settle(&f.rt, "schedule:after:after:1:0000000001").await;
     f.time.set(609_999);
     assert!(f.rt.fire_due().unwrap().is_empty());
     f.time.set(610_000);
-    assert_eq!(f.rt.fire_due().unwrap(), vec!["schedule:after:after:0000000002".to_string()]);
+    assert_eq!(f.rt.fire_due().unwrap(), vec!["schedule:after:after:1:0000000002".to_string()]);
     // A version without the schedule removes its trigger.
     save(&f.rt, "every", &doc("every", "do: [ { a: { set: { ok: true } } } ]"));
     f.time.set(10_000_000);
@@ -597,6 +606,109 @@ async fn schedule_on_starts_a_run_per_match() {
     // A version without the schedule stops reacting.
     save(&f.rt, "alarm", &doc("alarm", "do: [ { a: { set: { ok: true } } } ]"));
     assert!(f.rt.publish(event("4", "heartbeat.low", json!({"bpm": 1}))).unwrap().is_empty());
+}
+
+// Activation epochs: a version without a schedule removes the triggers in
+// its activation's commit; the breaker's rollback re-arms the predecessor's
+// in its own commit; with no predecessor the definition trips.
+#[tokio::test]
+async fn rollback_rearms_the_predecessor_schedule_and_no_predecessor_trips() {
+    let f = fixture();
+    let ok = "schedule: { every: PT1M }\ndo: [ { a: { set: { ok: true } } } ]";
+    let boom = "do: [ { boom: { raise: { error: { type: 'urn:t:boom', status: 500 } } } } ]";
+    save(&f.rt, "flaky", &doc("flaky", ok));
+    assert_eq!(f.rt.triggers("flaky").unwrap().len(), 1);
+    save(&f.rt, "flaky", &doc("flaky", boom));
+    assert!(f.rt.triggers("flaky").unwrap().is_empty(), "removed with the activation");
+    for n in 0..3 {
+        let id = format!("boom{n}");
+        f.rt.start(&id, "flaky", json!({})).unwrap();
+        assert!(matches!(settle(&f.rt, &id).await, Some(Status::Faulted(_))));
+    }
+    let d = f.rt.definitions("flaky").unwrap();
+    assert_eq!((d.active, d.epoch), (Some(1), 3), "rolled back in a new epoch");
+    assert_eq!(f.rt.triggers("flaky").unwrap().len(), 1, "re-armed with the rollback");
+    // The re-armed trigger first finds its slot, then fires as before.
+    assert!(f.rt.fire_due().unwrap().is_empty());
+    f.time.set(60_000);
+    assert_eq!(f.rt.fire_due().unwrap(), vec!["schedule:flaky:every:60000".to_string()]);
+    // Nothing to roll back to: the definition trips and its schedule stops.
+    save(&f.rt, "lonely", &doc("lonely", &boom.replace("do:", "schedule: { every: PT1M }\ndo:")));
+    for n in 0..3 {
+        let id = format!("lonely{n}");
+        f.rt.start(&id, "lonely", json!({})).unwrap();
+        settle(&f.rt, &id).await;
+    }
+    assert!(f.rt.definitions("lonely").unwrap().tripped, "visible in the runs API");
+    assert!(f.rt.triggers("lonely").unwrap().is_empty());
+    assert!(f.rt.start("refused", "lonely", json!({})).unwrap_err().to_string().contains("tripped"));
+    f.time.set(10_000_000);
+    assert!(!f.rt.fire_due().unwrap().iter().any(|id| id.contains("lonely")));
+    f.rt.activate("lonely", 1).unwrap();
+    assert!(!f.rt.definitions("lonely").unwrap().tripped, "a new activation clears it");
+    assert!(f.rt.start("accepted", "lonely", json!({})).is_ok());
+}
+
+#[tokio::test]
+async fn catchup_none_skips_missed_slots_with_a_record() {
+    let f = fixture();
+    let body = "schedule: { every: PT1M }\ndo: [ { a: { set: { ok: true } } } ]";
+    let yaml = doc("strict", body).replace("version: '1.0.0' }", "version: '1.0.0', metadata: { catchup: none } }");
+    save(&f.rt, "strict", &yaml);
+    f.time.set(60_000);
+    assert_eq!(f.rt.fire_due().unwrap(), vec!["schedule:strict:every:60000".to_string()]);
+    settle(&f.rt, "schedule:strict:every:60000").await;
+    // Down until 10 minutes: the missed slot is skipped, recorded, not run.
+    f.time.set(600_000);
+    assert!(f.rt.fire_due().unwrap().is_empty());
+    let (_, trigger) = f.rt.triggers("strict").unwrap().pop().unwrap();
+    assert_eq!(trigger.state["skipped"], json!([{ "slot": 120_000, "reason": "missed" }]));
+    assert_eq!(trigger.at_ms, Some(660_000));
+    f.time.set(660_000);
+    assert_eq!(f.rt.fire_due().unwrap(), vec!["schedule:strict:every:660000".to_string()]);
+    let bad = doc("bad", "do: [ { a: { set: { ok: true } } } ]")
+        .replace("version: '1.0.0' }", "version: '1.0.0', metadata: { catchup: none } }");
+    assert!(f.rt.save("bad", &bad).unwrap_err().to_string().contains("catchup"));
+}
+
+// The mailbox: an event addressed to a run waits for its listen (which reads
+// the mailbox first) until its lifetime ends; then it leaves a record.
+#[tokio::test]
+async fn the_mailbox_keeps_addressed_events_until_a_listen_or_expiry() {
+    let policy = durable::Policy { mailbox_ms: 5_000, ..durable::Policy::default() };
+    let store = Arc::new(
+        durable::TransactionalStore::new(Arc::new(durable::memory::MemoryBackend::default())).with_policy(policy),
+    );
+    let f = fixture_on(store, Arc::default(), Arc::default(), Arc::default());
+    let body = "do:\n  - pause: { wait: PT1S }\n  - answer: { listen: { to: { one: { with: { type: answer } } } } }";
+    save(&f.rt, "late", &doc("late", body));
+    save(&f.rt, "later", &doc("later", &body.replace("PT1S", "PT10S")));
+    let answer = |id: &str, data: Value| json!({"id": id, "source": "/test", "type": "answer", "data": data});
+    for (run, name) in [("listens", "late"), ("too-late", "later")] {
+        f.rt.start(run, name, json!({})).unwrap();
+        // Before the run has run at all, let alone listened.
+        assert_eq!(f.rt.deliver(answer(run, json!(42)), Some(run)).unwrap(), Some(run.to_string()));
+    }
+    assert_eq!(f.rt.deliver(answer("listens", json!(42)), Some("listens")).unwrap(), Some("listens".into()));
+    assert!(f.rt.deliver(answer("listens", json!(0)), Some("listens")).is_err(), "same identity, other payload");
+    for run in ["listens", "too-late"] {
+        assert_eq!(settle(&f.rt, run).await, None, "pausing");
+    }
+    f.time.set(1_000);
+    assert_eq!(completed(settle(&f.rt, "listens").await), json!([42]));
+    // The other one listens only after the event's lifetime.
+    f.time.set(10_000);
+    assert!(f.rt.records("too-late").unwrap().keys().all(|k| !k.starts_with("mailbox#")));
+    assert_eq!(settle(&f.rt, "too-late").await, None, "still listening");
+    assert_eq!(f.rt.get("too-late").unwrap().unwrap().state, durable::RunState::Waiting);
+    let expired = f.rt.records("too-late").unwrap();
+    assert!(expired.iter().any(|(k, r)| k == "mailbox#expired[0]"
+        && matches!(r, owf::durable::Record::Expired { event } if event["id"] == "too-late")));
+    // A run that never listens again: the sweep expires it, observably.
+    f.rt.start("idle", "late", json!({})).unwrap();
+    f.rt.deliver(answer("idle", json!(1)), Some("idle")).unwrap();
+    f.time.set(15_000);
+    assert_eq!(f.rt.sweep().unwrap().expired, 1);
 }
 
 // ── crashes at every commit ────────────────────────────────────────────────

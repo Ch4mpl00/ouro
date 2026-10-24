@@ -1,326 +1,468 @@
-//! The bridge uses RunStore snapshots, never backend rows or engine helpers.
-//! Fault injection and construction are confined to the adapter factory.
+//! Model-based tests driven by the normative contract model (`spec/contract.qnt`):
+//! Quint generates random and witness histories, this bridge executes each
+//! command against a real store and compares a projection of the store with
+//! the model's state after every step. The concurrent batches in
+//! `quint/concurrent.rs` take their sequential specification from the same
+//! model. The bridge reads the store only through `RunStore`, never backend
+//! rows or engine helpers; fault injection and construction are confined to
+//! the adapter factory.
+//!
+//! The bridge is the model's host: it keeps each worker's local state (fence,
+//! phase, permit), decides from durable reads what the model's host decides
+//! (dispatch, replay, which slot a firing takes) and dispatches to a ghost
+//! counter, never a network. Store answers (authority, compare-and-swap,
+//! deduplication, overlap, breaker, expiry) come from the store under test.
 use anyhow::{Context, ensure};
 use ouro_durable::{
-    Admission, ChildLink, CommitFault, FaultInjector, Fence, RunSnapshot, RunState, RunStore, TransactionalStore,
-    memory::MemoryBackend, sqlite::SqliteBackend,
+    Admission, Arming, ChildLink, CommitFault, Compatibility, FaultInjector, Fence, Fired, Firing, IdentityConflict,
+    Policy, Rearm, RunSnapshot, RunState, RunStore, TransactionalStore, Trigger, memory::MemoryBackend,
+    sqlite::SqliteBackend,
 };
 use owf::{
     durable::{CallState, Delivery, Record, StepOutcome, TaskResult},
     model::Flow,
     run::{Effect, Status, WorkflowError},
 };
-use quint_connect::{Config, Driver, State, Step, switch};
+use quint_connect::{Config, Driver, State, Step};
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{Value, json};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     path::PathBuf,
     sync::{Arc, Mutex},
 };
 
-#[derive(Debug, PartialEq, Eq, Deserialize)]
-struct EventView {
-    kind: usize,
-    value: i64,
-    time: i64,
-    key: i64,
+// ── 1. the model's units and bindings ──────────────────────────────────────
+
+/// One model tick. The store's lease is four ticks, the model's.
+pub const TICK: i64 = 7_500;
+/// The model's time policy: mailbox copies and ingress tombstones last five
+/// ticks, the skew bound ε is one.
+pub fn model_policy() -> Policy {
+    Policy { mailbox_ms: 5 * TICK, ingress_ms: 5 * TICK, skew_ms: TICK }
 }
-#[derive(Debug, PartialEq, Eq, Deserialize)]
-struct RunView {
-    state: i64,
-    version: u64,
-    input: i64,
-    generation: u64,
-    lease: i64,
-    wake: i64,
-    interruptions: u32,
-    ended: i64,
-    parent: i64,
-    calls: Vec<i64>,
-    tasks: Vec<bool>,
-    awaits: Vec<i64>,
-    listeners: Vec<i64>,
-    held: Vec<bool>,
-    events: Vec<EventView>,
-    taken: Vec<i64>,
+const RUNS: usize = 2;
+const CALLS: usize = 3;
+const SWEEP_KEPT: i64 = 5 * TICK;
+const DEADLINE: i64 = 8;
+const NAME: &str = "model";
+const SCHEDULE: &str = "schedule";
+const INGRESS: &str = "ingress";
+// Invocation 0 is an at-most-once write, 1 an at-least-once read, 2 an
+// at-least-once write: protection is the declared delivery alone.
+fn protected(i: usize) -> bool {
+    i == 0
 }
-impl Default for RunView {
-    fn default() -> Self {
-        Self {
-            state: 0,
-            version: 0,
-            input: 0,
-            generation: 0,
-            lease: -1,
-            wake: 0,
-            interruptions: 0,
-            ended: -1,
-            parent: -1,
-            calls: vec![0; 3],
-            tasks: vec![false; 3],
-            awaits: vec![-1; 5],
-            listeners: vec![-1; 3],
-            held: vec![false; 3],
-            events: vec![],
-            taken: vec![-1; 3],
-        }
-    }
+fn writes(i: usize) -> bool {
+    i != 1
 }
-#[derive(Debug, PartialEq, Eq, Deserialize)]
-struct CatalogView {
-    count: usize,
-    active: u64,
-    previous: u64,
-    faults: u32,
-}
-#[derive(Debug, PartialEq, Eq, Deserialize)]
-struct DatabaseView {
-    runs: Vec<RunView>,
-    catalog: CatalogView,
-}
-fn run_id(r: usize) -> String {
+pub fn run_id(r: usize) -> String {
     format!("r{r}")
 }
-fn event_type(t: usize) -> String {
-    match t {
-        0 => "external".into(),
-        1 | 2 => format!("done:r{t}"),
-        3 | 4 => format!("waiting:r{}", t - 2),
-        _ => panic!("invalid model event type"),
+fn run_index(id: &str) -> Option<usize> {
+    id.strip_prefix('r')?.parse().ok().filter(|r| *r < RUNS)
+}
+/// Worker `w` declares application version `w + 1`.
+pub fn worker(w: usize) -> Compatibility {
+    Compatibility { version: Some((w + 1).to_string()), accepts: vec![] }
+}
+fn error(kind: &str, detail: impl Into<String>) -> WorkflowError {
+    WorkflowError {
+        type_: format!("urn:model:{kind}"),
+        status: 500,
+        title: None,
+        detail: Some(detail.into()),
+        instance: None,
     }
 }
-fn event_kind(t: &str) -> anyhow::Result<usize> {
-    (0..5).find(|i| event_type(*i) == t).context("unexpected event type")
-}
-fn error() -> WorkflowError {
-    WorkflowError::runtime("model failure")
-}
-fn status(n: i64) -> Status {
-    match n {
-        3 => Status::Waiting { wake_at_ms: 1_000_000_000 },
-        4 => Status::Completed(json!(42)),
-        5 => Status::Faulted(error()),
-        6 => Status::Cancelled,
-        7 => Status::Interrupted(error()),
-        _ => panic!("invalid model status"),
+/// Outcomes 1 success, 2 unhandled failure, 3 timeout, 4 unknown, 5 cancellation.
+pub fn status(outcome: i64) -> Status {
+    match outcome {
+        1 => Status::Completed(json!(42)),
+        2 => Status::Faulted(error("unhandled", "model failure")),
+        3 => Status::Faulted(error("timeout", "deadline passed")),
+        4 => Status::Faulted(error("unknown", "outcome unknown")),
+        _ => Status::Cancelled,
     }
 }
-fn state_number(s: &RunState) -> i64 {
-    match s {
-        RunState::Ready => 1,
-        RunState::Running => 2,
-        RunState::Waiting => 3,
-        RunState::Completed => 4,
-        RunState::Failed => 5,
-        RunState::Cancelled => 6,
-    }
+fn outcome(status: &Status) -> anyhow::Result<i64> {
+    Ok(match status {
+        Status::Completed(_) => 1,
+        Status::Faulted(e) => match e.type_.as_str() {
+            "urn:model:unhandled" => 2,
+            "urn:model:timeout" => 3,
+            "urn:model:unknown" => 4,
+            other => anyhow::bail!("unexpected fault {other}"),
+        },
+        Status::Cancelled => 5,
+        other => anyhow::bail!("nonterminal outcome persisted: {other:?}"),
+    })
 }
-fn call_record(i: usize, state: i64) -> Record {
+pub fn call_record(i: usize, state: CallState) -> Record {
     Record::Call {
         logical: format!("invocation{i}"),
         function: format!("function{i}"),
         arguments: json!(i),
-        effect: if i == 0 { Effect::Write } else { Effect::Read },
-        delivery: if i == 2 { Delivery::AtLeastOnce } else { Delivery::AtMostOnce },
-        state: match state {
-            1 => CallState::Pending,
-            2 => CallState::Done(Ok(json!(i))),
-            3 => CallState::Done(Err(error())),
-            4 => CallState::NotExecuted(error()),
-            _ => panic!("invalid call state"),
-        },
+        effect: if writes(i) { Effect::Write } else { Effect::Read },
+        delivery: if protected(i) { Delivery::AtMostOnce } else { Delivery::AtLeastOnce },
+        state,
     }
 }
-fn task_record(i: usize) -> Record {
+fn task_record(continuation: i64) -> Record {
     Record::Task {
         started_ms: 0,
         result: Some(TaskResult {
             context: json!({}),
-            outcome: StepOutcome::Completed { output: json!(i), flow: Flow::Continue },
+            outcome: StepOutcome::Completed { output: json!(continuation), flow: Flow::Continue },
         }),
     }
 }
-impl RunView {
-    fn project(snapshot: RunSnapshot) -> anyhow::Result<Self> {
-        let r = &snapshot.run;
-        let mut view = Self {
-            state: state_number(&r.state),
-            version: r.admission.version,
-            input: r.admission.input.as_i64().context("admission input")?,
-            generation: r.generation,
-            lease: r.lease_until_ms.unwrap_or(-1),
-            wake: r.wake_at_ms,
-            interruptions: r.interruptions,
-            ended: r.ended_ms.unwrap_or(-1),
-            parent: r.child.as_ref().map(|l| l.parent[1..].parse()).transpose()?.unwrap_or(-1),
-            ..Self::default()
-        };
-        ensure!(r.admission.name == "model", "definition name changed");
-        ensure!(r.admission.definition == format!("definition{}", r.admission.version), "definition changed");
-        ensure!(r.admission.runtime == json!({"bindings": "fixed", "format": 1}), "bindings changed");
-        ensure!(r.fence.is_some() == (r.state == RunState::Running), "fence/state mismatch");
-        if let Some(outcome) = &r.outcome {
-            let expected = match outcome {
-                Status::Completed(_) => 4,
-                Status::Faulted(_) => 5,
-                Status::Cancelled => 6,
-                _ => anyhow::bail!("nonterminal outcome persisted"),
-            };
-            ensure!(expected == view.state, "outcome/state mismatch");
-        } else {
-            ensure!(view.state < 4, "terminal outcome missing");
-        }
-        for (t, at) in &snapshot.awaits {
-            view.awaits[event_kind(t)?] = *at;
-        }
-        for (key, types) in &snapshot.listeners {
-            if let Some(id) = key.strip_prefix("child:r") {
-                view.held[id.parse::<usize>()?] = true;
-            } else {
-                ensure!(types.len() == 1, "unexpected listener type list");
-                let k = key.strip_prefix("event").context("listener key")?.parse::<usize>()?;
-                view.listeners[k] = i64::try_from(event_kind(&types[0])?)?;
-            }
-        }
-        for (key, record) in &snapshot.records {
-            if let Some(i) = key.strip_prefix("call") {
-                let i: usize = i.parse()?;
-                let Record::Call { state, .. } = record else { anyhow::bail!("not a call") };
-                let n = match state {
-                    CallState::Pending => 1,
-                    CallState::Done(Ok(_)) => 2,
-                    CallState::Done(Err(_)) => 3,
-                    CallState::NotExecuted(_) => 4,
-                };
-                ensure!(*record == call_record(i, n), "call binding/result changed");
-                view.calls[i] = n;
-            } else if let Some(i) = key.strip_prefix("task") {
-                let i: usize = i.parse()?;
-                ensure!(*record == task_record(i), "task output/context/flow changed");
-                view.tasks[i] = true;
-            } else {
-                ensure!(key.starts_with("event"), "unexpected record");
-            }
-        }
-        for (index, e) in snapshot.events.iter().enumerate() {
-            let kind = event_kind(&e.type_)?;
-            let value = if kind == 0 {
-                e.data.as_i64().context("external payload")?
-            } else {
-                match e.data["status"].as_str() {
-                    Some("completed") => 4,
-                    Some("faulted") => 5,
-                    Some("cancelled") => 6,
-                    Some("waiting") => 3,
-                    _ => anyhow::bail!("child payload"),
-                }
-            };
-            let key = if let Some(key) = &e.consumed_key {
-                let k: usize = key.strip_prefix("event").context("consumed key")?.parse()?;
-                let Record::Event { event } = snapshot.records.get(key).context("event record missing")? else {
-                    anyhow::bail!("consumed event has wrong record")
-                };
-                ensure!(event["type"] == e.type_ && event["data"] == e.data, "event evidence differs");
-                let time = chrono::DateTime::parse_from_rfc3339(event["time"].as_str().context("event time")?)?;
-                ensure!(time.timestamp_millis() == e.delivered_at_ms, "event time differs");
-                ensure!(view.taken[k] == -1, "two events for one invocation");
-                view.taken[k] = i64::try_from(index)?;
-                i64::try_from(k)?
-            } else {
-                -1
-            };
-            view.events.push(EventView { kind, value, time: e.delivered_at_ms, key });
-        }
-        for key in snapshot.records.keys().filter(|k| k.starts_with("event")) {
-            let k: usize = key[5..].parse()?;
-            ensure!(view.taken[k] >= 0, "event record without consumed event");
-        }
-        Ok(view)
+/// The model's event `i` with a payload: its identity is `source` + `id`.
+pub fn event(i: usize, payload: i64) -> Value {
+    json!({"source": "model", "id": i.to_string(), "type": "event", "data": payload})
+}
+fn ingress_event(i: usize, payload: i64) -> Value {
+    json!({"source": "ingress", "id": i.to_string(), "type": INGRESS, "data": payload})
+}
+/// The schedule's trigger: due at tick `at` (`None`: until a run ends).
+pub fn schedule_trigger(at: Option<i64>, epoch: u64, slot: i64, catchup: i64, rearm: bool) -> Trigger {
+    Trigger {
+        at_ms: at.map(|t| t * TICK),
+        types: vec![],
+        state: json!({"epoch": epoch, "slot": slot, "catchup": catchup, "rearm": rearm}),
     }
 }
-impl State<StoreDriver> for DatabaseView {
-    fn from_driver(d: &StoreDriver) -> anyhow::Result<Self> {
-        let runs = (0..3)
-            .map(|r| d.store.inspect(&run_id(r))?.map(RunView::project).transpose().map(Option::unwrap_or_default))
-            .collect::<anyhow::Result<Vec<_>>>()?;
-        let c = d.store.definitions("model")?;
-        for (v, definition) in &c.versions {
-            ensure!(definition.yaml == format!("definition{v}"), "version changed");
+fn ticks(ms: Option<i64>) -> i64 {
+    ms.map_or(-1, |ms| ms / TICK)
+}
+
+// ── 2. the projection both sides are compared in ───────────────────────────
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct RunView {
+    admitted: bool,
+    input: i64,
+    version: i64,
+    epoch: i64,
+    app: i64,
+    mode: i64,
+    outcome: i64,
+    ended: i64,
+    deadline: i64,
+    owner: i64,
+    generation: i64,
+    lease: i64,
+    records: Vec<i64>,
+    values: Vec<i64>,
+    frontier: BTreeSet<i64>,
+    continuation: i64,
+    subscription: bool,
+    parent: i64,
+}
+impl RunView {
+    fn absent() -> Self {
+        Self {
+            ended: -1,
+            deadline: -1,
+            owner: -1,
+            lease: -1,
+            records: vec![0; CALLS],
+            values: vec![0; CALLS],
+            parent: -1,
+            ..Self::default()
         }
-        for worker in &d.workers {
-            if let Some(fence) = &worker.fence {
-                let loaded = d.store.load_records(fence, d.now);
-                if d.valid(fence)? {
-                    ensure!(
-                        loaded? == d.store.inspect(&fence.run_id)?.context("leased run missing")?.records,
-                        "load differs from snapshot"
-                    );
-                } else {
-                    ensure!(loaded.is_err(), "stale load succeeded");
+    }
+}
+/// A copy per recipient, in arrival order. Disposition 0 pending, 1 taken
+/// (`key`), 2 expired: a pending copy past its time counts as expired, which
+/// the store records lazily (at a take or a sweep) and the model at `expire`.
+/// A broadcast copy never expires (`expires` -1).
+#[derive(Debug, PartialEq, Eq)]
+struct CopyView {
+    recipient: i64,
+    id: i64,
+    payload: i64,
+    expires: i64,
+    disposition: i64,
+    key: i64,
+}
+#[derive(Debug, PartialEq, Eq)]
+struct TriggerView {
+    epoch: i64,
+    due: i64,
+    slot: i64,
+    catchup: i64,
+    rearm: bool,
+}
+#[derive(Debug, PartialEq, Eq)]
+struct CatalogView {
+    active: i64,
+    previous: i64,
+    epoch: i64,
+    faults: i64,
+    tripped: bool,
+    trigger: Option<TriggerView>,
+    fallback: i64,
+}
+#[derive(Debug, PartialEq, Eq, Deserialize)]
+#[serde(from = "Machine")]
+pub struct View {
+    now: i64,
+    runs: Vec<RunView>,
+    copies: Vec<CopyView>,
+    catalog: CatalogView,
+    admissions: Vec<i64>,
+    fired: BTreeSet<(i64, i64)>,
+    ingress: Vec<Option<i64>>,
+}
+
+// The model's state as Quint writes it (unused fields are ignored).
+#[derive(Deserialize)]
+struct Machine {
+    db: Durable,
+    now: i64,
+}
+#[derive(Deserialize)]
+struct Durable {
+    runs: Vec<ModelRun>,
+    copies: Vec<ModelCopy>,
+    catalog: ModelCatalog,
+    admissions: Vec<i64>,
+    fired: BTreeSet<(i64, i64)>,
+    ingress: BTreeMap<i64, i64>,
+    #[serde(rename = "ingressPayload")]
+    ingress_payload: BTreeMap<i64, i64>,
+}
+#[derive(Deserialize)]
+struct ModelRun {
+    admitted: bool,
+    input: i64,
+    version: i64,
+    epoch: i64,
+    app: i64,
+    mode: i64,
+    outcome: i64,
+    ended: i64,
+    deadline: i64,
+    owner: i64,
+    generation: i64,
+    lease: i64,
+    records: Vec<i64>,
+    values: Vec<i64>,
+    frontier: BTreeSet<i64>,
+    continuation: i64,
+    subscription: bool,
+    parent: i64,
+    retained: bool,
+}
+#[derive(Deserialize)]
+struct ModelCopy {
+    id: i64,
+    recipient: i64,
+    payload: i64,
+    expires: i64,
+    disposition: i64,
+    key: i64,
+}
+#[derive(Deserialize)]
+struct ModelCatalog {
+    active: i64,
+    previous: i64,
+    epoch: i64,
+    faults: i64,
+    tripped: bool,
+    #[serde(rename = "triggerEpoch")]
+    trigger_epoch: i64,
+    due: i64,
+    slot: i64,
+    catchup: i64,
+    rearm: bool,
+    armed: bool,
+    fallback: i64,
+}
+/// The model's `never`: a broadcast copy's expiry.
+const NEVER: i64 = 1_000_000_000;
+fn disposition(disposition: i64, expires: i64, now: i64) -> i64 {
+    if disposition == 0 && expires >= 0 && expires <= now { 2 } else { disposition }
+}
+impl From<Machine> for View {
+    fn from(m: Machine) -> Self {
+        let now = m.now;
+        let d = m.db;
+        // Swept evidence is gone from the store; the model keeps it, marked.
+        let retained = |r: i64| usize::try_from(r).ok().and_then(|r| d.runs.get(r)).is_none_or(|x| x.retained);
+        let runs = d
+            .runs
+            .iter()
+            .map(|x| {
+                if !x.admitted {
+                    return RunView::absent();
+                }
+                let kept = x.retained;
+                RunView {
+                    admitted: true,
+                    input: x.input,
+                    version: x.version,
+                    epoch: x.epoch,
+                    app: x.app,
+                    mode: x.mode,
+                    outcome: x.outcome,
+                    ended: x.ended,
+                    deadline: x.deadline,
+                    owner: x.owner,
+                    generation: x.generation,
+                    lease: x.lease,
+                    records: if kept { x.records.clone() } else { vec![0; CALLS] },
+                    values: if kept { x.values.clone() } else { vec![0; CALLS] },
+                    frontier: if kept { x.frontier.clone() } else { BTreeSet::new() },
+                    continuation: if kept { x.continuation } else { 0 },
+                    subscription: x.subscription,
+                    parent: x.parent,
+                }
+            })
+            .collect();
+        let mut copies: Vec<CopyView> = d
+            .copies
+            .iter()
+            .filter(|c| retained(c.recipient))
+            .map(|c| {
+                let expires = if c.expires >= NEVER { -1 } else { c.expires };
+                CopyView {
+                    recipient: c.recipient,
+                    id: c.id,
+                    payload: c.payload,
+                    expires,
+                    disposition: disposition(c.disposition, expires, now),
+                    key: c.key,
+                }
+            })
+            .collect();
+        copies.sort_by_key(|c| c.recipient);
+        let c = d.catalog;
+        let ingress = (0..CALLS as i64)
+            .map(|i| d.ingress.get(&i).filter(|t| **t > now).and_then(|_| d.ingress_payload.get(&i).copied()))
+            .collect();
+        View {
+            now,
+            runs,
+            copies,
+            catalog: CatalogView {
+                active: c.active,
+                previous: c.previous,
+                epoch: c.epoch,
+                faults: c.faults,
+                tripped: c.tripped,
+                trigger: c.armed.then_some(TriggerView {
+                    epoch: c.trigger_epoch,
+                    due: c.due,
+                    slot: c.slot,
+                    catchup: c.catchup,
+                    rearm: c.rearm,
+                }),
+                fallback: c.fallback,
+            },
+            admissions: d.admissions,
+            fired: d.fired,
+            ingress,
+        }
+    }
+}
+
+impl State<StoreDriver> for View {
+    fn from_driver(d: &StoreDriver) -> anyhow::Result<Self> {
+        let store = d.store.as_ref();
+        let mut runs = Vec::new();
+        let mut copies = Vec::new();
+        let mut admissions = Vec::new();
+        let mut fired = BTreeSet::new();
+        let mut snapshots = Vec::new();
+        for r in 0..RUNS {
+            let snapshot = store.inspect(&run_id(r))?;
+            admissions.push(i64::from(snapshot.is_some()));
+            let Some(snapshot) = snapshot else {
+                runs.push(RunView::absent());
+                snapshots.push(None);
+                continue;
+            };
+            let (view, slot) = d.run_view(&snapshot)?;
+            fired.extend(slot);
+            runs.push(view);
+            copies.extend(d.copies(r, &snapshot)?);
+            snapshots.push(Some(snapshot));
+        }
+        d.audit(&snapshots)?;
+        let defs = store.definitions(NAME)?;
+        let trigger = store.trigger(SCHEDULE)?;
+        ensure!(
+            defs.triggers == trigger.iter().map(|_| SCHEDULE.to_string()).collect::<Vec<_>>(),
+            "the definition's triggers and the stored triggers differ"
+        );
+        let trigger = trigger
+            .map(|t| -> anyhow::Result<TriggerView> {
+                let number = |k: &str| t.state[k].as_i64().with_context(|| format!("trigger {k}"));
+                Ok(TriggerView {
+                    epoch: number("epoch")?,
+                    due: ticks(t.at_ms),
+                    slot: number("slot")?,
+                    catchup: number("catchup")?,
+                    rearm: t.state["rearm"].as_bool().context("trigger rearm")?,
+                })
+            })
+            .transpose()?;
+        let mut ingress = Vec::new();
+        for i in 0..CALLS {
+            let mut live = None;
+            for payload in 0..5 {
+                match store.ingested(&ingress_event(i, payload), d.ms()) {
+                    Ok(true) => live = Some(payload),
+                    Ok(false) => break,
+                    Err(e) if e.is::<IdentityConflict>() => {}
+                    Err(e) => return Err(e),
                 }
             }
+            ingress.push(live);
         }
-        // Query APIs are checked as well as the persisted projection.
-        let expected_due: Vec<_> = {
-            let mut due = d
-                .store
-                .list(Some("model"), "r")?
-                .into_iter()
-                .filter(|r| match r.state {
-                    RunState::Ready | RunState::Waiting => r.wake_at_ms <= d.now,
-                    RunState::Running => r.lease_until_ms.is_some_and(|t| t <= d.now),
-                    _ => false,
-                })
-                .collect::<Vec<_>>();
-            // Ordered by when each run became eligible: a running run by its
-            // lease expiry, not the wake time it was claimed at.
-            due.sort_by_key(|r| {
-                let eligible = match r.state {
-                    RunState::Running => r.lease_until_ms.unwrap_or(r.wake_at_ms),
-                    _ => r.wake_at_ms,
-                };
-                (eligible, r.admission.id.clone())
-            });
-            due.into_iter().map(|r| r.admission.id).collect()
-        };
-        ensure!(d.store.due(d.now, 3)? == expected_due, "due projection differs");
-        for r in 0..3 {
-            if let Some(saved) = d.store.get(&run_id(r))?
-                && let Some(link) = &saved.child
-            {
-                ensure!(
-                    d.store.child_outcome(&link.parent, &link.key, &run_id(r))? == saved.outcome,
-                    "child outcome differs"
-                );
-                ensure!(d.store.child_outcome("unowned", &link.key, &run_id(r)).is_err(), "child ownership bypass");
-            }
-        }
-        Ok(Self {
+        Ok(View {
+            now: d.now,
             runs,
+            copies,
             catalog: CatalogView {
-                count: c.versions.len(),
-                active: c.active.unwrap_or(0),
-                previous: c.previous.unwrap_or(0),
-                faults: c.consecutive_faults,
+                active: defs.active.map_or(0, |v| v as i64),
+                previous: defs.previous.map_or(0, |v| v as i64),
+                epoch: defs.epoch as i64,
+                faults: i64::from(defs.consecutive_faults),
+                tripped: defs.tripped,
+                trigger,
+                fallback: ticks(defs.fallback.get(SCHEDULE).and_then(|t| t.at_ms)),
             },
+            admissions,
+            fired,
+            ingress,
         })
     }
 }
 
+// ── 3. the driver: adapters, workers and the store ─────────────────────────
+
+/// A worker's local state, the model's `Local`. Phase 0 idle, 1 authorized
+/// to send (a fresh intent), 2 sent, 4 authorized to send again (an unknown
+/// at-least-once call).
 #[derive(Clone, Default)]
 struct Worker {
     fence: Option<Fence>,
-    invocation: usize,
+    execution: usize,
     phase: i64,
+    invocation: usize,
+    stopped: bool,
+    permit: bool,
 }
 #[derive(Clone, Copy)]
-enum Adapter {
+pub enum Adapter {
     Memory,
     Sqlite,
     Postgres,
 }
-struct TestDatabase {
+pub struct TestDatabase {
     config: tokio_postgres::Config,
     name: String,
 }
@@ -347,30 +489,41 @@ struct Coverage {
     actions: BTreeMap<String, usize>,
     rejected: usize,
 }
-struct StoreDriver {
+pub struct StoreDriver {
     coverage: Arc<Mutex<Coverage>>,
-    adapter: Adapter,
-    directory: tempfile::TempDir,
-    store: Arc<dyn RunStore>,
+    pub adapter: Adapter,
+    pub directory: tempfile::TempDir,
+    pub store: Arc<dyn RunStore>,
+    pub policy: Policy,
     faults: Arc<FaultInjector>,
     _database: Option<TestDatabase>,
     workers: [Worker; 2],
+    /// The model's clock, in ticks.
     now: i64,
-    next_event: i64,
-    sent: [[usize; 3]; 3],
+    sends: [[usize; CALLS]; RUNS],
+    /// Fence owners by worker, to name a run's current owner.
+    owners: BTreeMap<String, i64>,
 }
 impl StoreDriver {
-    fn new(adapter: Adapter) -> anyhow::Result<Self> {
+    /// A store with the default time policy.
+    pub fn new(adapter: Adapter) -> anyhow::Result<Self> {
+        Self::with_policy(adapter, Policy::default())
+    }
+    /// A store with the model's time policy.
+    pub fn model(adapter: Adapter) -> anyhow::Result<Self> {
+        Self::with_policy(adapter, model_policy())
+    }
+    fn with_policy(adapter: Adapter, policy: Policy) -> anyhow::Result<Self> {
         let directory = tempfile::tempdir()?;
         let mut database = None;
         let (store, faults): (Arc<dyn RunStore>, _) = match adapter {
             Adapter::Memory => {
                 let b = Arc::new(MemoryBackend::default());
-                (Arc::new(TransactionalStore::new(b.clone())), b.faults.clone())
+                (Arc::new(TransactionalStore::new(b.clone()).with_policy(policy)), b.faults.clone())
             }
             Adapter::Sqlite => {
                 let b = Arc::new(SqliteBackend::open(directory.path().join("model.sqlite"))?);
-                (Arc::new(TransactionalStore::new(b.clone())), b.faults.clone())
+                (Arc::new(TransactionalStore::new(b.clone()).with_policy(policy)), b.faults.clone())
             }
             Adapter::Postgres => {
                 let config: tokio_postgres::Config = std::env::var("TEST_DATABASE_URL")?.parse()?;
@@ -383,7 +536,7 @@ impl StoreDriver {
                 child.dbname(&db.name);
                 let b = Arc::new(ouro_durable::postgres::PostgresBackend::connect_config(child)?);
                 database = Some(db);
-                (Arc::new(TransactionalStore::new(b.clone())), b.faults.clone())
+                (Arc::new(TransactionalStore::new(b.clone()).with_policy(policy)), b.faults.clone())
             }
         };
         Ok(Self {
@@ -391,324 +544,719 @@ impl StoreDriver {
             adapter,
             directory,
             store,
+            policy,
             faults,
             _database: database,
             workers: Default::default(),
             now: 0,
-            next_event: 1,
-            sent: [[0; 3]; 3],
+            sends: [[0; CALLS]; RUNS],
+            owners: BTreeMap::new(),
         })
     }
-    fn admission(&self, r: usize, input: i64) -> anyhow::Result<Admission> {
-        let version = self.store.definitions("model")?.active.context("no active definition")?;
+    /// Another handle to the same database (SQLite: an independent connection).
+    pub fn handle(&self) -> anyhow::Result<Arc<dyn RunStore>> {
+        Ok(match self.adapter {
+            Adapter::Sqlite => {
+                let mut backend = SqliteBackend::open(self.directory.path().join("model.sqlite"))?;
+                backend.faults = self.faults.clone();
+                Arc::new(TransactionalStore::new(Arc::new(backend)).with_policy(self.policy))
+            }
+            _ => self.store.clone(),
+        })
+    }
+    /// The model's initial catalog: versions 1–3 saved, version 1 (the one
+    /// with a schedule) active in epoch 1, its trigger due at tick 2, and the
+    /// generic trigger that takes ingress events.
+    pub fn initialize(&mut self) -> anyhow::Result<()> {
+        for v in 1..=3 {
+            self.store.save_definition(NAME, &format!("definition{v}"))?;
+        }
+        let arming = Arming {
+            triggers: BTreeMap::from([(SCHEDULE.to_string(), schedule_trigger(Some(2), 1, 0, 0, false))]),
+            fallback: BTreeMap::new(),
+        };
+        ensure!(self.store.activate_with(NAME, 1, 0, &arming)?.is_some(), "initial activation");
+        let ingress = Trigger { at_ms: None, types: vec![INGRESS.into()], state: json!({}) };
+        ensure!(self.store.swap_trigger(INGRESS, None, Some(&ingress), &[], None, 0)?, "ingress trigger");
+        Ok(())
+    }
+    pub fn ms(&self) -> i64 {
+        self.now * TICK
+    }
+    pub fn admission(
+        &self,
+        r: usize,
+        input: i64,
+        app: i64,
+        mode: i64,
+        slot: Option<(u64, i64)>,
+    ) -> anyhow::Result<Admission> {
+        let version = self.store.definitions(NAME)?.active.context("no active definition")?;
+        let mut runtime = json!({"bindings": "fixed", "mode": mode});
+        if app > 0 {
+            runtime[ouro_durable::APPLICATION_VERSION] = json!(app.to_string());
+        }
+        if let Some((epoch, slot)) = slot {
+            runtime["slot"] = json!([epoch, slot]);
+        }
         Ok(Admission {
             id: run_id(r),
-            name: "model".into(),
+            name: NAME.into(),
             version,
             definition: format!("definition{version}"),
             input: json!(input),
-            runtime: json!({"bindings": "fixed", "format": 1}),
+            runtime,
         })
     }
-    fn fence(&self, w: usize) -> anyhow::Result<Fence> {
-        self.workers[w].fence.clone().context("worker has no fence")
+    /// The fence worker `w` acts on run `r` with, as the model's host sees
+    /// it: its own claim of that run, unless it stopped. Whether the lease
+    /// still holds is the store's decision.
+    fn fence(&self, w: usize, r: usize) -> Option<Fence> {
+        let x = &self.workers[w];
+        if x.stopped || x.execution != r { None } else { x.fence.clone() }
     }
     fn valid(&self, f: &Fence) -> anyhow::Result<bool> {
+        let skew = self.policy.skew_ms;
         Ok(self.store.get(&f.run_id)?.is_some_and(|r| {
             r.fence.as_ref() == Some(f)
                 && r.state == RunState::Running
-                && r.lease_until_ms.is_some_and(|t| t > self.now)
+                && r.lease_until_ms.is_some_and(|t| t > self.ms() + skew)
         }))
     }
-    fn arm(&self, fault: i64) {
-        match fault {
-            1 => self.faults.arm(CommitFault::BeforeCommit),
-            2 => self.faults.arm(CommitFault::AfterCommit),
-            _ => {}
+    /// Runs one store mutation under the step's injected fault. Returns its
+    /// answer and whether it committed: an injected failure after the
+    /// commit is an error that committed nonetheless.
+    fn write<T>(
+        &self,
+        fault: Option<CommitFault>,
+        call: impl FnOnce(&dyn RunStore) -> anyhow::Result<T>,
+    ) -> (anyhow::Result<T>, bool) {
+        if let Some(fault) = fault {
+            self.faults.arm(fault);
         }
+        let result = call(self.store.as_ref());
+        // Probing an armed fault disarms it; one still armed did not fire.
+        let fired = fault.is_some_and(|f| self.faults.check(f).is_ok());
+        let committed = result.is_ok() || (fault == Some(CommitFault::AfterCommit) && fired);
+        (result, committed)
     }
-    fn outcome<T>(
-        &mut self,
-        result: anyhow::Result<T>,
-        fault: i64,
-        w: Option<usize>,
-        valid: bool,
-    ) -> anyhow::Result<Option<T>> {
-        self.faults.clear();
-        if fault != 0 || !valid {
-            ensure!(result.is_err(), "operation unexpectedly succeeded");
-            self.coverage.lock().unwrap().rejected += 1;
-            if fault != 0
-                && let Some(w) = w
-            {
-                self.workers[w].phase = 0;
+    /// Stops every worker acting for a run that is now terminal.
+    fn stop_terminal(&mut self) -> anyhow::Result<()> {
+        for w in 0..2 {
+            let r = self.workers[w].execution;
+            if self.store.get(&run_id(r))?.is_some_and(|x| x.outcome.is_some()) {
+                self.workers[w].stopped = true;
+                self.workers[w].permit = false;
             }
-            Ok(None)
-        } else {
-            Ok(Some(result?))
-        }
-    }
-    fn prepare(&mut self, w: usize, i: usize, fault: i64) -> anyhow::Result<()> {
-        let f = self.fence(w)?;
-        let records = self.store.load_records(&f, self.now)?;
-        self.workers[w].invocation = i;
-        match records.get(&format!("call{i}")) {
-            Some(Record::Call { state: CallState::Done(_), .. }) => self.workers[w].phase = 0,
-            Some(Record::Call { state: CallState::Pending, delivery: Delivery::AtMostOnce, .. }) => {
-                self.workers[w].phase = 3
-            }
-            _ => {
-                self.arm(fault);
-                let result = self.store.save_record(&f, &format!("call{i}"), &call_record(i, 1), self.now);
-                self.outcome(result, fault, Some(w), true)?;
-                self.workers[w].phase = 1;
-            }
-        }
-        if fault != 0 {
-            self.workers[w].phase = 0;
-        }
-        Ok(())
-    }
-    fn send(&mut self, w: usize) -> anyhow::Result<()> {
-        ensure!(self.workers[w].phase == 1, "dispatch without acknowledged intent");
-        let f = self.fence(w)?;
-        let r: usize = f.run_id[1..].parse()?;
-        let i = self.workers[w].invocation;
-        self.sent[r][i] += 1;
-        ensure!(i == 2 || self.sent[r][i] <= 1, "protected dispatch repeated");
-        self.workers[w].phase = 2;
-        Ok(())
-    }
-    fn reopen(&mut self) -> anyhow::Result<()> {
-        if matches!(self.adapter, Adapter::Sqlite) {
-            let mut backend = SqliteBackend::open(self.directory.path().join("model.sqlite"))?;
-            backend.faults = self.faults.clone();
-            self.store = Arc::new(TransactionalStore::new(Arc::new(backend)));
         }
         Ok(())
     }
 }
+
+// ── 4. executing the model's commands ──────────────────────────────────────
+
 impl Driver for StoreDriver {
-    type State = DatabaseView;
+    type State = View;
     fn config() -> Config {
-        Config { state: &["s", "db"], nondet: &["command"] }
+        Config { state: &["m"], nondet: &["command"] }
     }
-    fn step(&mut self, original: &Step) -> anyhow::Result<()> {
-        // Parameterized witness actions retain the same nondeterministic picks.
-        let step = original;
+    fn step(&mut self, step: &Step) -> anyhow::Result<()> {
         *self.coverage.lock().unwrap().actions.entry(step.action_taken.clone()).or_default() += 1;
-        switch!(step {
-            init => {
-                let coverage = self.coverage.clone();
-                *self = Self::new(self.adapter)?;
-                self.coverage = coverage;
-            },
-            saveVersion => {
-                let n = self.store.definitions("model")?.versions.len() + 1;
-                self.store.save_definition("model", &format!("definition{n}"))?;
-            },
-            activate(version: u64) => { self.store.activate("model", version)?; },
-            activateWith(version: u64) => { self.store.activate("model", version)?; },
-            _ => { self.operation(original)?; },
-        })
-    }
-}
-impl StoreDriver {
-    fn operation(&mut self, step: &Step) -> anyhow::Result<()> {
-        // Both random and singleton-choice actions call these same handlers.
-        let name = step.action_taken.strip_suffix("With").unwrap_or(&step.action_taken);
+        if step.action_taken == "init" {
+            let coverage = self.coverage.clone();
+            *self = Self::model(self.adapter)?;
+            self.coverage = coverage;
+            return self.initialize();
+        }
         macro_rules! pick {
             ($name:literal, $ty:ty) => {
                 <$ty>::deserialize(step.nondet_picks.get($name).context(concat!("missing choice ", $name))?.clone())?
             };
         }
-        match name {
-            "admit" => {
-                let r = pick!("r", usize);
-                let input = pick!("input", i64);
-                let fault = pick!("fault", i64);
-                let a = self.admission(r, input)?;
-                self.arm(fault);
-                self.outcome(self.store.admit(&a, self.now), fault, None, true)?;
+        let command = Command {
+            op: step.action_taken.clone(),
+            r: pick!("r", usize),
+            w: pick!("w", usize),
+            i: pick!("i", usize),
+            value: pick!("value", i64),
+            fault: pick!("fault", i64),
+        };
+        self.execute(&command)
+    }
+}
+
+struct Command {
+    op: String,
+    r: usize,
+    w: usize,
+    i: usize,
+    value: i64,
+    fault: i64,
+}
+
+impl StoreDriver {
+    /// The model's `execute`: the environment's part of a fault first, then
+    /// the operation, then the fault's consequence for the acting worker.
+    fn execute(&mut self, c: &Command) -> anyhow::Result<()> {
+        match c.fault {
+            6 => self.now += 4,
+            7 => self.now += 1,
+            10 => self.apply("activate", c.r, c.w, c.i, c.value, None)?,
+            _ => {}
+        }
+        let actor = if matches!(c.fault, 5 | 11) { 1 - c.w } else { c.w };
+        let op = match c.fault {
+            4 if c.value % 2 == 0 => "take",
+            4 => "address",
+            _ => c.op.as_str(),
+        };
+        let value = if c.fault == 9 { -1 } else { c.value };
+        let injected = match c.fault {
+            1 | 8 => Some(CommitFault::BeforeCommit),
+            2 => Some(CommitFault::AfterCommit),
+            _ => None,
+        };
+        let before = (self.workers.clone(), self.now, self.sends);
+        self.apply(op, c.r, actor, c.i, value, injected)?;
+        if c.fault == 3 {
+            self.apply(op, c.r, actor, c.i, c.value, None)?;
+        }
+        self.faults.clear();
+        if matches!(c.fault, 1 | 8) {
+            // Nothing committed: the step's local effects are lost too.
+            (self.workers, self.now, self.sends) = before;
+        }
+        if matches!(c.fault, 1 | 2 | 8) {
+            self.coverage.lock().unwrap().rejected += 1;
+            let x = &mut self.workers[actor];
+            x.stopped = true;
+            x.phase = 0;
+            x.permit = false;
+        }
+        Ok(())
+    }
+
+    fn apply(
+        &mut self,
+        op: &str,
+        r: usize,
+        w: usize,
+        i: usize,
+        value: i64,
+        fault: Option<CommitFault>,
+    ) -> anyhow::Result<()> {
+        let ms = self.ms();
+        let injected = fault.is_some();
+        // An unfenced operation fails only by an injected fault or a
+        // conflicting event identity; anything else is a finding.
+        let expect = |result: anyhow::Result<()>| -> anyhow::Result<()> {
+            match result {
+                Err(e) if !injected && !e.is::<IdentityConflict>() => Err(e),
+                _ => Ok(()),
             }
-            "start" | "claim" => {
-                let r = pick!("r", usize);
-                let w = pick!("w", usize);
-                let expected = if name == "start" {
-                    self.store.get(&run_id(r))?.is_none()
-                } else {
-                    self.store.due(self.now, 3)?.contains(&run_id(r))
+        };
+        match op {
+            "admit" | "dry" | "replay" => {
+                let defs = self.store.definitions(NAME)?;
+                if value < 0 || defs.tripped || self.store.get(&run_id(r))?.is_some() {
+                    return Ok(());
+                }
+                let mode = match op {
+                    "dry" => 1,
+                    "replay" => 2,
+                    _ => 0,
                 };
-                let f = if name == "start" {
-                    self.store.start(&self.admission(r, 1)?, self.now)?
-                } else {
-                    self.store.claim(&run_id(r), self.now)?
+                let a = self.admission(r, value, i as i64, mode, None)?;
+                expect(self.write(fault, |s| s.admit(&a, ms)).0.map(drop))?;
+            }
+            "claim" => {
+                if self.workers.iter().any(|x| x.permit) {
+                    return Ok(());
+                }
+                let before = self.store.get(&run_id(r))?.map(|x| x.generation);
+                let (result, committed) = self.write(fault, |s| s.claim_as(&run_id(r), ms, &worker(w)));
+                let fence = match result {
+                    Ok(fence) => fence,
+                    // A claim whose reply was lost: the new owner is read back
+                    // only to name it; the worker stops anyway.
+                    Err(_) if committed => {
+                        self.store.get(&run_id(r))?.filter(|x| Some(x.generation) != before).and_then(|x| x.fence)
+                    }
+                    Err(e) if !injected => return Err(e),
+                    Err(_) => None,
                 };
-                ensure!(f.is_some() == expected, "claim/start return differs");
-                if let Some(f) = f {
-                    self.workers[w] = Worker { fence: Some(f), ..Worker::default() };
+                if let Some(f) = fence {
+                    self.owners.insert(f.owner.clone(), w as i64);
+                    self.workers[w] = Worker { fence: Some(f), execution: r, permit: true, ..Worker::default() };
                 }
             }
-            "renew" | "release" => {
-                let w = pick!("w", usize);
-                let f = self.fence(w)?;
-                let valid = self.valid(&f)?;
-                let result =
-                    if name == "renew" { self.store.renew(&f, self.now) } else { self.store.release(&f, self.now) };
-                self.outcome(result, 0, Some(w), valid)?;
-                if name == "release" {
+            "renew" => {
+                if let Some(f) = self.fence(w, r) {
+                    let _ = self.write(fault, |s| s.renew(&f, ms));
+                }
+            }
+            "release" => {
+                if let Some(f) = self.fence(w, r)
+                    && self.write(fault, |s| s.release(&f, ms)).1
+                {
+                    let x = &mut self.workers[w];
+                    x.stopped = true;
+                    x.phase = 0;
+                    x.permit = false;
+                }
+            }
+            "intent" => {
+                let Some(f) = self.fence(w, r) else { return Ok(()) };
+                let Ok(records) = self.store.load_records(&f, ms) else { return Ok(()) };
+                let saved = self.store.get(&run_id(r))?.context("leased run missing")?;
+                let mode = saved.admission.runtime["mode"].as_i64().unwrap_or(0);
+                let fresh = matches!(
+                    records.get(&format!("call{i}")),
+                    None | Some(Record::Call { state: CallState::NotExecuted(_), .. })
+                );
+                let deadline = saved.admitted_ms / TICK + DEADLINE;
+                if fresh && mode != 2 && !(mode == 1 && writes(i)) && self.now < deadline {
+                    let record = call_record(i, CallState::Pending);
+                    if self.write(fault, |s| s.save_record(&f, &format!("call{i}"), &record, ms)).1 {
+                        self.workers[w].phase = 1;
+                        self.workers[w].invocation = i;
+                    }
+                }
+            }
+            "dispatch" => {
+                let x = &mut self.workers[w];
+                if !x.stopped && matches!(x.phase, 1 | 4) && x.execution == r && x.invocation == i {
+                    x.phase = 2;
+                    self.sends[r][i] += 1;
+                    ensure!(!protected(i) || self.sends[r][i] <= 1, "an at-most-once call was sent twice");
+                }
+            }
+            "result" | "notExecuted" => {
+                let Some(f) = self.fence(w, r) else { return Ok(()) };
+                let x = &self.workers[w];
+                let state = match op {
+                    "result" if x.phase == 2 && x.invocation == i && value >= 0 => {
+                        let admission = self.store.get(&run_id(r))?.context("leased run missing")?.admission;
+                        let v = admission.input.as_i64().context("input")? + i as i64;
+                        // Value 1: the function answered with an error.
+                        if value == 1 {
+                            CallState::Done(Err(error("response", v.to_string())))
+                        } else {
+                            CallState::Done(Ok(json!(v)))
+                        }
+                    }
+                    "notExecuted" if x.phase == 1 && x.invocation == i => {
+                        CallState::NotExecuted(error("rejected", "not sent"))
+                    }
+                    _ => return Ok(()),
+                };
+                let record = call_record(i, state);
+                if self.write(fault, |s| s.save_record(&f, &format!("call{i}"), &record, ms)).1 {
                     self.workers[w].phase = 0;
                 }
             }
-            "tick" => {
-                self.now += pick!("delta", i64);
-            }
-            "crash" => {
-                let w = pick!("w", usize);
-                self.workers[w].phase = 0;
-                self.reopen()?;
-            }
-            "restart" => {
-                let w = pick!("w", usize);
-                self.workers[w] = Worker::default();
-            }
-            "prepare" => {
-                self.prepare(pick!("w", usize), pick!("i", usize), pick!("fault", i64))?;
-            }
-            "send" => {
-                self.send(pick!("w", usize))?;
-            }
-            "response" | "notExecuted" => {
-                let w = pick!("w", usize);
-                let f = self.fence(w)?;
-                let (result, fault) =
-                    if name == "response" { (pick!("result", i64), pick!("fault", i64)) } else { (4, 0) };
-                let valid = self.valid(&f)?;
-                let i = self.workers[w].invocation;
-                self.arm(fault);
-                self.outcome(
-                    self.store.save_record(&f, &format!("call{i}"), &call_record(i, result), self.now),
-                    fault,
-                    Some(w),
-                    valid,
-                )?;
-                self.workers[w].phase = 0;
+            "recover" => {
+                let Some(f) = self.fence(w, r) else { return Ok(()) };
+                let Ok(records) = self.store.load_records(&f, ms) else { return Ok(()) };
+                // An unknown at-least-once call may be sent again.
+                if let Some(Record::Call { state: CallState::Pending, delivery: Delivery::AtLeastOnce, .. }) =
+                    records.get(&format!("call{i}"))
+                {
+                    self.workers[w].phase = 4;
+                    self.workers[w].invocation = i;
+                }
             }
             "checkpoint" => {
-                let w = pick!("w", usize);
-                let i = pick!("i", usize);
-                let fault = pick!("fault", i64);
-                let f = self.fence(w)?;
-                let valid = self.valid(&f)?;
-                self.arm(fault);
-                self.outcome(
-                    self.store.save_record(&f, &format!("task{i}"), &task_record(i), self.now),
-                    fault,
-                    Some(w),
-                    valid,
-                )?;
+                let Some(f) = self.fence(w, r) else { return Ok(()) };
+                let Ok(records) = self.store.load_records(&f, ms) else { return Ok(()) };
+                let result = |k: usize| match records.get(&format!("call{k}")) {
+                    Some(Record::Call { state: CallState::Done(Ok(v)), .. }) => v.as_i64(),
+                    _ => None,
+                };
+                if result(i).is_none() {
+                    return Ok(());
+                }
+                // The continuation is computed from durable records only.
+                let continuation = (0..CALLS)
+                    .filter(|k| *k == i || records.contains_key(&format!("task{k}")))
+                    .map(|k| result(k).unwrap_or(0))
+                    .sum();
+                let record = task_record(continuation);
+                let _ = self.write(fault, |s| s.save_record(&f, &format!("task{i}"), &record, ms));
             }
             "conflict" => {
-                let w = pick!("w", usize);
-                let i = pick!("i", usize);
-                let f = self.fence(w)?;
+                let Some(f) = self.fence(w, r) else { return Ok(()) };
+                let Ok(records) = self.store.load_records(&f, ms) else { return Ok(()) };
+                if !records.contains_key(&format!("call{i}")) {
+                    return Ok(());
+                }
+                // Every changed binding under the invocation's identity is refused.
                 for change in 0..4 {
-                    let mut record = call_record(i, 1);
+                    let mut record = call_record(i, CallState::Pending);
                     if let Record::Call { logical, function, arguments, delivery, .. } = &mut record {
                         match change {
                             0 => *logical = "different identity".into(),
                             1 => *function = "different function".into(),
                             2 => *arguments = json!("changed"),
                             _ => {
-                                *delivery = if *delivery == Delivery::AtMostOnce {
-                                    Delivery::AtLeastOnce
-                                } else {
-                                    Delivery::AtMostOnce
+                                *delivery = match delivery {
+                                    Delivery::AtMostOnce => Delivery::AtLeastOnce,
+                                    Delivery::AtLeastOnce => Delivery::AtMostOnce,
                                 }
                             }
                         }
                     }
                     ensure!(
-                        self.store.save_record(&f, &format!("call{i}"), &record, self.now).is_err(),
+                        self.store.save_record(&f, &format!("call{i}"), &record, ms).is_err(),
                         "binding conflict accepted"
                     );
                 }
-                self.store.finish(&f, &status(5), self.now, 2)?;
+                if self.write(fault, |s| s.finish(&f, &status(2), ms, 2)).1 {
+                    self.stop_terminal()?;
+                }
             }
-            "registerWait" | "unregisterWait" | "takeEvent" => {
-                let w = pick!("w", usize);
-                let t = pick!("t", usize);
-                let f = self.fence(w)?;
-                let valid = self.valid(&f)?;
-                let types = [event_type(t)];
-                let (fault, result) = match name {
-                    "registerWait" => (0, self.store.register_wait(&f, &types, self.now)),
-                    "unregisterWait" => {
-                        let k = pick!("k", usize);
-                        (0, self.store.unregister_wait(&f, &format!("event{k}"), &types, self.now))
-                    }
-                    _ => {
-                        let k = pick!("k", usize);
-                        let fault = pick!("fault", i64);
-                        self.arm(fault);
-                        (fault, self.store.take_event(&f, &format!("event{k}"), &types, self.now).map(|_| ()))
-                    }
-                };
-                self.outcome(result, fault, Some(w), valid)?;
+            "subscribe" => {
+                if let Some(f) = self.fence(w, r) {
+                    let _ = self.write(fault, |s| s.subscribe(&f, "listen", &["event".into()], ms));
+                }
             }
-            "deliver" => {
-                let t = pick!("t", usize);
-                let fault = pick!("fault", i64);
-                self.arm(fault);
-                self.outcome(self.store.deliver(&event_type(t), &json!(self.next_event), self.now), fault, None, true)?;
-                self.next_event += 1;
+            "address" | "publish" => {
+                if value >= 0 {
+                    let target = (op == "address").then(|| run_id(r));
+                    let e = event(i, value);
+                    expect(self.write(fault, |s| s.publish(&e, target.as_deref(), ms)).0.map(drop))?;
+                }
             }
-            "finish" => {
-                let w = pick!("w", usize);
-                let n = pick!("status", i64);
-                let fault = pick!("fault", i64);
-                let f = self.fence(w)?;
-                let valid = self.valid(&f)?;
-                self.arm(fault);
-                self.outcome(self.store.finish(&f, &status(n), self.now, 2), fault, Some(w), valid)?;
-                self.workers[w].phase = 0;
+            "take" => {
+                if let Some(f) = self.fence(w, r) {
+                    let _ = self.write(fault, |s| s.take_event(&f, &format!("event{i}"), &["event".into()], ms));
+                }
             }
-            "startChild" => {
-                let w = pick!("w", usize);
-                let child = pick!("child", usize);
-                let fault = pick!("fault", i64);
-                let f = self.fence(w)?;
-                let a = self.admission(child, 1)?;
-                let link = ChildLink {
-                    parent: f.run_id.clone(),
-                    key: format!("child{child}"),
-                    reference: format!("child{child}"),
-                };
-                self.arm(fault);
-                self.outcome(self.store.start_child(&f, &a, &link, self.now), fault, Some(w), true)?;
-            }
-            "cancel" => {
-                let r = pick!("r", usize);
-                let fault = pick!("fault", i64);
-                self.arm(fault);
-                self.outcome(self.store.cancel(&run_id(r), self.now), fault, None, true)?;
+            "expire" => {
+                expect(self.write(fault, |s| s.sweep(ms, i64::MAX)).0.map(drop))?;
             }
             "sweep" => {
-                self.store.sweep(self.now, pick!("kept", i64))?;
+                expect(self.write(fault, |s| s.sweep(ms, SWEEP_KEPT)).0.map(drop))?;
             }
-            _ => anyhow::bail!("unhandled model action {}", step.action_taken),
+            "child" => {
+                let Some(f) = self.fence(w, r) else { return Ok(()) };
+                if r != 0 || self.store.get(&run_id(1))?.is_some() {
+                    return Ok(());
+                }
+                let parent = self.store.get(&run_id(0))?.context("leased parent missing")?.admission;
+                let app = parent.application_version().map_or(Ok(0), str::parse)?;
+                let mode = parent.runtime["mode"].as_i64().unwrap_or(0);
+                let a = self.admission(1, parent.input.as_i64().context("input")?, app, mode, None)?;
+                let link = ChildLink { parent: run_id(0), key: "child".into(), reference: "child".into() };
+                // The child's first lease stays with the parent's host.
+                let _ = self.write(fault, |s| s.start_child(&f, &a, &link, ms));
+            }
+            "finish" | "timeout" => {
+                let Some(f) = self.fence(w, r) else { return Ok(()) };
+                let outcome = if op == "timeout" {
+                    let saved = self.store.get(&run_id(r))?.context("leased run missing")?;
+                    if self.now < saved.admitted_ms / TICK + DEADLINE {
+                        return Ok(());
+                    }
+                    3
+                } else if value >= 0 {
+                    value + 1
+                } else {
+                    return Ok(());
+                };
+                if self.write(fault, |s| s.finish(&f, &status(outcome), ms, 2)).1 {
+                    self.stop_terminal()?;
+                }
+            }
+            "cancel" => {
+                let (result, committed) = self.write(fault, |s| s.cancel(&run_id(r), ms));
+                expect(result.map(drop))?;
+                if committed {
+                    self.stop_terminal()?;
+                }
+            }
+            "activate" => {
+                if value < 0 {
+                    return Ok(());
+                }
+                let defs = self.store.definitions(NAME)?;
+                let version = i as u64 + 1;
+                let predecessor = if defs.active == Some(version) { defs.previous } else { defs.active };
+                let (catchup, rearm) = (value % 2, value >= 2);
+                // Version 1 has the schedule; a rollback to it arms it again.
+                let mut arming = Arming::default();
+                if version == 1 {
+                    let t = schedule_trigger(Some(self.now + 2), defs.epoch + 1, 0, catchup, rearm);
+                    arming.triggers.insert(SCHEDULE.into(), t);
+                }
+                if predecessor == Some(1) {
+                    let t = schedule_trigger(Some(self.now + 2), defs.epoch + 2, 0, catchup, rearm);
+                    arming.fallback.insert(SCHEDULE.into(), t);
+                }
+                let (result, _) = self.write(fault, |s| s.activate_with(NAME, version, defs.epoch, &arming));
+                if !injected {
+                    ensure!(result?.is_some(), "the definition changed under a serial activation");
+                }
+            }
+            "fire" => {
+                let defs = self.store.definitions(NAME)?;
+                let Some(t) = self.store.trigger(SCHEDULE)? else { return Ok(()) };
+                let Some(at) = t.at_ms else { return Ok(()) };
+                if value < 0 || at > ms || defs.tripped || t.state["epoch"] != json!(defs.epoch) {
+                    return Ok(());
+                }
+                let slot = t.state["slot"].as_i64().context("slot")?;
+                let catchup = t.state["catchup"].as_i64().context("catchup")?;
+                let rearm = t.state["rearm"].as_bool().context("rearm")?;
+                let moved = |at: Option<i64>| schedule_trigger(at, defs.epoch, slot + 1, catchup, rearm);
+                let skip = moved(Some(self.now + 2));
+                // A missed slot under `catchup: none`, or a slot whose run id
+                // is taken, is skipped; the next slot is two ticks on.
+                if (catchup == 1 && at < ms) || self.store.get(&run_id(r))?.is_some() {
+                    let firing = Firing { key: SCHEDULE, expected: Some(&t), next: Some(&skip), ..Firing::default() };
+                    let (result, _) = self.write(fault, |s| s.fire(&firing, ms));
+                    if !injected {
+                        ensure!(result? == Fired::Committed, "a serial skip did not commit");
+                    }
+                    return Ok(());
+                }
+                let admit = [self.admission(r, value, 0, 0, Some((defs.epoch, slot)))?];
+                let next = moved(if rearm { None } else { Some(self.now + 2) });
+                let again = Rearm { trigger: SCHEDULE.into(), delay_ms: 2 * TICK };
+                let firing = Firing {
+                    key: SCHEDULE,
+                    expected: Some(&t),
+                    next: Some(&next),
+                    admit: &admit,
+                    rearm: rearm.then_some(&again),
+                    ingress: None,
+                    // The store skips the slot, in this commit, when the
+                    // schedule's last run is unfinished.
+                    busy: Some(&skip),
+                };
+                let (result, _) = self.write(fault, |s| s.fire(&firing, ms));
+                if !injected {
+                    ensure!(matches!(result?, Fired::Committed | Fired::Busy(_)), "a serial firing did not commit");
+                }
+            }
+            "ingress" => {
+                let e = ingress_event(i, value);
+                match self.store.ingested(&e, ms) {
+                    Err(e) if e.is::<IdentityConflict>() => return Ok(()),
+                    Err(e) => return Err(e),
+                    Ok(true) => return Ok(()),
+                    Ok(false) => {}
+                }
+                let defs = self.store.definitions(NAME)?;
+                if value < 0 || defs.tripped || self.store.get(&run_id(r))?.is_some() {
+                    return Ok(());
+                }
+                let t = self.store.trigger(INGRESS)?.context("ingress trigger")?;
+                let admit = [self.admission(r, value, 0, 0, None)?];
+                let firing = Firing {
+                    key: INGRESS,
+                    expected: Some(&t),
+                    next: Some(&t),
+                    admit: &admit,
+                    ingress: Some(&e),
+                    ..Firing::default()
+                };
+                let (result, _) = self.write(fault, |s| s.fire(&firing, ms));
+                if !injected {
+                    ensure!(result? == Fired::Committed, "a fresh ingress identity was refused");
+                }
+            }
+            "crash" => {
+                let x = &mut self.workers[w];
+                x.stopped = true;
+                x.phase = 0;
+                x.permit = false;
+                if matches!(self.adapter, Adapter::Sqlite) {
+                    self.store = self.handle()?;
+                }
+            }
+            "tick" => {
+                self.now += 1;
+                for w in 0..2 {
+                    let lease = self.store.get(&run_id(self.workers[w].execution))?.and_then(|r| r.lease_until_ms);
+                    if ticks(lease) <= self.now {
+                        self.workers[w].permit = false;
+                        self.workers[w].stopped = true;
+                    }
+                }
+            }
+            other => anyhow::bail!("unhandled model command {other}"),
         }
         Ok(())
     }
 }
 
-fn spec_path(name: &str) -> PathBuf {
+// ── 5. reading the store back ──────────────────────────────────────────────
+
+impl StoreDriver {
+    fn run_view(&self, snapshot: &RunSnapshot) -> anyhow::Result<(RunView, Option<(i64, i64)>)> {
+        let r = &snapshot.run;
+        ensure!(r.admission.name == NAME, "definition name changed");
+        ensure!(r.admission.definition == format!("definition{}", r.admission.version), "definition changed");
+        ensure!(r.admission.runtime["bindings"] == json!("fixed"), "bindings changed");
+        ensure!(r.fence.is_some() == (r.state == RunState::Running), "fence/state mismatch");
+        ensure!(r.outcome.is_some() == r.ended_ms.is_some(), "terminal outcome without its end");
+        let mut view = RunView {
+            admitted: true,
+            input: r.admission.input.as_i64().context("admission input")?,
+            version: r.admission.version as i64,
+            epoch: r.epoch.map_or(0, |e| e as i64),
+            app: r.admission.application_version().map_or(Ok(0), str::parse)?,
+            mode: r.admission.runtime["mode"].as_i64().context("mode")?,
+            outcome: r.outcome.as_ref().map(outcome).transpose()?.unwrap_or(0),
+            ended: ticks(r.ended_ms),
+            deadline: r.admitted_ms / TICK + DEADLINE,
+            owner: r.fence.as_ref().and_then(|f| self.owners.get(&f.owner).copied()).unwrap_or(-1),
+            generation: r.generation as i64,
+            lease: ticks(r.lease_until_ms),
+            subscription: !snapshot.subscriptions.is_empty(),
+            parent: r.child.as_ref().and_then(|l| run_index(&l.parent)).map_or(-1, |p| p as i64),
+            ..RunView::absent()
+        };
+        for (key, record) in &snapshot.records {
+            if let Some(i) = key.strip_prefix("call") {
+                let i: usize = i.parse()?;
+                let Record::Call { state, .. } = record else { anyhow::bail!("not a call") };
+                let (n, v) = match state {
+                    CallState::Pending => (1, 0),
+                    CallState::Done(Ok(v)) => (2, v.as_i64().context("call value")?),
+                    CallState::Done(Err(e)) => (3, e.detail.as_deref().context("error value")?.parse()?),
+                    CallState::NotExecuted(_) => (4, 0),
+                };
+                ensure!(*record == call_record(i, state.clone()), "call binding changed");
+                view.records[i] = n;
+                view.values[i] = v;
+            } else if let Some(i) = key.strip_prefix("task") {
+                let Record::Task {
+                    result: Some(TaskResult { outcome: StepOutcome::Completed { output, .. }, .. }),
+                    ..
+                } = record
+                else {
+                    anyhow::bail!("not a completed task")
+                };
+                view.frontier.insert(i.parse()?);
+                view.continuation = view.continuation.max(output.as_i64().context("continuation")?);
+            } else {
+                ensure!(key.starts_with("event") || key.starts_with("mailbox#expired["), "unexpected record {key}");
+            }
+        }
+        let slot = r.admission.runtime.get("slot").map(|s| (s[0].as_i64().unwrap_or(-1), s[1].as_i64().unwrap_or(-1)));
+        Ok((view, slot))
+    }
+
+    /// The run's copies of model events, with each consumption's evidence.
+    fn copies(&self, r: usize, snapshot: &RunSnapshot) -> anyhow::Result<Vec<CopyView>> {
+        let mut out = Vec::new();
+        let mut taken = BTreeSet::new();
+        for e in snapshot.events.iter().filter(|e| e.type_ == "event") {
+            let envelope = e.envelope.as_ref().context("a model event without its envelope")?;
+            let id: i64 = envelope["id"].as_str().context("event id")?.parse()?;
+            let payload = e.data.as_i64().context("event payload")?;
+            let expires = ticks(e.expires_at_ms);
+            let (disposition, key) = match &e.consumed_key {
+                None => (disposition(0, expires, self.now), -1),
+                Some(k) if k.starts_with("mailbox#expired[") => {
+                    let Some(Record::Expired { event }) = snapshot.records.get(k) else {
+                        anyhow::bail!("an expiry without its record")
+                    };
+                    ensure!(event["id"] == envelope["id"] && event["data"] == e.data, "expiry evidence differs");
+                    (2, -1)
+                }
+                Some(k) => {
+                    let n: i64 = k.strip_prefix("event").context("consumed key")?.parse()?;
+                    let Some(Record::Event { event }) = snapshot.records.get(k) else {
+                        anyhow::bail!("a take without its record")
+                    };
+                    ensure!(event["id"] == envelope["id"] && event["data"] == e.data, "event evidence differs");
+                    ensure!(taken.insert(n), "two copies taken under one key");
+                    (1, n)
+                }
+            };
+            out.push(CopyView { recipient: r as i64, id, payload, expires, disposition, key });
+        }
+        for key in snapshot.records.keys().filter(|k| k.starts_with("event")) {
+            ensure!(taken.contains(&key[5..].parse::<i64>()?), "an event record without its taken copy");
+        }
+        Ok(out)
+    }
+
+    /// Checks outside the projection: fenced loads, the due queries per
+    /// worker version, owned child outcomes and the parent's notification.
+    fn audit(&self, snapshots: &[Option<RunSnapshot>]) -> anyhow::Result<()> {
+        for x in &self.workers {
+            if let Some(fence) = &x.fence {
+                let loaded = self.store.load_records(fence, self.ms());
+                if self.valid(fence)? {
+                    let records = self.store.inspect(&fence.run_id)?.context("leased run missing")?.records;
+                    ensure!(loaded? == records, "load differs from snapshot");
+                } else {
+                    ensure!(loaded.is_err(), "load outside the lease succeeded");
+                }
+            }
+        }
+        let mut due: Vec<_> = snapshots
+            .iter()
+            .flatten()
+            .filter_map(|s| {
+                let r = &s.run;
+                let eligible = match r.state {
+                    RunState::Ready | RunState::Waiting => r.wake_at_ms,
+                    RunState::Running => r.lease_until_ms?,
+                    _ => return None,
+                };
+                let app = r.admission.application_version().map(str::to_owned);
+                (eligible <= self.ms()).then(|| (eligible, r.admission.id.clone(), app))
+            })
+            .collect();
+        due.sort();
+        let ids = |w: Option<usize>| -> Vec<String> {
+            due.iter()
+                .filter(|(_, _, app)| w.is_none_or(|w| worker(w).admits(app.as_deref())))
+                .map(|(_, id, _)| id.clone())
+                .collect()
+        };
+        ensure!(self.store.due(self.ms(), 3)? == ids(None), "due projection differs");
+        for w in 0..2 {
+            ensure!(self.store.due_as(self.ms(), 3, &worker(w))? == ids(Some(w)), "versioned due projection differs");
+        }
+        if let (Some(parent), Some(child)) = (&snapshots[0], &snapshots[1])
+            && let Some(link) = &child.run.child
+        {
+            let id = &child.run.admission.id;
+            ensure!(
+                self.store.child_outcome(&link.parent, &link.key, id)? == child.run.outcome,
+                "child outcome differs"
+            );
+            ensure!(self.store.child_outcome("unowned", &link.key, id).is_err(), "child ownership bypass");
+            // A child that ended while its parent was live left the parent
+            // its terminal notification, unless the parent's evidence is swept.
+            let swept = parent.run.ended_ms.is_some() && parent.events.is_empty();
+            if let Some(end) = child.run.ended_ms
+                && parent.run.ended_ms.is_none_or(|p| p > end)
+                && !swept
+            {
+                let notified = parent.events.iter().filter(|e| e.type_ == format!("done:{id}")).count();
+                ensure!(notified == 1, "a finished child notified its live parent {notified} times");
+            }
+        }
+        Ok(())
+    }
+}
+
+// ── 6. running the model's histories ───────────────────────────────────────
+
+pub fn spec_path(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../spec").join(name)
 }
 
 // quint-connect finds `quint` through PATH. Set it only on a child test process,
 // avoiding process-global environment mutation while Rust tests run in parallel.
-fn with_quint(name: &str, run: impl FnOnce() -> anyhow::Result<()>) {
+pub fn with_quint(name: &str, run: impl FnOnce() -> anyhow::Result<()>) {
     if std::env::var_os("OURO_QUINT_CHILD").is_some() {
         run().unwrap();
         return;
@@ -731,60 +1279,47 @@ fn with_quint(name: &str, run: impl FnOnce() -> anyhow::Result<()>) {
         .unwrap();
     assert!(result.success(), "Quint child test failed");
 }
+/// Every command of the contract model, and initialization.
+const COMMANDS: usize = 29;
 fn simulation(adapter: Adapter) -> anyhow::Result<()> {
     use quint_connect::runner::{self, RunConfig};
-    let driver = StoreDriver::new(adapter)?;
+    let seed = std::env::var("QUINT_SEED").unwrap_or_else(|_| "20261023".into());
+    let driver = StoreDriver::model(adapter)?;
     let coverage = driver.coverage.clone();
     runner::run_test(
         driver,
         runner::Config {
-            test_name: "durable protocol".into(),
+            test_name: "durable contract".into(),
             gen_config: RunConfig {
-                spec: spec_path("protocol.qnt").to_string_lossy().into_owned(),
+                spec: spec_path("contract.qnt").to_string_lossy().into_owned(),
                 main: None,
                 init: None,
                 step: None,
                 max_samples: Some(std::env::var("QUINT_SAMPLES").ok().map(|v| v.parse()).transpose()?.unwrap_or(100)),
                 max_steps: Some(150),
-                seed: std::env::var("QUINT_SEED").unwrap_or_else(|_| "20261023".into()),
+                seed: seed.clone(),
             },
         },
     )?;
     eprintln!("Quint random coverage: {:?}", coverage.lock().unwrap());
-    for test in [
-        "ambiguousTest",
-        "sendCrashTest",
-        "listenersTest",
-        "childTest",
-        "breakerTest",
-        "replayTest",
-        "beforeCommitTest",
-        "staleFenceTest",
-        "admissionTest",
-        "readRetryTest",
-        "cascadeTest",
-        "retentionTest",
-        "successResetsBreakerTest",
-        "interruptionTest",
-    ] {
-        let mut witness_driver = StoreDriver::new(adapter)?;
-        witness_driver.coverage = coverage.clone();
-        runner::run_test(
-            witness_driver,
-            runner::Config {
-                test_name: test.into(),
-                gen_config: runner::TestConfig {
-                    spec: spec_path("witnesses.qnt").to_string_lossy().into_owned(),
-                    main: None,
-                    test: test.into(),
-                    max_samples: Some(1),
-                    seed: std::env::var("QUINT_SEED").unwrap_or_else(|_| "20261023".into()),
-                },
+    let mut witnesses = StoreDriver::model(adapter)?;
+    witnesses.coverage = coverage.clone();
+    runner::run_test(
+        witnesses,
+        runner::Config {
+            test_name: "contract witnesses".into(),
+            gen_config: runner::TestConfig {
+                spec: spec_path("contract_witnesses.qnt").to_string_lossy().into_owned(),
+                main: None,
+                test: "bridgeSuite".into(),
+                max_samples: Some(1),
+                seed,
             },
-        )?;
-    }
-    eprintln!("Quint combined coverage: {:?}", coverage.lock().unwrap());
-    ensure!(coverage.lock().unwrap().actions.len() == 25, "suite missed a protocol action");
+        },
+    )?;
+    let coverage = coverage.lock().unwrap();
+    eprintln!("Quint combined coverage: {coverage:?}");
+    ensure!(coverage.actions.len() == COMMANDS, "the suite missed a contract command");
     Ok(())
 }
 #[test]

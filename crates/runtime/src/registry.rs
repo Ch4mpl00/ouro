@@ -1,7 +1,9 @@
-//! User functions: schemas, effects and explicit injected async handlers.
+//! User functions: schemas, effects, declared delivery and explicit injected
+//! async handlers.
 use crate::capabilities::{Capabilities, HostCatalog};
 use async_trait::async_trait;
 use opentelemetry::Context as SpanContext;
+pub use owf::durable::Delivery;
 pub use owf::run::Effect;
 use owf::{
     model::{self, Catalog, Workflow},
@@ -43,7 +45,15 @@ pub struct Function {
     pub name: String,
     pub input_schema: Value,
     pub output_schema: Value,
+    /// What the function does to the world. Dry runs mock writes; it never
+    /// decides whether a call may be dispatched again (`delivery` does).
     pub effect: Effect,
+    /// At least once unless declared otherwise: a call whose outcome is
+    /// unknown after a crash may be dispatched again under the same
+    /// idempotency key. A function that must not be repeated (sending a
+    /// message, charging a card) declares `AtMostOnce`; a call in YAML may
+    /// tighten it (`metadata.delivery: at_most_once`), never loosen it.
+    pub delivery: Delivery,
     pub handler: Arc<dyn Handler>,
 }
 impl Function {
@@ -54,7 +64,19 @@ impl Function {
         effect: Effect,
         handler: impl Handler + 'static,
     ) -> Self {
-        Self { name: name.into(), input_schema: input, output_schema: output, effect, handler: Arc::new(handler) }
+        Self {
+            name: name.into(),
+            input_schema: input,
+            output_schema: output,
+            effect,
+            delivery: Delivery::AtLeastOnce,
+            handler: Arc::new(handler),
+        }
+    }
+    /// Declares the function's delivery (`Function::new` is at least once).
+    pub fn with_delivery(mut self, delivery: Delivery) -> Self {
+        self.delivery = delivery;
+        self
     }
 }
 pub(crate) struct Registered {
@@ -125,13 +147,22 @@ impl Registry {
         }
         Ok(wf)
     }
-    /// Persist schemas/effects for the functions this definition binds. Changes
-    /// to those bindings fail recovery explicitly, before executing a handler.
+    /// Persist schemas, effects and declared delivery for the functions this
+    /// definition binds. Changes to those bindings fail recovery explicitly,
+    /// before executing a handler.
     pub(crate) fn bindings(&self, wf: &Workflow) -> Value {
         let mut bindings = BTreeMap::new();
         for site in model::call_sites(wf) {
             if let Some(f) = self.get(&site.function) {
-                bindings.insert(site.function,json!({"input":f.function.input_schema,"output":f.function.output_schema,"effect":f.function.effect}));
+                bindings.insert(
+                    site.function,
+                    json!({
+                        "input": f.function.input_schema,
+                        "output": f.function.output_schema,
+                        "effect": f.function.effect,
+                        "delivery": f.function.delivery,
+                    }),
+                );
             }
         }
         json!(bindings)

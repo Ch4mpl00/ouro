@@ -4,13 +4,21 @@
 use opentelemetry::{
     Context, KeyValue,
     global::BoxedTracer,
-    trace::{Status, TraceContextExt, Tracer},
+    trace::{Span, Status, TraceContextExt, Tracer},
 };
 use owf::run::{Event, Observer};
 use std::{
     collections::BTreeMap,
     sync::{Arc, Mutex},
 };
+
+/// A point-in-time observation (a skipped schedule slot, expired mailbox
+/// events) as a span with no duration.
+pub(crate) fn mark(tracer: &BoxedTracer, name: &str, attributes: Vec<KeyValue>) {
+    let mut span = tracer.start(name.to_string());
+    span.set_attributes(attributes);
+    span.end();
+}
 
 pub(crate) struct Spans {
     pub tracer: Arc<BoxedTracer>,

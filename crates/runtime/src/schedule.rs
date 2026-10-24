@@ -1,7 +1,8 @@
 //! Schedules and published events: 1. the triggers a definition's
-//! `schedule` keeps in the store, armed on activation; 2. firing due
-//! triggers (`every`, `cron`, `after`); 3. publishing an event to the runs
-//! listening for it and to event-triggered schedules (`on`).
+//! `schedule` keeps in the store, armed in the commit that activates it;
+//! 2. firing due triggers (`every`, `cron`, `after`), with the missed-slot
+//! and overlap policies; 3. publishing an event to the runs listening for it
+//! and to event-triggered schedules (`on`), each ingress event at most once.
 //!
 //! The store holds generic triggers (`ouro_durable::Trigger`): indexed by
 //! the time they are next due and by the event types they react to, and
@@ -11,32 +12,48 @@
 //! index (a range ending now), and a publish reads the trigger index of the
 //! event's type.
 //!
+//! Every activation and every breaker rollback starts an activation epoch.
+//! The activation's commit replaces the definition's triggers with the
+//! activated version's (a version without a schedule leaves none) and stores
+//! those of its predecessor, which a rollback arms in the breaker's commit.
+//! Each trigger's state names its epoch, so a trigger of an older epoch is
+//! never the stored one again: it cannot fire, and an old run's end cannot
+//! re-arm the new epoch's trigger (the store re-arms only the exact trigger
+//! the run's firing stored).
+//!
 //! A slot's run id is derived from the slot (`schedule:<name>:every:<ms>`,
-//! `…:cron:<ms>`, `…:after:<n>`, `…:on:<digest of the events>`) and the
-//! trigger moves to the next slot in the commit that admits it, so several
-//! processes start each run once.
+//! `…:cron:<ms>`, `…:after:<epoch>:<n>`, `…:on:<digest of the events>`) and
+//! the trigger moves to the next slot in the commit that admits it, so
+//! several processes start each run once. A time slot whose previous run of
+//! the same trigger is still running or waiting is skipped (the store checks
+//! it in the firing's commit); so is a missed slot under `catchup: none`.
+//! A skip is kept in the trigger's state (`skips`, the last `skipped` slots)
+//! and traced.
 //!
 //! `on` keeps the events matched so far in its trigger's state and replays
 //! them through the same consumer a `listen` uses (`owf::events`), so `all`,
-//! correlation and `until` mean what they mean in a listen. CHOICE: no
-//! listener run is involved (an earlier version kept one per schedule): a
-//! run exists only once its events have arrived, nothing waits between two
-//! generations of listeners, and a publish costs a read of the matching
-//! triggers instead of a delivery to a run plus a later scan.
-use crate::{Runtime, execution::Admitter};
-use ouro_durable::{Rearm, RunStore, Trigger};
+//! correlation and `until` mean what they mean in a listen. An identified
+//! event is taken from ingress once, by the first trigger (in key order)
+//! that wants it, under a tombstone with its own lifetime: one event starts
+//! at most one run. CHOICE: no listener run is involved (an earlier version
+//! kept one per schedule): a run exists only once its events have arrived.
+use crate::{Runtime, execution::Admitter, telemetry};
+use opentelemetry::KeyValue;
+use ouro_durable::{Admission, Arming, Definitions, Fired, Firing, Rearm, RunStore, Trigger};
 use owf::{
     events::{self, Consumer, Offer},
     expr::{self, Args},
-    model::{self, Schedule, Strategy, Until},
+    model::{self, Catchup, Schedule, Strategy, Until},
 };
 use serde_json::{Value, json};
+use std::collections::BTreeMap;
 
 /// How many due triggers one call fires, and how many triggers one event
 /// may reach; more wait for the next tick.
 const BATCH: usize = 256;
 
-const KINDS: [&str; 4] = ["every", "cron", "after", "on"];
+/// How many skipped slots a trigger keeps in its state.
+const SKIPS_KEPT: usize = 16;
 
 fn key(name: &str, kind: &str) -> String {
     format!("{name}#{kind}")
@@ -64,108 +81,134 @@ fn next_cron(cron: &str, after: i64) -> anyhow::Result<i64> {
     Ok(cron.find_next_occurrence(&at, false)?.timestamp_millis())
 }
 
-/// The active definition's schedule and its `schedule` as written.
-struct Active {
-    schedule: Option<Schedule>,
-    raw: Value,
+/// The first slot of a time trigger after `after`.
+fn next_slot(schedule: &Schedule, kind: &str, after: i64) -> anyhow::Result<Option<i64>> {
+    Ok(match (kind, schedule) {
+        ("every", Schedule { every: Some(every), .. }) => Some(next_every(millis(*every), after)),
+        ("cron", Schedule { cron: Some(cron), .. }) => Some(next_cron(cron, after)?),
+        _ => None,
+    })
 }
 
-fn active(definitions: &dyn RunStore, name: &str) -> anyhow::Result<Option<Active>> {
-    let definitions = definitions.definitions(name)?;
+/// The active version's schedule.
+fn active(definitions: &Definitions) -> anyhow::Result<Option<Schedule>> {
     let Some(d) = definitions.active.and_then(|v| definitions.versions.get(&v)) else { return Ok(None) };
-    let wf = model::parse_yaml(&d.yaml)?;
-    Ok(Some(Active { schedule: wf.schedule, raw: wf.definition["schedule"].clone() }))
+    Ok(model::parse_yaml(&d.yaml)?.schedule)
+}
+
+/// Whether a trigger belongs to the definition's current epoch.
+fn current(definitions: &Definitions, trigger: &Trigger) -> bool {
+    !definitions.tripped && trigger.state["epoch"] == json!(definitions.epoch)
 }
 
 // ── 1. arming ──────────────────────────────────────────────────────────────
 
-impl Runtime {
-    /// Brings `name`'s triggers in line with its active definition: arms
-    /// what its schedule declares, removes what it no longer does. Called on
-    /// activation; four point reads and at most four swaps.
-    pub(crate) fn arm(&self, name: &str) -> anyhow::Result<()> {
-        let active = active(&*self.store, name)?;
-        let now = self.clock.now_ms();
-        for kind in KINDS {
-            let k = key(name, kind);
-            for _ in 0..16 {
-                let current = self.store.trigger(&k)?;
-                let desired = desired(name, kind, active.as_ref(), current.as_ref(), now)?;
-                if desired == current
-                    || self.store.swap_trigger(&k, current.as_ref(), desired.as_ref(), &[], None, now)?
-                {
-                    break;
-                }
-            }
-        }
-        Ok(())
-    }
-}
-
-/// The trigger a schedule wants for `kind`. One already in place for the
-/// same schedule is kept: its slot, its `after` count, its matched events.
-fn desired(
-    name: &str,
-    kind: &str,
-    active: Option<&Active>,
-    current: Option<&Trigger>,
-    now: i64,
-) -> anyhow::Result<Option<Trigger>> {
-    let Some(Active { schedule: Some(s), raw }) = active else { return Ok(None) };
-    let fingerprint = digest(&raw.to_string());
-    let same = |t: &Trigger| t.state["schedule"] == fingerprint;
-    let state = |extra: Value| {
-        let mut state = json!({ "name": name, "kind": kind, "schedule": fingerprint });
+/// The triggers `yaml`'s schedule arms for `name` in `epoch`. A version
+/// without a schedule arms none. `rollback`: armed later, by a breaker
+/// rollback, so a time trigger is due at once and first finds its slot.
+fn arming(name: &str, yaml: &str, epoch: u64, now: i64, rollback: bool) -> anyhow::Result<BTreeMap<String, Trigger>> {
+    let wf = model::parse_yaml(yaml)?;
+    let Some(s) = wf.schedule else { return Ok(BTreeMap::new()) };
+    let state = |kind: &str, extra: Value| {
+        let mut state = json!({ "name": name, "kind": kind, "epoch": epoch });
         if let (Value::Object(m), Value::Object(e)) = (&mut state, extra) {
             m.extend(e);
         }
         state
     };
-    Ok(match kind {
-        "every" => s.every.map(|every| {
-            current.filter(|t| same(t)).cloned().unwrap_or_else(|| Trigger {
-                at_ms: Some(next_every(millis(every), now)),
-                types: Vec::new(),
-                state: state(json!({})),
-            })
-        }),
-        "cron" => match &s.cron {
-            None => None,
-            Some(cron) => match current.filter(|t| same(t)) {
-                Some(t) => Some(t.clone()),
-                None => {
-                    Some(Trigger { at_ms: Some(next_cron(cron, now)?), types: Vec::new(), state: state(json!({})) })
-                }
-            },
-        },
-        // The `after` chain survives new versions: a new one neither starts
-        // a second chain nor restarts the count.
-        "after" => s.after.map(|_| {
-            current.cloned().unwrap_or_else(|| Trigger {
-                at_ms: Some(now),
-                types: Vec::new(),
-                state: state(json!({ "n": 1 })),
-            })
-        }),
-        _ => s.on.as_ref().map(|on| {
-            current.filter(|t| same(t)).cloned().unwrap_or_else(|| Trigger {
-                at_ms: None,
-                types: events::routes(on, &Args::new()),
-                state: state(json!({ "events": [] })),
-            })
-        }),
-    })
+    let mut out = BTreeMap::new();
+    for kind in ["every", "cron"] {
+        if let Some(slot) = next_slot(&s, kind, now)? {
+            let trigger = if rollback {
+                Trigger { at_ms: Some(now), types: Vec::new(), state: state(kind, json!({ "rebase": true })) }
+            } else {
+                Trigger { at_ms: Some(slot), types: Vec::new(), state: state(kind, json!({})) }
+            };
+            out.insert(key(name, kind), trigger);
+        }
+    }
+    if s.after.is_some() {
+        let trigger = Trigger { at_ms: Some(now), types: Vec::new(), state: state("after", json!({ "n": 1 })) };
+        out.insert(key(name, "after"), trigger);
+    }
+    if let Some(on) = &s.on {
+        let types = events::routes(on, &Args::new());
+        out.insert(key(name, "on"), Trigger { at_ms: None, types, state: state("on", json!({ "events": [] })) });
+    }
+    Ok(out)
+}
+
+impl Runtime {
+    /// Activates `version` of `name` in a new epoch: its triggers replace
+    /// the definition's ones in the activation's commit, and its
+    /// predecessor's are kept for a breaker rollback.
+    pub(crate) fn activate_armed(&self, name: &str, version: u64) -> anyhow::Result<()> {
+        for _ in 0..16 {
+            let definitions = self.store.definitions(name)?;
+            let d = definitions.versions.get(&version).ok_or_else(|| anyhow::anyhow!("unknown definition version"))?;
+            let now = self.clock.now_ms();
+            let epoch = definitions.epoch + 1;
+            let triggers = arming(name, &d.yaml, epoch, now, false)?;
+            let predecessor =
+                if definitions.active == Some(version) { definitions.previous } else { definitions.active };
+            let fallback = match predecessor.and_then(|v| definitions.versions.get(&v)) {
+                Some(p) => arming(name, &p.yaml, epoch + 1, now, true)?,
+                None => BTreeMap::new(),
+            };
+            let arming = Arming { triggers, fallback };
+            if self.store.activate_with(name, version, definitions.epoch, &arming)?.is_some() {
+                return Ok(());
+            }
+        }
+        anyhow::bail!("definition {name} changed too often to activate")
+    }
+    /// The triggers `name`'s current activation armed, with their state
+    /// (the next slot, skipped slots, matched events).
+    pub fn triggers(&self, name: &str) -> anyhow::Result<Vec<(String, Trigger)>> {
+        let definitions = self.store.definitions(name)?;
+        let mut out = Vec::new();
+        for k in definitions.triggers {
+            if let Some(t) = self.store.trigger(&k)? {
+                out.push((k, t));
+            }
+        }
+        Ok(out)
+    }
 }
 
 // ── 2. firing ──────────────────────────────────────────────────────────────
 
+/// A time trigger's firing from `t` to `next`.
+fn moved<'a>(
+    key: &'a str,
+    t: &'a Trigger,
+    next: &'a Trigger,
+    admit: &'a [Admission],
+    rearm: Option<&'a Rearm>,
+    busy: Option<&'a Trigger>,
+) -> Firing<'a> {
+    Firing { key, expected: Some(t), next: Some(next), admit, rearm, ingress: None, busy }
+}
+
+/// `t` with a skipped slot recorded in its state.
+fn skipped(mut t: Trigger, slot: i64, reason: &str) -> Trigger {
+    let mut skipped: Vec<Value> = t.state["skipped"].as_array().cloned().unwrap_or_default();
+    skipped.push(json!({ "slot": slot, "reason": reason }));
+    let excess = skipped.len().saturating_sub(SKIPS_KEPT);
+    skipped.drain(..excess);
+    t.state["skipped"] = Value::Array(skipped);
+    t.state["skips"] = json!(t.state["skips"].as_u64().unwrap_or(0) + 1);
+    t
+}
+
 impl Runtime {
     /// Starts the runs whose slots are due now and moves each trigger to its
-    /// next slot in the same commit. CHOICE: a slot missed while no worker
-    /// ran starts once, late, and the next slot is the first after now, so a
-    /// scheduler that was down does not start a burst. Scheduled runs get
-    /// `{}` as input. Returns the runs it admitted. The worker calls it on
-    /// every tick: when nothing is due it reads no rows.
+    /// next slot in the same commit. A slot missed while no worker ran starts
+    /// once, late (`catchup: latest`), or is skipped (`none`); either way the
+    /// next slot is the first after now, so a scheduler that was down does
+    /// not start a burst. Scheduled runs get `{}` as input. Returns the runs
+    /// it admitted. The worker calls it on every tick: when nothing is due it
+    /// reads no rows.
     pub fn fire_due(&self) -> anyhow::Result<Vec<String>> {
         let now = self.clock.now_ms();
         let mut started = Vec::new();
@@ -179,35 +222,73 @@ impl Runtime {
         let (Some(name), Some(kind), Some(slot)) = (t.state["name"].as_str(), t.state["kind"].as_str(), t.at_ms) else {
             anyhow::bail!("trigger {k} is not a schedule's");
         };
-        let schedule = active(&*self.store, name)?.and_then(|a| a.schedule);
+        let definitions = self.store.definitions(name)?;
+        // Replaced by a newer epoch since it was read: its swap would fail.
+        let Some(schedule) = active(&definitions)?.filter(|_| current(&definitions, t)) else { return Ok(None) };
+        let firing = |next, admit, rearm, busy| moved(k, t, next, admit, rearm, busy);
+        if t.state.get("rebase").is_some() {
+            // Armed by a rollback: find the first slot from now; no run.
+            let mut next = t.clone();
+            if let Value::Object(m) = &mut next.state {
+                m.remove("rebase");
+            }
+            next.at_ms = next_slot(&schedule, kind, now)?;
+            self.store.fire(&firing(&next, &[], None, None), now)?;
+            return Ok(None);
+        }
         let mut next = t.clone();
         let mut rearm = None;
-        let id = match (kind, &schedule) {
-            ("every", Some(Schedule { every: Some(every), .. })) => {
-                next.at_ms = Some(next_every(millis(*every), slot.max(now)));
-                format!("schedule:{name}:every:{slot}")
+        let mut busy = t.clone();
+        let id = match kind {
+            "every" | "cron" => {
+                let Some(following) = next_slot(&schedule, kind, slot)? else { return Ok(None) };
+                next.at_ms = next_slot(&schedule, kind, slot.max(now))?;
+                busy.at_ms = next.at_ms;
+                if following <= now && schedule.catchup == Catchup::None {
+                    let skip = skipped(next, slot, "missed");
+                    self.store.fire(&firing(&skip, &[], None, None), now)?;
+                    self.skip(name, kind, slot, "missed");
+                    return Ok(None);
+                }
+                format!("schedule:{name}:{kind}:{slot}")
             }
-            ("cron", Some(Schedule { cron: Some(cron), .. })) => {
-                next.at_ms = Some(next_cron(cron, slot.max(now))?);
-                format!("schedule:{name}:cron:{slot}")
-            }
-            ("after", Some(Schedule { after: Some(after), .. })) => {
+            "after" => {
+                let Some(after) = schedule.after else { return Ok(None) };
                 let n = t.state["n"].as_u64().unwrap_or(1);
                 // Not due again until this run ends: the store re-arms it then.
                 next.at_ms = None;
                 next.state["n"] = json!(n + 1);
-                rearm = Some(Rearm { trigger: k.to_owned(), delay_ms: millis(*after) });
-                format!("schedule:{name}:after:{n:010}")
+                rearm = Some(Rearm { trigger: k.to_owned(), delay_ms: millis(after) });
+                // A previous run still going: look again one delay later.
+                busy.at_ms = Some(now.saturating_add(millis(after)));
+                format!("schedule:{name}:after:{}:{n:010}", definitions.epoch)
             }
-            // The schedule no longer declares it (another version is active).
-            _ => {
-                self.store.swap_trigger(k, Some(t), None, &[], None, now)?;
-                return Ok(None);
-            }
+            _ => return Ok(None),
         };
+        let busy = skipped(busy, slot, "overlap");
         let admission = self.admission(&id, name, json!({}))?;
-        let fired = self.store.swap_trigger(k, Some(t), Some(&next), &[admission], rearm.as_ref(), now)?;
-        Ok(fired.then_some(id))
+        let admit = std::slice::from_ref(&admission);
+        match self.store.fire(&firing(&next, admit, rearm.as_ref(), Some(&busy)), now)? {
+            Fired::Committed => Ok(Some(id)),
+            Fired::Busy(_) => {
+                self.skip(name, kind, slot, "overlap");
+                Ok(None)
+            }
+            Fired::Changed | Fired::Ingested => Ok(None),
+        }
+    }
+
+    fn skip(&self, name: &str, kind: &str, slot: i64, reason: &str) {
+        telemetry::mark(
+            &self.tracer,
+            "schedule skip",
+            vec![
+                KeyValue::new("ouro.definition.name", name.to_string()),
+                KeyValue::new("ouro.schedule.kind", kind.to_string()),
+                KeyValue::new("ouro.schedule.slot", slot),
+                KeyValue::new("ouro.schedule.reason", reason.to_string()),
+            ],
+        );
     }
 }
 
@@ -217,23 +298,30 @@ impl Runtime {
     /// Delivers a CloudEvent (at least `id`, `source` and `type`) to every
     /// run listening for it and to the event-triggered schedules it may
     /// start. `specversion` and `time` are filled in when absent.
-    /// Publishing the same `source` + `id` again delivers nothing new.
-    /// Returns the runs it reached or started.
+    /// Publishing the same `source` + `id` again delivers nothing new and
+    /// starts nothing; another payload under it is an error. Returns the
+    /// runs it reached or started.
     pub fn publish(&self, mut event: Value) -> anyhow::Result<Vec<String>> {
         let now = self.clock.now_ms();
-        let Value::Object(e) = &mut event else { anyhow::bail!("an event is an object") };
-        for k in ["id", "source", "type"] {
-            anyhow::ensure!(e.get(k).and_then(Value::as_str).is_some_and(|s| !s.is_empty()), "an event needs `{k}`");
-        }
-        e.entry("specversion").or_insert_with(|| json!(events::SPEC_VERSION));
-        e.entry("time").or_insert_with(|| {
-            json!(chrono::DateTime::from_timestamp_millis(now).map(|t| t.to_rfc3339()).unwrap_or_default())
-        });
+        complete(&mut event, now)?;
         publish(&*self.store, &self.admitter(), &event, now)
     }
 }
 
-/// The runs a published event reaches, and the runs it starts through the
+/// Checks a CloudEvent's identity and type; fills `specversion` and `time`.
+pub(crate) fn complete(event: &mut Value, now: i64) -> anyhow::Result<()> {
+    let Value::Object(e) = event else { anyhow::bail!("an event is an object") };
+    for k in ["id", "source", "type"] {
+        anyhow::ensure!(e.get(k).and_then(Value::as_str).is_some_and(|s| !s.is_empty()), "an event needs `{k}`");
+    }
+    e.entry("specversion").or_insert_with(|| json!(events::SPEC_VERSION));
+    e.entry("time").or_insert_with(|| {
+        json!(chrono::DateTime::from_timestamp_millis(now).map(|t| t.to_rfc3339()).unwrap_or_default())
+    });
+    Ok(())
+}
+
+/// The runs a published event reaches, and the run it starts through the
 /// `on` schedules indexed under its type (runs and triggers in `store`,
 /// definitions where the admitter reads them).
 pub(crate) fn publish(
@@ -242,17 +330,33 @@ pub(crate) fn publish(
     event: &Value,
     now: i64,
 ) -> anyhow::Result<Vec<String>> {
+    // An identity some trigger already took is not offered again (and
+    // another payload under it is an error, before anything is accepted).
+    let ingested = store.ingested(event, now)?;
     let mut reached = store.publish(event, None, now)?;
+    if ingested {
+        return Ok(reached);
+    }
     let t = event.get("type").and_then(Value::as_str).unwrap_or_default();
     for (k, trigger) in store.triggers_for(t, BATCH)? {
-        reached.extend(offer(store, admitter, &k, trigger, event, now)?);
+        if let Taken::Yes(run) = offer(store, admitter, &k, trigger, event, now)? {
+            reached.extend(run);
+            break;
+        }
     }
     Ok(reached)
+}
+
+/// Whether a trigger took the event from ingress, and the run it started.
+enum Taken {
+    No,
+    Yes(Option<String>),
 }
 
 /// Offers the event to an `on` trigger: its matched events plus this one
 /// go through the schedule's strategy again; a complete match starts the
 /// workflow and empties the trigger in one commit, a partial one is kept.
+/// Either way the commit takes the event's identity from ingress.
 fn offer(
     store: &dyn RunStore,
     admitter: &Admitter,
@@ -260,20 +364,23 @@ fn offer(
     mut trigger: Trigger,
     event: &Value,
     now: i64,
-) -> anyhow::Result<Option<String>> {
+) -> anyhow::Result<Taken> {
     let same = |a: &Value| a.get("id") == event.get("id") && a.get("source") == event.get("source");
     for _ in 0..16 {
         let name = trigger.state["name"].as_str().unwrap_or_default().to_owned();
-        let Some(Schedule { on: Some(on), read, .. }) = active(&*admitter.definitions, &name)?.and_then(|a| a.schedule)
+        let definitions = admitter.definitions.definitions(&name)?;
+        let Some(Schedule { on: Some(on), read, .. }) =
+            active(&definitions)?.filter(|_| current(&definitions, &trigger))
         else {
-            return Ok(None);
+            return Ok(Taken::No);
         };
         let mut matched: Vec<Value> = trigger.state["events"].as_array().cloned().unwrap_or_default();
         if matched.iter().any(same) {
-            return Ok(None);
+            // This trigger holds it already (its tombstone has expired).
+            return Ok(Taken::Yes(None));
         }
         matched.push(event.clone());
-        let Some(outcome) = consume(&on, &matched)? else { return Ok(None) };
+        let Some(outcome) = consume(&on, &matched)? else { return Ok(Taken::No) };
         let mut next = trigger.clone();
         let mut admit = Vec::new();
         let mut id = None;
@@ -282,22 +389,27 @@ fn offer(
                 next.state["events"] = json!([]);
                 let ids: Vec<String> = matched.iter().map(|e| format!("{}\u{0}{}", e["source"], e["id"])).collect();
                 let run = format!("schedule:{name}:on:{}", digest(&ids.join("\u{1}")));
-                // The same events again (republished): that run exists.
-                if store.get(&run)?.is_some() {
-                    return Ok(None);
-                }
                 let input: Vec<Value> = consumed.iter().map(|e| events::read(e, read)).collect();
                 admit.push(admitter.active(&run, &name, Value::Array(input))?);
                 id = Some(run);
             }
             None => next.state["events"] = Value::Array(matched),
         }
-        if store.swap_trigger(k, Some(&trigger), Some(&next), &admit, None, now)? {
-            return Ok(id);
-        }
-        match store.trigger(k)? {
-            Some(t) => trigger = t,
-            None => return Ok(None),
+        let firing = Firing {
+            key: k,
+            expected: Some(&trigger),
+            next: Some(&next),
+            admit: &admit,
+            ingress: Some(event),
+            ..Firing::default()
+        };
+        match store.fire(&firing, now)? {
+            Fired::Committed => return Ok(Taken::Yes(id)),
+            Fired::Ingested | Fired::Busy(_) => return Ok(Taken::Yes(None)),
+            Fired::Changed => match store.trigger(k)? {
+                Some(t) => trigger = t,
+                None => return Ok(Taken::No),
+            },
         }
     }
     anyhow::bail!("trigger {k} changed too often to offer an event")

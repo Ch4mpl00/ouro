@@ -259,7 +259,7 @@ fn convert(r: &Record, f: &mut dyn FnMut(&str) -> Result<String, String>) -> Res
                 other => other.clone(),
             },
         },
-        Record::Event { .. } | Record::Timer { .. } | Record::Retry { .. } => r.clone(),
+        Record::Event { .. } | Record::Expired { .. } | Record::Timer { .. } | Record::Retry { .. } => r.clone(),
     })
 }
 

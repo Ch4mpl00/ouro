@@ -178,14 +178,17 @@ async fn shutdown_releases_the_lease_and_unknown_writes_never_dispatch_again() {
     let w = writes.clone();
     let n = started.clone();
     registry
-        .register(Function::new("write", json!({}), json!({}), Effect::Write, move |_: Value, ctx: FunctionContext| {
-            w.fetch_add(1, Ordering::SeqCst);
-            n.notify_one();
-            async move {
-                ctx.cancel.cancelled().await;
-                Ok(Value::Null)
-            }
-        }))
+        .register(
+            Function::new("write", json!({}), json!({}), Effect::Write, move |_: Value, ctx: FunctionContext| {
+                w.fetch_add(1, Ordering::SeqCst);
+                n.notify_one();
+                async move {
+                    ctx.cancel.cancelled().await;
+                    Ok(Value::Null)
+                }
+            })
+            .with_delivery(Delivery::AtMostOnce),
+        )
         .unwrap();
     let rt = runtime(Arc::new(durable::memory::memory()), registry, Arc::new(Time::default()));
     save(&rt, &yaml("  - write: { call: write }"));
@@ -208,8 +211,9 @@ async fn events_resume_a_waiting_listen_and_cancel_is_terminal() {
     save(&rt, &yaml("  - listen: { listen: { to: { one: { with: { type: answer } } }, read: envelope } }"));
     rt.start("r", "workflow", Value::Null).unwrap();
     assert!(matches!(rt.drive("r", &CancellationToken::new()).await.unwrap(), Some(Status::Waiting { .. })));
-    assert_eq!(rt.deliver("answer", json!(42)).unwrap(), Some("r".into()));
-    assert!(rt.deliver("answer", json!(0)).unwrap().is_none());
+    let answer = |id: &str, data: Value| json!({"id": id, "source": "/test", "type": "answer", "data": data});
+    assert_eq!(rt.deliver(answer("1", json!(42)), None).unwrap(), Some("r".into()));
+    assert!(rt.deliver(answer("2", json!(0)), None).unwrap().is_none());
     assert!(
         matches!(rt.drive("r",&CancellationToken::new()).await.unwrap(),Some(Status::Completed(v)) if v[0]["data"]==42)
     );
@@ -308,6 +312,114 @@ async fn host_concurrency_is_bounded_and_cancellation_reaches_handlers() {
     assert_eq!(rt.get("r0").unwrap().unwrap().outcome, Some(Status::Cancelled));
     assert!(peak.load(Ordering::SeqCst) > 0);
 }
+// Delivery is declared, not derived from the effect: a write with the default
+// at-least-once delivery goes out again under the same idempotency key after
+// its outcome was lost; a declared or YAML-tightened at-most-once one never
+// does; a changed declaration fails recovery as a changed binding.
+#[tokio::test]
+async fn delivery_is_declared_not_derived_from_the_effect() {
+    type Keys = Arc<std::sync::Mutex<Vec<(String, String)>>>;
+    fn registry(keys: Keys, post: Delivery) -> Registry {
+        let mut registry = Registry::new();
+        for (name, delivery) in [("post", post), ("send", Delivery::AtMostOnce)] {
+            let keys = keys.clone();
+            let f = Function::new(name, json!({}), json!({}), Effect::Write, move |_: Value, ctx: FunctionContext| {
+                keys.lock().unwrap().push((name.to_string(), ctx.idempotency_key.clone()));
+                async move {
+                    // The answer is lost: the worker stops before it is saved.
+                    ctx.cancel.cancelled().await;
+                    Ok(json!({}))
+                }
+            });
+            registry.register(f.with_delivery(delivery)).unwrap();
+        }
+        registry
+    }
+    async fn interrupted(rt: &Runtime, id: &str, keys: &Keys, calls: usize) {
+        let stop = CancellationToken::new();
+        let stopping = async {
+            while keys.lock().unwrap().len() < calls {
+                tokio::task::yield_now().await;
+            }
+            stop.cancel();
+        };
+        let (status, ()) = tokio::join!(rt.drive(id, &stop), stopping);
+        assert!(matches!(status.unwrap(), Some(Status::Interrupted(_))), "{id}");
+    }
+    let store: Arc<dyn RunStore> = Arc::new(durable::memory::memory());
+    let keys = Keys::default();
+    let rt = runtime(store.clone(), registry(keys.clone(), Delivery::AtLeastOnce), Arc::new(Time::default()));
+    for (name, task) in [
+        ("default", "  - post: { call: post }"),
+        ("declared", "  - send: { call: send }"),
+        ("tightened", "  - post: { call: post, metadata: { delivery: at_most_once } }"),
+    ] {
+        let d = rt.save(name, &yaml(task)).unwrap();
+        rt.activate(name, d.version).unwrap();
+        rt.start(name, name, json!({})).unwrap();
+        let before = keys.lock().unwrap().len();
+        interrupted(&rt, name, &keys, before + 1).await;
+        if name == "default" {
+            interrupted(&rt, name, &keys, before + 2).await;
+            let sent = keys.lock().unwrap()[before..].to_vec();
+            assert_eq!(sent[0], sent[1], "re-dispatched once more, under the same idempotency key");
+        } else {
+            let outcome = rt.drive(name, &CancellationToken::new()).await.unwrap();
+            assert!(matches!(outcome, Some(Status::Faulted(e)) if e.is("outcome_unknown")), "{name}");
+            assert_eq!(keys.lock().unwrap().len(), before + 1, "{name}: never sent again");
+        }
+        let delivery = rt.records(name).unwrap().values().find_map(|r| match r {
+            Record::Call { delivery, .. } => Some(*delivery),
+            _ => None,
+        });
+        let expected = if name == "default" { Delivery::AtLeastOnce } else { Delivery::AtMostOnce };
+        assert_eq!(delivery, Some(expected), "{name}: the effective delivery is bound into the record");
+    }
+    // The declaration is a pinned binding: a host that now declares `post` at
+    // most once cannot resume a run admitted under at-least-once.
+    let changed = runtime(store, registry(keys.clone(), Delivery::AtMostOnce), Arc::new(Time::default()));
+    let outcome = changed.drive("default", &CancellationToken::new()).await.unwrap();
+    assert!(matches!(outcome, Some(Status::Interrupted(e)) if e.to_string().contains("bindings changed")));
+}
+
+// #3: a declared application version is recorded at admission; a worker of
+// an incompatible version never claims the run, which stays visible and
+// waiting; a compatible or undeclared one resumes it.
+#[tokio::test]
+async fn runs_wait_for_a_compatible_application_version() {
+    let store: Arc<dyn RunStore> = Arc::new(durable::memory::memory());
+    let time: Arc<Time> = Arc::new(Time::default());
+    let at = |version: Option<&str>, accepts: &[&str]| {
+        let application = durable::Compatibility {
+            version: version.map(Into::into),
+            accepts: accepts.iter().map(|v| v.to_string()).collect(),
+        };
+        let config = Config { application, ..Config::default() };
+        Runtime::new(store.clone(), Arc::new(Registry::new()), config, time.clone(), tracer()).unwrap()
+    };
+    let one = at(Some("1"), &[]);
+    save(&one, &yaml("  - done: { set: { ok: true } }"));
+    let run = one.start("r", "workflow", json!({})).unwrap();
+    assert_eq!(run.admission.application_version(), Some("1"));
+    let two = at(Some("2"), &[]);
+    assert_eq!(two.drive("r", &CancellationToken::new()).await.unwrap(), None);
+    assert_eq!(two.recover_once(&CancellationToken::new()).await.unwrap(), 0);
+    let waiting = two.get("r").unwrap().unwrap();
+    assert!(waiting.outcome.is_none() && !two.compatible(&waiting), "waiting for a compatible worker");
+    let upgraded = at(Some("2"), &["1"]);
+    assert!(upgraded.compatible(&waiting));
+    assert_eq!(
+        upgraded.drive("r", &CancellationToken::new()).await.unwrap(),
+        Some(Status::Completed(json!({"ok":true})))
+    );
+    // Undeclared on either side: compatible, as before versions existed.
+    let undeclared = at(None, &[]);
+    undeclared.start("u", "workflow", json!({})).unwrap();
+    assert_eq!(two.drive("u", &CancellationToken::new()).await.unwrap(), Some(Status::Completed(json!({"ok":true}))));
+    one.start("v", "workflow", json!({})).unwrap();
+    assert!(undeclared.compatible(&undeclared.get("v").unwrap().unwrap()));
+}
+
 #[tokio::test]
 async fn write_response_survives_crash_before_task_checkpoint() {
     let backend = Arc::new(durable::memory::MemoryBackend::default());
@@ -317,14 +429,17 @@ async fn write_response_survives_crash_before_task_checkpoint() {
     let w = writes.clone();
     let mut registry = Registry::new();
     registry
-        .register(Function::new("write", json!({}), json!({}), Effect::Write, move |_: Value, _: FunctionContext| {
-            w.fetch_add(1, Ordering::SeqCst);
-            let b = b.clone();
-            async move {
-                b.faults.arm(durable::CommitFault::AfterCommit);
-                Ok(json!(42))
-            }
-        }))
+        .register(
+            Function::new("write", json!({}), json!({}), Effect::Write, move |_: Value, _: FunctionContext| {
+                w.fetch_add(1, Ordering::SeqCst);
+                let b = b.clone();
+                async move {
+                    b.faults.arm(durable::CommitFault::AfterCommit);
+                    Ok(json!(42))
+                }
+            })
+            .with_delivery(Delivery::AtMostOnce),
+        )
         .unwrap();
     let time = Arc::new(Time::default());
     let rt = runtime(store, registry, time.clone());
@@ -528,7 +643,6 @@ fn x1_x2_generated_dry_runs_and_replays_are_isolated() {
 }
 
 #[tokio::test]
-#[ignore = "pending #4: workflow deadline starts at admission, before the first drive"]
 async fn t3_admission_fixes_the_workflow_deadline() {
     let reads = Arc::new(AtomicUsize::new(0));
     let clock = Arc::new(Time::default());
@@ -547,7 +661,6 @@ async fn t3_admission_fixes_the_workflow_deadline() {
 }
 
 #[test]
-#[ignore = "pending #4: one ingress identity starts at most one run across trigger names"]
 fn t1_ingress_identity_is_global_across_triggers() {
     let rt = runtime(Arc::new(durable::memory::memory()), Registry::new(), Arc::new(Time::default()));
     let definition = yaml("  - done: { set: { ok: true } }")
@@ -563,7 +676,6 @@ fn t1_ingress_identity_is_global_across_triggers() {
 }
 
 #[tokio::test]
-#[ignore = "pending #4: a live prior schedule run makes the next slot an explicit skip"]
 async fn t1_live_schedule_run_prevents_overlap() {
     let clock = Arc::new(Time::default());
     let rt = runtime(Arc::new(durable::memory::memory()), Registry::new(), clock.clone());

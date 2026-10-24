@@ -1,4 +1,96 @@
-# Contract checking — 2026-10-23
+# Contract checking — 2026-10-24
+
+One model: `contract.qnt` now carries the section 8 decisions of
+`docs/durable-invariants.md` and drives both model-based tests; the
+`protocol.qnt` family was folded in and deleted (#4, items 7 and 8). The
+store and runtime implement decisions 1–6 and #3; the eight former
+`pending #3/#4` tests run and pass unchanged in what they assert. This is
+bounded and partial verification, not a proof; the coverage and its limits
+are in [README.md](README.md#contract-coverage).
+
+Environment: Apple Silicon macOS, Cargo 1.90.0, Node 22.16.0, Quint 0.33.0,
+quint-connect 0.1.2, Docker `postgres:16` for the opt-in Postgres bridges.
+Times are elapsed wall times on this machine, with other checks sometimes
+running alongside.
+
+## Results
+
+| Check | Scope | Result | Time |
+| --- | --- | --- | --- |
+| Typecheck | `contract`, `contract_bounded`, `contract_concurrent`, `contract_progress`, `contract_witnesses` | Pass | 0.5–4.3 s each |
+| Witnesses | 29 deterministic histories (`quint test contract_witnesses.qnt`) | Pass | 6.9 s |
+| Simulation | 10,000 × 150 steps, seed 20261023, every command and fault switch, invariant `checked` (all safety monitors and shadow correspondence) | Pass | 147.0 s |
+| Fault rows | 11 switches × 1,000 × 150 steps, seed 20261023 | No violation | 15.9–19.8 s each, 190.9 s |
+| Safety mutants | 32 (one mechanism per safety ID), scripted witnesses | All targets detected | 130.2 s |
+| Fault detection | 11 rows, each with its broken mechanism | All detected | 40.9 s |
+| Concurrent batches | 8 batches; every order computed by the model | Table computed | 4.7 s |
+| Serial MBT, memory | 100 × 150 steps + `bridgeSuite` (29 witnesses in one trace) | Pass | ≈18 s |
+| Serial MBT, SQLite | same | Pass | ≈22 s |
+| Serial MBT, memory, five more seeds | seeds 1–5, 100 × 150 steps each | Pass | ≈18 s each |
+| Serial MBT, Postgres | 100 × 150 steps + `bridgeSuite`, disposable databases | Pass | 449.2 s |
+| Concurrent MBT | 12 rounds × 8 batches per adapter; memory, SQLite, Postgres; checker negative test | Pass | 4.1 s, 4.8 s, 35.1 s |
+| `cargo fmt --all -- --check` | workspace | Pass | |
+| `cargo clippy --workspace --all-targets -- -D warnings` | workspace | Pass | |
+| `OURO_REQUIRE_QUINT=1 cargo test --workspace --no-fail-fast` | all crates; Postgres conformance and scalability on a testcontainer | Pass | 256.8 s |
+| Restart example | real worker kill and recovery | value 42, write sent once | 1.2 s |
+| `spec/check.sh --only rust` with `TEST_DATABASE_URL` | fmt, Clippy, `cargo test --workspace`, restart example, both Postgres bridges | Pass | 0.7 s, 0.9 s, 310.3 s, 1.2 s, 471.6 s |
+
+Mutants detected, with every monitor violated at the end of each witness:
+A1 (A1, O2, V1, X3), A2, A3 (A3, A5, X3), A4, A5, E1, E2, E3 (E3, R2), E4, R1,
+R2, R3, W1, W2, W3, W4, W5, C1, C2, C3, T1, T2, T3, V1, V2, V3, O1, O2, O3, X1,
+X2, X3 (A1, A3, O2, V1, X3); the others violate only their target. Fault
+detection footprints: 1 (E2, O1), 2 (E3, R2), 3 W2, 4 W4, 5 W1, 6 A5, 7 T3,
+8 (E2, O1), 9 A4, 10 V2, 11 V3. `contract-evidence.json` holds the matrices.
+
+**Not run in this revision** (deferred): the Apalache check of
+`contract_bounded.qnt` and the TLC progress quotient. `contract_progress.qnt`
+is byte-identical to the model TLC checked on 2026-10-23, so those temporal
+results (below) still describe it; `evidence.py` verifies the hash before
+carrying them over. The 2026-10-23 Apalache results were for the deleted
+protocol slices and the earlier contract fixture; they say nothing about
+this model.
+
+## Model changes and what they found
+
+- Delivery, not the effect, decides protection: a third invocation (an
+  at-least-once write) and resending after an unknown outcome (phase 4); E2,
+  the shadow and the refinement count dispatches per delivery.
+- Folded from the protocol model: release, error responses, proven
+  non-execution, binding conflicts, stale fences, readmission, breaker reset,
+  rollback, retention.
+- Aligned with the settled semantics: broadcast copies never expire; a sweep
+  covers every finished run; the owner decides a timeout; a child's first
+  lease stays with the parent's host; reactivation keeps the predecessor,
+  whose triggers activation prepares (`fallback`, `armed`); the schedule's
+  last run survives epochs; an `after` trigger re-arms at any end, including
+  cancellation (the serial bridge first found the store re-arming after a
+  cancellation the model ignored); rejected activations claim nothing (the
+  simulation first flagged T2/V1 on an activation refused for invalid data).
+- **Model bug found by the serial bridge:** cancellation selected runs by
+  value, so two runs with equal fields were cancelled together. It now goes by
+  position.
+- Mutant witnesses adapted to the new text: E4, C2 (the child's lease must
+  expire before its claim), C3, T2 (an activation that changes the catalog),
+  V1, O2, X1.
+
+No production bug was found by the new bridges.
+
+## Limits
+
+1. The serial bridge does not exercise unaddressed `deliver`, wait
+   registration, waiting runs and wake-ups, interruption backoff, `waiting`
+   notifications, deeper descendants or `on` strategies; the conformance suite
+   and DSL tests do.
+2. Signed worker skew within ε is not enumerated; the model uses a one-tick
+   margin and bounded clock jumps.
+3. Compatibility is exact matching plus undeclared; host `accepts` lists are
+   tested in Rust only.
+4. Concurrent batches cover eight families, not every interleaving of the
+   public API, and no storage faults.
+5. The shadow checks an invocation/event projection, not the section 2
+   theorem; no refinement to the progress quotient is proved.
+
+## Contract checking — 2026-10-23 (earlier model)
 
 All 38 contract IDs now have named model predicates and a detected target
 mutant. This is **bounded and partial verification**, not a proof of the whole
@@ -210,7 +302,7 @@ as a production bug.
 The following is historical evidence from the preceding pass; its narrower claims
 and test counts are not replacements for the contract results above.
 
-# Checked evidence — 2026-10-23
+### Checked evidence — 2026-10-23 (deleted protocol model)
 
 Environment: Apple Silicon macOS, Node 22.16.0, Rust/Cargo 1.90.0,
 Quint 0.33.0, quint-connect 0.1.2, Apalache 0.62.4. Symbolic checks used

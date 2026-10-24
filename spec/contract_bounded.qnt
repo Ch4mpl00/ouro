@@ -6,7 +6,8 @@ module contract_bounded {
   pure val fixture = transition(admittedFixture,"claim",0,0,0,0)
   action callsInit = all {
     m'=fixture,
-    ideal'=fixture.observations.foldl(emptyIdeal,(a,e) => idealEvent(a,e))
+    ideal'=fixture.observations.foldl(emptyIdeal,(a,e) => idealEvent(a,e)),
+    command'={ tag: "claim", value: noCommand }
   }
   action callsStep = {
     nondet op = Set("intent","dispatch","result","recover","checkpoint","crash","tick","claim").oneOf()

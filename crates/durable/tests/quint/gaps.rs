@@ -1,4 +1,5 @@
-//! Executable contract gaps. These assertions intentionally fail on today's API.
+//! Regressions for the contract gaps #3 and #4 closed: each failed on the API
+//! before them.
 use super::{Adapter, StoreDriver};
 use ouro_durable::{Rearm, Trigger, conformance::admission};
 use owf::run::{Status, WorkflowError};
@@ -10,7 +11,6 @@ fn adapters(test: impl Fn(StoreDriver)) {
     }
 }
 #[test]
-#[ignore = "pending #4: conflicting source/id payload must return an error"]
 fn w2_conflicting_event_identity_is_an_error() {
     adapters(|d| {
         d.store.admit(&admission("r"), 0).unwrap();
@@ -22,7 +22,6 @@ fn w2_conflicting_event_identity_is_an_error() {
     });
 }
 #[test]
-#[ignore = "pending #4: live addressed mailbox TTL and observable expiry record"]
 fn w3_mailbox_expiry_is_observable() {
     adapters(|d| {
         d.store.admit(&admission("r"), 0).unwrap();
@@ -34,7 +33,6 @@ fn w3_mailbox_expiry_is_observable() {
     });
 }
 #[test]
-#[ignore = "pending #4: completion of an old epoch cannot rearm its replacement"]
 fn t2_old_completion_cannot_rearm_new_epoch() {
     adapters(|d| {
         let old = Trigger { at_ms: None, types: vec![], state: json!({"epoch":1}) };
@@ -48,7 +46,6 @@ fn t2_old_completion_cannot_rearm_new_epoch() {
     });
 }
 #[test]
-#[ignore = "pending #4: reactivating the same version creates a fresh breaker epoch"]
 fn v2_old_epoch_fault_does_not_count_after_reactivation() {
     adapters(|d| {
         let version = d.store.save_definition("model", "definition").unwrap();
@@ -63,18 +60,17 @@ fn v2_old_epoch_fault_does_not_count_after_reactivation() {
     });
 }
 
-// The bridge command carries a declared worker version. RunStore::claim has no
-// corresponding parameter yet; replacing this delegation with the #3 public
-// operation is part of implementing that issue, not a test-side policy guard.
+// The bridge command carries a declared worker version, passed to the #3
+// public operation; no test-side policy guard.
 fn claim_as(
     store: &dyn ouro_durable::RunStore,
     id: &str,
-    _worker_version: &str,
+    worker_version: &str,
 ) -> anyhow::Result<Option<ouro_durable::Fence>> {
-    store.claim(id, 0)
+    let worker = ouro_durable::Compatibility { version: Some(worker_version.into()), accepts: vec![] };
+    store.claim_as(id, 0, &worker)
 }
 #[test]
-#[ignore = "pending #3: bridge needs a version-aware public claim operation"]
 fn v3_incompatible_worker_cannot_claim() {
     adapters(|d| {
         let mut a = admission("versioned");
