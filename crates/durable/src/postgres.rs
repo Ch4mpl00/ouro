@@ -1,59 +1,22 @@
-//! Serializable Postgres transactions over indexed engine keys. A bounded I/O
-//! thread bridges synchronous interpreter calls without nesting runtimes.
+//! Serializable Postgres transactions over indexed engine keys, on
+//! `tokio-postgres` through a `deadpool-postgres` pool. Every operation is
+//! awaited on the caller's runtime, whatever its flavour: no thread of its
+//! own, no queue in front of the pool. Connections are spawned on the runtime
+//! that opens them, so a backend serves the runtime it was built on.
 use crate::*;
-use deadpool_postgres::{Manager, Pool};
-use std::{
-    sync::{Arc, mpsc},
-    thread::JoinHandle,
-    time::Duration,
-};
-use tokio::{sync::mpsc as channel, task::JoinSet};
-use tokio_postgres::{IsolationLevel, NoTls, error::SqlState};
+use deadpool_postgres::{Manager, Object, Pool};
+use std::{future::Future, sync::Arc, time::Duration};
+use tokio_postgres::{NoTls, error::SqlState};
 
-type Reply<T> = mpsc::SyncSender<anyhow::Result<T>>;
-enum Command {
-    Get(String, String, Reply<Option<Value>>),
-    Scan(String, String, Option<String>, usize, Reply<Rows>),
-    Put(String, String, Option<Value>, Reply<()>),
-    Commit(Reply<()>),
-}
-enum Request {
-    Begin(channel::Receiver<Command>, Reply<()>),
-    Snapshot(Reply<Snapshot>),
-}
+/// The most sessions (pooled connections, hence open transactions) at once.
+const SESSIONS: usize = 16;
+/// The longest a wait for a session, one statement or a commit may take.
+const DEADLINE: Duration = Duration::from_secs(30);
+
 pub struct PostgresBackend {
-    sender: Option<channel::Sender<Request>>,
-    worker: Option<JoinHandle<()>>,
+    pool: Pool,
     pub faults: Arc<FaultInjector>,
     pub metrics: Arc<Metrics>,
-}
-// These synchronous seams may be called from a Tokio host. blocking_send
-// would panic there; try_send with a deadline also bounds admission to I/O.
-fn send<T>(sender: &channel::Sender<T>, mut request: T) -> anyhow::Result<()> {
-    let started = std::time::Instant::now();
-    loop {
-        match sender.try_send(request) {
-            Ok(()) => return Ok(()),
-            Err(channel::error::TrySendError::Closed(_)) => {
-                anyhow::bail!("Postgres I/O session closed; commit outcome may be unknown")
-            }
-            Err(channel::error::TrySendError::Full(value)) => request = value,
-        }
-        anyhow::ensure!(started.elapsed() < Duration::from_secs(30), "Postgres request queue exceeded 30 seconds");
-        std::thread::sleep(Duration::from_micros(100));
-    }
-}
-fn receive<T>(rx: mpsc::Receiver<anyhow::Result<T>>) -> anyhow::Result<T> {
-    rx.recv_timeout(Duration::from_secs(30))
-        .map_err(|_| anyhow::anyhow!("Postgres I/O response unavailable; commit outcome may be unknown"))?
-}
-impl Drop for PostgresBackend {
-    fn drop(&mut self) {
-        self.sender.take();
-        if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
-        }
-    }
 }
 impl PostgresBackend {
     pub async fn connect(url: &str) -> anyhow::Result<Self> {
@@ -69,62 +32,55 @@ impl PostgresBackend {
         Self::with_manager(Manager::new(config, NoTls), faults).await
     }
     /// The host can inject a manager with TLS or custom connection settings.
+    /// Migrates the schema before returning.
     pub async fn with_manager(manager: Manager, faults: Arc<FaultInjector>) -> anyhow::Result<Self> {
-        let (sender, mut receiver) = channel::channel(64);
-        let (ready, started) = mpsc::sync_channel(1);
-        let worker_faults = faults.clone();
-        let metrics = Arc::new(Metrics::default());
-        let worker_metrics = metrics.clone();
-        let worker = std::thread::Builder::new().name("ouro-postgres".into()).spawn(move || {
-            let result = (|| -> anyhow::Result<_> {
-                let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
-                let pool = Pool::builder(manager).max_size(16).build()?;
-                rt.block_on(bounded(migrate(&pool)))?;
-                Ok((rt,pool))
-            })();
-            match result {
-                Ok((rt,pool)) => {
-                    if ready.send(Ok(())).is_err() { return; }
-                    rt.block_on(async move {
-                        let mut sessions = JoinSet::new();
-                        loop {
-                            if sessions.len() == 16 { sessions.join_next().await; }
-                            tokio::select! {
-                                request = receiver.recv() => {
-                                    let Some(request) = request else { break; };
-                                    let pool = pool.clone();
-                                    let faults = worker_faults.clone();
-                                    let metrics = worker_metrics.clone();
-                                    sessions.spawn(async move {
-                                        match request {
-                                            Request::Begin(commands,reply) => { let _ = bounded(session(&pool,commands,reply,&faults,&metrics)).await; }
-                                            Request::Snapshot(reply) => { let _ = reply.send(bounded(snapshot(&pool,&metrics)).await); }
-                                        }
-                                    });
-                                }
-                                _ = sessions.join_next(), if !sessions.is_empty() => {}
-                            }
-                        }
-                        while sessions.join_next().await.is_some() {}
-                        pool.close();
-                    });
-                }
-                Err(error) => { let _ = ready.send(Err(error)); }
-            }
-        })?;
-        started.recv()??;
-        Ok(Self { sender: Some(sender), worker: Some(worker), faults, metrics })
+        let pool = Pool::builder(manager).max_size(SESSIONS).build()?;
+        bounded(migrate(&pool)).await?;
+        Ok(Self { pool, faults, metrics: Arc::new(Metrics::default()) })
+    }
+    async fn session(&self) -> anyhow::Result<Object> {
+        bounded(async { Ok(self.pool.get().await?) }).await
     }
 }
+impl Drop for PostgresBackend {
+    fn drop(&mut self) {
+        // Idle sessions close now; a transaction borrows the backend, so
+        // none is open any more.
+        self.pool.close();
+    }
+}
+
+/// One serializable transaction on its own session. A session goes back to
+/// the pool only in a known state: after a commit, a rollback round trip or
+/// a commit the server refused. Any other end (a dropped future, a passed
+/// deadline, a transport error) discards it: its connection closes and the
+/// server rolls the transaction back, so nothing half applied outlives it.
 struct PostgresTransaction<'a> {
-    sender: channel::Sender<Command>,
+    session: Option<Object>,
     backend: &'a PostgresBackend,
+    writes: usize,
+}
+impl Drop for PostgresTransaction<'_> {
+    fn drop(&mut self) {
+        if let Some(session) = self.session.take() {
+            drop(Object::take(session));
+        }
+    }
 }
 impl PostgresTransaction<'_> {
-    fn call<T>(&self, command: impl FnOnce(Reply<T>) -> Command) -> anyhow::Result<T> {
-        let (tx, rx) = mpsc::sync_channel(1);
-        send(&self.sender, command(tx))?;
-        let result = receive(rx);
+    fn session(&self) -> anyhow::Result<&Object> {
+        self.session.as_ref().ok_or_else(|| anyhow::anyhow!("the Postgres transaction has ended"))
+    }
+    /// One statement under the deadline; definite serialization failures
+    /// become `Conflict` and are counted.
+    async fn statement<T>(
+        &self,
+        operation: impl Future<Output = Result<T, tokio_postgres::Error>>,
+    ) -> anyhow::Result<T> {
+        let result = match tokio::time::timeout(DEADLINE, operation).await {
+            Ok(result) => result.map_err(definite),
+            Err(_) => Err(anyhow::anyhow!("Postgres operation exceeded 30 seconds; commit outcome may be unknown")),
+        };
         if result.as_ref().is_err_and(|e| e.is::<Conflict>()) {
             self.backend.metrics.conflict();
         }
@@ -134,34 +90,119 @@ impl PostgresTransaction<'_> {
 #[async_trait::async_trait]
 impl AtomicBackend for PostgresBackend {
     async fn begin(&self) -> anyhow::Result<Box<dyn Transaction + '_>> {
-        let (sender, receiver) = channel::channel(1);
-        let (tx, rx) = mpsc::sync_channel(1);
-        send(self.sender.as_ref().unwrap(), Request::Begin(receiver, tx))?;
-        receive(rx)?;
-        Ok(Box::new(PostgresTransaction { sender, backend: self }))
+        let tx = PostgresTransaction { session: Some(self.session().await?), backend: self, writes: 0 };
+        tx.statement(tx.session()?.batch_execute("BEGIN ISOLATION LEVEL SERIALIZABLE")).await?;
+        Ok(Box::new(tx))
     }
     async fn snapshot(&self) -> anyhow::Result<Snapshot> {
-        let (tx, rx) = mpsc::sync_channel(1);
-        send(self.sender.as_ref().unwrap(), Request::Snapshot(tx))?;
-        receive(rx)
+        let session = self.session().await?;
+        let raw =
+            bounded(async { Ok(session.query("SELECT kind,id,value FROM ouro_rows ORDER BY kind,id", &[]).await?) })
+                .await?;
+        self.metrics.read(raw.len());
+        let rows = raw
+            .into_iter()
+            .map(|r| Ok(((r.get(0), r.get(1)), serde_json::from_str(&r.get::<_, String>(2))?)))
+            .collect::<anyhow::Result<_>>()?;
+        Ok(Snapshot { rows })
     }
 }
 #[async_trait::async_trait]
 impl Transaction for PostgresTransaction<'_> {
     async fn get(&mut self, kind: &str, id: &str) -> anyhow::Result<Option<Value>> {
-        self.call(|r| Command::Get(kind.into(), id.into(), r))
+        let session = self.session()?;
+        let row = self
+            .statement(async {
+                let query = session.prepare_cached("SELECT value FROM ouro_rows WHERE kind=$1 AND id=$2").await?;
+                session.query_opt(&query, &[&kind, &id]).await
+            })
+            .await?;
+        self.backend.metrics.read(usize::from(row.is_some()));
+        row.map(|r| Ok(serde_json::from_str(&r.get::<_, String>(0))?)).transpose()
     }
     async fn scan(&mut self, kind: &str, start: &str, end: Option<&str>, limit: usize) -> anyhow::Result<Rows> {
-        self.call(|r| Command::Scan(kind.into(), start.into(), end.map(str::to_owned), limit, r))
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let session = self.session()?;
+        let rows = self
+            .statement(async {
+                if let Some(end) = end {
+                    let query = session
+                        .prepare_cached(
+                            "SELECT id,value FROM ouro_rows WHERE kind=$1 AND id>=$2 AND id<$3 ORDER BY id LIMIT $4",
+                        )
+                        .await?;
+                    session.query(&query, &[&kind, &start, &end, &limit]).await
+                } else {
+                    let query = session
+                        .prepare_cached("SELECT id,value FROM ouro_rows WHERE kind=$1 AND id>=$2 ORDER BY id LIMIT $3")
+                        .await?;
+                    session.query(&query, &[&kind, &start, &limit]).await
+                }
+            })
+            .await?;
+        self.backend.metrics.read(rows.len());
+        rows.into_iter()
+            .map(|r| Ok(((kind.to_owned(), r.get(0)), serde_json::from_str(&r.get::<_, String>(1))?)))
+            .collect()
     }
     async fn put(&mut self, kind: &str, id: &str, value: &Value) -> anyhow::Result<()> {
-        self.call(|r| Command::Put(kind.into(), id.into(), Some(value.clone()), r))
+        self.backend.faults.check(CommitFault::BeforeWrite(self.writes))?;
+        self.writes += 1;
+        self.backend.metrics.write();
+        let value = serde_json::to_string(value)?;
+        let session = self.session()?;
+        // Concurrent inserts of the same absent key become a serializable
+        // conflict, rather than an ambiguous retry.
+        self.statement(async {
+            let query = session
+                .prepare_cached(
+                    "INSERT INTO ouro_rows(kind,id,value) VALUES ($1,$2,$3) ON CONFLICT(kind,id) DO UPDATE SET value=excluded.value",
+                )
+                .await?;
+            session.execute(&query, &[&kind, &id, &value]).await
+        })
+        .await?;
+        Ok(())
     }
     async fn delete(&mut self, kind: &str, id: &str) -> anyhow::Result<()> {
-        self.call(|r| Command::Put(kind.into(), id.into(), None, r))
+        self.backend.faults.check(CommitFault::BeforeWrite(self.writes))?;
+        self.writes += 1;
+        self.backend.metrics.write();
+        let session = self.session()?;
+        self.statement(async {
+            let query = session.prepare_cached("DELETE FROM ouro_rows WHERE kind=$1 AND id=$2").await?;
+            session.execute(&query, &[&kind, &id]).await
+        })
+        .await?;
+        Ok(())
     }
-    async fn commit(self: Box<Self>) -> anyhow::Result<()> {
-        self.call(Command::Commit)
+    async fn commit(mut self: Box<Self>) -> anyhow::Result<()> {
+        self.backend.faults.check(CommitFault::BeforeCommit)?;
+        let session = self.session()?;
+        let answered = match tokio::time::timeout(DEADLINE, session.batch_execute("COMMIT")).await {
+            Ok(answered) => answered,
+            Err(_) => anyhow::bail!("Postgres commit exceeded 30 seconds; commit outcome may be unknown"),
+        };
+        // The server answered, so the transaction is over either way and
+        // the session can serve another one.
+        if answered.as_ref().map_or_else(|e| e.as_db_error().is_some(), |()| true) {
+            self.session.take();
+        }
+        answered.map_err(|e| {
+            let e = definite(e);
+            if e.is::<Conflict>() {
+                self.backend.metrics.conflict();
+            }
+            e
+        })?;
+        self.backend.faults.check(CommitFault::AfterCommit)
+    }
+    async fn rollback(mut self: Box<Self>) {
+        if let Some(session) = &self.session
+            && let Ok(Ok(())) = tokio::time::timeout(DEADLINE, session.batch_execute("ROLLBACK")).await
+        {
+            self.session.take();
+        }
     }
 }
 fn definite(error: tokio_postgres::Error) -> anyhow::Error {
@@ -171,119 +212,6 @@ fn definite(error: tokio_postgres::Error) -> anyhow::Error {
     } else {
         error.into()
     }
-}
-async fn session(
-    pool: &Pool,
-    mut commands: channel::Receiver<Command>,
-    ready: Reply<()>,
-    faults: &FaultInjector,
-    metrics: &Metrics,
-) -> anyhow::Result<()> {
-    let started = async {
-        let client = pool.get().await?;
-        Ok::<_, anyhow::Error>(client)
-    }
-    .await;
-    let mut client = match started {
-        Ok(client) => client,
-        Err(e) => {
-            let _ = ready.send(Err(e));
-            return Ok(());
-        }
-    };
-    let tx = match client.build_transaction().isolation_level(IsolationLevel::Serializable).start().await {
-        Ok(tx) => tx,
-        Err(e) => {
-            let _ = ready.send(Err(definite(e)));
-            return Ok(());
-        }
-    };
-    if ready.send(Ok(())).is_err() {
-        return Ok(());
-    }
-    let mut writes = 0;
-    while let Some(command) = commands.recv().await {
-        match command {
-            Command::Get(kind, id, reply) => {
-                let result = async {
-                    let row = tx
-                        .query_opt("SELECT value FROM ouro_rows WHERE kind=$1 AND id=$2", &[&kind, &id])
-                        .await
-                        .map_err(definite)?;
-                    metrics.read(usize::from(row.is_some()));
-                    row.map(|r| Ok(serde_json::from_str(&r.get::<_, String>(0))?)).transpose()
-                }
-                .await;
-                let failed = result.is_err();
-                let _ = reply.send(result);
-                if failed {
-                    break;
-                }
-            }
-            Command::Scan(kind, start, end, limit, reply) => {
-                let result: anyhow::Result<Rows> = async {
-                    let limit = i64::try_from(limit).unwrap_or(i64::MAX);
-                    let rows = if let Some(end) = end {
-                        tx.query(
-                            "SELECT id,value FROM ouro_rows WHERE kind=$1 AND id>=$2 AND id<$3 ORDER BY id LIMIT $4",
-                            &[&kind, &start, &end, &limit],
-                        )
-                        .await
-                    } else {
-                        tx.query(
-                            "SELECT id,value FROM ouro_rows WHERE kind=$1 AND id>=$2 ORDER BY id LIMIT $3",
-                            &[&kind, &start, &limit],
-                        )
-                        .await
-                    }
-                    .map_err(definite)?;
-                    metrics.read(rows.len());
-                    rows.into_iter()
-                        .map(|r| Ok(((kind.clone(), r.get(0)), serde_json::from_str(&r.get::<_, String>(1))?)))
-                        .collect()
-                }
-                .await;
-                let failed = result.is_err();
-                let _ = reply.send(result);
-                if failed {
-                    break;
-                }
-            }
-            Command::Put(kind, id, value, reply) => {
-                let result = async {
-                    faults.check(CommitFault::BeforeWrite(writes))?;
-                    writes += 1;
-                    metrics.write();
-                    if let Some(value) = value {
-                        let value = serde_json::to_string(&value)?;
-                        // Concurrent inserts of the same absent key become a
-                        // serializable conflict, rather than an ambiguous retry.
-                        tx.execute("INSERT INTO ouro_rows(kind,id,value) VALUES ($1,$2,$3) ON CONFLICT(kind,id) DO UPDATE SET value=excluded.value",&[&kind,&id,&value]).await.map_err(definite)?;
-                    } else {
-                        tx.execute("DELETE FROM ouro_rows WHERE kind=$1 AND id=$2",&[&kind,&id]).await.map_err(definite)?;
-                    }
-                    Ok(())
-                }.await;
-                let failed = result.is_err();
-                let _ = reply.send(result);
-                if failed {
-                    break;
-                }
-            }
-            Command::Commit(reply) => {
-                let result = async {
-                    faults.check(CommitFault::BeforeCommit)?;
-                    tx.commit().await.map_err(definite)?;
-                    faults.check(CommitFault::AfterCommit)
-                }
-                .await;
-                let _ = reply.send(result);
-                return Ok(());
-            }
-        }
-    }
-    tx.rollback().await?;
-    Ok(())
 }
 async fn migrate(pool: &Pool) -> anyhow::Result<()> {
     let mut client = pool.get().await?;
@@ -298,21 +226,11 @@ async fn migrate(pool: &Pool) -> anyhow::Result<()> {
     tx.commit().await?;
     Ok(())
 }
-async fn snapshot(pool: &Pool, metrics: &Metrics) -> anyhow::Result<Snapshot> {
-    let client = pool.get().await?;
-    let raw = client.query("SELECT kind,id,value FROM ouro_rows ORDER BY kind,id", &[]).await?;
-    metrics.read(raw.len());
-    let rows = raw
-        .into_iter()
-        .map(|r| Ok(((r.get(0), r.get(1)), serde_json::from_str(&r.get::<_, String>(2))?)))
-        .collect::<anyhow::Result<_>>()?;
-    Ok(Snapshot { rows })
-}
 pub async fn connect(url: &str) -> anyhow::Result<TransactionalStore> {
     Ok(TransactionalStore::new(Arc::new(PostgresBackend::connect(url).await?)))
 }
-async fn bounded<T>(operation: impl std::future::Future<Output = anyhow::Result<T>>) -> anyhow::Result<T> {
-    tokio::time::timeout(Duration::from_secs(30), operation)
+async fn bounded<T>(operation: impl Future<Output = anyhow::Result<T>>) -> anyhow::Result<T> {
+    tokio::time::timeout(DEADLINE, operation)
         .await
         .map_err(|_| anyhow::anyhow!("Postgres operation exceeded 30 seconds; commit outcome may be unknown"))?
 }
