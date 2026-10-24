@@ -1,285 +1,313 @@
-//! Bounded linearizability over public observations and independent handles.
-//! The reference states contain only the facts relevant to a batch; UUID owners
-//! are represented by the operation that successfully acquired the generation.
-use super::{Adapter, StoreDriver};
-use ouro_durable::{Fence, RunStore, Trigger, conformance::admission};
-use owf::run::Status;
+//! Bounded linearizability against the contract model. Each batch of
+//! `spec/contract_concurrent.qnt` names a setup history and commands that run
+//! at once; the model lists, for every order of the commands, each command's
+//! reply and the state after all of them. Here the setup runs through the
+//! serial bridge, the commands start together at a barrier on independent
+//! store handles (independent SQLite connections), and some order that
+//! respects real time (no command placed before one that ended before it
+//! began) must match every reply and a fresh projection of the store.
+use super::{
+    Adapter, CALLS, Command, INGRESS, NAME, SCHEDULE, StoreDriver, TICK, View, call_record, event, ingress_event,
+    run_id, schedule_trigger, status, worker,
+};
+use anyhow::{Context, ensure};
+use ouro_durable::{Admission, Arming, Fence, Fired, Firing, IdentityConflict, Rearm, RunStore, Trigger};
+use owf::durable::CallState;
+use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
     sync::{
-        Arc, Barrier,
+        Barrier,
         atomic::{AtomicUsize, Ordering},
     },
 };
 
-#[derive(Clone, Debug)]
-enum Op {
-    Take(String),
-    Publish,
-    Finish,
-    Swap(usize),
-    Claim,
-    StaleSave,
+#[derive(Clone, Debug, Deserialize)]
+struct Cmd {
+    op: String,
+    r: usize,
+    w: usize,
+    i: usize,
+    value: i64,
 }
-#[derive(Clone, Debug, PartialEq)]
-enum Reply {
-    Empty,
-    Value(Value),
-    Bool(bool),
-    Rejected,
+#[derive(Deserialize)]
+struct Order {
+    order: Vec<usize>,
+    replies: Vec<i64>,
+    #[serde(rename = "final")]
+    end: View,
+}
+#[derive(Deserialize)]
+struct Batch {
+    name: String,
+    setup: Vec<Cmd>,
+    commands: Vec<Cmd>,
+    orders: Vec<Order>,
 }
 #[derive(Clone, Debug)]
 struct Completed {
-    op: Op,
     begin: usize,
     end: usize,
-    reply: Reply,
-}
-#[derive(Clone, Debug, Default, PartialEq)]
-struct Abstract {
-    terminal: bool,
-    pending: bool,
-    published: bool,
-    consumed: Option<String>,
-    records: BTreeMap<String, Value>,
-    trigger: Option<usize>,
-    admitted: Vec<usize>,
-    claimed: bool,
-}
-impl Abstract {
-    fn apply(&mut self, op: &Op) -> Reply {
-        match op {
-            Op::Take(key) => {
-                if let Some(value) = self.records.get(key) {
-                    Reply::Value(value.clone())
-                } else if self.pending {
-                    self.pending = false;
-                    self.consumed = Some(key.clone());
-                    self.records.insert(key.clone(), envelope());
-                    Reply::Value(envelope())
-                } else {
-                    Reply::Empty
-                }
-            }
-            Op::Publish => {
-                if self.terminal {
-                    Reply::Bool(false)
-                } else {
-                    self.pending = true;
-                    self.published = true;
-                    Reply::Bool(true)
-                }
-            }
-            Op::Finish => {
-                self.terminal = true;
-                Reply::Bool(true)
-            }
-            Op::Swap(winner) => {
-                if self.trigger.is_some() {
-                    Reply::Bool(false)
-                } else {
-                    self.trigger = Some(*winner);
-                    self.admitted.push(*winner);
-                    Reply::Bool(true)
-                }
-            }
-            Op::Claim => {
-                if self.claimed {
-                    Reply::Bool(false)
-                } else {
-                    self.claimed = true;
-                    Reply::Bool(true)
-                }
-            }
-            Op::StaleSave => Reply::Rejected,
-        }
-    }
+    reply: i64,
 }
 
-// Explore every order extending response-before-invocation. Matching replies
-// alone is insufficient: the final independent snapshot must also match.
-fn linearizable(initial: &Abstract, history: &[Completed], final_state: &Abstract) -> bool {
-    fn search(state: Abstract, history: &[Completed], used: &mut [bool], final_state: &Abstract) -> bool {
-        if used.iter().all(|x| *x) {
-            return state == *final_state;
+/// ITF's encodings of big integers, sets, tuples and maps as plain JSON.
+fn plain(v: Value) -> Value {
+    match v {
+        Value::Object(mut m) => {
+            if let Some(n) = m.get("#bigint").and_then(Value::as_str) {
+                return json!(n.parse::<i64>().unwrap());
+            }
+            if let Some(Value::Array(items)) = m.remove("#set").or_else(|| m.remove("#tup")) {
+                return Value::Array(items.into_iter().map(plain).collect());
+            }
+            if let Some(Value::Array(pairs)) = m.remove("#map") {
+                let mut out = serde_json::Map::new();
+                for pair in pairs {
+                    let [k, v]: [Value; 2] = serde_json::from_value(pair).unwrap();
+                    out.insert(plain(k).to_string(), plain(v));
+                }
+                return Value::Object(out);
+            }
+            Value::Object(m.into_iter().map(|(k, v)| (k, plain(v))).collect())
         }
-        for (index, event) in history.iter().enumerate() {
-            if used[index] || history.iter().enumerate().any(|(j, other)| !used[j] && other.end < event.begin) {
-                continue;
-            }
-            let mut next = state.clone();
-            if next.apply(&event.op) != event.reply {
-                continue;
-            }
-            used[index] = true;
-            if search(next, history, used, final_state) {
-                return true;
-            }
-            used[index] = false;
-        }
-        false
+        Value::Array(items) => Value::Array(items.into_iter().map(plain).collect()),
+        other => other,
     }
-    search(initial.clone(), history, &mut vec![false; history.len()], final_state)
+}
+/// The model's batches with their sequential answers (`quint` on PATH).
+fn table() -> anyhow::Result<Vec<Batch>> {
+    let directory = tempfile::tempdir()?;
+    let out = directory.path().join("table.itf.json");
+    let status = std::process::Command::new("quint")
+        .arg("run")
+        .arg(super::spec_path("contract_concurrent.qnt"))
+        .args(["--init", "tableInit", "--step", "tableStep", "--max-samples", "1", "--max-steps", "1"])
+        .args(["--seed", "1", "--verbosity", "0", "--out-itf"])
+        .arg(&out)
+        .status()?;
+    ensure!(status.success(), "quint could not compute the batches");
+    let itf: Value = serde_json::from_str(&std::fs::read_to_string(out)?)?;
+    Ok(serde_json::from_value(plain(itf["states"][0]["table"].clone()))?)
 }
 
-fn envelope() -> Value {
-    let mut event = ouro_durable::conformance::event("event", "event", json!(42));
-    event["time"] = json!("1970-01-01T00:00:00+00:00");
-    event
+/// What a racer needs that the serial bridge reads beforehand: the workers'
+/// fences, admissions and the trigger a firing expects (a stale one loses
+/// its compare-and-swap, as the model's later order would).
+struct Prepared {
+    now: i64,
+    fences: Vec<Option<Fence>>,
+    admissions: BTreeMap<usize, Admission>,
+    schedule: Option<Trigger>,
+    ingress: Option<Trigger>,
+    epoch: u64,
+    active: Option<u64>,
+    previous: Option<u64>,
 }
-fn trigger(winner: usize) -> Trigger {
-    Trigger { at_ms: Some(100), types: vec![], state: json!({"winner":winner}) }
-}
-fn execute(store: &dyn RunStore, fence: &Fence, op: &Op) -> Reply {
-    match op {
-        Op::Take(key) => match store.take_event(fence, key, &["event".into()], 0).unwrap() {
-            Some(value) => Reply::Value(value),
-            None => Reply::Empty,
-        },
-        Op::Publish => Reply::Bool(
-            !store
-                .publish(&json!({"source":"test","id":"event","type":"event","data":42}), None, 0)
-                .unwrap()
-                .is_empty(),
-        ),
-        Op::Finish => {
-            assert_eq!(store.finish(fence, &Status::Completed(json!(42)), 0, 3).unwrap(), Status::Completed(json!(42)));
-            Reply::Bool(true)
-        }
-        Op::Swap(winner) => Reply::Bool(
-            store
-                .swap_trigger("slot", None, Some(&trigger(*winner)), &[admission(&format!("slot-{winner}"))], None, 0)
-                .unwrap(),
-        ),
-        Op::Claim => Reply::Bool(store.claim("batch", ouro_durable::LEASE_MS).unwrap().is_some()),
-        Op::StaleSave => {
-            let result = store.save_record(
-                fence,
-                "late",
-                &owf::durable::Record::Timer { deadline_ms: 9 },
-                ouro_durable::LEASE_MS,
-            );
-            if result.is_err() { Reply::Rejected } else { Reply::Bool(true) }
-        }
-    }
-}
-fn handles(driver: &StoreDriver, count: usize) -> Vec<Arc<dyn RunStore>> {
-    (0..count)
-        .map(|_| -> Arc<dyn RunStore> {
-            match driver.adapter {
-                Adapter::Sqlite => {
-                    Arc::new(ouro_durable::sqlite::open(driver.directory.path().join("model.sqlite")).unwrap())
-                }
-                _ => driver.store.clone(),
+impl Prepared {
+    fn new(d: &StoreDriver, commands: &[Cmd]) -> anyhow::Result<Self> {
+        let defs = d.store.definitions(NAME)?;
+        let mut admissions = BTreeMap::new();
+        for (k, c) in commands.iter().enumerate() {
+            let slot = (c.op == "fire").then(|| -> anyhow::Result<(u64, i64)> {
+                let t = d.store.trigger(SCHEDULE)?.context("schedule trigger")?;
+                Ok((defs.epoch, t.state["slot"].as_i64().context("slot")?))
+            });
+            if matches!(c.op.as_str(), "fire" | "ingress") {
+                admissions.insert(k, d.admission(c.r, c.value, 0, 0, slot.transpose()?)?);
             }
+        }
+        Ok(Self {
+            now: d.ms(),
+            fences: d.workers.iter().map(|x| x.fence.clone()).collect(),
+            admissions,
+            schedule: d.store.trigger(SCHEDULE)?,
+            ingress: d.store.trigger(INGRESS)?,
+            epoch: defs.epoch,
+            active: defs.active,
+            previous: defs.previous,
         })
-        .collect()
+    }
+    fn fence(&self, w: usize) -> &Fence {
+        self.fences[w].as_ref().expect("the batch's worker holds a fence")
+    }
 }
-fn batch(driver: &StoreDriver, fence: &Fence, ops: Vec<Op>) -> Vec<Completed> {
-    let stores = handles(driver, ops.len());
-    let barrier = Barrier::new(ops.len());
+
+/// One command against one handle, answered as the model's `reply` reads it.
+fn race(store: &dyn RunStore, p: &Prepared, k: usize, c: &Cmd) -> (i64, Option<Fence>) {
+    let ms = p.now;
+    let accepted = |result: anyhow::Result<Vec<String>>| match result {
+        Ok(receivers) => i64::from(!receivers.is_empty()),
+        Err(e) if e.is::<IdentityConflict>() => -1,
+        Err(e) => panic!("{e}"),
+    };
+    let reply = match c.op.as_str() {
+        "take" => store
+            .take_event(p.fence(c.w), &format!("event{}", c.i), &["event".into()], ms)
+            .unwrap()
+            .map_or(-1, |e| e["data"].as_i64().unwrap()),
+        "address" => accepted(store.publish(&event(c.i, c.value), Some(&run_id(c.r)), ms)),
+        "publish" => accepted(store.publish(&event(c.i, c.value), None, ms)),
+        "finish" => i64::from(store.finish(p.fence(c.w), &status(c.value + 1), ms, 2).is_ok()),
+        "intent" => {
+            let record = call_record(c.i, CallState::Pending);
+            i64::from(store.save_record(p.fence(c.w), &format!("call{}", c.i), &record, ms).is_ok())
+        }
+        "claim" => {
+            let fence = store.claim_as(&run_id(c.r), ms, &worker(c.w)).unwrap();
+            return (i64::from(fence.is_some()), fence);
+        }
+        "fire" => {
+            let Some(t) = p.schedule.as_ref().filter(|t| t.at_ms.is_some_and(|at| at <= ms)) else { return (0, None) };
+            let slot = t.state["slot"].as_i64().unwrap();
+            let (catchup, rearm) = (t.state["catchup"].as_i64().unwrap(), t.state["rearm"].as_bool().unwrap());
+            let at = |at: Option<i64>| schedule_trigger(at, p.epoch, slot + 1, catchup, rearm);
+            let (next, busy) = (at(if rearm { None } else { Some(ms / TICK + 2) }), at(Some(ms / TICK + 2)));
+            let again = Rearm { trigger: SCHEDULE.into(), delay_ms: 2 * TICK };
+            let firing = Firing {
+                key: SCHEDULE,
+                expected: Some(t),
+                next: Some(&next),
+                admit: std::slice::from_ref(&p.admissions[&k]),
+                rearm: rearm.then_some(&again),
+                ingress: None,
+                busy: Some(&busy),
+            };
+            i64::from(store.fire(&firing, ms).unwrap() == Fired::Committed)
+        }
+        "ingress" => {
+            let e = ingress_event(c.i, c.value);
+            match store.ingested(&e, ms) {
+                Ok(false) => {}
+                Ok(true) => return (0, None),
+                Err(e) if e.is::<IdentityConflict>() => return (0, None),
+                Err(e) => panic!("{e}"),
+            }
+            let t = p.ingress.as_ref().unwrap();
+            let firing = Firing {
+                key: INGRESS,
+                expected: Some(t),
+                next: Some(t),
+                admit: std::slice::from_ref(&p.admissions[&k]),
+                ingress: Some(&e),
+                ..Firing::default()
+            };
+            i64::from(store.fire(&firing, ms).unwrap() == Fired::Committed)
+        }
+        "activate" => {
+            let version = c.i as u64 + 1;
+            let predecessor = if p.active == Some(version) { p.previous } else { p.active };
+            let (catchup, rearm) = (c.value % 2, c.value >= 2);
+            let mut arming = Arming::default();
+            if version == 1 {
+                arming
+                    .triggers
+                    .insert(SCHEDULE.into(), schedule_trigger(Some(ms / TICK + 2), p.epoch + 1, 0, catchup, rearm));
+            }
+            if predecessor == Some(1) {
+                arming
+                    .fallback
+                    .insert(SCHEDULE.into(), schedule_trigger(Some(ms / TICK + 2), p.epoch + 2, 0, catchup, rearm));
+            }
+            i64::from(store.activate_with(NAME, version, p.epoch, &arming).unwrap().is_some())
+        }
+        other => panic!("no concurrent form for {other}"),
+    };
+    (reply, None)
+}
+
+/// Whether some order of the model's matches: it respects real time, its
+/// replies are the observed ones and its final state is the observed one.
+fn linearizable<F: PartialEq>(orders: &[(&[usize], &[i64], F)], history: &[Completed], actual: &F) -> bool {
+    orders.iter().any(|(order, replies, end)| {
+        let timely =
+            order.iter().enumerate().all(|(a, x)| order[a + 1..].iter().all(|y| history[*y].end > history[*x].begin));
+        timely && history.iter().zip(replies.iter()).all(|(h, r)| h.reply == *r) && end == actual
+    })
+}
+
+fn run(adapter: Adapter, batch: &Batch, round: usize) -> anyhow::Result<()> {
+    let mut driver = StoreDriver::model(adapter)?;
+    driver.initialize()?;
+    for c in &batch.setup {
+        driver.execute(&Command { op: c.op.clone(), r: c.r, w: c.w, i: c.i, value: c.value, fault: 0 })?;
+    }
+    let prepared = Prepared::new(&driver, &batch.commands)?;
+    let stores = (0..batch.commands.len()).map(|_| driver.handle()).collect::<anyhow::Result<Vec<_>>>()?;
+    let barrier = Barrier::new(batch.commands.len());
     let sequence = AtomicUsize::new(0);
-    std::thread::scope(|scope| {
-        let tasks: Vec<_> = ops
-            .into_iter()
+    let results: Vec<(Completed, Option<Fence>)> = std::thread::scope(|scope| {
+        let tasks: Vec<_> = batch
+            .commands
+            .iter()
+            .enumerate()
             .zip(stores)
-            .map(|(op, store)| {
-                let barrier = &barrier;
-                let sequence = &sequence;
+            .map(|((k, c), store)| {
+                let (barrier, sequence, prepared) = (&barrier, &sequence, &prepared);
                 scope.spawn(move || {
                     barrier.wait();
                     let begin = sequence.fetch_add(1, Ordering::SeqCst);
-                    let reply = execute(store.as_ref(), fence, &op);
+                    let (reply, fence) = race(store.as_ref(), prepared, k, c);
                     let end = sequence.fetch_add(1, Ordering::SeqCst);
-                    Completed { op, begin, end, reply }
+                    (Completed { begin, end, reply }, fence)
                 })
             })
             .collect();
         tasks.into_iter().map(|task| task.join().unwrap()).collect()
-    })
-}
-fn suite(adapter: Adapter) {
-    for round in 0..12 {
-        for scenario in 0..5 {
-            let driver = StoreDriver::new(adapter).unwrap();
-            let fence = driver.store.start(&admission("batch"), 0).unwrap().unwrap();
-            let mut initial = Abstract::default();
-            let ops = match scenario {
-                0 | 1 => {
-                    driver.store.register_wait(&fence, &["event".into()], 0).unwrap();
-                    let event = ouro_durable::conformance::event("event", "event", json!(42));
-                    assert_eq!(driver.store.deliver(&event, None, 0).unwrap(), Some("batch".into()));
-                    initial.pending = true;
-                    (0..4).map(|k| Op::Take(format!("take-{}", if scenario == 0 { k } else { 0 }))).collect()
-                }
-                2 => {
-                    driver.store.subscribe(&fence, "listen", &["event".into()], 0).unwrap();
-                    vec![Op::Publish, Op::Finish]
-                }
-                3 => vec![Op::Swap(0), Op::Swap(1)],
-                _ => vec![Op::Claim, Op::Claim, Op::StaleSave],
-            };
-            let history = batch(&driver, &fence, ops);
-            let audit = handles(&driver, 1).pop().unwrap();
-            let snapshot = audit.inspect("batch").unwrap().unwrap();
-            let mut actual = Abstract {
-                terminal: snapshot.run.outcome.is_some(),
-                pending: snapshot.events.iter().any(|e| e.consumed_key.is_none()),
-                published: snapshot.events.iter().any(|e| e.envelope.is_some() && !e.delivered),
-                consumed: snapshot.events.iter().find_map(|e| e.consumed_key.clone()),
-                claimed: snapshot.run.generation > 1,
-                ..Abstract::default()
-            };
-            for (key, record) in snapshot.records {
-                match record {
-                    owf::durable::Record::Event { event, .. } => {
-                        actual.records.insert(key, event);
-                    }
-                    other => panic!("unexpected record: {other:?}"),
-                }
-            }
-            if scenario == 3 {
-                actual.trigger = audit
-                    .trigger("slot")
-                    .unwrap()
-                    .map(|t| usize::try_from(t.state["winner"].as_u64().unwrap()).unwrap());
-                actual.admitted = (0..2).filter(|k| audit.get(&format!("slot-{k}")).unwrap().is_some()).collect();
-            }
-            assert!(
-                linearizable(&initial, &history, &actual),
-                "round={round}, scenario={scenario}: {history:?}\nactual={actual:?}"
-            );
+    });
+    for ((_, fence), c) in results.iter().zip(&batch.commands) {
+        if let Some(f) = fence {
+            driver.owners.insert(f.owner.clone(), c.w as i64);
         }
     }
+    // A fresh handle reads the outcome back.
+    driver.store = driver.handle()?;
+    let actual = <View as quint_connect::State<StoreDriver>>::from_driver(&driver)?;
+    let history: Vec<_> = results.into_iter().map(|(h, _)| h).collect();
+    let orders: Vec<_> = batch.orders.iter().map(|o| (o.order.as_slice(), o.replies.as_slice(), &o.end)).collect();
+    ensure!(
+        linearizable(&orders, &history, &&actual),
+        "{} (round {round}): no order of the model's explains {history:?}\nactual: {actual:?}",
+        batch.name
+    );
+    Ok(())
+}
+fn suite(adapter: Adapter) -> anyhow::Result<()> {
+    let batches = table()?;
+    ensure!(batches.len() == 8 && CALLS == 3, "the model's batches changed");
+    for round in 0..12 {
+        for batch in &batches {
+            run(adapter, batch, round)?;
+        }
+    }
+    Ok(())
 }
 #[test]
 fn concurrent_memory() {
-    suite(Adapter::Memory);
+    super::with_quint("concurrent::concurrent_memory", || suite(Adapter::Memory));
 }
 #[test]
 fn concurrent_sqlite() {
-    suite(Adapter::Sqlite);
+    super::with_quint("concurrent::concurrent_sqlite", || suite(Adapter::Sqlite));
 }
 #[test]
 #[ignore = "requires TEST_DATABASE_URL with permission to create disposable databases"]
 fn concurrent_postgres() {
-    suite(Adapter::Postgres);
+    super::with_quint("concurrent::concurrent_postgres", || suite(Adapter::Postgres));
 }
 
 #[test]
 fn checker_rejects_duplicate_acquisitions_and_impossible_real_time_order() {
-    let initial = Abstract { pending: true, ..Abstract::default() };
-    let history: Vec<_> = (0..2)
-        .map(|k| Completed { op: Op::Take(format!("key{k}")), begin: k, end: k + 2, reply: Reply::Value(envelope()) })
-        .collect();
-    let mut final_state = initial.clone();
-    final_state.apply(&history[1].op);
-    assert!(!linearizable(&initial, &history, &final_state));
-    let history = vec![
-        Completed { op: Op::Finish, begin: 0, end: 1, reply: Reply::Bool(true) },
-        Completed { op: Op::Publish, begin: 2, end: 3, reply: Reply::Bool(true) },
-    ];
-    let final_state = Abstract { terminal: true, pending: true, published: true, ..Abstract::default() };
-    assert!(!linearizable(&Abstract::default(), &history, &final_state));
+    // Two takes of one copy under distinct keys: the model gives it to one.
+    let orders = [(&[0, 1][..], &[4, -1][..], 0), (&[1, 0][..], &[-1, 4][..], 0)];
+    let both: Vec<_> = (0..2).map(|k| Completed { begin: k, end: k + 2, reply: 4 }).collect();
+    assert!(!linearizable(&orders, &both, &0));
+    let one = vec![Completed { begin: 0, end: 2, reply: 4 }, Completed { begin: 1, end: 3, reply: -1 }];
+    assert!(linearizable(&orders, &one, &0));
+    // A publish that began after the finish ended cannot have reached the run.
+    let orders = [(&[0, 1][..], &[1, 1][..], 0), (&[1, 0][..], &[0, 1][..], 1)];
+    let late = vec![Completed { begin: 2, end: 3, reply: 1 }, Completed { begin: 0, end: 1, reply: 1 }];
+    assert!(!linearizable(&orders, &late, &0));
+    assert!(!linearizable(&orders, &late, &1));
 }
