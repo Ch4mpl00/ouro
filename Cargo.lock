@@ -2255,7 +2255,7 @@ dependencies = [
  "chrono",
  "deadpool-postgres",
  "futures",
- "owf",
+ "ows",
  "proptest",
  "quint-connect",
  "rusqlite",
@@ -2295,7 +2295,7 @@ dependencies = [
  "opentelemetry-otlp",
  "opentelemetry_sdk",
  "ouro-durable",
- "owf",
+ "ows",
  "proptest",
  "serde_json",
  "serde_yaml_ng",
@@ -2311,7 +2311,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1a80800c0488c3a21695ea981a54918fbb37abf04f4d0720c453632255e2ff0e"
 
 [[package]]
-name = "owf"
+name = "ows"
 version = "0.1.0"
 dependencies = [
  "anyhow",

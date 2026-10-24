@@ -6,7 +6,7 @@ use ouro_durable::{
     postgres::PostgresBackend,
     sqlite::SqliteBackend,
 };
-use owf::{
+use ows::{
     durable::Record,
     run::{Status, WorkflowError},
 };
@@ -396,15 +396,15 @@ async fn long_run(backend: &Arc<dyn AtomicBackend>, metrics: &Metrics, validatio
         logical: "/do/call".into(),
         function: "f".into(),
         arguments: json!({}),
-        delivery: owf::durable::Delivery::AtMostOnce,
+        delivery: ows::durable::Delivery::AtMostOnce,
         state,
     };
     bounded(metrics, "long_save_record_intent", 0, async || {
-        s.save_record(&f, "/do/call#call", &call(owf::durable::CallState::Pending), 1).await
+        s.save_record(&f, "/do/call#call", &call(ows::durable::CallState::Pending), 1).await
     })
     .await?;
     bounded(metrics, "long_save_record_result", 0, async || {
-        s.save_record(&f, "/do/call#call", &call(owf::durable::CallState::Done(Ok(json!(1)))), 1).await
+        s.save_record(&f, "/do/call#call", &call(ows::durable::CallState::Done(Ok(json!(1)))), 1).await
     })
     .await?;
     assert!(s.save_record(&f, "/do/1000/step#wait", &Record::Timer { deadline_ms: 43 }, 1).await.is_err());
@@ -1267,8 +1267,8 @@ async fn control_bounds(backend: &Arc<dyn AtomicBackend>, metrics: &Metrics) -> 
     let f = s.start(&a, now).await?.unwrap();
     let mut w = control_wait();
     w.types = vec!["*".into()];
-    w.strategy = owf::model::Strategy::Any { filters: Vec::new(), until: None };
-    w.progress = owf::events::Consumer::new(&w.strategy).progress();
+    w.strategy = ows::model::Strategy::Any { filters: Vec::new(), until: None };
+    w.progress = ows::events::Consumer::new(&w.strategy).progress();
     w.since_ms = now;
     w.timeout_ms = None;
     bounded(metrics, "control_describe_wildcard", 1, async || s.describe_wait(&f, "listen", &w, now).await).await?;

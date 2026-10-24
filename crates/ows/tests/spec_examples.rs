@@ -4,7 +4,7 @@
 // protocol call, a process, authentication or a catalog, all of which are
 // host functions or packs. Any other rejection means we disagree with the
 // specification.
-use owf::model::{Invalid, conforms, parse};
+use ows::model::{Invalid, conforms, parse};
 use std::path::PathBuf;
 
 /// What the parser rejects outside the core (see model.rs, section 2).
@@ -68,7 +68,7 @@ fn the_parser_accepts_examples_or_names_the_unsupported_construct() {
 /// A host with every capability the core defines and no protocol function,
 /// process runner or catalog: what remains unknown is out of the core.
 struct Core;
-impl owf::model::Catalog for Core {
+impl ows::model::Catalog for Core {
     fn has(&self, _: &str) -> bool {
         false
     }
@@ -93,7 +93,7 @@ impl owf::model::Catalog for Core {
 /// a problem is not explained by a protocol, a process or a catalog. A
 /// protocol call's own arguments belong to the protocol (an AsyncAPI
 /// subscription binds `$message` for its `foreach`).
-fn out_of_core(problems: &[owf::model::Problem]) -> Option<&'static str> {
+fn out_of_core(problems: &[ows::model::Problem]) -> Option<&'static str> {
     let mut reason = None;
     let mut protocol_tasks = Vec::new();
     for p in problems {
@@ -131,7 +131,7 @@ fn every_example_is_accepted_by_the_core_or_needs_a_protocol_process_auth_or_cat
                 );
                 "auth/catalog"
             }
-            Ok(wf) => match owf::model::validate(&wf, &Core) {
+            Ok(wf) => match ows::model::validate(&wf, &Core) {
                 Ok(()) => "accepted",
                 Err(Invalid(problems)) => {
                     out_of_core(&problems).unwrap_or_else(|| panic!("{name}: rejected inside the core: {problems:?}"))

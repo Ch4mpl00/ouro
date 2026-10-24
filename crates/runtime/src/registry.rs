@@ -9,8 +9,8 @@
 use crate::capabilities::{Capabilities, HostCatalog};
 use async_trait::async_trait;
 use opentelemetry::Context as SpanContext;
-pub use owf::durable::Delivery;
-use owf::{
+pub use ows::durable::Delivery;
+use ows::{
     model::{self, Catalog, Process, Workflow},
     run::WorkflowError,
 };

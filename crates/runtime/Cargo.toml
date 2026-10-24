@@ -13,7 +13,7 @@ async-trait = "0.1.92"
 futures = "0.3.34"
 chrono = "0.4.45"
 jsonschema = { version = "0.59.0", default-features = false }
-owf = { path = "../owf" }
+ows = { path = "../ows" }
 ouro-durable = { path = "../durable" }
 serde_json = { version = "1.0.151", features = ["preserve_order"] }
 serde_yaml_ng = "0.10.0"

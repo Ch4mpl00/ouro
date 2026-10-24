@@ -11,7 +11,7 @@ The design and boundary are described in [issue #1](https://github.com/Ch4mpl00/
 
 ```text
 crates/
-  owf/             DSL parser, validation, interpreter, schema and reference tests
+  ows/             DSL parser, validation, interpreter, schema and reference tests
   durable/         RunStore, lease Journal, storage adapters, conformance suite
     migrations/    versioned SQLite and Postgres SQL
   runtime/         functions, versions, run driver, dry runs, replay, OpenTelemetry
@@ -33,7 +33,7 @@ reads or writes. That is the host's to judge, from a run's call journal and
 with its own dry-run mock rule (below). Handlers receive arguments and
 `FunctionContext`: a
 cancellation token, run ID, task path, retry attempt, stable idempotency key
-and current OpenTelemetry context. Return JSON or `FunctionError` (OWF Problem
+and current OpenTelemetry context. Return JSON or `FunctionError` (OWS Problem
 Details); YAML `try/catch` handles ordinary function and schema errors.
 Both input and output schemas are checked.
 
@@ -269,7 +269,7 @@ refused rather than guessed without the host's secret resolver.
 
 The core implements the DSL's semantics; what it does not implement are
 protocol clients, processes, authentication and catalogs, which are host
-functions or packs. `src/model.rs` in `owf` lists the supported subset and
+functions or packs. `src/model.rs` in `ows` lists the supported subset and
 the choices made where the specification is silent (`CHOICE` comments).
 
 ### The jump budget (an ouro extension)
@@ -429,7 +429,7 @@ pinned bindings. At most once commits intent before dispatch; intent without a
 response produces `outcome_unknown`, never another dispatch. This can lose a
 call if the process dies before sending; neither mode promises exactly-once
 external effects. A function may use its stable idempotency key for recipient
-deduplication or reconciliation. A run without a journal (`owf::run::run`)
+deduplication or reconciliation. A run without a journal (`ows::run::run`)
 keeps no results, so it never retries an attempt that started an at-most-once
 call. Cancellation cannot undo an external effect already sent.
 
@@ -574,7 +574,7 @@ calls that follow its interruption.
 Breaking changes (issue #7), for hosts and adapters written against the
 synchronous seams:
 
-- `owf::durable::Journal`, `owf::run::Events` and `owf::run::Children` are
+- `ows::durable::Journal`, `ows::run::Events` and `ows::run::Children` are
   `#[async_trait]` traits; implementations add `async` to their methods
   (`Events::notification` still returns a future). `Resources`, `Clock`
   and `Observer` stay synchronous: they hold no store call.
@@ -607,8 +607,8 @@ using the public API. Its injected recovery clock advances past the dead
 worker's lease to avoid a 30-second pause; production hosts share a wall clock.
 It uses local files and calls no external service.
 
-The official conformance kit (`crates/owf/tests/ctk`) runs with
-`cargo test -p owf --test ctk`; its HTTP and OpenAPI scenarios use local
+The official conformance kit (`crates/ows/tests/ctk`) runs with
+`cargo test -p ows --test ctk`; its HTTP and OpenAPI scenarios use local
 fakes registered as `http` and `openapi` functions.
 
 `ouro_durable::conformance::run_all(factory).await` is public and runs on the
@@ -647,7 +647,7 @@ TEST_DATABASE_URL=postgresql://postgres:local-test-password@localhost/postgres c
 
 Each case creates and drops its own database; the URL's existing database is
 used only for administration. The official schema's attribution and the
-upstream example-corpus exception are in [schema/README.md](crates/owf/schema/README.md).
+upstream example-corpus exception are in [schema/README.md](crates/ows/schema/README.md).
 
 ## Contract model
 

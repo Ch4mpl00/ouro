@@ -12,7 +12,7 @@ use super::{
 };
 use anyhow::{Context, ensure};
 use ouro_durable::{Admission, Arming, Fence, Fired, Firing, IdentityConflict, Rearm, RunStore, Trigger};
-use owf::durable::CallState;
+use ows::durable::CallState;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{

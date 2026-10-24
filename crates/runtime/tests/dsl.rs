@@ -8,7 +8,7 @@ use ouro_runtime::{
     Runtime, SecretResolver,
     durable::{self, AtomicBackend, Clock, RunStore},
     mock,
-    owf::{
+    ows::{
         self,
         run::{Status, WorkflowError},
     },
@@ -811,7 +811,7 @@ async fn the_mailbox_keeps_addressed_events_until_a_listen_or_expiry() {
     assert_eq!(f.rt.get("too-late").await.unwrap().unwrap().state, durable::RunState::Waiting);
     let expired = f.rt.records("too-late").await.unwrap();
     assert!(expired.iter().any(|(k, r)| k == "mailbox#expired[0]"
-        && matches!(r, owf::durable::Record::Expired { event } if event["id"] == "too-late")));
+        && matches!(r, ows::durable::Record::Expired { event } if event["id"] == "too-late")));
     // A run that never listens again: the sweep expires it, observably.
     f.rt.start("idle", "late", json!({})).await.unwrap();
     f.rt.deliver(answer("idle", json!(1)), Some("idle")).await.unwrap();
@@ -1125,11 +1125,11 @@ fn budgeted() -> String {
     )
 }
 
-fn decisions(records: &BTreeMap<String, owf::durable::Record>) -> Vec<(String, bool, u64)> {
+fn decisions(records: &BTreeMap<String, ows::durable::Record>) -> Vec<(String, bool, u64)> {
     records
         .iter()
         .filter_map(|(k, r)| match r {
-            owf::durable::Record::Budget { granted, spent, .. } => Some((k.clone(), *granted, *spent)),
+            ows::durable::Record::Budget { granted, spent, .. } => Some((k.clone(), *granted, *spent)),
             _ => None,
         })
         .collect()
@@ -1365,7 +1365,7 @@ impl durable::Transaction for ClaimingTx<'_> {
         self.inner.scan(kind, start, end, limit).await
     }
     async fn put(&mut self, kind: &str, id: &str, value: &Value) -> anyhow::Result<()> {
-        self.claims |= kind.starts_with("record:") && id == owf::durable::EXCEEDED;
+        self.claims |= kind.starts_with("record:") && id == ows::durable::EXCEEDED;
         self.inner.put(kind, id, value).await
     }
     async fn delete(&mut self, kind: &str, id: &str) -> anyhow::Result<()> {

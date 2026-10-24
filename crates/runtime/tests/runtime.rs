@@ -1,7 +1,7 @@
 use ouro_runtime::{
     CallStatus, Config, Function, FunctionContext, MissingFunction, Mock, Registry, Runtime,
     durable::{self, Clock, RunStore},
-    owf::{
+    ows::{
         durable::{CallState, Delivery, Record},
         run::{Status, WorkflowError},
     },

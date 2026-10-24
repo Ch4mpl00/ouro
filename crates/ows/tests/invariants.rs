@@ -3,15 +3,15 @@
 // well-formed spans; 3. calls and retries; 4. cancellation; 5. validation
 // soundness; 6. determinism; 7. the parser never panics.
 //
-//   cargo test -p owf --test invariants
-//   PROPERTY_RUNS=2000 cargo test -p owf --test invariants
+//   cargo test -p ows --test invariants
+//   PROPERTY_RUNS=2000 cargo test -p ows --test invariants
 //
 // A failure prints the smallest program that breaks the property (proptest
 // shrinks it); `pretty(&definition(&p))` shows it as YAML.
 mod support;
 
-use owf::model::{self, Invalid};
-use owf::run::{self, Limits, Status};
+use ows::model::{self, Invalid};
+use ows::run::{self, Limits, Status};
 use proptest::prelude::*;
 use proptest::strategy::ValueTree;
 use proptest::test_runner::{TestCaseError, TestRunner};
@@ -94,7 +94,7 @@ fn a_then_cycle_hits_the_ceiling_which_no_try_catches() {
             shift_gotos(list, at);
             // Validation rejects the exit-less cycle; a host that runs it
             // anyway still stops at the ceiling (below the jump budget).
-            let wf = owf::model::parse(definition(&p)).map_err(|e| TestCaseError::fail(e.to_string()))?;
+            let wf = ows::model::parse(definition(&p)).map_err(|e| TestCaseError::fail(e.to_string()))?;
             ensure(run::validate(&wf, &Known).is_err(), &p, "an exit-less cycle validated")?;
             let opts = Options { limits: Limits { max_jumps: u64::MAX, ..limits() }, ..Options::default() };
             let ran = execute_workflow(&wf, input, &opts);

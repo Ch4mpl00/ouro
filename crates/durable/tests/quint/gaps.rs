@@ -2,7 +2,7 @@
 //! before them.
 use super::{Adapter, StoreDriver};
 use ouro_durable::{Rearm, Trigger, conformance::admission};
-use owf::run::{Status, WorkflowError};
+use ows::run::{Status, WorkflowError};
 use serde_json::json;
 
 fn adapters(test: impl Fn(StoreDriver)) {

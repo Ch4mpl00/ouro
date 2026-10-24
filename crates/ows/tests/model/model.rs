@@ -1,7 +1,7 @@
 // The reference model of the control-flow core: what a workflow run means,
 // with nothing else in the way — no async, no timers, no observer, no
 // parser. It reads the generator's program tree (support/program.rs)
-// directly and calls `owf::expr::eval` only for the jq leaves.
+// directly and calls `ows::expr::eval` only for the jq leaves.
 //
 // This file is the specification for the differential test (main.rs);
 // properties.rs checks the model itself. It is written from the DSL text
@@ -16,7 +16,7 @@
 //   4. one task — `if` → input.from → body → output.as → export.as
 //   5. bodies   — set, call, do, for, switch, try, raise
 
-use owf::expr::{self, Args};
+use ows::expr::{self, Args};
 use serde_json::{Map, Value, json};
 use std::collections::HashMap;
 

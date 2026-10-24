@@ -7,7 +7,7 @@
 //! credentials and remote resources belong to the embedding application.
 use crate::{FunctionContext, FunctionError, Registry};
 use async_trait::async_trait;
-use owf::{durable::Delivery, model::Catalog};
+use ows::{durable::Delivery, model::Catalog};
 use serde_json::Value;
 use std::sync::Arc;
 
@@ -30,9 +30,9 @@ pub trait ProcessRunner: Send + Sync {
     async fn run(&self, kind: &str, definition: Value, context: FunctionContext) -> Result<Value, FunctionError>;
 }
 
-/// Resolves `use.secrets` (see `owf::secrets`): values stay in memory and
+/// Resolves `use.secrets` (see `ows::secrets`): values stay in memory and
 /// are redacted from records, spans and errors.
-pub use owf::secrets::Secrets as SecretResolver;
+pub use ows::secrets::Secrets as SecretResolver;
 
 /// Resolves external resources: the JSON Schemas `schema.resource` names.
 /// Called when a definition is saved and when a run is admitted; the run

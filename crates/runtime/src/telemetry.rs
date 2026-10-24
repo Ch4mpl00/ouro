@@ -6,7 +6,7 @@ use opentelemetry::{
     global::BoxedTracer,
     trace::{Span, Status, TraceContextExt, Tracer},
 };
-use owf::run::{Event, Observer};
+use ows::run::{Event, Observer};
 use std::{
     collections::BTreeMap,
     sync::{Arc, Mutex},
