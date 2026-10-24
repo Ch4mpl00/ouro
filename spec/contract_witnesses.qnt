@@ -129,6 +129,14 @@ module contract_witnesses {
     .then(do("claim")).then(at("spend",1)).then(at("spend",1)).then(do("cancel"))
   run budgetTest = budget.expect(checked and m.db.runs.nth(0).spends == [1,2,0] and
     m.db.runs.nth(1).spends == [1,0,0] and m.db.runs.nth(1).spent == [2,0,0] and m.db.budget == [0,0,0])
+  // A slot whose run the host refuses (#15) is consumed with that run admitted
+  // already failed and counted; the second refusal trips the definition, which
+  // stops its schedule and reports once.
+  action refused = init.then(ticks(2)).then(do("refuse")).then(ticks(2)).then(execute("refuse",1,0,0,0,0))
+  run refusedTest = refused.expect(checked and m.db.admissions == [1,1,0] and m.db.fired == Set((1,0),(1,1)) and
+    m.db.runs.nth(0).outcome == 2 and m.db.runs.nth(1).outcome == 2 and m.db.runs.nth(1).ended == 4 and
+    m.db.catalog.tripped and m.db.catalog.faults == 2 and m.db.catalog.notices == [1] and
+    not(m.db.catalog.armed) and m.db.catalog.due == -1)
   // Every history above in one trace (each starts with init), replayed
   // against the stores by crates/durable/tests/quint.rs.
   run bridgeSuite = continuation.then(unknown).then(mailbox).then(expiry).then(child).then(childFinish).then(grandchild).then(activation)
@@ -136,4 +144,5 @@ module contract_witnesses {
     .then(noCatchup).then(overlap).then(ingress).then(ingressExpiry).then(redispatch).then(protectedUnknown)
     .then(notExecuted).then(errorResponse).then(conflict).then(release).then(staleFence).then(admission)
     .then(successResetsBreaker).then(noRollback).then(reactivation).then(broadcast).then(retention).then(budget)
+    .then(refused)
 }

@@ -1,3 +1,40 @@
+# Contract checking — 2026-10-24, refused trigger admissions (#15)
+
+A slot whose run the host refuses to admit deterministically (a missing
+function, validation the definition fails) is consumed by a firing that
+admits the run already ended with an unhandled failure, counted by the
+breaker in the same transition. An admission the host interrupts (a failing
+schema resolver) keeps its slot in the trigger, uncounted, and retries it
+after a capped backoff: for the store that is a plain trigger
+compare-and-swap with no admission, the model's slot staying due, so the
+model has no command for it. Rebased onto the parent-end cascade (#14,
+three runs), same environment as below. Quick checks only:
+
+| Check | Scope | Result | Time |
+| --- | --- | --- | --- |
+| Typecheck | all five modules | Pass | under 6 s each |
+| Witnesses | 34 histories (`refusedTest` added) | Pass | 8 s |
+| Simulation | 10,000 × 150 steps, seed 20261023, invariant `checked` | No violation | 219 s |
+| Concurrent table | 8 batches, every order | Computed | 5 s |
+| Safety mutants | 35 scripted witnesses | All targets detected | 147 s |
+| Fault rows | 11 switches × 1,000 × 150 steps | No violation | 279 s |
+| Fault detection | 11 rows | All detected | 51 s |
+| Serial and concurrent MBT | memory and SQLite, 100 × 150 + `bridgeSuite` (31 commands with init), 12 rounds × 8 batches | Pass | 52 s |
+| fmt, Clippy, `OURO_REQUIRE_QUINT=1 cargo test --workspace --no-fail-fast`, restart example | Postgres conformance and scalability on testcontainers | Pass | 1 s, 0 s, 303 s, 6 s |
+
+Not run: the Postgres MBT bridges (no `TEST_DATABASE_URL`), Apalache and
+TLC; `contract_progress.qnt` is unchanged and `contract-evidence.json` was
+not regenerated.
+
+Model changes: the command `refuse` shares `fire`'s transition (its skips
+and the slot) and then ends the admitted run with outcome 2 through
+`refuseRun`, which counts the fault, trips at the threshold and keeps an
+`after` trigger due two ticks on. T1 applies to `refuse` as to `fire`; V2's
+terminal observations include it, reading the run's epoch after the
+transition (equal to before for every other command, by A1). A store that
+stores the refused run without counting it fails the serial bridge (seed
+20261023) and conformance; no implementation bug was found.
+
 # Contract checking — 2026-10-24, owned children end with their parent (#14)
 
 Decided in #14: an owned child never outlives its parent. Any end of a run

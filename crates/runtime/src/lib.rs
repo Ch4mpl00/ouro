@@ -7,7 +7,7 @@ mod schedule;
 mod telemetry;
 mod testing;
 pub use capabilities::{EventSink, ProcessRunner, ResourceResolver, SecretResolver};
-pub use execution::{Config, Runtime};
+pub use execution::{Config, InvalidDefinition, ResourceUnavailable, Runtime};
 pub use opentelemetry;
 #[cfg(feature = "otlp")]
 pub use opentelemetry_otlp as otlp;

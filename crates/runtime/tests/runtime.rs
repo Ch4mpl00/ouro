@@ -884,3 +884,301 @@ async fn worker_hands_a_breaker_trip_to_the_event_sink() {
     assert_eq!((event["data"]["run"].as_str(), event["data"]["faults"].as_u64()), (Some("r"), Some(1)));
     assert_eq!(rt.notify(&CancellationToken::new()).await.unwrap(), 0, "acknowledged by the worker");
 }
+
+// ── a trigger's refused admission is a per-definition outcome ──────────────
+
+/// `healthy` and `broken` fire every second; the release the worker runs no
+/// longer registers `read`, which `broken` calls. The worker keeps firing
+/// `healthy`; each `broken` slot is consumed with a run that ended faulted
+/// at admission, which counts toward its breaker; the third trips it, its
+/// schedule stops and the trip's notice reaches the sink.
+#[tokio::test]
+async fn a_scheduled_definition_the_host_cannot_admit_trips_without_stopping_the_others() {
+    struct Sink(tokio::sync::mpsc::UnboundedSender<Value>);
+    #[async_trait::async_trait]
+    impl ouro_runtime::EventSink for Sink {
+        async fn emit(&self, event: &Value) -> Result<(), ouro_runtime::FunctionError> {
+            self.0.send(event.clone()).ok();
+            Ok(())
+        }
+    }
+    let (reads, writes) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+    let time = Arc::new(Time::default());
+    let (sent, mut received) = tokio::sync::mpsc::unbounded_channel();
+    let config = Config { poll_interval: Duration::from_millis(5), ..Config::default() };
+    let rt = Runtime::new(
+        Arc::new(durable::memory::memory()),
+        Arc::new(counter_registry(reads.clone(), writes)),
+        config,
+        time.clone(),
+        tracer(),
+    )
+    .unwrap()
+    .with_event_sink(Arc::new(Sink(sent)));
+    let every = |name: &str, body: &str| {
+        let definition = yaml(body)
+            .replace("name: workflow", &format!("name: {name}"))
+            .replace("\ndo:", "\nschedule: { every: PT1S }\ndo:");
+        let d = rt.save(name, &definition).unwrap();
+        rt.activate(name, d.version).unwrap();
+    };
+    every("healthy", "  - ok: { set: { ok: true } }");
+    every("broken", "  - fetch: { call: read, with: {} }");
+    rt.set_registry(Arc::new(Registry::new()));
+    let stop = CancellationToken::new();
+    // One second per few ticks, until the trip is handed on, and three
+    // seconds more.
+    let drive = async {
+        let mut trip = None;
+        for second in 1..=20 {
+            time.0.store(second * 1000, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            if trip.is_none() {
+                trip = received.try_recv().ok().map(|event| (second, event));
+            } else if trip.as_ref().is_some_and(|(at, _)| second >= at + 3) {
+                break;
+            }
+        }
+        stop.cancel();
+        trip
+    };
+    let (result, trip) = tokio::join!(rt.worker(stop.clone()), drive);
+    result.expect("a refused admission does not stop the worker");
+    let (tripped_at, event) = trip.expect("the trip's notice reached the sink");
+    assert_eq!((event["type"].as_str(), event["subject"].as_str()), (Some(durable::TRIPPED), Some("broken")));
+    let d = rt.definitions("broken").unwrap();
+    let trip = d.tripped.expect("tripped at the threshold");
+    assert_eq!((trip.faults, trip.threshold), (3, 3));
+    assert!(trip.reason.is("configuration"), "{:?}", trip.reason);
+    assert_eq!(event["data"]["run"].as_str(), Some(trip.run.as_str()));
+    assert!(rt.triggers("broken").unwrap().is_empty(), "its schedule stops");
+    // Exactly the three refused slots, each a run that ended faulted at its
+    // admission, with nothing executed.
+    let broken = rt.list(Some("broken"), "").unwrap();
+    assert_eq!(broken.len(), 3, "{broken:?}");
+    for run in &broken {
+        assert!(run.admission.id.starts_with("schedule:broken:every:"), "{}", run.admission.id);
+        let Some(Status::Faulted(error)) = &run.outcome else { panic!("{run:?}") };
+        assert!(
+            error.is("configuration") && error.detail.as_deref().is_some_and(|d| d.contains("`read`")),
+            "{error:?}"
+        );
+        assert_eq!(run.ended_ms, Some(run.admitted_ms), "ended in its admission's commit");
+        assert!(rt.records(&run.admission.id).unwrap().is_empty());
+    }
+    assert_eq!(trip.run, broken.last().unwrap().admission.id);
+    assert_eq!(reads.load(Ordering::SeqCst), 0);
+    // `healthy` kept firing, before and after the trip.
+    let healthy = rt.list(Some("healthy"), "").unwrap();
+    let last = |runs: &[durable::SavedRun]| runs.iter().map(|r| r.admitted_ms).max().unwrap_or_default();
+    assert!(last(&healthy) >= (tripped_at + 2) * 1000, "{healthy:?}");
+    assert!(healthy.iter().all(|r| !matches!(r.outcome, Some(Status::Faulted(_)))), "{healthy:?}");
+    assert_eq!(rt.definitions("healthy").unwrap().consecutive_faults, 0);
+}
+
+/// The refused slot and its run commit together: a process that dies after
+/// that commit and before its next tick leaves the slot consumed once, never
+/// refired or lost. `after` has no run to wait for, so it is due one delay
+/// after the refusal.
+#[tokio::test]
+async fn a_refused_slot_is_recorded_once_across_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("runs.sqlite");
+    let time = Arc::new(Time::default());
+    let open = |registry: Registry| runtime(Arc::new(durable::sqlite::open(&path).unwrap()), registry, time.clone());
+    let rt = open(counter_registry(Arc::default(), Arc::default()));
+    for (name, schedule) in [("broken", "every: PT1S"), ("later", "after: PT10S")] {
+        let definition = yaml("  - fetch: { call: read, with: {} }")
+            .replace("name: workflow", &format!("name: {name}"))
+            .replace("\ndo:", &format!("\nschedule: {{ {schedule} }}\ndo:"));
+        let d = rt.save(name, &definition).unwrap();
+        rt.activate(name, d.version).unwrap();
+    }
+    drop(rt);
+    // The next release has no `read`.
+    time.0.store(1000, Ordering::SeqCst);
+    let rt = open(Registry::new());
+    assert!(rt.fire_due().unwrap().is_empty(), "nothing admitted to run");
+    let failed = |rt: &Runtime, id: &str| {
+        let run = rt.get(id).unwrap().unwrap_or_else(|| panic!("{id} not recorded"));
+        matches!(run.outcome, Some(Status::Faulted(e)) if e.is("configuration"))
+    };
+    assert!(failed(&rt, "schedule:broken:every:1000"));
+    assert!(failed(&rt, "schedule:later:after:1:0000000001"));
+    let next = |rt: &Runtime, name: &str| rt.triggers(name).unwrap()[0].1.at_ms;
+    assert_eq!((next(&rt, "broken"), next(&rt, "later")), (Some(2000), Some(11_000)));
+    drop(rt);
+    // Restarted before the next tick, at the same instant: nothing again.
+    let rt = open(Registry::new());
+    assert!(rt.fire_due().unwrap().is_empty());
+    let count = |rt: &Runtime, name: &str| {
+        (rt.list(Some(name), "").unwrap().len(), rt.definitions(name).unwrap().consecutive_faults)
+    };
+    assert_eq!((count(&rt, "broken"), count(&rt, "later")), ((1, 1), (1, 1)));
+    time.0.store(2000, Ordering::SeqCst);
+    rt.fire_due().unwrap();
+    assert_eq!((count(&rt, "broken"), count(&rt, "later")), ((2, 2), (1, 1)));
+    // Down until 11 s: `broken`'s missed slots run once, late (`catchup:
+    // latest`), its third fault trips it; `later` refuses its second run.
+    time.0.store(11_000, Ordering::SeqCst);
+    rt.fire_due().unwrap();
+    assert!(failed(&rt, "schedule:broken:every:3000") && failed(&rt, "schedule:later:after:1:0000000002"));
+    assert_eq!((count(&rt, "broken"), count(&rt, "later")), ((3, 3), (2, 2)));
+    let trip = rt.definitions("broken").unwrap().tripped.expect("tripped");
+    assert_eq!(trip.run, "schedule:broken:every:3000");
+    assert!(rt.triggers("broken").unwrap().is_empty());
+    assert_eq!(next(&rt, "later"), Some(21_000));
+    // Another release brings `read` back; only an activation resumes `broken`.
+    rt.set_registry(Arc::new(counter_registry(Arc::default(), Arc::default())));
+    time.0.store(21_000, Ordering::SeqCst);
+    assert_eq!(rt.fire_due().unwrap(), vec!["schedule:later:after:1:0000000003".to_string()]);
+    rt.activate("broken", 1).unwrap();
+    time.0.store(22_000, Ordering::SeqCst);
+    assert_eq!(rt.fire_due().unwrap(), vec!["schedule:broken:every:22000".to_string()]);
+}
+
+/// A definition that no longer validates against the host (here a host whose
+/// jump ceiling dropped below the one the definition declares) is refused
+/// like a missing function, with a validation fault; so is the run an event
+/// schedule (`on`) would start, whose event is consumed once.
+#[tokio::test]
+async fn invalid_definitions_and_event_schedules_are_refused_per_definition() {
+    let store: Arc<dyn RunStore> = Arc::new(durable::memory::memory());
+    let time = Arc::new(Time::default());
+    let rt = runtime(store.clone(), counter_registry(Arc::default(), Arc::default()), time.clone());
+    let save_as = |name: &str, document: &str| {
+        let d = rt.save(name, document).unwrap();
+        rt.activate(name, d.version).unwrap();
+    };
+    save_as(
+        "bounded",
+        "document: { dsl: '1.0.4', namespace: test, name: bounded, version: '1.0.0', metadata: { limits: { max_jumps: 30 } } }\nschedule: { every: PT1S }\ndo:\n  - ok: { set: { ok: true } }\n",
+    );
+    save_as(
+        "orders",
+        &yaml("  - fetch: { call: read, with: {} }")
+            .replace("name: workflow", "name: orders")
+            .replace("\ndo:", "\nschedule: { on: { one: { with: { type: order } } } }\ndo:"),
+    );
+    let mut config = Config::default();
+    config.limits.max_jumps = 10;
+    let lowered = Runtime::new(store, Arc::new(Registry::new()), config, time.clone(), tracer()).unwrap();
+    time.0.store(1000, Ordering::SeqCst);
+    assert!(lowered.fire_due().unwrap().is_empty());
+    let run = lowered.get("schedule:bounded:every:1000").unwrap().expect("recorded");
+    assert!(matches!(&run.outcome, Some(Status::Faulted(e)) if e.is("validation")), "{run:?}");
+    assert_eq!(lowered.definitions("bounded").unwrap().consecutive_faults, 1);
+    assert_eq!(lowered.triggers("bounded").unwrap()[0].1.at_ms, Some(2000));
+    // `start` still answers its caller with the error and records nothing.
+    let e = lowered.start("direct", "bounded", json!({})).unwrap_err();
+    assert!(e.is::<ouro_runtime::InvalidDefinition>(), "{e:#}");
+    assert!(lowered.get("direct").unwrap().is_none());
+    let order = json!({ "id": "1", "source": "/shop", "type": "order", "data": { "n": 1 } });
+    assert!(lowered.publish(order.clone()).unwrap().is_empty());
+    let orders = lowered.list(Some("orders"), "").unwrap();
+    assert_eq!(orders.len(), 1);
+    assert!(matches!(&orders[0].outcome, Some(Status::Faulted(e)) if e.is("configuration")), "{orders:?}");
+    assert_eq!(lowered.definitions("orders").unwrap().consecutive_faults, 1);
+    assert!(lowered.publish(order).unwrap().is_empty());
+    assert_eq!(lowered.list(Some("orders"), "").unwrap().len(), 1, "one event starts at most one run");
+}
+
+/// A schema resolver that fails is an interruption of the host, not a fault
+/// of the definition: the slot is neither consumed nor counted toward the
+/// breaker; its trigger keeps it and retries after a capped backoff, stored
+/// with the trigger, while the other schedules go on. Once the resolver
+/// answers, the kept slot runs.
+#[tokio::test]
+async fn a_failing_schema_resolver_retries_the_slot_without_consuming_or_counting_it() {
+    struct Flaky(std::sync::atomic::AtomicBool);
+    impl ouro_runtime::ResourceResolver for Flaky {
+        fn resolve(&self, uri: &str) -> anyhow::Result<Value> {
+            anyhow::ensure!(self.0.load(Ordering::SeqCst), "{uri} unreachable");
+            Ok(json!({ "type": "object" }))
+        }
+    }
+    let store: Arc<dyn RunStore> = Arc::new(durable::memory::memory());
+    let time = Arc::new(Time::default());
+    let resolver = Arc::new(Flaky(std::sync::atomic::AtomicBool::new(true)));
+    let open = || runtime(store.clone(), Registry::new(), time.clone()).with_resources(resolver.clone());
+    let rt = open();
+    let typed = "input: { schema: { format: json, resource: { endpoint: 'https://schemas.test/in.json' } } }\n";
+    for (name, schedule, extra) in [
+        ("typed", "every: PT1S", typed),
+        ("healthy", "every: PT1S", ""),
+        ("orders", "on: { one: { with: { type: order } } }", typed),
+    ] {
+        let definition = yaml("  - ok: { set: { ok: true } }")
+            .replace("name: workflow", &format!("name: {name}"))
+            .replace("\ndo:", &format!("\nschedule: {{ {schedule} }}\n{extra}do:"));
+        let d = rt.save(name, &definition).unwrap();
+        rt.activate(name, d.version).unwrap();
+    }
+    resolver.0.store(false, Ordering::SeqCst);
+    let stop = CancellationToken::new();
+    let tick = |rt: &Runtime, at: i64| {
+        time.0.store(at, Ordering::SeqCst);
+        rt.fire_due().expect("an interrupted admission does not stop the scheduler")
+    };
+    let retry = |rt: &Runtime| {
+        let (_, t) = rt.triggers("typed").unwrap().remove(0);
+        (t.at_ms, t.state["retry"]["slot"].as_i64(), t.state["retry"]["failures"].as_u64())
+    };
+    // Due at 1, 2, 4 s: 1 s doubling, the slot kept, nothing recorded or counted.
+    for (at, next, failures) in [(1000, 2000, 1), (2000, 4000, 2), (4000, 8000, 3)] {
+        for id in tick(&rt, at) {
+            assert!(id.starts_with("schedule:healthy:"), "{id}");
+            rt.drive(&id, &stop).await.unwrap();
+        }
+        assert_eq!(retry(&rt), (Some(next), Some(1000), Some(failures)));
+    }
+    assert!(rt.list(Some("typed"), "").unwrap().is_empty(), "the slot is not consumed");
+    let d = rt.definitions("typed").unwrap();
+    assert_eq!((d.consecutive_faults, d.tripped), (0, None), "past the threshold of 3, still not counted");
+    assert_eq!(rt.list(Some("healthy"), "").unwrap().len(), 3, "the others went on");
+    // An `on` schedule: the event is not taken, the publisher hears why.
+    let order = json!({ "id": "1", "source": "/shop", "type": "order" });
+    let e = rt.publish(order.clone()).unwrap_err();
+    assert!(e.is::<ouro_runtime::ResourceUnavailable>(), "{e:#}");
+    assert!(rt.list(Some("orders"), "").unwrap().is_empty());
+    assert_eq!(rt.definitions("orders").unwrap().consecutive_faults, 0);
+    // The backoff is stored with the trigger: a restart does not shorten it.
+    drop(rt);
+    let rt = open();
+    tick(&rt, 5000);
+    assert_eq!(retry(&rt).0, Some(8000));
+    // The resolver answers again: the kept slot runs, late, once.
+    resolver.0.store(true, Ordering::SeqCst);
+    assert!(tick(&rt, 8000).contains(&"schedule:typed:every:1000".to_string()));
+    assert_eq!(retry(&rt), (Some(9000), None, None));
+    assert_eq!(
+        rt.drive("schedule:typed:every:1000", &stop).await.unwrap(),
+        Some(Status::Completed(json!({ "ok": true })))
+    );
+    assert_eq!(rt.publish(order).unwrap().len(), 1, "republished, the event starts its run");
+    // The worker's hand-off of a trip notice to such an `on` schedule keeps
+    // the notice, after its backoff, until the resolver answers.
+    let watch = yaml("  - ok: { set: { ok: true } }").replace("name: workflow", "name: watch").replace(
+        "\ndo:",
+        &format!("\nschedule: {{ on: {{ one: {{ with: {{ type: ouro.definition.tripped }} }} }} }}\n{typed}do:"),
+    );
+    let d = rt.save("watch", &watch).unwrap();
+    rt.activate("watch", d.version).unwrap();
+    let boom = yaml("  - boom: { raise: { error: { type: 'urn:test:boom', status: 500 } } }")
+        .replace("name: workflow", "name: boom");
+    let d = rt.save("boom", &boom).unwrap();
+    rt.activate("boom", d.version).unwrap();
+    for n in 0..3 {
+        rt.start(&format!("boom{n}"), "boom", json!({})).unwrap();
+        rt.drive(&format!("boom{n}"), &stop).await.unwrap();
+    }
+    assert!(rt.definitions("boom").unwrap().tripped.is_some());
+    resolver.0.store(false, Ordering::SeqCst);
+    assert_eq!(rt.notify(&stop).await.unwrap(), 0, "kept");
+    assert!(rt.list(Some("watch"), "").unwrap().is_empty());
+    resolver.0.store(true, Ordering::SeqCst);
+    assert_eq!(rt.notify(&stop).await.unwrap(), 0, "still backing off");
+    time.0.store(9000, Ordering::SeqCst);
+    assert_eq!(rt.notify(&stop).await.unwrap(), 1);
+    assert_eq!(rt.list(Some("watch"), "").unwrap().len(), 1);
+}

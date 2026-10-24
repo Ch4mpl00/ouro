@@ -1,6 +1,6 @@
 use ouro_durable::{
-    Arming, AtomicBackend, Compatibility, Conflict, Fence, Fired, Firing, IoCounts, Metrics, Policy, Rearm, RunState,
-    RunStore, TransactionalStore, Trigger,
+    Arming, AtomicBackend, Compatibility, Conflict, Fence, Fired, Firing, IoCounts, Metrics, Policy, Rearm, Refused,
+    RunState, RunStore, TransactionalStore, Trigger,
     conformance::{admission, event},
     memory::MemoryBackend,
     postgres::PostgresBackend,
@@ -426,6 +426,37 @@ fn decided(backend: &Arc<dyn AtomicBackend>, metrics: &Metrics) -> anyhow::Resul
     let counts = metrics.counts();
     assert!(counts.rows_read <= 32 && counts.rows_written == 0, "admit_tripped: {counts:?}");
     let epoch = s.definitions("decided")?.epoch;
+    s.activate_with("decided", v2.version, epoch, &Arming::default())?.unwrap();
+    // A refused trigger run: the slot moves, the run is stored ended and the
+    // breaker counts it, by a constant number of rows; at the threshold the
+    // same commit trips, removes the trigger and stores the notice.
+    let armed = Arming { triggers: BTreeMap::from([("decided#refused".to_string(), slot(200))]) };
+    let epoch = s.definitions("decided")?.epoch;
+    s.activate_with("decided", v2.version, epoch, &armed)?.unwrap();
+    let refusal = |id: &str| Refused {
+        admission: ouro_durable::Admission { id: id.into(), version: v2.version, ..a.clone() },
+        error: WorkflowError::validation("invalid"),
+        breaker_threshold: 2,
+    };
+    let refuse = |at: i64, refused: &Refused| {
+        let firing = Firing {
+            key: "decided#refused",
+            expected: Some(&slot(at)),
+            next: Some(&slot(at + 1)),
+            refused: Some(refused),
+            busy: Some(&slot(at + 1)),
+            ..Firing::default()
+        };
+        s.fire(&firing, 0)
+    };
+    let first = refusal("decided:refused1");
+    assert_eq!(bounded(metrics, "fire_refused", 1, || refuse(200, &first))?, Fired::Committed);
+    let second = refusal("decided:refused2");
+    assert_eq!(bounded(metrics, "fire_refused_trip", 2, || refuse(201, &second))?, Fired::Committed);
+    let d = s.definitions("decided")?;
+    assert!(d.tripped.is_some_and(|t| t.run == second.admission.id) && d.triggers.is_empty());
+    assert_eq!(s.get(&first.admission.id)?.map(|r| r.state), Some(RunState::Failed));
+    let epoch = d.epoch;
     s.activate_with("decided", v2.version, epoch, &Arming::default())?.unwrap();
     // Version-aware claims page through their own partitions only.
     let mut versioned = a.clone();

@@ -49,11 +49,11 @@ are the bridges in `crates/durable/tests/quint.rs` and `quint/concurrent.rs`.
 | C1 | `C1`: acyclic owned link and one child admission | Serial MBT; native-child recovery tests |
 | C2 | `C2`: terminal child has notification obligation | Serial MBT audits the parent's one notification; child conformance |
 | C3 | `C3`: any end of a run (completion, fault, cancellation) closes its owned subtree, transitively, in that transition | Serial MBT (`childTest`, `childFinishTest`, `grandchildTest`; the bridge audits that no owned child outlives its parent); conformance audit and commit faults; handler cancellation tests remain separate |
-| T1 | `T1`: slot disposition, overlap and global ingress identity | Concurrent firings and ingress; serial MBT; `t1_*` runtime regressions |
+| T1 | `T1`: slot disposition (a refused slot's run included), overlap and global ingress identity | Concurrent firings and ingress; serial MBT; `t1_*` runtime regressions |
 | T2 | `T2`: activation epoch (only an activation starts one), dormant rearm | Concurrent firing/activation; serial MBT; `gaps::t2_old_completion_cannot_rearm_new_epoch` |
 | T3 | `T3`: deadline fixed at admission | Serial MBT; `t3_admission_fixes_the_workflow_deadline` |
 | V1 | `V1`: only an activation selects the active version (no rollback); pinned admission | Serial MBT; runtime pinned-version recovery |
-| V2 | `V2`: epoch, fault classification, reset; a trip reports once (one notice), stops the schedule and every admission, ignores later observations, cleared only by activation | Serial MBT; `gaps::v2_old_epoch_fault_does_not_count_after_reactivation`; refusal on every admission path in conformance (a trip then a child needs two faulted runs besides a live parent and its unadmitted child, more than the model's three, so the model's clause is not reached) |
+| V2 | `V2`: epoch, fault classification (a refused slot's run counts), reset; a trip reports once (one notice), stops the schedule and every admission, ignores later observations, cleared only by activation | Serial MBT; `gaps::v2_old_epoch_fault_does_not_count_after_reactivation`; `refusedTest` witness; refusal on every admission path in conformance (a trip then a child needs two faulted runs besides a live parent and its unadmitted child, more than the model's three, so the model's clause is not reached) |
 | V3 | `V3`: undeclared/exact-match claim and mutation guards | Serial MBT (`claim_as`, `due_as` per worker version); `gaps::v3_incompatible_worker_cannot_claim` |
 | O1 | `O1`: failed operation stops the attempt | Serial MBT fault switches; generated interrupted journals |
 | O2 | `O2`: terminal-only retention and stable identities | Serial MBT (swept evidence projected away); replay-after-sweep refusal |
@@ -101,7 +101,10 @@ deadline fixed at admission and epoch.
   both advance the slot. The schedule's
   last run is remembered across epochs, as the store's trigger key does. An
   `after` trigger re-arms at any end of its run (finish, timeout, conflict,
-  cancellation) unless a later epoch replaced it.
+  cancellation) unless a later epoch replaced it. `refuse` is a firing whose
+  run the host cannot admit (#15): the slot advances as for `fire`, and its
+  run is admitted already ended with an unhandled failure, which the breaker
+  observes in that transition; an `after` trigger is then due two ticks on.
 - **Time** (decision 4). The lease is four ticks; a worker acts only while
   more than ε = 1 is left; takeover only after it ends. The deadline is
   admission + 8; the owner decides a timeout.
@@ -150,8 +153,8 @@ exact matching plus undeclared, without a host-supplied `accepts` list.
 ### Serial
 
 `crates/durable/tests/quint.rs` replays Quint's random traces of `contract.qnt`
-(100 traces × 150 steps per adapter by default, all 29 commands and every fault
-switch) and the `bridgeSuite` run of `contract_witnesses.qnt` (all 33 witness
+(100 traces × 150 steps per adapter by default, all 30 commands and every fault
+switch) and the `bridgeSuite` run of `contract_witnesses.qnt` (all 34 witness
 histories in one trace). After every step it compares a projection of the store
 with the model's state. The model records each command in its `command`
 variable; the driver never sees the model's state.
@@ -182,6 +185,7 @@ ticks), with `Policy { mailbox_ms: 37_500, ingress_ms: 37_500, skew_ms: 7_500 }`
 | `finish`, `timeout`, `cancel` | `finish` (outcomes 1–5), `cancel` |
 | `activate` | `activate_with`: the version's trigger |
 | `fire` | `fire` with `busy` and `rearm`; a missed or taken slot commits a skip |
+| `refuse` | `fire` with `busy` and `refused` (the model's unhandled failure, threshold 2) instead of `admit`; skips as `fire` |
 | `ingress` | `ingested`, then `fire` with the ingress event on a generic trigger |
 
 The projection keeps what both sides state: runs (admission, epoch, version,

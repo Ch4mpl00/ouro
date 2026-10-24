@@ -284,6 +284,31 @@ pub struct Firing<'a> {
     /// unfinished (running or waiting), store `busy` instead of `next` and
     /// admit nothing.
     pub busy: Option<&'a Trigger>,
+    /// The slot's run the host could not admit (`Refused`), given instead of
+    /// `admit`: stored in this commit as a run that ended faulted at its
+    /// admission, which counts toward its definition's breaker as a terminal
+    /// fault does (`finish`) and may trip it in this commit. The slot is
+    /// consumed like an admitted one: overlap (`busy`), ingress and the next
+    /// trigger apply unchanged.
+    pub refused: Option<&'a Refused>,
+}
+
+/// A trigger's run the host refused to admit: a function the definition
+/// calls is no longer registered, or the definition no longer validates
+/// against the host. Recorded with the slot (`Firing::refused`) so a broken
+/// definition is a per-definition outcome, visible in the runs API and
+/// counted by its breaker, never an error that stops the scheduler. Only a
+/// deterministic refusal belongs here: an admission interrupted by the
+/// host's infrastructure is no fault of the definition and consumes nothing.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Refused {
+    /// The run as far as the host could build its admission: the slot's id,
+    /// the definition version it would run, its input. It is never executed.
+    pub admission: Admission,
+    /// Why it was refused: the run's terminal fault.
+    pub error: WorkflowError,
+    /// The breaker threshold the fault counts against, as for `finish`.
+    pub breaker_threshold: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -451,7 +476,7 @@ pub trait RunStore: Send + Sync {
         rearm: Option<&Rearm>,
         now_ms: i64,
     ) -> anyhow::Result<bool> {
-        let firing = Firing { key, expected, next, admit, rearm, ingress: None, busy: None };
+        let firing = Firing { key, expected, next, admit, rearm, ingress: None, busy: None, refused: None };
         Ok(self.fire(&firing, now_ms)? == Fired::Committed)
     }
     /// Terminal outcomes of runs admitted in the active version's current

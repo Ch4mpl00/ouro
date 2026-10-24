@@ -384,6 +384,7 @@ pub fn run_all(factory: impl Fn(&str) -> anyhow::Result<TestStore>) -> anyhow::R
         "ingress",
         "arm",
         "trip",
+        "refuse",
         "acknowledge",
     ] {
         for point in [
@@ -414,7 +415,7 @@ pub fn run_all(factory: impl Fn(&str) -> anyhow::Result<TestStore>) -> anyhow::R
             let d = s.save_definition("workflow", "yaml")?;
             let mut tripping = None;
             let mut notice = None;
-            if matches!(operation, "trip" | "acknowledge") {
+            if matches!(operation, "trip" | "refuse" | "acknowledge") {
                 // An activation with an armed trigger and a run of its epoch
                 // whose fault trips the breaker (removing the trigger and
                 // storing the notice); `acknowledge` then removes the notice.
@@ -514,6 +515,25 @@ pub fn run_all(factory: impl Fn(&str) -> anyhow::Result<TestStore>) -> anyhow::R
                     .map(|_| ()),
                 "trip" => s
                     .finish(tripping.as_ref().unwrap(), &Status::Faulted(WorkflowError::runtime("fault")), 0, 1)
+                    .map(|_| ()),
+                // A refused slot whose fault trips the breaker: the run, the
+                // moved trigger, the count, the trip, the trigger's removal
+                // and the notice, all in one commit.
+                "refuse" => s
+                    .fire(
+                        &Firing {
+                            key: "armed",
+                            expected: Some(&Trigger { at_ms: Some(9), types: vec!["t".into()], state: json!(2) }),
+                            next: Some(&Trigger { at_ms: Some(19), types: vec!["t".into()], state: json!(3) }),
+                            refused: Some(&Refused {
+                                admission: admission("refused"),
+                                error: WorkflowError::validation("invalid"),
+                                breaker_threshold: 1,
+                            }),
+                            ..Firing::default()
+                        },
+                        9,
+                    )
                     .map(|_| ()),
                 "acknowledge" => s.acknowledge(notice.as_ref().unwrap()).map(|_| ()),
                 _ => unreachable!(),
@@ -619,7 +639,7 @@ pub fn run_all(factory: impl Fn(&str) -> anyhow::Result<TestStore>) -> anyhow::R
         audit(&*s)?;
     }
     report.witnesses.insert("finite histories drain every live listener");
-    assert_eq!(report.witnesses.len(), 25);
+    assert_eq!(report.witnesses.len(), 26);
     let t = factory("concurrent-claims")?;
     report.cases += 1;
     t.store.admit(&admission("r"), 0)?;
@@ -1033,6 +1053,68 @@ fn decisions(factory: &impl Fn(&str) -> anyhow::Result<TestStore>, report: &mut 
     assert_eq!(fire(&slot(40, 2), &slot(50, 2), &slot(50, 3), "slot40", 40)?, Fired::Committed);
     report.operations += 8;
     report.witnesses.insert("a live previous run makes the next slot an explicit skip");
+
+    // A trigger's run the host refused to admit: the slot is consumed with a
+    // run that ended faulted in that commit, counted by the breaker, whose
+    // threshold refusal trips it and removes the trigger in the same commit.
+    let t = factory("refused")?;
+    report.cases += 1;
+    let s = &t.store;
+    let v = s.save_definition("w", "yaml")?;
+    let slot = |at: i64| Trigger { at_ms: Some(at), types: vec![], state: json!({ "at": at }) };
+    let arming = Arming { triggers: BTreeMap::from([("w#every".into(), slot(10))]) };
+    s.activate_with("w", v.version, 0, &arming)?.unwrap();
+    let run_of = |id: &str| Admission { name: "w".into(), version: v.version, ..admission(id) };
+    let invalid = WorkflowError::validation("invalid");
+    let refused = |id: &str| Refused { admission: run_of(id), error: invalid.clone(), breaker_threshold: 2 };
+    let fire = |at: i64, admit: &[Admission], refused: Option<&Refused>| {
+        let firing = Firing {
+            key: "w#every",
+            expected: Some(&slot(at)),
+            next: Some(&slot(at + 10)),
+            admit,
+            refused,
+            busy: Some(&slot(at + 10)),
+            ..Firing::default()
+        };
+        s.fire(&firing, at)
+    };
+    // Overlap applies to a refused slot as to an admitted one.
+    assert_eq!(fire(10, &[run_of("live")], None)?, Fired::Committed);
+    assert_eq!(fire(20, &[], Some(&refused("slot20")))?, Fired::Busy("live".into()));
+    assert!(s.get("slot20")?.is_none());
+    s.cancel("live", 25)?;
+    assert_eq!(fire(30, &[], Some(&refused("slot30")))?, Fired::Committed);
+    let r = s.get("slot30")?.unwrap();
+    assert_eq!(
+        (r.state, r.outcome.clone(), r.ended_ms, r.epoch),
+        (RunState::Failed, Some(Status::Faulted(invalid.clone())), Some(30), Some(1))
+    );
+    assert_eq!((r.admitted_ms, r.admission), (30, run_of("slot30")), "visible in the runs API as it was refused");
+    assert!(s.due(i64::MAX, 10)?.is_empty() && s.claim("slot30", 30)?.is_none(), "never due, never claimed");
+    assert_eq!(s.trigger("w#every")?, Some(slot(40)), "the slot is consumed");
+    assert_eq!(s.definitions("w")?.consecutive_faults, 1);
+    assert_eq!(fire(30, &[], Some(&refused("slot30")))?, Fired::Changed, "a repeated firing changes nothing");
+    assert_eq!(s.definitions("w")?.consecutive_faults, 1);
+    assert!(
+        s.fire(
+            &Firing { key: "w#every", admit: &[run_of("a")], refused: Some(&refused("b")), ..Firing::default() },
+            40
+        )
+        .is_err(),
+        "admit or refuse, not both"
+    );
+    assert!(s.get("a")?.is_none() && s.get("b")?.is_none());
+    assert_eq!(fire(40, &[], Some(&refused("slot40")))?, Fired::Committed);
+    let d = s.definitions("w")?;
+    let trip = d.tripped.expect("the threshold refusal trips");
+    assert_eq!((trip.run.as_str(), &trip.reason, trip.faults, trip.threshold), ("slot40", &invalid, 2, 2));
+    assert!(d.triggers.is_empty() && s.trigger("w#every")?.is_none(), "its schedule stops in that commit");
+    assert_eq!(s.notices(10)?, vec![(s.notices(10)?[0].0.clone(), trip.event("w"))]);
+    assert_eq!(fire(40, &[], Some(&refused("slot50")))?, Fired::Changed);
+    audit(&**s)?;
+    report.operations += 16;
+    report.witnesses.insert("a refused trigger run consumes its slot, counts and may trip");
 
     // The skew bound: an owner stops acting ε before its lease ends, and a
     // lease is taken over only after it ends.

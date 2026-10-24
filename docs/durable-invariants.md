@@ -493,7 +493,9 @@ late external completions separately.
 
 For slot `s`, `count_H(Admit(run(s),_)) <= 1`. Consuming/advancing `s` and admitting
 its run are one transition; a due unsatisfied slot remains represented until
-admission or an explicit policy-defined skip/removal. Event-trigger partial matches
+admission or an explicit policy-defined skip/removal. A slot whose run the host
+refuses to admit is admitted with that run already terminal, in the same transition
+(decision 3): a refusal neither leaves the slot due nor drops it. Event-trigger partial matches
 survive recovery. An identified ingress event is accepted at most once per trigger
 epoch; once used, it cannot satisfy another match position or firing in that epoch
 unless the declared strategy explicitly permits reuse. New event-trigger runs
@@ -557,7 +559,8 @@ host. From then on every admission of a new run of that definition, by any path
 and of any version, is refused in its own commit with a typed, non-retryable
 error; an already admitted run is still joined. The active version and the epoch do not change. A tripped
 breaker observes nothing more; only an activation clears it, in a new epoch.
-Completions outside the current epoch cannot alter it. Classification is decision 5.
+Completions outside the current epoch cannot alter it. A schedule's run the host
+refused to admit is observed in its firing's transition (decision 3). Classification is decision 5.
 
 Concurrency cannot lose counts, report one trip twice, or change the active
 version. **Source:** [README][README], [#10][I10]; epoch interpretation is
@@ -970,6 +973,7 @@ public runtime exports already implement that rule.
 [I3]: https://github.com/Ch4mpl00/ouro/issues/3
 [I10]: https://github.com/Ch4mpl00/ouro/issues/10
 [I14]: https://github.com/Ch4mpl00/ouro/issues/14
+[I15]: https://github.com/Ch4mpl00/ouro/issues/15
 [RMR]: https://arxiv.org/html/2608.03836
 [DF]: https://www.microsoft.com/en-us/research/uploads/prod/2021/10/DF-Semantics-With-Proofs.pdf
 [DBOS]: https://www.dbos.dev/blog/how-to-test-durable-execution
@@ -1002,7 +1006,19 @@ Decision 5 and the epoch rule of decision 3 were revised on 2026-10-24
    Activating a version without `schedule` removes its triggers in that
    transaction; runs already started finish. Missed slots: `catchup: latest`
    (default, one late run) or `none`. Overlap: a slot whose previous run of the
-   same schedule is still running is skipped, with a record.
+   same schedule is still running is skipped, with a record. A slot whose run
+   the host refuses to admit (2026-10-24, [#15][I15]: a function the
+   definition calls is not registered, or it no longer validates) is
+   consumed in the firing's transaction, which admits its run already ended
+   with the refusal as an unhandled fault: `Admit` and `Finish` of that run
+   share the `Fire` transition (T1 holds: one admission per slot; L4: the
+   slot resolves), and the fault is a terminal observation of the epoch (V2).
+   It is not retried at the next poll, which would refire the slot on every
+   poll, and it is never a scheduler error that stops other definitions'
+   slots. Only deterministic refusals are treated so: an admission the host
+   interrupts (its schema resolver failing) is an infrastructure
+   interruption (decision 5), so the slot stays represented by its trigger,
+   uncounted, and is retried after a capped backoff (T1, L4).
 4. **Time (T3, L4).** Deadlines are absolute instants fixed when they start
    (a workflow `timeout` from admission, not from the last resume), so moving
    between processes never resets them. Clock skew between workers is bounded
@@ -1013,7 +1029,8 @@ Decision 5 and the epoch rule of decision 3 were revised on 2026-10-24
    know which version of a workflow is the "original" or "safe" one, so it
    never chooses one. The breaker counts terminal faults of runs of the active
    version admitted in the current epoch: unhandled errors, timeouts,
-   outcome-unknown that ended the run. It does not count cancellations or
+   outcome-unknown that ended the run, and a schedule's run the host refused
+   to admit deterministically (decision 3), never an interrupted admission. It does not count cancellations or
    infrastructure interruptions (a process or storage failure that a later
    attempt resumes, even when the interruptions run out). Success and a new
    activation reset the count. At the threshold the definition becomes

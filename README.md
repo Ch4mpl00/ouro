@@ -49,10 +49,13 @@ the functions its calls name, the process runners its `run:` tasks need
 `run: workflow` tasks name, as they resolve now. The registry can change
 after a definition was activated: a new release of the host, or
 `set_registry` on a running one. At admission a missing function fails
-`start` (and a child's start, a schedule's or a trigger's admission) with a
-`MissingFunction` error naming it and the definitions that lead to it; a
-resumed run checks again before its next step and faults with a
-`configuration` error instead of failing halfway through. Each definition
+`start` (and a child's start) with a `MissingFunction` error naming it and
+the definitions that lead to it, and a definition that no longer validates
+against the host fails it with `InvalidDefinition` (a schema resolver that
+fails, with `ResourceUnavailable`); a schedule's slot records either of the
+first two as a refused run instead and retries the third (below). A resumed run checks again
+before its next step and faults with a `configuration` error instead of
+failing halfway through. Each definition
 version's own needs are computed once per registry generation (replacing the
 registry starts a new one); the children it names are resolved on every
 check, since activation may change which version `latest` is.
@@ -90,7 +93,8 @@ only the runs subscribed at that moment.
 Versions are immutable. Every activation, including reactivating the active
 version, starts a new activation epoch, and nothing else does. The breaker
 counts terminal faults (unhandled errors, timeouts, unknown outcomes) of runs
-admitted in the active version's current epoch; cancellations and interruptions
+admitted in the active version's current epoch, and the schedule slots of that
+epoch whose run the host refused to admit; cancellations and interruptions
 (even exhausted ones) do not count, and a success resets the count. The breaker
 reports and never rolls back: the runtime does not know which version is the
 safe one. N consecutive faults (`Config::breaker_threshold`, default 3) trip
@@ -278,11 +282,26 @@ is bounded by its collection and `retry` by its attempts.
   workers start each once. A slot whose previous run of the same trigger is
   still running or waiting is skipped, as is a missed slot under
   `document.metadata.catchup: none` (the default `latest` runs it once,
-  late); a skip is recorded in the trigger's state and traced. `after`
-  re-arms when its run ends, never across epochs. `on` keeps the events
+  late); a skip is recorded in the trigger's state and traced. A slot whose
+  run the host refuses to admit (a `MissingFunction` or an
+  `InvalidDefinition`) never stops the worker: the firing's commit consumes
+  the slot, stores the run under the slot's id as ended faulted at its
+  admission (`configuration` or `validation`; `get`, `list`) and counts the
+  fault toward the definition's breaker, so a definition that stays broken
+  trips after the threshold and its schedule stops. CHOICE: the slot is
+  consumed, not retried at the next tick, which would refire it on every
+  tick; it is not lost either, since its failed run holds it. Only such
+  deterministic refusals count: a schema resolver that fails
+  (`ResourceUnavailable`) interrupts the admission, so the trigger keeps
+  the slot, uncounted, and retries it after a backoff of 1 s doubling to
+  five minutes, stored with the trigger (`retry` in its state); an `on`
+  schedule leaves the event untaken and `publish` returns the error. `after`
+  re-arms when its run ends, never across epochs (a refused one is due one
+  delay later). `on` keeps the events
   matched so far in its trigger and starts the workflow, with the consumed
-  events as input, once the strategy is satisfied; a publish reads only the
-  triggers indexed under its type. An identified event is taken from
+  events as input, once the strategy is satisfied (a refused run consumes
+  the match like a refused slot); a publish reads only the triggers indexed
+  under its type. An identified event is taken from
   ingress by at most one trigger (a tombstone kept for
   `Policy::ingress_ms`, default seven days): one event starts at most one
   run.
