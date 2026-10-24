@@ -15,8 +15,8 @@
 use anyhow::{Context, ensure};
 use ouro_durable::{
     Admission, Arming, ChildLink, CommitFault, Compatibility, DefinitionTripped, FaultInjector, Fence, Fired, Firing,
-    IdentityConflict, Policy, Rearm, Refused, RunSnapshot, RunState, RunStore, TransactionalStore, Trigger,
-    memory::MemoryBackend, sqlite::SqliteBackend,
+    IdentityConflict, Overlap, OverlapGuard, Policy, Rearm, Refused, RunSnapshot, RunState, RunStore,
+    TransactionalStore, Trigger, memory::MemoryBackend, sqlite::SqliteBackend,
 };
 use owf::{
     durable::{CallState, Delivery, Record, StepOutcome, TaskResult},
@@ -131,7 +131,16 @@ pub fn schedule_trigger(at: Option<i64>, epoch: u64, slot: i64, catchup: i64, re
     Trigger {
         at_ms: at.map(|t| t * TICK),
         types: vec![],
-        state: json!({"epoch": epoch, "slot": slot, "catchup": catchup, "rearm": rearm}),
+        state: json!({"epoch": epoch, "slot": slot, "catchup": catchup, "rearm": rearm, "overlap": 0, "maxRuns": 2}),
+    }
+}
+fn overlap_policy(policy: i64) -> anyhow::Result<Overlap> {
+    match policy {
+        0 => Ok(Overlap::Skip),
+        1 => Ok(Overlap::Allow),
+        2 => Ok(Overlap::Queue),
+        3 => Ok(Overlap::Replace),
+        _ => anyhow::bail!("invalid model overlap policy"),
     }
 }
 fn ticks(ms: Option<i64>) -> i64 {
@@ -196,11 +205,21 @@ struct CopyView {
 }
 #[derive(Debug, PartialEq, Eq)]
 struct TriggerView {
+    overlap: i64,
+    max_runs: i64,
     epoch: i64,
     due: i64,
     slot: i64,
     catchup: i64,
     rearm: bool,
+}
+#[derive(Debug, PartialEq, Eq)]
+struct QueueView {
+    run: i64,
+    slot: i64,
+    epoch: i64,
+    input: i64,
+    refused: bool,
 }
 #[derive(Debug, PartialEq, Eq)]
 struct CatalogView {
@@ -219,6 +238,7 @@ pub struct View {
     runs: Vec<RunView>,
     copies: Vec<CopyView>,
     catalog: CatalogView,
+    queued: Option<QueueView>,
     admissions: Vec<i64>,
     fired: BTreeSet<(i64, i64)>,
     ingress: Vec<Option<i64>>,
@@ -276,6 +296,16 @@ struct ModelCopy {
 }
 #[derive(Deserialize)]
 struct ModelCatalog {
+    overlap: i64,
+    #[serde(rename = "maxRuns")]
+    max_runs: i64,
+    queued: i64,
+    #[serde(rename = "queueSlot")]
+    queue_slot: i64,
+    #[serde(rename = "queueInput")]
+    queue_input: i64,
+    #[serde(rename = "queueRefused")]
+    queue_refused: bool,
     active: i64,
     epoch: i64,
     faults: i64,
@@ -363,6 +393,8 @@ impl From<Machine> for View {
                 faults: c.faults,
                 tripped: c.tripped,
                 trigger: c.armed.then_some(TriggerView {
+                    overlap: c.overlap,
+                    max_runs: c.max_runs,
                     epoch: c.trigger_epoch,
                     due: c.due,
                     slot: c.slot,
@@ -371,6 +403,13 @@ impl From<Machine> for View {
                 }),
                 notices: c.notices,
             },
+            queued: (c.queued >= 0).then_some(QueueView {
+                run: c.queued,
+                slot: c.queue_slot,
+                epoch: c.epoch,
+                input: c.queue_input,
+                refused: c.queue_refused,
+            }),
             admissions: d.admissions,
             fired: d.fired,
             ingress,
@@ -411,6 +450,8 @@ impl State<StoreDriver> for View {
             .map(|t| -> anyhow::Result<TriggerView> {
                 let number = |k: &str| t.state[k].as_i64().with_context(|| format!("trigger {k}"));
                 Ok(TriggerView {
+                    overlap: number("overlap")?,
+                    max_runs: number("maxRuns")?,
                     epoch: number("epoch")?,
                     due: ticks(t.at_ms),
                     slot: number("slot")?,
@@ -459,6 +500,18 @@ impl State<StoreDriver> for View {
                 trigger,
                 notices,
             },
+            queued: store
+                .queued(SCHEDULE)?
+                .map(|a| -> anyhow::Result<QueueView> {
+                    Ok(QueueView {
+                        run: i64::try_from(run_index(&a.id).context("queued run id")?)?,
+                        slot: a.runtime["slot"][1].as_i64().context("queued slot")?,
+                        epoch: a.runtime["slot"][0].as_i64().context("queued epoch")?,
+                        input: a.input.as_i64().context("queued input")?,
+                        refused: a.runtime["refused"].as_bool().unwrap_or(false),
+                    })
+                })
+                .transpose()?,
             admissions,
             fired,
             ingress,
@@ -519,6 +572,8 @@ pub struct StoreDriver {
     pub directory: tempfile::TempDir,
     pub store: Arc<dyn RunStore>,
     pub policy: Policy,
+    overlap: i64,
+    max_runs: usize,
     faults: Arc<FaultInjector>,
     _database: Option<TestDatabase>,
     workers: [Worker; 2],
@@ -569,6 +624,8 @@ impl StoreDriver {
             directory,
             store,
             policy,
+            overlap: 0,
+            max_runs: 2,
             faults,
             _database: database,
             workers: Default::default(),
@@ -1010,6 +1067,25 @@ impl StoreDriver {
                     self.stop_terminal()?;
                 }
             }
+            "policy" => {
+                let Some(t) = self.store.trigger(SCHEDULE)? else { return Ok(()) };
+                if value < 0
+                    || t.state["slot"] != json!(0)
+                    || (0..RUNS).any(|r| self.store.get(&run_id(r)).ok().flatten().is_some())
+                {
+                    return Ok(());
+                }
+                let mut next = t.clone();
+                next.state["overlap"] = json!(value % 4);
+                next.state["maxRuns"] = json!(i + 1);
+                let (result, committed) =
+                    self.write(fault, |s| s.swap_trigger(SCHEDULE, Some(&t), Some(&next), &[], None, ms));
+                expect(result.map(drop))?;
+                if committed {
+                    self.overlap = value % 4;
+                    self.max_runs = i + 1;
+                }
+            }
             "activate" => {
                 if value < 0 {
                     return Ok(());
@@ -1020,7 +1096,9 @@ impl StoreDriver {
                 // Version 1 has the schedule.
                 let mut arming = Arming::default();
                 if version == 1 {
-                    let t = schedule_trigger(Some(self.now + 2), defs.epoch + 1, 0, catchup, rearm);
+                    let mut t = schedule_trigger(Some(self.now + 2), defs.epoch + 1, 0, catchup, rearm);
+                    t.state["overlap"] = json!(self.overlap);
+                    t.state["maxRuns"] = json!(self.max_runs);
                     arming.triggers.insert(SCHEDULE.into(), t);
                 }
                 let (result, _) = self.write(fault, |s| s.activate_with(NAME, version, defs.epoch, &arming));
@@ -1040,7 +1118,12 @@ impl StoreDriver {
                 let slot = t.state["slot"].as_i64().context("slot")?;
                 let catchup = t.state["catchup"].as_i64().context("catchup")?;
                 let rearm = t.state["rearm"].as_bool().context("rearm")?;
-                let moved = |at: Option<i64>| schedule_trigger(at, defs.epoch, slot + 1, catchup, rearm);
+                let moved = |at: Option<i64>| {
+                    let mut next = t.clone();
+                    next.at_ms = at.map(|at| at * TICK);
+                    next.state["slot"] = json!(slot + 1);
+                    next
+                };
                 let skip = moved(Some(self.now + 2));
                 // A missed slot under `catchup: none`, or a slot whose run id
                 // is taken, is skipped; the next slot is two ticks on.
@@ -1052,7 +1135,10 @@ impl StoreDriver {
                     }
                     return Ok(());
                 }
-                let admission = self.admission(r, value, 0, 0, Some((defs.epoch, slot)))?;
+                let mut admission = self.admission(r, value, 0, 0, Some((defs.epoch, slot)))?;
+                if op == "refuse" {
+                    admission.runtime["refused"] = json!(true);
+                }
                 let refused = (op == "refuse").then(|| Refused {
                     admission: admission.clone(),
                     // The model's unhandled failure (outcome 2), as `status(2)`.
@@ -1075,12 +1161,20 @@ impl StoreDriver {
                     // schedule's last run is unfinished.
                     busy: Some(&skip),
                     refused: refused.as_ref(),
-                    overlap: None,
+                    overlap: Some(OverlapGuard {
+                        policy: overlap_policy(self.overlap)?,
+                        max_concurrent_runs: self.max_runs,
+                        ceiling: &skip,
+                    }),
                 };
                 let (result, _) = self.write(fault, |s| s.fire(&firing, ms));
                 if !injected {
-                    ensure!(matches!(result?, Fired::Committed | Fired::Busy(_)), "a serial firing did not commit");
+                    ensure!(
+                        matches!(result?, Fired::Committed | Fired::Busy(_) | Fired::Queued | Fired::Ceiling),
+                        "a serial firing did not commit"
+                    );
                 }
+                self.stop_terminal()?;
             }
             "ingress" => {
                 let e = ingress_event(i, value);

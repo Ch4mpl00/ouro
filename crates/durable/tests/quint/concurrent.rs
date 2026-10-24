@@ -157,8 +157,13 @@ fn race(store: &dyn RunStore, p: &Prepared, k: usize, c: &Cmd) -> (i64, Option<F
         "fire" => {
             let Some(t) = p.schedule.as_ref().filter(|t| t.at_ms.is_some_and(|at| at <= ms)) else { return (0, None) };
             let slot = t.state["slot"].as_i64().unwrap();
-            let (catchup, rearm) = (t.state["catchup"].as_i64().unwrap(), t.state["rearm"].as_bool().unwrap());
-            let at = |at: Option<i64>| schedule_trigger(at, p.epoch, slot + 1, catchup, rearm);
+            let rearm = t.state["rearm"].as_bool().unwrap();
+            let at = |at: Option<i64>| {
+                let mut next = t.clone();
+                next.at_ms = at.map(|at| at * TICK);
+                next.state["slot"] = json!(slot + 1);
+                next
+            };
             let (next, busy) = (at(if rearm { None } else { Some(ms / TICK + 2) }), at(Some(ms / TICK + 2)));
             let again = Rearm { trigger: SCHEDULE.into(), delay_ms: 2 * TICK };
             let firing = Firing {
