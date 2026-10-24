@@ -1665,3 +1665,30 @@ async fn replacing_a_slot_signals_its_running_handler() {
     // The interpreter may drop an in-flight handler after signaling it; the
     // durable cancellation and prompt return are the required observations.
 }
+
+#[test]
+fn schedule_ceiling_is_supplied_by_the_host() {
+    let time = Arc::new(Time::default());
+    let config = Config { max_concurrent_runs: 1, ..Config::default() };
+    let rt =
+        Runtime::new(Arc::new(durable::memory::memory()), Arc::new(Registry::new()), config, time.clone(), tracer())
+            .unwrap();
+    let yaml = doc("host-ceiling", "schedule: { every: PT1M }\ndo: [ { pause: { wait: PT1H } } ]")
+        .replace("version: '1.0.0' }", "version: '1.0.0', metadata: { overlap: allow } }");
+    save(&rt, "host-ceiling", &yaml);
+    time.set(60_000);
+    assert_eq!(rt.fire_due().unwrap().len(), 1);
+    time.set(120_000);
+    assert!(rt.fire_due().unwrap().is_empty());
+    assert_eq!(rt.triggers("host-ceiling").unwrap()[0].1.state["skipped"][0]["overlap"], "ceiling");
+    assert!(
+        Runtime::new(
+            Arc::new(durable::memory::memory()),
+            Arc::new(Registry::new()),
+            Config { max_concurrent_runs: 0, ..Config::default() },
+            time,
+            tracer()
+        )
+        .is_err()
+    );
+}

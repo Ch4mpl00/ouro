@@ -25,11 +25,12 @@
 //! A slot's run id is derived from the slot (`schedule:<name>:every:<ms>`,
 //! `…:cron:<ms>`, `…:after:<epoch>:<n>`, `…:on:<digest of the events>`) and
 //! the trigger moves to the next slot in the commit that admits it, so
-//! several processes start each run once. A time slot whose previous run of
-//! the same trigger is still running or waiting is skipped (the store checks
-//! it in the firing's commit); so is a missed slot under `catchup: none`.
-//! A skip is kept in the trigger's state (`skips`, the last `skipped` slots)
-//! and traced.
+//! several processes start each run once. `document.metadata.overlap` chooses
+//! skip, allow, queue (one durable slot) or replace (normal cancellation)
+//! over the trigger's unfinished runs. The store decides it and the host's
+//! definition ceiling in the firing's commit. A missed slot under
+//! `catchup: none` is skipped too. Skips stay in the trigger's state (`skips`,
+//! the last `skipped` slots); time skips are traced.
 //!
 //! A slot whose run this host refuses to admit (a function the definition
 //! calls is not registered, or it no longer validates) is a per-definition

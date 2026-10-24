@@ -1069,11 +1069,13 @@ impl StoreDriver {
             }
             "policy" => {
                 let Some(t) = self.store.trigger(SCHEDULE)? else { return Ok(()) };
-                if value < 0
-                    || t.state["slot"] != json!(0)
-                    || (0..RUNS).any(|r| self.store.get(&run_id(r)).ok().flatten().is_some())
-                {
+                if value < 0 || t.state["slot"] != json!(0) {
                     return Ok(());
+                }
+                for r in 0..RUNS {
+                    if self.store.get(&run_id(r))?.is_some() {
+                        return Ok(());
+                    }
                 }
                 let mut next = t.clone();
                 next.state["overlap"] = json!(value % 4);

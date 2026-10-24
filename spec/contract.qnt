@@ -418,10 +418,17 @@ module contract {
     val errorAllow = flag(errorSkip,"OverlapAllow",not(eligible and c.overlap == 1 and room) or fired)
     val errorQueue = flag(errorAllow,"OverlapQueue",not(eligible and c.overlap == 2 and room and busy) or
       (if (c.queued < 0) buffered and d.queued == r and d.queueInput == value else skipped and d.queued == c.queued))
+    val queueStable = c.queued < 0 or d.queued < 0 or
+      (c.queued == d.queued and c.queueSlot == d.queueSlot and c.queueInput == d.queueInput)
+    val queueReady = c.queued >= 0 and not(b.db.runs.nth(c.queued).admitted) and d.armed and not(d.tripped) and
+      op != "activate" and not(Runs.exists(k => k != c.queued and live(a.db.runs.nth(k)) and a.db.runs.nth(k).scheduled)) and
+      Runs.filter(k => k != c.queued and live(a.db.runs.nth(k))).size() < c.maxRuns
+    val errorPromotion = flag(errorQueue,"OverlapQueue",queueStable and (not(queueReady) or
+      (d.queued < 0 and a.db.runs.nth(c.queued).admitted and a.db.runs.nth(c.queued).input == c.queueInput)))
     val replaced = Runs.filter(k => live(b.db.runs.nth(k)) and b.db.runs.nth(k).scheduled)
     val closed = replaced.fold(replaced,(a,k) => a.union(descendants(b,k)))
     val replaceRoom = Runs.filter(k => live(b.db.runs.nth(k)) and not(closed.contains(k))).size() < c.maxRuns
-    val errorReplace = flag(errorQueue,"OverlapReplace",not(eligible and c.overlap == 3) or
+    val errorReplace = flag(errorPromotion,"OverlapReplace",not(eligible and c.overlap == 3) or
       (fired == replaceRoom and skipped == not(replaceRoom) and closed.forall(k => a.db.runs.nth(k).outcome == 5)))
     val errorCapacity = flag(errorReplace,"OverlapCeiling",not(slotChanged and fired) or Runs.filter(k => live(a.db.runs.nth(k))).size() <= c.maxRuns)
     val rearmDue = Set("finish","timeout","conflict","cancel").contains(op) and old.outcome == 0 and execution.outcome != 0 and

@@ -871,6 +871,8 @@ fn fire(rows: &mut dyn Transaction, f: &Firing<'_>, now: i64, policy: &Policy) -
     let candidate = f.admit.first().or(f.refused.map(|r| &r.admission));
     if let (Some(guard), Some(a)) = (f.overlap, candidate) {
         anyhow::ensure!(f.admit.len() <= 1, "overlap policy requires one admission");
+        anyhow::ensure!(guard.max_concurrent_runs > 0, "schedule ceiling must be positive");
+        anyhow::ensure!(f.next.is_some() && f.busy.is_some(), "overlap firing requires next and busy triggers");
         let limit = if guard.policy == Overlap::Replace { usize::MAX } else { 1 };
         let live = rows.scan(&partition("trigger_live", f.key), "", None, limit)?;
         if guard.policy == Overlap::Replace {

@@ -1491,6 +1491,68 @@ fn overlap_policies(factory: &impl Fn(&str) -> anyhow::Result<TestStore>, report
         assert!(s.get("slot1")?.unwrap().ended_ms.is_some());
         report.crash_points += 1;
     }
+    for trip in [false, true] {
+        let t = factory("overlap-epoch")?;
+        report.cases += 1;
+        let s = &t.store;
+        let d = s.save_definition("workflow", "original")?;
+        let armed = Arming { triggers: BTreeMap::from([("policy".into(), slot(1))]) };
+        s.activate_with("workflow", d.version, 0, &armed)?;
+        fire(&**s, Overlap::Queue, 1, 10, None)?;
+        fire(&**s, Overlap::Queue, 2, 10, None)?;
+        assert!(s.queued("policy")?.is_some());
+        if trip {
+            let f = s.claim("slot1", 2)?.unwrap();
+            s.finish(&f, &Status::Faulted(WorkflowError::runtime("trip")), 3, 1)?;
+            assert!(s.trigger("policy")?.is_none());
+        } else {
+            s.activate_with(
+                "workflow",
+                d.version,
+                1,
+                &Arming { triggers: BTreeMap::from([("policy".into(), slot(10))]) },
+            )?;
+            s.cancel("slot1", 3)?;
+            assert_eq!(s.trigger("policy")?, Some(slot(10)));
+        }
+        assert!(s.queued("policy")?.is_none(), "a replaced epoch discards its buffer");
+        assert!(s.get("slot2")?.is_none(), "an old buffered slot cannot be resurrected");
+    }
+    // Independent trigger CAS operations still contend on the definition's
+    // capacity range, so several workers cannot overbook its last permits.
+    let t = factory("overlap-ceiling-race")?;
+    report.cases += 1;
+    let barrier = Arc::new(std::sync::Barrier::new(8));
+    let mut workers = Vec::new();
+    for n in 0..8 {
+        let k = format!("race{n}");
+        t.store.swap_trigger(&k, None, Some(&slot(1)), &[], None, 0)?;
+        let s = (t.reopen)()?;
+        let barrier = barrier.clone();
+        workers.push(std::thread::spawn(move || {
+            let timer = Trigger { at_ms: Some(1), types: vec!["tick".into()], state: json!(1) };
+            barrier.wait();
+            s.fire(
+                &Firing {
+                    key: &k,
+                    expected: Some(&timer),
+                    next: Some(&timer),
+                    admit: &[admission(&k)],
+                    busy: Some(&timer),
+                    overlap: Some(OverlapGuard { policy: Overlap::Allow, max_concurrent_runs: 2, ceiling: &timer }),
+                    ..Firing::default()
+                },
+                1,
+            )
+        }));
+    }
+    let answers = workers.into_iter().map(|w| w.join().unwrap()).collect::<anyhow::Result<Vec<_>>>()?;
+    assert_eq!(answers.iter().filter(|a| **a == Fired::Committed).count(), 2);
+    assert_eq!(answers.iter().filter(|a| **a == Fired::Ceiling).count(), 6);
+    assert_eq!(t.store.list(None, "race")?.len(), 2);
+    let rows = t.backend.snapshot()?.rows;
+    assert_eq!(rows.keys().filter(|(kind, _)| kind.starts_with("live_name:")).count(), 2);
+    assert_eq!(rows.keys().filter(|(kind, _)| kind.starts_with("trigger_live:")).count(), 2);
     report.witnesses.insert("all overlap policies and queue promotion survive decision/admission crashes");
     Ok(())
 }

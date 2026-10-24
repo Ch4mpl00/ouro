@@ -1005,9 +1005,35 @@ Decision 5 and the epoch rule of decision 3 were revised on 2026-10-24
    never fires.
    Activating a version without `schedule` removes its triggers in that
    transaction; runs already started finish. Missed slots: `catchup: latest`
-   (default, one late run) or `none`. Overlap: a slot whose previous run of the
-   same schedule is still running is skipped, with a record. A slot whose run
-   the host refuses to admit (2026-10-24, [#15][I15]: a function the
+   (default, one late run) or `none`. `document.metadata.overlap` selects the
+   policy for unfinished runs of the same trigger, including waiting runs and
+   runs of earlier epochs: `skip` (default) records a skip, `allow` admits the
+   slot concurrently, `queue` durably buffers one slot until the trigger has
+   no unfinished runs, and `replace` cancels its unfinished runs through the
+   normal cancellation transition (owned descendants included) and admits
+   the new slot in that commit. A full buffer skips later slots with a record;
+   it never overwrites the buffered admission, input or bindings. Promotion
+   commits with the terminal transition that releases capacity; admission
+   time and workflow deadlines start at promotion. New activation or a trip
+   removes the replaced trigger's buffered slot, so it cannot fire later.
+   The host's `Config::max_concurrent_runs` (default 10, positive) bounds a
+   schedule admission against all unfinished runs of its definition, across
+   trigger kinds and epochs. A slot at the ceiling is skipped with a record
+   (`overlap: ceiling`); replacement first releases its cancelled runs' capacity.
+   A queue also respects the ceiling at buffering and promotion, using the
+   host ceiling captured with the buffer. Workers sharing a store must use
+   the same host ceiling. Explicit starts and children count toward it but
+   are not refused by this schedule policy.
+   These policies apply equally to `every`, `cron`, `after` and `on`. A matched
+   event is taken from ingress even when its slot is skipped or buffered.
+   Under every policy the original slot remains the run's idempotency key:
+   one slot never yields two runs, also after a crash or an ambiguous reply.
+   Policy decisions, trigger movement, ingress identity, buffering,
+   cancellation and admission are atomic; none may commit alone.
+   A refused admission follows the same overlap decision. Under `queue` its
+   refusal is pinned with the buffer; promotion records the failed run and
+   counts the fault then. Otherwise, after the overlap guard permits it,
+   a run the host refuses to admit (2026-10-24, [#15][I15]: a function the
    definition calls is not registered, or it no longer validates) is
    consumed in the firing's transaction, which admits its run already ended
    with the refusal as an unhandled fault: `Admit` and `Finish` of that run
