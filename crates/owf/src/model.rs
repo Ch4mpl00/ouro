@@ -9,7 +9,8 @@
 // container/script/shell through a host process runner), set, switch,
 // try/catch with retry (limit.attempt.duration included), wait;
 // input/output/export transforms and schemas (inline or a host-resolved
-// `resource`); if/then/timeout; schedule (every, cron, after, on);
+// `resource`); if/then/timeout; schedule (every, cron, after, on; missed
+// slots per `document.metadata.catchup`, an extension: `latest` | `none`);
 // use.functions/errors/retries/timeouts/extensions/secrets; evaluate (jq,
 // strict). Runtime arguments: $context, $input, $output, $task, $workflow,
 // $runtime, and $secrets in `input.from` only.
@@ -93,6 +94,19 @@ pub struct Schedule {
     pub after: Option<Duration>,
     pub on: Option<Strategy>,
     pub read: Read,
+    /// `document.metadata.catchup` (an extension): what becomes of `every`
+    /// and `cron` slots missed while no scheduler ran.
+    pub catchup: Catchup,
+}
+
+/// A missed slot is one whose following slot is due as well.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Catchup {
+    /// One late run for the missed slots (the default).
+    #[default]
+    Latest,
+    /// Skip missed slots (with a record); run at the next one.
+    None,
 }
 
 /// `listen`: what to consume, how to read it, what to do with each event.
@@ -527,7 +541,18 @@ impl Parser {
         let input = m.get("input").map(|i| self.input(i, "/input"));
         let output = m.get("output").map(|o| self.output(o, "/output"));
         let timeout = m.get("timeout").and_then(|t| self.timeout(t, "/timeout"));
-        let schedule = m.get("schedule").and_then(|s| self.schedule(s));
+        let mut schedule = m.get("schedule").and_then(|s| self.schedule(s));
+        // CHOICE: the OWS `schedule` object admits no extra property, so the
+        // missed-slot policy is the document's metadata.
+        match m.get("document").and_then(|d| d.get("metadata")).and_then(|d| d.get("catchup")) {
+            None => {}
+            Some(c) => match (c.as_str(), schedule.as_mut()) {
+                (Some(_), None) => self.fail("/document/metadata/catchup", "catchup applies only with a schedule"),
+                (Some("latest"), Some(s)) => s.catchup = Catchup::Latest,
+                (Some("none"), Some(s)) => s.catchup = Catchup::None,
+                _ => self.fail("/document/metadata/catchup", "expected latest or none"),
+            },
+        }
         Some(Workflow { document: document?, input, output, uses, tasks, timeout, schedule, definition: v.clone() })
     }
 
@@ -981,7 +1006,7 @@ impl Parser {
         if every.is_none() && after.is_none() && cron.is_none() && on.is_none() {
             self.fail(at, "a schedule needs every, cron, after or on");
         }
-        Some(Schedule { every, cron, after, on, read })
+        Some(Schedule { every, cron, after, on, read, catchup: Catchup::Latest })
     }
 
     fn for_task(&mut self, m: &Map<String, Value>, at: &str) -> Option<Kind> {

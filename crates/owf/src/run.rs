@@ -545,11 +545,13 @@ fn datetime(t: DateTime<Utc>) -> Value {
 
 /// Runs `wf` on `input` to completion, a fault, or `cancel`.
 pub async fn run(host: &Host, wf: &Workflow, run_id: &str, input: Value, cancel: &CancellationToken) -> Outcome {
-    execute(host, wf, run_id, input, cancel, None).await
+    execute(host, wf, run_id, input, cancel, None, None).await
 }
 
 /// Replays saved checkpoints, then executes until completion or a durable
 /// wait. The same run must always use the same definition and original input.
+/// A first execution starts the workflow's clock now (`resume_from` fixes it
+/// at admission instead).
 pub async fn resume(
     host: &Host,
     wf: &Workflow,
@@ -558,7 +560,22 @@ pub async fn resume(
     cancel: &CancellationToken,
     journal: &dyn Journal,
 ) -> Outcome {
-    execute(host, wf, run_id, input, cancel, Some(journal)).await
+    execute(host, wf, run_id, input, cancel, Some(journal), None).await
+}
+
+/// `resume` for a run admitted at `admitted_ms`: its workflow `timeout` and
+/// `$workflow.startedAt` count from admission, so a run that waited for a
+/// worker longer than its timeout times out before any task runs.
+pub async fn resume_from(
+    host: &Host,
+    wf: &Workflow,
+    run_id: &str,
+    input: Value,
+    admitted_ms: i64,
+    cancel: &CancellationToken,
+    journal: &dyn Journal,
+) -> Outcome {
+    execute(host, wf, run_id, input, cancel, Some(journal), Some(admitted_ms)).await
 }
 
 async fn execute(
@@ -568,6 +585,7 @@ async fn execute(
     input: Value,
     cancel: &CancellationToken,
     journal: Option<&dyn Journal>,
+    admitted_ms: Option<i64>,
 ) -> Outcome {
     let interrupted = |e: String| Outcome {
         status: Status::Interrupted(WorkflowError::runtime(e)),
@@ -634,7 +652,9 @@ async fn execute(
                 tasks_run: tasks,
             };
         }
-        None if records.is_empty() => (host.clock.now().timestamp_millis(), host.runtime.clone()),
+        None if records.is_empty() => {
+            (admitted_ms.unwrap_or_else(|| host.clock.now().timestamp_millis()), host.runtime.clone())
+        }
         None => {
             return Outcome {
                 status: Status::Interrupted(WorkflowError::runtime("missing execution record")),
@@ -652,6 +672,7 @@ async fn execute(
         Record::Call { .. } => key.ends_with("#call"),
         Record::Winner { .. } => key.ends_with("#winner"),
         Record::Event { .. } => key.contains("#event[") || key.ends_with("#child"),
+        Record::Expired { .. } => key.starts_with("mailbox#expired["),
         Record::Timer { .. } => key.ends_with("#wait") || key.contains("#retry[") || key.contains("#attempt["),
         Record::Retry { .. } => key.contains("#retry-decision["),
     }) {

@@ -54,6 +54,9 @@
 //!    snapshot. It may span SQLite rows, but retains every result, decision,
 //!    pending operation and wait still needed for replay and deduplication.
 //!    Deleting old snapshots must not delete that evidence.
+//!    Deadlines are absolute instants fixed when they start: the workflow's
+//!    `timeout` from the run's admission (`resume_from`), a task's from its
+//!    start, so moving between processes never resets them.
 //!
 //! ## External calls
 //!
@@ -132,7 +135,10 @@ use std::collections::BTreeMap;
 
 /// 2: a listen keeps every consumed event (`#event[i]`), child runs are
 /// joined at `#child`, attempts may have a deadline (`#attempt[k]`).
-pub const VERSION: u32 = 2;
+/// 3: the workflow deadline counts from admission (`Execution::started_ms`
+/// is the admission instant), and a mailbox copy that expired before a listen
+/// took it leaves `Record::Expired` at `mailbox#expired[i]`.
+pub const VERSION: u32 = 3;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -202,6 +208,11 @@ pub enum Record {
         state: CallState,
     },
     Event {
+        event: Value,
+    },
+    /// A mailbox event no listen took before it expired: the store's
+    /// observable evidence (`mailbox#expired[i]`), never consumed by a task.
+    Expired {
         event: Value,
     },
     Timer {
