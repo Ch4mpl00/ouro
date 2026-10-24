@@ -655,6 +655,30 @@ reuse or payload-based guessing. **Mutant:** serve the first branch's decision t
 every later fork. **Check:** same-value new branches, different-value branches and
 duplicate branch requests. This is not OWF's parallel `fork` construct.
 
+### B. Budgets (1)
+
+#### B1 — A run tree never spends more than its budget [P, safety]
+
+A run tree is a root and its owned descendants. Its budget is one counter; each
+`Spend(run, key, limit)` of a tree member commits, with the member's current
+fenced authority, one decision `Budget(granted, spent)` at `key` in that run's
+evidence and the counter it moved, atomically. Always: the counter is at most
+every granted spender's `limit` (so at most the host ceiling the runtime passes);
+for a live root it equals the number of granted decisions of its tree; a decision,
+once committed, is immutable and returned again for the same key; a refusal
+happens only when the counter has reached the spender's limit. A restart, a
+replaced owner or a lost reply neither resets the counter nor spends a unit
+twice. The counter ends with its root (whose descendants end in the same commit).
+
+What a unit stands for (a jump to a named task) is the interpreter's, not the
+store's. **Source:** issue #8, [README][README]. **Fault:** boundary crash and
+ambiguous commit between the decision and the counter; concurrent spenders of one
+tree; a stale owner. **Mutant:** grant past the limit, or move the counter in a
+separate commit. **Check:** the contract model's `spend` and its B1 monitor, the
+serial bridge projecting every decision, conformance (restarts, failed commits,
+parent/child/grandchild, a race at the last unit) and the interpreter's
+generated budgets across crashes.
+
 ### L. Progress obligations (5)
 
 These are temporal properties, not state invariants in the narrow model-checking
@@ -735,7 +759,9 @@ listed ID says which property should detect a bad consequence of that fault;
 fault injection itself is not a violation. `—` means no direct oracle assigned in
 that cell, not a proved non-implication. `*` marks a conditional/open guarantee.
 The matrix is split horizontally for readability; together the panels contain
-all 38 invariant columns and the same fault rows.
+all 38 invariant columns and the same fault rows. B1 (budgets, added for issue
+#8) is predicted in the boundary crash, ambiguous commit, duplicate delivery,
+concurrent racers, lease expiry and storage disconnect rows.
 
 Boundary crash B means injecting immediately before/after admission, intent,
 dispatch, external effect, response, result/checkpoint commit, event acceptance/
