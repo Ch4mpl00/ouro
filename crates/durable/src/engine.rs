@@ -54,6 +54,8 @@ struct StoredRun {
     /// trigger that differs at the run's end was replaced (a later epoch).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     rearm: Option<(Rearm, Trigger)>,
+    /// Live membership of the trigger that admitted this run, across epochs.
+    trigger: Option<String>,
     /// Copies accepted so far, the next copy's sequence number. Never reset,
     /// so a copy's sequence is also its position (`mailbox#expired[i]`).
     accepted: u64,
@@ -213,6 +215,10 @@ fn indexes(s: &StoredRun) -> Rows {
     let value = json!(id);
     keys.insert(key(&partition("name", &s.run.admission.name), id), value.clone());
     if s.run.ended_ms.is_none() {
+        keys.insert(key(&partition("live_name", &s.run.admission.name), id), value.clone());
+        if let Some(trigger) = &s.trigger {
+            keys.insert(key(&partition("trigger_live", trigger), id), value.clone());
+        }
         let due = if s.run.state == RunState::Running { s.run.lease_until_ms } else { Some(s.run.wake_at_ms) };
         if let Some(due) = due {
             keys.insert(key("due", &timed(due, id)), value.clone());
@@ -342,6 +348,7 @@ fn admitted(rows: &mut dyn Transaction, admission: &Admission, now: i64) -> anyh
         listeners: BTreeMap::new(),
         subscriptions: BTreeMap::new(),
         rearm: None,
+        trigger: None,
         accepted: 0,
         pending: BTreeMap::new(),
         published: 0,
@@ -704,6 +711,71 @@ fn forget(rows: &mut dyn Transaction, s: &mut StoredRun) -> anyhow::Result<usize
 
 // ── 4. triggers, ingress and activation epochs ─────────────────────────────
 
+/// One buffered slot. Admission and bindings are pinned before buffering;
+/// promotion and the predecessor's terminal transition share a commit.
+#[derive(Serialize, Deserialize)]
+struct Queued {
+    version: u32,
+    admission: Admission,
+    rearm: Option<Rearm>,
+    max_concurrent_runs: usize,
+    failure: Option<(WorkflowError, u32)>,
+}
+fn queued(rows: &mut dyn Transaction, k: &str) -> anyhow::Result<Option<Queued>> {
+    let q = get::<Queued>(rows, "trigger_queue", k)?;
+    anyhow::ensure!(q.as_ref().is_none_or(|q| q.version == 1), "unsupported trigger queue layout");
+    Ok(q)
+}
+fn remove_queue(rows: &mut dyn Transaction, k: &str) -> anyhow::Result<()> {
+    if let Some(q) = queued(rows, k)? {
+        rows.delete("trigger_queue", k)?;
+        rows.delete(&partition("queue_name", &q.admission.name), k)?;
+    }
+    Ok(())
+}
+fn capacity(rows: &mut dyn Transaction, name: &str, max: usize) -> anyhow::Result<bool> {
+    Ok(max > 0 && rows.scan(&partition("live_name", name), "", None, max)?.len() < max)
+}
+fn admit_firing(
+    rows: &mut dyn Transaction,
+    k: &str,
+    a: &Admission,
+    rearm: Option<&Rearm>,
+    next: Option<&Trigger>,
+    now: i64,
+) -> anyhow::Result<()> {
+    if insert(rows, a, now)? {
+        let mut s = run(rows, &a.id)?;
+        s.trigger = Some(k.into());
+        s.rearm = rearm.zip(next).map(|(r, t)| (r.clone(), t.clone()));
+        store_run(rows, &s)?;
+    }
+    put(rows, "trigger_run", k, &a.id)
+}
+fn drain_queues(rows: &mut dyn Transaction, name: &str, now: i64) -> anyhow::Result<()> {
+    for ((_, k), _) in rows.scan(&partition("queue_name", name), "", None, usize::MAX)? {
+        let Some(q) = queued(rows, &k)? else {
+            // A prior promotion in this batch may trip and disarm the
+            // definition, removing the remaining buffered slots.
+            anyhow::ensure!(rows.get(&partition("queue_name", name), &k)?.is_none(), "dangling queue index");
+            continue;
+        };
+        if !rows.scan(&partition("trigger_live", &k), "", None, 1)?.is_empty()
+            || !capacity(rows, name, q.max_concurrent_runs)?
+        {
+            continue;
+        }
+        let t = get::<Trigger>(rows, "trigger", &k)?.ok_or_else(|| anyhow::anyhow!("queue without trigger"))?;
+        remove_queue(rows, &k)?;
+        if let Some((error, breaker_threshold)) = q.failure {
+            refuse(rows, &Refused { admission: q.admission, error, breaker_threshold }, now)?;
+        } else {
+            admit_firing(rows, &k, &q.admission, q.rearm.as_ref(), Some(&t), now)?;
+        }
+    }
+    Ok(())
+}
+
 fn trigger_indexes(key_: &str, t: &Trigger) -> Rows {
     let mut keys = Rows::new();
     if let Some(at) = t.at_ms {
@@ -750,6 +822,9 @@ fn indexed_triggers(rows: &mut dyn Transaction, keys: Rows) -> anyhow::Result<Ve
 }
 /// Replaces the triggers a definition owns with `wanted`, in this commit.
 fn arm(rows: &mut dyn Transaction, defs: &mut Definitions, wanted: &BTreeMap<String, Trigger>) -> anyhow::Result<()> {
+    for k in &defs.triggers {
+        remove_queue(rows, k)?;
+    }
     for k in defs.triggers.iter().filter(|k| !wanted.contains_key(*k)) {
         let current: Option<Trigger> = get(rows, "trigger", k)?;
         store_trigger(rows, k, current.as_ref(), None)?;
@@ -784,14 +859,55 @@ fn fire(rows: &mut dyn Transaction, f: &Firing<'_>, now: i64, policy: &Policy) -
     if current.as_ref() != f.expected {
         return Ok(Fired::Changed);
     }
-    // Overlap: the previous run of this trigger is still running or waiting.
-    if let Some(busy) = f.busy
+    // Validate ingress before any policy outcome: a skipped or buffered event
+    // is consumed too, and a conflicting payload must never cancel a run.
+    if let Some(event) = f.ingress
+        && tombstone(rows, event, now)?.2
+    {
+        return Ok(Fired::Ingested);
+    }
+    let mut disposition = Fired::Committed;
+    let mut next = f.next;
+    let candidate = f.admit.first().or(f.refused.map(|r| &r.admission));
+    if let (Some(guard), Some(a)) = (f.overlap, candidate) {
+        anyhow::ensure!(f.admit.len() <= 1, "overlap policy requires one admission");
+        let limit = if guard.policy == Overlap::Replace { usize::MAX } else { 1 };
+        let live = rows.scan(&partition("trigger_live", f.key), "", None, limit)?;
+        if guard.policy == Overlap::Replace {
+            for id in live.values() {
+                let id = id.as_str().ok_or_else(|| anyhow::anyhow!("invalid trigger run index"))?;
+                cancel_run(rows, id, now)?;
+            }
+        }
+        if !capacity(rows, &a.name, guard.max_concurrent_runs)? {
+            next = Some(guard.ceiling);
+            disposition = Fired::Ceiling;
+        } else if !live.is_empty() && guard.policy != Overlap::Allow && guard.policy != Overlap::Replace {
+            if guard.policy == Overlap::Queue && queued(rows, f.key)?.is_none() {
+                let q = Queued {
+                    version: 1,
+                    admission: a.clone(),
+                    rearm: f.rearm.cloned(),
+                    max_concurrent_runs: guard.max_concurrent_runs,
+                    failure: f.refused.map(|r| (r.error.clone(), r.breaker_threshold)),
+                };
+                put(rows, "trigger_queue", f.key, &q)?;
+                rows.put(&partition("queue_name", &a.name), f.key, &json!(f.key))?;
+                disposition = Fired::Queued;
+            } else {
+                next = f.busy;
+                disposition = Fired::Busy(live.values().next().and_then(Value::as_str).unwrap_or_default().into());
+            }
+        }
+    } else if f.overlap.is_some() && !f.admit.is_empty() {
+        anyhow::bail!("overlap policy requires one admission");
+    } else if let Some(busy) = f.busy
         && (!f.admit.is_empty() || f.refused.is_some())
         && let Some(last) = get::<String>(rows, "trigger_run", f.key)?
         && find_run(rows, &last)?.is_some_and(|s| s.run.ended_ms.is_none())
     {
-        store_trigger(rows, f.key, current.as_ref(), Some(busy))?;
-        return Ok(Fired::Busy(last));
+        next = Some(busy);
+        disposition = Fired::Busy(last);
     }
     if let Some(event) = f.ingress {
         let (k, old, used) = tombstone(rows, event, now)?;
@@ -805,24 +921,21 @@ fn fire(rows: &mut dyn Transaction, f: &Firing<'_>, now: i64, policy: &Policy) -
         put(rows, "ingress", &k, &Tombstone { payload: payload(event), expires_at_ms })?;
         rows.put("ingress_due", &timed(expires_at_ms, &k), &json!(k))?;
     }
-    store_trigger(rows, f.key, current.as_ref(), f.next)?;
-    for a in f.admit {
-        if insert(rows, a, now)?
-            && let (Some(rearm), Some(next)) = (f.rearm, f.next)
-        {
-            let mut s = run(rows, &a.id)?;
-            s.rearm = Some((rearm.clone(), next.clone()));
-            store_run(rows, &s)?;
+    store_trigger(rows, f.key, current.as_ref(), next)?;
+    if disposition == Fired::Committed {
+        for a in f.admit {
+            admit_firing(rows, f.key, a, f.rearm, next, now)?;
         }
     }
-    if let Some(r) = f.refused {
+    if disposition == Fired::Committed
+        && let Some(r) = f.refused
+    {
         refuse(rows, r, now)?;
+        put(rows, "trigger_run", f.key, &r.admission.id)?;
     }
-    if let Some(id) = f.admit.last().or(f.refused.map(|r| &r.admission)).map(|a| &a.id) {
-        put(rows, "trigger_run", f.key, id)?;
-    }
-    Ok(Fired::Committed)
+    Ok(disposition)
 }
+
 fn activate(
     rows: &mut dyn Transaction,
     name: &str,
@@ -896,6 +1009,7 @@ fn terminate(rows: &mut dyn Transaction, id: &str, status: &Status, now: i64) ->
         store_trigger(rows, &rearm.trigger, Some(&t), Some(&due))?;
     }
     // Iterative cascade avoids stack growth on arbitrarily nested child runs.
+    let mut names = std::collections::BTreeSet::from([snapshot.run.admission.name.clone()]);
     let mut parents = vec![id.to_string()];
     while let Some(parent) = parents.pop() {
         for mut child in indexed_runs(rows, &partition("children", &parent), "", None, usize::MAX)? {
@@ -907,12 +1021,25 @@ fn terminate(rows: &mut dyn Transaction, id: &str, status: &Status, now: i64) ->
             child.awaits.clear();
             child.listeners.clear();
             child.subscriptions.clear();
+            names.insert(child.run.admission.name.clone());
             parents.push(child.run.admission.id.clone());
             store_run(rows, &child)?;
             lifecycle(rows, &child.run.admission.id, &Status::Cancelled, now)?;
         }
     }
-    lifecycle(rows, id, status, now)
+    lifecycle(rows, id, status, now)?;
+    for name in names {
+        drain_queues(rows, &name, now)?;
+    }
+    Ok(())
+}
+fn cancel_run(rows: &mut dyn Transaction, id: &str, now: i64) -> anyhow::Result<bool> {
+    let Some(s) = find_run(rows, id)? else { return Ok(false) };
+    if s.run.ended_ms.is_some() {
+        return Ok(false);
+    }
+    terminate(rows, id, &Status::Cancelled, now)?;
+    Ok(true)
 }
 /// The notice of a trip, keyed by its time, then the definition and epoch.
 fn notice_key(name: &str, trip: &Trip) -> String {
@@ -1162,6 +1289,9 @@ impl RunStore for TransactionalStore {
             indexed_triggers(rows, keys)
         })
     }
+    fn queued(&self, key: &str) -> anyhow::Result<Option<Admission>> {
+        self.update(|rows| Ok(queued(rows, key)?.map(|q| q.admission)))
+    }
     fn fire(&self, firing: &Firing<'_>, now: i64) -> anyhow::Result<Fired> {
         self.update(|rows| fire(rows, firing, now, &self.policy))
     }
@@ -1325,17 +1455,9 @@ impl RunStore for TransactionalStore {
     }
 
     fn cancel(&self, id: &str, now: i64) -> anyhow::Result<bool> {
-        self.update(|rows| {
-            let Some(s) = find_run(rows, id)? else {
-                return Ok(false);
-            };
-            if s.run.ended_ms.is_some() {
-                return Ok(false);
-            }
-            terminate(rows, id, &Status::Cancelled, now)?;
-            Ok(true)
-        })
+        self.update(|rows| cancel_run(rows, id, now))
     }
+
     fn sweep(&self, now: i64, kept: i64) -> anyhow::Result<Swept> {
         anyhow::ensure!(kept >= 0, "negative retention");
         self.update(|rows| {

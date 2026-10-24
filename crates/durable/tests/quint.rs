@@ -1075,6 +1075,7 @@ impl StoreDriver {
                     // schedule's last run is unfinished.
                     busy: Some(&skip),
                     refused: refused.as_ref(),
+                    overlap: None,
                 };
                 let (result, _) = self.write(fault, |s| s.fire(&firing, ms));
                 if !injected {

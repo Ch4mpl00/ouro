@@ -154,7 +154,9 @@ use std::collections::BTreeMap;
 /// and a run's first refusal `Record::Exceeded` at `EXCEEDED`.
 /// 6: a call record no longer carries a read/write effect, nor do a run's
 /// pinned function bindings.
-pub const VERSION: u32 = 6;
+/// 7: run rows track their admitting trigger and maintain live-run indexes;
+/// one buffered firing per trigger is stored separately (queue layout 1).
+pub const VERSION: u32 = 7;
 
 /// The key of a run's `Record::Exceeded`.
 pub const EXCEEDED: &str = "exceeded";

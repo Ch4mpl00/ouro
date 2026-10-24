@@ -15,6 +15,7 @@ pub use backend::{
     AtomicBackend, CommitFault, Conflict, FaultInjector, IoCounts, Key, Metrics, Rows, Snapshot, Transaction,
     TransactionalStore,
 };
+pub use owf::model::Overlap;
 use owf::{
     durable::{Journal, Record},
     run::{Events, Status, WorkflowError},
@@ -291,6 +292,10 @@ pub struct Firing<'a> {
     /// consumed like an admitted one: overlap (`busy`), ingress and the next
     /// trigger apply unchanged.
     pub refused: Option<&'a Refused>,
+    /// Policy and per-definition host ceiling. With `None`, the legacy
+    /// exclusive `busy` guard applies. With `Some`, `busy` records an overlap
+    /// skip and `ceiling` records a capacity skip. One admission per firing.
+    pub overlap: Option<OverlapGuard<'a>>,
 }
 
 /// A trigger's run the host refused to admit: a function the definition
@@ -311,6 +316,13 @@ pub struct Refused {
     pub breaker_threshold: u32,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct OverlapGuard<'a> {
+    pub policy: Overlap,
+    pub max_concurrent_runs: usize,
+    pub ceiling: &'a Trigger,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Fired {
     Committed,
@@ -320,6 +332,10 @@ pub enum Fired {
     Busy(String),
     /// The ingress event was already used; nothing was written.
     Ingested,
+    /// One admission was durably buffered; it starts after the live runs end.
+    Queued,
+    /// The host ceiling refused this slot; `ceiling` was stored instead.
+    Ceiling,
 }
 
 /// The type of the workflow error a tripped definition answers a new run
@@ -463,6 +479,10 @@ pub trait RunStore: Send + Sync {
         anyhow::bail!("this store does not support triggers")
     }
     /// The claim-once primitive (`Firing`).
+    /// The single buffered admission of a trigger, pinned when queued.
+    fn queued(&self, _key: &str) -> anyhow::Result<Option<Admission>> {
+        Ok(None)
+    }
     fn fire(&self, _firing: &Firing<'_>, _now_ms: i64) -> anyhow::Result<Fired> {
         anyhow::bail!("this store does not support triggers")
     }
@@ -476,7 +496,8 @@ pub trait RunStore: Send + Sync {
         rearm: Option<&Rearm>,
         now_ms: i64,
     ) -> anyhow::Result<bool> {
-        let firing = Firing { key, expected, next, admit, rearm, ingress: None, busy: None, refused: None };
+        let firing =
+            Firing { key, expected, next, admit, rearm, ingress: None, busy: None, refused: None, overlap: None };
         Ok(self.fire(&firing, now_ms)? == Fired::Committed)
     }
     /// Terminal outcomes of runs admitted in the active version's current

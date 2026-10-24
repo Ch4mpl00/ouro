@@ -170,6 +170,7 @@ fn race(store: &dyn RunStore, p: &Prepared, k: usize, c: &Cmd) -> (i64, Option<F
                 ingress: None,
                 busy: Some(&busy),
                 refused: None,
+                overlap: None,
             };
             i64::from(store.fire(&firing, ms).unwrap() == Fired::Committed)
         }

@@ -330,7 +330,7 @@ impl Runtime {
                 self.skip(name, kind, slot, "overlap");
                 Ok(None)
             }
-            Fired::Changed | Fired::Ingested => Ok(None),
+            Fired::Changed | Fired::Ingested | Fired::Queued | Fired::Ceiling => Ok(None),
         }
     }
 
@@ -515,7 +515,7 @@ fn offer(
         }
         match store.fire(&firing, now)? {
             Fired::Committed => return Ok(Taken::Yes(id)),
-            Fired::Ingested | Fired::Busy(_) => return Ok(Taken::Yes(None)),
+            Fired::Ingested | Fired::Busy(_) | Fired::Queued | Fired::Ceiling => return Ok(Taken::Yes(None)),
             Fired::Changed => match store.trigger(k)? {
                 Some(t) => trigger = t,
                 None => return Ok(Taken::No),
