@@ -1128,7 +1128,7 @@ impl ExecutionFunctions {
             return Err(CallFailure::NotExecuted(WorkflowError::validation(format!("unknown function {name}"))));
         }
         let mut span = self.spans.function(name, info.reference, info.attempt);
-        let admission = &self.definition;
+        let (definition, version) = &self.definition;
         let context = FunctionContext {
             cancel: info.cancel.clone(),
             run_id: info.run_id.into(),
@@ -1138,8 +1138,8 @@ impl ExecutionFunctions {
             span: span.context.clone(),
             input: info.input.clone(),
             function: name.into(),
-            definition: admission.0.clone(),
-            version: admission.1,
+            definition: definition.clone(),
+            version: *version,
             delivery: info.delivery,
             meter: self.metrics.meter.clone(),
         };
