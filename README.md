@@ -219,7 +219,7 @@ pending calls retain their declared delivery and unknown-outcome rules.
 
 `pause(request, definition, note)` makes a manual trip (`reason.type =
 "manual"`, with actor, reason and note), stops every admission path and
-suspends the current triggers in that transaction. Existing runs finish.
+suspends the current triggers and buffered admissions in that transaction. Existing runs finish.
 `resume` clears a manual trip and restores its exact triggers, epoch and
 previous breaker count. Overdue timers follow their existing catch-up policy.
 Pausing an already tripped definition preserves its first report; an automatic
@@ -231,7 +231,7 @@ and replaces its saved triggers in a new epoch.
 slot or ingress identity. Fenced steps and dispatch boundaries refuse further
 progress. In-flight workers release for recovery on a boundary or heartbeat,
 without spending their interruption budget; clearing the flag resumes from
-the same evidence. New execution can be authorized only while the flag is
+the same evidence. Clearing promotes a bounded batch of deferred queues; subsequent due-run polls drain remaining indexed batches. New execution can be authorized only while the flag is
 clear. Events may still be accepted into mailboxes while stopped.
 
 `inspect` includes the admitted definition/version, state, lease, waits and
@@ -478,7 +478,8 @@ The engine owns primary and secondary keys in `(kind, id)` order:
 | `control_command`, `control_history` | request ID, ordered time + hex request ID | Operator request/reply and chronological journal |
 | `control_history_run:<hex run ID>` | ordered time + hex request ID | Run-targeted operator journal |
 | `control_response:<hex run ID>` | hex event identity | Response identity, original attribution, payload and reply |
-| `paused` | definition name | Manual pause's epoch and suspended triggers |
+| `paused` | definition name | Manual pause's epoch, suspended triggers and buffered admissions |
+| `control_drain` | definition name | Indexed queue promotions deferred by emergency stop |
 | `control_run`, `control_run:<hex name>` | ordered admission time + run ID | Bounded run pages and counts |
 | `control_end`, `control_end:<hex name>` | ordered end time + run ID | Bounded terminal history and outcome counts |
 | `control_parent:<hex parent ID>` | ordered admission time + child ID | Owned children including terminal children |

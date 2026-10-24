@@ -52,6 +52,7 @@ struct StoredRun {
     subscriptions: BTreeMap<String, Vec<String>>,
     waits: BTreeMap<String, owf::events::PendingWait>,
     budget_ended: Option<u64>,
+    addressed_waits: std::collections::BTreeSet<String>,
     /// The rearm a firing attached and the trigger that firing stored: a
     /// trigger that differs at the run's end was replaced (a later epoch).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -257,7 +258,12 @@ fn indexes(s: &StoredRun) -> Rows {
             keys.insert(key(&partition("children", &link.parent), id), value.clone());
         }
         for (t, at) in &s.awaits {
-            if !s.pending.contains_key(t) {
+            // Child waiting notifications are addressed internally. Their
+            // automatic registration needs no competing-delivery index until
+            // an explicit listen registers that type.
+            let internal =
+                t.strip_prefix("waiting:").is_some_and(|id| s.listeners.contains_key(&format!("child:{id}")));
+            if !s.pending.contains_key(t) && (!internal || s.addressed_waits.contains(t)) {
                 keys.insert(key(&partition("wait", t), &timed(*at, id)), value.clone());
             }
         }
@@ -393,6 +399,7 @@ fn admitted(rows: &mut dyn Transaction, admission: &Admission, now: i64) -> anyh
         subscriptions: BTreeMap::new(),
         waits: BTreeMap::new(),
         budget_ended: None,
+        addressed_waits: Default::default(),
         rearm: None,
         trigger: None,
         accepted: 0,
@@ -419,6 +426,7 @@ fn close(snapshot: &mut StoredRun, types: &[String]) {
     for t in types {
         if !snapshot.listeners.values().any(|types| types.contains(t)) {
             snapshot.awaits.remove(t);
+            snapshot.addressed_waits.remove(t);
         }
     }
 }
@@ -799,6 +807,12 @@ fn admit_firing(
     put(rows, "trigger_run", k, &a.id)
 }
 fn drain_queues(rows: &mut dyn Transaction, name: &str, now: i64) -> anyhow::Result<()> {
+    if is_stopped(rows)? {
+        if !rows.scan(&partition("queue_name", name), "", None, 1)?.is_empty() {
+            put(rows, "control_drain", name, &true)?;
+        }
+        return Ok(());
+    }
     for ((_, k), _) in rows.scan(&partition("queue_name", name), "", None, usize::MAX)? {
         let Some(q) = queued(rows, &k)? else {
             // A prior promotion in this batch may trip and disarm the
@@ -818,6 +832,14 @@ fn drain_queues(rows: &mut dyn Transaction, name: &str, now: i64) -> anyhow::Res
         } else {
             admit_firing(rows, &k, &q.admission, q.rearm.as_ref(), Some(&t), now)?;
         }
+    }
+    Ok(())
+}
+
+fn drain_pending(rows: &mut dyn Transaction, now: i64, limit: usize) -> anyhow::Result<()> {
+    for ((_, name), _) in rows.scan("control_drain", "", None, limit)? {
+        rows.delete("control_drain", &name)?;
+        drain_queues(rows, &name, now)?;
     }
     Ok(())
 }
@@ -1060,6 +1082,7 @@ fn terminate(rows: &mut dyn Transaction, id: &str, status: &Status, now: i64) ->
     snapshot.run.fence = None;
     snapshot.run.lease_until_ms = None;
     snapshot.awaits.clear();
+    snapshot.addressed_waits.clear();
     snapshot.listeners.clear();
     snapshot.subscriptions.clear();
     snapshot.waits.clear();
@@ -1094,6 +1117,7 @@ fn terminate(rows: &mut dyn Transaction, id: &str, status: &Status, now: i64) ->
             child.run.fence = None;
             child.run.lease_until_ms = None;
             child.awaits.clear();
+            child.addressed_waits.clear();
             child.listeners.clear();
             child.subscriptions.clear();
             names.insert(child.run.admission.name.clone());
@@ -1376,6 +1400,7 @@ impl RunStore for TransactionalStore {
         self.update(|rows| {
             let mut s = checked(rows, f, now, self.policy.skew_ms)?;
             for t in types {
+                s.addressed_waits.insert(t.clone());
                 s.awaits.entry(t.clone()).or_insert(now);
             }
             store_run(rows, &s)
@@ -1634,6 +1659,7 @@ impl RunStore for TransactionalStore {
             if is_stopped(rows)? {
                 return Ok(Vec::new());
             }
+            drain_pending(rows, now, limit)?;
             let Some(own) = &worker.version else {
                 return rows
                     .scan("due", "", Some(&until(now)), limit)?
@@ -1854,12 +1880,16 @@ fn query_runs(
 }
 fn suspend(rows: &mut dyn Transaction, name: &str, defs: &mut Definitions) -> anyhow::Result<()> {
     let mut triggers = BTreeMap::new();
+    let mut queues = BTreeMap::new();
     for k in &defs.triggers {
         if let Some(t) = get(rows, "trigger", k)? {
             triggers.insert(k.clone(), t);
         }
+        if let Some(queue) = rows.get("trigger_queue", k)? {
+            queues.insert(k.clone(), queue);
+        }
     }
-    put(rows, "paused", name, &control::Paused { epoch: defs.epoch, triggers })?;
+    put(rows, "paused", name, &control::Paused { epoch: defs.epoch, triggers, queues })?;
     arm(rows, defs, &BTreeMap::new())
 }
 fn normalize_command(command: &control::Command) -> control::Command {
@@ -1906,6 +1936,7 @@ fn control_command(
                     put(rows, "control", "stopped", enabled)?;
                 } else {
                     rows.delete("control", "stopped")?;
+                    drain_pending(rows, now, control::MAX_PAGE)?;
                 }
             }
             Reply::Changed(changed)
@@ -1953,8 +1984,15 @@ fn control_command(
                 anyhow::ensure!(paused.epoch == defs.epoch, "suspended activation changed");
                 defs.tripped = None;
                 arm(rows, &mut defs, &paused.triggers)?;
+                for (key, value) in &paused.queues {
+                    let q: Queued = serde_json::from_value(value.clone())?;
+                    anyhow::ensure!(q.version == 1 && q.admission.name == *name, "invalid suspended queue");
+                    rows.put("trigger_queue", key, value)?;
+                    put(rows, &partition("queue_name", name), key, key)?;
+                }
                 rows.delete("paused", name)?;
                 store_definitions(rows, name, &defs)?;
+                drain_queues(rows, name, now)?;
             }
             Reply::Changed(changed)
         }

@@ -789,17 +789,17 @@ async fn execute(
                 Ok(limit) => match run.remaining(limit, started_ms) {
                     Err(_) if run.has_unknown("") => Err(run.unknown("workflow")),
                     Err(e) => Err(e),
-                    Ok((remaining, deadline)) => match {
+                    Ok((remaining, deadline)) => {
                         run.deadlines.lock().unwrap().insert(String::new(), deadline);
-                        tokio::time::timeout(remaining, run.workflow(input)).await
-                    } {
-                        Ok(Err(Fault::Waiting(wake))) => Err(Fault::Waiting(wake.min(deadline))),
-                        Ok(r) => r,
-                        Err(_) if run.has_unknown("") => Err(run.unknown("workflow")),
-                        Err(_) => Err(Fault::Fatal(WorkflowError::timeout(format!(
-                            "the workflow did not finish within {limit:?}"
-                        )))),
-                    },
+                        match tokio::time::timeout(remaining, run.workflow(input)).await {
+                            Ok(Err(Fault::Waiting(wake))) => Err(Fault::Waiting(wake.min(deadline))),
+                            Ok(r) => r,
+                            Err(_) if run.has_unknown("") => Err(run.unknown("workflow")),
+                            Err(_) => Err(Fault::Fatal(WorkflowError::timeout(format!(
+                                "the workflow did not finish within {limit:?}"
+                            )))),
+                        }
+                    }
                 },
             },
         }

@@ -59,6 +59,7 @@ pub struct ManualTrip {
 pub(crate) struct Paused {
     pub epoch: u64,
     pub triggers: BTreeMap<String, Trigger>,
+    pub queues: BTreeMap<String, Value>,
 }
 
 #[derive(Debug)]

@@ -157,7 +157,7 @@ module contract {
     })
     val first = pending.fold(-1,(a,b) => if (a == -1 or b < a) b else a)
     if (op == "stop" and value >= 0) { ...s,db:{ ...s.db,stopped:value != 0 } }
-    else if (s.db.stopped and Set("admit","dry","replay","claim","fire","refuse","ingress","renew","intent","dispatch","result","notExecuted","recover","checkpoint","conflict","subscribe","take","child","finish","timeout","spend").contains(op)) s
+    else if (s.db.stopped and Set("admit","dry","replay","claim","fire","refuse","ingress","renew","intent","dispatch","result","notExecuted","recover","checkpoint","conflict","subscribe","take","child","finish","timeout","spend","policy").contains(op)) s
     else if (Set("admit","dry","replay").contains(op) and value >= 0 and not(execution.admitted) and not(c.tripped))
       observe(admitRun(s,r,value,i,if (op == "dry") 1 else if (op == "replay") 2 else 0),"admit",r,i,value,1)
     else if (op == "claim" and live(execution) and execution.lease <= s.now and compatible(execution.app,w) and
@@ -422,7 +422,7 @@ module contract {
       (if (c.queued < 0) buffered and d.queued == r and d.queueInput == value else skipped and d.queued == c.queued))
     val queueStable = c.queued < 0 or d.queued < 0 or
       (c.queued == d.queued and c.queueSlot == d.queueSlot and c.queueInput == d.queueInput and c.queueRefused == d.queueRefused)
-    val queueReady = c.queued >= 0 and not(b.db.runs.nth(c.queued).admitted) and d.armed and not(d.tripped) and
+    val queueReady = not(a.db.stopped) and c.queued >= 0 and not(b.db.runs.nth(c.queued).admitted) and d.armed and not(d.tripped) and
       op != "activate" and not(Runs.exists(k => k != c.queued and live(a.db.runs.nth(k)) and a.db.runs.nth(k).scheduled)) and
       Runs.filter(k => k != c.queued and live(a.db.runs.nth(k))).size() < c.maxRuns
     val errorPromotion = flag(errorQueue,"OverlapQueue",queueStable and (not(queueReady) or

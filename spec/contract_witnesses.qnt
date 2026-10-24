@@ -181,11 +181,17 @@ module contract_witnesses {
     .then(execute("fire",1,0,0,0,0))
   run clearStopTest = clearStop.expect(checked and not(m.db.stopped) and m.db.admissions == [1,1,0]
     and m.db.runs.nth(0).generation == 1 and m.db.fired == Set((1,0)))
+  action stoppedQueue = policyOverlap(2).then(execute("stop",0,0,0,1,0)).then(do("cancel"))
+  run stoppedQueueTest = stoppedQueue.expect(checked and m.db.stopped and m.db.catalog.queued == 1
+    and m.db.admissions == [1,0,0])
+  action resumedQueue = stoppedQueue.then(do("stop"))
+  run resumedQueueTest = resumedQueue.expect(checked and not(m.db.stopped) and m.db.catalog.queued == -1
+    and m.db.admissions == [1,1,0] and m.db.runs.nth(1).input == 7)
   // Every history above in one trace (each starts with init), replayed
   // against the stores by crates/durable/tests/quint.rs.
   run bridgeSuite = continuation.then(unknown).then(mailbox).then(expiry).then(child).then(childFinish).then(grandchild).then(activation)
     .then(deadline).then(compatibility).then(dry).then(replay).then(schedule).then(breaker).then(rearm)
     .then(noCatchup).then(overlap).then(ingress).then(ingressExpiry).then(redispatch).then(protectedUnknown)
     .then(notExecuted).then(errorResponse).then(conflict).then(release).then(staleFence).then(admission)
-    .then(successResetsBreaker).then(noRollback).then(reactivation).then(broadcast).then(retention).then(budget).then(skipPolicy).then(allowPolicy).then(queuePolicy).then(replacePolicy).then(ceilingPolicy).then(skipCrash).then(allowCrash).then(queueCrash).then(replaceCrash).then(refused).then(oldCompletionPromotes).then(queuedRefusal).then(emergencyStop).then(clearStop)
+    .then(successResetsBreaker).then(noRollback).then(reactivation).then(broadcast).then(retention).then(budget).then(skipPolicy).then(allowPolicy).then(queuePolicy).then(replacePolicy).then(ceilingPolicy).then(skipCrash).then(allowCrash).then(queueCrash).then(replaceCrash).then(refused).then(oldCompletionPromotes).then(queuedRefusal).then(emergencyStop).then(clearStop).then(stoppedQueue).then(resumedQueue)
 }

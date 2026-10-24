@@ -861,6 +861,7 @@ impl StoreDriver {
                 "finish",
                 "timeout",
                 "spend",
+                "policy",
             ]
             .contains(&op)
         {

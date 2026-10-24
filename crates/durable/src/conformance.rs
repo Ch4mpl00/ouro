@@ -705,6 +705,7 @@ pub fn run_all(factory: impl Fn(&str) -> anyhow::Result<TestStore>) -> anyhow::R
     budgets(&factory, &mut report)?;
     overlap_policies(&factory, &mut report)?;
     controls(&factory, &mut report)?;
+    control_overlap(&factory, &mut report)?;
     Ok(report)
 }
 
@@ -1891,6 +1892,23 @@ fn controls(factory: &impl Fn(&str) -> anyhow::Result<TestStore>, report: &mut R
     assert_eq!(t.store.control_history(Some("r"), None, 10)?.items.len(), 1);
     audit_control(&t)?;
 
+    let t = factory("control-lifecycle-route")?;
+    report.cases += 1;
+    let s = &t.store;
+    let parent = s.start(&admission("p"), 0)?.unwrap();
+    s.start_child(
+        &parent,
+        &admission("c"),
+        &ChildLink { parent: "p".into(), key: "c".into(), reference: "c".into() },
+        0,
+    )?;
+    // Internal eligibility must still become addressable as soon as a host
+    // explicitly registers a lifecycle type, even before its first take.
+    s.register_wait(&parent, &["waiting:c".into()], 0)?;
+    assert_eq!(s.deliver(&event("explicit", "waiting:c", json!(true)), None, 0)?, Some("p".into()));
+    assert!(s.take_event(&parent, "explicit", &["waiting:c".into()], 0)?.is_some());
+    audit(&**s)?;
+
     // The audit row, event receipt and each command's indexes commit together.
     for op in ["cancel", "pause", "resume", "stop", "clear", "respond", "describe"] {
         for fault in [
@@ -2027,5 +2045,56 @@ fn audit_control(t: &TestStore) -> anyhow::Result<()> {
         })
         .collect();
     assert_eq!(actual, expected, "persisted control indexes disagree with primary facts");
+    Ok(())
+}
+
+fn control_overlap(factory: &impl Fn(&str) -> anyhow::Result<TestStore>, report: &mut Report) -> anyhow::Result<()> {
+    use control::Command;
+    for pause in [false, true] {
+        let t = factory("control-overlap")?;
+        report.cases += 1;
+        let s = &t.store;
+        let d = s.save_definition("workflow", "yaml")?;
+        let slot = |n| Trigger { at_ms: Some(n), types: vec![], state: json!(n) };
+        s.activate_with("workflow", d.version, 0, &Arming { triggers: BTreeMap::from([("q".into(), slot(0))]) })?;
+        let fire = |n, id: &str| {
+            s.fire(
+                &Firing {
+                    key: "q",
+                    expected: Some(&slot(n)),
+                    next: Some(&slot(n + 1)),
+                    busy: Some(&slot(n + 1)),
+                    admit: &[admission(id)],
+                    overlap: Some(OverlapGuard {
+                        policy: Overlap::Queue,
+                        max_concurrent_runs: 2,
+                        ceiling: &slot(n + 1),
+                    }),
+                    ..Firing::default()
+                },
+                n,
+            )
+        };
+        assert_eq!(fire(0, "first")?, Fired::Committed);
+        assert_eq!(fire(1, "buffered")?, Fired::Queued);
+        let pinned = s.queued("q")?.unwrap();
+        let stopped = if pause {
+            Command::Pause { definition: "workflow".into(), note: "retain buffer".into() }
+        } else {
+            Command::Stop { enabled: true }
+        };
+        s.control(&control_request("stop"), &stopped, 2)?;
+        s.control(&control_request("cancel"), &Command::Cancel { run: "first".into() }, 2)?;
+        assert!(s.get("buffered")?.is_none(), "stopped work must not promote a buffered admission");
+        let clear =
+            if pause { Command::Resume { definition: "workflow".into() } } else { Command::Stop { enabled: false } };
+        let fresh = (t.reopen)()?;
+        fresh.control(&control_request("clear"), &clear, 3)?;
+        assert_eq!(fresh.get("buffered")?.unwrap().admission, pinned);
+        assert!(fresh.queued("q")?.is_none());
+        assert_eq!(fresh.definitions("workflow")?.epoch, 1);
+        audit_control(&t)?;
+        audit(&*fresh)?;
+    }
     Ok(())
 }

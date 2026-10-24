@@ -1132,5 +1132,54 @@ fn control_bounds(backend: &Arc<dyn AtomicBackend>, metrics: &Metrics) -> anyhow
     bounded(metrics, "control_respond_wildcard", 2, || s.control(&req("wildcard"), &respond, now))?;
     bounded(metrics, "control_take_wildcard", 2, || s.take_event(&f, &w.position, &w.types, now))?;
     s.finish(&f, &Status::Completed(json!(42)), now, 3)?;
+    for pause in [false, true] {
+        let name = if pause { "operatorpausequeue" } else { "operatorstopqueue" };
+        s.save_definition(name, "yaml")?;
+        let slot = |n| Trigger { at_ms: Some(now + n), types: vec![], state: json!(n) };
+        s.activate_with(name, 1, 0, &Arming { triggers: BTreeMap::from([(name.into(), slot(0))]) })?;
+        let mut first = a.clone();
+        first.id = format!("{name}:first");
+        first.name = name.into();
+        let mut buffered = first.clone();
+        buffered.id = format!("{name}:buffered");
+        let fire = |n, a: &ouro_durable::Admission| {
+            s.fire(
+                &Firing {
+                    key: name,
+                    expected: Some(&slot(n)),
+                    next: Some(&slot(n + 1)),
+                    busy: Some(&slot(n + 1)),
+                    admit: std::slice::from_ref(a),
+                    overlap: Some(ouro_durable::OverlapGuard {
+                        policy: ouro_durable::Overlap::Queue,
+                        max_concurrent_runs: 2,
+                        ceiling: &slot(n + 1),
+                    }),
+                    ..Firing::default()
+                },
+                now,
+            )
+        };
+        assert_eq!(fire(0, &first)?, Fired::Committed);
+        assert_eq!(fire(1, &buffered)?, Fired::Queued);
+        let stop = if pause {
+            Command::Pause { definition: name.into(), note: "retain queue".into() }
+        } else {
+            Command::Stop { enabled: true }
+        };
+        bounded(metrics, if pause { "control_pause_queue" } else { "control_stop_queue" }, 2, || {
+            s.control(&req(&format!("{name}:stop")), &stop, now)
+        })?;
+        bounded(metrics, "control_cancel_deferred_queue", 2, || {
+            s.control(&req(&format!("{name}:cancel")), &Command::Cancel { run: first.id.clone() }, now)
+        })?;
+        assert!(s.get(&buffered.id)?.is_none());
+        let resume = if pause { Command::Resume { definition: name.into() } } else { Command::Stop { enabled: false } };
+        bounded(metrics, if pause { "control_resume_queue" } else { "control_clear_deferred_queue" }, 3, || {
+            s.control(&req(&format!("{name}:clear")), &resume, now)
+        })?;
+        assert_eq!(s.get(&buffered.id)?.unwrap().admission, buffered);
+        s.cancel(&buffered.id, now)?;
+    }
     Ok(())
 }

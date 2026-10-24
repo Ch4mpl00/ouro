@@ -168,7 +168,7 @@ exact matching plus undeclared, without a host-supplied `accepts` list.
 
 `crates/durable/tests/quint.rs` replays Quint's random traces of `contract.qnt`
 (100 traces × 150 steps per adapter by default, all 32 commands and every fault
-switch) and the `bridgeSuite` run of `contract_witnesses.qnt` (all 47 witness
+switch) and the `bridgeSuite` run of `contract_witnesses.qnt` (all 49 witness
 histories in one trace). After every step it compares a projection of the store
 with the model's state. The model records each command in its `command`
 variable; the driver never sees the model's state.
