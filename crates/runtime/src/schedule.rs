@@ -31,6 +31,12 @@
 //! A skip is kept in the trigger's state (`skips`, the last `skipped` slots)
 //! and traced.
 //!
+//! A slot whose run this host refuses to admit (a function the definition
+//! calls is not registered, or it no longer validates) is a per-definition
+//! outcome, never an error of the scheduler: the firing consumes the slot
+//! and records the run as ended faulted at its admission, which counts
+//! toward the definition's breaker (`ouro_durable::Firing::refused`).
+//!
 //! `on` keeps the events matched so far in its trigger's state and replays
 //! them through the same consumer a `listen` uses (`owf::events`), so `all`,
 //! correlation and `until` mean what they mean in a listen. An identified
@@ -40,11 +46,14 @@
 //! kept one per schedule): a run exists only once its events have arrived.
 use crate::{Runtime, execution::Admitter, telemetry};
 use opentelemetry::KeyValue;
-use ouro_durable::{Admission, Arming, Definitions, Fired, Firing, Rearm, RunStore, Trigger};
+use ouro_durable::{
+    Admission, Arming, DefinitionTripped, Definitions, Fired, Firing, Rearm, Refused, RunStore, Trigger,
+};
 use owf::{
     events::{self, Consumer, Offer},
     expr::{self, Args},
     model::{self, Catchup, Schedule, Strategy, Until},
+    run::WorkflowError,
 };
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -168,15 +177,24 @@ impl Runtime {
 // ── 2. firing ──────────────────────────────────────────────────────────────
 
 /// A time trigger's firing from `t` to `next`.
-fn moved<'a>(
-    key: &'a str,
-    t: &'a Trigger,
-    next: &'a Trigger,
-    admit: &'a [Admission],
-    rearm: Option<&'a Rearm>,
-    busy: Option<&'a Trigger>,
-) -> Firing<'a> {
-    Firing { key, expected: Some(t), next: Some(next), admit, rearm, ingress: None, busy, refused: None }
+fn moved<'a>(key: &'a str, t: &'a Trigger, next: &'a Trigger, busy: Option<&'a Trigger>) -> Firing<'a> {
+    Firing { key, expected: Some(t), next: Some(next), busy, ..Firing::default() }
+}
+
+/// A trigger's run: admitted, refused by this host (recorded with the slot,
+/// `Firing::refused`), or not at all because its definition tripped since
+/// the trigger was read (the trip removed the trigger: nothing to fire).
+fn triggered(
+    admitter: &Admitter,
+    id: &str,
+    name: &str,
+    input: Value,
+) -> anyhow::Result<Option<Result<Admission, Refused>>> {
+    match admitter.triggered(id, name, input) {
+        Ok(admitted) => Ok(Some(admitted)),
+        Err(e) if e.is::<DefinitionTripped>() => Ok(None),
+        Err(e) => Err(e),
+    }
 }
 
 /// `t` with a skipped slot recorded in its state.
@@ -198,6 +216,18 @@ impl Runtime {
     /// not start a burst. Scheduled runs get `{}` as input. Returns the runs
     /// it admitted. The worker calls it on every tick: when nothing is due it
     /// reads no rows.
+    ///
+    /// A slot whose run this host refuses to admit (a function the
+    /// definition calls is no longer registered, or the definition no longer
+    /// validates) does not stop the others: the slot is consumed like an
+    /// admitted one, and its run is recorded as ended faulted with the
+    /// reason, under the slot's id (`get`, `list`). The fault counts toward
+    /// the definition's breaker, so a definition that stays broken trips
+    /// after `Config::breaker_threshold` slots, which removes its schedule
+    /// and stores the trip's notice. CHOICE: consumed, not retried at the
+    /// next tick: a retry would refire the same slot on every tick, and a
+    /// consumed slot is never lost silently, it holds its failed run. Only
+    /// storage errors are returned.
     pub fn fire_due(&self) -> anyhow::Result<Vec<String>> {
         let now = self.clock.now_ms();
         let mut started = Vec::new();
@@ -214,7 +244,6 @@ impl Runtime {
         let definitions = self.store.definitions(name)?;
         // Replaced by a newer epoch since it was read: its swap would fail.
         let Some(schedule) = active(&definitions)?.filter(|_| current(&definitions, t)) else { return Ok(None) };
-        let firing = |next, admit, rearm, busy| moved(k, t, next, admit, rearm, busy);
         let mut next = t.clone();
         let mut rearm = None;
         let mut busy = t.clone();
@@ -225,7 +254,7 @@ impl Runtime {
                 busy.at_ms = next.at_ms;
                 if following <= now && schedule.catchup == Catchup::None {
                     let skip = skipped(next, slot, "missed");
-                    self.store.fire(&firing(&skip, &[], None, None), now)?;
+                    self.store.fire(&moved(k, t, &skip, None), now)?;
                     self.skip(name, kind, slot, "missed");
                     return Ok(None);
                 }
@@ -245,16 +274,50 @@ impl Runtime {
             _ => return Ok(None),
         };
         let busy = skipped(busy, slot, "overlap");
-        let admission = self.admission(&id, name, json!({}))?;
-        let admit = std::slice::from_ref(&admission);
-        match self.store.fire(&firing(&next, admit, rearm.as_ref(), Some(&busy)), now)? {
-            Fired::Committed => Ok(Some(id)),
+        let Some(admission) = triggered(&self.admitter(), &id, name, json!({}))? else { return Ok(None) };
+        let refused = admission.as_ref().err();
+        if refused.is_some()
+            && let Some(rearm) = &rearm
+        {
+            // No run of a refused slot will end and re-arm `after`: it is
+            // due again one delay from now.
+            next.at_ms = Some(now.saturating_add(rearm.delay_ms));
+        }
+        let mut firing = moved(k, t, &next, Some(&busy));
+        match &admission {
+            Ok(admission) => {
+                firing.admit = std::slice::from_ref(admission);
+                firing.rearm = rearm.as_ref();
+            }
+            Err(refused) => firing.refused = Some(refused),
+        }
+        match self.store.fire(&firing, now)? {
+            Fired::Committed => match refused {
+                Some(refused) => {
+                    self.refused(name, kind, &id, &refused.error);
+                    Ok(None)
+                }
+                None => Ok(Some(id)),
+            },
             Fired::Busy(_) => {
                 self.skip(name, kind, slot, "overlap");
                 Ok(None)
             }
             Fired::Changed | Fired::Ingested => Ok(None),
         }
+    }
+
+    fn refused(&self, name: &str, kind: &str, run: &str, error: &WorkflowError) {
+        telemetry::mark(
+            &self.tracer,
+            "schedule refused",
+            vec![
+                KeyValue::new("ouro.definition.name", name.to_string()),
+                KeyValue::new("ouro.schedule.kind", kind.to_string()),
+                KeyValue::new("ouro.run.id", run.to_string()),
+                KeyValue::new("ouro.error.type", error.type_.clone()),
+            ],
+        );
     }
 
     fn skip(&self, name: &str, kind: &str, slot: i64, reason: &str) {
@@ -361,7 +424,7 @@ fn offer(
         matched.push(event.clone());
         let Some(outcome) = consume(&on, &matched)? else { return Ok(Taken::No) };
         let mut next = trigger.clone();
-        let mut admit = Vec::new();
+        let mut admission = None;
         let mut id = None;
         match outcome {
             Some(consumed) => {
@@ -369,19 +432,23 @@ fn offer(
                 let ids: Vec<String> = matched.iter().map(|e| format!("{}\u{0}{}", e["source"], e["id"])).collect();
                 let run = format!("schedule:{name}:on:{}", digest(&ids.join("\u{1}")));
                 let input: Vec<Value> = consumed.iter().map(|e| events::read(e, read)).collect();
-                admit.push(admitter.active(&run, &name, Value::Array(input))?);
-                id = Some(run);
+                // Refused like a time slot's run (`fire_due`): the match is
+                // consumed and the failed run recorded in its place.
+                let Some(triggered) = triggered(admitter, &run, &name, Value::Array(input))? else {
+                    return Ok(Taken::No);
+                };
+                id = triggered.is_ok().then_some(run);
+                admission = Some(triggered);
             }
             None => next.state["events"] = Value::Array(matched),
         }
-        let firing = Firing {
-            key: k,
-            expected: Some(&trigger),
-            next: Some(&next),
-            admit: &admit,
-            ingress: Some(event),
-            ..Firing::default()
-        };
+        let mut firing =
+            Firing { key: k, expected: Some(&trigger), next: Some(&next), ingress: Some(event), ..Firing::default() };
+        match &admission {
+            Some(Ok(admission)) => firing.admit = std::slice::from_ref(admission),
+            Some(Err(refused)) => firing.refused = Some(refused),
+            None => {}
+        }
         match store.fire(&firing, now)? {
             Fired::Committed => return Ok(Taken::Yes(id)),
             Fired::Ingested | Fired::Busy(_) => return Ok(Taken::Yes(None)),

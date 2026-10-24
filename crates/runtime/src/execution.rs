@@ -207,6 +207,7 @@ impl Runtime {
             metadata: self.config.metadata.clone(),
             application: self.config.application.version.clone(),
             limits: self.config.limits.clone(),
+            breaker_threshold: self.config.breaker_threshold,
         }
     }
     pub(crate) fn admission(&self, id: &str, name: &str, input: Value) -> anyhow::Result<Admission> {
@@ -550,6 +551,42 @@ pub(crate) struct Admitter {
     pub application: Option<String>,
     /// The host's ceilings: a root run is admitted with its jump budget.
     pub limits: Limits,
+    /// What a refused trigger run counts against (`Admitter::triggered`).
+    pub breaker_threshold: u32,
+}
+
+/// A definition this host cannot admit a run of because it no longer
+/// validates against the host (its registry, capabilities, ceilings or
+/// external schemas): `start` returns it, a trigger records it (`Refused`).
+/// It reads as the validation error it wraps.
+#[derive(Debug)]
+pub struct InvalidDefinition(pub anyhow::Error);
+impl InvalidDefinition {
+    /// The fault a refused trigger run ends with.
+    pub fn error(&self) -> WorkflowError {
+        WorkflowError::validation(format!("{:#}", self.0))
+    }
+}
+impl std::fmt::Display for InvalidDefinition {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if f.alternate() { write!(f, "{:#}", self.0) } else { write!(f, "{}", self.0) }
+    }
+}
+impl std::error::Error for InvalidDefinition {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.0.chain().nth(1)
+    }
+}
+
+/// Why this host refuses to admit a run of a definition, as the fault a
+/// trigger records: a function it calls is not registered, or it does not
+/// validate. `None` for every other error (storage, a tripped definition),
+/// which the caller handles as before.
+pub(crate) fn refusal(e: &anyhow::Error) -> Option<WorkflowError> {
+    if let Some(missing) = e.downcast_ref::<MissingFunction>() {
+        return Some(missing.error());
+    }
+    e.downcast_ref::<InvalidDefinition>().map(InvalidDefinition::error)
 }
 
 /// Where a run stands in its tree, pinned in its admission's runtime
@@ -618,38 +655,84 @@ impl Admitter {
     }
     /// `active` at a place in a run tree.
     pub fn active_in(&self, id: &str, name: &str, input: Value, lineage: &Lineage) -> anyhow::Result<Admission> {
-        let definitions = self.definitions.definitions(name)?;
+        self.of(id, &self.current(name)?, input, lineage)
+    }
+    /// `name`'s active version, unless its breaker tripped.
+    fn current(&self, name: &str) -> anyhow::Result<Definition> {
+        let mut definitions = self.definitions.definitions(name)?;
         if let Some(trip) = &definitions.tripped {
             return Err(trip.refusal(name).into());
         }
-        let d = definitions
+        definitions
             .active
-            .and_then(|v| definitions.versions.get(&v))
-            .ok_or_else(|| anyhow::anyhow!("no active definition for {name}"))?;
-        self.of(id, d, input, lineage)
+            .and_then(|v| definitions.versions.remove(&v))
+            .ok_or_else(|| anyhow::anyhow!("no active definition for {name}"))
     }
+    /// A run of `d`: checked (`MissingFunction`), validated
+    /// (`InvalidDefinition`) and bound.
     pub fn of(&self, id: &str, d: &Definition, input: Value, lineage: &Lineage) -> anyhow::Result<Admission> {
         self.check(&d.name, d.version, &d.yaml)?;
-        let wf = self.validate(&d.yaml)?;
+        let invalid = |e: anyhow::Error| anyhow::Error::new(InvalidDefinition(e));
+        let wf = self.validate(&d.yaml).map_err(invalid)?;
+        let schemas = self.schemas(&wf).map_err(invalid)?;
+        Ok(self.admission(id, d, input, lineage, Some((self.registry.bindings(&wf), schemas))))
+    }
+    /// The admission of a run of `d`, with its bindings (function schemas
+    /// and delivery, external schemas) when it has them: a refused run is
+    /// recorded without.
+    fn admission(
+        &self,
+        id: &str,
+        d: &Definition,
+        input: Value,
+        lineage: &Lineage,
+        bound: Option<(Value, serde_json::Map<String, Value>)>,
+    ) -> Admission {
         let mut runtime = json!({
             "name": "ouro-runtime",
             "version": env!("CARGO_PKG_VERSION"),
             "metadata": self.metadata,
-            "bindings": self.registry.bindings(&wf),
-            "schemas": self.schemas(&wf)?,
-            "limits": lineage.pin(),
         });
+        if let Some((bindings, schemas)) = bound {
+            runtime["bindings"] = bindings;
+            runtime["schemas"] = Value::Object(schemas);
+        }
+        runtime["limits"] = lineage.pin();
         if let Some(version) = &self.application {
             runtime[ouro_durable::APPLICATION_VERSION] = json!(version);
         }
-        Ok(Admission {
+        Admission {
             id: id.into(),
             name: d.name.clone(),
             version: d.version,
             definition: d.yaml.clone(),
             input,
             runtime,
-        })
+        }
+    }
+    /// A trigger's root run of `name`'s active version: its admission, or,
+    /// when this host refuses it (`refusal`: a missing function, an invalid
+    /// definition), the `Refused` the trigger records with its slot instead.
+    /// A tripped definition, no active version and storage errors remain
+    /// errors.
+    pub fn triggered(
+        &self,
+        id: &str,
+        name: &str,
+        input: Value,
+    ) -> anyhow::Result<Result<Admission, ouro_durable::Refused>> {
+        let d = self.current(name)?;
+        match self.of(id, &d, input.clone(), &self.root()) {
+            Ok(admission) => Ok(Ok(admission)),
+            Err(e) => match refusal(&e) {
+                Some(error) => Ok(Err(ouro_durable::Refused {
+                    admission: self.admission(id, &d, input, &self.root(), None),
+                    error,
+                    breaker_threshold: self.breaker_threshold,
+                })),
+                None => Err(e),
+            },
+        }
     }
     /// The start check: every function the definition can call is
     /// registered, directly or in the child workflows its `run: workflow`
