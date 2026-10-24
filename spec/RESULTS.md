@@ -1,3 +1,33 @@
+# Contract checking — 2026-10-24, schedule overlap (#19)
+
+Quick checks only, on the combined #14/#15/#19 model. The policy and host
+capacity parameterize `firePolicy`; the model retains one buffered identity,
+slot, input and refusal flag independently of admission. T1 retains each slot
+as admitted, skipped or buffered; independent monitors check every policy,
+capacity, queue stability and promotion. Replacement uses the same transitive
+cancellation transition as explicit cancellation. The bridge projects the
+actual buffer through `RunStore::queued` and replays policy and crash histories.
+
+| Check | Scope | Result | Time |
+| --- | --- | --- | --- |
+| Typecheck | all five modules | Pass | 0.488–5.477 s each |
+| Witnesses | 45 histories, including each policy's decision/admission crash, old-epoch completion and queued refusal | Pass | 11.424 s including CLI startup |
+| Simulation | 1,000 × 150 steps, seed 20261023, invariant `checked` | No violation | 28.267 s |
+| Concurrent table | 8 batches, every order | Computed | 5.242 s |
+| Safety mutants | 40 (35 existing, 4 policies and the ceiling) | All targets detected | 199.125 s |
+| Serial MBT, memory, targeted | 100 × 150 + all 45 `bridgeSuite` histories | Pass | 41.88 s |
+
+The V2 monitor permits only the specified queue-field changes during an
+old-epoch completion, leaving its breaker observations unchanged, and checks
+the two terminal observations when a predecessor fault promotes a queued
+refusal in the same transition. The old V2 mutant still detects counting an
+old epoch. No contract ID, fault switch or prior witness was removed.
+
+Not run for this revision: TLC, Apalache, the temporal quotient or symbolic
+checks. `contract_progress.qnt` is unchanged. Earlier symbolic/temporal results
+below concern earlier revisions; no updated unbounded or temporal proof is
+claimed. Exact Rust results are recorded with the overlap implementation report.
+
 # Contract checking — 2026-10-24, refused trigger admissions (#15)
 
 A slot whose run the host refuses to admit deterministically (a missing
