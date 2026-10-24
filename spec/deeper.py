@@ -15,15 +15,11 @@ def main():
     output.mkdir(exist_ok=True)
     results=[]
     endpoint=os.environ.get("APALACHE_ENDPOINT","localhost:8823")
-    cases = [
-        ("version_check",12,[]),("event_check",10,[]),("child_check",6,[]),
-        ("call_check",9,[]),("bounded",3,["--init","callsInit","--step","callsStep"]),
-    ]
-    if args.contract_depth:
-        cases=[("contract_bounded",args.contract_depth,["--init","callsInit","--step","callsStep"])]
+    depth=args.contract_depth or 2
+    cases=[("contract_bounded",depth,["--init","callsInit","--step","callsStep"])]
     for module,depth,extra in cases:
         command=[QUINT,"verify",str(ROOT/f"{module}.qnt"),"--invariant",
-            "combinedCheck" if module=="contract_bounded" else "combinedSafety" if module in ("bounded","child_check") else "safety",
+            "combinedCheck",
             "--max-steps",str(depth),"--server-endpoint",endpoint,
             "--apalache-config",str(ROOT/"apalache.json"),"--verbosity","1"]+extra
         started=time.monotonic()
