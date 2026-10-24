@@ -306,46 +306,61 @@ fn claim_run(snapshot: &mut StoredRun, now: i64, owner: &str) -> anyhow::Result<
 /// definition admits no new run, of any version and by any path, in the
 /// same commit that reads the trip; an existing run is still joined.
 fn insert(rows: &mut dyn Transaction, admission: &Admission, now: i64) -> anyhow::Result<bool> {
+    let Some(snapshot) = admitted(rows, admission, now)? else { return Ok(false) };
+    store_run(rows, &snapshot)?;
+    Ok(true)
+}
+/// The row a new run starts with, not stored yet; `None`: already admitted.
+fn admitted(rows: &mut dyn Transaction, admission: &Admission, now: i64) -> anyhow::Result<Option<StoredRun>> {
     if let Some(existing) = find_run(rows, &admission.id)? {
         anyhow::ensure!(existing.run.admission.name == admission.name, "run already belongs to another definition");
-        return Ok(false);
+        return Ok(None);
     }
     let defs = load_definitions(rows, &admission.name)?;
     if let Some(trip) = defs.as_ref().and_then(|d| d.tripped.as_ref()) {
         return Err(trip.refusal(&admission.name).into());
     }
     let epoch = defs.filter(|d| d.active == Some(admission.version)).map(|d| d.epoch);
-    store_run(
-        rows,
-        &StoredRun {
-            run: SavedRun {
-                admission: admission.clone(),
-                state: RunState::Ready,
-                fence: None,
-                generation: 0,
-                lease_until_ms: None,
-                wake_at_ms: now,
-                interruptions: 0,
-                outcome: None,
-                ended_ms: None,
-                child: None,
-                admitted_ms: now,
-                epoch,
-                root: None,
-            },
-            version: VERSION,
-            awaits: BTreeMap::new(),
-            listeners: BTreeMap::new(),
-            subscriptions: BTreeMap::new(),
-            rearm: None,
-            accepted: 0,
-            pending: BTreeMap::new(),
-            published: 0,
-            mailbox: None,
-            evidence: false,
+    Ok(Some(StoredRun {
+        run: SavedRun {
+            admission: admission.clone(),
+            state: RunState::Ready,
+            fence: None,
+            generation: 0,
+            lease_until_ms: None,
+            wake_at_ms: now,
+            interruptions: 0,
+            outcome: None,
+            ended_ms: None,
+            child: None,
+            admitted_ms: now,
+            epoch,
+            root: None,
         },
-    )?;
-    Ok(true)
+        version: VERSION,
+        awaits: BTreeMap::new(),
+        listeners: BTreeMap::new(),
+        subscriptions: BTreeMap::new(),
+        rearm: None,
+        accepted: 0,
+        pending: BTreeMap::new(),
+        published: 0,
+        mailbox: None,
+        evidence: false,
+    }))
+}
+/// A refused trigger run (`Firing::refused`): admitted under the same rules
+/// as `insert` and ended faulted in the same write, so it is never due and
+/// never claimed. Its fault feeds the breaker as a terminal one would. A
+/// run already stored under its id is joined: nothing is counted again.
+fn refuse(rows: &mut dyn Transaction, refused: &Refused, now: i64) -> anyhow::Result<()> {
+    let Some(mut snapshot) = admitted(rows, &refused.admission, now)? else { return Ok(()) };
+    let status = Status::Faulted(refused.error.clone());
+    snapshot.run.state = RunState::Failed;
+    snapshot.run.outcome = Some(status);
+    snapshot.run.ended_ms = Some(now);
+    store_run(rows, &snapshot)?;
+    breaker(rows, &snapshot.run, Some(&refused.error), false, refused.breaker_threshold, now)
 }
 fn close(snapshot: &mut StoredRun, types: &[String]) {
     for t in types {
@@ -764,13 +779,14 @@ fn tombstone(rows: &mut dyn Transaction, event: &Value, now: i64) -> anyhow::Res
     Ok((k, stored, used))
 }
 fn fire(rows: &mut dyn Transaction, f: &Firing<'_>, now: i64, policy: &Policy) -> anyhow::Result<Fired> {
+    anyhow::ensure!(f.refused.is_none() || f.admit.is_empty(), "a firing admits its runs or records a refusal");
     let current: Option<Trigger> = get(rows, "trigger", f.key)?;
     if current.as_ref() != f.expected {
         return Ok(Fired::Changed);
     }
     // Overlap: the previous run of this trigger is still running or waiting.
     if let Some(busy) = f.busy
-        && !f.admit.is_empty()
+        && (!f.admit.is_empty() || f.refused.is_some())
         && let Some(last) = get::<String>(rows, "trigger_run", f.key)?
         && find_run(rows, &last)?.is_some_and(|s| s.run.ended_ms.is_none())
     {
@@ -799,8 +815,11 @@ fn fire(rows: &mut dyn Transaction, f: &Firing<'_>, now: i64, policy: &Policy) -
             store_run(rows, &s)?;
         }
     }
-    if let Some(a) = f.admit.last() {
-        put(rows, "trigger_run", f.key, &a.id)?;
+    if let Some(r) = f.refused {
+        refuse(rows, r, now)?;
+    }
+    if let Some(id) = f.admit.last().or(f.refused.map(|r| &r.admission)).map(|a| &a.id) {
+        put(rows, "trigger_run", f.key, id)?;
     }
     Ok(Fired::Committed)
 }

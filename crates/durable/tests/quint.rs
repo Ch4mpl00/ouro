@@ -1063,6 +1063,7 @@ impl StoreDriver {
                     // The store skips the slot, in this commit, when the
                     // schedule's last run is unfinished.
                     busy: Some(&skip),
+                    refused: None,
                 };
                 let (result, _) = self.write(fault, |s| s.fire(&firing, ms));
                 if !injected {

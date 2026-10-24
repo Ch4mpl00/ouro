@@ -176,7 +176,7 @@ fn moved<'a>(
     rearm: Option<&'a Rearm>,
     busy: Option<&'a Trigger>,
 ) -> Firing<'a> {
-    Firing { key, expected: Some(t), next: Some(next), admit, rearm, ingress: None, busy }
+    Firing { key, expected: Some(t), next: Some(next), admit, rearm, ingress: None, busy, refused: None }
 }
 
 /// `t` with a skipped slot recorded in its state.
