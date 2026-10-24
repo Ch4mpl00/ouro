@@ -852,3 +852,35 @@ async fn a_dry_run_dispatches_no_call_the_rule_marks() {
     assert_eq!(mocked, [("/do/1/two", "write"), ("/do/2/three", "read")]);
     assert_eq!((writes.load(Ordering::SeqCst), reads.load(Ordering::SeqCst)), (1, 0), "only `one` was dispatched");
 }
+// The worker hands a trip's notice on by itself, polled beside the runs.
+#[tokio::test]
+async fn worker_hands_a_breaker_trip_to_the_event_sink() {
+    struct Sink(tokio::sync::mpsc::UnboundedSender<Value>);
+    #[async_trait::async_trait]
+    impl ouro_runtime::EventSink for Sink {
+        async fn emit(&self, event: &Value) -> Result<(), ouro_runtime::FunctionError> {
+            self.0.send(event.clone()).ok();
+            Ok(())
+        }
+    }
+    let (sent, mut received) = tokio::sync::mpsc::unbounded_channel();
+    let config = Config { breaker_threshold: 1, poll_interval: Duration::from_millis(5), ..Config::default() };
+    let store = Arc::new(durable::memory::memory());
+    let rt = Runtime::new(store, Arc::new(Registry::new()), config, Arc::new(Time::default()), tracer())
+        .unwrap()
+        .with_event_sink(Arc::new(Sink(sent)));
+    save(&rt, &yaml("  - fail: { raise: { error: { type: 'urn:test:failure', status: 500 } } }"));
+    rt.start("r", "workflow", Value::Null).unwrap();
+    let stop = CancellationToken::new();
+    let watch = async {
+        let event = tokio::time::timeout(Duration::from_secs(10), received.recv()).await;
+        stop.cancel();
+        event
+    };
+    let (result, event) = tokio::join!(rt.worker(stop.clone()), watch);
+    result.unwrap();
+    let event = event.expect("the worker handed the notice on").unwrap();
+    assert_eq!(event["type"], durable::TRIPPED);
+    assert_eq!((event["data"]["run"].as_str(), event["data"]["faults"].as_u64()), (Some("r"), Some(1)));
+    assert_eq!(rt.notify(&CancellationToken::new()).await.unwrap(), 0, "acknowledged by the worker");
+}

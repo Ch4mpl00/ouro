@@ -2,7 +2,8 @@
 //! `schedule` keeps in the store, armed in the commit that activates it;
 //! 2. firing due triggers (`every`, `cron`, `after`), with the missed-slot
 //! and overlap policies; 3. publishing an event to the runs listening for it
-//! and to event-triggered schedules (`on`), each ingress event at most once.
+//! and to event-triggered schedules (`on`), each ingress event at most once;
+//! 4. handing the store's notices (breaker trips) on to the host.
 //!
 //! The store holds generic triggers (`ouro_durable::Trigger`): indexed by
 //! the time they are next due and by the event types they react to, and
@@ -47,6 +48,7 @@ use owf::{
 };
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
+use tokio_util::sync::CancellationToken;
 
 /// How many due triggers one call fires, and how many triggers one event
 /// may reach; more wait for the next tick.
@@ -418,4 +420,59 @@ fn consume(strategy: &Strategy, events: &[Value]) -> anyhow::Result<Option<Optio
         _ if consumer.done() => Some(Some(consumed)),
         _ => Some(None),
     })
+}
+
+// ── 4. notices ─────────────────────────────────────────────────────────────
+
+/// How many notices one call hands on; more wait for the next tick.
+const NOTICES: usize = 64;
+
+impl Runtime {
+    /// Hands each pending notice of the store on, oldest first: a breaker
+    /// trip (`ouro_durable::TRIPPED`, `Trip::event`), committed with the trip
+    /// itself. It goes to the runs and `on` schedules listening for its type,
+    /// as `publish` does, then to the event sink, and is then acknowledged.
+    /// At least once: a hand-off interrupted before its acknowledgement is
+    /// repeated with the same `source` + `id`, which `publish` deduplicates
+    /// and a sink must. A sink failure leaves the notice for a later call;
+    /// a storage error is returned. The worker calls it on every tick;
+    /// returns how many notices were acknowledged.
+    pub async fn notify(&self, stop: &CancellationToken) -> anyhow::Result<usize> {
+        let mut acknowledged = 0;
+        for (k, event) in self.store.notices(NOTICES)? {
+            if stop.is_cancelled() {
+                break;
+            }
+            publish(&*self.store, &self.admitter(), &event, self.clock.now_ms())?;
+            if let Some(sink) = &self.capabilities.sink {
+                let sent = tokio::select! {
+                    biased;
+                    _ = stop.cancelled() => break,
+                    sent = sink.emit(&event) => sent,
+                };
+                if let Err(e) = sent {
+                    self.noticed(&event, Some(&e.to_string()));
+                    continue;
+                }
+            }
+            self.noticed(&event, None);
+            if self.store.acknowledge(&k)? {
+                acknowledged += 1;
+            }
+        }
+        Ok(acknowledged)
+    }
+
+    fn noticed(&self, event: &Value, failure: Option<&str>) {
+        let text = |k: &str| event[k].as_str().unwrap_or_default().to_string();
+        let mut attributes = vec![
+            KeyValue::new("ouro.event.type", text("type")),
+            KeyValue::new("ouro.event.source", text("source")),
+            KeyValue::new("ouro.event.id", text("id")),
+        ];
+        if let Some(failure) = failure {
+            attributes.push(KeyValue::new("ouro.notice.failure", failure.to_string()));
+        }
+        telemetry::mark(&self.tracer, if failure.is_some() { "notice failed" } else { "notice" }, attributes);
+    }
 }

@@ -596,23 +596,43 @@ async fn schedule_on_starts_a_run_per_match() {
 
 // Activation epochs: a version without a schedule removes the triggers in
 // its activation's commit. The breaker reports and never rolls back: a trip
-// stops new runs and the schedule in its own commit and is visible in the
-// runs API; only an activation, of the version the host picks, clears it.
+// stops new runs and the schedule in its own commit, is visible in the runs
+// API and is handed on as a CloudEvent (to the event sink and to an `on`
+// schedule); only an activation, of the version the host picks, clears it.
 #[tokio::test]
 async fn a_trip_reports_and_only_an_activation_clears_it() {
+    struct Sink {
+        seen: Mutex<Vec<Value>>,
+        failures: AtomicUsize,
+    }
+    #[async_trait]
+    impl EventSink for Sink {
+        async fn emit(&self, event: &Value) -> Result<(), FunctionError> {
+            self.seen.lock().unwrap().push(event.clone());
+            if self.failures.load(Ordering::SeqCst) > 0 {
+                self.failures.fetch_sub(1, Ordering::SeqCst);
+                return Err(FunctionError::communication(503, "sink unavailable"));
+            }
+            Ok(())
+        }
+    }
+    let sink = Arc::new(Sink { seen: Mutex::default(), failures: AtomicUsize::new(1) });
     let f = fixture();
-    let rt = &f.rt;
+    let rt = f.rt.with_event_sink(sink.clone());
     let ok = "schedule: { every: PT1M }\ndo: [ { a: { set: { ok: true } } } ]";
     let boom = "schedule: { every: PT1M }\ndo: [ { boom: { raise: { error: { type: 'urn:t:boom', status: 500 } } } } ]";
-    save(rt, "flaky", &doc("flaky", ok));
-    save(rt, "flaky", &doc("flaky", "do: [ { a: { set: { ok: true } } } ]"));
+    save(&rt, "flaky", &doc("flaky", ok));
+    save(&rt, "flaky", &doc("flaky", "do: [ { a: { set: { ok: true } } } ]"));
     assert!(rt.triggers("flaky").unwrap().is_empty(), "removed with the activation");
-    save(rt, "flaky", &doc("flaky", boom));
+    save(&rt, "flaky", &doc("flaky", boom));
     assert_eq!(rt.triggers("flaky").unwrap().len(), 1);
+    // The host's own reaction, a workflow started once per trip.
+    let watch = "schedule: { on: { one: { with: { type: ouro.definition.tripped } } } }\ndo: [ { a: { set: { tripped: '${ .[0] }' } } } ]";
+    save(&rt, "watch", &doc("watch", watch));
     for n in 0..3 {
         let id = format!("boom{n}");
         rt.start(&id, "flaky", json!({})).unwrap();
-        assert!(matches!(settle(rt, &id).await, Some(Status::Faulted(_))));
+        assert!(matches!(settle(&rt, &id).await, Some(Status::Faulted(_))));
     }
     let d = rt.definitions("flaky").unwrap();
     assert_eq!((d.active, d.epoch), (Some(3), 3), "no rollback and no new epoch");
@@ -623,13 +643,30 @@ async fn a_trip_reports_and_only_an_activation_clears_it() {
     assert!(rt.start("refused", "flaky", json!({})).unwrap_err().to_string().contains("tripped"));
     f.time.set(10_000_000);
     assert!(!rt.fire_due().unwrap().iter().any(|id| id.contains("flaky")));
+    // A failing sink leaves the notice; the next hand-off repeats it with
+    // the same identity, which starts the host's workflow once.
+    let stop = CancellationToken::new();
+    assert_eq!(rt.notify(&stop).await.unwrap(), 0);
+    assert_eq!(rt.notify(&stop).await.unwrap(), 1);
+    assert_eq!(rt.notify(&stop).await.unwrap(), 0, "acknowledged");
+    let seen = sink.seen.lock().unwrap().clone();
+    assert_eq!(seen.len(), 2);
+    assert_eq!(seen[0], seen[1]);
+    assert_eq!(seen[0], trip.event("flaky"));
+    assert_eq!(seen[0]["type"], durable::TRIPPED);
+    let watched = rt.list(Some("watch"), "").unwrap();
+    assert_eq!(watched.len(), 1, "one run per trip: {watched:?}");
+    let id = watched[0].admission.id.clone();
+    let output = completed(settle(&rt, &id).await);
+    assert_eq!(output["tripped"]["run"], "boom2");
+    assert_eq!(output["tripped"]["faults"], 3);
     // The host decides: here it activates the earlier version, in a new epoch.
     rt.activate("flaky", 1).unwrap();
     let d = rt.definitions("flaky").unwrap();
     assert!(d.tripped.is_none() && d.epoch == 4 && d.active == Some(1), "a new activation clears it");
     assert_eq!(rt.triggers("flaky").unwrap().len(), 1);
     rt.start("accepted", "flaky", json!({})).unwrap();
-    assert_eq!(completed(settle(rt, "accepted").await), json!({"ok": true}));
+    assert_eq!(completed(settle(&rt, "accepted").await), json!({"ok": true}));
 }
 
 #[tokio::test]

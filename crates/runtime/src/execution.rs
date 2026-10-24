@@ -182,7 +182,7 @@ impl Runtime {
     /// Activates a saved version in a new activation epoch, clearing a
     /// tripped breaker; its schedule's triggers replace the definition's
     /// current ones in the same commit. Only an activation does either: a
-    /// tripped breaker reports (`definitions`) and the host decides
+    /// tripped breaker reports (`definitions`, `notify`) and the host decides
     /// which version, if any, to activate.
     pub fn activate(&self, name: &str, version: u64) -> anyhow::Result<()> {
         let definitions = self.store.definitions(name)?;
@@ -484,6 +484,9 @@ impl Runtime {
         let mut sweep = tokio::time::Instant::now();
         let mut running: FuturesUnordered<BoxFuture<'_, (String, anyhow::Result<Option<Status>>)>> =
             FuturesUnordered::new();
+        // At most one hand-off of notices at a time, polled with the runs so
+        // a slow event sink never stalls their heartbeats.
+        let mut notifying: FuturesUnordered<BoxFuture<'_, anyhow::Result<usize>>> = FuturesUnordered::new();
         let mut ids = std::collections::BTreeSet::new();
         let mut failure = None;
         let shutdown = stop.child_token();
@@ -492,10 +495,13 @@ impl Runtime {
                 biased;
                 _=stop.cancelled()=>break,
                 Some((id,result))=running.next(),if !running.is_empty()=> {ids.remove(&id);if let Err(e)=result {failure=Some(e);break;}},
+                Some(result)=notifying.next(),if !notifying.is_empty()=> {if let Err(e)=result {failure=Some(e);break;}},
                 _=tick.tick()=> {
                     if sweep.elapsed()>=Duration::from_secs(3600) {if let Err(e)=self.sweep() {failure=Some(e);break;} sweep=tokio::time::Instant::now();}
                     // Due schedule slots: a range of the trigger index ending now.
                     if let Err(e)=self.fire_due() {failure=Some(e);break;}
+                    // Breaker trips and other notices, handed on to the host.
+                    if notifying.is_empty() {let token=shutdown.clone();notifying.push(Box::pin(async move {self.notify(&token).await}));}
                     let due=match self.store.due_as(self.clock.now_ms(),self.config.max_concurrency,&self.config.application) {Ok(due)=>due,Err(e)=>{failure=Some(e);break;}};
                     for id in due {
                         if ids.len()>=self.config.max_concurrency {break;}
@@ -506,6 +512,11 @@ impl Runtime {
         }
         shutdown.cancel();
         while let Some((_, result)) = running.next().await {
+            if let Err(e) = result {
+                failure = Some(e);
+            }
+        }
+        while let Some(result) = notifying.next().await {
             if let Err(e) = result {
                 failure = Some(e);
             }

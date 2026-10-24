@@ -42,9 +42,10 @@ pub trait ResourceResolver: Send + Sync {
 }
 
 /// Receives every event a run emits, after the runtime has delivered it to
-/// the runs listening for it. Called again with the same envelope when
-/// recovery cannot tell whether a previous attempt got through:
-/// deduplicate by `source` + `id`.
+/// the runs listening for it, and every notice the store commits for the
+/// host (a breaker trip, `ouro_durable::TRIPPED`; `Runtime::notify`). Called
+/// again with the same envelope when recovery cannot tell whether a previous
+/// attempt got through: deduplicate by `source` + `id`.
 #[async_trait]
 pub trait EventSink: Send + Sync {
     async fn emit(&self, event: &Value) -> Result<(), FunctionError>;
