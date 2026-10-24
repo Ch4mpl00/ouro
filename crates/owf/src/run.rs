@@ -209,6 +209,18 @@ impl Drop for TaskSpan<'_> {
     }
 }
 
+// Enclosing deadlines constrain an operator answer too. The guard removes
+// only this task's entry when a timeout or fork drops its future.
+struct DeadlineGuard<'a> {
+    deadlines: &'a Mutex<BTreeMap<String, i64>>,
+    reference: &'a str,
+}
+impl Drop for DeadlineGuard<'_> {
+    fn drop(&mut self) {
+        self.deadlines.lock().unwrap().remove(self.reference);
+    }
+}
+
 /// Durable event delivery. `take` atomically consumes the first matching event
 /// AND saves `Record::Event` at `key` in this run's journal. It must fence the
 /// executor just like Journal::save. Repeating a take returns the saved event.
@@ -733,6 +745,7 @@ async fn execute(
         journal,
         records: Mutex::new(records),
         attempts: Mutex::default(),
+        deadlines: Mutex::default(),
         secrets,
     };
     if let Some(Record::Finished { status }) = run.record("finished") {
@@ -776,7 +789,10 @@ async fn execute(
                 Ok(limit) => match run.remaining(limit, started_ms) {
                     Err(_) if run.has_unknown("") => Err(run.unknown("workflow")),
                     Err(e) => Err(e),
-                    Ok((remaining, deadline)) => match tokio::time::timeout(remaining, run.workflow(input)).await {
+                    Ok((remaining, deadline)) => match {
+                        run.deadlines.lock().unwrap().insert(String::new(), deadline);
+                        tokio::time::timeout(remaining, run.workflow(input)).await
+                    } {
                         Ok(Err(Fault::Waiting(wake))) => Err(Fault::Waiting(wake.min(deadline))),
                         Ok(r) => r,
                         Err(_) if run.has_unknown("") => Err(run.unknown("workflow")),
@@ -852,6 +868,7 @@ struct Run<'a> {
     attempts: Mutex<Vec<(String, String, u32)>>,
     /// The declared secrets; what is persisted or reported is redacted.
     secrets: Redaction,
+    deadlines: Mutex<BTreeMap<String, i64>>,
 }
 
 impl Run<'_> {
@@ -1438,6 +1455,11 @@ impl Run<'_> {
             Some(spec) => Some(self.duration(spec, &input, &self.args(ctx, &input, &null, &desc, scope))?),
             None => None,
         };
+        let _deadline = limit.map(|limit| {
+            let millis = i64::try_from(limit.as_millis()).unwrap_or(i64::MAX);
+            self.deadlines.lock().unwrap().insert(reference.into(), started_ms.saturating_add(millis));
+            DeadlineGuard { deadlines: &self.deadlines, reference }
+        });
         self.observe(Event::TaskStarted { reference, parent, kind: task.kind.name(), input: &input });
         span.active = true;
         let (extensions, described) = self.extensions(task, reference, &input, ctx, scope, &desc)?;
@@ -2129,7 +2151,21 @@ impl Run<'_> {
                         progress: consumer.progress(),
                         position: key.clone(),
                         since_ms: self.host.clock.now().timestamp_millis(),
-                        timeout_ms: deadline,
+                        timeout_ms: self
+                            .deadlines
+                            .lock()
+                            .unwrap()
+                            .iter()
+                            .filter(|(ancestor, _)| {
+                                ancestor.is_empty()
+                                    || reference == ancestor.as_str()
+                                    || reference
+                                        .strip_prefix(ancestor.as_str())
+                                        .is_some_and(|rest| rest.starts_with('/'))
+                            })
+                            .map(|(_, at)| *at)
+                            .chain(deadline)
+                            .min(),
                         redacted: false,
                     };
                     let raw = serde_json::to_value(&wait).map_err(|e| storage(e.into()))?;

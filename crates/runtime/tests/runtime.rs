@@ -1400,3 +1400,32 @@ async fn attributed_in_process_cancel_fires_the_token_synchronously() {
     let (result, ()) = tokio::join!(rt.drive("r", &stop), cancel);
     assert_eq!(result.unwrap(), Some(Status::Cancelled));
 }
+
+#[tokio::test]
+async fn operator_answers_respect_enclosing_workflow_and_task_deadlines() {
+    use ouro_runtime::control::{Control, Waits};
+    for workflow_timeout in [false, true] {
+        let store = Arc::new(durable::memory::memory());
+        let clock = Arc::new(Time::default());
+        let rt = runtime(store.clone(), Registry::new(), clock.clone());
+        let definition = if workflow_timeout {
+            yaml("  - decision: { listen: { to: { any: [] } } }").replace("\ndo:", "\ntimeout: { after: PT1S }\ndo:")
+        } else {
+            yaml(
+                "  - enclosing:\n      timeout: { after: PT1S }\n      do:\n        - decision: { listen: { to: { any: [] } } }",
+            )
+        };
+        save(&rt, &definition);
+        rt.start("r", "workflow", Value::Null).unwrap();
+        assert!(matches!(rt.drive("r", &CancellationToken::new()).await.unwrap(), Some(Status::Waiting { .. })));
+        let control = Control::new(store, clock.clone());
+        let wait = control.waits(&Waits::default(), None, 10).unwrap().items.pop().unwrap();
+        assert_eq!(wait.waiting.timeout_ms, Some(1000));
+        clock.0.store(1000, Ordering::SeqCst);
+        assert!(
+            control
+                .respond(&operator("late"), "r", &wait.key, json!({"source":"/operator", "id":"late", "type":"answer"}))
+                .is_err()
+        );
+    }
+}
