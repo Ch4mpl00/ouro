@@ -426,6 +426,16 @@ fn consume(strategy: &Strategy, events: &[Value]) -> anyhow::Result<Option<Optio
 
 /// How many notices one call hands on; more wait for the next tick.
 const NOTICES: usize = 64;
+/// A notice the sink refused waits 1 s, then twice as long after each
+/// further failure, at most five minutes.
+const NOTICE_RETRY_MS: i64 = 1_000;
+const NOTICE_RETRY_MAX_MS: i64 = 300_000;
+
+/// When a notice that failed `failures` times may be tried again.
+fn retry_at(now: i64, failures: u32) -> i64 {
+    let delay = NOTICE_RETRY_MS.saturating_mul(1_i64 << failures.saturating_sub(1).min(20));
+    now.saturating_add(delay.min(NOTICE_RETRY_MAX_MS))
+}
 
 impl Runtime {
     /// Hands each pending notice of the store on, oldest first: a breaker
@@ -434,16 +444,25 @@ impl Runtime {
     /// as `publish` does, then to the event sink, and is then acknowledged.
     /// At least once: a hand-off interrupted before its acknowledgement is
     /// repeated with the same `source` + `id`, which `publish` deduplicates
-    /// and a sink must. A sink failure leaves the notice for a later call;
-    /// a storage error is returned. The worker calls it on every tick;
-    /// returns how many notices were acknowledged.
+    /// and a sink must. A sink failure leaves the notice for a later call,
+    /// after a capped exponential backoff of its own (1 s doubling to five
+    /// minutes); a storage error is returned. The worker calls it on every
+    /// tick; returns how many notices were acknowledged.
     pub async fn notify(&self, stop: &CancellationToken) -> anyhow::Result<usize> {
+        let notices = self.store.notices(NOTICES)?;
+        // Forget the backoff of notices no longer pending (acknowledged
+        // elsewhere), so the map stays bounded by the pending page.
+        self.notice_backoff.lock().unwrap().retain(|k, _| notices.iter().any(|(n, _)| n == k));
         let mut acknowledged = 0;
-        for (k, event) in self.store.notices(NOTICES)? {
+        for (k, event) in notices {
             if stop.is_cancelled() {
                 break;
             }
-            publish(&*self.store, &self.admitter(), &event, self.clock.now_ms())?;
+            let now = self.clock.now_ms();
+            if self.notice_backoff.lock().unwrap().get(&k).is_some_and(|(_, at)| *at > now) {
+                continue;
+            }
+            publish(&*self.store, &self.admitter(), &event, now)?;
             if let Some(sink) = &self.capabilities.sink {
                 let sent = tokio::select! {
                     biased;
@@ -451,6 +470,10 @@ impl Runtime {
                     sent = sink.emit(&event) => sent,
                 };
                 if let Err(e) = sent {
+                    let mut backoff = self.notice_backoff.lock().unwrap();
+                    let failures = backoff.get(&k).map_or(0, |(n, _)| *n).saturating_add(1);
+                    backoff.insert(k, (failures, retry_at(self.clock.now_ms(), failures)));
+                    drop(backoff);
                     self.noticed(&event, Some(&e.to_string()));
                     continue;
                 }
@@ -459,6 +482,7 @@ impl Runtime {
             if self.store.acknowledge(&k)? {
                 acknowledged += 1;
             }
+            self.notice_backoff.lock().unwrap().remove(&k);
         }
         Ok(acknowledged)
     }
@@ -474,5 +498,14 @@ impl Runtime {
             attributes.push(KeyValue::new("ouro.notice.failure", failure.to_string()));
         }
         telemetry::mark(&self.tracer, if failure.is_some() { "notice failed" } else { "notice" }, attributes);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn notice_retries_back_off_exponentially_up_to_a_cap() {
+        let delays: Vec<i64> = [1, 2, 3, 9, 10, u32::MAX].iter().map(|n| super::retry_at(0, *n)).collect();
+        assert_eq!(delays, vec![1_000, 2_000, 4_000, 256_000, 300_000, 300_000]);
     }
 }

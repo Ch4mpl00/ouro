@@ -94,6 +94,10 @@ pub struct Runtime {
     permits: Semaphore,
     function_permits: Arc<Semaphore>,
     executions: Mutex<BTreeMap<(String, u64), CancellationToken>>,
+    /// Per notice key, the sink failures so far and when to try it again.
+    /// In memory: another process, or a restart, may try sooner, which
+    /// at-least-once allows.
+    pub(crate) notice_backoff: Mutex<BTreeMap<String, (u32, i64)>>,
 }
 impl Runtime {
     /// Dependencies are built once by the embedding host. No exporter or
@@ -130,6 +134,7 @@ impl Runtime {
             function_permits: Arc::new(Semaphore::new(config.max_function_concurrency)),
             config,
             executions: Mutex::new(BTreeMap::new()),
+            notice_backoff: Mutex::new(BTreeMap::new()),
         })
     }
     pub fn embedded(path: impl AsRef<std::path::Path>, registry: Registry) -> anyhow::Result<Self> {

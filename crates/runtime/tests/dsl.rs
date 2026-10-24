@@ -643,10 +643,16 @@ async fn a_trip_reports_and_only_an_activation_clears_it() {
     assert!(rt.start("refused", "flaky", json!({})).unwrap_err().to_string().contains("tripped"));
     f.time.set(10_000_000);
     assert!(!rt.fire_due().unwrap().iter().any(|id| id.contains("flaky")));
-    // A failing sink leaves the notice; the next hand-off repeats it with
-    // the same identity, which starts the host's workflow once.
+    // A failing sink leaves the notice, retried after its own backoff (1 s
+    // after the first failure) with the same identity, which starts the
+    // host's workflow once.
     let stop = CancellationToken::new();
     assert_eq!(rt.notify(&stop).await.unwrap(), 0);
+    assert_eq!(rt.notify(&stop).await.unwrap(), 0, "backing off");
+    f.time.set(10_000_999);
+    assert_eq!(rt.notify(&stop).await.unwrap(), 0, "still backing off");
+    assert_eq!(sink.seen.lock().unwrap().len(), 1, "not offered to the sink while backing off");
+    f.time.set(10_001_000);
     assert_eq!(rt.notify(&stop).await.unwrap(), 1);
     assert_eq!(rt.notify(&stop).await.unwrap(), 0, "acknowledged");
     let seen = sink.seen.lock().unwrap().clone();
