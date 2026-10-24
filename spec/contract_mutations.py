@@ -46,7 +46,7 @@ MUTANTS = {
  # Only direct children end with their parent: a grandchild outlives it.
  "C3/transitive": ('Runs.filter(k => live(s.db.runs.nth(k)) and ancestors(s,k).contains(r))','Runs.filter(k => live(s.db.runs.nth(k)) and s.db.runs.nth(k).parent == r)',
    BOOT+[op("child")]+TICKS+[op("claim",r=1,w=1),op("child",r=1,w=1),op("release",r=1,w=1),op("claim"),op("finish",value=1)]),
- "T1": ('fired:if (skip) s.db.fired else s.db.fired.union(Set(slot))','fired:s.db.fired',[op("tick"),op("tick"),op("fire")]),
+ "T1": ('fired:if (skip or buffer) s.db.fired else s.db.fired.union(Set(slot))','fired:s.db.fired',[op("tick"),op("tick"),op("fire")]),
  "T2": ('val epoch = c.epoch+1','val epoch = c.epoch',[op("activate",i=1)]),
  "T3": ('owner:w, generation:execution.generation+1, lease:s.now+4','owner:w, generation:execution.generation+1, lease:s.now+4, deadline:s.now+8',BOOT+TICKS+[op("claim")]),
  "V1": ('active:i+1,epoch:epoch','active:c.active,epoch:epoch',[op("activate",i=1)]),
@@ -59,6 +59,11 @@ MUTANTS = {
  "X2": ('execution.mode != 2','true',[op("replay"),op("claim")]+CALL),
  "X3": ('Set("admit","dry","replay").contains(op) and value >= 0 and not(execution.admitted)','Set("admit","dry","replay").contains(op) and value >= 0',BOOT+[op("finish"),op("admit",value=1)]),
  "B1": ('val granted = count < ceiling','val granted = true',BOOT+[op("spend"),op("spend",i=1),op("spend",i=2)]),
+ "OverlapSkip": ('val blocked = busy.size() > 0 and policy != 1 and policy != 3', 'val blocked = busy.size() > 0 and policy != 0 and policy != 1 and policy != 3', [op("policy",i=1,value=0)]+[op("tick")]*2+[op("fire")]+[op("tick")]*2+[op("fire",r=1)]),
+ "OverlapAllow": ('val blocked = busy.size() > 0 and policy != 1 and policy != 3', 'val blocked = busy.size() > 0 and policy != 3', [op("policy",i=1,value=1)]+[op("tick")]*2+[op("fire")]+[op("tick")]*2+[op("fire",r=1)]),
+ "OverlapQueue": ('and policy == 2 and c.queued < 0', 'and false and c.queued < 0', [op("policy",i=1,value=2)]+[op("tick")]*2+[op("fire")]+[op("tick")]*2+[op("fire",r=1)]),
+ "OverlapReplace": ('not(invalid) and policy == 3', 'false', [op("policy",i=1,value=3)]+[op("tick")]*2+[op("fire")]+[op("tick")]*2+[op("fire",r=1)]),
+ "OverlapCeiling": ('val full = Runs.filter(k => live(replaced.db.runs.nth(k))).size() >= maxRuns', 'val full = false', [op("policy",i=0,value=1)]+[op("tick")]*2+[op("fire")]+[op("tick")]*2+[op("fire",r=1)]),
 }
 
 def harness(commands):

@@ -10,7 +10,8 @@
 // try/catch with retry (limit.attempt.duration included), wait;
 // input/output/export transforms and schemas (inline or a host-resolved
 // `resource`); if/then/timeout; schedule (every, cron, after, on; missed
-// slots per `document.metadata.catchup`, an extension: `latest` | `none`);
+// slots per `document.metadata.catchup`: `latest` | `none`; overlap per
+// `document.metadata.overlap`: `skip` | `allow` | `queue` | `replace`);
 // use.functions/errors/retries/timeouts/extensions/secrets; evaluate (jq,
 // strict). Runtime arguments: $context, $input, $output, $task, $workflow,
 // $runtime, $run (an extension: jump and visit counts), and $secrets in
@@ -135,6 +136,19 @@ pub struct Schedule {
     /// `document.metadata.catchup` (an extension): what becomes of `every`
     /// and `cron` slots missed while no scheduler ran.
     pub catchup: Catchup,
+    /// How a slot overlaps unfinished runs of this trigger.
+    pub overlap: Overlap,
+}
+
+/// A trigger's policy for slots arriving while its runs are unfinished.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Overlap {
+    #[default]
+    Skip,
+    Allow,
+    Queue,
+    Replace,
 }
 
 /// A missed slot is one whose following slot is due as well.
@@ -589,6 +603,17 @@ impl Parser {
                 (Some("latest"), Some(s)) => s.catchup = Catchup::Latest,
                 (Some("none"), Some(s)) => s.catchup = Catchup::None,
                 _ => self.fail("/document/metadata/catchup", "expected latest or none"),
+            },
+        }
+        match m.get("document").and_then(|d| d.get("metadata")).and_then(|d| d.get("overlap")) {
+            None => {}
+            Some(value) => match (value.as_str(), schedule.as_mut()) {
+                (Some(_), None) => self.fail("/document/metadata/overlap", "overlap applies only with a schedule"),
+                (Some("skip"), Some(s)) => s.overlap = Overlap::Skip,
+                (Some("allow"), Some(s)) => s.overlap = Overlap::Allow,
+                (Some("queue"), Some(s)) => s.overlap = Overlap::Queue,
+                (Some("replace"), Some(s)) => s.overlap = Overlap::Replace,
+                _ => self.fail("/document/metadata/overlap", "expected skip, allow, queue or replace"),
             },
         }
         let budget = match m.get("document").and_then(|d| d.get("metadata")).and_then(|d| d.get("limits")) {
@@ -1088,7 +1113,7 @@ impl Parser {
         if every.is_none() && after.is_none() && cron.is_none() && on.is_none() {
             self.fail(at, "a schedule needs every, cron, after or on");
         }
-        Some(Schedule { every, cron, after, on, read, catchup: Catchup::Latest })
+        Some(Schedule { every, cron, after, on, read, catchup: Catchup::Latest, overlap: Overlap::Skip })
     }
 
     fn for_task(&mut self, m: &Map<String, Value>, at: &str) -> Option<Kind> {
@@ -2542,6 +2567,34 @@ do:
         assert!(checked("do: [ { a: { set: { v: '${ $run.visits.a }' } } } ]\n").is_empty());
         let p = checked("do: [ { l: { for: { each: run, in: '.xs' }, do: [] } } ]\n");
         assert!(p.iter().any(|p| p.contains("/do/0/l/for/each") && p.contains("reserved")), "{p:?}");
+    }
+
+    #[test]
+    fn overlap_is_schedule_metadata_with_a_strict_policy() {
+        let yaml = |policy: &str, schedule: &str| {
+            format!(
+                "document: {{ dsl: '1.0.4', namespace: t, name: w, version: '1.0.0', metadata: {{ overlap: {policy} }} }}\n{schedule}\ndo: [ {{ a: {{ set: {{ ok: true }} }} }} ]"
+            )
+        };
+        for (name, policy) in [
+            ("skip", Overlap::Skip),
+            ("allow", Overlap::Allow),
+            ("queue", Overlap::Queue),
+            ("replace", Overlap::Replace),
+        ] {
+            assert_eq!(parse_yaml(&yaml(name, "schedule: { every: PT1S }")).unwrap().schedule.unwrap().overlap, policy);
+        }
+        assert_eq!(
+            wf("schedule: { after: PT1S }\ndo: [ { a: { set: { ok: true } } } ]").unwrap().schedule.unwrap().overlap,
+            Overlap::Skip
+        );
+        for (policy, schedule) in
+            [("allow", ""), ("unknown", "schedule: { every: PT1S }"), ("42", "schedule: { every: PT1S }")]
+        {
+            assert!(
+                parse_yaml(&yaml(policy, schedule)).unwrap_err().to_string().contains("/document/metadata/overlap")
+            );
+        }
     }
 
     #[test]

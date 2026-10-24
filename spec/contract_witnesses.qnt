@@ -137,12 +137,45 @@ module contract_witnesses {
     m.db.runs.nth(0).outcome == 2 and m.db.runs.nth(1).outcome == 2 and m.db.runs.nth(1).ended == 4 and
     m.db.catalog.tripped and m.db.catalog.faults == 2 and m.db.catalog.notices == [1] and
     not(m.db.catalog.armed) and m.db.catalog.due == -1)
+  action policyOverlap(policy: int): bool = init.then(execute("policy",0,0,1,policy,0))
+    .then(ticks(2)).then(do("fire")).then(ticks(2)).then(execute("fire",1,0,0,7,0))
+  action skipPolicy = policyOverlap(0)
+  run skipPolicyTest = skipPolicy.expect(checked and m.db.admissions == [1,0,0] and m.db.skipped == Set((1,1)))
+  action allowPolicy = policyOverlap(1)
+  run allowPolicyTest = allowPolicy.expect(checked and m.db.admissions == [1,1,0] and Set(0,1).forall(r => live(m.db.runs.nth(r))))
+  action queuePolicy = policyOverlap(2).then(ticks(2)).then(execute("fire",1,0,0,8,0)).then(do("crash")).then(do("cancel"))
+  run queuePolicyTest = queuePolicy.expect(checked and m.db.admissions == [1,1,0] and m.db.runs.nth(1).input == 7 and m.db.catalog.queued == -1)
+  action replacePolicy = policyOverlap(3)
+  run replacePolicyTest = replacePolicy.expect(checked and m.db.runs.nth(0).outcome == 5 and live(m.db.runs.nth(1)))
+  action ceilingPolicy = init.then(execute("policy",0,0,0,1,0)).then(ticks(2)).then(do("fire"))
+    .then(ticks(2)).then(execute("fire",1,0,0,0,0))
+  run ceilingPolicyTest = ceilingPolicy.expect(checked and m.db.admissions == [1,0,0] and m.db.skipped == Set((1,1)))
+  action policyCrash(policy: int): bool = init.then(execute("policy",0,0,1,policy,0))
+    .then(ticks(2)).then(do("fire")).then(ticks(2))
+    .then(execute("fire",1,0,0,7,1)).then(do("crash")).then(execute("fire",1,0,0,7,2))
+  action skipCrash = policyCrash(0)
+  run skipCrashTest = skipCrash.expect(checked and m.db.admissions == [1,0,0])
+  action allowCrash = policyCrash(1)
+  run allowCrashTest = allowCrash.expect(checked and m.db.admissions == [1,1,0])
+  action queueCrash = policyCrash(2).then(do("cancel"))
+  run queueCrashTest = queueCrash.expect(checked and m.db.admissions == [1,1,0] and m.db.runs.nth(1).input == 7)
+  action replaceCrash = policyCrash(3)
+  run replaceCrashTest = replaceCrash.expect(checked and m.db.runs.nth(0).outcome == 5 and live(m.db.runs.nth(1)))
+  action oldCompletionPromotes = init.then(execute("policy",0,0,1,2,0)).then(ticks(2)).then(do("fire"))
+    .then(do("activate")).then(ticks(2)).then(execute("fire",1,0,0,7,0)).then(do("claim")).then(do("finish"))
+  run oldCompletionPromotesTest = oldCompletionPromotes.expect(checked and m.db.admissions == [1,1,0] and
+    m.db.runs.nth(0).epoch == 1 and m.db.runs.nth(1).epoch == 2 and m.db.catalog.faults == 0)
+  action queuedRefusal = init.then(execute("policy",0,0,1,2,0)).then(ticks(2)).then(do("fire"))
+    .then(ticks(2)).then(execute("refuse",1,0,0,7,0)).then(do("crash")).then(do("claim"))
+    .then(execute("finish",0,0,0,1,0))
+  run queuedRefusalTest = queuedRefusal.expect(checked and m.db.admissions == [1,1,0] and
+    m.db.runs.nth(1).outcome == 2 and m.db.runs.nth(1).input == 7 and m.db.catalog.tripped and
+    m.db.catalog.faults == 2 and m.db.catalog.notices == [1] and m.db.catalog.queued == -1)
   // Every history above in one trace (each starts with init), replayed
   // against the stores by crates/durable/tests/quint.rs.
   run bridgeSuite = continuation.then(unknown).then(mailbox).then(expiry).then(child).then(childFinish).then(grandchild).then(activation)
     .then(deadline).then(compatibility).then(dry).then(replay).then(schedule).then(breaker).then(rearm)
     .then(noCatchup).then(overlap).then(ingress).then(ingressExpiry).then(redispatch).then(protectedUnknown)
     .then(notExecuted).then(errorResponse).then(conflict).then(release).then(staleFence).then(admission)
-    .then(successResetsBreaker).then(noRollback).then(reactivation).then(broadcast).then(retention).then(budget)
-    .then(refused)
+    .then(successResetsBreaker).then(noRollback).then(reactivation).then(broadcast).then(retention).then(budget).then(skipPolicy).then(allowPolicy).then(queuePolicy).then(replacePolicy).then(ceilingPolicy).then(skipCrash).then(allowCrash).then(queueCrash).then(replaceCrash).then(refused).then(oldCompletionPromotes).then(queuedRefusal)
 }

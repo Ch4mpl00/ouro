@@ -577,7 +577,7 @@ async fn schedule_on_starts_a_run_per_match() {
         &doc(
             "alarm",
             "schedule: { on: { one: { with: { type: heartbeat.low, data: '${ .bpm < 50 }' } } } }\ndo: [ { a: { set: { patient: '${ .[0].patient }' } } } ]",
-        ),
+        ).replace("version: '1.0.0' }", "version: '1.0.0', metadata: { overlap: allow } }"),
     );
     let mut started = Vec::new();
     for (id, bpm, patient) in [("1", 40, "ann"), ("2", 70, "bob"), ("3", 45, "cid"), ("1", 40, "ann")] {
@@ -1479,4 +1479,252 @@ async fn branches_refused_together_follow_the_first_refusal_across_crashes() {
         }
     }
     assert!(decided > 2, "crash points after the first refusal: {decided}");
+}
+
+#[tokio::test]
+async fn schedule_overlap_policies_apply_to_time_and_event_slots() {
+    for policy in ["skip", "allow", "queue", "replace"] {
+        for kind in ["every", "cron", "on"] {
+            let f = fixture();
+            let schedule = match kind {
+                "every" => "every: PT1M",
+                "cron" => "cron: '* * * * *'",
+                _ => "on: { one: { with: { type: tick } } }",
+            };
+            let yaml = doc("overlap", &format!("schedule: {{ {schedule} }}\ndo: [ {{ pause: {{ wait: PT1H }} }} ]"))
+                .replace("version: '1.0.0' }", &format!("version: '1.0.0', metadata: {{ overlap: {policy} }} }}"));
+            save(&f.rt, "overlap", &yaml);
+            let fire = |n: i64| {
+                f.time.set(n * 60_000);
+                if kind == "on" {
+                    f.rt.publish(json!({"source":"test", "id":format!("{n}"), "type":"tick", "data":n})).unwrap()
+                } else {
+                    f.rt.fire_due().unwrap()
+                }
+            };
+            let first = fire(1).pop().unwrap();
+            assert_eq!(settle(&f.rt, &first).await, None, "waiting counts as overlap");
+            let second = fire(2);
+            let third = fire(3);
+            match policy {
+                "skip" => {
+                    assert!(second.is_empty() && third.is_empty());
+                    assert_eq!(f.rt.list(Some("overlap"), "").unwrap().len(), 1);
+                }
+                "allow" => {
+                    assert_eq!((second.len(), third.len()), (1, 1));
+                    assert!(f.rt.get(&first).unwrap().unwrap().ended_ms.is_none());
+                }
+                "queue" => {
+                    assert!(second.is_empty() && third.is_empty());
+                    assert_eq!(f.rt.queued("overlap").unwrap().len(), 1);
+                    f.rt.cancel(&first).unwrap();
+                    assert!(f.rt.queued("overlap").unwrap().is_empty());
+                    let runs = f.rt.list(Some("overlap"), "").unwrap();
+                    assert_eq!(runs.len(), 2);
+                    let promoted = runs.iter().find(|r| r.admission.id != first).unwrap();
+                    assert_eq!(promoted.admitted_ms, 180_000);
+                    if kind == "on" {
+                        assert_eq!(promoted.admission.input, json!([2]));
+                    } else {
+                        assert!(promoted.admission.id.ends_with(":120000"));
+                    }
+                }
+                _ => {
+                    assert_eq!((second.len(), third.len()), (1, 1));
+                    assert_eq!(f.rt.get(&first).unwrap().unwrap().outcome, Some(Status::Cancelled));
+                    assert_eq!(f.rt.get(&second[0]).unwrap().unwrap().outcome, Some(Status::Cancelled));
+                }
+            }
+            // Reoffering the same event or ticking the same slot never admits
+            // a second run, even after a policy's skip or replacement.
+            let count = f.rt.list(Some("overlap"), "").unwrap().len();
+            fire(3);
+            assert_eq!(f.rt.list(Some("overlap"), "").unwrap().len(), count);
+            let (_, t) = f.rt.triggers("overlap").unwrap().pop().unwrap();
+            if policy == "skip" || policy == "queue" {
+                assert!(t.state["skips"].as_u64().unwrap() >= 1);
+            }
+        }
+    }
+}
+
+#[test]
+fn schedule_allow_stops_at_the_host_ceiling_across_trigger_kinds() {
+    let f = fixture();
+    let yaml = doc(
+        "bounded",
+        "schedule: { every: PT1M, on: { one: { with: { type: tick } } } }\ndo: [ { pause: { wait: PT1H } } ]",
+    )
+    .replace("version: '1.0.0' }", "version: '1.0.0', metadata: { overlap: allow } }");
+    save(&f.rt, "bounded", &yaml);
+    for n in 1..=10 {
+        f.time.set(n * 60_000);
+        assert_eq!(f.rt.fire_due().unwrap().len(), 1);
+    }
+    f.time.set(660_000);
+    assert!(f.rt.fire_due().unwrap().is_empty());
+    assert!(f.rt.publish(json!({"source":"test", "id":"ceiling", "type":"tick"})).unwrap().is_empty());
+    assert_eq!(f.rt.list(Some("bounded"), "").unwrap().len(), 10);
+    for (_, t) in f.rt.triggers("bounded").unwrap() {
+        assert_eq!(t.state["skipped"][0]["overlap"], "ceiling");
+    }
+    f.rt.cancel("schedule:bounded:every:60000").unwrap();
+    assert_eq!(f.rt.publish(json!({"source":"test", "id":"free", "type":"tick"})).unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn after_overlap_and_ceiling_rearm_without_stranding_the_trigger() {
+    for policy in ["skip", "allow", "queue", "replace"] {
+        let f = fixture();
+        let yaml = doc("after-overlap", "schedule: { after: PT1M }\ndo: [ { pause: { wait: PT1H } } ]")
+            .replace("version: '1.0.0' }", &format!("version: '1.0.0', metadata: {{ overlap: {policy} }} }}"));
+        save(&f.rt, "after-overlap", &yaml);
+        let first = f.rt.fire_due().unwrap().pop().unwrap();
+        settle(&f.rt, &first).await;
+        // Reactivation arms a fresh after trigger while the older run lives.
+        f.rt.activate("after-overlap", 1).unwrap();
+        let second = f.rt.fire_due().unwrap();
+        match policy {
+            "skip" => {
+                assert!(second.is_empty());
+                assert_eq!(f.rt.triggers("after-overlap").unwrap()[0].1.at_ms, Some(60_000));
+            }
+            "queue" => {
+                assert!(second.is_empty());
+                let queued = f.rt.queued("after-overlap").unwrap().pop().unwrap();
+                f.rt.cancel(&first).unwrap();
+                assert!(f.rt.get(&queued.id).unwrap().is_some());
+                f.rt.cancel(&queued.id).unwrap();
+                assert_eq!(f.rt.triggers("after-overlap").unwrap()[0].1.at_ms, Some(60_000));
+            }
+            _ => assert_eq!(second.len(), 1),
+        }
+    }
+    let f = fixture();
+    let yaml = doc("after-ceiling", "schedule: { after: PT1M }\ndo: [ { pause: { wait: PT1H } } ]");
+    save(&f.rt, "after-ceiling", &yaml);
+    for n in 0..10 {
+        f.rt.start(&format!("manual{n}"), "after-ceiling", json!({})).unwrap();
+    }
+    assert!(f.rt.fire_due().unwrap().is_empty());
+    assert_eq!(f.rt.triggers("after-ceiling").unwrap()[0].1.at_ms, Some(60_000));
+    f.rt.cancel("manual0").unwrap();
+    f.time.set(60_000);
+    assert_eq!(f.rt.fire_due().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn replacing_a_slot_signals_its_running_handler() {
+    let time = Arc::new(Time::default());
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let cancelled = Arc::new(AtomicUsize::new(0));
+    let mut registry = Registry::new();
+    registry
+        .register(Function::new("block", json!({}), json!({}), {
+            let entered = entered.clone();
+            let cancelled = cancelled.clone();
+            move |_: Value, ctx: FunctionContext| {
+                let entered = entered.clone();
+                let cancelled = cancelled.clone();
+                async move {
+                    entered.notify_one();
+                    ctx.cancel.cancelled().await;
+                    cancelled.fetch_add(1, Ordering::SeqCst);
+                    Ok(json!({}))
+                }
+            }
+        }))
+        .unwrap();
+    let rt = Runtime::new(
+        Arc::new(durable::memory::memory()),
+        Arc::new(registry),
+        Config::default(),
+        time.clone(),
+        tracer(),
+    )
+    .unwrap();
+    let yaml = doc("replace-handler", "schedule: { every: PT1M }\ndo: [ { block: { call: block } } ]")
+        .replace("version: '1.0.0' }", "version: '1.0.0', metadata: { overlap: replace } }");
+    save(&rt, "replace-handler", &yaml);
+    time.set(60_000);
+    let first = rt.fire_due().unwrap().pop().unwrap();
+    let stop = CancellationToken::new();
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        tokio::join!(rt.drive(&first, &stop), async {
+            entered.notified().await;
+            time.set(120_000);
+            assert_eq!(rt.fire_due().unwrap().len(), 1);
+        })
+    })
+    .await
+    .unwrap()
+    .0
+    .ok();
+    assert_eq!(rt.get(&first).unwrap().unwrap().outcome, Some(Status::Cancelled));
+    // The interpreter may drop an in-flight handler after signaling it; the
+    // durable cancellation and prompt return are the required observations.
+}
+
+#[test]
+fn schedule_ceiling_is_supplied_by_the_host() {
+    let time = Arc::new(Time::default());
+    let config = Config { max_concurrent_runs: 1, ..Config::default() };
+    let rt =
+        Runtime::new(Arc::new(durable::memory::memory()), Arc::new(Registry::new()), config, time.clone(), tracer())
+            .unwrap();
+    let yaml = doc("host-ceiling", "schedule: { every: PT1M }\ndo: [ { pause: { wait: PT1H } } ]")
+        .replace("version: '1.0.0' }", "version: '1.0.0', metadata: { overlap: allow } }");
+    save(&rt, "host-ceiling", &yaml);
+    time.set(60_000);
+    assert_eq!(rt.fire_due().unwrap().len(), 1);
+    time.set(120_000);
+    assert!(rt.fire_due().unwrap().is_empty());
+    assert_eq!(rt.triggers("host-ceiling").unwrap()[0].1.state["skipped"][0]["overlap"], "ceiling");
+    assert!(
+        Runtime::new(
+            Arc::new(durable::memory::memory()),
+            Arc::new(Registry::new()),
+            Config { max_concurrent_runs: 0, ..Config::default() },
+            time,
+            tracer()
+        )
+        .is_err()
+    );
+}
+
+#[tokio::test]
+async fn refused_slots_follow_the_selected_overlap_policy() {
+    for policy in ["skip", "allow", "queue", "replace"] {
+        let f = fixture();
+        let yaml = doc(
+            "refused-overlap",
+            "schedule: { every: PT1M }\ndo: [ { pause: { wait: PT1H } }, { write: { call: write } } ]",
+        )
+        .replace("version: '1.0.0' }", &format!("version: '1.0.0', metadata: {{ overlap: {policy} }} }}"));
+        save(&f.rt, "refused-overlap", &yaml);
+        f.time.set(60_000);
+        let first = f.rt.fire_due().unwrap().pop().unwrap();
+        assert_eq!(settle(&f.rt, &first).await, None);
+        f.rt.set_registry(Arc::new(Registry::new()));
+        f.time.set(120_000);
+        assert!(f.rt.fire_due().unwrap().is_empty());
+        let second = "schedule:refused-overlap:every:120000";
+        if policy == "skip" {
+            assert!(f.rt.get(second).unwrap().is_none());
+            assert_eq!(f.rt.definitions("refused-overlap").unwrap().consecutive_faults, 0);
+            continue;
+        }
+        if policy == "queue" {
+            assert_eq!(f.rt.queued("refused-overlap").unwrap()[0].id, second);
+            assert!(f.rt.get(second).unwrap().is_none());
+            f.rt.cancel(&first).unwrap();
+            assert!(f.rt.queued("refused-overlap").unwrap().is_empty());
+        }
+        assert!(matches!(f.rt.get(second).unwrap().unwrap().outcome, Some(Status::Faulted(_))));
+        assert_eq!(f.rt.definitions("refused-overlap").unwrap().consecutive_faults, 1);
+        if policy == "replace" {
+            assert_eq!(f.rt.get(&first).unwrap().unwrap().outcome, Some(Status::Cancelled));
+        }
+    }
 }

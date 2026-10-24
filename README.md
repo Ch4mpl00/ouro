@@ -279,12 +279,24 @@ is bounded by its collection and `retry` by its attempts.
   fires. The `worker` fires due slots on each tick (`fire_due`, a range
   read of the due index); the trigger moves to its next slot in the commit
   that admits the slot's run, whose id derives from the slot, so concurrent
-  workers start each once. A slot whose previous run of the same trigger is
-  still running or waiting is skipped, as is a missed slot under
-  `document.metadata.catchup: none` (the default `latest` runs it once,
-  late); a skip is recorded in the trigger's state and traced. A slot whose
-  run the host refuses to admit (a `MissingFunction` or an
-  `InvalidDefinition`) never stops the worker: the firing's commit consumes
+  workers start each once. A missed slot under `document.metadata.catchup:
+  none` is skipped (the default `latest` runs it once, late). Overlap is
+  selected in `document.metadata.overlap`, for unfinished runs of the same
+  trigger, waiting runs and earlier epochs included:
+
+  ```yaml
+  document:
+    metadata:
+      overlap: skip    # default: skip with a record
+      # allow         # admit each slot concurrently
+      # queue         # buffer one slot durably; skip later ones
+      # replace       # cancel unfinished runs and their owned children
+  ```
+
+  A slot whose run the host refuses to admit (a `MissingFunction` or an
+  `InvalidDefinition`) follows the same overlap policy. A queued refusal is
+  pinned until promotion; its failed run is recorded and counted then.
+  Otherwise, when the overlap guard permits it, the firing's commit consumes
   the slot, stores the run under the slot's id as ended faulted at its
   admission (`configuration` or `validation`; `get`, `list`) and counts the
   fault toward the definition's breaker, so a definition that stays broken
@@ -295,9 +307,24 @@ is bounded by its collection and `retry` by its attempts.
   (`ResourceUnavailable`) interrupts the admission, so the trigger keeps
   the slot, uncounted, and retries it after a backoff of 1 s doubling to
   five minutes, stored with the trigger (`retry` in its state); an `on`
-  schedule leaves the event untaken and `publish` returns the error. `after`
-  re-arms when its run ends, never across epochs (a refused one is due one
-  delay later). `on` keeps the events
+  schedule leaves the event untaken and `publish` returns the error.
+
+  `Config::max_concurrent_runs` (default 10, positive) is the host's ceiling
+  across all unfinished runs of a definition. A schedule slot at it is
+  skipped with `overlap: ceiling` in its skip record; replacement releases
+  its old runs' capacity first. Explicit starts and children count toward
+  this ceiling; the schedule policy does not refuse them. Workers sharing a
+  store use the same ceiling. A queue captures the ceiling with its pinned
+  definition, input and bindings; it respects it when buffering and promoting.
+  `Runtime::queued(name)` exposes these buffers. Promotion commits with the
+  previous run's end, and its admission time and timeout start then. A new
+  activation or breaker trip discards the replaced epoch's buffers. Every
+  policy keeps the original slot as the run ID across restarts, and policy,
+  cancellation, trigger movement and admission share a transaction. Skips
+  are recorded in the trigger's state and time skips are traced. `after`
+  re-arms when its run ends, never across epochs; a skip leaves a future
+  retry. `on` uses the same overlap policies, takes a matched event's identity
+  even on a skip or buffer, keeps the events
   matched so far in its trigger and starts the workflow, with the consumed
   events as input, once the strategy is satisfied (a refused run consumes
   the match like a refused slot); a publish reads only the triggers indexed
@@ -358,7 +385,11 @@ The engine owns primary and secondary keys in `(kind, id)` order:
 | `children:<hex parent ID>` | child ID | Live descendants for atomic cancellation |
 | `finished` | ordered end time + run ID | Retained evidence due for sweeping |
 | `trigger`, `trigger_due`, `trigger_type:<hex type>` | trigger key | Triggers by key, next due time and event type |
-| `trigger_run` | trigger key | The run a trigger admitted last, for exclusive firing |
+| `trigger_run` | trigger key | The run a trigger admitted last (legacy exclusive firing) |
+| `live_name:<hex name>` | run ID | Unfinished runs for a limited definition-capacity lookup |
+| `trigger_live:<hex trigger key>` | run ID | Unfinished runs admitted by a trigger, across epochs |
+| `trigger_queue` | trigger key | One pinned buffered admission, optional refusal/rearm and captured ceiling (layout 1) |
+| `queue_name:<hex name>` | trigger key | Buffers to promote when this definition releases capacity |
 | `ingress`, `ingress_due` | hex identity | Ingress tombstones and their expiry |
 | `budget` | root run ID | The units a run tree has spent, until its root ends |
 
@@ -394,7 +425,7 @@ Both initial migrations were replaced before any release or deployment. This
 layout requires a fresh database from the earlier development checkout; there
 is no conversion of that unreleased layout. Applied migrations are immutable
 from the next release onward. The SQL schema is a generic key/value table, so
-the row shapes above (and the interpreter's durable state version, now 6) can
+the row shapes above (and the interpreter's durable state version, now 7) can
 change without a migration; nothing persisted before them is converted. Each
 run row records the durable state version it was written under, and a row of
 another version (including the earlier one-aggregate-per-run layout) is
@@ -434,7 +465,8 @@ fakes registered as `http` and `openapi` functions.
 fencing, immutable evidence, event histories, held listens, every interpreter
 checkpoint boundary, child notifications, rollback and ambiguous commits,
 corruption, concurrent claims, retention, liveness drains and a run tree's
-shared budget (restarts, failed commits, children, a race at the last unit). Factories supply
+shared budget (restarts, failed commits, children, a race at the last unit),
+all overlap policies, queue promotion and a race at the schedule ceiling. Factories supply
 an independent reopen handle, persisted-row inspection and failure injection.
 
 `cargo test -p ouro-durable --test scalability -- --nocapture` checks every

@@ -703,6 +703,7 @@ pub fn run_all(factory: impl Fn(&str) -> anyhow::Result<TestStore>) -> anyhow::R
         .witnesses
         .extend(["listen recovery before and after every interpreter commit", "held delivery and catchable timeout"]);
     budgets(&factory, &mut report)?;
+    overlap_policies(&factory, &mut report)?;
     Ok(report)
 }
 
@@ -1341,4 +1342,308 @@ async fn listen_case(
         usize::from(mode != 3)
     );
     Ok((saves, interrupted))
+}
+
+/// Policy decisions, ingress consumption, cancellation and admission are one
+/// transaction. Reopening after an ambiguous reply observes that transaction.
+fn overlap_policies(factory: &impl Fn(&str) -> anyhow::Result<TestStore>, report: &mut Report) -> anyhow::Result<()> {
+    let slot = |n| Trigger { at_ms: Some(n), types: vec!["tick".into()], state: json!(n) };
+    let fire = |s: &dyn RunStore, policy, n, max, ingress: Option<&Value>| {
+        s.fire(
+            &Firing {
+                key: "policy",
+                expected: Some(&slot(n)),
+                next: Some(&slot(n + 1)),
+                admit: &[admission(&format!("slot{n}"))],
+                busy: Some(&slot(n + 1)),
+                ingress,
+                overlap: Some(OverlapGuard { policy, max_concurrent_runs: max, ceiling: &slot(n + 1) }),
+                ..Firing::default()
+            },
+            n,
+        )
+    };
+    for policy in [Overlap::Skip, Overlap::Allow, Overlap::Queue, Overlap::Replace] {
+        let t = factory("overlap-policy")?;
+        report.cases += 1;
+        let s = &t.store;
+        s.swap_trigger("policy", None, Some(&slot(1)), &[], None, 0)?;
+        assert_eq!(fire(&**s, policy, 1, 10, None)?, Fired::Committed);
+        let f = s.claim("slot1", 1)?.unwrap();
+        let c = admission("owned");
+        let link = ChildLink { parent: "slot1".into(), key: "child".into(), reference: "/child".into() };
+        let child = s.start_child(&f, &c, &link, 1)?.unwrap();
+        s.save_record(
+            &child,
+            "protected",
+            &Record::Call {
+                logical: "call".into(),
+                function: "f".into(),
+                arguments: json!({}),
+                delivery: owf::durable::Delivery::AtMostOnce,
+                state: owf::durable::CallState::Pending,
+            },
+            1,
+        )?;
+        s.finish(&f, &Status::Waiting { wake_at_ms: i64::MAX }, 1, 3)?;
+        let e = event("second", "tick", json!(2));
+        let answer = fire(&**s, policy, 2, 10, Some(&e))?;
+        assert_eq!(
+            answer,
+            match policy {
+                Overlap::Skip => Fired::Busy("slot1".into()),
+                Overlap::Queue => Fired::Queued,
+                _ => Fired::Committed,
+            }
+        );
+        let s = (t.reopen)()?;
+        assert!(s.ingested(&e, 2)?, "even a skipped event is consumed");
+        assert_eq!(
+            s.fire(&Firing { key: "policy", expected: Some(&slot(2)), next: Some(&slot(3)), ..Firing::default() }, 2)?,
+            Fired::Changed
+        );
+        if policy == Overlap::Queue {
+            assert_eq!(s.queued("policy")?, Some(admission("slot2")));
+            assert!(s.get("slot2")?.is_none(), "a buffer is not an admitted run");
+            assert_eq!(fire(&*s, policy, 3, 10, None)?, Fired::Busy("slot1".into()));
+            assert!(s.get("slot3")?.is_none(), "only one buffered slot");
+        }
+        if policy == Overlap::Replace {
+            assert_eq!(s.get("slot1")?.unwrap().outcome, Some(Status::Cancelled));
+            assert_eq!(s.get("owned")?.unwrap().outcome, Some(Status::Cancelled));
+            assert!(s.save_record(&child, "late", &Record::Timer { deadline_ms: 0 }, 3).is_err());
+            assert!(matches!(
+                s.inspect("owned")?.unwrap().records["protected"],
+                Record::Call { state: owf::durable::CallState::Pending, .. }
+            ));
+        } else {
+            s.cancel("slot1", 4)?;
+        }
+        assert!(s.queued("policy")?.is_none());
+        assert_eq!(s.get("slot2")?.is_some(), policy != Overlap::Skip);
+        if policy == Overlap::Queue {
+            assert_eq!(s.get("slot2")?.unwrap().admission, admission("slot2"));
+            assert_eq!(s.get("slot2")?.unwrap().admitted_ms, 4, "timeout starts at promotion");
+        }
+        audit(&*s)?;
+        report.operations += 18;
+        // Fail after the overlap decision at different write boundaries. A
+        // rollback keeps every row; an ambiguous commit keeps all new rows.
+        let points = (0..8).map(CommitFault::BeforeWrite).chain([CommitFault::BeforeCommit, CommitFault::AfterCommit]);
+        for point in points {
+            let t = factory("overlap-crash")?;
+            report.cases += 1;
+            let s = &t.store;
+            s.swap_trigger("policy", None, Some(&slot(1)), &[], None, 0)?;
+            fire(&**s, policy, 1, 10, None)?;
+            let before = t.backend.snapshot()?;
+            t.faults.arm(point);
+            let result = fire(&**s, policy, 2, 10, Some(&e));
+            t.faults.clear();
+            let reopened = (t.reopen)()?;
+            if result.is_err() && point != CommitFault::AfterCommit {
+                assert_eq!(t.backend.snapshot()?, before, "{policy:?} {point:?}");
+                assert_eq!(reopened.trigger("policy")?, Some(slot(2)));
+            } else {
+                assert_eq!(reopened.trigger("policy")?, Some(slot(3)));
+                assert!(reopened.ingested(&e, 2)?);
+                assert_eq!(reopened.queued("policy")?.is_some(), policy == Overlap::Queue);
+                assert_eq!(reopened.get("slot2")?.is_some(), matches!(policy, Overlap::Allow | Overlap::Replace));
+                assert_eq!(reopened.get("slot1")?.unwrap().ended_ms.is_some(), policy == Overlap::Replace);
+            }
+            audit(&*reopened)?;
+            report.crash_points += 1;
+        }
+    }
+    // A different trigger and manually admitted runs share the definition's
+    // ceiling. Ended runs do not count, and cancellation releases capacity.
+    let t = factory("overlap-ceiling")?;
+    report.cases += 1;
+    let s = &t.store;
+    s.swap_trigger("policy", None, Some(&slot(1)), &[], None, 0)?;
+    for n in 0..10 {
+        s.admit(&admission(&format!("manual{n}")), 0)?;
+    }
+    assert_eq!(fire(&**s, Overlap::Allow, 1, 10, None)?, Fired::Ceiling);
+    assert!(s.get("slot1")?.is_none());
+    s.cancel("manual0", 1)?;
+    assert_eq!(fire(&**s, Overlap::Allow, 2, 10, None)?, Fired::Committed);
+    assert_eq!(fire(&**s, Overlap::Allow, 3, 10, None)?, Fired::Ceiling);
+    // Promotion has its own crash boundary, atomic with the previous end.
+    for point in [CommitFault::BeforeCommit, CommitFault::AfterCommit] {
+        let t = factory("overlap-promotion-crash")?;
+        report.cases += 1;
+        let s = &t.store;
+        s.swap_trigger("policy", None, Some(&slot(1)), &[], None, 0)?;
+        fire(&**s, Overlap::Queue, 1, 10, None)?;
+        fire(&**s, Overlap::Queue, 2, 10, None)?;
+        let before = t.backend.snapshot()?;
+        t.faults.arm(point);
+        assert!(s.cancel("slot1", 3).is_err());
+        t.faults.clear();
+        let s = (t.reopen)()?;
+        if point == CommitFault::BeforeCommit {
+            assert_eq!(t.backend.snapshot()?, before);
+            s.cancel("slot1", 3)?;
+        }
+        assert!(s.queued("policy")?.is_none());
+        assert_eq!(s.get("slot2")?.unwrap().admission, admission("slot2"));
+        assert!(s.get("slot1")?.unwrap().ended_ms.is_some());
+        report.crash_points += 1;
+    }
+    for trip in [false, true] {
+        let t = factory("overlap-epoch")?;
+        report.cases += 1;
+        let s = &t.store;
+        let d = s.save_definition("workflow", "original")?;
+        let armed = Arming { triggers: BTreeMap::from([("policy".into(), slot(1))]) };
+        s.activate_with("workflow", d.version, 0, &armed)?;
+        fire(&**s, Overlap::Queue, 1, 10, None)?;
+        fire(&**s, Overlap::Queue, 2, 10, None)?;
+        assert!(s.queued("policy")?.is_some());
+        if trip {
+            let f = s.claim("slot1", 2)?.unwrap();
+            s.finish(&f, &Status::Faulted(WorkflowError::runtime("trip")), 3, 1)?;
+            assert!(s.trigger("policy")?.is_none());
+        } else {
+            s.activate_with(
+                "workflow",
+                d.version,
+                1,
+                &Arming { triggers: BTreeMap::from([("policy".into(), slot(10))]) },
+            )?;
+            s.cancel("slot1", 3)?;
+            assert_eq!(s.trigger("policy")?, Some(slot(10)));
+        }
+        assert!(s.queued("policy")?.is_none(), "a replaced epoch discards its buffer");
+        assert!(s.get("slot2")?.is_none(), "an old buffered slot cannot be resurrected");
+    }
+    // Independent trigger CAS operations still contend on the definition's
+    // capacity range, so several workers cannot overbook its last permits.
+    let t = factory("overlap-ceiling-race")?;
+    report.cases += 1;
+    let barrier = Arc::new(std::sync::Barrier::new(8));
+    let mut workers = Vec::new();
+    for n in 0..8 {
+        let k = format!("race{n}");
+        t.store.swap_trigger(&k, None, Some(&slot(1)), &[], None, 0)?;
+        let s = (t.reopen)()?;
+        let barrier = barrier.clone();
+        workers.push(std::thread::spawn(move || {
+            let timer = Trigger { at_ms: Some(1), types: vec!["tick".into()], state: json!(1) };
+            barrier.wait();
+            s.fire(
+                &Firing {
+                    key: &k,
+                    expected: Some(&timer),
+                    next: Some(&timer),
+                    admit: &[admission(&k)],
+                    busy: Some(&timer),
+                    overlap: Some(OverlapGuard { policy: Overlap::Allow, max_concurrent_runs: 2, ceiling: &timer }),
+                    ..Firing::default()
+                },
+                1,
+            )
+        }));
+    }
+    let answers = workers.into_iter().map(|w| w.join().unwrap()).collect::<anyhow::Result<Vec<_>>>()?;
+    assert_eq!(answers.iter().filter(|a| **a == Fired::Committed).count(), 2);
+    assert_eq!(answers.iter().filter(|a| **a == Fired::Ceiling).count(), 6);
+    assert_eq!(t.store.list(None, "race")?.len(), 2);
+    let rows = t.backend.snapshot()?.rows;
+    assert_eq!(rows.keys().filter(|(kind, _)| kind.starts_with("live_name:")).count(), 2);
+    assert_eq!(rows.keys().filter(|(kind, _)| kind.starts_with("trigger_live:")).count(), 2);
+    // A host refusal is a slot outcome too (#15): overlap decides whether
+    // it is skipped, recorded now, or pinned until queue promotion.
+    for policy in [Overlap::Skip, Overlap::Allow, Overlap::Queue, Overlap::Replace] {
+        let t = factory("overlap-refused")?;
+        report.cases += 1;
+        let s = &t.store;
+        let d = s.save_definition("workflow", "original")?;
+        s.activate_with("workflow", d.version, 0, &Arming { triggers: BTreeMap::from([("policy".into(), slot(1))]) })?;
+        fire(&**s, policy, 1, 10, None)?;
+        let refused = Refused {
+            admission: admission("slot2"),
+            error: WorkflowError::runtime("pinned refusal"),
+            breaker_threshold: 2,
+        };
+        let result = s.fire(
+            &Firing {
+                key: "policy",
+                expected: Some(&slot(2)),
+                next: Some(&slot(3)),
+                busy: Some(&slot(3)),
+                refused: Some(&refused),
+                overlap: Some(OverlapGuard { policy, max_concurrent_runs: 10, ceiling: &slot(3) }),
+                ..Firing::default()
+            },
+            2,
+        )?;
+        assert_eq!(
+            result,
+            match policy {
+                Overlap::Skip => Fired::Busy("slot1".into()),
+                Overlap::Queue => Fired::Queued,
+                _ => Fired::Committed,
+            }
+        );
+        let s = (t.reopen)()?;
+        if policy == Overlap::Skip {
+            assert!(s.get("slot2")?.is_none());
+            continue;
+        }
+        if policy == Overlap::Queue {
+            assert_eq!(s.queued("policy")?, Some(refused.admission.clone()));
+            assert_eq!(s.definitions("workflow")?.consecutive_faults, 0);
+            let f = s.claim("slot1", 2)?.unwrap();
+            // Both observations commit together: the old run faults, then
+            // promotion records the queued refusal and trips the breaker.
+            t.faults.arm(CommitFault::BeforeCommit);
+            let before = t.backend.snapshot()?;
+            assert!(s.finish(&f, &Status::Faulted(WorkflowError::runtime("first fault")), 3, 2).is_err());
+            t.faults.clear();
+            assert_eq!(t.backend.snapshot()?, before);
+            s.finish(&f, &Status::Faulted(WorkflowError::runtime("first fault")), 3, 2)?;
+            assert_eq!(s.definitions("workflow")?.consecutive_faults, 2);
+            assert!(s.definitions("workflow")?.tripped.is_some());
+            assert_eq!(s.notices(10)?.len(), 1);
+            assert!(s.queued("policy")?.is_none());
+        } else {
+            assert_eq!(s.definitions("workflow")?.consecutive_faults, 1);
+        }
+        assert_eq!(s.get("slot2")?.unwrap().outcome, Some(Status::Faulted(refused.error)));
+        assert!(s.get("slot2")?.unwrap().ended_ms.is_some());
+        assert!(s.claim("slot2", 4)?.is_none(), "a refused buffer is never executable");
+    }
+    for policy in [Overlap::Skip, Overlap::Allow, Overlap::Queue, Overlap::Replace] {
+        let t = factory("overlap-idempotency")?;
+        report.cases += 1;
+        let s = &t.store;
+        let timer = slot(1);
+        s.swap_trigger("policy", None, Some(&timer), &[], None, 0)?;
+        let ingress = event("repeated-slot", "tick", json!(1));
+        let a = admission("stable-slot");
+        let firing = Firing {
+            key: "policy",
+            expected: Some(&timer),
+            next: Some(&timer),
+            admit: std::slice::from_ref(&a),
+            ingress: Some(&ingress),
+            busy: Some(&timer),
+            overlap: Some(OverlapGuard { policy, max_concurrent_runs: 1, ceiling: &timer }),
+            ..Firing::default()
+        };
+        assert_eq!(s.fire(&firing, 0)?, Fired::Committed);
+        let reopened = (t.reopen)()?;
+        assert_eq!(reopened.fire(&firing, reopened.policy().ingress_ms + 1)?, Fired::Committed);
+        assert_eq!(reopened.get("stable-slot")?.unwrap().admission, a);
+        assert!(
+            reopened.get("stable-slot")?.unwrap().ended_ms.is_none(),
+            "replace must not cancel its own idempotent slot"
+        );
+        assert_eq!(reopened.list(None, "stable-slot")?.len(), 1);
+        assert!(reopened.queued("policy")?.is_none());
+    }
+    report.witnesses.insert("all overlap policies and queue promotion survive decision/admission crashes");
+    Ok(())
 }
