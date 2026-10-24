@@ -108,6 +108,7 @@ pub fn call_record(i: usize, state: CallState) -> Record {
         arguments: json!(i),
         delivery: if protected(i) { Delivery::AtMostOnce } else { Delivery::AtLeastOnce },
         state,
+        annotations: Default::default(),
     }
 }
 fn task_record(continuation: i64) -> Record {

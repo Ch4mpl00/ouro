@@ -1781,6 +1781,7 @@ async fn overlap_policies(
                 arguments: json!({}),
                 delivery: ows::durable::Delivery::AtMostOnce,
                 state: ows::durable::CallState::Pending,
+                annotations: Default::default(),
             },
             1,
         )

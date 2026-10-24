@@ -10,7 +10,10 @@
 // external schemas reach the host through its seams; the DSL's semantics
 // (flow, data, errors, retries, timers, event matching and consumption,
 // extensions) are evaluated here.
-use crate::durable::{self, CallEntry, CallFailure, CallState, Delivery, Journal, Record, StepOutcome, TaskResult};
+use crate::durable::{
+    self, Annotation, Annotations, CallEntry, CallFailure, CallState, Delivery, Journal, Record, StepOutcome,
+    TaskResult,
+};
 use crate::events::{self, Offer};
 use crate::expr::{self, Args};
 use crate::model::{
@@ -48,6 +51,51 @@ pub struct CallInfo<'a> {
     /// Hides the run's secrets in what the host reports about the call
     /// (a span's error); the call itself gets the real values.
     pub secrets: &'a Redaction,
+    /// Where the host puts what its answer carries beside the result (a
+    /// model step's token counts); saved with the result.
+    pub annotations: &'a Annotator,
+}
+
+/// What a call's answer carries beside its result (`durable::Annotations`),
+/// handed over by the host while it answers. The interpreter takes them when
+/// the call returns and saves them with its result, within the bounds of
+/// `durable::check_annotations`; a later annotation of a name replaces an
+/// earlier one.
+#[derive(Debug, Default)]
+pub struct Annotator(Mutex<Annotations>);
+
+impl Annotator {
+    pub fn annotate(&self, name: impl Into<String>, value: impl Into<Annotation>) {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).insert(name.into(), value.into());
+    }
+    pub fn extend(&self, annotations: Annotations) {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).extend(annotations);
+    }
+    /// What the call handed over so far, leaving none.
+    pub fn take(&self) -> Annotations {
+        std::mem::take(&mut *self.0.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+}
+
+/// A call's answer with the annotations it carried. Only an answer (a result
+/// or an error response) carries any; an answer whose annotations exceed the
+/// bounds is answered with a validation error instead, saved like any error.
+fn annotated(
+    name: &str,
+    result: Result<Value, CallFailure>,
+    annotator: &Annotator,
+) -> (Result<Value, CallFailure>, Annotations) {
+    let annotations = annotator.take();
+    if !matches!(result, Ok(_) | Err(CallFailure::Response(_))) {
+        return (result, Annotations::new());
+    }
+    match durable::check_annotations(&annotations) {
+        Ok(()) => (result, annotations),
+        Err(e) => {
+            let error = WorkflowError::validation(format!("{name} annotations: {e}"));
+            (Err(CallFailure::Response(error)), Annotations::new())
+        }
+    }
 }
 
 /// The user functions `call` reaches, and the host's other seams. Each
@@ -1777,7 +1825,8 @@ impl Run<'_> {
         let key = format!("{reference}#call");
         let logical = self.logical(reference);
         let prior = self.record(&key);
-        if let Some(Record::Call { logical: old_logical, function, arguments, delivery: old_delivery, state }) = &prior
+        if let Some(Record::Call { logical: old_logical, function, arguments, delivery: old_delivery, state, .. }) =
+            &prior
         {
             if old_logical != &logical || function != name || arguments != &args || *old_delivery != delivery {
                 return Err(Fault::Fatal(WorkflowError::runtime(format!("{reference}: call bindings changed"))));
@@ -1817,6 +1866,7 @@ impl Run<'_> {
                 arguments: args.clone(),
                 delivery,
                 state: CallState::Pending,
+                annotations: Annotations::new(),
             },
         )
         .await?;
@@ -1833,6 +1883,7 @@ impl Run<'_> {
             })
             .max_by_key(|(prefix, _, _)| prefix.len())
             .map_or(1, |(_, _, attempt)| *attempt);
+        let annotator = Annotator::default();
         let info = CallInfo {
             run_id: self.run_id,
             reference,
@@ -1842,6 +1893,7 @@ impl Run<'_> {
             delivery,
             input,
             secrets: &self.secrets,
+            annotations: &annotator,
         };
         let cooperative = self.host.functions.cooperative(name);
         let functions = &self.host.functions;
@@ -1865,6 +1917,7 @@ impl Run<'_> {
             if self.cancel.is_cancelled() {
                 return Err(Fault::Cancelled);
             }
+            let (result, annotations) = annotated(name, result, &annotator);
             // No journal, so no record to save: the call journal still
             // learns how the call ended.
             let state = match &result {
@@ -1874,7 +1927,14 @@ impl Run<'_> {
                 Err(CallFailure::Unknown(_) | CallFailure::Interrupted(_)) => None,
             };
             if let Some(state) = state {
-                let record = Record::Call { logical, function: name.into(), arguments: Value::Null, delivery, state };
+                let record = Record::Call {
+                    logical,
+                    function: name.into(),
+                    arguments: Value::Null,
+                    delivery,
+                    state,
+                    annotations,
+                };
                 self.note(&key, &record);
             }
             return result.map_err(|failure| match failure {
@@ -1893,6 +1953,7 @@ impl Run<'_> {
                 r = dispatch(args.clone(), true) => r,
             }
         };
+        let (result, annotations) = annotated(name, result, &annotator);
         let (state, result) = match result {
             Ok(value) => (CallState::Done(Ok(value.clone())), Ok(value)),
             Err(CallFailure::Response(error)) => (CallState::Done(Err(error.clone())), Err(Fault::Error(error))),
@@ -1917,7 +1978,8 @@ impl Run<'_> {
                 return Err(Fault::Interrupted(error));
             }
         };
-        self.save(&key, Record::Call { logical, function: name.into(), arguments: args, delivery, state }).await?;
+        let record = Record::Call { logical, function: name.into(), arguments: args, delivery, state, annotations };
+        self.save(&key, record).await?;
         result
     }
 
@@ -1997,6 +2059,7 @@ impl Run<'_> {
                 arguments: args,
                 delivery: Delivery::AtMostOnce,
                 state: CallState::Done(Ok(marker.clone())),
+                annotations: Annotations::new(),
             },
         )
         .await?;
@@ -2390,6 +2453,7 @@ impl Run<'_> {
             arguments: envelope.clone(),
             delivery: Delivery::AtLeastOnce,
             state,
+            annotations: Annotations::new(),
         };
         self.save(&key, pending(CallState::Pending)).await?;
         let info = CallInfo {
@@ -2401,6 +2465,7 @@ impl Run<'_> {
             delivery: Delivery::AtLeastOnce,
             input,
             secrets: &self.secrets,
+            annotations: &Annotator::default(),
         };
         let result = tokio::select! {
             biased;

@@ -112,7 +112,11 @@ pub struct Wait {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Inspection {
     pub snapshot: RunSnapshot,
+    /// The call journal, each call with its annotations.
     pub calls: Vec<CallEntry>,
+    /// The calls' numeric annotations summed per name
+    /// (`ows::durable::annotation_totals`): a run's tokens, its cost.
+    pub annotations: BTreeMap<String, serde_json::Number>,
     pub waits: BTreeMap<String, PendingWait>,
     pub children: Vec<SavedRun>,
     pub budget_spent: u64,

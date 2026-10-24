@@ -161,7 +161,8 @@ impl Runtime {
             original.run.admission.runtime["bindings"] = self.registry().bindings(&wf);
         }
         for (key, record) in original.records {
-            if let Record::Call { logical, function, arguments, delivery, state: CallState::Done(result) } = record {
+            if let Record::Call { logical, function, arguments, delivery, state: CallState::Done(result), .. } = record
+            {
                 let reference = key.strip_suffix("#call").ok_or_else(|| anyhow::anyhow!("invalid call record key"))?;
                 calls.insert(
                     reference.to_string(),

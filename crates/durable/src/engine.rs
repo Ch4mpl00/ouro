@@ -1319,9 +1319,11 @@ impl RunStore for TransactionalStore {
                 let span_id = runtime["span_id"].as_str().map(str::to_owned);
                 let snapshot = snapshot(rows, s).await?;
                 let calls = ows::durable::call_journal(&snapshot.records);
+                let annotations = ows::durable::annotation_totals(&calls);
                 Ok(Some(control::Inspection {
                     snapshot,
                     calls,
+                    annotations,
                     waits,
                     children,
                     budget_spent,

@@ -398,13 +398,24 @@ async fn long_run(backend: &Arc<dyn AtomicBackend>, metrics: &Metrics, validatio
         arguments: json!({}),
         delivery: ows::durable::Delivery::AtMostOnce,
         state,
+        annotations: Default::default(),
     };
+    // An answer carrying the most annotations allowed: still one record row.
+    let mut annotations = ows::durable::Annotations::new();
+    for n in 0..ows::durable::MAX_ANNOTATIONS {
+        annotations.insert(format!("gen_ai.usage.k{n:02}"), ows::durable::Annotation::from(n * 1_000));
+    }
+    ows::durable::check_annotations(&annotations).map_err(anyhow::Error::msg)?;
     bounded(metrics, "long_save_record_intent", 0, async || {
         s.save_record(&f, "/do/call#call", &call(ows::durable::CallState::Pending), 1).await
     })
     .await?;
-    bounded(metrics, "long_save_record_result", 0, async || {
-        s.save_record(&f, "/do/call#call", &call(ows::durable::CallState::Done(Ok(json!(1)))), 1).await
+    bounded(metrics, "long_save_record_annotated_result", 0, async || {
+        let mut done = call(ows::durable::CallState::Done(Ok(json!(1))));
+        if let Record::Call { annotations: a, .. } = &mut done {
+            *a = annotations.clone();
+        }
+        s.save_record(&f, "/do/call#call", &done, 1).await
     })
     .await?;
     assert!(s.save_record(&f, "/do/1000/step#wait", &Record::Timer { deadline_ms: 43 }, 1).await.is_err());
