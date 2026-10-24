@@ -54,6 +54,8 @@ pub(crate) enum Mode {
         calls: Arc<BTreeMap<String, RecordedCall>>,
         used: Arc<Mutex<BTreeSet<String>>>,
         events: Arc<BTreeMap<String, Value>>,
+        /// The recorded jump decisions by key: granted or refused.
+        budgets: Arc<BTreeMap<String, bool>>,
     },
 }
 /// A test clock advances durable waits instantly during isolated execution.
@@ -118,6 +120,13 @@ impl Runtime {
             .iter()
             .filter_map(|(k, r)| if let Record::Event { event } = r { Some((k.clone(), event.clone())) } else { None })
             .collect();
+        let budgets: BTreeMap<_, _> = original
+            .records
+            .iter()
+            .filter_map(
+                |(k, r)| if let Record::Budget { granted, .. } = r { Some((k.clone(), *granted)) } else { None },
+            )
+            .collect();
         if let Some(yaml) = yaml {
             let wf = self.validate(yaml)?;
             original.run.admission.definition = yaml.into();
@@ -166,7 +175,12 @@ impl Runtime {
         let status = run_isolated(
             &runtime,
             id,
-            Mode::Replay { calls: Arc::new(calls), used: used.clone(), events: Arc::new(events) },
+            Mode::Replay {
+                calls: Arc::new(calls),
+                used: used.clone(),
+                events: Arc::new(events),
+                budgets: Arc::new(budgets),
+            },
             &clock,
             stop,
         )

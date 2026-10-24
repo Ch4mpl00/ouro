@@ -1,9 +1,9 @@
 //! Run driver: 1. configuration and the runtime; 2. admission (definitions,
-//! versions, pinned bindings and schemas); 3. bounded execution,
-//! shutdown/recovery; 4. the interpreter's host: functions, processes,
-//! events, emitted events, child runs, secrets and resources. A process stop
-//! releases work; explicit cancellation is a terminal storage transaction.
-//! Lease loss always stops forward progress.
+//! versions, pinned bindings, schemas and the run tree's limits); 3. bounded
+//! execution, shutdown/recovery; 4. the interpreter's host: functions,
+//! processes, events, emitted events, child runs, secrets and resources. A
+//! process stop releases work; explicit cancellation is a terminal storage
+//! transaction. Lease loss always stops forward progress.
 use crate::{
     FunctionContext, Registry,
     capabilities::{Capabilities, EventSink, ProcessRunner, ResourceResolver, SecretResolver},
@@ -38,6 +38,10 @@ pub struct Config {
     pub poll_interval: Duration,
     pub heartbeat_interval: Duration,
     pub retention_ms: i64,
+    /// Host ceilings no definition can lift, among them the jump budget of a
+    /// run tree (`max_jumps`, default 100) and how deep child runs nest
+    /// (`max_depth`, default 10). Only the host sets them; a definition may
+    /// only tighten the budget (`document.metadata.limits`).
     pub limits: Limits,
     /// `$runtime.metadata`: implementation-specific facts the host exposes
     /// to every expression (a tenant, feature flags).
@@ -180,6 +184,7 @@ impl Runtime {
             capabilities: self.capabilities.clone(),
             metadata: self.config.metadata.clone(),
             application: self.config.application.version.clone(),
+            limits: self.config.limits.clone(),
         }
     }
     pub(crate) fn admission(&self, id: &str, name: &str, input: Value) -> anyhow::Result<Admission> {
@@ -268,7 +273,12 @@ impl Runtime {
             anyhow::ensure!(saved.admission.name == name, "child definition changed");
             saved.admission
         } else {
-            self.admission(id, name, input)?
+            let owner = self.store.get(&parent.run_id)?.ok_or_else(|| anyhow::anyhow!("unknown parent run"))?;
+            let declared = model::parse_yaml(&owner.admission.definition)?.budget;
+            let lineage = Lineage::of(&owner.admission, &self.config.limits);
+            let lineage = Lineage { max_jumps: declared.max_jumps(lineage.max_jumps), ..lineage };
+            let child = lineage.child(&self.config.limits).map_err(|e| anyhow::anyhow!("{e}"))?;
+            self.admitter().active_in(id, name, input, &child)?
         };
         let link = ChildLink { parent: parent.run_id.clone(), key: key.into(), reference: key.into() };
         if let Some(f) = self.store.start_child(parent, &a, &link, self.clock.now_ms())? {
@@ -340,6 +350,11 @@ impl Runtime {
             limits.max_sleep = Some(Duration::ZERO);
             limits.max_listen = Some(Duration::ZERO);
         }
+        // The budget the run was admitted with: the host's ceiling then, or
+        // its parent's budget. The definition tightens it in the interpreter.
+        let lineage = Lineage::of(&saved.admission, &limits);
+        limits.max_jumps = lineage.max_jumps;
+        let lineage = Lineage { max_jumps: wf.budget.max_jumps(lineage.max_jumps), ..lineage };
         let runtime = &saved.admission.runtime;
         let host = Host {
             functions: Arc::new(ExecutionFunctions {
@@ -351,7 +366,8 @@ impl Runtime {
                 lease: lease.clone(),
                 spans: spans.clone(),
                 function_permits: self.function_permits.clone(),
-                mode,
+                lineage,
+                mode: mode.clone(),
             }),
             observer: spans.clone(),
             clock: Arc::new(InterpreterClock(self.clock.clone())),
@@ -366,7 +382,17 @@ impl Runtime {
         // The workflow's deadline counts from admission, whichever process
         // first drives the run.
         let input = saved.admission.input.clone();
-        let run = run::resume_from(&host, &wf, &saved.admission.id, input, saved.admitted_ms, local_cancel, &*lease)
+        // Replay restores the recorded budget decisions, not its private
+        // store's: the store saves each one (granted or refused) as it was.
+        let replayed = match &mode {
+            Mode::Replay { budgets, .. } => Some(ReplayJournal { lease: lease.clone(), budgets: budgets.clone() }),
+            _ => None,
+        };
+        let journal: &dyn owf::durable::Journal = match &replayed {
+            Some(replayed) => replayed,
+            None => &*lease,
+        };
+        let run = run::resume_from(&host, &wf, &saved.admission.id, input, saved.admitted_ms, local_cancel, journal)
             .with_context(spans.root());
         tokio::pin!(run);
         let mut heartbeat = tokio::time::interval(self.config.heartbeat_interval);
@@ -388,6 +414,9 @@ impl Runtime {
                     }
                 },
                 outcome=&mut run=> {
+                    if outcome.limit_exceeded {
+                        spans.limit_exceeded();
+                    }
                     // Explicit cancel may already have committed and fenced us.
                     if let Some(status)=self.store.get(&saved.admission.id)?.and_then(|r|r.outcome) {return Ok(status)}
                     return self.store.finish(&lease.fence,&outcome.status,self.clock.now_ms(),self.config.breaker_threshold);
@@ -458,11 +487,48 @@ pub(crate) struct Admitter {
     pub metadata: Value,
     /// The declared application version, recorded in every admission.
     pub application: Option<String>,
+    /// The host's ceilings: a root run is admitted with its jump budget.
+    pub limits: Limits,
+}
+
+/// Where a run stands in its tree, pinned in its admission's runtime
+/// bindings (`limits`): the jump budget it was admitted with (the host's
+/// ceiling for a root, its parent's budget for an owned child) and how many
+/// ancestors it has.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Lineage {
+    pub max_jumps: u64,
+    pub depth: u32,
+}
+impl Lineage {
+    /// An admission without the pin is a root under today's ceiling.
+    fn of(admission: &Admission, limits: &Limits) -> Self {
+        let pinned = &admission.runtime["limits"];
+        Lineage {
+            max_jumps: pinned["max_jumps"].as_u64().unwrap_or(limits.max_jumps),
+            depth: pinned["depth"].as_u64().and_then(|d| u32::try_from(d).ok()).unwrap_or(0),
+        }
+    }
+    /// An owned child's lineage, refused past the host's nesting depth.
+    fn child(&self, limits: &Limits) -> Result<Lineage, WorkflowError> {
+        let depth = self.depth.saturating_add(1);
+        if depth > limits.max_depth {
+            return Err(WorkflowError::budget(format!(
+                "a child run would nest {depth} deep; this host allows {}",
+                limits.max_depth
+            )));
+        }
+        Ok(Lineage { depth, ..*self })
+    }
+    fn pin(&self) -> Value {
+        json!({ "max_jumps": self.max_jumps, "depth": self.depth })
+    }
 }
 
 impl Admitter {
     pub fn validate(&self, yaml: &str) -> anyhow::Result<Workflow> {
         let wf = self.registry.validate_with(yaml, &self.capabilities)?;
+        run::validate_limits(&wf, &self.limits)?;
         self.schemas(&wf)?;
         Ok(wf)
     }
@@ -482,8 +548,15 @@ impl Admitter {
         }
         Ok(out)
     }
-    /// A run of `name`'s active version, unless its breaker tripped.
+    /// A root run of `name`'s active version, unless its breaker tripped.
     pub fn active(&self, id: &str, name: &str, input: Value) -> anyhow::Result<Admission> {
+        self.active_in(id, name, input, &self.root())
+    }
+    fn root(&self) -> Lineage {
+        Lineage { max_jumps: self.limits.max_jumps, depth: 0 }
+    }
+    /// `active` at a place in a run tree.
+    pub fn active_in(&self, id: &str, name: &str, input: Value, lineage: &Lineage) -> anyhow::Result<Admission> {
         let definitions = self.definitions.definitions(name)?;
         anyhow::ensure!(
             !definitions.tripped,
@@ -493,9 +566,9 @@ impl Admitter {
             .active
             .and_then(|v| definitions.versions.get(&v))
             .ok_or_else(|| anyhow::anyhow!("no active definition for {name}"))?;
-        self.of(id, d, input)
+        self.of(id, d, input, lineage)
     }
-    pub fn of(&self, id: &str, d: &Definition, input: Value) -> anyhow::Result<Admission> {
+    pub fn of(&self, id: &str, d: &Definition, input: Value, lineage: &Lineage) -> anyhow::Result<Admission> {
         let wf = self.validate(&d.yaml)?;
         let mut runtime = json!({
             "name": "ouro-runtime",
@@ -503,6 +576,7 @@ impl Admitter {
             "metadata": self.metadata,
             "bindings": self.registry.bindings(&wf),
             "schemas": self.schemas(&wf)?,
+            "limits": lineage.pin(),
         });
         if let Some(version) = &self.application {
             runtime[ouro_durable::APPLICATION_VERSION] = json!(version);
@@ -560,6 +634,9 @@ pub(crate) struct ExecutionFunctions {
     pub lease: Arc<Lease>,
     pub spans: Arc<Spans>,
     pub function_permits: Arc<Semaphore>,
+    /// This run's budget (its definition's included) and depth, which its
+    /// owned children inherit.
+    pub lineage: Lineage,
     pub mode: Mode,
 }
 impl ExecutionFunctions {
@@ -598,9 +675,10 @@ impl ExecutionFunctions {
                 return self.replayed(name, &args, effect, info);
             }
             if crate::registry::builtin(name) {
-                return self
-                    .builtin(name, args, info)
-                    .map_err(|e| CallFailure::Interrupted(WorkflowError::runtime(e.to_string())));
+                return self.builtin(name, args, info).map_err(|e| match e.downcast::<Refused>() {
+                    Ok(Refused(error)) => CallFailure::NotExecuted(error),
+                    Err(e) => CallFailure::Interrupted(WorkflowError::runtime(e.to_string())),
+                });
             }
             let registered = match process {
                 Some(_) => None,
@@ -694,7 +772,8 @@ impl ExecutionFunctions {
             anyhow::ensure!(saved.admission.name == name, "child definition changed");
             saved.admission
         } else {
-            self.admitter.active(&id, name, args.get("input").cloned().unwrap_or(Value::Null))?
+            let lineage = self.lineage.child(&self.admitter.limits).map_err(Refused)?;
+            self.admitter.active_in(&id, name, args.get("input").cloned().unwrap_or(Value::Null), &lineage)?
         };
         let now = self.lease.clock.now_ms();
         let link = ChildLink { parent: info.run_id.into(), key: info.logical.into(), reference: info.reference.into() };
@@ -704,6 +783,42 @@ impl ExecutionFunctions {
         Ok(json!({"id":id,"key":info.logical,"done":format!("done:{id}"),"waiting":format!("waiting:{id}")}))
     }
 }
+/// A child the host refused to start (its nesting depth): an answer the
+/// workflow can catch, not a stop.
+#[derive(Debug)]
+struct Refused(WorkflowError);
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+impl std::error::Error for Refused {}
+
+/// Replay's journal: a recorded budget decision is saved again as it was
+/// (a granted one with no limit, a refused one with none left), so the
+/// replayed run jumps where the recorded one did whatever its private
+/// store counted; an unrecorded one spends the private budget.
+struct ReplayJournal {
+    lease: Arc<Lease>,
+    budgets: Arc<BTreeMap<String, bool>>,
+}
+impl owf::durable::Journal for ReplayJournal {
+    fn load(&self) -> anyhow::Result<BTreeMap<String, owf::durable::Record>> {
+        self.lease.load()
+    }
+    fn save(&self, key: &str, record: &owf::durable::Record) -> anyhow::Result<()> {
+        self.lease.save(key, record)
+    }
+    fn spend(&self, key: &str, limit: u64) -> anyhow::Result<Option<owf::durable::Record>> {
+        let limit = match self.budgets.get(key) {
+            Some(true) => u64::MAX,
+            Some(false) => 0,
+            None => limit,
+        };
+        self.lease.spend(key, limit)
+    }
+}
+
 /// A child's run id: its parent and the invocation that started it.
 fn child_id(run_id: &str, key: &str) -> String {
     format!("child:{}", serde_json::to_string(&(run_id, key)).expect("string tuple serializes"))
@@ -753,6 +868,11 @@ impl run::Children for ExecutionFunctions {
         let a = match store.get(&id).map_err(interrupted)? {
             Some(saved) => saved.admission,
             None => {
+                // An independent run starts a tree of its own, one level
+                // deeper, so recursion through either kind of child ends.
+                let lineage = self.lineage.child(&self.admitter.limits).map_err(CallFailure::NotExecuted)?;
+                let lineage =
+                    if owned { lineage } else { Lineage { max_jumps: self.admitter.limits.max_jumps, ..lineage } };
                 let d = self.admitter.target(target).map_err(interrupted)?.ok_or_else(|| {
                     CallFailure::NotExecuted(WorkflowError::standard(
                         "configuration",
@@ -761,7 +881,7 @@ impl run::Children for ExecutionFunctions {
                         format!("no workflow {}/{} version {} to run", target.namespace, target.name, target.version),
                     ))
                 })?;
-                self.admitter.of(&id, &d, input.clone()).map_err(|e| {
+                self.admitter.of(&id, &d, input.clone(), &lineage).map_err(|e| {
                     CallFailure::NotExecuted(WorkflowError::standard(
                         "configuration",
                         400,
