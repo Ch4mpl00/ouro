@@ -4,12 +4,13 @@ module contract {
   pure def elems(xs: List[a]): Set[a] = xs.foldl(Set(),(a,x) => a.union(Set(x)))
   pure def mapped(xs: List[a], f: a => b): List[b] = xs.foldl([],(a,x) => a.append(f(x)))
   pure val Runs = Set(0, 1)
-  // Invocation 0 is an at-most-once write, 1 an at-least-once read, 2 an
-  // at-least-once write. Protection follows the declared delivery alone; the
-  // effect only decides what a dry run may dispatch (decision 6).
+  // Invocation 0 is at most once, 1 and 2 at least once: protection follows
+  // the declared delivery alone (decision 6). The engine does not classify
+  // calls as reads or writes; a dry run's host supplies a mock rule, here
+  // marking invocations 0 and 2, and a dry run dispatches none it marks (X1).
   pure val Calls = Set(0, 1, 2)
   pure def protected(i: int): bool = i == 0
-  pure def writes(i: int): bool = i != 1
+  pure def mocked(i: int): bool = i != 1
   // A broadcast copy never expires; only an addressed (mailbox) copy does.
   pure val never = 1000000000
   pure val Workers = Set(0, 1)
@@ -34,7 +35,7 @@ module contract {
   type Local = { fence: int, execution: int, phase: int, invocation: int, stopped: bool, permit: bool }
   type Observation = { op: str, execution: int, invocation: int, value: int, result: int }
   type Machine = { db: Durable, workers: List[Local], now: int,
-    sends: List[List[int]], effects: List[List[int]], observations: List[Observation],
+    sends: List[List[int]], observations: List[Observation],
     violations: Set[str], faultsSeen: Set[int] }
   pure val emptyRun: Run = { admitted: false, input: 0, version: 0, epoch: 0, app: 0, mode: 0,
     outcome: 0, ended: -1, deadline: -1, owner: -1, generation: 0, lease: -1,
@@ -46,7 +47,7 @@ module contract {
       faults: 0, tripped: false, triggerEpoch: 1, due: 2, slot: 0, running: -1, catchup: 0, rearm:false,
       armed: true, fallback: -1 } }
   pure val initial: Machine = { db: initialDb, workers: [emptyLocal,emptyLocal], now: 0,
-    sends: [[0,0,0],[0,0,0]], effects: [[0,0,0],[0,0,0]], observations: [], violations: Set(), faultsSeen: Set() }
+    sends: [[0,0,0],[0,0,0]], observations: [], violations: Set(), faultsSeen: Set() }
   var m: Machine
   // The command just executed and its choices, for the model-based tests.
   type Command = { r: int, w: int, i: int, value: int, fault: int }
@@ -114,13 +115,12 @@ module contract {
     } else if (op == "renew" and authorized)
       update(s,r,{ ...execution, lease:s.now+4 })
     else if (op == "intent" and authorized and Set(0,4).contains(execution.records.nth(i)) and
-      execution.mode != 2 and not(execution.mode == 1 and writes(i)) and s.now < execution.deadline) {
+      execution.mode != 2 and not(execution.mode == 1 and mocked(i)) and s.now < execution.deadline) {
       val updated = update(s,r,{ ...execution, records:execution.records.replaceAt(i,1) })
       observe({ ...updated, workers: updated.workers.replaceAt(w,{ ...local, phase:1, invocation:i }) },op,r,i,execution.input+i,1)
     } else if (op == "dispatch" and not(local.stopped) and Set(1,4).contains(local.phase) and local.execution == r and local.invocation == i) {
       val updated = { ...s, workers:s.workers.replaceAt(w,{ ...local, phase:2 }),
-        sends:s.sends.replaceAt(r,s.sends.nth(r).replaceAt(i,s.sends.nth(r).nth(i)+1)),
-        effects:if (writes(i)) s.effects.replaceAt(r,s.effects.nth(r).replaceAt(i,s.effects.nth(r).nth(i)+1)) else s.effects }
+        sends:s.sends.replaceAt(r,s.sends.nth(r).replaceAt(i,s.sends.nth(r).nth(i)+1)) }
       observe(updated,op,r,i,execution.input+i,1)
     } else if (op == "result" and authorized and local.phase == 2 and local.invocation == i and value >= 0) {
       // Value 1: the function answered with an error, itself a result.
@@ -371,7 +371,7 @@ module contract {
       not(x.retained) or y.retained or (x.outcome != 0 and b.now >= x.ended+5)
     }) and admissionStable)
     val error26 = flag(error25,"O3",a.workers.select(x => x.permit).length() <= 1)
-    val error27 = flag(error26,"X1",Runs.forall(k => a.db.runs.nth(k).mode != 1 or Calls.forall(j => not(writes(j)) or a.sends.nth(k).nth(j) == 0)))
+    val error27 = flag(error26,"X1",Runs.forall(k => a.db.runs.nth(k).mode != 1 or Calls.forall(j => not(mocked(j)) or a.sends.nth(k).nth(j) == 0)))
     val error28 = flag(error27,"X2",Runs.forall(k => a.db.runs.nth(k).mode != 2 or a.sends.nth(k) == [0,0,0]))
     val error29 = flag(error28,"X3",admissionStable and terminalStable)
     // B1: a tree never spends more than the ceiling; a live root's counter

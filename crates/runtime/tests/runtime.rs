@@ -1,5 +1,5 @@
 use ouro_runtime::{
-    Config, Effect, Function, FunctionContext, Registry, Runtime,
+    CallStatus, Config, Function, FunctionContext, Mock, Registry, Runtime,
     durable::{self, Clock, RunStore},
     owf::{
         durable::{CallState, Delivery, Record},
@@ -35,6 +35,14 @@ fn save(rt: &Runtime, yaml: &str) {
     let d = rt.save("workflow", yaml).unwrap();
     rt.activate("workflow", d.version).unwrap();
 }
+/// The host's dry-run rule for the counter registry: it knows `write`
+/// changes the world, so a dry run answers it with its arguments.
+fn writes_mocked() -> Arc<dyn Mock> {
+    ouro_runtime::mock(
+        |function: &str, _: &Value| function == "write",
+        |_: &str, a: &Value, _: &FunctionContext| Ok(a.clone()),
+    )
+}
 fn counter_registry(reads: Arc<AtomicUsize>, writes: Arc<AtomicUsize>) -> Registry {
     let mut registry = Registry::new();
     registry
@@ -42,7 +50,6 @@ fn counter_registry(reads: Arc<AtomicUsize>, writes: Arc<AtomicUsize>) -> Regist
             "read",
             json!({"type":"object"}),
             json!({"type":"object"}),
-            Effect::Read,
             move |a: Value, _: FunctionContext| {
                 reads.fetch_add(1, Ordering::SeqCst);
                 async move { Ok(a) }
@@ -54,7 +61,6 @@ fn counter_registry(reads: Arc<AtomicUsize>, writes: Arc<AtomicUsize>) -> Regist
             "write",
             json!({"type":"object"}),
             json!({"type":"object"}),
-            Effect::Write,
             move |a: Value, _: FunctionContext| {
                 writes.fetch_add(1, Ordering::SeqCst);
                 async move { Ok(a) }
@@ -91,6 +97,14 @@ async fn pinned_versions_resume_a_wait_without_resending_the_write() {
     assert_eq!(rt.get("r").unwrap().unwrap().outcome, Some(Status::Completed(json!({"result":"original"}))));
     assert_eq!(writes.load(Ordering::SeqCst), 1);
     assert_eq!(reads.load(Ordering::SeqCst), 1);
+    let journal: Vec<_> = rt.calls("r").unwrap().into_iter().map(|c| (c.key, c.function, c.state)).collect();
+    assert_eq!(
+        journal,
+        [
+            ("/do/0/send#call".to_owned(), "write".to_owned(), CallStatus::Completed),
+            ("/do/2/read#call".to_owned(), "read".to_owned(), CallStatus::Completed),
+        ]
+    );
     rt.start("new", "workflow", json!({})).unwrap();
     assert_eq!(
         rt.drive("new", &CancellationToken::new()).await.unwrap(),
@@ -102,7 +116,7 @@ async fn schema_validation_and_typed_errors_are_caught_by_yaml() {
     let calls = Arc::new(AtomicUsize::new(0));
     let c = calls.clone();
     let mut registry = Registry::new();
-    registry.register(Function::new("typed",json!({"type":"object","required":["n"],"properties":{"n":{"type":"integer"}},"additionalProperties":false}),json!({"type":"integer"}),Effect::Read,move |_:Value,_:FunctionContext| {c.fetch_add(1,Ordering::SeqCst);async {Err(WorkflowError {type_:"urn:test:rejected".into(),status:409,title:Some("Rejected".into()),detail:None,instance:None})}})).unwrap();
+    registry.register(Function::new("typed",json!({"type":"object","required":["n"],"properties":{"n":{"type":"integer"}},"additionalProperties":false}),json!({"type":"integer"}), move |_:Value,_:FunctionContext| {c.fetch_add(1,Ordering::SeqCst);async {Err(WorkflowError {type_:"urn:test:rejected".into(),status:409,title:Some("Rejected".into()),detail:None,instance:None})}})).unwrap();
     let rt = runtime(Arc::new(durable::memory::memory()), registry, Arc::new(Time::default()));
     assert!(rt.save("bad", &yaml("  - bad: { call: typed, with: { n: text } }")).is_err());
     assert!(rt.save("bad", &yaml("  - bad: { call: absent }")).is_err());
@@ -120,7 +134,7 @@ async fn schema_validation_and_typed_errors_are_caught_by_yaml() {
     assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
 #[tokio::test]
-async fn dry_run_reads_are_real_writes_are_mocked_and_replay_calls_no_handlers() {
+async fn dry_run_mocks_what_the_host_rule_marks_and_replay_calls_no_handlers() {
     let reads = Arc::new(AtomicUsize::new(0));
     let writes = Arc::new(AtomicUsize::new(0));
     let rt = runtime(
@@ -130,17 +144,9 @@ async fn dry_run_reads_are_real_writes_are_mocked_and_replay_calls_no_handlers()
     );
     let definition =
         yaml("  - read: { call: read, with: { n: 1 } }\n  - write: { call: write, with: { n: '${ .n + 1 }' } }");
-    let dry = rt
-        .dry_run(
-            &definition,
-            json!({}),
-            Arc::new(|_: &str, a: &Value, _: &FunctionContext| Ok(a.clone())),
-            &CancellationToken::new(),
-        )
-        .await
-        .unwrap();
+    let dry = rt.dry_run(&definition, json!({}), writes_mocked(), &CancellationToken::new()).await.unwrap();
     assert_eq!(dry.status, Status::Completed(json!({"n":2})));
-    assert_eq!(dry.writes.len(), 1);
+    assert_eq!(dry.mocked.len(), 1);
     assert_eq!(reads.load(Ordering::SeqCst), 1);
     assert_eq!(writes.load(Ordering::SeqCst), 0);
     assert!(rt.list(None, "").unwrap().is_empty());
@@ -179,7 +185,7 @@ async fn shutdown_releases_the_lease_and_unknown_writes_never_dispatch_again() {
     let n = started.clone();
     registry
         .register(
-            Function::new("write", json!({}), json!({}), Effect::Write, move |_: Value, ctx: FunctionContext| {
+            Function::new("write", json!({}), json!({}), move |_: Value, ctx: FunctionContext| {
                 w.fetch_add(1, Ordering::SeqCst);
                 n.notify_one();
                 async move {
@@ -201,6 +207,11 @@ async fn shutdown_releases_the_lease_and_unknown_writes_never_dispatch_again() {
     let (result, ()) = tokio::join!(rt.drive("r", &stop), shutdown);
     assert!(matches!(result.unwrap(), Some(Status::Interrupted(_))));
     assert_eq!(rt.get("r").unwrap().unwrap().state, durable::RunState::Ready);
+    // The journal tells the host the write may have happened.
+    let calls = rt.calls("r").unwrap();
+    assert_eq!(calls.len(), 1);
+    assert_eq!((calls[0].key.as_str(), calls[0].function.as_str()), ("/do/0/write#call", "write"));
+    assert_eq!((calls[0].delivery, calls[0].state), (Delivery::AtMostOnce, CallStatus::Unknown));
     let result = rt.drive("r", &CancellationToken::new()).await.unwrap();
     assert!(matches!(result,Some(Status::Faulted(e)) if e.is("outcome_unknown")));
     assert_eq!(writes.load(Ordering::SeqCst), 1);
@@ -249,7 +260,7 @@ async fn retries_receive_stable_idempotency_keys_and_increasing_attempts() {
     let c = contexts.clone();
     let mut registry = Registry::new();
     registry
-        .register(Function::new("read", json!({}), json!({}), Effect::Read, move |_: Value, ctx: FunctionContext| {
+        .register(Function::new("read", json!({}), json!({}), move |_: Value, ctx: FunctionContext| {
             c.lock().unwrap().push((ctx.attempt, ctx.idempotency_key));
             async { Err(WorkflowError::runtime("retry")) }
         }))
@@ -275,7 +286,7 @@ async fn host_concurrency_is_bounded_and_cancellation_reaches_handlers() {
     let a = active.clone();
     let p = peak.clone();
     registry
-        .register(Function::new("read", json!({}), json!({}), Effect::Read, move |_: Value, ctx: FunctionContext| {
+        .register(Function::new("read", json!({}), json!({}), move |_: Value, ctx: FunctionContext| {
             let n = a.fetch_add(1, Ordering::SeqCst) + 1;
             p.fetch_max(n, Ordering::SeqCst);
             let a = a.clone();
@@ -312,18 +323,18 @@ async fn host_concurrency_is_bounded_and_cancellation_reaches_handlers() {
     assert_eq!(rt.get("r0").unwrap().unwrap().outcome, Some(Status::Cancelled));
     assert!(peak.load(Ordering::SeqCst) > 0);
 }
-// Delivery is declared, not derived from the effect: a write with the default
-// at-least-once delivery goes out again under the same idempotency key after
-// its outcome was lost; a declared or YAML-tightened at-most-once one never
-// does; a changed declaration fails recovery as a changed binding.
+// Delivery is declared per function: a call with the default at-least-once
+// delivery goes out again under the same idempotency key after its outcome
+// was lost; a declared or YAML-tightened at-most-once one never does; a
+// changed declaration fails recovery as a changed binding.
 #[tokio::test]
-async fn delivery_is_declared_not_derived_from_the_effect() {
+async fn delivery_is_declared_per_function() {
     type Keys = Arc<std::sync::Mutex<Vec<(String, String)>>>;
     fn registry(keys: Keys, post: Delivery) -> Registry {
         let mut registry = Registry::new();
         for (name, delivery) in [("post", post), ("send", Delivery::AtMostOnce)] {
             let keys = keys.clone();
-            let f = Function::new(name, json!({}), json!({}), Effect::Write, move |_: Value, ctx: FunctionContext| {
+            let f = Function::new(name, json!({}), json!({}), move |_: Value, ctx: FunctionContext| {
                 keys.lock().unwrap().push((name.to_string(), ctx.idempotency_key.clone()));
                 async move {
                     // The answer is lost: the worker stops before it is saved.
@@ -430,7 +441,7 @@ async fn write_response_survives_crash_before_task_checkpoint() {
     let mut registry = Registry::new();
     registry
         .register(
-            Function::new("write", json!({}), json!({}), Effect::Write, move |_: Value, _: FunctionContext| {
+            Function::new("write", json!({}), json!({}), move |_: Value, _: FunctionContext| {
                 w.fetch_add(1, Ordering::SeqCst);
                 let b = b.clone();
                 async move {
@@ -467,7 +478,7 @@ async fn telemetry_nests_function_task_and_run_spans_with_current_context() {
     let capture = seen.clone();
     let mut registry = Registry::new();
     registry
-        .register(Function::new("read", json!({}), json!({}), Effect::Read, move |_: Value, c: FunctionContext| {
+        .register(Function::new("read", json!({}), json!({}), move |_: Value, c: FunctionContext| {
             capture.lock().unwrap().push((
                 c.span.span().span_context().clone(),
                 opentelemetry::Context::current().span().span_context().clone(),
@@ -499,9 +510,11 @@ async fn telemetry_nests_function_task_and_run_spans_with_current_context() {
             assert!(span.attributes.iter().any(|a| a.key.as_str() == key), "missing {key} on {}", span.name);
         }
     }
-    for key in ["ouro.task.path", "ouro.effect", "ouro.attempt"] {
+    for key in ["ouro.task.path", "ouro.attempt"] {
         assert!(function.attributes.iter().any(|a| a.key.as_str() == key));
     }
+    // The engine does not classify calls: no read/write attribute.
+    assert!(spans.iter().all(|s| s.attributes.iter().all(|a| a.key.as_str() != "ouro.effect")));
     let seen = seen.lock().unwrap();
     assert_eq!(seen[0].0, seen[0].1);
     assert!(seen[0].0.is_valid());
@@ -521,17 +534,9 @@ async fn dry_children_are_isolated_and_event_replay_uses_recorded_envelopes() {
     let definition = yaml(
         "  - child: { call: start_child, with: { name: child, input: {} }, export: { as: '${ . }' } }\n  - join: { listen: { to: { one: { with: { type: '${ $context.done }' } } }, read: envelope } }",
     );
-    let dry = rt
-        .dry_run(
-            &definition,
-            json!({}),
-            Arc::new(|_: &str, a: &Value, _: &FunctionContext| Ok(a.clone())),
-            &CancellationToken::new(),
-        )
-        .await
-        .unwrap();
+    let dry = rt.dry_run(&definition, json!({}), writes_mocked(), &CancellationToken::new()).await.unwrap();
     assert!(matches!(dry.status, Status::Completed(_)), "{:?}", dry.status);
-    assert_eq!(dry.writes.len(), 1);
+    assert_eq!(dry.mocked.len(), 1);
     assert_eq!(writes.load(Ordering::SeqCst), 0);
     assert!(rt.list(None, "").unwrap().is_empty());
     save(&rt, &definition);
@@ -549,16 +554,10 @@ async fn dry_children_are_isolated_and_event_replay_uses_recorded_envelopes() {
 async fn dropping_a_stale_attempt_preserves_cancellation_of_its_successor() {
     let mut registry = Registry::new();
     registry
-        .register(Function::new(
-            "read",
-            json!({}),
-            json!({}),
-            Effect::Read,
-            |_: Value, ctx: FunctionContext| async move {
-                ctx.cancel.cancelled().await;
-                Ok(Value::Null)
-            },
-        ))
+        .register(Function::new("read", json!({}), json!({}), |_: Value, ctx: FunctionContext| async move {
+            ctx.cancel.cancelled().await;
+            Ok(Value::Null)
+        }))
         .unwrap();
     let time = Arc::new(Time::default());
     let rt = runtime(Arc::new(durable::memory::memory()), registry, time.clone());
@@ -609,17 +608,12 @@ fn x1_x2_generated_dry_runs_and_replays_are_isolated() {
                 save(&rt, &definition);
                 let before = backend.snapshot().unwrap().rows;
                 let dry = rt
-                    .dry_run(
-                        &definition,
-                        json!({"n":input}),
-                        Arc::new(|_: &str, a: &Value, _: &FunctionContext| Ok(a.clone())),
-                        &CancellationToken::new(),
-                    )
+                    .dry_run(&definition, json!({"n":input}), writes_mocked(), &CancellationToken::new())
                     .await
                     .unwrap();
                 prop_assert!(matches!(dry.status, Status::Completed(_)));
                 prop_assert_eq!(writes.load(Ordering::SeqCst), 0);
-                prop_assert_eq!(dry.writes.len(), writes_in_program.iter().filter(|x| **x).count());
+                prop_assert_eq!(dry.mocked.len(), writes_in_program.iter().filter(|x| **x).count());
                 prop_assert_eq!(backend.snapshot().unwrap().rows, before);
                 rt.start("recorded", "workflow", json!({"n":input})).unwrap();
                 let original = rt.drive("recorded", &CancellationToken::new()).await.unwrap();
@@ -688,4 +682,28 @@ async fn t1_live_schedule_run_prevents_overlap() {
     clock.0.store(2000, Ordering::SeqCst);
     assert!(rt.fire_due().unwrap().is_empty(), "overlap admitted a second live run");
     assert_eq!(rt.list(None, "").unwrap().len(), 1);
+}
+
+/// The mock rule sees each call's name and arguments: a dry run dispatches
+/// every call except what the rule marks.
+#[tokio::test]
+async fn a_dry_run_dispatches_no_call_the_rule_marks() {
+    let (reads, writes) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+    let rt = runtime(
+        Arc::new(durable::memory::memory()),
+        counter_registry(reads.clone(), writes.clone()),
+        Arc::new(Time::default()),
+    );
+    let definition = yaml(
+        "  - one: { call: write, with: { to: self } }\n  - two: { call: write, with: { to: boss } }\n  - three: { call: read, with: { to: boss } }",
+    );
+    let boss = ouro_runtime::mock(
+        |_: &str, a: &Value| a["to"] == "boss",
+        |f: &str, _: &Value, _: &FunctionContext| Ok(json!({ "mocked": f })),
+    );
+    let dry = rt.dry_run(&definition, json!({}), boss, &CancellationToken::new()).await.unwrap();
+    assert_eq!(dry.status, Status::Completed(json!({ "mocked": "read" })));
+    let mocked: Vec<_> = dry.mocked.iter().map(|c| (c.task_path.as_str(), c.function.as_str())).collect();
+    assert_eq!(mocked, [("/do/1/two", "write"), ("/do/2/three", "read")]);
+    assert_eq!((writes.load(Ordering::SeqCst), reads.load(Ordering::SeqCst)), (1, 0), "only `one` was dispatched");
 }

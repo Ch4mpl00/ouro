@@ -27,10 +27,10 @@ indivisible abstract transition, including its predicates.
 | Term | Meaning |
 | --- | --- |
 | Run `r` | One admitted execution identity, distinct from a workflow definition or a process. |
-| Admission `A(r)` | Immutable definition name/version/content, input, resolved resources, schema/effect bindings, runtime bindings, and application compatibility metadata. Not a live catalog lookup. |
+| Admission `A(r)` | Immutable definition name/version/content, input, resolved resources, schema/delivery bindings, runtime bindings, and application compatibility metadata. Not a live catalog lookup. |
 | Logical invocation `i` | `(r, branch lineage, task path, dynamic occurrence)`. Loop iterations and parallel branches distinguish occurrences. Recovery and retries of the same operation do not. |
 | Attempt `a` | One physical execution attempt, with worker and retry information. A run claim generation and a function retry ordinal are distinct dimensions. Neither creates a new logical invocation. |
-| Effect | The registered `read` or `write` classification. A read may observe changing external state but must not perform a business write. A write may change external state. The host must classify truthfully. |
+| Mock rule `M` | The host's predicate over a call's function and arguments, given to a dry run: a call it marks is answered by the host's mock instead of being dispatched. The engine does not classify calls as reads or writes; whether a call changed external state is the host's judgment, from the run's call journal. The host must mark truthfully. |
 | Protected call | A write governed by durable intent and at-most-once dispatch, ouro's current write mode. A future explicitly retryable/idempotent or transactional mode would have a different dispatch rule (E5). The protection covers the declared operation; undisclosed additional side effects are not made atomic by it. |
 | Intent | Durable authorization identifying a protected invocation and its immutable arguments/binding before any dispatch. It is not proof of dispatch or of an external effect. |
 | Dispatch | Crossing the runtime-controlled boundary into the handler, process runner, or external sink for an operation. The test oracle also observes outbound transport attempts; hidden transport retries cannot evade the contract. |
@@ -250,7 +250,7 @@ A store fence does not revoke an external request already authorized; see E2/C3.
 
 #### E1 — Invocation identity and bindings survive attempts [P, safety]
 
-All events for logical `i` use one stable key, arguments and schema/effect binding;
+All events for logical `i` use one stable key, arguments and schema/delivery binding;
 distinct logical invocations have distinct keys within the promised deduplication
 namespace. Changing a retry ordinal, process or fence does not change `i`.
 
@@ -613,13 +613,15 @@ actual handler lifetime and permits separately. Limit scope is an open choice.
 
 ### X. Isolated execution and explicit branching (3)
 
-#### X1 — Dry runs cannot dispatch declared writes [P, safety]
+#### X1 — Dry runs dispatch nothing the host's mock rule marks [P, safety]
 
-For dry-run history `H_d`, the production state delta is empty and
-`count(Dispatch(write,_)) = 0`. Writes go only to the injected mock. Owned children,
-emit/sinks and process calls inherit dry mode; definition reads may use the host
-catalog, but admissions, activation, triggers and events stay private. Real reads
-are permitted under the host's truthful effect declarations.
+For dry-run history `H_d` with mock rule `M`, the production state delta is empty
+and `count(Dispatch(i,_) | M(i)) = 0`. Calls `M` marks go only to the injected mock;
+every other call is dispatched for real. Owned children and process calls inherit
+dry mode and `M`; emitted events are recorded and never reach publication or sinks;
+definition reads may use the host catalog, but admissions, activation, triggers and
+events stay private. Whatever a dispatched call does is under the host's truthful
+rule.
 
 Dry mode must propagate through every escape path. **Source:** [README][README],
 [I1P][I1P]. **Fault:** unmocked child/process/event side channel.
@@ -813,7 +815,7 @@ only after whole-run completion does not cover B.
 
 **Uncovered rows: none within the stated fault model.** This is not universal
 coverage: unbounded clock error cannot support real-time lease/TTL/deadline
-guarantees; a permanent outage defeats F; lying effect/compatibility declarations
+guarantees; a permanent outage defeats F; lying mock rules/compatibility declarations
 and external services violating their contracts defeat the premises. Early-event
 loss without acceptance and payload-only targeted redelivery are allowed by the
 weaker current interface, not detected defects. Conditional cells become effective
@@ -864,9 +866,9 @@ separation targets because their observation dimensions differ:
 | W2 | Accept the same producer event twice as two copies; consume each copy only once. |
 | W4 | Choose the wrong eligible waiter without loss or duplicate consumption. |
 | V2 | Miscount terminal faults while preserving every run's outcome and effects. |
-| V3 | Let an incompatible worker claim a no-op run; no schema or effect difference masks the claim violation. |
+| V3 | Let an incompatible worker claim a no-op run; no schema or delivery difference masks the claim violation. |
 | O3 | Exceed capacity with distinct read-only runs, each otherwise correct. |
-| X1 / X2 | In an otherwise isolated execution, permit one dry write / replay read. |
+| X1 / X2 | In an otherwise isolated execution, permit one dispatch the mock rule marks / one replay read. |
 | X3 | Reuse a branch decision with no downstream effects. |
 | L2 / L3 / L4 / L5 | Respect all safety rules but strand, respectively, an expired lease, accepted copy, due slot, or local waiter. |
 
@@ -913,8 +915,9 @@ public runtime exports already implement that rule.
   tests with a virtual clock; this contract starts with declared slot obligations.
 - **Event filter/correlation expression semantics:** checked by DSL conformance;
   the durable boundary checks atomic selection and preservation of its decisions.
-- **Business correctness, authorization and truthful effect declarations:** checked
-  by the embedding host and function tests; a mislabeled write defeats dry-run safety.
+- **Business correctness, authorization and truthful mock rules:** checked by the
+  embedding host and function tests; a write the host's rule fails to mark is
+  dispatched by a dry run.
 - **External service idempotency and transactional effects:** checked by that
   adapter/recipient's contract tests; E5 explicitly states the composition boundary.
 - **Workflow-wide ACID, sagas and correct compensation:** checked by application
@@ -985,7 +988,7 @@ depended on them are to be read under these choices. The others stay open.
    count. With no predecessor to roll back to, the definition is marked
    tripped: new runs and its schedule stop, visibly in the runs API; running
    runs finish; a new activation clears it.
-6. **Delivery is declared, not derived from the effect (E2, E5).** The
+6. **Delivery is declared per function (E2, E5).** The
    default delivery of every call, reads and writes alike, is at-least-once:
    a call whose outcome is unknown after a crash may be dispatched again, with
    the same idempotency key. A function that must not be repeated (sending a
@@ -993,6 +996,9 @@ depended on them are to be read under these choices. The others stay open.
    registered; a call in YAML may tighten its function's delivery
    (`metadata.delivery: at_most_once`) but never loosen it. "Protected call" in
    this document means a call whose effective delivery is at-most-once, and E2
-   applies to exactly those. `effect` (`read` | `write`) stays independent and
-   keeps its other roles: dry runs mock writes, and a failure before the first
-   write can hand the task over.
+   applies to exactly those. The engine has no read/write classification
+   (2026-10-24, issue #13): a dry run's host passes a mock rule (X1), and a
+   host reads a run's call journal (each call's function, delivery and state:
+   pending, completed, failed, not executed, unknown) to decide whether a
+   failed run changed the world. A run without a journal keeps no results, so
+   it never retries an attempt that started an at-most-once call.

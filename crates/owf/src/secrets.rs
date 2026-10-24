@@ -238,11 +238,10 @@ fn convert(r: &Record, f: &mut dyn FnMut(&str) -> Result<String, String>) -> Res
                 }),
             },
         },
-        Record::Call { logical, function, arguments, effect, delivery, state } => Record::Call {
+        Record::Call { logical, function, arguments, delivery, state } => Record::Call {
             logical: logical.clone(),
             function: function.clone(),
             arguments: map_strings(arguments, f)?,
-            effect: *effect,
             delivery: *delivery,
             state: match state {
                 CallState::Pending => CallState::Pending,
@@ -309,7 +308,6 @@ mod tests {
             logical: "/do/0/a".into(),
             function: "f".into(),
             arguments: value.clone(),
-            effect: crate::run::Effect::Read,
             delivery: crate::durable::Delivery::AtLeastOnce,
             state: CallState::Done(Err(WorkflowError::runtime("bob said s3cr3t-token"))),
         };

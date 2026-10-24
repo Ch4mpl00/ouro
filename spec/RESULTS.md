@@ -1,4 +1,26 @@
-# Contract checking — 2026-10-24
+# Contract checking — 2026-10-24, the mock rule (#13)
+
+The engine no longer classifies calls as reads or writes. In `contract.qnt`
+`writes(i)` became `mocked(i)`, the dry-run host's mock rule (it still marks
+invocations 0 and 2), and the unused `effects` ledger left the machine; X1 now
+says a dry run dispatches nothing the rule marks. No transition, monitor or
+witness changed otherwise. Rerun on the changed model, same environment as
+below:
+
+| Check | Scope | Result | Time |
+| --- | --- | --- | --- |
+| Typecheck | all five modules | Pass | |
+| Witnesses | 29 histories | Pass | 6.6 s |
+| Simulation | 10,000 × 150 steps, seed 20261023, invariant `checked` | Pass | 149.9 s |
+| Fault rows | 11 switches × 1,000 × 150 steps | No violation | 16.5–22.8 s each, 211.2 s |
+| Safety mutants | 32 scripted witnesses | All targets detected, same footprints | 135.4 s |
+| Fault detection | 11 rows | All detected, same footprints | 45.7 s |
+| Serial and concurrent MBT | memory and SQLite, through `cargo test` | Pass | |
+
+Not rerun: the Apalache and TLC checks (deferred, as below);
+`contract_progress.qnt` is unchanged.
+
+# Contract checking — 2026-10-24 (before #13)
 
 One model: `contract.qnt` now carries the section 8 decisions of
 `docs/durable-invariants.md` and drives both model-based tests; the

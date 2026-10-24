@@ -1,7 +1,7 @@
 //! A single process restart, using only public APIs and local files. The
 //! ledger stands in for an external service whose effect outlives a worker.
 use ouro_runtime::{
-    Config, Delivery, Effect, Function, FunctionContext, Registry, Runtime,
+    Config, Delivery, Function, FunctionContext, Registry, Runtime,
     durable::{self, Clock},
     owf::run::{Status, WorkflowError},
 };
@@ -38,28 +38,22 @@ fn registry(dir: &Path, recovering: bool) -> anyhow::Result<Registry> {
     let ready = dir.join("ready");
     let input = json!({"type":"object","required":["value"],"properties":{"value":{"type":"integer"},"pause":{"type":"boolean"}},"additionalProperties":false});
     let output = json!({"type":"object","required":["value"],"properties":{"value":{"type":"integer"}}});
-    registry.register(Function::new(
-        "read",
-        input.clone(),
-        output.clone(),
-        Effect::Read,
-        move |a: Value, c: FunctionContext| {
-            let ready = ready.clone();
-            async move {
-                if a["pause"] == true && !recovering {
-                    // Synchronization for this example only: send has committed
-                    // its result before this following task can start.
-                    std::fs::write(ready, b"write recorded").map_err(io_error)?;
-                    c.cancel.cancelled().await;
-                }
-                Ok(json!({"value":a["value"]}))
+    registry.register(Function::new("read", input.clone(), output.clone(), move |a: Value, c: FunctionContext| {
+        let ready = ready.clone();
+        async move {
+            if a["pause"] == true && !recovering {
+                // Synchronization for this example only: send has committed
+                // its result before this following task can start.
+                std::fs::write(ready, b"write recorded").map_err(io_error)?;
+                c.cancel.cancelled().await;
             }
-        },
-    ))?;
+            Ok(json!({"value":a["value"]}))
+        }
+    }))?;
     let ledger = dir.join("ledger");
     // A ledger entry must not be repeated: the function declares at-most-once
     // delivery (calls are at least once unless their function says otherwise).
-    let write = Function::new("write", input, output, Effect::Write, move |a: Value, _: FunctionContext| {
+    let write = Function::new("write", input, output, move |a: Value, _: FunctionContext| {
         let ledger = ledger.clone();
         async move {
             let mut f = OpenOptions::new().create(true).append(true).open(ledger).map_err(io_error)?;

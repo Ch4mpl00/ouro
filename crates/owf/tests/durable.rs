@@ -3,7 +3,7 @@ use chrono::{DateTime, Utc};
 use owf::{
     durable::{CallFailure, Journal, Record, check_transition},
     model,
-    run::{self, CallInfo, Clock, Effect, Functions, Host, Limits, Silent, Status, WorkflowError},
+    run::{self, CallInfo, Clock, Functions, Host, Limits, Silent, Status, WorkflowError},
 };
 use serde_json::{Value, json};
 use std::{
@@ -57,8 +57,8 @@ impl Clock for Time {
 struct World(Mutex<Vec<(String, String)>>);
 #[async_trait]
 impl Functions for World {
-    fn effect(&self, _: &str) -> Option<Effect> {
-        Some(Effect::Write)
+    fn has(&self, _: &str) -> bool {
+        true
     }
     async fn call(&self, _: &str, args: Value, _: &CallInfo<'_>) -> Result<Value, WorkflowError> {
         Ok(args)
@@ -262,8 +262,8 @@ async fn explicit_cancellation_wins_over_an_interrupted_call() {
     struct Stops;
     #[async_trait]
     impl Functions for Stops {
-        fn effect(&self, _: &str) -> Option<Effect> {
-            Some(Effect::Read)
+        fn has(&self, _: &str) -> bool {
+            true
         }
         fn cooperative(&self, _: &str) -> bool {
             true
@@ -331,8 +331,8 @@ async fn saved_call_response_is_reused_when_the_tool_disappears_before_task_comm
     struct Gone;
     #[async_trait]
     impl Functions for Gone {
-        fn effect(&self, _: &str) -> Option<Effect> {
-            None
+        fn has(&self, _: &str) -> bool {
+            false
         }
         async fn call(&self, _: &str, _: Value, _: &CallInfo<'_>) -> Result<Value, WorkflowError> {
             panic!("must use saved response")
@@ -368,8 +368,8 @@ async fn a_timeout_cannot_turn_an_unknown_dispatch_into_a_catchable_retry() {
     struct Hanging(AtomicUsize);
     #[async_trait]
     impl Functions for Hanging {
-        fn effect(&self, _: &str) -> Option<Effect> {
-            Some(Effect::Read)
+        fn has(&self, _: &str) -> bool {
+            true
         }
         async fn call(&self, _: &str, _: Value, _: &CallInfo<'_>) -> Result<Value, WorkflowError> {
             self.0.fetch_add(1, Ordering::SeqCst);
@@ -419,8 +419,8 @@ struct PropertyWorld {
 
 #[async_trait]
 impl Functions for PropertyWorld {
-    fn effect(&self, name: &str) -> Option<Effect> {
-        support::host::effect(name)
+    fn has(&self, name: &str) -> bool {
+        support::host::has(name)
     }
     async fn call(&self, name: &str, args: Value, info: &CallInfo<'_>) -> Result<Value, WorkflowError> {
         self.calls.lock().unwrap().push((info.reference.into(), info.delivery));
@@ -702,11 +702,11 @@ impl Tools {
 }
 #[async_trait]
 impl Functions for Tools {
-    fn effect(&self, name: &str) -> Option<Effect> {
-        Some(if name.starts_with("send") || name == "post" { Effect::Write } else { Effect::Read })
+    fn has(&self, _: &str) -> bool {
+        true
     }
-    // Delivery is declared, never derived from the effect: `send` is declared
-    // at most once, `post` is a write with the default at-least-once delivery.
+    // Delivery is declared per function: `send` at most once, `post` (a
+    // write, as only this host knows) with the default at-least-once.
     fn at_most_once(&self, name: &str, _: &Value) -> bool {
         name == "send"
     }
@@ -1040,18 +1040,15 @@ async fn retried_writes_survive_a_crash_at_every_checkpoint() {
     }
 }
 
-// A host that dispatches by an argument: `tool { name }` is a write (and at
-// most once) for `send`, a read otherwise, and a `send` that may have run
-// comes back as a marker instead of faulting the run.
+// A host that dispatches by an argument: `tool { name }` is at most once for
+// `send`, at least once otherwise, and a `send` that may have run comes back
+// as a marker instead of faulting the run.
 #[derive(Default)]
 struct Dispatch(Mutex<Vec<(String, String)>>);
 #[async_trait]
 impl Functions for Dispatch {
-    fn effect(&self, name: &str) -> Option<Effect> {
-        (name == "tool").then_some(Effect::Read)
-    }
-    fn effect_of(&self, name: &str, args: &Value) -> Option<Effect> {
-        self.effect(name).map(|read| if args["name"] == "send" { Effect::Write } else { read })
+    fn has(&self, name: &str) -> bool {
+        name == "tool"
     }
     fn at_most_once(&self, _: &str, args: &Value) -> bool {
         args["name"] == "send"
@@ -1084,7 +1081,7 @@ const ROUND: &str = r#"do:
 "#;
 
 #[tokio::test]
-async fn a_write_classified_per_call_is_never_sent_twice_and_an_unknown_one_is_a_marker() {
+async fn a_call_protected_per_invocation_is_never_sent_twice_and_an_unknown_one_is_a_marker() {
     let wf = workflow(ROUND);
     let mut markers = 0;
     for after_commit in [false, true] {
@@ -1114,8 +1111,8 @@ async fn a_concurrent_for_runs_its_iterations_at_once_on_its_input() {
     struct Slow(AtomicUsize, AtomicUsize);
     #[async_trait]
     impl Functions for Slow {
-        fn effect(&self, _: &str) -> Option<Effect> {
-            Some(Effect::Read)
+        fn has(&self, _: &str) -> bool {
+            true
         }
         async fn call(&self, _: &str, args: Value, _: &CallInfo<'_>) -> Result<Value, WorkflowError> {
             let now = self.0.fetch_add(1, Ordering::SeqCst) + 1;
@@ -1208,8 +1205,8 @@ impl run::Events for Inbox {
 }
 #[async_trait]
 impl Functions for Inbox {
-    fn effect(&self, _: &str) -> Option<Effect> {
-        None
+    fn has(&self, _: &str) -> bool {
+        false
     }
     fn events(&self) -> Option<&dyn run::Events> {
         Some(self)
@@ -1412,8 +1409,8 @@ async fn ephemeral_and_durable_host_stops_cannot_be_caught_by_yaml() {
     struct Stopping;
     #[async_trait]
     impl Functions for Stopping {
-        fn effect(&self, _: &str) -> Option<Effect> {
-            Some(Effect::Read)
+        fn has(&self, _: &str) -> bool {
+            true
         }
         async fn call(&self, _: &str, _: Value, _: &CallInfo<'_>) -> Result<Value, WorkflowError> {
             Err(WorkflowError::communication(500, "ordinary response"))
@@ -1521,11 +1518,11 @@ fn r2_generated_recoveries_from_one_journal_make_identical_decisions() {
 struct EffectWorld(Mutex<Vec<(String, String, Value)>>);
 #[async_trait]
 impl Functions for EffectWorld {
-    fn effect(&self, name: &str) -> Option<Effect> {
-        support::host::effect(name)
+    fn has(&self, name: &str) -> bool {
+        support::host::has(name)
     }
     async fn call(&self, name: &str, args: Value, info: &CallInfo<'_>) -> Result<Value, WorkflowError> {
-        if self.effect(name) == Some(Effect::Write) {
+        if support::host::writes(name) {
             // Independent recipient ledger, never reconstructed from the journal.
             self.0.lock().unwrap().push((info.reference.into(), name.into(), args.clone()));
         }

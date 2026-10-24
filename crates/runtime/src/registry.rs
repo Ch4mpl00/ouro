@@ -1,10 +1,13 @@
-//! User functions: schemas, effects, declared delivery and explicit injected
-//! async handlers.
+//! User functions: schemas, declared delivery and explicit injected async
+//! handlers.
+//!
+//! The registry does not say whether a function reads or writes: only the
+//! host can judge that, and it decides from the call journal (what a run
+//! called, how far each call got) and from its own dry-run mock rule.
 use crate::capabilities::{Capabilities, HostCatalog};
 use async_trait::async_trait;
 use opentelemetry::Context as SpanContext;
 pub use owf::durable::Delivery;
-pub use owf::run::Effect;
 use owf::{
     model::{self, Catalog, Workflow},
     run::WorkflowError,
@@ -45,9 +48,6 @@ pub struct Function {
     pub name: String,
     pub input_schema: Value,
     pub output_schema: Value,
-    /// What the function does to the world. Dry runs mock writes; it never
-    /// decides whether a call may be dispatched again (`delivery` does).
-    pub effect: Effect,
     /// At least once unless declared otherwise: a call whose outcome is
     /// unknown after a crash may be dispatched again under the same
     /// idempotency key. A function that must not be repeated (sending a
@@ -57,18 +57,11 @@ pub struct Function {
     pub handler: Arc<dyn Handler>,
 }
 impl Function {
-    pub fn new(
-        name: impl Into<String>,
-        input: Value,
-        output: Value,
-        effect: Effect,
-        handler: impl Handler + 'static,
-    ) -> Self {
+    pub fn new(name: impl Into<String>, input: Value, output: Value, handler: impl Handler + 'static) -> Self {
         Self {
             name: name.into(),
             input_schema: input,
             output_schema: output,
-            effect,
             delivery: Delivery::AtLeastOnce,
             handler: Arc::new(handler),
         }
@@ -147,7 +140,7 @@ impl Registry {
         }
         Ok(wf)
     }
-    /// Persist schemas, effects and declared delivery for the functions this
+    /// Persist schemas and declared delivery for the functions this
     /// definition binds. Changes to those bindings fail recovery explicitly,
     /// before executing a handler.
     pub(crate) fn bindings(&self, wf: &Workflow) -> Value {
@@ -159,7 +152,6 @@ impl Registry {
                     json!({
                         "input": f.function.input_schema,
                         "output": f.function.output_schema,
-                        "effect": f.function.effect,
                         "delivery": f.function.delivery,
                     }),
                 );

@@ -21,7 +21,7 @@ use ouro_durable::{
 use owf::{
     durable::{CallState, Delivery, Record, StepOutcome, TaskResult},
     model::Flow,
-    run::{Effect, Status, WorkflowError},
+    run::{Status, WorkflowError},
 };
 use quint_connect::{Config, Driver, State, Step};
 use serde::Deserialize;
@@ -50,12 +50,12 @@ const DEADLINE: i64 = 8;
 const NAME: &str = "model";
 const SCHEDULE: &str = "schedule";
 const INGRESS: &str = "ingress";
-// Invocation 0 is an at-most-once write, 1 an at-least-once read, 2 an
-// at-least-once write: protection is the declared delivery alone.
+// Invocation 0 is at most once, 1 and 2 at least once: protection is the
+// declared delivery alone. The host's dry-run mock rule marks 0 and 2.
 fn protected(i: usize) -> bool {
     i == 0
 }
-fn writes(i: usize) -> bool {
+fn mocked(i: usize) -> bool {
     i != 1
 }
 pub fn run_id(r: usize) -> String {
@@ -105,7 +105,6 @@ pub fn call_record(i: usize, state: CallState) -> Record {
         logical: format!("invocation{i}"),
         function: format!("function{i}"),
         arguments: json!(i),
-        effect: if writes(i) { Effect::Write } else { Effect::Read },
         delivery: if protected(i) { Delivery::AtMostOnce } else { Delivery::AtLeastOnce },
         state,
     }
@@ -827,7 +826,7 @@ impl StoreDriver {
                     None | Some(Record::Call { state: CallState::NotExecuted(_), .. })
                 );
                 let deadline = saved.admitted_ms / TICK + DEADLINE;
-                if fresh && mode != 2 && !(mode == 1 && writes(i)) && self.now < deadline {
+                if fresh && mode != 2 && !(mode == 1 && mocked(i)) && self.now < deadline {
                     let record = call_record(i, CallState::Pending);
                     if self.write(fault, |s| s.save_record(&f, &format!("call{i}"), &record, ms)).1 {
                         self.workers[w].phase = 1;

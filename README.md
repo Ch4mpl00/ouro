@@ -25,10 +25,13 @@ crates depends on another checkout or on an application database.
 
 ## Public API
 
-Register `Function::new(name, input_schema, output_schema, effect, handler)`
-with a `Registry`; `.with_delivery(Delivery::AtMostOnce)` declares a function
-that must never be repeated (calls are at least once otherwise). Handlers
-receive arguments and `FunctionContext`: a
+Register `Function::new(name, input_schema, output_schema, handler)` with a
+`Registry`; `.with_delivery(Delivery::AtMostOnce)` declares a function that
+must never be repeated (calls are at least once otherwise). The registry holds
+name, schemas and delivery only: the engine does not know whether a function
+reads or writes. That is the host's to judge, from a run's call journal and
+with its own dry-run mock rule (below). Handlers receive arguments and
+`FunctionContext`: a
 cancellation token, run ID, task path, retry attempt, stable idempotency key
 and current OpenTelemetry context. Return JSON or `FunctionError` (OWF Problem
 Details); YAML `try/catch` handles ordinary function and schema errors.
@@ -43,9 +46,19 @@ persists before execution; `start` enqueues and is idempotent by run ID.
 `worker` recovers due and interrupted runs, renews leases, enforces concurrency
 limits and periodically sweeps retained evidence and expired mailbox events. A
 shutdown token releases work for recovery. `cancel` is terminal and cascades to
-owned descendants. `get`, `list`, `records`, `definitions`, `triggers`,
+owned descendants. `get`, `list`, `records`, `calls`, `definitions`, `triggers`,
 `deliver`, `sweep` and `recover_once` support embedding applications that own
 their polling and control surface.
+
+`calls(id)` is the run's call journal, one `CallEntry` per call and emitted
+event (as `emit`): its record key (where its arguments and result are), the
+function, its delivery, and its state: `pending` (an at-least-once call
+without an answer, dispatched again on recovery), `completed`, `failed` (an
+error answer), `not_executed` or `unknown` (an at-most-once call that may have
+run and is never sent again). The interpreter's `Outcome::calls` carries the
+same journal. The engine does not decide whether a run changed the world; a
+host reads the journal to choose between rerunning a failed run, handing it
+over, or reconciling it.
 
 `deliver(event, target)` takes an identified CloudEvent (`source`, `id`,
 `type`). With a target it goes to that run's mailbox, whether or not the run
@@ -68,7 +81,7 @@ consecutive faults (default N = 3) atomically roll back to the prior version in
 a new epoch. With no prior version the definition is `tripped` (visible in
 `definitions`): it admits no new runs and its schedule stops, running runs
 finish, and the next activation clears it. In-flight runs keep their admitted
-YAML, version, input and schema/effect/delivery bindings.
+YAML, version, input and schema/delivery bindings.
 
 Deadlines are absolute instants fixed when they start: the workflow's
 `timeout` counts from admission, not from the drive that first runs it, and a
@@ -91,9 +104,14 @@ parent joins with `listen`, or reads the owned result with `child_outcome`.
 The worker drives children under the same bounds. Native `run: workflow`
 (below) is the DSL's way to run a child and wait for it.
 
-`dry_run` executes real reads, records writes and answers them through an
-injected `Mock`, using a private memory store for all runs and definitions.
-Child definitions are read from the host's catalog. Durable delays advance
+`dry_run` takes the host's `Mock`: a rule over each call's function and
+arguments (`mocks`) and the answers to what it marks (`response`);
+`mock(rule, response)` builds one from two closures. Its guarantee: a dry run
+dispatches no call (function or process run, `run:<kind>`) the rule marks.
+Every other call is dispatched for real. Emitted events are recorded, never
+published or handed to the sink. `DryRun::mocked` lists the mocked calls and
+the emitted events. All runs and definitions live in a private memory store;
+child definitions are read from the host's catalog. Durable delays advance
 without sleeping. `replay` and `replay_definition` take function results and
 event envelopes from a recorded run and execute in isolation, with no handler
 dispatch. Replay rejects missing or changed call bindings and requires evidence
@@ -176,9 +194,11 @@ is bounded by its collection and `retry` by its attempts.
   atomically; recovery joins the same child and never reruns a completed
   one. `await: false` starts an independent run. `run: container | script |
   shell` need a `ProcessRunner` (`with_process_runner`); it is recorded like
-  a function call, with the effect and delivery the runner declares per kind.
-- `emit` builds a CloudEvents envelope, records it like a write, delivers it
-  to the runs listening for it and hands it to an optional `EventSink`.
+  a function call (`run:<kind>`), with the delivery the runner declares per
+  kind.
+- `emit` builds a CloudEvents envelope, records it like a call (`emit`, at
+  least once), delivers it to the runs listening for it and hands it to an
+  optional `EventSink`.
   `publish` delivers an external CloudEvent the same way, idempotently per
   `source` + `id`. `listen` supports `one`, `any` (empty: any event), `all`,
   `until` (a condition or events), filters (literal, regular expression or
@@ -214,8 +234,7 @@ is bounded by its collection and `retry` by its attempts.
 ## Durability and storage
 
 Completed calls and tasks restore their saved results on resume. Delivery is
-declared, not derived from the effect. Every call, reads and writes alike, is
-at least once by default: a call whose outcome is unknown after a crash may be
+declared per function. Every call is at least once by default: a call whose outcome is unknown after a crash may be
 dispatched again, with the same idempotency key. A function declares
 `Delivery::AtMostOnce` at registration (a process runner per kind); a task may
 tighten its call with `metadata.delivery: at_most_once`, never loosen it. The
@@ -224,9 +243,9 @@ pinned bindings. At most once commits intent before dispatch; intent without a
 response produces `outcome_unknown`, never another dispatch. This can lose a
 call if the process dies before sending; neither mode promises exactly-once
 external effects. A function may use its stable idempotency key for recipient
-deduplication or reconciliation. `effect` decides what a dry run mocks and
-whether a failure happened before the first write. Cancellation cannot undo
-an external effect already sent.
+deduplication or reconciliation. A run without a journal (`owf::run::run`)
+keeps no results, so it never retries an attempt that started an at-most-once
+call. Cancellation cannot undo an external effect already sent.
 
 Fenced commits reject expired or replaced workers. Event consumption and its
 journal evidence share a commit; child completion and parent notification do
@@ -299,7 +318,7 @@ Both initial migrations were replaced before any release or deployment. This
 layout requires a fresh database from the earlier development checkout; there
 is no conversion of that unreleased layout. Applied migrations are immutable
 from the next release onward. The SQL schema is a generic key/value table, so
-the row shapes above (and the interpreter's durable state version, now 5) can
+the row shapes above (and the interpreter's durable state version, now 6) can
 change without a migration; nothing persisted before them is converted. Each
 run row records the durable state version it was written under, and a row of
 another version (including the earlier one-aggregate-per-run layout) is

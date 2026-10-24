@@ -5,9 +5,10 @@
 //!
 //! The interpreter and Journal host jointly enforce the run/call contract.
 //! Event waits use the same invocation identities and checkpoints. Retry
-//! safety is a call's effective delivery, bound into its record; `Effect`
-//! never determines it (it only decides what a dry run mocks and whether a
-//! failure happened before the first write).
+//! safety is a call's effective delivery, bound into its record. The engine
+//! does not classify calls as reads or writes: what a dry run mocks and
+//! whether a call changed the world are the host's to judge, from the call
+//! journal (`call_journal`) and its own knowledge of its functions.
 //!
 //! ## Run identity and replay
 //!
@@ -64,8 +65,7 @@
 //!    third-party functions without requiring service changes. Every call
 //!    defaults to `at least once`; `at most once` is declared by the function
 //!    (`Functions::at_most_once`) and a task may tighten it
-//!    (`metadata.delivery`), never loosen it. It is independent of the
-//!    function's read/write classification. This is no external exactly-once
+//!    (`metadata.delivery`), never loosen it. This is no external exactly-once
 //!    guarantee and does not require a host-side idempotency guard.
 //! 10. `At least once`: durably save the received result before using it. Without
 //!     a saved result, recovery may resend the call, so effects can be duplicated.
@@ -138,10 +138,7 @@
 //!     refusal of the run carries that key (`Record::Budget::first`). Only
 //!     the jump it names acts on `on_exceeded`; other branches refused at the
 //!     same moment follow its outcome, and recovery and replay pick the same.
-use crate::{
-    model::Flow,
-    run::{Effect, WorkflowError},
-};
+use crate::{model::Flow, run::WorkflowError};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -155,7 +152,9 @@ use std::collections::BTreeMap;
 /// aggregate per run; a run row of an earlier version is refused.
 /// 5: every jump to a named task leaves `Record::Budget` at `<task>#jump`,
 /// and a run's first refusal `Record::Exceeded` at `EXCEEDED`.
-pub const VERSION: u32 = 5;
+/// 6: a call record no longer carries a read/write effect, nor do a run's
+/// pinned function bindings.
+pub const VERSION: u32 = 6;
 
 /// The key of a run's `Record::Exceeded`.
 pub const EXCEEDED: &str = "exceeded";
@@ -234,7 +233,6 @@ pub enum Record {
         logical: String,
         function: String,
         arguments: Value,
-        effect: Effect,
         delivery: Delivery,
         state: CallState,
     },
@@ -281,9 +279,9 @@ pub fn check_transition(old: &Record, new: &Record) -> anyhow::Result<()> {
         || match (old, new) {
             (Record::Task { started_ms: a, result: None }, Record::Task { started_ms: b, .. }) => a == b,
             (
-                Record::Call { logical: l, function: a, arguments: b, effect: c, delivery: d, state },
-                Record::Call { logical: m, function: e, arguments: f, effect: g, delivery: h, .. },
-            ) => !matches!(state, CallState::Done(_)) && l == m && a == e && b == f && c == g && d == h,
+                Record::Call { logical: l, function: a, arguments: b, delivery: d, state },
+                Record::Call { logical: m, function: e, arguments: f, delivery: h, .. },
+            ) => !matches!(state, CallState::Done(_)) && l == m && a == e && b == f && d == h,
             _ => false,
         };
     anyhow::ensure!(allowed, "invalid durable record transition");
@@ -300,4 +298,59 @@ pub struct TaskResult {
 pub enum StepOutcome {
     Completed { output: Value, flow: Flow },
     Faulted { error: WorkflowError, fatal: bool },
+}
+
+/// One call of a run as its host sees it: what was called, how it may be
+/// delivered and how far it got. The engine does not know whether a call
+/// changed the world; a host decides that from this journal and its own
+/// knowledge of its functions (to retry a failed run, hand it over, or
+/// reconcile it). Emitted events appear as calls of `emit`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CallEntry {
+    /// The call's record key in the run's records (`<task reference>#call`),
+    /// where its arguments and result are kept.
+    pub key: String,
+    pub function: String,
+    pub delivery: Delivery,
+    pub state: CallStatus,
+}
+
+/// How far a call got, from its durable record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CallStatus {
+    /// Its intent is saved and no answer is: an at-least-once call that may
+    /// be dispatched again (on recovery, under the same idempotency key).
+    Pending,
+    /// The function answered with a result. An unknown at-most-once outcome
+    /// the host answered with its marker (`Functions::unknown_outcome`) is
+    /// completed with that marker.
+    Completed,
+    /// The function answered with an error.
+    Failed,
+    /// Proven not executed (`CallFailure::NotExecuted`).
+    NotExecuted,
+    /// An at-most-once call whose intent has no answer: it may have run and
+    /// is never dispatched again.
+    Unknown,
+}
+
+impl CallEntry {
+    /// The entry a call record stands for; `None` for any other record.
+    pub fn of(key: &str, record: &Record) -> Option<Self> {
+        let Record::Call { function, delivery, state, .. } = record else { return None };
+        let state = match state {
+            CallState::Pending if *delivery == Delivery::AtMostOnce => CallStatus::Unknown,
+            CallState::Pending => CallStatus::Pending,
+            CallState::NotExecuted(_) => CallStatus::NotExecuted,
+            CallState::Done(Ok(_)) => CallStatus::Completed,
+            CallState::Done(Err(_)) => CallStatus::Failed,
+        };
+        Some(Self { key: key.into(), function: function.clone(), delivery: *delivery, state })
+    }
+}
+
+/// A run's call journal from its records, in record-key order.
+pub fn call_journal(records: &BTreeMap<String, Record>) -> Vec<CallEntry> {
+    records.iter().filter_map(|(key, record)| CallEntry::of(key, record)).collect()
 }

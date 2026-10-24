@@ -5,9 +5,7 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use owf::model::{self, Workflow};
-use owf::run::{
-    self, CallInfo, Clock, Effect, Event, Functions, Host, Limits, Observer, Outcome, Status, WorkflowError,
-};
+use owf::run::{self, CallInfo, Clock, Event, Functions, Host, Limits, Observer, Outcome, Status, WorkflowError};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -18,13 +16,21 @@ use super::program::{Program, definition};
 
 // ── 1. fake functions ──────────────────────────────────────────────────────
 
-/// The host's functions and their effect class.
-pub fn effect(name: &str) -> Option<Effect> {
-    match name {
-        "inc" | "down" | "flaky" => Some(Effect::Read),
-        "send" | "reject" => Some(Effect::Write),
-        _ => None,
-    }
+/// Whether the host has a function `name`.
+pub fn has(name: &str) -> bool {
+    matches!(name, "inc" | "down" | "flaky" | "send" | "reject")
+}
+
+/// The host's writes: what only the host knows about its functions (the
+/// engine does not), for the recipient ledgers some properties keep.
+pub fn writes(name: &str) -> bool {
+    matches!(name, "send" | "reject")
+}
+
+/// The functions the host declares at most once: its writes, which must
+/// never be sent twice. Every other one is at least once.
+pub fn at_most_once(name: &str) -> bool {
+    writes(name)
 }
 
 /// What `name` answers to `args` when it was called `before` times already
@@ -50,21 +56,25 @@ struct Fake {
 
 #[async_trait]
 impl Functions for Fake {
-    fn effect(&self, name: &str) -> Option<Effect> {
-        effect(name)
+    fn has(&self, name: &str) -> bool {
+        has(name)
+    }
+
+    fn at_most_once(&self, name: &str, _: &Value) -> bool {
+        at_most_once(name)
     }
 
     fn emits(&self) -> bool {
         true
     }
 
-    /// An emitted event is a write the journal records like a call.
+    /// An emitted event is recorded like an at-least-once call.
     async fn emit(&self, event: &Value, info: &CallInfo<'_>) -> Result<(), owf::durable::CallFailure> {
         self.journal.push(Entry::Call {
             name: "emit".into(),
             args: event.clone(),
             reference: info.reference.into(),
-            write: true,
+            protected: false,
             after_cancel: info.cancel.is_cancelled(),
         });
         if !self.latency.is_zero() {
@@ -84,7 +94,7 @@ impl Functions for Fake {
             name: name.into(),
             args: args.clone(),
             reference: info.reference.into(),
-            write: effect(name) == Some(Effect::Write),
+            protected: at_most_once(name),
             after_cancel: info.cancel.is_cancelled(),
         });
         if !self.latency.is_zero() {
@@ -98,12 +108,35 @@ impl Functions for Fake {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Entry {
-    Started { reference: String, parent: Option<String>, kind: String },
-    Skipped { reference: String, parent: Option<String> },
-    Completed { reference: String, output: Value },
-    Faulted { reference: String, error: WorkflowError },
-    Retrying { reference: String, attempt: u32 },
-    Call { name: String, args: Value, reference: String, write: bool, after_cancel: bool },
+    Started {
+        reference: String,
+        parent: Option<String>,
+        kind: String,
+    },
+    Skipped {
+        reference: String,
+        parent: Option<String>,
+    },
+    Completed {
+        reference: String,
+        output: Value,
+    },
+    Faulted {
+        reference: String,
+        error: WorkflowError,
+    },
+    Retrying {
+        reference: String,
+        attempt: u32,
+    },
+    /// `protected`: the call is at most once.
+    Call {
+        name: String,
+        args: Value,
+        reference: String,
+        protected: bool,
+        after_cancel: bool,
+    },
 }
 
 #[derive(Default)]
@@ -225,8 +258,11 @@ pub struct Known;
 
 #[async_trait]
 impl Functions for Known {
-    fn effect(&self, name: &str) -> Option<Effect> {
-        effect(name)
+    fn has(&self, name: &str) -> bool {
+        has(name)
+    }
+    fn at_most_once(&self, name: &str, _: &Value) -> bool {
+        at_most_once(name)
     }
     fn emits(&self) -> bool {
         true

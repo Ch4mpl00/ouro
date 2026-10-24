@@ -1099,8 +1099,8 @@ impl Events for Inbox {
 }
 #[async_trait::async_trait]
 impl owf::run::Functions for Inbox {
-    fn effect(&self, _: &str) -> Option<owf::run::Effect> {
-        None
+    fn has(&self, _: &str) -> bool {
+        false
     }
     fn events(&self) -> Option<&dyn Events> {
         Some(self)

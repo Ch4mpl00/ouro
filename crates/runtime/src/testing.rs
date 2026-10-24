@@ -1,6 +1,8 @@
-//! Isolated dry runs and replay. Both use a private in-memory store; reads
-//! execute only in dry mode. Replay takes results from durable call records.
-use crate::{Effect, FunctionContext, FunctionError, Runtime};
+//! Isolated dry runs and replay. Both use a private in-memory store. A dry
+//! run dispatches every call except those its host's mock rule marks, which
+//! the mock answers; replay dispatches nothing and takes results from
+//! durable call records.
+use crate::{FunctionContext, FunctionError, Runtime};
 use ouro_durable::{Clock, RunStore};
 use owf::{
     durable::{CallState, Delivery, Record},
@@ -14,16 +16,35 @@ use std::{
 };
 use tokio_util::sync::CancellationToken;
 
+/// A dry run's host decides what must not happen for real: the engine does
+/// not know which functions change the world. Guarantee: a dry run
+/// dispatches no call (function or process run, `run:<kind>`) its `mocks`
+/// marks; `response` answers it instead. Every other call is dispatched.
 pub trait Mock: Send + Sync {
+    /// Whether the call is mocked rather than dispatched.
+    fn mocks(&self, function: &str, arguments: &Value) -> bool;
+    /// The answer to a mocked call.
     fn response(&self, function: &str, arguments: &Value, context: &FunctionContext) -> Result<Value, FunctionError>;
 }
-impl<F> Mock for F
-where
-    F: Fn(&str, &Value, &FunctionContext) -> Result<Value, FunctionError> + Send + Sync,
-{
-    fn response(&self, f: &str, a: &Value, c: &FunctionContext) -> Result<Value, FunctionError> {
-        self(f, a, c)
+/// A `Mock` from the host's rule and the answers to what it marks.
+pub fn mock(
+    rule: impl Fn(&str, &Value) -> bool + Send + Sync + 'static,
+    response: impl Fn(&str, &Value, &FunctionContext) -> Result<Value, FunctionError> + Send + Sync + 'static,
+) -> Arc<dyn Mock> {
+    struct Rule<R, F>(R, F);
+    impl<R, F> Mock for Rule<R, F>
+    where
+        R: Fn(&str, &Value) -> bool + Send + Sync,
+        F: Fn(&str, &Value, &FunctionContext) -> Result<Value, FunctionError> + Send + Sync,
+    {
+        fn mocks(&self, f: &str, a: &Value) -> bool {
+            (self.0)(f, a)
+        }
+        fn response(&self, f: &str, a: &Value, c: &FunctionContext) -> Result<Value, FunctionError> {
+            (self.1)(f, a, c)
+        }
     }
+    Arc::new(Rule(rule, response))
 }
 #[derive(Clone, Debug, PartialEq)]
 pub struct RecordedCall {
@@ -31,13 +52,14 @@ pub struct RecordedCall {
     pub logical: String,
     pub function: String,
     pub arguments: Value,
-    pub effect: Effect,
     pub delivery: Delivery,
     pub result: Result<Value, WorkflowError>,
 }
 pub struct DryRun {
     pub status: Status,
-    pub writes: Vec<RecordedCall>,
+    /// The calls the mock answered and the events the run emitted (as
+    /// `emit`; a dry run publishes none), in the order they happened.
+    pub mocked: Vec<RecordedCall>,
 }
 pub struct Replay {
     pub status: Status,
@@ -48,7 +70,7 @@ pub(crate) enum Mode {
     Live,
     Dry {
         mock: Arc<dyn Mock>,
-        writes: Arc<Mutex<Vec<RecordedCall>>>,
+        mocked: Arc<Mutex<Vec<RecordedCall>>>,
     },
     Replay {
         calls: Arc<BTreeMap<String, RecordedCall>>,
@@ -99,17 +121,17 @@ impl Runtime {
         runtime.start("dry-run", "dry-run", input)?;
         runtime.definition_source = self.store.clone();
         runtime.tracer = self.tracer.clone();
-        let writes = Arc::new(Mutex::new(Vec::new()));
+        let mocked = Arc::new(Mutex::new(Vec::new()));
         let status =
-            run_isolated(&runtime, "dry-run", Mode::Dry { mock, writes: writes.clone() }, &clock, stop).await?;
-        let writes = writes.lock().unwrap().clone();
-        Ok(DryRun { status, writes })
+            run_isolated(&runtime, "dry-run", Mode::Dry { mock, mocked: mocked.clone() }, &clock, stop).await?;
+        let mocked = mocked.lock().unwrap().clone();
+        Ok(DryRun { status, mocked })
     }
     pub async fn replay(&self, id: &str, stop: &CancellationToken) -> anyhow::Result<Replay> {
         self.replay_inner(id, None, stop).await
     }
     /// Exercise a candidate definition using a recorded run's input and
-    /// function results. Changed call names, arguments or effects fail replay.
+    /// function results. Changed call names, arguments or delivery fail replay.
     pub async fn replay_definition(&self, yaml: &str, id: &str, stop: &CancellationToken) -> anyhow::Result<Replay> {
         self.validate(yaml)?;
         self.replay_inner(id, Some(yaml), stop).await
@@ -139,21 +161,11 @@ impl Runtime {
             original.run.admission.runtime["bindings"] = self.registry.bindings(&wf);
         }
         for (key, record) in original.records {
-            if let Record::Call { logical, function, arguments, effect, delivery, state: CallState::Done(result) } =
-                record
-            {
+            if let Record::Call { logical, function, arguments, delivery, state: CallState::Done(result) } = record {
                 let reference = key.strip_suffix("#call").ok_or_else(|| anyhow::anyhow!("invalid call record key"))?;
                 calls.insert(
                     reference.to_string(),
-                    RecordedCall {
-                        task_path: reference.into(),
-                        logical,
-                        function,
-                        arguments,
-                        effect,
-                        delivery,
-                        result,
-                    },
+                    RecordedCall { task_path: reference.into(), logical, function, arguments, delivery, result },
                 );
             }
         }
