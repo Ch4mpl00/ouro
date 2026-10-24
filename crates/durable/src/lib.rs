@@ -129,6 +129,9 @@ pub struct SavedRun {
     pub fence: Option<Fence>,
     pub generation: u64,
     pub lease_until_ms: Option<i64>,
+    /// When a ready or waiting run is due. For a running run, when it
+    /// became due for the claim that runs it (its previous lease's end, for
+    /// a run taken over).
     pub wake_at_ms: i64,
     pub interruptions: u32,
     pub outcome: Option<Status>,
@@ -398,6 +401,8 @@ pub struct Swept {
     pub records: usize,
     pub expired: usize,
     pub tombstones: usize,
+    /// Worker rows stale for longer than `control::WORKERS_KEPT_MS`.
+    pub workers: usize,
 }
 
 /// Transactional operations, independent of SQL. `now_ms` is supplied by the
@@ -441,6 +446,20 @@ pub trait RunStore: Send + Sync {
         limit: usize,
     ) -> anyhow::Result<control::Page<control::Wait>>;
     async fn inspect_control(&self, id: &str) -> anyhow::Result<Option<control::Inspection>>;
+    /// Upserts a worker's liveness row in one commit: the row and its
+    /// expiry index entry, nothing else. A beat older than the stored one
+    /// changes nothing.
+    async fn beat(&self, _worker: &control::Worker) -> anyhow::Result<()> {
+        anyhow::bail!("this store does not support worker heartbeats")
+    }
+    /// A page of worker rows in id order, at most `limit` (1..=`MAX_PAGE`).
+    async fn workers(
+        &self,
+        _cursor: Option<&control::Cursor>,
+        _limit: usize,
+    ) -> anyhow::Result<control::Page<control::Worker>> {
+        anyhow::bail!("this store does not support worker heartbeats")
+    }
     async fn describe_wait(
         &self,
         fence: &Fence,
@@ -598,8 +617,9 @@ pub trait RunStore: Send + Sync {
     async fn due_as(&self, now_ms: i64, limit: usize, worker: &Compatibility) -> anyhow::Result<Vec<String>>;
     async fn cancel(&self, id: &str, now_ms: i64) -> anyhow::Result<bool>;
     /// Removes finished runs' evidence older than `kept_ms`, expires due
-    /// mailbox copies of unfinished runs (each into a `Record::Expired`) and
-    /// drops expired ingress tombstones.
+    /// mailbox copies of unfinished runs (each into a `Record::Expired`),
+    /// drops expired ingress tombstones and the rows of workers stale for
+    /// longer than `control::WORKERS_KEPT_MS`.
     async fn sweep(&self, now_ms: i64, kept_ms: i64) -> anyhow::Result<Swept>;
     async fn get(&self, id: &str) -> anyhow::Result<Option<SavedRun>>;
     async fn list(&self, name: Option<&str>, prefix: &str) -> anyhow::Result<Vec<SavedRun>>;
