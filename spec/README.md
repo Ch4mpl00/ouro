@@ -21,7 +21,7 @@ simulated and its histories replayed against memory, SQLite and Postgres.
 
 ## Contract coverage
 
-`contract_progress.qnt` supplies E5 and the five temporal obligations. All 39 IDs
+`contract_progress.qnt` supplies E5 and the five temporal obligations. All 40 IDs
 have named predicates, but the scopes below matter: naming a predicate does not
 prove every clause of its English contract. "Serial MBT" and "concurrent MBT"
 are the bridges in `crates/durable/tests/quint.rs` and `quint/concurrent.rs`.
@@ -61,6 +61,7 @@ are the bridges in `crates/durable/tests/quint.rs` and `quint/concurrent.rs`.
 | X1 | `X1`: dry runs dispatch nothing the host's mock rule (`mocked(i)`) marks | `x1_x2_generated_dry_runs_and_replays_are_isolated`, `a_dry_run_dispatches_no_call_the_rule_marks`, `dry_runs_dispatch_no_process_the_rule_marks` |
 | X2 | `X2`: replay dispatches nothing | Same property |
 | X3 | `X3`: no silent readmission/reopening | Terminal/admission checks |
+| S1 | `S1`: emergency stop blocks claim, firing and admission (including children and ingress); clearing preserves evidence | Stop/clear witnesses, serial MBT, `S1` guard mutant, control conformance |
 | B1 | `B1`: tree counter within the ceiling, equal to a live root's granted decisions; immutable decisions; refusal only at the ceiling | Serial MBT (`spend`, decisions projected); `budgetTest` witness; budget conformance; generated interpreter budgets |
 | L1 | `contract_progress::L1`: ready work eventually completes under F | Finite drains; temporal quotient |
 | L2 | `L2`: abandoned ownership eventually claimed/completed under F | Temporal quotient |
@@ -166,8 +167,8 @@ exact matching plus undeclared, without a host-supplied `accepts` list.
 ### Serial
 
 `crates/durable/tests/quint.rs` replays Quint's random traces of `contract.qnt`
-(100 traces × 150 steps per adapter by default, all 31 commands and every fault
-switch) and the `bridgeSuite` run of `contract_witnesses.qnt` (all 45 witness
+(100 traces × 150 steps per adapter by default, all 32 commands and every fault
+switch) and the `bridgeSuite` run of `contract_witnesses.qnt` (all 49 witness
 histories in one trace). After every step it compares a projection of the store
 with the model's state. The model records each command in its `command`
 variable; the driver never sees the model's state.
@@ -344,3 +345,14 @@ JVM; whether they were run for this revision is in [RESULTS.md](RESULTS.md).
   retries, transport rejection proofs, corrupt/unsupported checkpoint formats.
 - A checked refinement relation between the model and the progress quotient,
   plus larger symbolic bounds. No such refinement theorem is claimed here.
+
+## Control API quick checks (#18)
+
+The durable `stopped` flag gates claims, admissions and trigger firings,
+including child/refused/ingress admission paths. Worker steps and dispatch
+also stop, while release, cancellation and mailbox acceptance remain possible.
+`emergencyStopTest` witnesses refused work; `clearStopTest` witnesses the same
+run and slot progressing after clearing. Both join `bridgeSuite`; the serial
+bridge independently projects the store flag. The `S1` mutant removes the stop
+guard and must violate the new monitor. This revision uses witness tests and
+bounded simulation only; no new TLC or Apalache result is claimed.

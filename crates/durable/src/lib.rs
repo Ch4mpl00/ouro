@@ -6,6 +6,7 @@
 //! are explicit so expiry can be tested without changing persisted rows.
 mod backend;
 pub mod conformance;
+pub mod control;
 mod engine;
 pub mod memory;
 pub mod postgres;
@@ -201,7 +202,7 @@ pub struct Definitions {
     /// current epoch count toward its breaker.
     pub epoch: u64,
     /// The breaker's report once it reached its threshold: no new runs (any
-    /// path, `DefinitionTripped`) and no schedule until the next activation, which alone clears it. The
+    /// path, `DefinitionTripped`) and no schedule until activation (or a manual pause is resumed). The
     /// engine never chooses another version; the host decides.
     pub tripped: Option<Trip>,
     /// Trigger keys the current activation armed. Activation and tripping
@@ -215,6 +216,9 @@ pub const TRIPPED: &str = "ouro.definition.tripped";
 /// What a tripped breaker reports, in `Definitions::tripped` and as a notice.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Trip {
+    /// Present for an operator pause; `reason.type_` is `manual`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manual: Option<control::ManualTrip>,
     /// The active version and the epoch the breaker tripped in.
     pub version: u64,
     pub epoch: u64,
@@ -402,6 +406,42 @@ pub struct Swept {
 /// ownership and expiry in the same commit as its changes. Synchronous
 /// methods match the interpreter's Journal/Events contract.
 pub trait RunStore: Send + Sync {
+    fn control(
+        &self,
+        request: &control::Request,
+        command: &control::Command,
+        now_ms: i64,
+    ) -> anyhow::Result<control::Reply>;
+    fn stopped(&self) -> anyhow::Result<bool>;
+    fn control_entry(&self, id: &str) -> anyhow::Result<Option<control::Entry>>;
+    fn control_history(
+        &self,
+        run: Option<&str>,
+        cursor: Option<&control::Cursor>,
+        limit: usize,
+    ) -> anyhow::Result<control::Page<control::Entry>>;
+    fn query_runs(
+        &self,
+        filter: &control::Runs,
+        history: bool,
+        cursor: Option<&control::Cursor>,
+        limit: usize,
+    ) -> anyhow::Result<control::Page<SavedRun>>;
+    fn pending_waits(
+        &self,
+        filter: &control::Waits,
+        cursor: Option<&control::Cursor>,
+        limit: usize,
+    ) -> anyhow::Result<control::Page<control::Wait>>;
+    fn inspect_control(&self, id: &str) -> anyhow::Result<Option<control::Inspection>>;
+    fn describe_wait(
+        &self,
+        fence: &Fence,
+        key: &str,
+        wait: &owf::events::PendingWait,
+        now_ms: i64,
+    ) -> anyhow::Result<()>;
+
     /// The time policy this store applies.
     fn policy(&self) -> Policy {
         Policy::default()
@@ -419,6 +459,8 @@ pub trait RunStore: Send + Sync {
     /// compatible with stays due and visible, never failed or lost. Every
     /// later owned mutation is fenced by the claim it granted.
     fn claim_as(&self, id: &str, now_ms: i64, worker: &Compatibility) -> anyhow::Result<Option<Fence>>;
+    /// A dispatch boundary: current ownership and the global stop gate.
+    fn check_lease(&self, fence: &Fence, now_ms: i64) -> anyhow::Result<()>;
     fn renew(&self, fence: &Fence, now_ms: i64) -> anyhow::Result<()>;
     fn release(&self, fence: &Fence, now_ms: i64) -> anyhow::Result<()>;
     fn load_records(&self, fence: &Fence, now_ms: i64) -> anyhow::Result<BTreeMap<String, Record>>;
@@ -626,6 +668,11 @@ impl Journal for Lease {
     }
 }
 impl Events for Lease {
+    fn waiting(&self, run_id: &str, key: &str, wait: &owf::events::PendingWait) -> anyhow::Result<()> {
+        anyhow::ensure!(run_id == self.fence.run_id, "event run does not own this lease");
+        self.store.describe_wait(&self.fence, key, wait, self.clock.now_ms())
+    }
+
     fn register(&self, run_id: &str, types: &[String]) -> anyhow::Result<()> {
         anyhow::ensure!(run_id == self.fence.run_id, "event run does not own this lease");
         self.store.register_wait(&self.fence, types, self.clock.now_ms())

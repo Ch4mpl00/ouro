@@ -172,58 +172,112 @@ pub enum Offer {
 /// ends it); `all` fills each filter with the first event that matches it
 /// (in filter order), and events matching only filled filters are dropped.
 /// Correlation expectations are shared by all filters of one listen.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Progress {
+    filled: Vec<bool>,
+    pub expectations: BTreeMap<String, Value>,
+    until: Option<Box<Progress>>,
+    done: bool,
+}
+
+/// A pending listen's exact matching context and position. No live host is
+/// needed to validate an answer; secrets are redacted before persistence.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct PendingWait {
+    pub types: Vec<String>,
+    pub strategy: Strategy,
+    pub input: Value,
+    pub args: Args,
+    pub progress: Progress,
+    pub position: String,
+    pub since_ms: i64,
+    pub timeout_ms: Option<i64>,
+    pub redacted: bool,
+}
+impl PendingWait {
+    pub fn accepts(&self, event: &Value) -> Result<bool, String> {
+        if self.redacted {
+            return Err("wait matching requires redacted secrets".into());
+        }
+        let mut consumer = Consumer { strategy: &self.strategy, progress: self.progress.clone() };
+        Ok(consumer.offer(event, &self.input, &self.args)? != Offer::Ignored)
+    }
+}
+
 pub struct Consumer<'s> {
     strategy: &'s Strategy,
-    filled: Vec<bool>,
-    expectations: BTreeMap<String, Value>,
-    until: Option<Box<Consumer<'s>>>,
-    done: bool,
+    progress: Progress,
 }
 
 impl<'s> Consumer<'s> {
     pub fn new(strategy: &'s Strategy) -> Self {
         let (filled, until) = match strategy {
             Strategy::All(filters) => (vec![false; filters.len()], None),
-            Strategy::Any { until: Some(Until::Events(s)), .. } => (Vec::new(), Some(Box::new(Consumer::new(s)))),
+            Strategy::Any { until: Some(Until::Events(s)), .. } => {
+                (Vec::new(), Some(Box::new(Consumer::new(s).progress)))
+            }
             _ => (Vec::new(), None),
         };
-        Self { strategy, filled, expectations: BTreeMap::new(), until, done: false }
+        Self { strategy, progress: Progress { filled, expectations: BTreeMap::new(), until, done: false } }
+    }
+
+    pub fn progress(&self) -> Progress {
+        self.progress.clone()
+    }
+    fn offer_with_progress(
+        mut self,
+        event: &Value,
+        input: &Value,
+        args: &Args,
+        progress: &mut Progress,
+    ) -> Result<Offer, String> {
+        let result = self.offer(event, input, args)?;
+        *progress = self.progress;
+        Ok(result)
     }
 
     pub fn done(&self) -> bool {
-        self.done
+        self.progress.done
     }
 
     /// Ends the listen: its `until` condition held.
     pub fn stop(&mut self) {
-        self.done = true;
+        self.progress.done = true;
     }
 
     pub fn offer(&mut self, event: &Value, input: &Value, args: &Args) -> Result<Offer, String> {
-        if self.done {
+        if self.progress.done {
             return Ok(Offer::Ignored);
         }
         match self.strategy {
             Strategy::One(f) => {
-                if matches(f, event, input, args, &mut self.expectations)? {
-                    self.done = true;
+                if matches(f, event, input, args, &mut self.progress.expectations)? {
+                    self.progress.done = true;
                     return Ok(Offer::Consumed);
                 }
             }
             Strategy::All(filters) => {
                 for (i, f) in filters.iter().enumerate() {
-                    if !self.filled[i] && matches(f, event, input, args, &mut self.expectations)? {
-                        self.filled[i] = true;
-                        self.done = self.filled.iter().all(|f| *f);
+                    if !self.progress.filled[i] && matches(f, event, input, args, &mut self.progress.expectations)? {
+                        self.progress.filled[i] = true;
+                        self.progress.done = self.progress.filled.iter().all(|f| *f);
                         return Ok(Offer::Consumed);
                     }
                 }
             }
             Strategy::Any { filters, until } => {
-                if let Some(u) = &mut self.until
-                    && u.offer(event, input, args)? != Offer::Ignored
+                if let Some(u) = &mut self.progress.until
+                    && (Consumer {
+                        strategy: match until {
+                            Some(Until::Events(s)) => s,
+                            _ => unreachable!(),
+                        },
+                        progress: (**u).clone(),
+                    })
+                    .offer_with_progress(event, input, args, u)?
+                        != Offer::Ignored
                 {
-                    self.done = u.done();
+                    self.progress.done = u.done;
                     return Ok(Offer::Until);
                 }
                 let mut hit = filters.is_empty();
@@ -231,10 +285,10 @@ impl<'s> Consumer<'s> {
                     if hit {
                         break;
                     }
-                    hit = matches(f, event, input, args, &mut self.expectations)?;
+                    hit = matches(f, event, input, args, &mut self.progress.expectations)?;
                 }
                 if hit {
-                    self.done = until.is_none();
+                    self.progress.done = until.is_none();
                     return Ok(Offer::Consumed);
                 }
             }

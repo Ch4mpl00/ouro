@@ -1099,3 +1099,13 @@ Addendum (2026-10-24, issue #14). An owned child never outlives its parent:
 any terminal end of a run cancels its owned live descendants, transitively, in
 the commit of that end (C3). This was already the stores' behaviour; the model
 had ended them only on cancellation. Independent runs are unaffected.
+
+Addendum (2026-10-24, issue #18). Operator pause is a manual trip carrying
+actor, reason and note. A manual resume restores its triggers without a new
+activation epoch or resetting the previous breaker count; automatic breaker
+trips still require activation. Emergency stop is a separate global durable
+gate on admission, claim, firing and worker progress at step/dispatch boundaries.
+Cancellation closes the same owned subtree as C3 and reaches the owner's
+function token at its next renewal (immediately through the in-process control
+path). Attributed commands commit their audit and idempotency reply atomically;
+a matched response commits its addressed event in that same transition.

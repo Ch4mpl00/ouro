@@ -1182,3 +1182,250 @@ async fn a_failing_schema_resolver_retries_the_slot_without_consuming_or_countin
     assert_eq!(rt.notify(&stop).await.unwrap(), 1);
     assert_eq!(rt.list(Some("watch"), "").unwrap().len(), 1);
 }
+
+#[tokio::test(start_paused = true)]
+async fn independent_store_cancel_fires_in_flight_token_within_one_heartbeat() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("cancel.sqlite");
+    let store = Arc::new(durable::sqlite::open(&path).unwrap());
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let token = Arc::new(Mutex::new(None));
+    let mut registry = Registry::new();
+    let observed = token.clone();
+    let ready = entered.clone();
+    registry
+        .register(Function::new("hold", json!({}), json!({}), move |_: Value, ctx: FunctionContext| {
+            *observed.lock().unwrap() = Some(ctx.cancel.clone());
+            ready.notify_one();
+            async move { std::future::pending().await }
+        }))
+        .unwrap();
+    let heartbeat = Duration::from_secs(1);
+    let rt = Runtime::new(
+        store,
+        Arc::new(registry),
+        Config { heartbeat_interval: heartbeat, ..Config::default() },
+        Arc::new(Time::default()),
+        tracer(),
+    )
+    .unwrap();
+    save(&rt, &yaml("  - hold: { call: hold }"));
+    rt.start("r", "workflow", Value::Null).unwrap();
+    let remote =
+        ouro_runtime::control::Control::new(Arc::new(durable::sqlite::open(path).unwrap()), Arc::new(Time::default()));
+    let stop = CancellationToken::new();
+    let drive = rt.drive("r", &stop);
+    let cancel = async {
+        entered.notified().await;
+        let token = token.lock().unwrap().clone().unwrap();
+        assert!(!token.is_cancelled());
+        remote.cancel(&operator("remote-cancel"), "r").unwrap();
+        let started = tokio::time::Instant::now();
+        tokio::time::timeout(heartbeat + Duration::from_millis(1), token.cancelled()).await.unwrap();
+        assert!(started.elapsed() <= heartbeat);
+    };
+    let (result, ()) = tokio::join!(drive, cancel);
+    assert_eq!(result.unwrap(), Some(Status::Cancelled));
+    assert_eq!(rt.calls("r").unwrap()[0].state, CallStatus::Pending);
+}
+
+fn operator(id: &str) -> ouro_runtime::control::Request {
+    ouro_runtime::control::Request { id: id.into(), actor: "operator".into(), reason: "review".into() }
+}
+
+#[tokio::test]
+async fn store_only_control_answers_a_multi_event_listen_with_persisted_correlation() {
+    use ouro_runtime::control::{Control, Runs, Waits};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("control.sqlite");
+    let clock = Arc::new(Time::default());
+    let rt = runtime(Arc::new(durable::sqlite::open(&path).unwrap()), Registry::new(), clock.clone());
+    save(
+        &rt,
+        &yaml(
+            "  - decision:\n      timeout: { after: PT1S }\n      listen:\n        to:\n          all:\n            - with: { type: first }\n              correlate: { ticket: { from: .ticket } }\n            - with: { type: second }\n              correlate: { ticket: { from: .ticket } }",
+        ),
+    );
+    rt.start("r", "workflow", json!({})).unwrap();
+    let stop = CancellationToken::new();
+    assert!(matches!(rt.drive("r", &stop).await.unwrap(), Some(Status::Waiting { .. })));
+    let control = Control::new(Arc::new(durable::sqlite::open(path).unwrap()), clock.clone());
+    let waits = control.waits(&Waits::default(), None, 10).unwrap().items;
+    assert_eq!(waits.len(), 1);
+    let wait = &waits[0];
+    assert_eq!(wait.waiting.types, ["first", "second"]);
+    assert_eq!(wait.waiting.timeout_ms, Some(1000));
+    assert_eq!(wait.waiting.since_ms, 0);
+    let event =
+        |id: &str, type_: &str, ticket| json!({"source":"/operator","id":id,"type":type_,"ticket":ticket,"data":{}});
+    control.respond(&operator("first"), "r", &wait.key, event("1", "first", 42)).unwrap();
+    assert!(matches!(rt.drive("r", &stop).await.unwrap(), Some(Status::Waiting { .. })));
+    let wait = control.waits(&Waits::default(), None, 10).unwrap().items.pop().unwrap();
+    assert_eq!(wait.waiting.progress.expectations["ticket"], 42);
+    assert!(control.respond(&operator("filled"), "r", &wait.key, event("filled", "first", 42)).is_err());
+    assert!(control.respond(&operator("wrong"), "r", &wait.key, event("wrong", "second", 43)).is_err());
+    let answer = event("2", "second", 42);
+    control.respond(&operator("second"), "r", &wait.key, answer.clone()).unwrap();
+    assert!(matches!(rt.drive("r", &stop).await.unwrap(), Some(Status::Completed(_))));
+    assert!(control.waits(&Waits::default(), None, 10).unwrap().items.is_empty());
+    control.respond(&operator("retry"), "r", &wait.key, answer).unwrap();
+    let inspection = control.inspect("r").unwrap().unwrap();
+    assert!(inspection.calls.is_empty() && inspection.waits.is_empty());
+    assert_eq!(inspection.snapshot.run.state, durable::RunState::Completed);
+    let filter = Runs { definition: Some("workflow".into()), ..Runs::default() };
+    assert_eq!(control.counts(&filter, false, None, 10).unwrap().states["completed"], 1);
+    let filter = Runs { since_ms: Some(0), before_ms: Some(1000), ..filter };
+    assert_eq!(control.counts(&filter, true, None, 10).unwrap().states["completed"], 1);
+    assert_eq!(control.history(&filter, None, 10).unwrap().items.len(), 1);
+    assert_eq!(control.journal(Some("r"), None, 10).unwrap().items.len(), 3);
+}
+
+#[tokio::test]
+async fn control_respond_supports_wildcard_listens_and_refuses_expired_waits() {
+    use ouro_runtime::control::{Control, Waits};
+    let store = Arc::new(durable::memory::memory());
+    let clock = Arc::new(Time::default());
+    let rt = runtime(store.clone(), Registry::new(), clock.clone());
+    save(&rt, &yaml("  - decision: { timeout: { after: PT1S }, listen: { to: { any: [] } } }"));
+    let control = Control::new(store, clock.clone());
+    let stop = CancellationToken::new();
+    for id in ["answered", "expired"] {
+        rt.start(id, "workflow", json!({})).unwrap();
+        assert!(matches!(rt.drive(id, &stop).await.unwrap(), Some(Status::Waiting { .. })));
+    }
+    let wait = control
+        .waits(&Waits { run: Some("answered".into()), ..Waits::default() }, None, 10)
+        .unwrap()
+        .items
+        .pop()
+        .unwrap();
+    assert_eq!(wait.waiting.types, ["*"]);
+    let event = json!({"source":"/operator","id":"answer","type":"choice","data":42});
+    control.respond(&operator("answer"), "answered", &wait.key, event.clone()).unwrap();
+    assert_eq!(rt.drive("answered", &stop).await.unwrap(), Some(Status::Completed(json!([42]))));
+    let wait = control
+        .waits(&Waits { run: Some("expired".into()), ..Waits::default() }, None, 10)
+        .unwrap()
+        .items
+        .pop()
+        .unwrap();
+    clock.0.store(1000, Ordering::SeqCst);
+    assert!(control.respond(&operator("late"), "expired", &wait.key, event).is_err());
+    assert!(matches!(rt.drive("expired", &stop).await.unwrap(), Some(Status::Faulted(_))));
+    assert!(control.waits(&Waits::default(), None, 10).unwrap().items.is_empty());
+}
+
+#[tokio::test]
+async fn emergency_stop_preserves_delivery_at_the_next_step_boundary_and_resumes() {
+    use ouro_runtime::control::{Command, Control};
+    for delivery in [Delivery::AtLeastOnce, Delivery::AtMostOnce] {
+        let store = Arc::new(durable::memory::memory());
+        let clock = Arc::new(Time::default());
+        let control = Arc::new(Control::new(store.clone(), clock.clone()));
+        let first = Arc::new(AtomicUsize::new(0));
+        let second = Arc::new(AtomicUsize::new(0));
+        let mut registry = Registry::new();
+        let stop = control.clone();
+        let calls = first.clone();
+        registry
+            .register(
+                Function::new("stop", json!({}), json!({}), move |_: Value, _: FunctionContext| {
+                    if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                        stop.execute(&operator("stop"), &Command::Stop { enabled: true }).unwrap();
+                    }
+                    async { Ok(json!({})) }
+                })
+                .with_delivery(delivery),
+            )
+            .unwrap();
+        let calls = second.clone();
+        registry
+            .register(Function::new("next", json!({}), json!({}), move |_: Value, _: FunctionContext| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                async { Ok(json!({})) }
+            }))
+            .unwrap();
+        let rt = runtime(store, registry, clock);
+        save(&rt, &yaml("  - stop: { call: stop }\n  - next: { call: next }"));
+        rt.start("r", "workflow", json!({})).unwrap();
+        let token = CancellationToken::new();
+        assert!(matches!(rt.drive("r", &token).await.unwrap(), Some(Status::Interrupted(_))));
+        assert_eq!(second.load(Ordering::SeqCst), 0);
+        assert_eq!(rt.get("r").unwrap().unwrap().state, durable::RunState::Ready);
+        assert!(rt.start("blocked", "workflow", json!({})).unwrap_err().is::<ouro_runtime::control::Stopped>());
+        assert_eq!(rt.recover_once(&token).await.unwrap(), 0);
+        control.emergency_stop(&operator("clear"), false).unwrap();
+        let outcome = rt.drive("r", &token).await.unwrap();
+        if delivery == Delivery::AtLeastOnce {
+            assert!(matches!(outcome, Some(Status::Completed(_))));
+            assert_eq!((first.load(Ordering::SeqCst), second.load(Ordering::SeqCst)), (2, 1));
+        } else {
+            assert!(matches!(outcome, Some(Status::Faulted(_))));
+            assert_eq!((first.load(Ordering::SeqCst), second.load(Ordering::SeqCst)), (1, 0));
+            assert_eq!(rt.calls("r").unwrap()[0].state, CallStatus::Unknown);
+        }
+    }
+}
+
+#[tokio::test]
+async fn attributed_in_process_cancel_fires_the_token_synchronously() {
+    use ouro_runtime::control::{Command, Reply};
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let token = Arc::new(Mutex::new(None));
+    let mut registry = Registry::new();
+    let observed = token.clone();
+    let ready = entered.clone();
+    registry
+        .register(Function::new("hold", json!({}), json!({}), move |_: Value, ctx: FunctionContext| {
+            *observed.lock().unwrap() = Some(ctx.cancel.clone());
+            ready.notify_one();
+            async move {
+                ctx.cancel.cancelled().await;
+                Ok(json!({}))
+            }
+        }))
+        .unwrap();
+    let rt = runtime(Arc::new(durable::memory::memory()), registry, Arc::new(Time::default()));
+    save(&rt, &yaml("  - hold: { call: hold }"));
+    rt.start("r", "workflow", Value::Null).unwrap();
+    let stop = CancellationToken::new();
+    let cancel = async {
+        entered.notified().await;
+        assert_eq!(
+            rt.control(&operator("cancel"), &Command::Cancel { run: "r".into() }).unwrap(),
+            Reply::Changed(true)
+        );
+        assert!(token.lock().unwrap().as_ref().unwrap().is_cancelled());
+    };
+    let (result, ()) = tokio::join!(rt.drive("r", &stop), cancel);
+    assert_eq!(result.unwrap(), Some(Status::Cancelled));
+}
+
+#[tokio::test]
+async fn operator_answers_respect_enclosing_workflow_and_task_deadlines() {
+    use ouro_runtime::control::{Control, Waits};
+    for workflow_timeout in [false, true] {
+        let store = Arc::new(durable::memory::memory());
+        let clock = Arc::new(Time::default());
+        let rt = runtime(store.clone(), Registry::new(), clock.clone());
+        let definition = if workflow_timeout {
+            yaml("  - decision: { listen: { to: { any: [] } } }").replace("\ndo:", "\ntimeout: { after: PT1S }\ndo:")
+        } else {
+            yaml(
+                "  - enclosing:\n      timeout: { after: PT1S }\n      do:\n        - decision: { listen: { to: { any: [] } } }",
+            )
+        };
+        save(&rt, &definition);
+        rt.start("r", "workflow", Value::Null).unwrap();
+        assert!(matches!(rt.drive("r", &CancellationToken::new()).await.unwrap(), Some(Status::Waiting { .. })));
+        let control = Control::new(store, clock.clone());
+        let wait = control.waits(&Waits::default(), None, 10).unwrap().items.pop().unwrap();
+        assert_eq!(wait.waiting.timeout_ms, Some(1000));
+        clock.0.store(1000, Ordering::SeqCst);
+        assert!(
+            control
+                .respond(&operator("late"), "r", &wait.key, json!({"source":"/operator", "id":"late", "type":"answer"}))
+                .is_err()
+        );
+    }
+}

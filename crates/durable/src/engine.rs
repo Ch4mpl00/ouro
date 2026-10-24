@@ -50,6 +50,9 @@ struct StoredRun {
     awaits: BTreeMap<String, i64>,
     listeners: BTreeMap<String, Vec<String>>,
     subscriptions: BTreeMap<String, Vec<String>>,
+    waits: BTreeMap<String, owf::events::PendingWait>,
+    budget_ended: Option<u64>,
+    addressed_waits: std::collections::BTreeSet<String>,
     /// The rearm a firing attached and the trigger that firing stored: a
     /// trigger that differs at the run's end was replaced (a later epoch).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -110,7 +113,7 @@ fn run(rows: &mut dyn Transaction, id: &str) -> anyhow::Result<StoredRun> {
 /// The layout version of a `definitions` row. The earlier layout (none: it
 /// kept a predecessor and its triggers for a breaker rollback, and a boolean
 /// trip) is refused, never read as a definition that cannot be tripped.
-const DEFINITIONS_VERSION: u64 = 2;
+const DEFINITIONS_VERSION: u64 = 3;
 fn load_definitions(rows: &mut dyn Transaction, name: &str) -> anyhow::Result<Option<Definitions>> {
     let Some(mut value) = rows.get("definitions", name)? else { return Ok(None) };
     let version = value.as_object_mut().and_then(|m| m.remove("version")).and_then(|v| v.as_u64());
@@ -214,6 +217,30 @@ fn indexes(s: &StoredRun) -> Rows {
     let id = &s.run.admission.id;
     let value = json!(id);
     keys.insert(key(&partition("name", &s.run.admission.name), id), value.clone());
+    let started = timed(s.run.admitted_ms, id);
+    for kind in run_kinds(&s.run, false) {
+        keys.insert(key(&kind, &started), value.clone());
+    }
+    if let Some(at) = s.run.ended_ms {
+        for kind in run_kinds(&s.run, true) {
+            keys.insert(key(&kind, &timed(at, id)), value.clone());
+        }
+    }
+    if let Some(link) = &s.run.child {
+        keys.insert(key(&partition("control_parent", &link.parent), &started), value.clone());
+    }
+    for (k, w) in &s.waits {
+        let entry = control::Wait {
+            run: id.clone(),
+            definition: s.run.admission.name.clone(),
+            key: k.clone(),
+            waiting: w.clone(),
+        };
+        let index = timed(w.since_ms, &format!("{}:{}", component(id), component(k)));
+        for kind in wait_kinds(&entry) {
+            keys.insert(key(&kind, &index), serde_json::to_value(&entry).expect("wait serializes"));
+        }
+    }
     if s.run.ended_ms.is_none() {
         keys.insert(key(&partition("live_name", &s.run.admission.name), id), value.clone());
         if let Some(trigger) = &s.trigger {
@@ -231,7 +258,12 @@ fn indexes(s: &StoredRun) -> Rows {
             keys.insert(key(&partition("children", &link.parent), id), value.clone());
         }
         for (t, at) in &s.awaits {
-            if !s.pending.contains_key(t) {
+            // Child waiting notifications are addressed internally. Their
+            // automatic registration needs no competing-delivery index until
+            // an explicit listen registers that type.
+            let internal =
+                t.strip_prefix("waiting:").is_some_and(|id| s.listeners.contains_key(&format!("child:{id}")));
+            if !s.pending.contains_key(t) && (!internal || s.addressed_waits.contains(t)) {
                 keys.insert(key(&partition("wait", t), &timed(*at, id)), value.clone());
             }
         }
@@ -283,7 +315,7 @@ fn indexed_runs(
 
 /// The current owner's authority: it acts only while its lease has more
 /// than the skew bound left, so no other worker can have taken over yet.
-fn checked(rows: &mut dyn Transaction, fence: &Fence, now: i64, skew: i64) -> anyhow::Result<StoredRun> {
+fn authority(rows: &mut dyn Transaction, fence: &Fence, now: i64, skew: i64) -> anyhow::Result<StoredRun> {
     let snapshot = run(rows, &fence.run_id)?;
     anyhow::ensure!(
         snapshot.run.state == RunState::Running
@@ -293,6 +325,19 @@ fn checked(rows: &mut dyn Transaction, fence: &Fence, now: i64, skew: i64) -> an
         fence.run_id
     );
     Ok(snapshot)
+}
+fn is_stopped(rows: &mut dyn Transaction) -> anyhow::Result<bool> {
+    Ok(get::<bool>(rows, "control", "stopped")?.unwrap_or(false))
+}
+fn running(rows: &mut dyn Transaction) -> anyhow::Result<()> {
+    if is_stopped(rows)? {
+        return Err(control::Stopped.into());
+    }
+    Ok(())
+}
+fn checked(rows: &mut dyn Transaction, fence: &Fence, now: i64, skew: i64) -> anyhow::Result<StoredRun> {
+    running(rows)?;
+    authority(rows, fence, now, skew)
 }
 fn claimable(r: &SavedRun, now: i64) -> bool {
     match r.state {
@@ -326,6 +371,7 @@ fn admitted(rows: &mut dyn Transaction, admission: &Admission, now: i64) -> anyh
         anyhow::ensure!(existing.run.admission.name == admission.name, "run already belongs to another definition");
         return Ok(None);
     }
+    running(rows)?;
     let defs = load_definitions(rows, &admission.name)?;
     if let Some(trip) = defs.as_ref().and_then(|d| d.tripped.as_ref()) {
         return Err(trip.refusal(&admission.name).into());
@@ -351,6 +397,9 @@ fn admitted(rows: &mut dyn Transaction, admission: &Admission, now: i64) -> anyh
         awaits: BTreeMap::new(),
         listeners: BTreeMap::new(),
         subscriptions: BTreeMap::new(),
+        waits: BTreeMap::new(),
+        budget_ended: None,
+        addressed_waits: Default::default(),
         rearm: None,
         trigger: None,
         accepted: 0,
@@ -377,6 +426,7 @@ fn close(snapshot: &mut StoredRun, types: &[String]) {
     for t in types {
         if !snapshot.listeners.values().any(|types| types.contains(t)) {
             snapshot.awaits.remove(t);
+            snapshot.addressed_waits.remove(t);
         }
     }
 }
@@ -757,6 +807,12 @@ fn admit_firing(
     put(rows, "trigger_run", k, &a.id)
 }
 fn drain_queues(rows: &mut dyn Transaction, name: &str, now: i64) -> anyhow::Result<()> {
+    if is_stopped(rows)? {
+        if !rows.scan(&partition("queue_name", name), "", None, 1)?.is_empty() {
+            put(rows, "control_drain", name, &true)?;
+        }
+        return Ok(());
+    }
     for ((_, k), _) in rows.scan(&partition("queue_name", name), "", None, usize::MAX)? {
         let Some(q) = queued(rows, &k)? else {
             // A prior promotion in this batch may trip and disarm the
@@ -776,6 +832,14 @@ fn drain_queues(rows: &mut dyn Transaction, name: &str, now: i64) -> anyhow::Res
         } else {
             admit_firing(rows, &k, &q.admission, q.rearm.as_ref(), Some(&t), now)?;
         }
+    }
+    Ok(())
+}
+
+fn drain_pending(rows: &mut dyn Transaction, now: i64, limit: usize) -> anyhow::Result<()> {
+    for ((_, name), _) in rows.scan("control_drain", "", None, limit)? {
+        rows.delete("control_drain", &name)?;
+        drain_queues(rows, &name, now)?;
     }
     Ok(())
 }
@@ -858,6 +922,9 @@ fn tombstone(rows: &mut dyn Transaction, event: &Value, now: i64) -> anyhow::Res
     Ok((k, stored, used))
 }
 fn fire(rows: &mut dyn Transaction, f: &Firing<'_>, now: i64, policy: &Policy) -> anyhow::Result<Fired> {
+    if is_stopped(rows)? {
+        return Ok(Fired::Changed);
+    }
     anyhow::ensure!(f.refused.is_none() || f.admit.is_empty(), "a firing admits its runs or records a refusal");
     let current: Option<Trigger> = get(rows, "trigger", f.key)?;
     if current.as_ref() != f.expected {
@@ -958,12 +1025,13 @@ fn activate(
     if epoch.is_some_and(|e| e != defs.epoch) {
         return Ok(None);
     }
-    // The only transition that starts an epoch and the only one that clears
-    // a trip. A trip's notice stays until the host acknowledges it.
+    // Only activation starts an epoch and clears an automatic trip. Manual
+    // pauses can resume in place; notices stay until the host acknowledges them.
     defs.active = Some(version);
     defs.epoch = defs.epoch.checked_add(1).ok_or_else(|| anyhow::anyhow!("activation epoch overflow"))?;
     defs.consecutive_faults = 0;
     defs.tripped = None;
+    rows.delete("paused", name)?;
     arm(rows, &mut defs, &arming.triggers)?;
     store_definitions(rows, name, &defs)?;
     Ok(Some(defs))
@@ -986,10 +1054,24 @@ fn lifecycle(rows: &mut dyn Transaction, id: &str, status: &Status, now: i64) ->
     if kind == "done" && rows.get(&types_of(&link.parent), &component(&t))?.is_some() {
         return Ok(());
     }
+    if kind == "done" {
+        // A terminal child can never report waiting again. Close the automatic
+        // registration, while retaining any explicit listen for that type.
+        let mut parent = run(rows, &link.parent)?;
+        let waiting = format!("waiting:{id}");
+        let had = parent.awaits.contains_key(&waiting);
+        close(&mut parent, std::slice::from_ref(&waiting));
+        if had && !parent.awaits.contains_key(&waiting) {
+            store_run(rows, &parent)?;
+        }
+    }
     notify(rows, &link.parent, &t, &data, now)
 }
 fn terminate(rows: &mut dyn Transaction, id: &str, status: &Status, now: i64) -> anyhow::Result<()> {
     let mut snapshot = run(rows, id)?;
+    let root = snapshot.run.root.as_deref().unwrap_or(id);
+    let spent: u64 = get(rows, "budget", root)?.unwrap_or(0);
+    snapshot.budget_ended = Some(spent);
     snapshot.run.state = match status {
         Status::Completed(_) => RunState::Completed,
         Status::Faulted(_) => RunState::Failed,
@@ -1000,8 +1082,10 @@ fn terminate(rows: &mut dyn Transaction, id: &str, status: &Status, now: i64) ->
     snapshot.run.fence = None;
     snapshot.run.lease_until_ms = None;
     snapshot.awaits.clear();
+    snapshot.addressed_waits.clear();
     snapshot.listeners.clear();
     snapshot.subscriptions.clear();
+    snapshot.waits.clear();
     store_run(rows, &snapshot)?;
     // The tree ends with its root (its owned descendants are cancelled
     // below, in this commit): nothing can spend its budget any more.
@@ -1026,15 +1110,18 @@ fn terminate(rows: &mut dyn Transaction, id: &str, status: &Status, now: i64) ->
             // The indexed read already holds this child's primary row in
             // the transaction; reuse its indexes instead of reading it twice.
             let before = indexes(&child);
+            child.budget_ended = Some(spent);
             child.run.state = RunState::Cancelled;
             child.run.outcome = Some(Status::Cancelled);
             child.run.ended_ms = Some(now);
             child.run.fence = None;
             child.run.lease_until_ms = None;
             child.awaits.clear();
+            child.addressed_waits.clear();
             child.listeners.clear();
             child.subscriptions.clear();
             names.insert(child.run.admission.name.clone());
+            child.waits.clear();
             parents.push(child.run.admission.id.clone());
             store_run_indexed(rows, &child, &before)?;
             lifecycle(rows, &child.run.admission.id, &Status::Cancelled, now)?;
@@ -1085,6 +1172,7 @@ fn breaker(
             let threshold = threshold.max(1);
             if defs.consecutive_faults >= threshold {
                 let trip = Trip {
+                    manual: None,
                     version: run.admission.version,
                     epoch: defs.epoch,
                     faults: defs.consecutive_faults,
@@ -1106,6 +1194,114 @@ fn breaker(
 // ── 6. the RunStore implementation ─────────────────────────────────────────
 
 impl RunStore for TransactionalStore {
+    fn control(
+        &self,
+        request: &control::Request,
+        command: &control::Command,
+        now: i64,
+    ) -> anyhow::Result<control::Reply> {
+        self.update(|rows| control_command(rows, request, command, now, &self.policy))
+    }
+    fn stopped(&self) -> anyhow::Result<bool> {
+        self.update(is_stopped)
+    }
+    fn control_entry(&self, id: &str) -> anyhow::Result<Option<control::Entry>> {
+        self.update(|rows| get(rows, "control_command", id))
+    }
+    fn control_history(
+        &self,
+        run: Option<&str>,
+        cursor: Option<&control::Cursor>,
+        limit: usize,
+    ) -> anyhow::Result<control::Page<control::Entry>> {
+        self.update(|rows| {
+            let kind = run.map_or_else(|| "control_history".into(), |r| partition("control_history_run", r));
+            let (found, next) = page_rows(rows, &kind, &kind, None, None, cursor, limit)?;
+            let items = found.into_values().map(|v| Ok(serde_json::from_value(v)?)).collect::<anyhow::Result<_>>()?;
+            Ok(control::Page { items, next })
+        })
+    }
+    fn query_runs(
+        &self,
+        filter: &control::Runs,
+        history: bool,
+        cursor: Option<&control::Cursor>,
+        limit: usize,
+    ) -> anyhow::Result<control::Page<SavedRun>> {
+        self.update(|rows| query_runs(rows, filter, history, cursor, limit))
+    }
+    fn pending_waits(
+        &self,
+        f: &control::Waits,
+        cursor: Option<&control::Cursor>,
+        limit: usize,
+    ) -> anyhow::Result<control::Page<control::Wait>> {
+        self.update(|rows| {
+            let query = serde_json::to_string(&("waits", f))?;
+            let (found, next) = page_rows(rows, &wait_kind(f), &query, f.since_ms, f.before_ms, cursor, limit)?;
+            let mut items = Vec::new();
+            for v in found.into_values() {
+                let w: control::Wait = serde_json::from_value(v)?;
+                if f.definition.as_ref().is_none_or(|d| *d == w.definition)
+                    && f.run.as_ref().is_none_or(|r| *r == w.run)
+                    && f.event_type.as_ref().is_none_or(|t| w.waiting.types.contains(t))
+                {
+                    items.push(w);
+                }
+            }
+            Ok(control::Page { items, next })
+        })
+    }
+    fn describe_wait(&self, f: &Fence, k: &str, wait: &owf::events::PendingWait, now: i64) -> anyhow::Result<()> {
+        self.update(|rows| {
+            let mut s = checked(rows, f, now, self.policy.skew_ms)?;
+            let mut wait = wait.clone();
+            if let Some(old) = s.waits.get(k) {
+                wait.since_ms = old.since_ms;
+            }
+            if s.waits.get(k) != Some(&wait) {
+                s.waits.insert(k.into(), wait);
+                store_run(rows, &s)?;
+            }
+            Ok(())
+        })
+    }
+    fn inspect_control(&self, id: &str) -> anyhow::Result<Option<control::Inspection>> {
+        self.update(|rows| {
+            let Some(s) = find_run(rows, id)? else {
+                return Ok(None);
+            };
+            let waits = s.waits.clone();
+            let root = s.run.root.as_deref().unwrap_or(id);
+            let budget_spent = match s.budget_ended {
+                Some(spent) => spent,
+                None => get::<u64>(rows, "budget", root)?.unwrap_or(0),
+            };
+            let children = indexed_runs(rows, &partition("control_parent", id), "", None, usize::MAX)?
+                .into_iter()
+                .map(|s| s.run)
+                .collect();
+            let runtime = &s.run.admission.runtime;
+            let budget_limit = runtime["limits"]["max_jumps"].as_u64().map(|host| {
+                owf::model::parse_yaml(&s.run.admission.definition).map_or(host, |w| w.budget.max_jumps(host))
+            });
+            let trace_id = runtime["trace_id"].as_str().map(str::to_owned);
+            let span_id = runtime["span_id"].as_str().map(str::to_owned);
+            let snapshot = snapshot(rows, s)?;
+            let calls = owf::durable::call_journal(&snapshot.records);
+            Ok(Some(control::Inspection {
+                snapshot,
+                calls,
+                waits,
+                children,
+                budget_spent,
+                budget_limit,
+                trace_id,
+                span_id,
+            }))
+        })
+    }
+
     fn policy(&self) -> Policy {
         self.policy
     }
@@ -1115,10 +1311,9 @@ impl RunStore for TransactionalStore {
     fn start(&self, a: &Admission, now: i64) -> anyhow::Result<Option<Fence>> {
         let owner = uuid::Uuid::new_v4().to_string();
         self.update(|rows| {
-            if !insert(rows, a, now)? {
+            let Some(mut s) = admitted(rows, a, now)? else {
                 return Ok(None);
-            }
-            let mut s = run(rows, &a.id)?;
+            };
             let fence = claim_run(&mut s, now, &owner)?;
             store_run(rows, &s)?;
             Ok(Some(fence))
@@ -1127,6 +1322,9 @@ impl RunStore for TransactionalStore {
     fn claim_as(&self, id: &str, now: i64, worker: &Compatibility) -> anyhow::Result<Option<Fence>> {
         let owner = uuid::Uuid::new_v4().to_string();
         self.update(|rows| {
+            if is_stopped(rows)? {
+                return Ok(None);
+            }
             let Some(mut s) = find_run(rows, id)? else {
                 return Ok(None);
             };
@@ -1138,6 +1336,9 @@ impl RunStore for TransactionalStore {
             Ok(Some(fence))
         })
     }
+    fn check_lease(&self, f: &Fence, now: i64) -> anyhow::Result<()> {
+        self.update(|rows| checked(rows, f, now, self.policy.skew_ms).map(|_| ()))
+    }
     fn renew(&self, f: &Fence, now: i64) -> anyhow::Result<()> {
         self.update(|rows| {
             let mut s = checked(rows, f, now, self.policy.skew_ms)?;
@@ -1147,7 +1348,7 @@ impl RunStore for TransactionalStore {
     }
     fn release(&self, f: &Fence, now: i64) -> anyhow::Result<()> {
         self.update(|rows| {
-            let mut s = checked(rows, f, now, self.policy.skew_ms)?;
+            let mut s = authority(rows, f, now, self.policy.skew_ms)?;
             s.run.state = RunState::Ready;
             s.run.fence = None;
             s.run.lease_until_ms = None;
@@ -1199,6 +1400,7 @@ impl RunStore for TransactionalStore {
         self.update(|rows| {
             let mut s = checked(rows, f, now, self.policy.skew_ms)?;
             for t in types {
+                s.addressed_waits.insert(t.clone());
                 s.awaits.entry(t.clone()).or_insert(now);
             }
             store_run(rows, &s)
@@ -1253,6 +1455,7 @@ impl RunStore for TransactionalStore {
                     refresh_mailbox(rows, &mut s)?;
                 }
                 s.listeners.remove(k);
+                s.waits.retain(|_, w| w.position != k);
                 close(&mut s, types);
                 put(rows, &records_of(id), k, &Record::Event { event: event.clone() })?;
                 Some(event)
@@ -1275,6 +1478,7 @@ impl RunStore for TransactionalStore {
         self.update(|rows| {
             let mut s = checked(rows, f, now, self.policy.skew_ms)?;
             s.subscriptions.remove(k);
+            s.waits.remove(k);
             store_run(rows, &s)
         })
     }
@@ -1289,12 +1493,18 @@ impl RunStore for TransactionalStore {
     }
     fn due_triggers(&self, now: i64, limit: usize) -> anyhow::Result<Vec<(String, Trigger)>> {
         self.update(|rows| {
+            if is_stopped(rows)? {
+                return Ok(Vec::new());
+            }
             let keys = rows.scan("trigger_due", "", Some(&until(now)), limit)?;
             indexed_triggers(rows, keys)
         })
     }
     fn triggers_for(&self, t: &str, limit: usize) -> anyhow::Result<Vec<(String, Trigger)>> {
         self.update(|rows| {
+            if is_stopped(rows)? {
+                return Ok(Vec::new());
+            }
             let mut keys = rows.scan(&partition("trigger_type", t), "", None, limit)?;
             if t != "*" && keys.len() < limit {
                 keys.extend(rows.scan(&partition("trigger_type", "*"), "", None, limit - keys.len())?);
@@ -1369,8 +1579,12 @@ impl RunStore for TransactionalStore {
             }
             p.listeners.insert(format!("child:{}", a.id), vec![format!("done:{}", a.id)]);
             store_run(rows, &p)?;
-            let inserted = insert(rows, a, now)?;
-            let mut c = run(rows, &a.id)?;
+            let fresh = admitted(rows, a, now)?;
+            let inserted = fresh.is_some();
+            let mut c = match fresh {
+                Some(c) => c,
+                None => run(rows, &a.id)?,
+            };
             if inserted {
                 c.run.child = Some(link.clone());
                 c.run.root = Some(p.run.root.clone().unwrap_or_else(|| parent.run_id.clone()));
@@ -1442,6 +1656,10 @@ impl RunStore for TransactionalStore {
     }
     fn due_as(&self, now: i64, limit: usize, worker: &Compatibility) -> anyhow::Result<Vec<String>> {
         self.update(|rows| {
+            if is_stopped(rows)? {
+                return Ok(Vec::new());
+            }
+            drain_pending(rows, now, limit)?;
             let Some(own) = &worker.version else {
                 return rows
                     .scan("due", "", Some(&until(now)), limit)?
@@ -1520,24 +1738,7 @@ impl RunStore for TransactionalStore {
             let Some(s) = find_run(rows, id)? else {
                 return Ok(None);
             };
-            let records = rows
-                .scan(&records_of(id), "", None, usize::MAX)?
-                .into_iter()
-                .map(|((_, k), v)| Ok((k, serde_json::from_value(v)?)))
-                .collect::<anyhow::Result<_>>()?;
-            let events = rows
-                .scan(&events_of(id), "", None, usize::MAX)?
-                .into_values()
-                .map(|v| Ok(serde_json::from_value(v)?))
-                .collect::<anyhow::Result<_>>()?;
-            Ok(Some(RunSnapshot {
-                run: s.run,
-                records,
-                awaits: s.awaits,
-                listeners: s.listeners,
-                events,
-                subscriptions: s.subscriptions,
-            }))
+            Ok(Some(snapshot(rows, s)?))
         })
     }
 
@@ -1583,4 +1784,309 @@ impl RunStore for TransactionalStore {
             Ok(true)
         })
     }
+}
+
+// ── 7. operator commands and bounded indexes ──────────────────────────────
+
+fn run_kinds(r: &SavedRun, history: bool) -> Vec<String> {
+    let base = if history { "control_end" } else { "control_run" };
+    let name = partition(base, &r.admission.name);
+    let kinds = vec![base.into(), name];
+    kinds
+}
+fn run_kind(filter: &control::Runs, history: bool) -> String {
+    if !history && let Some(parent) = &filter.parent {
+        return partition("control_parent", parent);
+    }
+    let base = if history { "control_end" } else { "control_run" };
+    filter.definition.as_ref().map_or_else(|| base.into(), |d| partition(base, d))
+}
+fn wait_kinds(w: &control::Wait) -> Vec<String> {
+    let name = partition("control_wait_definition", &w.definition);
+    let mut kinds = vec!["control_wait".into(), name.clone(), partition("control_wait_run", &w.run)];
+    for t in &w.waiting.types {
+        kinds.push(partition("control_wait_type", t));
+        kinds.push(format!("{name}:type:{}", component(t)));
+    }
+    kinds.sort();
+    kinds.dedup();
+    kinds
+}
+fn wait_kind(f: &control::Waits) -> String {
+    if let Some(r) = &f.run {
+        return partition("control_wait_run", r);
+    }
+    let name = f.definition.as_ref().map(|d| partition("control_wait_definition", d));
+    match (name, &f.event_type) {
+        (Some(n), Some(t)) => format!("{n}:type:{}", component(t)),
+        (Some(n), None) => n,
+        (None, Some(t)) => partition("control_wait_type", t),
+        (None, None) => "control_wait".into(),
+    }
+}
+fn page_rows(
+    rows: &mut dyn Transaction,
+    kind: &str,
+    query: &str,
+    since: Option<i64>,
+    before: Option<i64>,
+    cursor: Option<&control::Cursor>,
+    limit: usize,
+) -> anyhow::Result<(Rows, Option<control::Cursor>)> {
+    anyhow::ensure!((1..=control::MAX_PAGE).contains(&limit), "page limit must be 1..={}", control::MAX_PAGE);
+    anyhow::ensure!(since.zip(before).is_none_or(|(a, b)| a <= b), "invalid time window");
+    let start = match cursor {
+        Some(c) => {
+            anyhow::ensure!(c.query == query, "cursor belongs to another query");
+            c.after.clone()
+        }
+        None => since.map_or_else(String::new, time_key),
+    };
+    let end = before.map(time_key);
+    if end.as_ref().is_some_and(|end| start >= *end) {
+        return Ok((Rows::new(), None));
+    }
+    let found = rows.scan(kind, &start, end.as_deref(), limit + usize::from(cursor.is_some()))?;
+    let found: Rows = found.into_iter().filter(|((_, k), _)| cursor.is_none_or(|c| *k > c.after)).take(limit).collect();
+    let next = if found.len() == limit {
+        found.last_key_value().map(|((_, k), _)| control::Cursor { query: query.into(), after: k.clone() })
+    } else {
+        None
+    };
+    Ok((found, next))
+}
+fn query_runs(
+    rows: &mut dyn Transaction,
+    f: &control::Runs,
+    history: bool,
+    cursor: Option<&control::Cursor>,
+    limit: usize,
+) -> anyhow::Result<control::Page<SavedRun>> {
+    let query = serde_json::to_string(&("runs", f, history))?;
+    let kind = run_kind(f, history);
+    let (found, next) = page_rows(rows, &kind, &query, f.since_ms, f.before_ms, cursor, limit)?;
+    let mut items = Vec::new();
+    for v in found.into_values() {
+        let id = v.as_str().ok_or_else(|| anyhow::anyhow!("invalid control run index"))?;
+        let r = run(rows, id)?.run;
+        if f.definition.as_ref().is_none_or(|d| *d == r.admission.name)
+            && f.state.as_ref().is_none_or(|state| *state == r.state)
+            && f.parent.as_ref().is_none_or(|p| r.child.as_ref().is_some_and(|c| c.parent == *p))
+        {
+            items.push(r);
+        }
+    }
+    Ok(control::Page { items, next })
+}
+fn suspend(rows: &mut dyn Transaction, name: &str, defs: &mut Definitions) -> anyhow::Result<()> {
+    let mut triggers = BTreeMap::new();
+    let mut queues = BTreeMap::new();
+    for k in &defs.triggers {
+        if let Some(t) = get(rows, "trigger", k)? {
+            triggers.insert(k.clone(), t);
+        }
+        if let Some(queue) = rows.get("trigger_queue", k)? {
+            queues.insert(k.clone(), queue);
+        }
+    }
+    put(rows, "paused", name, &control::Paused { epoch: defs.epoch, triggers, queues })?;
+    arm(rows, defs, &BTreeMap::new())
+}
+fn normalize_command(command: &control::Command) -> control::Command {
+    match command {
+        control::Command::Respond { run, wait, event } => {
+            let mut event = payload(event);
+            if let Value::Object(m) = &mut event {
+                m.entry("specversion").or_insert(json!("1.0"));
+            }
+            control::Command::Respond { run: run.clone(), wait: wait.clone(), event }
+        }
+        c => c.clone(),
+    }
+}
+fn control_command(
+    rows: &mut dyn Transaction,
+    request: &control::Request,
+    command: &control::Command,
+    now: i64,
+    policy: &Policy,
+) -> anyhow::Result<control::Reply> {
+    use control::{Command, Reply};
+    anyhow::ensure!(
+        !request.id.trim().is_empty() && !request.actor.trim().is_empty() && !request.reason.trim().is_empty(),
+        "control request requires id, actor and reason"
+    );
+    let canonical = normalize_command(command);
+    if let Some(entry) = get::<control::Entry>(rows, "control_command", &request.id)? {
+        anyhow::ensure!(entry.request == *request && entry.command == canonical, "control request identity conflict");
+        return Ok(entry.reply);
+    }
+    let reply = match command {
+        Command::Cancel { run: id } => {
+            let changed = find_run(rows, id)?.is_some_and(|s| s.run.ended_ms.is_none());
+            if changed {
+                terminate(rows, id, &Status::Cancelled, now)?;
+            }
+            Reply::Changed(changed)
+        }
+        Command::Stop { enabled } => {
+            let changed = is_stopped(rows)? != *enabled;
+            if changed {
+                if *enabled {
+                    put(rows, "control", "stopped", enabled)?;
+                } else {
+                    rows.delete("control", "stopped")?;
+                    drain_pending(rows, now, control::MAX_PAGE)?;
+                }
+            }
+            Reply::Changed(changed)
+        }
+        Command::Pause { definition: name, note } => {
+            let mut defs = load_definitions(rows, name)?.ok_or_else(|| anyhow::anyhow!("unknown definition"))?;
+            let changed = defs.tripped.is_none();
+            if changed {
+                let version = defs.active.ok_or_else(|| anyhow::anyhow!("definition has no active version"))?;
+                suspend(rows, name, &mut defs)?;
+                defs.tripped = Some(Trip {
+                    manual: Some(control::ManualTrip {
+                        actor: request.actor.clone(),
+                        reason: request.reason.clone(),
+                        note: note.clone(),
+                    }),
+                    version,
+                    epoch: defs.epoch,
+                    faults: defs.consecutive_faults,
+                    threshold: 0,
+                    run: String::new(),
+                    reason: WorkflowError {
+                        type_: "manual".into(),
+                        status: 409,
+                        title: Some("Definition paused".into()),
+                        detail: Some(request.reason.clone()),
+                        instance: None,
+                    },
+                    at_ms: now,
+                });
+                store_definitions(rows, name, &defs)?;
+            }
+            Reply::Changed(changed)
+        }
+        Command::Resume { definition: name } => {
+            let mut defs = load_definitions(rows, name)?.ok_or_else(|| anyhow::anyhow!("unknown definition"))?;
+            anyhow::ensure!(
+                defs.tripped.as_ref().is_none_or(|t| t.manual.is_some()),
+                "a breaker trip requires activation"
+            );
+            let changed = defs.tripped.is_some();
+            if changed {
+                let paused: control::Paused =
+                    get(rows, "paused", name)?.ok_or_else(|| anyhow::anyhow!("missing suspended triggers"))?;
+                anyhow::ensure!(paused.epoch == defs.epoch, "suspended activation changed");
+                defs.tripped = None;
+                arm(rows, &mut defs, &paused.triggers)?;
+                for (key, value) in &paused.queues {
+                    let q: Queued = serde_json::from_value(value.clone())?;
+                    anyhow::ensure!(q.version == 1 && q.admission.name == *name, "invalid suspended queue");
+                    rows.put("trigger_queue", key, value)?;
+                    put(rows, &partition("queue_name", name), key, key)?;
+                }
+                rows.delete("paused", name)?;
+                store_definitions(rows, name, &defs)?;
+                drain_queues(rows, name, now)?;
+            }
+            Reply::Changed(changed)
+        }
+        Command::Respond { run: id, wait: key, event } => {
+            let identity = identity(event).ok_or_else(|| anyhow::anyhow!("response requires event source and id"))?;
+            let kind = partition("control_response", id);
+            let dedup = component(&identity);
+            if let Some(entry) = get::<control::Entry>(rows, &kind, &dedup)? {
+                anyhow::ensure!(entry.command == canonical, "response event identity conflict");
+                entry.reply
+            } else {
+                let s = run(rows, id)?;
+                let w = s.waits.get(key).ok_or_else(|| anyhow::anyhow!("wait is no longer pending"))?;
+                anyhow::ensure!(
+                    s.run.ended_ms.is_none() && w.timeout_ms.is_none_or(|at| now < at),
+                    "wait ended or timed out"
+                );
+                let mut event = event.clone();
+                if let Value::Object(m) = &mut event {
+                    m.entry("specversion").or_insert(json!("1.0"));
+                    let time = chrono::DateTime::from_timestamp_millis(now)
+                        .ok_or_else(|| anyhow::anyhow!("invalid response timestamp"))?
+                        .to_rfc3339();
+                    m.entry("time").or_insert(json!(time));
+                }
+                anyhow::ensure!(w.accepts(&event).map_err(anyhow::Error::msg)?, "event does not match wait");
+                let result = Reply::Responded(deliver(rows, &event, Some(id), now, policy)?);
+                let sequence: u64 = get(rows, &identities_of(id), &dedup)?
+                    .ok_or_else(|| anyhow::anyhow!("response was not accepted"))?;
+                // A validated answer is also offered to a wildcard listen.
+                // Ordinary addressed deliveries retain their type-only routing.
+                if w.types.iter().any(|t| t == "*") {
+                    let mut stored = copy(rows, id, sequence)?;
+                    anyhow::ensure!(stored.consumed_key.is_none(), "response event already consumed by another wait");
+                    if stored.delivered {
+                        stored.delivered = false;
+                        let mut current = run(rows, id)?;
+                        current.run.wake_at_ms = current.run.wake_at_ms.min(now);
+                        current.published = current
+                            .published
+                            .checked_add(1)
+                            .ok_or_else(|| anyhow::anyhow!("published counter overflow"))?;
+                        put(rows, &events_of(id), &self::sequence(sequence), &stored)?;
+                        put(rows, &published_of(id), &self::sequence(sequence), &sequence)?;
+                        let live = stored.expires_at_ms.map_or_else(
+                            || format!("~:{}", self::sequence(sequence)),
+                            |at| timed(at, &self::sequence(sequence)),
+                        );
+                        put(rows, &live_published_of(id), &live, &sequence)?;
+                        store_run(rows, &current)?;
+                    }
+                }
+                put(
+                    rows,
+                    &kind,
+                    &dedup,
+                    &control::Entry {
+                        request: request.clone(),
+                        command: canonical.clone(),
+                        at_ms: now,
+                        reply: result.clone(),
+                    },
+                )?;
+                result
+            }
+        }
+    };
+    let entry = control::Entry { request: request.clone(), command: canonical, at_ms: now, reply: reply.clone() };
+    put(rows, "control_command", &request.id, &entry)?;
+    let k = timed(now, &component(&request.id));
+    put(rows, "control_history", &k, &entry)?;
+    if let Command::Cancel { run } | Command::Respond { run, .. } = command {
+        put(rows, &partition("control_history_run", run), &k, &entry)?;
+    }
+    Ok(reply)
+}
+
+fn snapshot(rows: &mut dyn Transaction, s: StoredRun) -> anyhow::Result<RunSnapshot> {
+    let records = rows
+        .scan(&records_of(&s.run.admission.id), "", None, usize::MAX)?
+        .into_iter()
+        .map(|((_, k), v)| Ok((k, serde_json::from_value(v)?)))
+        .collect::<anyhow::Result<_>>()?;
+    let events = rows
+        .scan(&events_of(&s.run.admission.id), "", None, usize::MAX)?
+        .into_values()
+        .map(|v| Ok(serde_json::from_value(v)?))
+        .collect::<anyhow::Result<_>>()?;
+    Ok(RunSnapshot {
+        run: s.run,
+        records,
+        awaits: s.awaits,
+        listeners: s.listeners,
+        events,
+        subscriptions: s.subscriptions,
+    })
 }

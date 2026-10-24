@@ -20,6 +20,7 @@ CALL = [op("intent"),op("dispatch"),op("result")]
 TICKS = [op("tick")]*4
 # Replacements affect transition mechanisms only, never the oracle formulas.
 MUTANTS = {
+ "S1": ('else if (s.db.stopped and Set(', 'else if (false and Set(', [op("stop",value=1),op("admit")]),
  "A1": ('Set("admit","dry","replay").contains(op) and value >= 0 and not(execution.admitted)', 'Set("admit","dry","replay").contains(op) and value >= 0', BOOT+[op("admit",value=1)]),
  "A2": ('val persisted = if (commits) proposed else before', 'val persisted = if (commits) { ...proposed,db:before.db } else before', [op("admit")]),
  "A3": ('else if (op == "renew" and authorized)', 'else if (op == "renew" and execution.outcome != 0) update(s,r,{ ...execution,outcome:1 })\n    else if (op == "renew" and authorized)', BOOT+[op("finish",value=1),op("renew")]),

@@ -34,6 +34,7 @@ fn bounded<T>(
 }
 fn bounds(backend: Arc<dyn AtomicBackend>, metrics: Arc<Metrics>, validation: u64) -> anyhow::Result<()> {
     support::seed(&backend, 10_000)?;
+    control_bounds(&backend, &metrics)?;
     decided(&backend, &metrics)?;
     overlap_bounds(&backend, &metrics)?;
     let s = TransactionalStore::new(backend.clone());
@@ -569,23 +570,25 @@ fn workers(
                 let mut completed = 0;
                 for n in 0..RUNS {
                     let id = format!("load:{n:04}");
-                    let Some(old) = s.claim(&id, 0)? else {
+                    let Some(old) = s.claim(&id, 0).map_err(|e| e.context(format!("initial claim of {id}")))? else {
                         continue;
                     };
                     let now = ouro_durable::LEASE_MS + 1;
-                    let f = s.claim(&id, now)?.unwrap();
+                    let f = s.claim(&id, now).map_err(|e| e.context(format!("recovery claim of {id}")))?.unwrap();
                     assert_eq!(f.generation, old.generation + 1);
                     assert!(s.save_record(&old, "stale", &Record::Timer { deadline_ms: 42 }, now).is_err());
                     assert!(s.renew(&old, now).is_err());
                     assert!(s.finish(&old, &Status::Completed(json!(0)), now, 3).is_err());
                     for k in ["one", "two", "three"] {
-                        s.save_record(&f, k, &Record::Timer { deadline_ms: 42 }, now)?;
+                        s.save_record(&f, k, &Record::Timer { deadline_ms: 42 }, now)
+                            .map_err(|e| e.context(format!("save {id}/{k}")))?;
                     }
                     let types = vec![format!("event:{id}")];
-                    s.register_wait(&f, &types, now)?;
+                    s.register_wait(&f, &types, now).map_err(|e| e.context(format!("register {id}")))?;
                     assert_eq!(s.deliver(&event(&id, &types[0], json!(n)), None, now)?, Some(id.clone()));
                     assert_eq!(s.take_event(&f, "event", &types, now)?.unwrap()["data"], json!(n));
-                    s.finish(&f, &Status::Faulted(WorkflowError::runtime("counted")), now, u32::MAX)?;
+                    s.finish(&f, &Status::Faulted(WorkflowError::runtime("counted")), now, u32::MAX)
+                        .map_err(|e| e.context(format!("finish {id}")))?;
                     completed += 1;
                 }
                 Ok(completed)
@@ -1025,4 +1028,160 @@ fn memory_transactions_validate_absence_ranges_and_independent_keys() {
     c.put("test", "0", &json!(0)).unwrap();
     c.commit().unwrap();
     assert!(a.commit().unwrap_err().is::<Conflict>());
+}
+
+fn control_bounds(backend: &Arc<dyn AtomicBackend>, metrics: &Metrics) -> anyhow::Result<()> {
+    use ouro_durable::{
+        conformance::control_wait,
+        control::{Command, Request, Runs, Waits},
+    };
+    let s = TransactionalStore::new(backend.clone());
+    let now = 2_000_000;
+    let mut a = admission("operator:root");
+    a.name = "operator".into();
+    s.save_definition("operator", "yaml")?;
+    s.activate("operator", 1)?;
+    let f = s.start(&a, now)?.unwrap();
+    bounded(metrics, "control_check_lease", 0, || s.check_lease(&f, now))?;
+    let mut child = a.clone();
+    child.id = "operator:child".into();
+    s.start_child(
+        &f,
+        &child,
+        &ouro_durable::ChildLink { parent: a.id.clone(), key: "child".into(), reference: "child".into() },
+        now,
+    )?;
+    let req = |id: &str| Request { id: id.into(), actor: "operator".into(), reason: "row bounds".into() };
+    let mut w = control_wait();
+    w.since_ms = now;
+    w.timeout_ms = Some(now + 100);
+    bounded(metrics, "control_describe_wait", 2, || s.describe_wait(&f, "listen", &w, now))?;
+    bounded(metrics, "control_describe_wait_retry", 2, || s.describe_wait(&f, "listen", &w, now))?;
+    let filter = Runs { definition: Some("operator".into()), ..Runs::default() };
+    for (label, f) in [
+        ("control_list_definition", filter.clone()),
+        ("control_list_state", Runs { state: Some(RunState::Running), ..filter.clone() }),
+        ("control_list_parent", Runs { parent: Some(a.id.clone()), ..filter.clone() }),
+        ("control_list_age", Runs { since_ms: Some(now), before_ms: Some(now + 1), ..Runs::default() }),
+    ] {
+        assert!(!bounded(metrics, label, 2, || s.query_runs(&f, false, None, 2))?.items.is_empty());
+    }
+    let page = s.query_runs(&filter, false, None, 1)?;
+    bounded(metrics, "control_list_cursor", 1, || s.query_runs(&filter, false, page.next.as_ref(), 1))?;
+    for (label, f) in [
+        ("control_waits_definition", Waits { definition: Some("operator".into()), ..Waits::default() }),
+        ("control_waits_type", Waits { event_type: Some("answer".into()), ..Waits::default() }),
+        ("control_waits_run", Waits { run: Some(a.id.clone()), ..Waits::default() }),
+        ("control_waits_age", Waits { since_ms: Some(now), before_ms: Some(now + 1), ..Waits::default() }),
+        (
+            "control_waits_definition_type",
+            Waits { definition: Some("operator".into()), event_type: Some("answer".into()), ..Waits::default() },
+        ),
+    ] {
+        assert_eq!(bounded(metrics, label, 1, || s.pending_waits(&f, None, 2))?.items.len(), 1);
+    }
+    let page = s.pending_waits(&Waits::default(), None, 1)?;
+    bounded(metrics, "control_waits_cursor", 0, || s.pending_waits(&Waits::default(), page.next.as_ref(), 1))?;
+    bounded(metrics, "control_inspect", 3, || s.inspect_control(&a.id))?;
+    let pause = Command::Pause { definition: "operator".into(), note: "pause".into() };
+    bounded(metrics, "control_pause", 1, || s.control(&req("pause"), &pause, now))?;
+    bounded(metrics, "control_pause_retry", 0, || s.control(&req("pause"), &pause, now))?;
+    bounded(metrics, "control_resume", 1, || {
+        s.control(&req("resume"), &Command::Resume { definition: "operator".into() }, now)
+    })?;
+    bounded(metrics, "control_stop", 0, || s.control(&req("stop"), &Command::Stop { enabled: true }, now))?;
+    assert!(bounded(metrics, "control_stopped", 0, || s.stopped())?);
+    assert!(bounded(metrics, "control_claim_stopped", 0, || s.claim(&a.id, i64::MAX))?.is_none());
+    bounded(metrics, "control_clear_stop", 0, || s.control(&req("clear"), &Command::Stop { enabled: false }, now))?;
+    let mut event = event("response", "answer", json!({"approved":true}));
+    event["ticket"] = json!(42);
+    let respond = Command::Respond { run: a.id.clone(), wait: "listen".into(), event };
+    bounded(metrics, "control_respond", 2, || s.control(&req("respond"), &respond, now))?;
+    bounded(metrics, "control_respond_retry", 0, || s.control(&req("respond"), &respond, now))?;
+    bounded(metrics, "control_respond_identity", 0, || s.control(&req("respond-identity"), &respond, now))?;
+    bounded(metrics, "control_respond_take", 2, || s.take_event(&f, &w.position, &w.types, now))?;
+    bounded(metrics, "control_cancel_tree", 3, || {
+        s.control(&req("cancel"), &Command::Cancel { run: a.id.clone() }, now + 1)
+    })?;
+    bounded(metrics, "control_cancel_retry", 0, || {
+        s.control(&req("cancel"), &Command::Cancel { run: a.id.clone() }, now + 1)
+    })?;
+    bounded(metrics, "control_entry", 0, || s.control_entry("cancel"))?;
+    bounded(metrics, "control_journal_run", 2, || s.control_history(Some(&a.id), None, 2))?;
+    let journal = bounded(metrics, "control_journal", 2, || s.control_history(None, None, 2))?;
+    bounded(metrics, "control_journal_cursor", 2, || s.control_history(None, journal.next.as_ref(), 2))?;
+    assert_eq!(
+        bounded(metrics, "control_history_definition", 2, || s.query_runs(&filter, true, None, 2))?.items.len(),
+        2
+    );
+    let recent = Runs { since_ms: Some(now), before_ms: Some(now + 2), ..Runs::default() };
+    assert_eq!(bounded(metrics, "control_history_window", 2, || s.query_runs(&recent, true, None, 2))?.items.len(), 2);
+    let mut a = a.clone();
+    a.id = "operator:wildcard".into();
+    let f = s.start(&a, now)?.unwrap();
+    let mut w = control_wait();
+    w.types = vec!["*".into()];
+    w.strategy = owf::model::Strategy::Any { filters: Vec::new(), until: None };
+    w.progress = owf::events::Consumer::new(&w.strategy).progress();
+    w.since_ms = now;
+    w.timeout_ms = None;
+    bounded(metrics, "control_describe_wildcard", 1, || s.describe_wait(&f, "listen", &w, now))?;
+    let respond = Command::Respond {
+        run: a.id.clone(),
+        wait: "listen".into(),
+        event: ouro_durable::conformance::event("wildcard", "choice", json!(42)),
+    };
+    bounded(metrics, "control_respond_wildcard", 2, || s.control(&req("wildcard"), &respond, now))?;
+    bounded(metrics, "control_take_wildcard", 2, || s.take_event(&f, &w.position, &w.types, now))?;
+    s.finish(&f, &Status::Completed(json!(42)), now, 3)?;
+    for pause in [false, true] {
+        let name = if pause { "operatorpausequeue" } else { "operatorstopqueue" };
+        s.save_definition(name, "yaml")?;
+        let slot = |n| Trigger { at_ms: Some(now + n), types: vec![], state: json!(n) };
+        s.activate_with(name, 1, 0, &Arming { triggers: BTreeMap::from([(name.into(), slot(0))]) })?;
+        let mut first = a.clone();
+        first.id = format!("{name}:first");
+        first.name = name.into();
+        let mut buffered = first.clone();
+        buffered.id = format!("{name}:buffered");
+        let fire = |n, a: &ouro_durable::Admission| {
+            s.fire(
+                &Firing {
+                    key: name,
+                    expected: Some(&slot(n)),
+                    next: Some(&slot(n + 1)),
+                    busy: Some(&slot(n + 1)),
+                    admit: std::slice::from_ref(a),
+                    overlap: Some(ouro_durable::OverlapGuard {
+                        policy: ouro_durable::Overlap::Queue,
+                        max_concurrent_runs: 2,
+                        ceiling: &slot(n + 1),
+                    }),
+                    ..Firing::default()
+                },
+                now,
+            )
+        };
+        assert_eq!(fire(0, &first)?, Fired::Committed);
+        assert_eq!(fire(1, &buffered)?, Fired::Queued);
+        let stop = if pause {
+            Command::Pause { definition: name.into(), note: "retain queue".into() }
+        } else {
+            Command::Stop { enabled: true }
+        };
+        bounded(metrics, if pause { "control_pause_queue" } else { "control_stop_queue" }, 2, || {
+            s.control(&req(&format!("{name}:stop")), &stop, now)
+        })?;
+        bounded(metrics, "control_cancel_deferred_queue", 2, || {
+            s.control(&req(&format!("{name}:cancel")), &Command::Cancel { run: first.id.clone() }, now)
+        })?;
+        assert!(s.get(&buffered.id)?.is_none());
+        let resume = if pause { Command::Resume { definition: name.into() } } else { Command::Stop { enabled: false } };
+        bounded(metrics, if pause { "control_resume_queue" } else { "control_clear_deferred_queue" }, 3, || {
+            s.control(&req(&format!("{name}:clear")), &resume, now)
+        })?;
+        assert_eq!(s.get(&buffered.id)?.unwrap().admission, buffered);
+        s.cancel(&buffered.id, now)?;
+    }
+    Ok(())
 }

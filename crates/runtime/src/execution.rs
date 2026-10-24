@@ -191,7 +191,7 @@ impl Runtime {
     }
     /// Activates a saved version in a new activation epoch, clearing a
     /// tripped breaker; its schedule's triggers replace the definition's
-    /// current ones in the same commit. Only an activation does either: a
+    /// current ones in the same commit. Only activation starts an epoch: a
     /// tripped breaker reports (`definitions`, `notify`) and the host decides
     /// which version, if any, to activate.
     pub fn activate(&self, name: &str, version: u64) -> anyhow::Result<()> {
@@ -284,6 +284,19 @@ impl Runtime {
             ],
         );
         Ok(swept)
+    }
+    /// Execute an attributed operator command. Local cancellations fire tokens
+    /// immediately; independent control processes are observed at renewal.
+    pub fn control(
+        &self,
+        request: &ouro_durable::control::Request,
+        command: &ouro_durable::control::Command,
+    ) -> anyhow::Result<ouro_durable::control::Reply> {
+        let reply = self.store.control(request, command, self.clock.now_ms())?;
+        if matches!(command, ouro_durable::control::Command::Cancel { .. }) {
+            self.signal_cancelled()?;
+        }
+        Ok(reply)
     }
     pub fn cancel(&self, id: &str) -> anyhow::Result<bool> {
         let changed = self.store.cancel(id, self.clock.now_ms())?;
@@ -459,6 +472,7 @@ impl Runtime {
                 _=heartbeat.tick()=> {
                     if let Err(error)=self.store.renew(&lease.fence,self.clock.now_ms()) {
                         local_cancel.cancel();
+                        if error.is::<ouro_durable::control::Stopped>() { self.store.release(&lease.fence, self.clock.now_ms())?; }
                         if let Some(status)=self.store.get(&saved.admission.id)?.and_then(|r|r.outcome) {return Ok(status)}
                         return Ok(Status::Interrupted(WorkflowError::runtime(error.to_string())));
                     }
@@ -469,7 +483,17 @@ impl Runtime {
                     }
                     // Explicit cancel may already have committed and fenced us.
                     if let Some(status)=self.store.get(&saved.admission.id)?.and_then(|r|r.outcome) {return Ok(status)}
-                    return self.store.finish(&lease.fence,&outcome.status,self.clock.now_ms(),self.config.breaker_threshold);
+                    if self.store.stopped()? {
+                        self.store.release(&lease.fence, self.clock.now_ms())?;
+                        return Ok(Status::Interrupted(WorkflowError::runtime("runtime emergency stop is set")));
+                    }
+                    match self.store.finish(&lease.fence,&outcome.status,self.clock.now_ms(),self.config.breaker_threshold) {
+                        Err(e) if e.is::<ouro_durable::control::Stopped>() => {
+                            self.store.release(&lease.fence, self.clock.now_ms())?;
+                            return Ok(Status::Interrupted(WorkflowError::runtime(e.to_string())));
+                        }
+                        result => return result,
+                    }
                 }
             }
         }
@@ -919,6 +943,10 @@ impl ExecutionFunctions {
                 permit = self.function_permits.acquire() => permit.map_err(|e|
                     CallFailure::Interrupted(WorkflowError::runtime(e.to_string())))?
             };
+            self.lease
+                .store
+                .check_lease(&self.lease.fence, self.lease.clock.now_ms())
+                .map_err(|e| CallFailure::Interrupted(WorkflowError::runtime(e.to_string())))?;
             let result = match &self.mode {
                 // The dry run's guarantee: a call the host's rule marks is
                 // answered here and never reaches its handler or runner.
@@ -1054,6 +1082,10 @@ fn child_id(run_id: &str, key: &str) -> String {
     format!("child:{}", serde_json::to_string(&(run_id, key)).expect("string tuple serializes"))
 }
 impl run::Events for ExecutionFunctions {
+    fn waiting(&self, id: &str, key: &str, wait: &owf::events::PendingWait) -> anyhow::Result<()> {
+        run::Events::waiting(&*self.lease, id, key, wait)
+    }
+
     fn register(&self, id: &str, types: &[String]) -> anyhow::Result<()> {
         run::Events::register(&*self.lease, id, types)
     }
@@ -1194,6 +1226,10 @@ impl Functions for ExecutionFunctions {
             }
             Mode::Live => {
                 let now = self.lease.clock.now_ms();
+                self.lease
+                    .store
+                    .check_lease(&self.lease.fence, now)
+                    .map_err(|e| CallFailure::Interrupted(WorkflowError::runtime(e.to_string())))?;
                 // A storage failure is no answer: the run stops recoverably and
                 // recovery publishes the same envelope again (deduplicated).
                 crate::schedule::publish(&*self.lease.store, &self.admitter, event, now)

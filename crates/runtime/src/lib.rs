@@ -1,6 +1,7 @@
 //! Embeddable durable workflow host. Register functions, save and activate
 //! definitions, admit runs, then drive or recover them with a bounded worker.
 mod capabilities;
+pub mod control;
 mod execution;
 mod registry;
 mod schedule;

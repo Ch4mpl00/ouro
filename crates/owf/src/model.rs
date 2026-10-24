@@ -170,7 +170,7 @@ pub struct Listen {
 }
 
 /// An event consumption strategy.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Strategy {
     One(EventFilter),
     /// An empty list consumes any event.
@@ -181,7 +181,7 @@ pub enum Strategy {
     All(Vec<EventFilter>),
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Until {
     /// Evaluated on the events consumed so far, after each one.
     Condition(String),
@@ -189,7 +189,7 @@ pub enum Until {
     Events(Box<Strategy>),
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct EventFilter {
     /// Attribute name → literal (equality or a regular expression) or
     /// runtime expression (see `events::matches`).
@@ -197,7 +197,7 @@ pub struct EventFilter {
     pub correlate: Vec<(String, Correlation)>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Correlation {
     pub from: String,
     /// A constant, or a `${ }` expression evaluated on the task input.
