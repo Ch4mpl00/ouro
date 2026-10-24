@@ -2021,9 +2021,7 @@ fn can_leave(t: &Task, functions: &[(String, Task)]) -> bool {
         Kind::Do(tasks) | Kind::For { tasks, .. } => list(tasks),
         Kind::Fork { branches, .. } => list(branches),
         Kind::Switch(cases) => cases.iter().any(|(_, c)| c.then == Flow::End),
-        Kind::Try { tasks, catch } => {
-            list(tasks) || ends(&catch.then) || catch.tasks.as_ref().is_some_and(&list)
-        }
+        Kind::Try { tasks, catch } => list(tasks) || ends(&catch.then) || catch.tasks.as_ref().is_some_and(&list),
         Kind::Listen(l) => l.foreach.as_ref().is_some_and(|f| list(&f.tasks)),
         Kind::Set(_) | Kind::Wait(_) | Kind::Emit(_) | Kind::Run(_) => false,
     }

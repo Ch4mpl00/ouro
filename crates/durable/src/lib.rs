@@ -140,6 +140,10 @@ pub struct SavedRun {
     /// it ran the active version: only such runs feed that epoch's breaker.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub epoch: Option<u64>,
+    /// The root of an owned child's run tree, whose budget it spends
+    /// (`RunStore::spend`); `None` for a root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -386,6 +390,13 @@ pub trait RunStore: Send + Sync {
         now_ms: i64,
     ) -> anyhow::Result<Option<Fence>>;
     fn child_outcome(&self, parent: &str, key: &str, child: &str) -> anyhow::Result<Option<Status>>;
+    /// Spends one unit of the budget the run's tree shares (its root's
+    /// counter, an owned child's included) under `key`, if fewer than
+    /// `limit` are spent, and saves `Record::Budget` at `key` with the
+    /// decision and the count after it, in one fenced commit; repeating
+    /// returns the saved record. The count survives restarts and ends with
+    /// the root; the store never interprets what a unit stands for.
+    fn spend(&self, fence: &Fence, key: &str, limit: u64, now_ms: i64) -> anyhow::Result<Record>;
     /// Due runs for an undeclared worker: every application version.
     fn due(&self, now_ms: i64, limit: usize) -> anyhow::Result<Vec<String>> {
         self.due_as(now_ms, limit, &Compatibility::default())
@@ -467,6 +478,9 @@ impl Journal for Lease {
     }
     fn save(&self, key: &str, record: &Record) -> anyhow::Result<()> {
         self.store.save_record(&self.fence, key, record, self.clock.now_ms())
+    }
+    fn spend(&self, key: &str, limit: u64) -> anyhow::Result<Option<Record>> {
+        self.store.spend(&self.fence, key, limit, self.clock.now_ms()).map(Some)
     }
 }
 impl Events for Lease {

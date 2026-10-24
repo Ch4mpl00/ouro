@@ -120,12 +120,26 @@ fn bounds(backend: Arc<dyn AtomicBackend>, metrics: Arc<Metrics>, validation: u6
     let f = bounded(&metrics, "claim_waiting", 0, || s.claim(&a.id, 1))?.unwrap();
     bounded(&metrics, "release", 0, || s.release(&f, 1))?;
     let f = s.claim(&a.id, 1)?.unwrap();
+    assert_eq!(
+        bounded(&metrics, "spend", 0, || s.spend(&f, "loop#jump", 100, 1))?,
+        Record::Budget { granted: true, spent: 1 }
+    );
+    bounded(&metrics, "spend_replayed", 0, || s.spend(&f, "loop#jump", 100, 1))?;
+    assert!(matches!(
+        bounded(&metrics, "spend_refused", 0, || s.spend(&f, "late#jump", 1, 1))?,
+        Record::Budget { granted: false, .. }
+    ));
     for id in ["target:c", "target:live"] {
         let mut child = a.clone();
         child.id = id.into();
         let link = ouro_durable::ChildLink { parent: a.id.clone(), key: id.into(), reference: "/child".into() };
         let c = bounded(&metrics, "start_child", 1, || s.start_child(&f, &child, &link, 1))?.unwrap();
         assert!(bounded(&metrics, "child_outcome", 0, || s.child_outcome(&a.id, id, id))?.is_none());
+        // A child's unit commits with its root's counter: two runs' rows.
+        let unit = format!("{id}#jump");
+        let spent = bounded(&metrics, "spend_child", 0, || s.spend(&c, &unit, 100, 1))?;
+        assert!(matches!(spent, Record::Budget { granted: true, .. }));
+        bounded(&metrics, "spend_child_replayed", 0, || s.spend(&c, &unit, 100, 1))?;
         if id == "target:c" {
             bounded(&metrics, "finish_child", 1, || s.finish(&c, &Status::Completed(json!(42)), 1, 3))?;
         }
