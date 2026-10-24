@@ -18,10 +18,11 @@ use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
     sync::{
-        Barrier,
+        Arc,
         atomic::{AtomicUsize, Ordering},
     },
 };
+use tokio::sync::Barrier;
 
 #[derive(Clone, Debug, Deserialize)]
 struct Cmd {
@@ -105,11 +106,11 @@ struct Prepared {
 }
 impl Prepared {
     fn new(d: &StoreDriver, commands: &[Cmd]) -> anyhow::Result<Self> {
-        let defs = d.store.definitions(NAME)?;
+        let defs = d.block(d.store.definitions(NAME))?;
         let mut admissions = BTreeMap::new();
         for (k, c) in commands.iter().enumerate() {
             let slot = (c.op == "fire").then(|| -> anyhow::Result<(u64, i64)> {
-                let t = d.store.trigger(SCHEDULE)?.context("schedule trigger")?;
+                let t = d.block(d.store.trigger(SCHEDULE))?.context("schedule trigger")?;
                 Ok((defs.epoch, t.state["slot"].as_i64().context("slot")?))
             });
             if matches!(c.op.as_str(), "fire" | "ingress") {
@@ -120,8 +121,8 @@ impl Prepared {
             now: d.ms(),
             fences: d.workers.iter().map(|x| x.fence.clone()).collect(),
             admissions,
-            schedule: d.store.trigger(SCHEDULE)?,
-            ingress: d.store.trigger(INGRESS)?,
+            schedule: d.block(d.store.trigger(SCHEDULE))?,
+            ingress: d.block(d.store.trigger(INGRESS))?,
             epoch: defs.epoch,
         })
     }
@@ -131,7 +132,7 @@ impl Prepared {
 }
 
 /// One command against one handle, answered as the model's `reply` reads it.
-fn race(store: &dyn RunStore, p: &Prepared, k: usize, c: &Cmd) -> (i64, Option<Fence>) {
+async fn race(store: &dyn RunStore, p: &Prepared, k: usize, c: &Cmd) -> (i64, Option<Fence>) {
     let ms = p.now;
     let accepted = |result: anyhow::Result<Vec<String>>| match result {
         Ok(receivers) => i64::from(!receivers.is_empty()),
@@ -141,17 +142,18 @@ fn race(store: &dyn RunStore, p: &Prepared, k: usize, c: &Cmd) -> (i64, Option<F
     let reply = match c.op.as_str() {
         "take" => store
             .take_event(p.fence(c.w), &format!("event{}", c.i), &["event".into()], ms)
+            .await
             .unwrap()
             .map_or(-1, |e| e["data"].as_i64().unwrap()),
-        "address" => accepted(store.publish(&event(c.i, c.value), Some(&run_id(c.r)), ms)),
-        "publish" => accepted(store.publish(&event(c.i, c.value), None, ms)),
-        "finish" => i64::from(store.finish(p.fence(c.w), &status(c.value + 1), ms, 2).is_ok()),
+        "address" => accepted(store.publish(&event(c.i, c.value), Some(&run_id(c.r)), ms).await),
+        "publish" => accepted(store.publish(&event(c.i, c.value), None, ms).await),
+        "finish" => i64::from(store.finish(p.fence(c.w), &status(c.value + 1), ms, 2).await.is_ok()),
         "intent" => {
             let record = call_record(c.i, CallState::Pending);
-            i64::from(store.save_record(p.fence(c.w), &format!("call{}", c.i), &record, ms).is_ok())
+            i64::from(store.save_record(p.fence(c.w), &format!("call{}", c.i), &record, ms).await.is_ok())
         }
         "claim" => {
-            let fence = store.claim_as(&run_id(c.r), ms, &worker(c.w)).unwrap();
+            let fence = store.claim_as(&run_id(c.r), ms, &worker(c.w)).await.unwrap();
             return (i64::from(fence.is_some()), fence);
         }
         "fire" => {
@@ -177,11 +179,11 @@ fn race(store: &dyn RunStore, p: &Prepared, k: usize, c: &Cmd) -> (i64, Option<F
                 refused: None,
                 overlap: None,
             };
-            i64::from(store.fire(&firing, ms).unwrap() == Fired::Committed)
+            i64::from(store.fire(&firing, ms).await.unwrap() == Fired::Committed)
         }
         "ingress" => {
             let e = ingress_event(c.i, c.value);
-            match store.ingested(&e, ms) {
+            match store.ingested(&e, ms).await {
                 Ok(false) => {}
                 Ok(true) => return (0, None),
                 Err(e) if e.is::<IdentityConflict>() => return (0, None),
@@ -196,7 +198,7 @@ fn race(store: &dyn RunStore, p: &Prepared, k: usize, c: &Cmd) -> (i64, Option<F
                 ingress: Some(&e),
                 ..Firing::default()
             };
-            i64::from(store.fire(&firing, ms).unwrap() == Fired::Committed)
+            i64::from(store.fire(&firing, ms).await.unwrap() == Fired::Committed)
         }
         "activate" => {
             let version = c.i as u64 + 1;
@@ -207,7 +209,7 @@ fn race(store: &dyn RunStore, p: &Prepared, k: usize, c: &Cmd) -> (i64, Option<F
                     .triggers
                     .insert(SCHEDULE.into(), schedule_trigger(Some(ms / TICK + 2), p.epoch + 1, 0, catchup, rearm));
             }
-            i64::from(store.activate_with(NAME, version, p.epoch, &arming).unwrap().is_some())
+            i64::from(store.activate_with(NAME, version, p.epoch, &arming).await.unwrap().is_some())
         }
         other => panic!("no concurrent form for {other}"),
     };
@@ -232,26 +234,33 @@ fn run(adapter: Adapter, batch: &Batch, round: usize) -> anyhow::Result<()> {
     }
     let prepared = Prepared::new(&driver, &batch.commands)?;
     let stores = (0..batch.commands.len()).map(|_| driver.handle()).collect::<anyhow::Result<Vec<_>>>()?;
-    let barrier = Barrier::new(batch.commands.len());
-    let sequence = AtomicUsize::new(0);
-    let results: Vec<(Completed, Option<Fence>)> = std::thread::scope(|scope| {
+    let barrier = Arc::new(Barrier::new(batch.commands.len()));
+    let sequence = Arc::new(AtomicUsize::new(0));
+    let prepared = Arc::new(prepared);
+    // One task per command on the driver's workers, so they run in parallel.
+    let results: Vec<(Completed, Option<Fence>)> = driver.block(async {
         let tasks: Vec<_> = batch
             .commands
             .iter()
+            .cloned()
             .enumerate()
             .zip(stores)
             .map(|((k, c), store)| {
-                let (barrier, sequence, prepared) = (&barrier, &sequence, &prepared);
-                scope.spawn(move || {
-                    barrier.wait();
+                let (barrier, sequence, prepared) = (barrier.clone(), sequence.clone(), prepared.clone());
+                tokio::spawn(async move {
+                    barrier.wait().await;
                     let begin = sequence.fetch_add(1, Ordering::SeqCst);
-                    let (reply, fence) = race(store.as_ref(), prepared, k, c);
+                    let (reply, fence) = race(store.as_ref(), &prepared, k, &c).await;
                     let end = sequence.fetch_add(1, Ordering::SeqCst);
                     (Completed { begin, end, reply }, fence)
                 })
             })
             .collect();
-        tasks.into_iter().map(|task| task.join().unwrap()).collect()
+        let mut results = Vec::new();
+        for task in tasks {
+            results.push(task.await.unwrap());
+        }
+        results
     });
     for ((_, fence), c) in results.iter().zip(&batch.commands) {
         if let Some(f) = fence {

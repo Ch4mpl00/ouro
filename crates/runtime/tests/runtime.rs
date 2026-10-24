@@ -31,9 +31,9 @@ fn yaml(body: &str) -> String {
 fn runtime(store: Arc<dyn RunStore>, registry: Registry, clock: Arc<dyn Clock>) -> Runtime {
     Runtime::new(store, Arc::new(registry), Config::default(), clock, tracer()).unwrap()
 }
-fn save(rt: &Runtime, yaml: &str) {
-    let d = rt.save("workflow", yaml).unwrap();
-    rt.activate("workflow", d.version).unwrap();
+async fn save(rt: &Runtime, yaml: &str) {
+    let d = rt.save("workflow", yaml).await.unwrap();
+    rt.activate("workflow", d.version).await.unwrap();
 }
 /// The host's dry-run rule for the counter registry: it knows `write`
 /// changes the world, so a dry run answers it with its arguments.
@@ -84,20 +84,20 @@ async fn pinned_versions_resume_a_wait_without_resending_the_write() {
     let original = yaml(
         "  - send: { call: write, with: { n: 1 } }\n  - wait: { wait: PT1S }\n  - read: { call: read, with: { result: original } }",
     );
-    save(&rt, &original);
-    rt.start("r", "workflow", json!({})).unwrap();
+    save(&rt, &original).await;
+    rt.start("r", "workflow", json!({})).await.unwrap();
     assert!(matches!(rt.drive("r", &CancellationToken::new()).await.unwrap(), Some(Status::Waiting { .. })));
-    let d = rt.save("workflow", &yaml("  - changed: { set: { result: changed } }")).unwrap();
-    rt.activate("workflow", d.version).unwrap();
+    let d = rt.save("workflow", &yaml("  - changed: { set: { result: changed } }")).await.unwrap();
+    rt.activate("workflow", d.version).await.unwrap();
     drop(rt);
     time.0.store(1000, Ordering::SeqCst);
     let rt =
         runtime(Arc::new(durable::sqlite::open(path).unwrap()), counter_registry(reads.clone(), writes.clone()), time);
     rt.recover_once(&CancellationToken::new()).await.unwrap();
-    assert_eq!(rt.get("r").unwrap().unwrap().outcome, Some(Status::Completed(json!({"result":"original"}))));
+    assert_eq!(rt.get("r").await.unwrap().unwrap().outcome, Some(Status::Completed(json!({"result":"original"}))));
     assert_eq!(writes.load(Ordering::SeqCst), 1);
     assert_eq!(reads.load(Ordering::SeqCst), 1);
-    let journal: Vec<_> = rt.calls("r").unwrap().into_iter().map(|c| (c.key, c.function, c.state)).collect();
+    let journal: Vec<_> = rt.calls("r").await.unwrap().into_iter().map(|c| (c.key, c.function, c.state)).collect();
     assert_eq!(
         journal,
         [
@@ -105,7 +105,7 @@ async fn pinned_versions_resume_a_wait_without_resending_the_write() {
             ("/do/2/read#call".to_owned(), "read".to_owned(), CallStatus::Completed),
         ]
     );
-    rt.start("new", "workflow", json!({})).unwrap();
+    rt.start("new", "workflow", json!({})).await.unwrap();
     assert_eq!(
         rt.drive("new", &CancellationToken::new()).await.unwrap(),
         Some(Status::Completed(json!({"result":"changed"})))
@@ -118,16 +118,16 @@ async fn schema_validation_and_typed_errors_are_caught_by_yaml() {
     let mut registry = Registry::new();
     registry.register(Function::new("typed",json!({"type":"object","required":["n"],"properties":{"n":{"type":"integer"}},"additionalProperties":false}),json!({"type":"integer"}), move |_:Value,_:FunctionContext| {c.fetch_add(1,Ordering::SeqCst);async {Err(WorkflowError {type_:"urn:test:rejected".into(),status:409,title:Some("Rejected".into()),detail:None,instance:None})}})).unwrap();
     let rt = runtime(Arc::new(durable::memory::memory()), registry, Arc::new(Time::default()));
-    assert!(rt.save("bad", &yaml("  - bad: { call: typed, with: { n: text } }")).is_err());
-    assert!(rt.save("bad", &yaml("  - bad: { call: absent }")).is_err());
+    assert!(rt.save("bad", &yaml("  - bad: { call: typed, with: { n: text } }")).await.is_err());
+    assert!(rt.save("bad", &yaml("  - bad: { call: absent }")).await.is_err());
     save(
         &rt,
         &yaml(
             "  - handle:\n      try:\n        - invoke: { call: typed, with: { n: '${ .n }' } }\n      catch:\n        as: failure\n        do:\n          - result: { set: '${ $failure.status }' }",
         ),
-    );
+    ).await;
     for (id, input, expected) in [("typed", json!({"n":1}), 409), ("schema", json!({"n":"bad"}), 400)] {
-        rt.start(id, "workflow", input).unwrap();
+        rt.start(id, "workflow", input).await.unwrap();
         let result = rt.drive(id, &CancellationToken::new()).await.unwrap();
         assert_eq!(result, Some(Status::Completed(json!(expected))), "{result:?}");
     }
@@ -149,10 +149,10 @@ async fn dry_run_mocks_what_the_host_rule_marks_and_replay_calls_no_handlers() {
     assert_eq!(dry.mocked.len(), 1);
     assert_eq!(reads.load(Ordering::SeqCst), 1);
     assert_eq!(writes.load(Ordering::SeqCst), 0);
-    assert!(rt.list(None, "").unwrap().is_empty());
-    assert!(rt.definitions("dry-run").unwrap().versions.is_empty());
-    save(&rt, &definition);
-    rt.start("r", "workflow", json!({})).unwrap();
+    assert!(rt.list(None, "").await.unwrap().is_empty());
+    assert!(rt.definitions("dry-run").await.unwrap().versions.is_empty());
+    save(&rt, &definition).await;
+    rt.start("r", "workflow", json!({})).await.unwrap();
     let result = rt.drive("r", &CancellationToken::new()).await.unwrap();
     let replay = rt.replay("r", &CancellationToken::new()).await.unwrap();
     assert_eq!(Some(replay.status), result);
@@ -163,35 +163,35 @@ async fn dry_run_mocks_what_the_host_rule_marks_and_replay_calls_no_handlers() {
 #[tokio::test]
 async fn breaker_trips_after_configured_faults_and_success_resets_count() {
     let rt = runtime(Arc::new(durable::memory::memory()), Registry::new(), Arc::new(Time::default()));
-    save(&rt, &yaml("  - ok: { set: { result: old } }"));
+    save(&rt, &yaml("  - ok: { set: { result: old } }")).await;
     let flaky = "  - fail: { if: '${ .fail }', raise: { error: { type: 'urn:test:failure', status: 500 } } }";
-    let bad = rt.save("workflow", &yaml(flaky)).unwrap();
-    rt.activate("workflow", bad.version).unwrap();
+    let bad = rt.save("workflow", &yaml(flaky)).await.unwrap();
+    rt.activate("workflow", bad.version).await.unwrap();
     let stop = CancellationToken::new();
-    let run = |id: &'static str, fail: bool| {
-        rt.start(id, "workflow", json!({ "fail": fail })).unwrap();
-        rt.drive(id, &stop)
+    let run = async |id: &'static str, fail: bool| {
+        rt.start(id, "workflow", json!({ "fail": fail })).await.unwrap();
+        rt.drive(id, &stop).await
     };
-    let faults = || rt.definitions("workflow").unwrap().consecutive_faults;
+    let faults = async || rt.definitions("workflow").await.unwrap().consecutive_faults;
     for id in ["f0", "f1"] {
         assert!(matches!(run(id, true).await.unwrap(), Some(Status::Faulted(_))));
     }
-    assert_eq!(faults(), 2);
+    assert_eq!(faults().await, 2);
     assert!(matches!(run("s0", false).await.unwrap(), Some(Status::Completed(_))));
-    assert_eq!(faults(), 0, "a success resets the count");
+    assert_eq!(faults().await, 0, "a success resets the count");
     // Admitted before the trip; it finishes after it.
-    rt.start("late", "workflow", json!({ "fail": true })).unwrap();
+    rt.start("late", "workflow", json!({ "fail": true })).await.unwrap();
     for id in ["f2", "f3", "f4"] {
         assert!(matches!(run(id, true).await.unwrap(), Some(Status::Faulted(_))));
     }
-    let d = rt.definitions("workflow").unwrap();
+    let d = rt.definitions("workflow").await.unwrap();
     assert_eq!(d.active, Some(bad.version), "the breaker never picks another version");
     let trip = d.tripped.expect("tripped at the configured threshold");
     assert_eq!((trip.faults, trip.threshold, trip.run.as_str()), (3, 3, "f4"));
-    assert_eq!(rt.get("f0").unwrap().unwrap().admission.version, bad.version);
+    assert_eq!(rt.get("f0").await.unwrap().unwrap().admission.version, bad.version);
     assert!(matches!(rt.drive("late", &CancellationToken::new()).await.unwrap(), Some(Status::Faulted(_))));
-    assert_eq!(faults(), 3, "a tripped breaker counts nothing more");
-    assert_eq!(rt.definitions("workflow").unwrap().tripped.unwrap().run, "f4");
+    assert_eq!(faults().await, 3, "a tripped breaker counts nothing more");
+    assert_eq!(rt.definitions("workflow").await.unwrap().tripped.unwrap().run, "f4");
 }
 #[tokio::test]
 async fn shutdown_releases_the_lease_and_unknown_writes_never_dispatch_again() {
@@ -214,8 +214,8 @@ async fn shutdown_releases_the_lease_and_unknown_writes_never_dispatch_again() {
         )
         .unwrap();
     let rt = runtime(Arc::new(durable::memory::memory()), registry, Arc::new(Time::default()));
-    save(&rt, &yaml("  - write: { call: write }"));
-    rt.start("r", "workflow", Value::Null).unwrap();
+    save(&rt, &yaml("  - write: { call: write }")).await;
+    rt.start("r", "workflow", Value::Null).await.unwrap();
     let stop = CancellationToken::new();
     let shutdown = async {
         started.notified().await;
@@ -223,9 +223,9 @@ async fn shutdown_releases_the_lease_and_unknown_writes_never_dispatch_again() {
     };
     let (result, ()) = tokio::join!(rt.drive("r", &stop), shutdown);
     assert!(matches!(result.unwrap(), Some(Status::Interrupted(_))));
-    assert_eq!(rt.get("r").unwrap().unwrap().state, durable::RunState::Ready);
+    assert_eq!(rt.get("r").await.unwrap().unwrap().state, durable::RunState::Ready);
     // The journal tells the host the write may have happened.
-    let calls = rt.calls("r").unwrap();
+    let calls = rt.calls("r").await.unwrap();
     assert_eq!(calls.len(), 1);
     assert_eq!((calls[0].key.as_str(), calls[0].function.as_str()), ("/do/0/write#call", "write"));
     assert_eq!((calls[0].delivery, calls[0].state), (Delivery::AtMostOnce, CallStatus::Unknown));
@@ -236,40 +236,40 @@ async fn shutdown_releases_the_lease_and_unknown_writes_never_dispatch_again() {
 #[tokio::test]
 async fn events_resume_a_waiting_listen_and_cancel_is_terminal() {
     let rt = runtime(Arc::new(durable::memory::memory()), Registry::new(), Arc::new(Time::default()));
-    save(&rt, &yaml("  - listen: { listen: { to: { one: { with: { type: answer } } }, read: envelope } }"));
-    rt.start("r", "workflow", Value::Null).unwrap();
+    save(&rt, &yaml("  - listen: { listen: { to: { one: { with: { type: answer } } }, read: envelope } }")).await;
+    rt.start("r", "workflow", Value::Null).await.unwrap();
     assert!(matches!(rt.drive("r", &CancellationToken::new()).await.unwrap(), Some(Status::Waiting { .. })));
     let answer = |id: &str, data: Value| json!({"id": id, "source": "/test", "type": "answer", "data": data});
-    assert_eq!(rt.deliver(answer("1", json!(42)), None).unwrap(), Some("r".into()));
-    assert!(rt.deliver(answer("2", json!(0)), None).unwrap().is_none());
+    assert_eq!(rt.deliver(answer("1", json!(42)), None).await.unwrap(), Some("r".into()));
+    assert!(rt.deliver(answer("2", json!(0)), None).await.unwrap().is_none());
     assert!(
         matches!(rt.drive("r",&CancellationToken::new()).await.unwrap(),Some(Status::Completed(v)) if v[0]["data"]==42)
     );
-    rt.start("cancelled", "workflow", Value::Null).unwrap();
-    assert!(rt.cancel("cancelled").unwrap());
-    assert!(!rt.cancel("cancelled").unwrap());
+    rt.start("cancelled", "workflow", Value::Null).await.unwrap();
+    assert!(rt.cancel("cancelled").await.unwrap());
+    assert!(!rt.cancel("cancelled").await.unwrap());
     assert_eq!(rt.drive("cancelled", &CancellationToken::new()).await.unwrap(), Some(Status::Cancelled));
 }
 #[tokio::test]
 async fn child_runs_join_via_durable_events_with_one_worker_slot() {
     let store = Arc::new(durable::memory::memory());
     let rt = runtime(store.clone(), Registry::new(), Arc::new(Time::default()));
-    let child = rt.save("child", &yaml("  - result: { set: { answer: 42 } }")).unwrap();
-    rt.activate("child", child.version).unwrap();
+    let child = rt.save("child", &yaml("  - result: { set: { answer: 42 } }")).await.unwrap();
+    rt.activate("child", child.version).await.unwrap();
     save(
         &rt,
         &yaml(
             "  - child: { call: start_child, with: { name: child, input: {} }, export: { as: '${ . }' } }\n  - join: { listen: { to: { one: { with: { type: '${ $context.done }' } } }, read: envelope } }",
         ),
-    );
-    rt.start("p", "workflow", json!({})).unwrap();
+    ).await;
+    rt.start("p", "workflow", json!({})).await.unwrap();
     assert!(matches!(rt.drive("p", &CancellationToken::new()).await.unwrap(), Some(Status::Waiting { .. })));
     rt.recover_once(&CancellationToken::new()).await.unwrap();
     rt.recover_once(&CancellationToken::new()).await.unwrap();
     assert!(
-        matches!(rt.get("p").unwrap().unwrap().outcome,Some(Status::Completed(v)) if v[0]["data"]["output"]["answer"]==42)
+        matches!(rt.get("p").await.unwrap().unwrap().outcome,Some(Status::Completed(v)) if v[0]["data"]["output"]["answer"]==42)
     );
-    assert_eq!(store.list(Some("child"), "").unwrap().len(), 1);
+    assert_eq!(store.list(Some("child"), "").await.unwrap().len(), 1);
 }
 #[tokio::test]
 async fn retries_receive_stable_idempotency_keys_and_increasing_attempts() {
@@ -288,8 +288,8 @@ async fn retries_receive_stable_idempotency_keys_and_increasing_attempts() {
         &yaml(
             "  - attempts:\n      try: [ { read: { call: read } } ]\n      catch:\n        retry: { delay: { milliseconds: 0 }, limit: { attempt: { count: 3 } } }",
         ),
-    );
-    rt.start("r", "workflow", Value::Null).unwrap();
+    ).await;
+    rt.start("r", "workflow", Value::Null).await.unwrap();
     rt.drive("r", &CancellationToken::new()).await.unwrap();
     let c = contexts.lock().unwrap();
     assert_eq!(c.iter().map(|x| x.0).collect::<Vec<_>>(), vec![1, 2, 3]);
@@ -322,22 +322,22 @@ async fn host_concurrency_is_bounded_and_cancellation_reaches_handlers() {
         ..Config::default()
     };
     let rt = Runtime::new(store, Arc::new(registry), config, Arc::new(Time::default()), tracer()).unwrap();
-    save(&rt, &yaml("  - read: { call: read }"));
+    save(&rt, &yaml("  - read: { call: read }")).await;
     for n in 0..6 {
-        rt.start(&format!("r{n}"), "workflow", Value::Null).unwrap();
+        rt.start(&format!("r{n}"), "workflow", Value::Null).await.unwrap();
     }
     let stop = CancellationToken::new();
     let token = stop.clone();
     let cancel = async {
         tokio::time::sleep(Duration::from_millis(30)).await;
         assert!(peak.load(Ordering::SeqCst) <= 2);
-        rt.cancel("r0").unwrap();
+        rt.cancel("r0").await.unwrap();
         tokio::time::sleep(Duration::from_millis(20)).await;
         token.cancel();
     };
     let (result, ()) = tokio::join!(rt.worker(stop), cancel);
     result.unwrap();
-    assert_eq!(rt.get("r0").unwrap().unwrap().outcome, Some(Status::Cancelled));
+    assert_eq!(rt.get("r0").await.unwrap().unwrap().outcome, Some(Status::Cancelled));
     assert!(peak.load(Ordering::SeqCst) > 0);
 }
 // Delivery is declared per function: a call with the default at-least-once
@@ -382,9 +382,9 @@ async fn delivery_is_declared_per_function() {
         ("declared", "  - send: { call: send }"),
         ("tightened", "  - post: { call: post, metadata: { delivery: at_most_once } }"),
     ] {
-        let d = rt.save(name, &yaml(task)).unwrap();
-        rt.activate(name, d.version).unwrap();
-        rt.start(name, name, json!({})).unwrap();
+        let d = rt.save(name, &yaml(task)).await.unwrap();
+        rt.activate(name, d.version).await.unwrap();
+        rt.start(name, name, json!({})).await.unwrap();
         let before = keys.lock().unwrap().len();
         interrupted(&rt, name, &keys, before + 1).await;
         if name == "default" {
@@ -396,7 +396,7 @@ async fn delivery_is_declared_per_function() {
             assert!(matches!(outcome, Some(Status::Faulted(e)) if e.is("outcome_unknown")), "{name}");
             assert_eq!(keys.lock().unwrap().len(), before + 1, "{name}: never sent again");
         }
-        let delivery = rt.records(name).unwrap().values().find_map(|r| match r {
+        let delivery = rt.records(name).await.unwrap().values().find_map(|r| match r {
             Record::Call { delivery, .. } => Some(*delivery),
             _ => None,
         });
@@ -426,13 +426,13 @@ async fn runs_wait_for_a_compatible_application_version() {
         Runtime::new(store.clone(), Arc::new(Registry::new()), config, time.clone(), tracer()).unwrap()
     };
     let one = at(Some("1"), &[]);
-    save(&one, &yaml("  - done: { set: { ok: true } }"));
-    let run = one.start("r", "workflow", json!({})).unwrap();
+    save(&one, &yaml("  - done: { set: { ok: true } }")).await;
+    let run = one.start("r", "workflow", json!({})).await.unwrap();
     assert_eq!(run.admission.application_version(), Some("1"));
     let two = at(Some("2"), &[]);
     assert_eq!(two.drive("r", &CancellationToken::new()).await.unwrap(), None);
     assert_eq!(two.recover_once(&CancellationToken::new()).await.unwrap(), 0);
-    let waiting = two.get("r").unwrap().unwrap();
+    let waiting = two.get("r").await.unwrap().unwrap();
     assert!(waiting.outcome.is_none() && !two.compatible(&waiting), "waiting for a compatible worker");
     let upgraded = at(Some("2"), &["1"]);
     assert!(upgraded.compatible(&waiting));
@@ -442,10 +442,10 @@ async fn runs_wait_for_a_compatible_application_version() {
     );
     // Undeclared on either side: compatible, as before versions existed.
     let undeclared = at(None, &[]);
-    undeclared.start("u", "workflow", json!({})).unwrap();
+    undeclared.start("u", "workflow", json!({})).await.unwrap();
     assert_eq!(two.drive("u", &CancellationToken::new()).await.unwrap(), Some(Status::Completed(json!({"ok":true}))));
-    one.start("v", "workflow", json!({})).unwrap();
-    assert!(undeclared.compatible(&undeclared.get("v").unwrap().unwrap()));
+    one.start("v", "workflow", json!({})).await.unwrap();
+    assert!(undeclared.compatible(&undeclared.get("v").await.unwrap().unwrap()));
 }
 
 #[tokio::test]
@@ -471,14 +471,15 @@ async fn write_response_survives_crash_before_task_checkpoint() {
         .unwrap();
     let time = Arc::new(Time::default());
     let rt = runtime(store, registry, time.clone());
-    save(&rt, &yaml("  - write: { call: write }"));
-    rt.start("r", "workflow", Value::Null).unwrap();
+    save(&rt, &yaml("  - write: { call: write }")).await;
+    rt.start("r", "workflow", Value::Null).await.unwrap();
     assert!(matches!(rt.drive("r", &CancellationToken::new()).await.unwrap(), Some(Status::Interrupted(_))));
     time.0.store(2000, Ordering::SeqCst);
     assert_eq!(rt.drive("r", &CancellationToken::new()).await.unwrap(), Some(Status::Completed(json!(42))));
     assert_eq!(writes.load(Ordering::SeqCst), 1);
     assert!(
         rt.records("r")
+            .await
             .unwrap()
             .values()
             .any(|r| matches!(r, Record::Call { state: CallState::Done(Ok(_)), delivery: Delivery::AtMostOnce, .. }))
@@ -511,8 +512,8 @@ async fn telemetry_nests_function_task_and_run_spans_with_current_context() {
         opentelemetry::global::BoxedTracer::new(Box::new(provider.tracer("test"))),
     )
     .unwrap();
-    save(&rt, &yaml("  - read: { call: read }"));
-    rt.start("trace", "workflow", Value::Null).unwrap();
+    save(&rt, &yaml("  - read: { call: read }")).await;
+    rt.start("trace", "workflow", Value::Null).await.unwrap();
     rt.drive("trace", &CancellationToken::new()).await.unwrap();
     provider.force_flush().unwrap();
     let spans = exporter.get_finished_spans().unwrap();
@@ -546,8 +547,8 @@ async fn dry_children_are_isolated_and_event_replay_uses_recorded_envelopes() {
         counter_registry(reads.clone(), writes.clone()),
         Arc::new(Time::default()),
     );
-    let child = rt.save("child", &yaml("  - write: { call: write, with: { n: 42 } }")).unwrap();
-    rt.activate("child", child.version).unwrap();
+    let child = rt.save("child", &yaml("  - write: { call: write, with: { n: 42 } }")).await.unwrap();
+    rt.activate("child", child.version).await.unwrap();
     let definition = yaml(
         "  - child: { call: start_child, with: { name: child, input: {} }, export: { as: '${ . }' } }\n  - join: { listen: { to: { one: { with: { type: '${ $context.done }' } } }, read: envelope } }",
     );
@@ -555,13 +556,13 @@ async fn dry_children_are_isolated_and_event_replay_uses_recorded_envelopes() {
     assert!(matches!(dry.status, Status::Completed(_)), "{:?}", dry.status);
     assert_eq!(dry.mocked.len(), 1);
     assert_eq!(writes.load(Ordering::SeqCst), 0);
-    assert!(rt.list(None, "").unwrap().is_empty());
-    save(&rt, &definition);
-    rt.start("p", "workflow", json!({})).unwrap();
+    assert!(rt.list(None, "").await.unwrap().is_empty());
+    save(&rt, &definition).await;
+    rt.start("p", "workflow", json!({})).await.unwrap();
     for _ in 0..3 {
         rt.recover_once(&CancellationToken::new()).await.unwrap();
     }
-    let original = rt.get("p").unwrap().unwrap().outcome;
+    let original = rt.get("p").await.unwrap().unwrap().outcome;
     let replay = rt.replay("p", &CancellationToken::new()).await.unwrap();
     assert_eq!(Some(replay.status), original);
     assert_eq!(writes.load(Ordering::SeqCst), 1);
@@ -578,8 +579,8 @@ async fn dropping_a_stale_attempt_preserves_cancellation_of_its_successor() {
         .unwrap();
     let time = Arc::new(Time::default());
     let rt = runtime(Arc::new(durable::memory::memory()), registry, time.clone());
-    save(&rt, &yaml("  - read: { call: read }"));
-    rt.start("r", "workflow", Value::Null).unwrap();
+    save(&rt, &yaml("  - read: { call: read }")).await;
+    rt.start("r", "workflow", Value::Null).await.unwrap();
     let stop = CancellationToken::new();
     let mut old = Box::pin(rt.drive("r", &stop));
     assert!(futures::poll!(old.as_mut()).is_pending());
@@ -587,7 +588,7 @@ async fn dropping_a_stale_attempt_preserves_cancellation_of_its_successor() {
     let mut current = Box::pin(rt.drive("r", &stop));
     assert!(futures::poll!(current.as_mut()).is_pending());
     drop(old);
-    rt.cancel("r").unwrap();
+    rt.cancel("r").await.unwrap();
     assert_eq!(
         tokio::time::timeout(Duration::from_millis(100), current).await.unwrap().unwrap(),
         Some(Status::Cancelled)
@@ -622,8 +623,8 @@ fn x1_x2_generated_dry_runs_and_replays_are_isolated() {
                     .collect::<Vec<_>>()
                     .join("\n");
                 let definition = yaml(&body);
-                save(&rt, &definition);
-                let before = backend.snapshot().unwrap().rows;
+                save(&rt, &definition).await;
+                let before = backend.snapshot().await.unwrap().rows;
                 let dry = rt
                     .dry_run(&definition, json!({"n":input}), writes_mocked(), &CancellationToken::new())
                     .await
@@ -631,10 +632,10 @@ fn x1_x2_generated_dry_runs_and_replays_are_isolated() {
                 prop_assert!(matches!(dry.status, Status::Completed(_)));
                 prop_assert_eq!(writes.load(Ordering::SeqCst), 0);
                 prop_assert_eq!(dry.mocked.len(), writes_in_program.iter().filter(|x| **x).count());
-                prop_assert_eq!(backend.snapshot().unwrap().rows, before);
-                rt.start("recorded", "workflow", json!({"n":input})).unwrap();
+                prop_assert_eq!(backend.snapshot().await.unwrap().rows, before);
+                rt.start("recorded", "workflow", json!({"n":input})).await.unwrap();
                 let original = rt.drive("recorded", &CancellationToken::new()).await.unwrap();
-                let before = backend.snapshot().unwrap().rows;
+                let before = backend.snapshot().await.unwrap().rows;
                 let counts = (reads.load(Ordering::SeqCst), writes.load(Ordering::SeqCst));
                 let replay = rt.replay("recorded", &CancellationToken::new()).await.unwrap();
                 prop_assert_eq!(Some(replay.status), original);
@@ -643,8 +644,8 @@ fn x1_x2_generated_dry_runs_and_replays_are_isolated() {
                 let changed = rt.replay_definition(&changed, "recorded", &CancellationToken::new()).await;
                 prop_assert!(changed.is_err() || matches!(changed.unwrap().status, Status::Faulted(_)));
                 prop_assert_eq!((reads.load(Ordering::SeqCst), writes.load(Ordering::SeqCst)), counts);
-                prop_assert_eq!(backend.snapshot().unwrap().rows, before);
-                store.sweep(durable::RECORDS_KEPT_MS + 1, durable::RECORDS_KEPT_MS).unwrap();
+                prop_assert_eq!(backend.snapshot().await.unwrap().rows, before);
+                store.sweep(durable::RECORDS_KEPT_MS + 1, durable::RECORDS_KEPT_MS).await.unwrap();
                 prop_assert!(rt.replay("recorded", &CancellationToken::new()).await.is_err());
                 prop_assert_eq!((reads.load(Ordering::SeqCst), writes.load(Ordering::SeqCst)), counts);
                 Ok(())
@@ -663,27 +664,27 @@ async fn t3_admission_fixes_the_workflow_deadline() {
         clock.clone(),
     );
     let definition = yaml("  - read: { call: read, with: {} }").replace("\ndo:", "\ntimeout: { after: PT1S }\ndo:");
-    save(&rt, &definition);
-    rt.start("deadline", "workflow", json!({})).unwrap();
+    save(&rt, &definition).await;
+    rt.start("deadline", "workflow", json!({})).await.unwrap();
     clock.0.store(2000, Ordering::SeqCst);
     let outcome = rt.drive("deadline", &CancellationToken::new()).await.unwrap();
     assert!(matches!(outcome,Some(Status::Faulted(e)) if e.is("timeout")), "admission deadline was restarted");
     assert_eq!(reads.load(Ordering::SeqCst), 0);
 }
 
-#[test]
-fn t1_ingress_identity_is_global_across_triggers() {
+#[tokio::test]
+async fn t1_ingress_identity_is_global_across_triggers() {
     let rt = runtime(Arc::new(durable::memory::memory()), Registry::new(), Arc::new(Time::default()));
     let definition = yaml("  - done: { set: { ok: true } }")
         .replace("\ndo:", "\nschedule: { on: { one: { with: { type: event } } } }\ndo:");
     for name in ["first", "second"] {
-        let version = rt.save(name, &definition).unwrap();
-        rt.activate(name, version.version).unwrap();
+        let version = rt.save(name, &definition).await.unwrap();
+        rt.activate(name, version.version).await.unwrap();
     }
     let event = json!({"specversion":"1.0","source":"test","id":"one","type":"event","data":{}});
-    let started = rt.publish(event.clone()).unwrap();
+    let started = rt.publish(event.clone()).await.unwrap();
     assert_eq!(started.len(), 1, "one ingress event acquired multiple admission obligations");
-    assert!(rt.publish(event).unwrap().is_empty());
+    assert!(rt.publish(event).await.unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -691,14 +692,14 @@ async fn t1_live_schedule_run_prevents_overlap() {
     let clock = Arc::new(Time::default());
     let rt = runtime(Arc::new(durable::memory::memory()), Registry::new(), clock.clone());
     let definition = yaml("  - wait: { wait: PT1H }").replace("\ndo:", "\nschedule: { every: PT1S }\ndo:");
-    save(&rt, &definition);
+    save(&rt, &definition).await;
     clock.0.store(1000, Ordering::SeqCst);
-    let started = rt.fire_due().unwrap();
+    let started = rt.fire_due().await.unwrap();
     assert_eq!(started.len(), 1);
     assert!(matches!(rt.drive(&started[0], &CancellationToken::new()).await.unwrap(), Some(Status::Waiting { .. })));
     clock.0.store(2000, Ordering::SeqCst);
-    assert!(rt.fire_due().unwrap().is_empty(), "overlap admitted a second live run");
-    assert_eq!(rt.list(None, "").unwrap().len(), 1);
+    assert!(rt.fire_due().await.unwrap().is_empty(), "overlap admitted a second live run");
+    assert_eq!(rt.list(None, "").await.unwrap().len(), 1);
 }
 
 // ── the start check: every function a run can call is registered ──────────
@@ -724,8 +725,9 @@ async fn a_function_removed_after_activation_stops_admission_and_the_resumed_run
     save(
         &rt,
         &yaml("  - send: { call: write, with: {} }\n  - pause: { wait: PT1S }\n  - fetch: { call: read, with: {} }"),
-    );
-    rt.start("r", "workflow", json!({})).unwrap();
+    )
+    .await;
+    rt.start("r", "workflow", json!({})).await.unwrap();
     assert!(matches!(rt.drive("r", &CancellationToken::new()).await.unwrap(), Some(Status::Waiting { .. })));
     drop(rt);
     // The next release registers `write` only.
@@ -744,17 +746,17 @@ async fn a_function_removed_after_activation_stops_admission_and_the_resumed_run
         .unwrap();
     time.0.store(1000, Ordering::SeqCst);
     let rt = runtime(Arc::new(durable::sqlite::open(&path).unwrap()), release, time);
-    let e = rt.start("new", "workflow", json!({})).unwrap_err();
+    let e = rt.start("new", "workflow", json!({})).await.unwrap_err();
     assert_eq!(missing(&e), &MissingFunction { function: "read".into(), path: vec![("workflow".into(), 1)] });
-    assert!(rt.get("new").unwrap().is_none(), "nothing was admitted");
+    assert!(rt.get("new").await.unwrap().is_none(), "nothing was admitted");
     let outcome = rt.drive("r", &CancellationToken::new()).await.unwrap();
     let Some(Status::Faulted(error)) = outcome else { panic!("{outcome:?}") };
     assert!(error.is("configuration"), "{error:?}");
     assert!(error.detail.as_deref().is_some_and(|d| d.contains("`read`")), "{error:?}");
-    assert_eq!(rt.get("r").unwrap().unwrap().outcome, Some(Status::Faulted(error)));
+    assert_eq!(rt.get("r").await.unwrap().unwrap().outcome, Some(Status::Faulted(error)));
     assert_eq!((writes.load(Ordering::SeqCst), reads.load(Ordering::SeqCst)), (1, 0));
     // The journal shows where the run stopped: one completed call.
-    let journal: Vec<_> = rt.calls("r").unwrap().into_iter().map(|c| (c.function, c.state)).collect();
+    let journal: Vec<_> = rt.calls("r").await.unwrap().into_iter().map(|c| (c.function, c.state)).collect();
     assert_eq!(journal, [("write".to_owned(), CallStatus::Completed)]);
 }
 
@@ -772,14 +774,14 @@ async fn replacing_the_registry_invalidates_the_start_check() {
         tracer(),
     )
     .unwrap();
-    save(&rt, &yaml("  - fetch: { call: read, with: {} }"));
-    rt.start("before", "workflow", json!({})).unwrap();
+    save(&rt, &yaml("  - fetch: { call: read, with: {} }")).await;
+    rt.start("before", "workflow", json!({})).await.unwrap();
     rt.set_registry(Arc::new(Registry::new()));
-    assert_eq!(missing(&rt.start("without", "workflow", json!({})).unwrap_err()).function, "read");
+    assert_eq!(missing(&rt.start("without", "workflow", json!({})).await.unwrap_err()).function, "read");
     let outcome = rt.drive("before", &CancellationToken::new()).await.unwrap();
     assert!(matches!(outcome, Some(Status::Faulted(ref e)) if e.is("configuration")), "{outcome:?}");
     rt.set_registry(full);
-    rt.start("after", "workflow", json!({})).unwrap();
+    rt.start("after", "workflow", json!({})).await.unwrap();
     assert_eq!(rt.drive("after", &CancellationToken::new()).await.unwrap(), Some(Status::Completed(json!({}))));
     assert_eq!(reads.load(Ordering::SeqCst), 1);
 }
@@ -794,24 +796,24 @@ async fn a_missing_function_in_a_child_definition_fails_the_parent_before_it_sta
     let rt =
         Runtime::new(Arc::new(durable::memory::memory()), full, Config::default(), Arc::new(Time::default()), tracer())
             .unwrap();
-    let child = |name: &str, body: &str| {
-        let d = rt.save(name, &yaml(body).replace("name: workflow", &format!("name: {name}"))).unwrap();
-        rt.activate(name, d.version).unwrap();
+    let child = async |name: &str, body: &str| {
+        let d = rt.save(name, &yaml(body).replace("name: workflow", &format!("name: {name}"))).await.unwrap();
+        rt.activate(name, d.version).await.unwrap();
     };
-    child("leaf", "  - fetch: { call: read, with: {} }");
-    child("middle", "  - leaf: { run: { workflow: { namespace: test, name: leaf, version: latest } } }");
+    child("leaf", "  - fetch: { call: read, with: {} }").await;
+    child("middle", "  - leaf: { run: { workflow: { namespace: test, name: leaf, version: latest } } }").await;
     // A child that runs itself: the check visits it once.
     child(
         "workflow",
         "  - first: { set: { n: 1 } }\n  - middle: { run: { workflow: { namespace: test, name: middle, version: latest } } }\n  - again: { if: '${ false }', run: { workflow: { namespace: test, name: workflow, version: latest } } }",
-    );
-    rt.start("ok", "workflow", json!({})).unwrap();
+    ).await;
+    rt.start("ok", "workflow", json!({})).await.unwrap();
     let mut without_read = Registry::new();
     without_read
         .register(Function::new("write", json!({}), json!({}), |a: Value, _: FunctionContext| async move { Ok(a) }))
         .unwrap();
     rt.set_registry(Arc::new(without_read));
-    let e = rt.start("parent", "workflow", json!({})).unwrap_err();
+    let e = rt.start("parent", "workflow", json!({})).await.unwrap_err();
     assert_eq!(
         missing(&e),
         &MissingFunction {
@@ -823,10 +825,10 @@ async fn a_missing_function_in_a_child_definition_fails_the_parent_before_it_sta
     // The parent admitted before the change fails before its first step.
     let outcome = rt.drive("ok", &CancellationToken::new()).await.unwrap();
     assert!(matches!(outcome, Some(Status::Faulted(ref e)) if e.is("configuration")), "{outcome:?}");
-    assert!(rt.records("ok").unwrap().values().all(|r| !matches!(r, Record::Task { .. })), "no step ran");
+    assert!(rt.records("ok").await.unwrap().values().all(|r| !matches!(r, Record::Task { .. })), "no step ran");
     // A new `leaf` version without the call: the parent resolves it anew.
-    child("leaf", "  - done: { set: { leaf: true } }");
-    rt.start("later", "workflow", json!({})).unwrap();
+    child("leaf", "  - done: { set: { leaf: true } }").await;
+    rt.start("later", "workflow", json!({})).await.unwrap();
 }
 
 /// The mock rule sees each call's name and arguments: a dry run dispatches
@@ -869,8 +871,8 @@ async fn worker_hands_a_breaker_trip_to_the_event_sink() {
     let rt = Runtime::new(store, Arc::new(Registry::new()), config, Arc::new(Time::default()), tracer())
         .unwrap()
         .with_event_sink(Arc::new(Sink(sent)));
-    save(&rt, &yaml("  - fail: { raise: { error: { type: 'urn:test:failure', status: 500 } } }"));
-    rt.start("r", "workflow", Value::Null).unwrap();
+    save(&rt, &yaml("  - fail: { raise: { error: { type: 'urn:test:failure', status: 500 } } }")).await;
+    rt.start("r", "workflow", Value::Null).await.unwrap();
     let stop = CancellationToken::new();
     let watch = async {
         let event = tokio::time::timeout(Duration::from_secs(10), received.recv()).await;
@@ -915,15 +917,15 @@ async fn a_scheduled_definition_the_host_cannot_admit_trips_without_stopping_the
     )
     .unwrap()
     .with_event_sink(Arc::new(Sink(sent)));
-    let every = |name: &str, body: &str| {
+    let every = async |name: &str, body: &str| {
         let definition = yaml(body)
             .replace("name: workflow", &format!("name: {name}"))
             .replace("\ndo:", "\nschedule: { every: PT1S }\ndo:");
-        let d = rt.save(name, &definition).unwrap();
-        rt.activate(name, d.version).unwrap();
+        let d = rt.save(name, &definition).await.unwrap();
+        rt.activate(name, d.version).await.unwrap();
     };
-    every("healthy", "  - ok: { set: { ok: true } }");
-    every("broken", "  - fetch: { call: read, with: {} }");
+    every("healthy", "  - ok: { set: { ok: true } }").await;
+    every("broken", "  - fetch: { call: read, with: {} }").await;
     rt.set_registry(Arc::new(Registry::new()));
     let stop = CancellationToken::new();
     // One second per few ticks, until the trip is handed on, and three
@@ -946,15 +948,15 @@ async fn a_scheduled_definition_the_host_cannot_admit_trips_without_stopping_the
     result.expect("a refused admission does not stop the worker");
     let (tripped_at, event) = trip.expect("the trip's notice reached the sink");
     assert_eq!((event["type"].as_str(), event["subject"].as_str()), (Some(durable::TRIPPED), Some("broken")));
-    let d = rt.definitions("broken").unwrap();
+    let d = rt.definitions("broken").await.unwrap();
     let trip = d.tripped.expect("tripped at the threshold");
     assert_eq!((trip.faults, trip.threshold), (3, 3));
     assert!(trip.reason.is("configuration"), "{:?}", trip.reason);
     assert_eq!(event["data"]["run"].as_str(), Some(trip.run.as_str()));
-    assert!(rt.triggers("broken").unwrap().is_empty(), "its schedule stops");
+    assert!(rt.triggers("broken").await.unwrap().is_empty(), "its schedule stops");
     // Exactly the three refused slots, each a run that ended faulted at its
     // admission, with nothing executed.
-    let broken = rt.list(Some("broken"), "").unwrap();
+    let broken = rt.list(Some("broken"), "").await.unwrap();
     assert_eq!(broken.len(), 3, "{broken:?}");
     for run in &broken {
         assert!(run.admission.id.starts_with("schedule:broken:every:"), "{}", run.admission.id);
@@ -964,16 +966,16 @@ async fn a_scheduled_definition_the_host_cannot_admit_trips_without_stopping_the
             "{error:?}"
         );
         assert_eq!(run.ended_ms, Some(run.admitted_ms), "ended in its admission's commit");
-        assert!(rt.records(&run.admission.id).unwrap().is_empty());
+        assert!(rt.records(&run.admission.id).await.unwrap().is_empty());
     }
     assert_eq!(trip.run, broken.last().unwrap().admission.id);
     assert_eq!(reads.load(Ordering::SeqCst), 0);
     // `healthy` kept firing, before and after the trip.
-    let healthy = rt.list(Some("healthy"), "").unwrap();
+    let healthy = rt.list(Some("healthy"), "").await.unwrap();
     let last = |runs: &[durable::SavedRun]| runs.iter().map(|r| r.admitted_ms).max().unwrap_or_default();
     assert!(last(&healthy) >= (tripped_at + 2) * 1000, "{healthy:?}");
     assert!(healthy.iter().all(|r| !matches!(r.outcome, Some(Status::Faulted(_)))), "{healthy:?}");
-    assert_eq!(rt.definitions("healthy").unwrap().consecutive_faults, 0);
+    assert_eq!(rt.definitions("healthy").await.unwrap().consecutive_faults, 0);
 }
 
 /// The refused slot and its run commit together: a process that dies after
@@ -991,50 +993,50 @@ async fn a_refused_slot_is_recorded_once_across_a_restart() {
         let definition = yaml("  - fetch: { call: read, with: {} }")
             .replace("name: workflow", &format!("name: {name}"))
             .replace("\ndo:", &format!("\nschedule: {{ {schedule} }}\ndo:"));
-        let d = rt.save(name, &definition).unwrap();
-        rt.activate(name, d.version).unwrap();
+        let d = rt.save(name, &definition).await.unwrap();
+        rt.activate(name, d.version).await.unwrap();
     }
     drop(rt);
     // The next release has no `read`.
     time.0.store(1000, Ordering::SeqCst);
     let rt = open(Registry::new());
-    assert!(rt.fire_due().unwrap().is_empty(), "nothing admitted to run");
-    let failed = |rt: &Runtime, id: &str| {
-        let run = rt.get(id).unwrap().unwrap_or_else(|| panic!("{id} not recorded"));
+    assert!(rt.fire_due().await.unwrap().is_empty(), "nothing admitted to run");
+    let failed = async |rt: &Runtime, id: &str| {
+        let run = rt.get(id).await.unwrap().unwrap_or_else(|| panic!("{id} not recorded"));
         matches!(run.outcome, Some(Status::Faulted(e)) if e.is("configuration"))
     };
-    assert!(failed(&rt, "schedule:broken:every:1000"));
-    assert!(failed(&rt, "schedule:later:after:1:0000000001"));
-    let next = |rt: &Runtime, name: &str| rt.triggers(name).unwrap()[0].1.at_ms;
-    assert_eq!((next(&rt, "broken"), next(&rt, "later")), (Some(2000), Some(11_000)));
+    assert!(failed(&rt, "schedule:broken:every:1000").await);
+    assert!(failed(&rt, "schedule:later:after:1:0000000001").await);
+    let next = async |rt: &Runtime, name: &str| rt.triggers(name).await.unwrap()[0].1.at_ms;
+    assert_eq!((next(&rt, "broken").await, next(&rt, "later").await), (Some(2000), Some(11_000)));
     drop(rt);
     // Restarted before the next tick, at the same instant: nothing again.
     let rt = open(Registry::new());
-    assert!(rt.fire_due().unwrap().is_empty());
-    let count = |rt: &Runtime, name: &str| {
-        (rt.list(Some(name), "").unwrap().len(), rt.definitions(name).unwrap().consecutive_faults)
+    assert!(rt.fire_due().await.unwrap().is_empty());
+    let count = async |rt: &Runtime, name: &str| {
+        (rt.list(Some(name), "").await.unwrap().len(), rt.definitions(name).await.unwrap().consecutive_faults)
     };
-    assert_eq!((count(&rt, "broken"), count(&rt, "later")), ((1, 1), (1, 1)));
+    assert_eq!((count(&rt, "broken").await, count(&rt, "later").await), ((1, 1), (1, 1)));
     time.0.store(2000, Ordering::SeqCst);
-    rt.fire_due().unwrap();
-    assert_eq!((count(&rt, "broken"), count(&rt, "later")), ((2, 2), (1, 1)));
+    rt.fire_due().await.unwrap();
+    assert_eq!((count(&rt, "broken").await, count(&rt, "later").await), ((2, 2), (1, 1)));
     // Down until 11 s: `broken`'s missed slots run once, late (`catchup:
     // latest`), its third fault trips it; `later` refuses its second run.
     time.0.store(11_000, Ordering::SeqCst);
-    rt.fire_due().unwrap();
-    assert!(failed(&rt, "schedule:broken:every:3000") && failed(&rt, "schedule:later:after:1:0000000002"));
-    assert_eq!((count(&rt, "broken"), count(&rt, "later")), ((3, 3), (2, 2)));
-    let trip = rt.definitions("broken").unwrap().tripped.expect("tripped");
+    rt.fire_due().await.unwrap();
+    assert!(failed(&rt, "schedule:broken:every:3000").await && failed(&rt, "schedule:later:after:1:0000000002").await);
+    assert_eq!((count(&rt, "broken").await, count(&rt, "later").await), ((3, 3), (2, 2)));
+    let trip = rt.definitions("broken").await.unwrap().tripped.expect("tripped");
     assert_eq!(trip.run, "schedule:broken:every:3000");
-    assert!(rt.triggers("broken").unwrap().is_empty());
-    assert_eq!(next(&rt, "later"), Some(21_000));
+    assert!(rt.triggers("broken").await.unwrap().is_empty());
+    assert_eq!(next(&rt, "later").await, Some(21_000));
     // Another release brings `read` back; only an activation resumes `broken`.
     rt.set_registry(Arc::new(counter_registry(Arc::default(), Arc::default())));
     time.0.store(21_000, Ordering::SeqCst);
-    assert_eq!(rt.fire_due().unwrap(), vec!["schedule:later:after:1:0000000003".to_string()]);
-    rt.activate("broken", 1).unwrap();
+    assert_eq!(rt.fire_due().await.unwrap(), vec!["schedule:later:after:1:0000000003".to_string()]);
+    rt.activate("broken", 1).await.unwrap();
     time.0.store(22_000, Ordering::SeqCst);
-    assert_eq!(rt.fire_due().unwrap(), vec!["schedule:broken:every:22000".to_string()]);
+    assert_eq!(rt.fire_due().await.unwrap(), vec!["schedule:broken:every:22000".to_string()]);
 }
 
 /// A definition that no longer validates against the host (here a host whose
@@ -1046,41 +1048,42 @@ async fn invalid_definitions_and_event_schedules_are_refused_per_definition() {
     let store: Arc<dyn RunStore> = Arc::new(durable::memory::memory());
     let time = Arc::new(Time::default());
     let rt = runtime(store.clone(), counter_registry(Arc::default(), Arc::default()), time.clone());
-    let save_as = |name: &str, document: &str| {
-        let d = rt.save(name, document).unwrap();
-        rt.activate(name, d.version).unwrap();
+    let save_as = async |name: &str, document: &str| {
+        let d = rt.save(name, document).await.unwrap();
+        rt.activate(name, d.version).await.unwrap();
     };
     save_as(
         "bounded",
         "document: { dsl: '1.0.4', namespace: test, name: bounded, version: '1.0.0', metadata: { limits: { max_jumps: 30 } } }\nschedule: { every: PT1S }\ndo:\n  - ok: { set: { ok: true } }\n",
-    );
+    ).await;
     save_as(
         "orders",
         &yaml("  - fetch: { call: read, with: {} }")
             .replace("name: workflow", "name: orders")
             .replace("\ndo:", "\nschedule: { on: { one: { with: { type: order } } } }\ndo:"),
-    );
+    )
+    .await;
     let mut config = Config::default();
     config.limits.max_jumps = 10;
     let lowered = Runtime::new(store, Arc::new(Registry::new()), config, time.clone(), tracer()).unwrap();
     time.0.store(1000, Ordering::SeqCst);
-    assert!(lowered.fire_due().unwrap().is_empty());
-    let run = lowered.get("schedule:bounded:every:1000").unwrap().expect("recorded");
+    assert!(lowered.fire_due().await.unwrap().is_empty());
+    let run = lowered.get("schedule:bounded:every:1000").await.unwrap().expect("recorded");
     assert!(matches!(&run.outcome, Some(Status::Faulted(e)) if e.is("validation")), "{run:?}");
-    assert_eq!(lowered.definitions("bounded").unwrap().consecutive_faults, 1);
-    assert_eq!(lowered.triggers("bounded").unwrap()[0].1.at_ms, Some(2000));
+    assert_eq!(lowered.definitions("bounded").await.unwrap().consecutive_faults, 1);
+    assert_eq!(lowered.triggers("bounded").await.unwrap()[0].1.at_ms, Some(2000));
     // `start` still answers its caller with the error and records nothing.
-    let e = lowered.start("direct", "bounded", json!({})).unwrap_err();
+    let e = lowered.start("direct", "bounded", json!({})).await.unwrap_err();
     assert!(e.is::<ouro_runtime::InvalidDefinition>(), "{e:#}");
-    assert!(lowered.get("direct").unwrap().is_none());
+    assert!(lowered.get("direct").await.unwrap().is_none());
     let order = json!({ "id": "1", "source": "/shop", "type": "order", "data": { "n": 1 } });
-    assert!(lowered.publish(order.clone()).unwrap().is_empty());
-    let orders = lowered.list(Some("orders"), "").unwrap();
+    assert!(lowered.publish(order.clone()).await.unwrap().is_empty());
+    let orders = lowered.list(Some("orders"), "").await.unwrap();
     assert_eq!(orders.len(), 1);
     assert!(matches!(&orders[0].outcome, Some(Status::Faulted(e)) if e.is("configuration")), "{orders:?}");
-    assert_eq!(lowered.definitions("orders").unwrap().consecutive_faults, 1);
-    assert!(lowered.publish(order).unwrap().is_empty());
-    assert_eq!(lowered.list(Some("orders"), "").unwrap().len(), 1, "one event starts at most one run");
+    assert_eq!(lowered.definitions("orders").await.unwrap().consecutive_faults, 1);
+    assert!(lowered.publish(order).await.unwrap().is_empty());
+    assert_eq!(lowered.list(Some("orders"), "").await.unwrap().len(), 1, "one event starts at most one run");
 }
 
 /// A schema resolver that fails is an interruption of the host, not a fault
@@ -1111,76 +1114,76 @@ async fn a_failing_schema_resolver_retries_the_slot_without_consuming_or_countin
         let definition = yaml("  - ok: { set: { ok: true } }")
             .replace("name: workflow", &format!("name: {name}"))
             .replace("\ndo:", &format!("\nschedule: {{ {schedule} }}\n{extra}do:"));
-        let d = rt.save(name, &definition).unwrap();
-        rt.activate(name, d.version).unwrap();
+        let d = rt.save(name, &definition).await.unwrap();
+        rt.activate(name, d.version).await.unwrap();
     }
     resolver.0.store(false, Ordering::SeqCst);
     let stop = CancellationToken::new();
-    let tick = |rt: &Runtime, at: i64| {
+    let tick = async |rt: &Runtime, at: i64| {
         time.0.store(at, Ordering::SeqCst);
-        rt.fire_due().expect("an interrupted admission does not stop the scheduler")
+        rt.fire_due().await.expect("an interrupted admission does not stop the scheduler")
     };
-    let retry = |rt: &Runtime| {
-        let (_, t) = rt.triggers("typed").unwrap().remove(0);
+    let retry = async |rt: &Runtime| {
+        let (_, t) = rt.triggers("typed").await.unwrap().remove(0);
         (t.at_ms, t.state["retry"]["slot"].as_i64(), t.state["retry"]["failures"].as_u64())
     };
     // Due at 1, 2, 4 s: 1 s doubling, the slot kept, nothing recorded or counted.
     for (at, next, failures) in [(1000, 2000, 1), (2000, 4000, 2), (4000, 8000, 3)] {
-        for id in tick(&rt, at) {
+        for id in tick(&rt, at).await {
             assert!(id.starts_with("schedule:healthy:"), "{id}");
             rt.drive(&id, &stop).await.unwrap();
         }
-        assert_eq!(retry(&rt), (Some(next), Some(1000), Some(failures)));
+        assert_eq!(retry(&rt).await, (Some(next), Some(1000), Some(failures)));
     }
-    assert!(rt.list(Some("typed"), "").unwrap().is_empty(), "the slot is not consumed");
-    let d = rt.definitions("typed").unwrap();
+    assert!(rt.list(Some("typed"), "").await.unwrap().is_empty(), "the slot is not consumed");
+    let d = rt.definitions("typed").await.unwrap();
     assert_eq!((d.consecutive_faults, d.tripped), (0, None), "past the threshold of 3, still not counted");
-    assert_eq!(rt.list(Some("healthy"), "").unwrap().len(), 3, "the others went on");
+    assert_eq!(rt.list(Some("healthy"), "").await.unwrap().len(), 3, "the others went on");
     // An `on` schedule: the event is not taken, the publisher hears why.
     let order = json!({ "id": "1", "source": "/shop", "type": "order" });
-    let e = rt.publish(order.clone()).unwrap_err();
+    let e = rt.publish(order.clone()).await.unwrap_err();
     assert!(e.is::<ouro_runtime::ResourceUnavailable>(), "{e:#}");
-    assert!(rt.list(Some("orders"), "").unwrap().is_empty());
-    assert_eq!(rt.definitions("orders").unwrap().consecutive_faults, 0);
+    assert!(rt.list(Some("orders"), "").await.unwrap().is_empty());
+    assert_eq!(rt.definitions("orders").await.unwrap().consecutive_faults, 0);
     // The backoff is stored with the trigger: a restart does not shorten it.
     drop(rt);
     let rt = open();
-    tick(&rt, 5000);
-    assert_eq!(retry(&rt).0, Some(8000));
+    tick(&rt, 5000).await;
+    assert_eq!(retry(&rt).await.0, Some(8000));
     // The resolver answers again: the kept slot runs, late, once.
     resolver.0.store(true, Ordering::SeqCst);
-    assert!(tick(&rt, 8000).contains(&"schedule:typed:every:1000".to_string()));
-    assert_eq!(retry(&rt), (Some(9000), None, None));
+    assert!(tick(&rt, 8000).await.contains(&"schedule:typed:every:1000".to_string()));
+    assert_eq!(retry(&rt).await, (Some(9000), None, None));
     assert_eq!(
         rt.drive("schedule:typed:every:1000", &stop).await.unwrap(),
         Some(Status::Completed(json!({ "ok": true })))
     );
-    assert_eq!(rt.publish(order).unwrap().len(), 1, "republished, the event starts its run");
+    assert_eq!(rt.publish(order).await.unwrap().len(), 1, "republished, the event starts its run");
     // The worker's hand-off of a trip notice to such an `on` schedule keeps
     // the notice, after its backoff, until the resolver answers.
     let watch = yaml("  - ok: { set: { ok: true } }").replace("name: workflow", "name: watch").replace(
         "\ndo:",
         &format!("\nschedule: {{ on: {{ one: {{ with: {{ type: ouro.definition.tripped }} }} }} }}\n{typed}do:"),
     );
-    let d = rt.save("watch", &watch).unwrap();
-    rt.activate("watch", d.version).unwrap();
+    let d = rt.save("watch", &watch).await.unwrap();
+    rt.activate("watch", d.version).await.unwrap();
     let boom = yaml("  - boom: { raise: { error: { type: 'urn:test:boom', status: 500 } } }")
         .replace("name: workflow", "name: boom");
-    let d = rt.save("boom", &boom).unwrap();
-    rt.activate("boom", d.version).unwrap();
+    let d = rt.save("boom", &boom).await.unwrap();
+    rt.activate("boom", d.version).await.unwrap();
     for n in 0..3 {
-        rt.start(&format!("boom{n}"), "boom", json!({})).unwrap();
+        rt.start(&format!("boom{n}"), "boom", json!({})).await.unwrap();
         rt.drive(&format!("boom{n}"), &stop).await.unwrap();
     }
-    assert!(rt.definitions("boom").unwrap().tripped.is_some());
+    assert!(rt.definitions("boom").await.unwrap().tripped.is_some());
     resolver.0.store(false, Ordering::SeqCst);
     assert_eq!(rt.notify(&stop).await.unwrap(), 0, "kept");
-    assert!(rt.list(Some("watch"), "").unwrap().is_empty());
+    assert!(rt.list(Some("watch"), "").await.unwrap().is_empty());
     resolver.0.store(true, Ordering::SeqCst);
     assert_eq!(rt.notify(&stop).await.unwrap(), 0, "still backing off");
     time.0.store(9000, Ordering::SeqCst);
     assert_eq!(rt.notify(&stop).await.unwrap(), 1);
-    assert_eq!(rt.list(Some("watch"), "").unwrap().len(), 1);
+    assert_eq!(rt.list(Some("watch"), "").await.unwrap().len(), 1);
 }
 
 #[tokio::test(start_paused = true)]
@@ -1209,8 +1212,8 @@ async fn independent_store_cancel_fires_in_flight_token_within_one_heartbeat() {
         tracer(),
     )
     .unwrap();
-    save(&rt, &yaml("  - hold: { call: hold }"));
-    rt.start("r", "workflow", Value::Null).unwrap();
+    save(&rt, &yaml("  - hold: { call: hold }")).await;
+    rt.start("r", "workflow", Value::Null).await.unwrap();
     let remote =
         ouro_runtime::control::Control::new(Arc::new(durable::sqlite::open(path).unwrap()), Arc::new(Time::default()));
     let stop = CancellationToken::new();
@@ -1219,14 +1222,14 @@ async fn independent_store_cancel_fires_in_flight_token_within_one_heartbeat() {
         entered.notified().await;
         let token = token.lock().unwrap().clone().unwrap();
         assert!(!token.is_cancelled());
-        remote.cancel(&operator("remote-cancel"), "r").unwrap();
+        remote.cancel(&operator("remote-cancel"), "r").await.unwrap();
         let started = tokio::time::Instant::now();
         tokio::time::timeout(heartbeat + Duration::from_millis(1), token.cancelled()).await.unwrap();
         assert!(started.elapsed() <= heartbeat);
     };
     let (result, ()) = tokio::join!(drive, cancel);
     assert_eq!(result.unwrap(), Some(Status::Cancelled));
-    assert_eq!(rt.calls("r").unwrap()[0].state, CallStatus::Pending);
+    assert_eq!(rt.calls("r").await.unwrap()[0].state, CallStatus::Pending);
 }
 
 fn operator(id: &str) -> ouro_runtime::control::Request {
@@ -1245,12 +1248,12 @@ async fn store_only_control_answers_a_multi_event_listen_with_persisted_correlat
         &yaml(
             "  - decision:\n      timeout: { after: PT1S }\n      listen:\n        to:\n          all:\n            - with: { type: first }\n              correlate: { ticket: { from: .ticket } }\n            - with: { type: second }\n              correlate: { ticket: { from: .ticket } }",
         ),
-    );
-    rt.start("r", "workflow", json!({})).unwrap();
+    ).await;
+    rt.start("r", "workflow", json!({})).await.unwrap();
     let stop = CancellationToken::new();
     assert!(matches!(rt.drive("r", &stop).await.unwrap(), Some(Status::Waiting { .. })));
     let control = Control::new(Arc::new(durable::sqlite::open(path).unwrap()), clock.clone());
-    let waits = control.waits(&Waits::default(), None, 10).unwrap().items;
+    let waits = control.waits(&Waits::default(), None, 10).await.unwrap().items;
     assert_eq!(waits.len(), 1);
     let wait = &waits[0];
     assert_eq!(wait.waiting.types, ["first", "second"]);
@@ -1258,26 +1261,26 @@ async fn store_only_control_answers_a_multi_event_listen_with_persisted_correlat
     assert_eq!(wait.waiting.since_ms, 0);
     let event =
         |id: &str, type_: &str, ticket| json!({"source":"/operator","id":id,"type":type_,"ticket":ticket,"data":{}});
-    control.respond(&operator("first"), "r", &wait.key, event("1", "first", 42)).unwrap();
+    control.respond(&operator("first"), "r", &wait.key, event("1", "first", 42)).await.unwrap();
     assert!(matches!(rt.drive("r", &stop).await.unwrap(), Some(Status::Waiting { .. })));
-    let wait = control.waits(&Waits::default(), None, 10).unwrap().items.pop().unwrap();
+    let wait = control.waits(&Waits::default(), None, 10).await.unwrap().items.pop().unwrap();
     assert_eq!(wait.waiting.progress.expectations["ticket"], 42);
-    assert!(control.respond(&operator("filled"), "r", &wait.key, event("filled", "first", 42)).is_err());
-    assert!(control.respond(&operator("wrong"), "r", &wait.key, event("wrong", "second", 43)).is_err());
+    assert!(control.respond(&operator("filled"), "r", &wait.key, event("filled", "first", 42)).await.is_err());
+    assert!(control.respond(&operator("wrong"), "r", &wait.key, event("wrong", "second", 43)).await.is_err());
     let answer = event("2", "second", 42);
-    control.respond(&operator("second"), "r", &wait.key, answer.clone()).unwrap();
+    control.respond(&operator("second"), "r", &wait.key, answer.clone()).await.unwrap();
     assert!(matches!(rt.drive("r", &stop).await.unwrap(), Some(Status::Completed(_))));
-    assert!(control.waits(&Waits::default(), None, 10).unwrap().items.is_empty());
-    control.respond(&operator("retry"), "r", &wait.key, answer).unwrap();
-    let inspection = control.inspect("r").unwrap().unwrap();
+    assert!(control.waits(&Waits::default(), None, 10).await.unwrap().items.is_empty());
+    control.respond(&operator("retry"), "r", &wait.key, answer).await.unwrap();
+    let inspection = control.inspect("r").await.unwrap().unwrap();
     assert!(inspection.calls.is_empty() && inspection.waits.is_empty());
     assert_eq!(inspection.snapshot.run.state, durable::RunState::Completed);
     let filter = Runs { definition: Some("workflow".into()), ..Runs::default() };
-    assert_eq!(control.counts(&filter, false, None, 10).unwrap().states["completed"], 1);
+    assert_eq!(control.counts(&filter, false, None, 10).await.unwrap().states["completed"], 1);
     let filter = Runs { since_ms: Some(0), before_ms: Some(1000), ..filter };
-    assert_eq!(control.counts(&filter, true, None, 10).unwrap().states["completed"], 1);
-    assert_eq!(control.history(&filter, None, 10).unwrap().items.len(), 1);
-    assert_eq!(control.journal(Some("r"), None, 10).unwrap().items.len(), 3);
+    assert_eq!(control.counts(&filter, true, None, 10).await.unwrap().states["completed"], 1);
+    assert_eq!(control.history(&filter, None, 10).await.unwrap().items.len(), 1);
+    assert_eq!(control.journal(Some("r"), None, 10).await.unwrap().items.len(), 3);
 }
 
 #[tokio::test]
@@ -1286,33 +1289,35 @@ async fn control_respond_supports_wildcard_listens_and_refuses_expired_waits() {
     let store = Arc::new(durable::memory::memory());
     let clock = Arc::new(Time::default());
     let rt = runtime(store.clone(), Registry::new(), clock.clone());
-    save(&rt, &yaml("  - decision: { timeout: { after: PT1S }, listen: { to: { any: [] } } }"));
+    save(&rt, &yaml("  - decision: { timeout: { after: PT1S }, listen: { to: { any: [] } } }")).await;
     let control = Control::new(store, clock.clone());
     let stop = CancellationToken::new();
     for id in ["answered", "expired"] {
-        rt.start(id, "workflow", json!({})).unwrap();
+        rt.start(id, "workflow", json!({})).await.unwrap();
         assert!(matches!(rt.drive(id, &stop).await.unwrap(), Some(Status::Waiting { .. })));
     }
     let wait = control
         .waits(&Waits { run: Some("answered".into()), ..Waits::default() }, None, 10)
+        .await
         .unwrap()
         .items
         .pop()
         .unwrap();
     assert_eq!(wait.waiting.types, ["*"]);
     let event = json!({"source":"/operator","id":"answer","type":"choice","data":42});
-    control.respond(&operator("answer"), "answered", &wait.key, event.clone()).unwrap();
+    control.respond(&operator("answer"), "answered", &wait.key, event.clone()).await.unwrap();
     assert_eq!(rt.drive("answered", &stop).await.unwrap(), Some(Status::Completed(json!([42]))));
     let wait = control
         .waits(&Waits { run: Some("expired".into()), ..Waits::default() }, None, 10)
+        .await
         .unwrap()
         .items
         .pop()
         .unwrap();
     clock.0.store(1000, Ordering::SeqCst);
-    assert!(control.respond(&operator("late"), "expired", &wait.key, event).is_err());
+    assert!(control.respond(&operator("late"), "expired", &wait.key, event).await.is_err());
     assert!(matches!(rt.drive("expired", &stop).await.unwrap(), Some(Status::Faulted(_))));
-    assert!(control.waits(&Waits::default(), None, 10).unwrap().items.is_empty());
+    assert!(control.waits(&Waits::default(), None, 10).await.unwrap().items.is_empty());
 }
 
 #[tokio::test]
@@ -1330,10 +1335,14 @@ async fn emergency_stop_preserves_delivery_at_the_next_step_boundary_and_resumes
         registry
             .register(
                 Function::new("stop", json!({}), json!({}), move |_: Value, _: FunctionContext| {
-                    if calls.fetch_add(1, Ordering::SeqCst) == 0 {
-                        stop.execute(&operator("stop"), &Command::Stop { enabled: true }).unwrap();
+                    let first = calls.fetch_add(1, Ordering::SeqCst) == 0;
+                    let stop = stop.clone();
+                    async move {
+                        if first {
+                            stop.execute(&operator("stop"), &Command::Stop { enabled: true }).await.unwrap();
+                        }
+                        Ok(json!({}))
                     }
-                    async { Ok(json!({})) }
                 })
                 .with_delivery(delivery),
             )
@@ -1346,15 +1355,15 @@ async fn emergency_stop_preserves_delivery_at_the_next_step_boundary_and_resumes
             }))
             .unwrap();
         let rt = runtime(store, registry, clock);
-        save(&rt, &yaml("  - stop: { call: stop }\n  - next: { call: next }"));
-        rt.start("r", "workflow", json!({})).unwrap();
+        save(&rt, &yaml("  - stop: { call: stop }\n  - next: { call: next }")).await;
+        rt.start("r", "workflow", json!({})).await.unwrap();
         let token = CancellationToken::new();
         assert!(matches!(rt.drive("r", &token).await.unwrap(), Some(Status::Interrupted(_))));
         assert_eq!(second.load(Ordering::SeqCst), 0);
-        assert_eq!(rt.get("r").unwrap().unwrap().state, durable::RunState::Ready);
-        assert!(rt.start("blocked", "workflow", json!({})).unwrap_err().is::<ouro_runtime::control::Stopped>());
+        assert_eq!(rt.get("r").await.unwrap().unwrap().state, durable::RunState::Ready);
+        assert!(rt.start("blocked", "workflow", json!({})).await.unwrap_err().is::<ouro_runtime::control::Stopped>());
         assert_eq!(rt.recover_once(&token).await.unwrap(), 0);
-        control.emergency_stop(&operator("clear"), false).unwrap();
+        control.emergency_stop(&operator("clear"), false).await.unwrap();
         let outcome = rt.drive("r", &token).await.unwrap();
         if delivery == Delivery::AtLeastOnce {
             assert!(matches!(outcome, Some(Status::Completed(_))));
@@ -1362,7 +1371,7 @@ async fn emergency_stop_preserves_delivery_at_the_next_step_boundary_and_resumes
         } else {
             assert!(matches!(outcome, Some(Status::Faulted(_))));
             assert_eq!((first.load(Ordering::SeqCst), second.load(Ordering::SeqCst)), (1, 0));
-            assert_eq!(rt.calls("r").unwrap()[0].state, CallStatus::Unknown);
+            assert_eq!(rt.calls("r").await.unwrap()[0].state, CallStatus::Unknown);
         }
     }
 }
@@ -1386,13 +1395,13 @@ async fn attributed_in_process_cancel_fires_the_token_synchronously() {
         }))
         .unwrap();
     let rt = runtime(Arc::new(durable::memory::memory()), registry, Arc::new(Time::default()));
-    save(&rt, &yaml("  - hold: { call: hold }"));
-    rt.start("r", "workflow", Value::Null).unwrap();
+    save(&rt, &yaml("  - hold: { call: hold }")).await;
+    rt.start("r", "workflow", Value::Null).await.unwrap();
     let stop = CancellationToken::new();
     let cancel = async {
         entered.notified().await;
         assert_eq!(
-            rt.control(&operator("cancel"), &Command::Cancel { run: "r".into() }).unwrap(),
+            rt.control(&operator("cancel"), &Command::Cancel { run: "r".into() }).await.unwrap(),
             Reply::Changed(true)
         );
         assert!(token.lock().unwrap().as_ref().unwrap().is_cancelled());
@@ -1415,17 +1424,135 @@ async fn operator_answers_respect_enclosing_workflow_and_task_deadlines() {
                 "  - enclosing:\n      timeout: { after: PT1S }\n      do:\n        - decision: { listen: { to: { any: [] } } }",
             )
         };
-        save(&rt, &definition);
-        rt.start("r", "workflow", Value::Null).unwrap();
+        save(&rt, &definition).await;
+        rt.start("r", "workflow", Value::Null).await.unwrap();
         assert!(matches!(rt.drive("r", &CancellationToken::new()).await.unwrap(), Some(Status::Waiting { .. })));
         let control = Control::new(store, clock.clone());
-        let wait = control.waits(&Waits::default(), None, 10).unwrap().items.pop().unwrap();
+        let wait = control.waits(&Waits::default(), None, 10).await.unwrap().items.pop().unwrap();
         assert_eq!(wait.waiting.timeout_ms, Some(1000));
         clock.0.store(1000, Ordering::SeqCst);
         assert!(
             control
                 .respond(&operator("late"), "r", &wait.key, json!({"source":"/operator", "id":"late", "type":"answer"}))
+                .await
                 .is_err()
         );
     }
+}
+
+// ── async seams on a current-thread runtime (#7) ───────────────────────────
+
+/// `write` is at most once and counted; `hold` never answers on the first
+/// host (`held`: it signals and waits) and answers at once on the second;
+/// `meet` waits until three calls meet, so it completes only when three runs
+/// are in flight together.
+fn crash_registry(writes: Arc<AtomicUsize>, held: Option<Arc<tokio::sync::Notify>>) -> Registry {
+    let mut registry = Registry::new();
+    registry
+        .register(
+            Function::new("write", json!({}), json!({}), move |_: Value, _: FunctionContext| {
+                writes.fetch_add(1, Ordering::SeqCst);
+                async { Ok(json!({})) }
+            })
+            .with_delivery(Delivery::AtMostOnce),
+        )
+        .unwrap();
+    registry
+        .register(Function::new("hold", json!({}), json!({}), move |_: Value, _: FunctionContext| {
+            let held = held.clone();
+            async move {
+                if let Some(held) = held {
+                    held.notify_one();
+                    std::future::pending::<()>().await;
+                }
+                Ok(json!({}))
+            }
+        }))
+        .unwrap();
+    let meeting = Arc::new(tokio::sync::Barrier::new(3));
+    registry
+        .register(Function::new("meet", json!({}), json!({}), move |_: Value, _: FunctionContext| {
+            let meeting = meeting.clone();
+            async move {
+                meeting.wait().await;
+                Ok(json!({}))
+            }
+        }))
+        .unwrap();
+    registry
+}
+
+/// One thread runs everything. A worker dies mid-run: its `drive` future is
+/// dropped with a call in flight, so nothing releases or renews the lease. The
+/// lease then simply ends: before its expiry no other worker can claim the
+/// run, after it another runtime over the same database resumes it from its
+/// records without sending the at-most-once write again. Then three runs make
+/// progress together under one worker on that same thread.
+fn current_thread_crash_and_resume(open: impl Fn() -> Arc<dyn RunStore>) {
+    let executor = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    executor.block_on(async {
+        let writes = Arc::new(AtomicUsize::new(0));
+        let held = Arc::new(tokio::sync::Notify::new());
+        let clock = Arc::new(Time::default());
+        let first = runtime(open(), crash_registry(writes.clone(), Some(held.clone())), clock.clone());
+        save(&first, &yaml("  - write: { call: write }\n  - hold: { call: hold }\n  - done: { set: { ok: true } }"))
+            .await;
+        first.start("r", "workflow", json!({})).await.unwrap();
+        let crashed = CancellationToken::new();
+        tokio::select! {
+            _ = first.drive("r", &crashed) => panic!("the held run completed"),
+            _ = held.notified() => {}
+        }
+        drop(first);
+        let lease = first_lease(&open, "r").await;
+        assert_eq!(lease, durable::LEASE_MS, "the crashed worker's lease from its claim at 0");
+        // Nothing renews a dropped run's lease, however long its heartbeat waits.
+        clock.0.store(durable::LEASE_MS - 1, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(first_lease(&open, "r").await, lease);
+        let second = runtime(open(), crash_registry(writes.clone(), None), clock.clone());
+        assert_eq!(second.drive("r", &CancellationToken::new()).await.unwrap(), None, "claimed before its lease ended");
+        clock.0.store(durable::LEASE_MS, Ordering::SeqCst);
+        assert_eq!(second.recover_once(&CancellationToken::new()).await.unwrap(), 1);
+        let run = second.get("r").await.unwrap().unwrap();
+        assert_eq!(run.outcome, Some(Status::Completed(json!({"ok": true}))));
+        assert_eq!(writes.load(Ordering::SeqCst), 1, "the at-most-once write was sent again");
+
+        let d =
+            second.save("meeting", &yaml("  - meet: { call: meet }").replace("name: workflow", "name: meeting")).await;
+        second.activate("meeting", d.unwrap().version).await.unwrap();
+        for n in 0..3 {
+            second.start(&format!("m{n}"), "meeting", json!({})).await.unwrap();
+        }
+        let stop = CancellationToken::new();
+        let met = async {
+            for n in 0..3 {
+                while second.get(&format!("m{n}")).await.unwrap().unwrap().outcome.is_none() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }
+            stop.cancel();
+        };
+        let (worker, ()) =
+            tokio::time::timeout(Duration::from_secs(30), async { tokio::join!(second.worker(stop.clone()), met) })
+                .await
+                .expect("three runs did not progress together on one thread");
+        worker.unwrap();
+    });
+}
+async fn first_lease(open: &impl Fn() -> Arc<dyn RunStore>, id: &str) -> i64 {
+    open().get(id).await.unwrap().unwrap().lease_until_ms.expect("a running run holds a lease")
+}
+#[test]
+fn memory_runs_crash_and_resume_on_a_current_thread_runtime() {
+    let store: Arc<dyn RunStore> = Arc::new(durable::memory::memory());
+    current_thread_crash_and_resume(|| store.clone());
+}
+#[test]
+fn sqlite_runs_crash_and_resume_on_a_current_thread_runtime() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("runs.sqlite");
+    // Each runtime opens its own connection to the same file, as a restarted
+    // process would.
+    current_thread_crash_and_resume(|| Arc::new(durable::sqlite::open(&path).unwrap()));
 }

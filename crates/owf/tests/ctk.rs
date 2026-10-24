@@ -23,11 +23,12 @@ use tokio_util::sync::CancellationToken;
 
 #[derive(Default)]
 struct Memory(Mutex<BTreeMap<String, Record>>);
+#[async_trait]
 impl Journal for Memory {
-    fn load(&self) -> anyhow::Result<BTreeMap<String, Record>> {
+    async fn load(&self) -> anyhow::Result<BTreeMap<String, Record>> {
         Ok(self.0.lock().unwrap().clone())
     }
-    fn save(&self, key: &str, record: &Record) -> anyhow::Result<()> {
+    async fn save(&self, key: &str, record: &Record) -> anyhow::Result<()> {
         self.0.lock().unwrap().insert(key.into(), record.clone());
         Ok(())
     }

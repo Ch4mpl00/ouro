@@ -42,6 +42,8 @@ Both input and output schemas are checked.
 and OpenTelemetry tracer. Call `save`, `activate`, and `start`, then `drive`
 for immediate execution or run `worker` at application startup. Admission
 persists before execution; `start` enqueues and is idempotent by run ID.
+Every call that reaches the store is `async` (below, Async seams); a
+`current_thread` Tokio runtime is enough.
 
 Every run starts with a check that each function it can call is registered:
 the functions its calls name, the process runners its `run:` tasks need
@@ -135,7 +137,7 @@ impl EventSink for Trips {
 }
 // …in the host's task, beside `worker`:
 while let Some(name) = trips.recv().await {
-    runtime.activate(&name, builtin_version(&name))?;
+    runtime.activate(&name, builtin_version(&name)).await?;
 }
 ```
 
@@ -203,9 +205,9 @@ let request = Request {
     actor: "operator".into(),
     reason: "investigate this run".into(),
 };
-control.cancel_tree(&request, "run-42")?;
-let page = control.list(&Runs::default(), None, 50)?;
-let waits = control.waits(&Waits::default(), None, 50)?;
+control.cancel_tree(&request, "run-42").await?;
+let page = control.list(&Runs::default(), None, 50).await?;
+let waits = control.waits(&Waits::default(), None, 50).await?;
 ```
 
 `cancel` and `cancel_tree` have the same owned-tree semantics: the run and
@@ -213,7 +215,7 @@ its transitive owned descendants end in one commit; independent runs remain
 independent. A lease holder discovers a remote cancel at its next renewal
 and cancels the token given to its function, within one configured heartbeat.
 `Runtime::control(request, command)` additionally cancels local tokens
-synchronously. The existing executor-level `Runtime::cancel` remains
+as soon as the command commits. The existing executor-level `Runtime::cancel` remains
 available. Cancellation cannot retract an effect already dispatched, and
 pending calls retain their declared delivery and unknown-outcome rules.
 
@@ -527,14 +529,69 @@ refused with an error rather than read as a run without evidence. Likewise a
 kept a predecessor for a breaker rollback, is refused rather than read as a
 definition that never tripped.
 
-The interpreter's persistence seams are synchronous. The Postgres adapter uses
-`tokio-postgres` and `deadpool-postgres` on a dedicated I/O thread with a
-64-request admission queue, at most 16 concurrent sessions and a 30-second
-transaction timeout. Dropping the backend drains its sessions and joins the
-I/O thread. The calling thread waits for the
-commit. Use a multithreaded Tokio host for concurrent workloads. Inject a
-`deadpool_postgres::Manager` with `PostgresBackend::with_manager` for TLS or
-custom connection settings; the URL convenience constructor uses `NoTls`.
+### Async seams
+
+Every persistence operation is asynchronous, from the interpreter down to the
+adapters: the interpreter awaits `Journal` (`load`, `save`, `spend`),
+`Events` (`waiting`, `register`, `unregister`, `subscribe`, `unsubscribe`,
+`take`) and `Children::start`; `RunStore`, `AtomicBackend` and `Transaction`
+are `async_trait` traits; and so are the runtime's store-backed calls and the
+operator `Control`. No call blocks a thread while it waits for a database,
+and none needs a particular Tokio flavour: a `current_thread` runtime drives
+runs, workers, crash recovery and the conformance suite as well as a
+multithreaded one does.
+
+- Memory runs each operation in one poll.
+- SQLite keeps one connection per backend behind an async mutex and runs each
+  statement on Tokio's blocking pool (any flavour has one; a runtime is
+  required). rusqlite is synchronous and SQLite admits one writer, so a pool
+  of more connections would only queue on the database's lock.
+- Postgres awaits `tokio-postgres` through a `deadpool-postgres` pool of at
+  most 16 sessions, with a 30-second deadline on each session wait,
+  statement and commit. Connections are spawned on the runtime that opens
+  them. Inject a `deadpool_postgres::Manager` with
+  `PostgresBackend::with_manager` for TLS or custom connection settings; the
+  URL convenience constructor uses `NoTls`.
+
+Cancellation. A dropped operation leaves no partial transaction: before its
+commit nothing it wrote is visible, and a commit already sent either commits
+whole or not at all (an ambiguous outcome, as for any commit error: recover
+from storage). Its connection is released: SQLite rolls back before the next
+transaction gets the connection, and a Postgres session that did not end in a
+known state (commit, refused commit, rollback round trip) is discarded, which
+makes the server roll the transaction back. Nothing renews a lease by itself:
+a dropped `drive` stops its heartbeat with it, and the lease ends at its
+expiry, after which another worker may claim the run.
+
+A store future suspended inside a transaction holds its connection (SQLite's
+only one, or a pooled session) until it is polled to its end or dropped.
+Poll it alongside other store work or drop it first; never await another
+operation on the same store while holding one unpolled. The runtime follows
+this rule itself: a run's heartbeat is polled with the run, the worker's tick
+work is a future polled with its runs, and a run is dropped before the store
+calls that follow its interruption.
+
+Breaking changes (issue #7), for hosts and adapters written against the
+synchronous seams:
+
+- `owf::durable::Journal`, `owf::run::Events` and `owf::run::Children` are
+  `#[async_trait]` traits; implementations add `async` to their methods
+  (`Events::notification` still returns a future). `Resources`, `Clock`
+  and `Observer` stay synchronous: they hold no store call.
+- `RunStore`, `AtomicBackend` and `Transaction` are `#[async_trait]` traits.
+  `Transaction` gains `rollback` (default: drop), which an adapter whose
+  rollback keeps a pooled connection implements.
+- `Runtime::save`, `activate`, `start`, `get`, `list`, `definitions`,
+  `records`, `calls`, `deliver`, `sweep`, `cancel`, `control`, `start_child`,
+  `triggers`, `queued`, `fire_due` and `publish`, and every `Control` method
+  but `new`, are `async`.
+- `PostgresBackend::connect`, `connect_config`, `connect_with_faults`,
+  `with_manager` and `postgres::connect` are `async`; the backend has no I/O
+  thread, request queue or transaction-wide timeout any more (each session
+  wait, statement and commit has its own 30-second deadline). SQLite's `open`
+  stays synchronous: call it while composing the host.
+- `conformance::run_all` is `async` and takes an `AsyncFn(&str)` factory;
+  `TestStore::reopen` returns a future (`conformance::Reopen`).
 
 ## Checks and example
 
@@ -554,12 +611,17 @@ The official conformance kit (`crates/owf/tests/ctk`) runs with
 `cargo test -p owf --test ctk`; its HTTP and OpenAPI scenarios use local
 fakes registered as `http` and `openapi` functions.
 
-`ouro_durable::conformance::run_all(factory)` is public. It checks admission,
+`ouro_durable::conformance::run_all(factory).await` is public and runs on the
+caller's runtime, whatever its flavour. It checks admission,
 fencing, immutable evidence, event histories, held listens, every interpreter
 checkpoint boundary, child notifications, rollback and ambiguous commits,
 corruption, concurrent claims, retention, liveness drains and a run tree's
 shared budget (restarts, failed commits, children, a race at the last unit),
-all overlap policies, queue promotion and a race at the schedule ceiling. Factories supply
+all overlap policies, queue promotion and a race at the schedule ceiling, and
+operations dropped mid-transaction or mid-statement. Its interpreter cases
+keep a paused clock on a runtime of their own and reach the store through
+blocking tasks of the caller's runtime, so real I/O never advances virtual
+time. Factories supply
 an independent reopen handle, persisted-row inspection and failure injection.
 
 `cargo test -p ouro-durable --test scalability -- --nocapture` checks every

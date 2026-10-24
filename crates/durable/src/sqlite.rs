@@ -1,17 +1,24 @@
 //! Embedded SQLite adapter. WAL and FULL durability are set on every open.
+//!
+//! rusqlite is synchronous, so a transaction holds the backend's one
+//! connection and runs each statement on Tokio's blocking pool: no async
+//! worker waits on the disk, and a backend has at most one statement in
+//! flight (SQLite admits one writer anyway). Any runtime flavour works,
+//! `current_thread` included; one is required, since statements are handed
+//! to its blocking pool.
 use crate::*;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
-use std::{
-    path::Path,
-    sync::{Arc, Mutex, MutexGuard},
-    time::Duration,
-};
+use std::{path::Path, sync::Arc, time::Duration};
+use tokio::sync::{Mutex, OwnedMutexGuard};
+
 pub struct SqliteBackend {
-    connection: Mutex<Connection>,
+    connection: Arc<Mutex<Connection>>,
     pub faults: Arc<FaultInjector>,
     pub metrics: Arc<Metrics>,
 }
 impl SqliteBackend {
+    /// Opens (and migrates) the database file. Blocking: call it while
+    /// composing the host, before serving.
     pub fn open(path: impl AsRef<Path>) -> anyhow::Result<Self> {
         let mut connection = Connection::open(path)?;
         connection.busy_timeout(Duration::from_secs(30))?;
@@ -25,84 +32,166 @@ impl SqliteBackend {
         }
         tx.commit()?;
         Ok(Self {
-            connection: Mutex::new(connection),
+            connection: Arc::new(Mutex::new(connection)),
             faults: Arc::new(FaultInjector::default()),
             metrics: Arc::new(Metrics::default()),
         })
     }
 }
-struct SqliteTransaction<'a> {
-    connection: MutexGuard<'a, Connection>,
-    backend: &'a SqliteBackend,
-    writes: usize,
-    committed: bool,
+
+/// The connection while a transaction is open on it. Dropped uncommitted,
+/// wherever that happens (with a dropped future, or in a blocking task that
+/// finishes after its caller went away), it rolls back before the
+/// connection is released to the next transaction.
+struct Session {
+    connection: OwnedMutexGuard<Connection>,
+    open: bool,
 }
-impl Drop for SqliteTransaction<'_> {
+impl Drop for Session {
     fn drop(&mut self) {
-        if !self.committed {
+        if self.open {
             let _ = self.connection.execute_batch("ROLLBACK");
         }
     }
 }
-impl AtomicBackend for SqliteBackend {
-    fn begin(&self) -> anyhow::Result<Box<dyn Transaction + '_>> {
-        let connection = self.connection.lock().unwrap();
-        connection.execute_batch("BEGIN IMMEDIATE")?;
-        Ok(Box::new(SqliteTransaction { connection, backend: self, writes: 0, committed: false }))
+/// Runs `op` on the blocking pool with the session, and hands both back.
+async fn blocking<T: Send + 'static>(
+    mut session: Session,
+    op: impl FnOnce(&mut Session) -> anyhow::Result<T> + Send + 'static,
+) -> anyhow::Result<(Session, T)> {
+    let (session, result) = tokio::task::spawn_blocking(move || {
+        let result = op(&mut session);
+        (session, result)
+    })
+    .await?;
+    Ok((session, result?))
+}
+
+struct SqliteTransaction<'a> {
+    session: Option<Session>,
+    backend: &'a SqliteBackend,
+    writes: usize,
+}
+impl SqliteTransaction<'_> {
+    async fn run<T: Send + 'static>(
+        &mut self,
+        op: impl FnOnce(&mut Session) -> anyhow::Result<T> + Send + 'static,
+    ) -> anyhow::Result<T> {
+        let session = self.session.take().ok_or_else(|| anyhow::anyhow!("the SQLite transaction has ended"))?;
+        let (session, result) = blocking(session, op).await?;
+        self.session = Some(session);
+        Ok(result)
     }
-    fn snapshot(&self) -> anyhow::Result<Snapshot> {
-        let connection = self.connection.lock().unwrap();
-        let mut query = connection.prepare("SELECT kind,id,value FROM ouro_rows ORDER BY kind,id")?;
-        let raw = query
-            .query_map([], |r| Ok(((r.get(0)?, r.get(1)?), r.get::<_, String>(2)?)))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
+}
+impl Drop for SqliteTransaction<'_> {
+    fn drop(&mut self) {
+        // Roll back on the blocking pool rather than on an async worker. A
+        // runtime that refuses the task (shutting down) drops it, and the
+        // session's own drop rolls back where that happens.
+        if let Some(session) = self.session.take().filter(|s| s.open)
+            && let Ok(runtime) = tokio::runtime::Handle::try_current()
+        {
+            runtime.spawn_blocking(move || drop(session));
+        }
+    }
+}
+#[async_trait::async_trait]
+impl AtomicBackend for SqliteBackend {
+    async fn begin(&self) -> anyhow::Result<Box<dyn Transaction + '_>> {
+        let connection = self.connection.clone().lock_owned().await;
+        let (session, ()) = blocking(Session { connection, open: false }, |s| {
+            s.connection.execute_batch("BEGIN IMMEDIATE")?;
+            s.open = true;
+            Ok(())
+        })
+        .await?;
+        Ok(Box::new(SqliteTransaction { session: Some(session), backend: self, writes: 0 }))
+    }
+    async fn snapshot(&self) -> anyhow::Result<Snapshot> {
+        let connection = self.connection.clone().lock_owned().await;
+        let (_, raw) = blocking(Session { connection, open: false }, |s| {
+            let mut query = s.connection.prepare("SELECT kind,id,value FROM ouro_rows ORDER BY kind,id")?;
+            let raw = query
+                .query_map([], |r| Ok(((r.get(0)?, r.get(1)?), r.get::<_, String>(2)?)))?
+                .collect::<rusqlite::Result<Vec<(Key, String)>>>()?;
+            Ok(raw)
+        })
+        .await?;
         self.metrics.read(raw.len());
         Ok(Snapshot {
             rows: raw.into_iter().map(|(k, v)| Ok((k, serde_json::from_str(&v)?))).collect::<anyhow::Result<_>>()?,
         })
     }
 }
+#[async_trait::async_trait]
 impl Transaction for SqliteTransaction<'_> {
-    fn get(&mut self, kind: &str, id: &str) -> anyhow::Result<Option<Value>> {
+    async fn get(&mut self, kind: &str, id: &str) -> anyhow::Result<Option<Value>> {
+        let (kind, id) = (kind.to_owned(), id.to_owned());
         let value: Option<String> = self
-            .connection
-            .query_row("SELECT value FROM ouro_rows WHERE kind=?1 AND id=?2", params![kind, id], |r| r.get(0))
-            .optional()?;
+            .run(move |s| {
+                let mut query = s.connection.prepare_cached("SELECT value FROM ouro_rows WHERE kind=?1 AND id=?2")?;
+                Ok(query.query_row(params![kind, id], |r| r.get(0)).optional()?)
+            })
+            .await?;
         self.backend.metrics.read(usize::from(value.is_some()));
         value.map(|v| Ok(serde_json::from_str(&v)?)).transpose()
     }
-    fn scan(&mut self, kind: &str, start: &str, end: Option<&str>, limit: usize) -> anyhow::Result<Rows> {
+    async fn scan(&mut self, kind: &str, start: &str, end: Option<&str>, limit: usize) -> anyhow::Result<Rows> {
         let limit = i64::try_from(limit).unwrap_or(i64::MAX);
         let sql = if end.is_some() {
             "SELECT id,value FROM ouro_rows WHERE kind=?1 AND id>=?2 AND id<?3 ORDER BY id LIMIT ?4"
         } else {
             "SELECT id,value FROM ouro_rows WHERE kind=?1 AND id>=?2 AND ?3 IS NULL ORDER BY id LIMIT ?4"
         };
-        let mut query = self.connection.prepare_cached(sql)?;
-        let raw = query
-            .query_map(params![kind, start, end, limit], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let (owned, start, end) = (kind.to_owned(), start.to_owned(), end.map(str::to_owned));
+        let raw = self
+            .run(move |s| {
+                let mut query = s.connection.prepare_cached(sql)?;
+                let raw = query
+                    .query_map(params![owned, start, end, limit], |r| {
+                        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(raw)
+            })
+            .await?;
         self.backend.metrics.read(raw.len());
         raw.into_iter().map(|(id, v)| Ok(((kind.into(), id), serde_json::from_str(&v)?))).collect()
     }
-    fn put(&mut self, kind: &str, id: &str, value: &Value) -> anyhow::Result<()> {
+    async fn put(&mut self, kind: &str, id: &str, value: &Value) -> anyhow::Result<()> {
         self.backend.faults.check(CommitFault::BeforeWrite(self.writes))?;
         self.writes += 1;
         self.backend.metrics.write();
-        self.connection.execute("INSERT INTO ouro_rows(kind,id,value) VALUES (?1,?2,?3) ON CONFLICT(kind,id) DO UPDATE SET value=excluded.value",params![kind,id,serde_json::to_string(value)?])?;
-        Ok(())
+        let (kind, id, value) = (kind.to_owned(), id.to_owned(), serde_json::to_string(value)?);
+        self.run(move |s| {
+            let mut query = s.connection.prepare_cached(
+                "INSERT INTO ouro_rows(kind,id,value) VALUES (?1,?2,?3) ON CONFLICT(kind,id) DO UPDATE SET value=excluded.value",
+            )?;
+            query.execute(params![kind, id, value])?;
+            Ok(())
+        })
+        .await
     }
-    fn delete(&mut self, kind: &str, id: &str) -> anyhow::Result<()> {
+    async fn delete(&mut self, kind: &str, id: &str) -> anyhow::Result<()> {
         self.backend.faults.check(CommitFault::BeforeWrite(self.writes))?;
         self.writes += 1;
         self.backend.metrics.write();
-        self.connection.execute("DELETE FROM ouro_rows WHERE kind=?1 AND id=?2", params![kind, id])?;
-        Ok(())
+        let (kind, id) = (kind.to_owned(), id.to_owned());
+        self.run(move |s| {
+            let mut query = s.connection.prepare_cached("DELETE FROM ouro_rows WHERE kind=?1 AND id=?2")?;
+            query.execute(params![kind, id])?;
+            Ok(())
+        })
+        .await
     }
-    fn commit(mut self: Box<Self>) -> anyhow::Result<()> {
+    async fn commit(mut self: Box<Self>) -> anyhow::Result<()> {
         self.backend.faults.check(CommitFault::BeforeCommit)?;
-        self.connection.execute_batch("COMMIT")?;
-        self.committed = true;
+        self.run(|s| {
+            s.connection.execute_batch("COMMIT")?;
+            s.open = false;
+            Ok(())
+        })
+        .await?;
         self.backend.faults.check(CommitFault::AfterCommit)
     }
 }

@@ -1,5 +1,7 @@
 //! Ordered transactional adapter seam. The engine owns keys and indexes;
 //! adapters provide serializable scoped reads and durable atomic commits.
+use async_trait::async_trait;
+use futures::future::BoxFuture;
 use serde_json::Value;
 use std::{
     collections::BTreeMap,
@@ -84,14 +86,22 @@ impl Metrics {
 /// A serializable transaction, including read-only operations and empty range
 /// reads (phantoms). Ordering is binary UTF-8, ranges are [start, end), and a
 /// scan returns at most `limit` rows. Reads see this transaction's writes.
-/// Dropping without commit rolls back. Only definite serialization failures
-/// may return Conflict; transport/commit errors must never be retried.
-pub trait Transaction {
-    fn get(&mut self, kind: &str, id: &str) -> anyhow::Result<Option<Value>>;
-    fn scan(&mut self, kind: &str, start: &str, end: Option<&str>, limit: usize) -> anyhow::Result<Rows>;
-    fn put(&mut self, kind: &str, id: &str, value: &Value) -> anyhow::Result<()>;
-    fn delete(&mut self, kind: &str, id: &str) -> anyhow::Result<()>;
-    fn commit(self: Box<Self>) -> anyhow::Result<()>;
+/// Dropping without commit rolls back, at any await point: a dropped
+/// operation leaves nothing applied, and a dropped `commit` either committed
+/// as a whole or not at all (an ambiguous outcome the caller never learns).
+/// Only definite serialization failures may return Conflict; transport/commit
+/// errors must never be retried.
+#[async_trait]
+pub trait Transaction: Send {
+    async fn get(&mut self, kind: &str, id: &str) -> anyhow::Result<Option<Value>>;
+    async fn scan(&mut self, kind: &str, start: &str, end: Option<&str>, limit: usize) -> anyhow::Result<Rows>;
+    async fn put(&mut self, kind: &str, id: &str, value: &Value) -> anyhow::Result<()>;
+    async fn delete(&mut self, kind: &str, id: &str) -> anyhow::Result<()>;
+    async fn commit(self: Box<Self>) -> anyhow::Result<()>;
+    /// Ends the transaction without committing. Dropping it does the same;
+    /// an adapter whose rollback needs a round trip (to keep a pooled
+    /// connection) does it here, on the engine's error path.
+    async fn rollback(self: Box<Self>) {}
 }
 #[derive(Debug)]
 pub struct Conflict;
@@ -102,26 +112,27 @@ impl std::fmt::Display for Conflict {
 }
 impl std::error::Error for Conflict {}
 
+#[async_trait]
 pub trait AtomicBackend: Send + Sync {
-    fn begin(&self) -> anyhow::Result<Box<dyn Transaction + '_>>;
+    async fn begin(&self) -> anyhow::Result<Box<dyn Transaction + '_>>;
     /// Diagnostics only: full persisted-state audits, never used by RunStore.
-    fn snapshot(&self) -> anyhow::Result<Snapshot>;
+    async fn snapshot(&self) -> anyhow::Result<Snapshot>;
     /// Diagnostics/corruption injection only; validates the supplied rows.
-    fn compare_exchange(&self, before: &Snapshot, rows: &Rows) -> anyhow::Result<bool> {
-        let mut tx = self.begin()?;
+    async fn compare_exchange(&self, before: &Snapshot, rows: &Rows) -> anyhow::Result<bool> {
+        let mut tx = self.begin().await?;
         for ((kind, id), value) in &before.rows {
-            if tx.get(kind, id)?.as_ref() != Some(value) {
+            if tx.get(kind, id).await?.as_ref() != Some(value) {
                 return Ok(false);
             }
         }
         for (key, value) in changes(&before.rows, rows) {
             if let Some(value) = value {
-                tx.put(&key.0, &key.1, value)?;
+                tx.put(&key.0, &key.1, value).await?;
             } else {
-                tx.delete(&key.0, &key.1)?;
+                tx.delete(&key.0, &key.1).await?;
             }
         }
-        match tx.commit() {
+        match tx.commit().await {
             Ok(()) => Ok(true),
             Err(e) if e.is::<Conflict>() => Ok(false),
             Err(e) => Err(e),
@@ -142,21 +153,32 @@ impl TransactionalStore {
         self.policy = policy;
         self
     }
-    pub(crate) fn update<T>(&self, operation: impl Fn(&mut dyn Transaction) -> anyhow::Result<T>) -> anyhow::Result<T> {
+    /// Runs `operation` in a transaction and commits it, retrying definite
+    /// conflicts only. The operation is called again on each attempt, so it
+    /// must derive everything from what it reads. A dropped call rolls its
+    /// open transaction back (`Transaction`).
+    pub(crate) async fn update<'c, T: Send>(
+        &'c self,
+        operation: impl for<'t> Fn(&'t mut (dyn Transaction + 'c)) -> BoxFuture<'t, anyhow::Result<T>> + Send + Sync,
+    ) -> anyhow::Result<T> {
         for attempt in 0..128 {
-            let result: anyhow::Result<T> = (|| {
-                let mut tx = self.backend.begin()?;
-                let result = operation(&mut *tx)?;
-                tx.commit()?;
-                Ok(result)
-            })();
+            let result = match self.backend.begin().await {
+                Ok(mut tx) => match operation(&mut *tx).await {
+                    Ok(value) => tx.commit().await.map(|()| value),
+                    Err(e) => {
+                        tx.rollback().await;
+                        Err(e)
+                    }
+                },
+                Err(e) => Err(e),
+            };
             match result {
                 Err(e) if e.is::<Conflict>() => {
                     // Independent workers must not retry in lockstep. Jitter
                     // stays below the existing per-attempt backoff ceiling.
                     let ceiling = 50 * (1_u64 << attempt.min(7));
                     let jitter = uuid::Uuid::new_v4().as_u64_pair().0 % (ceiling / 2 + 1);
-                    std::thread::sleep(std::time::Duration::from_micros(ceiling / 2 + jitter));
+                    tokio::time::sleep(std::time::Duration::from_micros(ceiling / 2 + jitter)).await;
                 }
                 other => return other,
             }

@@ -116,9 +116,9 @@ impl Runtime {
             opentelemetry::global::BoxedTracer::new(Box::new(opentelemetry::trace::noop::NoopTracer::new())),
         )?;
         runtime.capabilities = self.capabilities.clone();
-        let d = runtime.save("dry-run", yaml)?;
-        runtime.activate(&d.name, d.version)?;
-        runtime.start("dry-run", "dry-run", input)?;
+        let d = runtime.save("dry-run", yaml).await?;
+        runtime.activate(&d.name, d.version).await?;
+        runtime.start("dry-run", "dry-run", input).await?;
         runtime.definition_source = self.store.clone();
         runtime.tracer = self.tracer.clone();
         let mocked = Arc::new(Mutex::new(Vec::new()));
@@ -137,7 +137,7 @@ impl Runtime {
         self.replay_inner(id, Some(yaml), stop).await
     }
     async fn replay_inner(&self, id: &str, yaml: Option<&str>, stop: &CancellationToken) -> anyhow::Result<Replay> {
-        let mut original = self.store.inspect(id)?.ok_or_else(|| anyhow::anyhow!("unknown recorded run"))?;
+        let mut original = self.store.inspect(id).await?.ok_or_else(|| anyhow::anyhow!("unknown recorded run"))?;
         let mut calls = BTreeMap::new();
         let events: BTreeMap<_, _> = original
             .records
@@ -172,14 +172,15 @@ impl Runtime {
         anyhow::ensure!(!calls.is_empty() || original.run.outcome.is_some(), "recorded results unavailable");
         let store = Arc::new(ouro_durable::memory::memory());
         let started = self
-            .records(id)?
+            .records(id)
+            .await?
             .values()
             .find_map(|r| if let Record::Execution { started_ms, .. } = r { Some(*started_ms) } else { None })
             .ok_or_else(|| anyhow::anyhow!("recorded execution unavailable (possibly retained out)"))?;
         let clock = Arc::new(TestClock(std::sync::atomic::AtomicI64::new(started)));
         // Preserve admitted identity and bindings. This isolated store never
         // writes to the original run, and no handler is invoked during replay.
-        store.admit(&original.run.admission, started)?;
+        store.admit(&original.run.admission, started).await?;
         let mut runtime = Runtime::new(
             store,
             self.registry(),
@@ -222,14 +223,15 @@ async fn run_isolated(
         if stop.is_cancelled() {
             return Ok(Status::Interrupted(WorkflowError::runtime("isolated run stopped")));
         }
-        let root = runtime.get(id)?.ok_or_else(|| anyhow::anyhow!("isolated run disappeared"))?;
+        let root = runtime.get(id).await?.ok_or_else(|| anyhow::anyhow!("isolated run disappeared"))?;
         if let Some(status) = root.outcome {
             return Ok(status);
         }
-        let due = runtime.store.due(clock.now_ms(), runtime.config.max_concurrency)?;
+        let due = runtime.store.due(clock.now_ms(), runtime.config.max_concurrency).await?;
         if due.is_empty() {
             let next = runtime
-                .list(None, "")?
+                .list(None, "")
+                .await?
                 .into_iter()
                 .filter(|r| r.ended_ms.is_none())
                 .map(|r| r.wake_at_ms)

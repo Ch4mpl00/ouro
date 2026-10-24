@@ -185,20 +185,20 @@ impl Runtime {
     pub fn validate(&self, yaml: &str) -> anyhow::Result<Workflow> {
         self.admitter().validate(yaml)
     }
-    pub fn save(&self, name: &str, yaml: &str) -> anyhow::Result<Definition> {
+    pub async fn save(&self, name: &str, yaml: &str) -> anyhow::Result<Definition> {
         self.validate(yaml)?;
-        self.store.save_definition(name, yaml)
+        self.store.save_definition(name, yaml).await
     }
     /// Activates a saved version in a new activation epoch, clearing a
     /// tripped breaker; its schedule's triggers replace the definition's
     /// current ones in the same commit. Only activation starts an epoch: a
     /// tripped breaker reports (`definitions`, `notify`) and the host decides
     /// which version, if any, to activate.
-    pub fn activate(&self, name: &str, version: u64) -> anyhow::Result<()> {
-        let definitions = self.store.definitions(name)?;
+    pub async fn activate(&self, name: &str, version: u64) -> anyhow::Result<()> {
+        let definitions = self.store.definitions(name).await?;
         let d = definitions.versions.get(&version).ok_or_else(|| anyhow::anyhow!("unknown definition version"))?;
         self.validate(&d.yaml)?;
-        self.activate_armed(name, version)
+        self.activate_armed(name, version).await
     }
     pub(crate) fn admitter(&self) -> Admitter {
         let (registry, generation) = self.installed.get();
@@ -216,38 +216,38 @@ impl Runtime {
             executions: self.executions.clone(),
         }
     }
-    pub(crate) fn admission(&self, id: &str, name: &str, input: Value) -> anyhow::Result<Admission> {
-        self.admitter().active(id, name, input)
+    pub(crate) async fn admission(&self, id: &str, name: &str, input: Value) -> anyhow::Result<Admission> {
+        self.admitter().active(id, name, input).await
     }
     /// Persist a run before any execution. `drive` executes it immediately;
     /// `worker` also picks it up, including after the embedding process restarts.
-    pub fn start(&self, id: &str, name: &str, input: Value) -> anyhow::Result<SavedRun> {
-        if let Some(saved) = self.store.get(id)? {
+    pub async fn start(&self, id: &str, name: &str, input: Value) -> anyhow::Result<SavedRun> {
+        if let Some(saved) = self.store.get(id).await? {
             anyhow::ensure!(saved.admission.name == name, "run belongs to another definition");
             return Ok(saved);
         }
-        let a = self.admission(id, name, input)?;
-        self.store.admit(&a, self.clock.now_ms())?;
-        self.store.get(id)?.ok_or_else(|| anyhow::anyhow!("admitted run disappeared"))
+        let a = self.admission(id, name, input).await?;
+        self.store.admit(&a, self.clock.now_ms()).await?;
+        self.store.get(id).await?.ok_or_else(|| anyhow::anyhow!("admitted run disappeared"))
     }
-    pub fn get(&self, id: &str) -> anyhow::Result<Option<SavedRun>> {
-        self.store.get(id)
+    pub async fn get(&self, id: &str) -> anyhow::Result<Option<SavedRun>> {
+        self.store.get(id).await
     }
-    pub fn list(&self, name: Option<&str>, prefix: &str) -> anyhow::Result<Vec<SavedRun>> {
-        self.store.list(name, prefix)
+    pub async fn list(&self, name: Option<&str>, prefix: &str) -> anyhow::Result<Vec<SavedRun>> {
+        self.store.list(name, prefix).await
     }
-    pub fn definitions(&self, name: &str) -> anyhow::Result<ouro_durable::Definitions> {
-        self.store.definitions(name)
+    pub async fn definitions(&self, name: &str) -> anyhow::Result<ouro_durable::Definitions> {
+        self.store.definitions(name).await
     }
-    pub fn records(&self, id: &str) -> anyhow::Result<BTreeMap<String, owf::durable::Record>> {
-        Ok(self.store.inspect(id)?.ok_or_else(|| anyhow::anyhow!("unknown run"))?.records)
+    pub async fn records(&self, id: &str) -> anyhow::Result<BTreeMap<String, owf::durable::Record>> {
+        Ok(self.store.inspect(id).await?.ok_or_else(|| anyhow::anyhow!("unknown run"))?.records)
     }
     /// The run's call journal: every call (and emitted event) it made, with
     /// its delivery and how far it got. The engine does not know whether a
     /// call changed the world; the host decides that from this journal (to
     /// rerun a failed run, hand it over, or reconcile it).
-    pub fn calls(&self, id: &str) -> anyhow::Result<Vec<CallEntry>> {
-        Ok(owf::durable::call_journal(&self.records(id)?))
+    pub async fn calls(&self, id: &str) -> anyhow::Result<Vec<CallEntry>> {
+        Ok(owf::durable::call_journal(&self.records(id).await?))
     }
     /// Delivers an identified CloudEvent (`id`, `source`, `type`; the
     /// `specversion` and `time` are filled in when absent): to `target`'s
@@ -255,10 +255,10 @@ impl Runtime {
     /// run waiting for its type. Delivering it again returns the same
     /// recipient; another payload under its identity is an error. Returns
     /// the recipient, `None` when no run is eligible.
-    pub fn deliver(&self, mut event: Value, target: Option<&str>) -> anyhow::Result<Option<String>> {
+    pub async fn deliver(&self, mut event: Value, target: Option<&str>) -> anyhow::Result<Option<String>> {
         let now = self.clock.now_ms();
         crate::schedule::complete(&mut event, now)?;
-        self.store.deliver(&event, target, now)
+        self.store.deliver(&event, target, now).await
     }
     /// Whether this runtime may resume `run`: its application version is
     /// undeclared, or one this runtime declares or accepts. An unfinished run
@@ -269,8 +269,8 @@ impl Runtime {
     /// Removes evidence past retention, expires mailbox events no listen
     /// took in time (each leaves a `Record::Expired`) and old ingress
     /// tombstones; traced as `sweep` with the counts. The worker calls it.
-    pub fn sweep(&self) -> anyhow::Result<Swept> {
-        let swept = self.store.sweep(self.clock.now_ms(), self.config.retention_ms)?;
+    pub async fn sweep(&self) -> anyhow::Result<Swept> {
+        let swept = self.store.sweep(self.clock.now_ms(), self.config.retention_ms).await?;
         crate::telemetry::mark(
             &self.tracer,
             "sweep",
@@ -287,26 +287,26 @@ impl Runtime {
     }
     /// Execute an attributed operator command. Local cancellations fire tokens
     /// immediately; independent control processes are observed at renewal.
-    pub fn control(
+    pub async fn control(
         &self,
         request: &ouro_durable::control::Request,
         command: &ouro_durable::control::Command,
     ) -> anyhow::Result<ouro_durable::control::Reply> {
-        let reply = self.store.control(request, command, self.clock.now_ms())?;
+        let reply = self.store.control(request, command, self.clock.now_ms()).await?;
         if matches!(command, ouro_durable::control::Command::Cancel { .. }) {
-            self.signal_cancelled()?;
+            self.signal_cancelled().await?;
         }
         Ok(reply)
     }
-    pub fn cancel(&self, id: &str) -> anyhow::Result<bool> {
-        let changed = self.store.cancel(id, self.clock.now_ms())?;
-        self.signal_cancelled()?;
+    pub async fn cancel(&self, id: &str) -> anyhow::Result<bool> {
+        let changed = self.store.cancel(id, self.clock.now_ms()).await?;
+        self.signal_cancelled().await?;
         Ok(changed)
     }
-    pub(crate) fn signal_cancelled(&self) -> anyhow::Result<()> {
-        signal_cancelled(&*self.store, &self.executions)
+    pub(crate) async fn signal_cancelled(&self) -> anyhow::Result<()> {
+        signal_cancelled(&*self.store, &self.executions).await
     }
-    pub fn start_child(
+    pub async fn start_child(
         &self,
         parent: &Fence,
         key: &str,
@@ -314,22 +314,22 @@ impl Runtime {
         name: &str,
         input: Value,
     ) -> anyhow::Result<SavedRun> {
-        let a = if let Some(saved) = self.store.get(id)? {
+        let a = if let Some(saved) = self.store.get(id).await? {
             anyhow::ensure!(saved.admission.name == name, "child definition changed");
             saved.admission
         } else {
-            let owner = self.store.get(&parent.run_id)?.ok_or_else(|| anyhow::anyhow!("unknown parent run"))?;
+            let owner = self.store.get(&parent.run_id).await?.ok_or_else(|| anyhow::anyhow!("unknown parent run"))?;
             let declared = model::parse_yaml(&owner.admission.definition)?.budget;
             let lineage = Lineage::of(&owner.admission, &self.config.limits);
             let lineage = Lineage { max_jumps: declared.max_jumps(lineage.max_jumps), ..lineage };
             let child = lineage.child(&self.config.limits).map_err(|e| anyhow::anyhow!("{e}"))?;
-            self.admitter().active_in(id, name, input, &child)?
+            self.admitter().active_in(id, name, input, &child).await?
         };
         let link = ChildLink { parent: parent.run_id.clone(), key: key.into(), reference: key.into() };
-        if let Some(f) = self.store.start_child(parent, &a, &link, self.clock.now_ms())? {
-            self.store.release(&f, self.clock.now_ms())?;
+        if let Some(f) = self.store.start_child(parent, &a, &link, self.clock.now_ms()).await? {
+            self.store.release(&f, self.clock.now_ms()).await?;
         }
-        self.store.get(id)?.ok_or_else(|| anyhow::anyhow!("child disappeared"))
+        self.store.get(id).await?.ok_or_else(|| anyhow::anyhow!("child disappeared"))
     }
     pub async fn drive(&self, id: &str, stop: &CancellationToken) -> anyhow::Result<Option<Status>> {
         self.drive_mode(id, stop, Mode::Live).await
@@ -341,10 +341,10 @@ impl Runtime {
         mode: Mode,
     ) -> anyhow::Result<Option<Status>> {
         let _permit = tokio::select! {biased; _=stop.cancelled()=>return Ok(None),p=self.permits.acquire()=>p?};
-        let Some(fence) = self.store.claim_as(id, self.clock.now_ms(), &self.config.application)? else {
-            return Ok(self.store.get(id)?.and_then(|r| r.outcome));
+        let Some(fence) = self.store.claim_as(id, self.clock.now_ms(), &self.config.application).await? else {
+            return Ok(self.store.get(id).await?.and_then(|r| r.outcome));
         };
-        let saved = self.store.get(id)?.ok_or_else(|| anyhow::anyhow!("claimed run disappeared"))?;
+        let saved = self.store.get(id).await?.ok_or_else(|| anyhow::anyhow!("claimed run disappeared"))?;
         let lease = Arc::new(Lease { store: self.store.clone(), fence, clock: self.clock.clone() });
         let local_cancel = CancellationToken::new();
         let execution_key = (id.to_string(), lease.fence.generation);
@@ -378,14 +378,17 @@ impl Runtime {
         // proceed fails now, never halfway through.
         let admitter = self.admitter();
         let a = &saved.admission;
-        if let Err(e) = admitter.check(&a.name, a.version, &a.definition) {
+        if let Err(e) = admitter.check(&a.name, a.version, &a.definition).await {
             let missing = e.downcast::<MissingFunction>()?;
-            return self.store.finish(
-                &lease.fence,
-                &Status::Faulted(missing.error()),
-                self.clock.now_ms(),
-                self.config.breaker_threshold,
-            );
+            return self
+                .store
+                .finish(
+                    &lease.fence,
+                    &Status::Faulted(missing.error()),
+                    self.clock.now_ms(),
+                    self.config.breaker_threshold,
+                )
+                .await;
         }
         let registry = admitter.registry.clone();
         let checked = registry.validate_with(&a.definition, &self.capabilities).and_then(|wf| {
@@ -398,12 +401,15 @@ impl Runtime {
         let wf = match checked {
             Ok(wf) => wf,
             Err(e) => {
-                return self.store.finish(
-                    &lease.fence,
-                    &Status::Interrupted(WorkflowError::validation(e.to_string())),
-                    self.clock.now_ms(),
-                    self.config.breaker_threshold,
-                );
+                return self
+                    .store
+                    .finish(
+                        &lease.fence,
+                        &Status::Interrupted(WorkflowError::validation(e.to_string())),
+                        self.clock.now_ms(),
+                        self.config.breaker_threshold,
+                    )
+                    .await;
             }
         };
         let mut limits = self.config.limits.clone();
@@ -455,51 +461,78 @@ impl Runtime {
             Some(replayed) => replayed,
             None => &*lease,
         };
-        let run = run::resume_from(&host, &wf, &saved.admission.id, input, saved.admitted_ms, local_cancel, journal)
-            .with_context(spans.root());
-        tokio::pin!(run);
-        let mut heartbeat = tokio::time::interval(self.config.heartbeat_interval);
-        loop {
-            tokio::select! {
-                biased;
-                _=stop.cancelled()=> {
-                    local_cancel.cancel();
-                    // Dropping the interpreter closes in-flight spans and
-                    // handlers. Intent already stored stays outcome-unknown.
-                    self.store.release(&lease.fence,self.clock.now_ms())?;
-                    return Ok(Status::Interrupted(WorkflowError::runtime("worker stopped")));
-                },
-                _=heartbeat.tick()=> {
-                    if let Err(error)=self.store.renew(&lease.fence,self.clock.now_ms()) {
-                        local_cancel.cancel();
-                        if error.is::<ouro_durable::control::Stopped>() { self.store.release(&lease.fence, self.clock.now_ms())?; }
-                        if let Some(status)=self.store.get(&saved.admission.id)?.and_then(|r|r.outcome) {return Ok(status)}
-                        return Ok(Status::Interrupted(WorkflowError::runtime(error.to_string())));
-                    }
-                },
-                outcome=&mut run=> {
-                    if outcome.limit_exceeded {
-                        spans.limit_exceeded();
-                    }
-                    // Explicit cancel may already have committed and fenced us.
-                    if let Some(status)=self.store.get(&saved.admission.id)?.and_then(|r|r.outcome) {return Ok(status)}
-                    if self.store.stopped()? {
-                        self.store.release(&lease.fence, self.clock.now_ms())?;
-                        return Ok(Status::Interrupted(WorkflowError::runtime("runtime emergency stop is set")));
-                    }
-                    match self.store.finish(&lease.fence,&outcome.status,self.clock.now_ms(),self.config.breaker_threshold) {
-                        Err(e) if e.is::<ouro_durable::control::Stopped>() => {
-                            self.store.release(&lease.fence, self.clock.now_ms())?;
-                            return Ok(Status::Interrupted(WorkflowError::runtime(e.to_string())));
-                        }
-                        result => return result,
-                    }
+        let mut run = Box::pin(run::resume_from(
+            &host,
+            &wf,
+            &saved.admission.id,
+            input,
+            saved.admitted_ms,
+            local_cancel,
+            journal,
+        ))
+        .with_context(spans.root());
+        // The heartbeat is polled together with the run, never instead of
+        // it: a store operation the run has started may hold a connection
+        // (SQLite's only one) until it is polled to its end. For the same
+        // reason the run is dropped, rolling back whatever it has open,
+        // before any other store operation here.
+        let heartbeat = async {
+            let mut ticks = tokio::time::interval(self.config.heartbeat_interval);
+            loop {
+                ticks.tick().await;
+                if let Err(error) = self.store.renew(&lease.fence, self.clock.now_ms()).await {
+                    return error;
                 }
             }
+        };
+        let ended = tokio::select! {
+            biased;
+            _ = stop.cancelled() => Err(None),
+            error = heartbeat => Err(Some(error)),
+            outcome = &mut run => Ok(outcome),
+        };
+        let outcome = match ended {
+            Ok(outcome) => outcome,
+            Err(lost) => {
+                local_cancel.cancel();
+                // Dropping the interpreter closes in-flight spans and
+                // handlers. Intent already stored stays outcome-unknown.
+                drop(run);
+                let Some(error) = lost else {
+                    self.store.release(&lease.fence, self.clock.now_ms()).await?;
+                    return Ok(Status::Interrupted(WorkflowError::runtime("worker stopped")));
+                };
+                if error.is::<ouro_durable::control::Stopped>() {
+                    self.store.release(&lease.fence, self.clock.now_ms()).await?;
+                }
+                if let Some(status) = self.store.get(&saved.admission.id).await?.and_then(|r| r.outcome) {
+                    return Ok(status);
+                }
+                return Ok(Status::Interrupted(WorkflowError::runtime(error.to_string())));
+            }
+        };
+        if outcome.limit_exceeded {
+            spans.limit_exceeded();
+        }
+        // Explicit cancel may already have committed and fenced us.
+        if let Some(status) = self.store.get(&saved.admission.id).await?.and_then(|r| r.outcome) {
+            return Ok(status);
+        }
+        if self.store.stopped().await? {
+            self.store.release(&lease.fence, self.clock.now_ms()).await?;
+            return Ok(Status::Interrupted(WorkflowError::runtime("runtime emergency stop is set")));
+        }
+        match self.store.finish(&lease.fence, &outcome.status, self.clock.now_ms(), self.config.breaker_threshold).await
+        {
+            Err(e) if e.is::<ouro_durable::control::Stopped>() => {
+                self.store.release(&lease.fence, self.clock.now_ms()).await?;
+                Ok(Status::Interrupted(WorkflowError::runtime(e.to_string())))
+            }
+            result => result,
         }
     }
     pub async fn recover_once(&self, stop: &CancellationToken) -> anyhow::Result<usize> {
-        let ids = self.store.due_as(self.clock.now_ms(), self.config.max_concurrency, &self.config.application)?;
+        let ids = self.store.due_as(self.clock.now_ms(), self.config.max_concurrency, &self.config.application).await?;
         let count = ids.len();
         let mut pending = FuturesUnordered::new();
         for id in &ids {
@@ -517,8 +550,13 @@ impl Runtime {
         let mut sweep = tokio::time::Instant::now();
         let mut running: FuturesUnordered<BoxFuture<'_, (String, anyhow::Result<Option<Status>>)>> =
             FuturesUnordered::new();
-        // At most one hand-off of notices at a time, polled with the runs so
-        // a slow event sink never stalls their heartbeats.
+        // At most one tick's store work (sweep, due slots, due runs) and one
+        // hand-off of notices at a time. Every store operation is a future
+        // polled with the runs, never awaited in a branch while they wait: a
+        // run suspended inside one may hold a connection (SQLite's only one)
+        // that the branch would need. A slow event sink never stalls the
+        // runs' heartbeats either.
+        let mut ticking: FuturesUnordered<BoxFuture<'_, anyhow::Result<Vec<String>>>> = FuturesUnordered::new();
         let mut notifying: FuturesUnordered<BoxFuture<'_, anyhow::Result<usize>>> = FuturesUnordered::new();
         let mut ids = std::collections::BTreeSet::new();
         let mut failure = None;
@@ -526,35 +564,90 @@ impl Runtime {
         loop {
             tokio::select! {
                 biased;
-                _=stop.cancelled()=>break,
-                Some((id,result))=running.next(),if !running.is_empty()=> {ids.remove(&id);if let Err(e)=result {failure=Some(e);break;}},
-                Some(result)=notifying.next(),if !notifying.is_empty()=> {if let Err(e)=result {failure=Some(e);break;}},
-                _=tick.tick()=> {
-                    if sweep.elapsed()>=Duration::from_secs(3600) {if let Err(e)=self.sweep() {failure=Some(e);break;} sweep=tokio::time::Instant::now();}
-                    // Due schedule slots: a range of the trigger index ending now.
-                    if let Err(e)=self.fire_due() {failure=Some(e);break;}
-                    // Breaker trips and other notices, handed on to the host.
-                    if notifying.is_empty() {let token=shutdown.clone();notifying.push(Box::pin(async move {self.notify(&token).await}));}
-                    let due=match self.store.due_as(self.clock.now_ms(),self.config.max_concurrency,&self.config.application) {Ok(due)=>due,Err(e)=>{failure=Some(e);break;}};
+                _ = stop.cancelled() => break,
+                Some((id, result)) = running.next(), if !running.is_empty() => {
+                    ids.remove(&id);
+                    if let Err(e) = result {
+                        failure = Some(e);
+                        break;
+                    }
+                }
+                Some(result) = notifying.next(), if !notifying.is_empty() => {
+                    if let Err(e) = result {
+                        failure = Some(e);
+                        break;
+                    }
+                }
+                Some(result) = ticking.next(), if !ticking.is_empty() => {
+                    let due = match result {
+                        Ok(due) => due,
+                        Err(e) => {
+                            failure = Some(e);
+                            break;
+                        }
+                    };
                     for id in due {
-                        if ids.len()>=self.config.max_concurrency {break;}
-                        if ids.insert(id.clone()) {let token=shutdown.clone();running.push(Box::pin(async move {let result=self.drive(&id,&token).await;(id,result)}));}
+                        if ids.len() >= self.config.max_concurrency {
+                            break;
+                        }
+                        if ids.insert(id.clone()) {
+                            let token = shutdown.clone();
+                            running.push(Box::pin(async move {
+                                let result = self.drive(&id, &token).await;
+                                (id, result)
+                            }));
+                        }
+                    }
+                }
+                _ = tick.tick() => {
+                    if ticking.is_empty() {
+                        let swept = sweep.elapsed() >= Duration::from_secs(3600);
+                        if swept {
+                            sweep = tokio::time::Instant::now();
+                        }
+                        ticking.push(Box::pin(async move {
+                            if swept {
+                                self.sweep().await?;
+                            }
+                            // Due schedule slots: a range of the trigger index ending now.
+                            self.fire_due().await?;
+                            self.store.due_as(self.clock.now_ms(), self.config.max_concurrency, &self.config.application).await
+                        }));
+                    }
+                    // Breaker trips and other notices, handed on to the host.
+                    if notifying.is_empty() {
+                        let token = shutdown.clone();
+                        notifying.push(Box::pin(async move { self.notify(&token).await }));
                     }
                 }
             }
         }
         shutdown.cancel();
-        while let Some((_, result)) = running.next().await {
-            if let Err(e) = result {
-                failure = Some(e);
-            }
-        }
-        while let Some(result) = notifying.next().await {
-            if let Err(e) = result {
-                failure = Some(e);
-            }
-        }
-        if let Some(e) = failure {
+        // Drained together, for the same reason they ran together.
+        let (runs, ticks, notices) = futures::join!(
+            async {
+                let mut failure = None;
+                while let Some((_, result)) = running.next().await {
+                    failure = result.err().or(failure);
+                }
+                failure
+            },
+            async {
+                let mut failure = None;
+                while let Some(result) = ticking.next().await {
+                    failure = result.err().or(failure);
+                }
+                failure
+            },
+            async {
+                let mut failure = None;
+                while let Some(result) = notifying.next().await {
+                    failure = result.err().or(failure);
+                }
+                failure
+            },
+        );
+        if let Some(e) = notices.or(ticks).or(runs).or(failure) {
             return Err(e);
         }
         Ok(())
@@ -674,12 +767,14 @@ impl Lineage {
 
 /// Local handlers see terminal cancellation immediately; remote workers see
 /// it at their next fenced operation or renewal, as for an explicit cancel.
-fn signal_cancelled(
+async fn signal_cancelled(
     store: &dyn RunStore,
     executions: &Mutex<BTreeMap<(String, u64), CancellationToken>>,
 ) -> anyhow::Result<()> {
-    for ((id, _), token) in executions.lock().unwrap().iter() {
-        if store.get(id)?.is_some_and(|r| r.ended_ms.is_some()) {
+    let running: Vec<(String, CancellationToken)> =
+        executions.lock().unwrap().iter().map(|((id, _), token)| (id.clone(), token.clone())).collect();
+    for (id, token) in running {
+        if store.get(&id).await?.is_some_and(|r| r.ended_ms.is_some()) {
             token.cancel();
         }
     }
@@ -687,8 +782,8 @@ fn signal_cancelled(
 }
 
 impl Admitter {
-    pub(crate) fn signal_cancelled(&self, store: &dyn RunStore) -> anyhow::Result<()> {
-        signal_cancelled(store, &self.executions)
+    pub(crate) async fn signal_cancelled(&self, store: &dyn RunStore) -> anyhow::Result<()> {
+        signal_cancelled(store, &self.executions).await
     }
     pub fn validate(&self, yaml: &str) -> anyhow::Result<Workflow> {
         let wf = self.registry.validate_with(yaml, &self.capabilities)?;
@@ -715,19 +810,19 @@ impl Admitter {
         Ok(out)
     }
     /// A root run of `name`'s active version, unless its breaker tripped.
-    pub fn active(&self, id: &str, name: &str, input: Value) -> anyhow::Result<Admission> {
-        self.active_in(id, name, input, &self.root())
+    pub async fn active(&self, id: &str, name: &str, input: Value) -> anyhow::Result<Admission> {
+        self.active_in(id, name, input, &self.root()).await
     }
     fn root(&self) -> Lineage {
         Lineage { max_jumps: self.limits.max_jumps, depth: 0 }
     }
     /// `active` at a place in a run tree.
-    pub fn active_in(&self, id: &str, name: &str, input: Value, lineage: &Lineage) -> anyhow::Result<Admission> {
-        self.of(id, &self.current(name)?, input, lineage)
+    pub async fn active_in(&self, id: &str, name: &str, input: Value, lineage: &Lineage) -> anyhow::Result<Admission> {
+        self.of(id, &self.current(name).await?, input, lineage).await
     }
     /// `name`'s active version, unless its breaker tripped.
-    fn current(&self, name: &str) -> anyhow::Result<Definition> {
-        let mut definitions = self.definitions.definitions(name)?;
+    async fn current(&self, name: &str) -> anyhow::Result<Definition> {
+        let mut definitions = self.definitions.definitions(name).await?;
         if let Some(trip) = &definitions.tripped {
             return Err(trip.refusal(name).into());
         }
@@ -738,19 +833,19 @@ impl Admitter {
     }
     /// A run of `d`: checked (`MissingFunction`), validated
     /// (`InvalidDefinition`) and bound.
-    pub fn of(&self, id: &str, d: &Definition, input: Value, lineage: &Lineage) -> anyhow::Result<Admission> {
-        self.check(&d.name, d.version, &d.yaml)?;
+    pub async fn of(&self, id: &str, d: &Definition, input: Value, lineage: &Lineage) -> anyhow::Result<Admission> {
+        self.check(&d.name, d.version, &d.yaml).await?;
         // A resolver that fails now is no property of the definition.
         let invalid =
             |e: anyhow::Error| if e.is::<ResourceUnavailable>() { e } else { anyhow::Error::new(InvalidDefinition(e)) };
         let wf = self.validate(&d.yaml).map_err(invalid)?;
         let schemas = self.schemas(&wf).map_err(invalid)?;
-        Ok(self.admission(id, d, input, lineage, Some((self.registry.bindings(&wf), schemas))))
+        Ok(self.admission(id, d, input, lineage, Some((self.registry.bindings(&wf), schemas))).await)
     }
     /// The admission of a run of `d`, with its bindings (function schemas
     /// and delivery, external schemas) when it has them: a refused run is
     /// recorded without.
-    fn admission(
+    async fn admission(
         &self,
         id: &str,
         d: &Definition,
@@ -785,18 +880,18 @@ impl Admitter {
     /// definition), the `Refused` the trigger records with its slot instead.
     /// A tripped definition, no active version and storage errors remain
     /// errors.
-    pub fn triggered(
+    pub async fn triggered(
         &self,
         id: &str,
         name: &str,
         input: Value,
     ) -> anyhow::Result<Result<Admission, ouro_durable::Refused>> {
-        let d = self.current(name)?;
-        match self.of(id, &d, input.clone(), &self.root()) {
+        let d = self.current(name).await?;
+        match self.of(id, &d, input.clone(), &self.root()).await {
             Ok(admission) => Ok(Ok(admission)),
             Err(e) => match refusal(&e) {
                 Some(error) => Ok(Err(ouro_durable::Refused {
-                    admission: self.admission(id, &d, input, &self.root(), None),
+                    admission: self.admission(id, &d, input, &self.root(), None).await,
                     error,
                     breaker_threshold: self.breaker_threshold,
                 })),
@@ -812,39 +907,41 @@ impl Admitter {
     /// which faults on it as it always has. Each definition version's own
     /// needs are cached per registry generation; resolving its children
     /// reads their names' catalog entries.
-    pub fn check(&self, name: &str, version: u64, yaml: &str) -> anyhow::Result<()> {
+    pub async fn check(&self, name: &str, version: u64, yaml: &str) -> anyhow::Result<()> {
         let mut path = Vec::new();
-        self.check_tree((name, version, yaml), &mut path, &mut BTreeSet::new())
+        self.check_tree((name, version, yaml), &mut path, &mut BTreeSet::new()).await
     }
-    fn check_tree(
-        &self,
-        (name, version, yaml): (&str, u64, &str),
-        path: &mut Vec<(String, u64)>,
-        seen: &mut BTreeSet<(String, u64)>,
-    ) -> anyhow::Result<()> {
-        // A definition reached twice (a recursive child) was checked already.
-        if !seen.insert((name.to_owned(), version)) {
-            return Ok(());
-        }
-        path.push((name.to_owned(), version));
-        let needs = self.checks.needs((name, version, yaml), (&self.registry, self.generation), &self.capabilities);
-        if let Some(function) = &needs.missing {
-            return Err(MissingFunction { function: function.clone(), path: path.clone() }.into());
-        }
-        for (namespace, child, version) in &needs.children {
-            if let Some(d) = self.target(&ChildTarget { namespace, name: child, version })? {
-                self.check_tree((&d.name, d.version, &d.yaml), path, seen)?;
+    fn check_tree<'a>(
+        &'a self,
+        (name, version, yaml): (&'a str, u64, &'a str),
+        path: &'a mut Vec<(String, u64)>,
+        seen: &'a mut BTreeSet<(String, u64)>,
+    ) -> BoxFuture<'a, anyhow::Result<()>> {
+        Box::pin(async move {
+            // A definition reached twice (a recursive child) was checked already.
+            if !seen.insert((name.to_owned(), version)) {
+                return Ok(());
             }
-        }
-        path.pop();
-        Ok(())
+            path.push((name.to_owned(), version));
+            let needs = self.checks.needs((name, version, yaml), (&self.registry, self.generation), &self.capabilities);
+            if let Some(function) = &needs.missing {
+                return Err(MissingFunction { function: function.clone(), path: path.clone() }.into());
+            }
+            for (namespace, child, version) in &needs.children {
+                if let Some(d) = self.target(&ChildTarget { namespace, name: child, version }).await? {
+                    self.check_tree((&d.name, d.version, &d.yaml), path, seen).await?;
+                }
+            }
+            path.pop();
+            Ok(())
+        })
     }
     /// `run.workflow`'s target. CHOICE: the catalog entry named `name`
     /// holds the workflow; the version is the active one for `latest`, else
     /// the newest saved version whose document has that semantic version.
     /// Either way the document's namespace must match. `None`: no such one.
-    pub fn target(&self, target: &ChildTarget<'_>) -> anyhow::Result<Option<Definition>> {
-        let definitions = self.definitions.definitions(target.name)?;
+    pub async fn target(&self, target: &ChildTarget<'_>) -> anyhow::Result<Option<Definition>> {
+        let definitions = self.definitions.definitions(target.name).await?;
         let document = |d: &Definition| -> Option<(String, String)> {
             let v: Value = serde_yaml_ng::from_str(&d.yaml).ok()?;
             let doc = v.get("document")?;
@@ -922,7 +1019,7 @@ impl ExecutionFunctions {
                 return self.replayed(name, &args, info);
             }
             if crate::registry::builtin(name) {
-                return self.builtin(name, args, info).map_err(|e| match e.downcast::<Refused>() {
+                return self.builtin(name, args, info).await.map_err(|e| match e.downcast::<Refused>() {
                     Ok(Refused(error)) => CallFailure::NotExecuted(error),
                     Err(e) => CallFailure::Interrupted(WorkflowError::runtime(e.to_string())),
                 });
@@ -946,6 +1043,7 @@ impl ExecutionFunctions {
             self.lease
                 .store
                 .check_lease(&self.lease.fence, self.lease.clock.now_ms())
+                .await
                 .map_err(|e| CallFailure::Interrupted(WorkflowError::runtime(e.to_string())))?;
             let result = match &self.mode {
                 // The dry run's guarantee: a call the host's rule marks is
@@ -1009,27 +1107,27 @@ impl ExecutionFunctions {
             Err(e) => Err(CallFailure::Response(e.clone())),
         }
     }
-    fn builtin(&self, name: &str, args: Value, info: &CallInfo<'_>) -> anyhow::Result<Value> {
+    async fn builtin(&self, name: &str, args: Value, info: &CallInfo<'_>) -> anyhow::Result<Value> {
         let store = &self.lease.store;
         if name == "child_outcome" {
             let id = args["id"].as_str().ok_or_else(|| anyhow::anyhow!("child_outcome requires id"))?;
             let key = args["key"].as_str().ok_or_else(|| anyhow::anyhow!("child_outcome requires key"))?;
-            return Ok(serde_json::to_value(store.child_outcome(info.run_id, key, id)?)?);
+            return Ok(serde_json::to_value(store.child_outcome(info.run_id, key, id).await?)?);
         }
         let name = args["name"].as_str().ok_or_else(|| anyhow::anyhow!("start_child requires name"))?;
         let id = child_id(info.run_id, info.logical);
         // Replay joins the pinned child even if its active definition changed.
-        let a = if let Some(saved) = store.get(&id)? {
+        let a = if let Some(saved) = store.get(&id).await? {
             anyhow::ensure!(saved.admission.name == name, "child definition changed");
             saved.admission
         } else {
             let lineage = self.lineage.child(&self.admitter.limits).map_err(Refused)?;
-            self.admitter.active_in(&id, name, args.get("input").cloned().unwrap_or(Value::Null), &lineage)?
+            self.admitter.active_in(&id, name, args.get("input").cloned().unwrap_or(Value::Null), &lineage).await?
         };
         let now = self.lease.clock.now_ms();
         let link = ChildLink { parent: info.run_id.into(), key: info.logical.into(), reference: info.reference.into() };
-        if let Some(fence) = store.start_child(&self.lease.fence, &a, &link, now)? {
-            store.release(&fence, now)?;
+        if let Some(fence) = store.start_child(&self.lease.fence, &a, &link, now).await? {
+            store.release(&fence, now).await?;
         }
         Ok(json!({"id":id,"key":info.logical,"done":format!("done:{id}"),"waiting":format!("waiting:{id}")}))
     }
@@ -1055,25 +1153,26 @@ struct ReplayJournal {
     budgets: Arc<BTreeMap<String, bool>>,
     first: Option<String>,
 }
+#[async_trait]
 impl owf::durable::Journal for ReplayJournal {
-    fn load(&self) -> anyhow::Result<BTreeMap<String, owf::durable::Record>> {
-        self.lease.load()
+    async fn load(&self) -> anyhow::Result<BTreeMap<String, owf::durable::Record>> {
+        self.lease.load().await
     }
-    fn save(&self, key: &str, record: &owf::durable::Record) -> anyhow::Result<()> {
-        self.lease.save(key, record)
+    async fn save(&self, key: &str, record: &owf::durable::Record) -> anyhow::Result<()> {
+        self.lease.save(key, record).await
     }
-    fn spend(&self, key: &str, limit: u64) -> anyhow::Result<Option<owf::durable::Record>> {
+    async fn spend(&self, key: &str, limit: u64) -> anyhow::Result<Option<owf::durable::Record>> {
         let limit = match self.budgets.get(key) {
             Some(true) => u64::MAX,
             Some(false) => {
                 if let Some(first) = self.first.as_deref().filter(|first| *first != key) {
-                    self.lease.spend(first, 0)?;
+                    self.lease.spend(first, 0).await?;
                 }
                 0
             }
             None => limit,
         };
-        self.lease.spend(key, limit)
+        self.lease.spend(key, limit).await
     }
 }
 
@@ -1081,40 +1180,42 @@ impl owf::durable::Journal for ReplayJournal {
 fn child_id(run_id: &str, key: &str) -> String {
     format!("child:{}", serde_json::to_string(&(run_id, key)).expect("string tuple serializes"))
 }
+#[async_trait]
 impl run::Events for ExecutionFunctions {
-    fn waiting(&self, id: &str, key: &str, wait: &owf::events::PendingWait) -> anyhow::Result<()> {
-        run::Events::waiting(&*self.lease, id, key, wait)
+    async fn waiting(&self, id: &str, key: &str, wait: &owf::events::PendingWait) -> anyhow::Result<()> {
+        run::Events::waiting(&*self.lease, id, key, wait).await
     }
 
-    fn register(&self, id: &str, types: &[String]) -> anyhow::Result<()> {
-        run::Events::register(&*self.lease, id, types)
+    async fn register(&self, id: &str, types: &[String]) -> anyhow::Result<()> {
+        run::Events::register(&*self.lease, id, types).await
     }
-    fn unregister(&self, id: &str, key: &str, types: &[String]) -> anyhow::Result<()> {
-        run::Events::unregister(&*self.lease, id, key, types)
+    async fn unregister(&self, id: &str, key: &str, types: &[String]) -> anyhow::Result<()> {
+        run::Events::unregister(&*self.lease, id, key, types).await
     }
-    fn subscribe(&self, id: &str, key: &str, types: &[String]) -> anyhow::Result<()> {
-        run::Events::subscribe(&*self.lease, id, key, types)
+    async fn subscribe(&self, id: &str, key: &str, types: &[String]) -> anyhow::Result<()> {
+        run::Events::subscribe(&*self.lease, id, key, types).await
     }
-    fn unsubscribe(&self, id: &str, key: &str) -> anyhow::Result<()> {
-        run::Events::unsubscribe(&*self.lease, id, key)
+    async fn unsubscribe(&self, id: &str, key: &str) -> anyhow::Result<()> {
+        run::Events::unsubscribe(&*self.lease, id, key).await
     }
-    fn take(&self, id: &str, key: &str, types: &[String]) -> anyhow::Result<Option<Value>> {
+    async fn take(&self, id: &str, key: &str, types: &[String]) -> anyhow::Result<Option<Value>> {
         if let Mode::Replay { events, .. } = &self.mode
             && let Some(event) = events.get(key)
         {
             // The recorded envelope, as it was taken, to this run only.
             let time = event["time"].as_str().ok_or_else(|| anyhow::anyhow!("missing recorded event time"))?;
             let delivered_at = chrono::DateTime::parse_from_rfc3339(time)?.timestamp_millis();
-            self.lease.store.publish(event, Some(id), delivered_at)?;
+            self.lease.store.publish(event, Some(id), delivered_at).await?;
         }
-        run::Events::take(&*self.lease, id, key, types)
+        run::Events::take(&*self.lease, id, key, types).await
     }
     fn notification(&self, id: &str) -> BoxFuture<'_, ()> {
         run::Events::notification(&*self.lease, id)
     }
 }
+#[async_trait]
 impl run::Children for ExecutionFunctions {
-    fn start(
+    async fn start(
         &self,
         run_id: &str,
         key: &str,
@@ -1133,7 +1234,7 @@ impl run::Children for ExecutionFunctions {
         let id = child_id(run_id, key);
         let done = format!("done:{id}");
         // A started child keeps the version it was admitted with.
-        let a = match store.get(&id).map_err(interrupted)? {
+        let a = match store.get(&id).await.map_err(interrupted)? {
             Some(saved) => saved.admission,
             None => {
                 // An independent run starts a tree of its own, one level
@@ -1141,7 +1242,7 @@ impl run::Children for ExecutionFunctions {
                 let lineage = self.lineage.child(&self.admitter.limits).map_err(CallFailure::NotExecuted)?;
                 let lineage =
                     if owned { lineage } else { Lineage { max_jumps: self.admitter.limits.max_jumps, ..lineage } };
-                let d = self.admitter.target(target).map_err(interrupted)?.ok_or_else(|| {
+                let d = self.admitter.target(target).await.map_err(interrupted)?.ok_or_else(|| {
                     CallFailure::NotExecuted(WorkflowError::standard(
                         "configuration",
                         400,
@@ -1149,7 +1250,7 @@ impl run::Children for ExecutionFunctions {
                         format!("no workflow {}/{} version {} to run", target.namespace, target.name, target.version),
                     ))
                 })?;
-                self.admitter.of(&id, &d, input.clone(), &lineage).map_err(|e| {
+                self.admitter.of(&id, &d, input.clone(), &lineage).await.map_err(|e| {
                     CallFailure::NotExecuted(WorkflowError::standard(
                         "configuration",
                         400,
@@ -1161,12 +1262,12 @@ impl run::Children for ExecutionFunctions {
         };
         let now = self.lease.clock.now_ms();
         if !owned {
-            store.admit(&a, now).map_err(refused)?;
+            store.admit(&a, now).await.map_err(refused)?;
             return Ok(Child { id, done });
         }
         let link = ChildLink { parent: run_id.into(), key: key.into(), reference: key.into() };
-        if let Some(fence) = store.start_child(&self.lease.fence, &a, &link, now).map_err(refused)? {
-            store.release(&fence, now).map_err(interrupted)?;
+        if let Some(fence) = store.start_child(&self.lease.fence, &a, &link, now).await.map_err(refused)? {
+            store.release(&fence, now).await.map_err(interrupted)?;
         }
         Ok(Child { id, done })
     }
@@ -1229,10 +1330,12 @@ impl Functions for ExecutionFunctions {
                 self.lease
                     .store
                     .check_lease(&self.lease.fence, now)
+                    .await
                     .map_err(|e| CallFailure::Interrupted(WorkflowError::runtime(e.to_string())))?;
                 // A storage failure is no answer: the run stops recoverably and
                 // recovery publishes the same envelope again (deduplicated).
                 crate::schedule::publish(&*self.lease.store, &self.admitter, event, now)
+                    .await
                     .map_err(|e| CallFailure::Interrupted(WorkflowError::runtime(e.to_string())))?;
                 if let Some(sink) = &self.admitter.capabilities.sink {
                     sink.emit(event).await.map_err(CallFailure::Response)?;

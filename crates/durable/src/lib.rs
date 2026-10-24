@@ -403,38 +403,45 @@ pub struct Swept {
 /// Transactional operations, independent of SQL. `now_ms` is supplied by the
 /// host clock and must use a common time basis across workers, within the
 /// store's skew bound (`Policy::skew_ms`). Every fenced operation checks
-/// ownership and expiry in the same commit as its changes. Synchronous
-/// methods match the interpreter's Journal/Events contract.
+/// ownership and expiry in the same commit as its changes.
+///
+/// Operations are asynchronous and need no particular Tokio flavour: a
+/// `current_thread` runtime drives them as well as a multithreaded one. A
+/// dropped operation leaves no partial transaction behind: either its commit
+/// happened whole (the caller, which no longer knows, recovers from storage)
+/// or nothing did. Nothing renews a lease by itself, so a dropped owner's
+/// lease simply ends at its expiry.
+#[async_trait::async_trait]
 pub trait RunStore: Send + Sync {
-    fn control(
+    async fn control(
         &self,
         request: &control::Request,
         command: &control::Command,
         now_ms: i64,
     ) -> anyhow::Result<control::Reply>;
-    fn stopped(&self) -> anyhow::Result<bool>;
-    fn control_entry(&self, id: &str) -> anyhow::Result<Option<control::Entry>>;
-    fn control_history(
+    async fn stopped(&self) -> anyhow::Result<bool>;
+    async fn control_entry(&self, id: &str) -> anyhow::Result<Option<control::Entry>>;
+    async fn control_history(
         &self,
         run: Option<&str>,
         cursor: Option<&control::Cursor>,
         limit: usize,
     ) -> anyhow::Result<control::Page<control::Entry>>;
-    fn query_runs(
+    async fn query_runs(
         &self,
         filter: &control::Runs,
         history: bool,
         cursor: Option<&control::Cursor>,
         limit: usize,
     ) -> anyhow::Result<control::Page<SavedRun>>;
-    fn pending_waits(
+    async fn pending_waits(
         &self,
         filter: &control::Waits,
         cursor: Option<&control::Cursor>,
         limit: usize,
     ) -> anyhow::Result<control::Page<control::Wait>>;
-    fn inspect_control(&self, id: &str) -> anyhow::Result<Option<control::Inspection>>;
-    fn describe_wait(
+    async fn inspect_control(&self, id: &str) -> anyhow::Result<Option<control::Inspection>>;
+    async fn describe_wait(
         &self,
         fence: &Fence,
         key: &str,
@@ -449,24 +456,24 @@ pub trait RunStore: Send + Sync {
     /// Admits a run once (`false`: already admitted). A new run of a tripped
     /// definition is refused with `DefinitionTripped`; so are `start`,
     /// `start_child` and a firing's admissions.
-    fn admit(&self, admission: &Admission, now_ms: i64) -> anyhow::Result<bool>;
-    fn start(&self, admission: &Admission, now_ms: i64) -> anyhow::Result<Option<Fence>>;
+    async fn admit(&self, admission: &Admission, now_ms: i64) -> anyhow::Result<bool>;
+    async fn start(&self, admission: &Admission, now_ms: i64) -> anyhow::Result<Option<Fence>>;
     /// A claim by an undeclared worker, which resumes every run.
-    fn claim(&self, id: &str, now_ms: i64) -> anyhow::Result<Option<Fence>> {
-        self.claim_as(id, now_ms, &Compatibility::default())
+    async fn claim(&self, id: &str, now_ms: i64) -> anyhow::Result<Option<Fence>> {
+        self.claim_as(id, now_ms, &Compatibility::default()).await
     }
     /// Grants a due run only to a compatible worker. A run no worker is
     /// compatible with stays due and visible, never failed or lost. Every
     /// later owned mutation is fenced by the claim it granted.
-    fn claim_as(&self, id: &str, now_ms: i64, worker: &Compatibility) -> anyhow::Result<Option<Fence>>;
+    async fn claim_as(&self, id: &str, now_ms: i64, worker: &Compatibility) -> anyhow::Result<Option<Fence>>;
     /// A dispatch boundary: current ownership and the global stop gate.
-    fn check_lease(&self, fence: &Fence, now_ms: i64) -> anyhow::Result<()>;
-    fn renew(&self, fence: &Fence, now_ms: i64) -> anyhow::Result<()>;
-    fn release(&self, fence: &Fence, now_ms: i64) -> anyhow::Result<()>;
-    fn load_records(&self, fence: &Fence, now_ms: i64) -> anyhow::Result<BTreeMap<String, Record>>;
-    fn save_record(&self, fence: &Fence, key: &str, record: &Record, now_ms: i64) -> anyhow::Result<()>;
-    fn register_wait(&self, fence: &Fence, types: &[String], now_ms: i64) -> anyhow::Result<()>;
-    fn unregister_wait(&self, fence: &Fence, key: &str, types: &[String], now_ms: i64) -> anyhow::Result<()>;
+    async fn check_lease(&self, fence: &Fence, now_ms: i64) -> anyhow::Result<()>;
+    async fn renew(&self, fence: &Fence, now_ms: i64) -> anyhow::Result<()>;
+    async fn release(&self, fence: &Fence, now_ms: i64) -> anyhow::Result<()>;
+    async fn load_records(&self, fence: &Fence, now_ms: i64) -> anyhow::Result<BTreeMap<String, Record>>;
+    async fn save_record(&self, fence: &Fence, key: &str, record: &Record, now_ms: i64) -> anyhow::Result<()>;
+    async fn register_wait(&self, fence: &Fence, types: &[String], now_ms: i64) -> anyhow::Result<()>;
+    async fn unregister_wait(&self, fence: &Fence, key: &str, types: &[String], now_ms: i64) -> anyhow::Result<()>;
     /// Accepts an identified CloudEvent (non-empty `source`, `id`, `type`).
     /// With `target`, into that run's mailbox, whether or not it listens yet;
     /// without, for the oldest eligible registration of its type (one
@@ -476,19 +483,25 @@ pub trait RunStore: Send + Sync {
     /// accepting it again returns the original recipient; the same identity
     /// with another payload (the event without `time`) is an error. Returns
     /// the recipient, `None` when none is eligible (a terminal target).
-    fn deliver(&self, event: &Value, target: Option<&str>, now_ms: i64) -> anyhow::Result<Option<String>>;
+    async fn deliver(&self, event: &Value, target: Option<&str>, now_ms: i64) -> anyhow::Result<Option<String>>;
     /// `types` may hold `*`, which takes any published event (never a
     /// delivered one). The first matching pending copy is taken, in arrival
     /// order; an expired one is consumed by its expiry record instead.
-    fn take_event(&self, fence: &Fence, key: &str, types: &[String], now_ms: i64) -> anyhow::Result<Option<Value>>;
+    async fn take_event(
+        &self,
+        fence: &Fence,
+        key: &str,
+        types: &[String],
+        now_ms: i64,
+    ) -> anyhow::Result<Option<Value>>;
     /// Opens a subscription under `key` (idempotent) for published events of
     /// `types` (`*`: every published event). It stays open until
     /// `unsubscribe` or the run's end, across consumptions, so a listen that
     /// takes several events misses none published between two takes.
-    fn subscribe(&self, _fence: &Fence, _key: &str, _types: &[String], _now_ms: i64) -> anyhow::Result<()> {
+    async fn subscribe(&self, _fence: &Fence, _key: &str, _types: &[String], _now_ms: i64) -> anyhow::Result<()> {
         anyhow::bail!("this store does not support published events")
     }
-    fn unsubscribe(&self, _fence: &Fence, _key: &str, _now_ms: i64) -> anyhow::Result<()> {
+    async fn unsubscribe(&self, _fence: &Fence, _key: &str, _now_ms: i64) -> anyhow::Result<()> {
         anyhow::bail!("this store does not support published events")
     }
     /// Appends a CloudEvent (an object with at least `type`) to every
@@ -499,37 +512,37 @@ pub trait RunStore: Send + Sync {
     /// same identity with another payload is an error. Several pending
     /// events of one type queue in order. Receiving runs wake; they are
     /// returned.
-    fn publish(&self, _event: &Value, _target: Option<&str>, _now_ms: i64) -> anyhow::Result<Vec<String>> {
+    async fn publish(&self, _event: &Value, _target: Option<&str>, _now_ms: i64) -> anyhow::Result<Vec<String>> {
         anyhow::bail!("this store does not support published events")
     }
     /// Whether a trigger already took this identified event from ingress
     /// (an unexpired tombstone with its payload); another payload under the
     /// same identity is an error.
-    fn ingested(&self, _event: &Value, _now_ms: i64) -> anyhow::Result<bool> {
+    async fn ingested(&self, _event: &Value, _now_ms: i64) -> anyhow::Result<bool> {
         anyhow::bail!("this store does not support triggers")
     }
     /// The trigger stored under `key`.
-    fn trigger(&self, _key: &str) -> anyhow::Result<Option<Trigger>> {
+    async fn trigger(&self, _key: &str) -> anyhow::Result<Option<Trigger>> {
         anyhow::bail!("this store does not support triggers")
     }
     /// Up to `limit` triggers due at `now_ms` or earlier, earliest first.
-    fn due_triggers(&self, _now_ms: i64, _limit: usize) -> anyhow::Result<Vec<(String, Trigger)>> {
+    async fn due_triggers(&self, _now_ms: i64, _limit: usize) -> anyhow::Result<Vec<(String, Trigger)>> {
         anyhow::bail!("this store does not support triggers")
     }
     /// Up to `limit` triggers reacting to events of `type_` (or to `*`).
-    fn triggers_for(&self, _type_: &str, _limit: usize) -> anyhow::Result<Vec<(String, Trigger)>> {
+    async fn triggers_for(&self, _type_: &str, _limit: usize) -> anyhow::Result<Vec<(String, Trigger)>> {
         anyhow::bail!("this store does not support triggers")
     }
     /// The single buffered admission of a trigger, pinned when queued.
-    fn queued(&self, _key: &str) -> anyhow::Result<Option<Admission>> {
+    async fn queued(&self, _key: &str) -> anyhow::Result<Option<Admission>> {
         Ok(None)
     }
     /// The claim-once primitive (`Firing`).
-    fn fire(&self, _firing: &Firing<'_>, _now_ms: i64) -> anyhow::Result<Fired> {
+    async fn fire(&self, _firing: &Firing<'_>, _now_ms: i64) -> anyhow::Result<Fired> {
         anyhow::bail!("this store does not support triggers")
     }
     /// A plain firing: returns whether it committed.
-    fn swap_trigger(
+    async fn swap_trigger(
         &self,
         key: &str,
         expected: Option<&Trigger>,
@@ -540,7 +553,7 @@ pub trait RunStore: Send + Sync {
     ) -> anyhow::Result<bool> {
         let firing =
             Firing { key, expected, next, admit, rearm, ingress: None, busy: None, refused: None, overlap: None };
-        Ok(self.fire(&firing, now_ms)? == Fired::Committed)
+        Ok(self.fire(&firing, now_ms).await? == Fired::Committed)
     }
     /// Terminal outcomes of runs admitted in the active version's current
     /// epoch feed its breaker in the same commit: a fault (an unhandled
@@ -550,17 +563,23 @@ pub trait RunStore: Send + Sync {
     /// its triggers are removed and a `TRIPPED` notice is stored, in that
     /// commit. A tripped breaker observes nothing more until an activation.
     /// It never changes the active version or the epoch.
-    fn finish(&self, fence: &Fence, outcome: &Status, now_ms: i64, breaker_threshold: u32) -> anyhow::Result<Status>;
+    async fn finish(
+        &self,
+        fence: &Fence,
+        outcome: &Status,
+        now_ms: i64,
+        breaker_threshold: u32,
+    ) -> anyhow::Result<Status>;
     /// Parent ownership, child admission, and completion subscriptions commit
     /// together. Replaying a link joins the original immutable child.
-    fn start_child(
+    async fn start_child(
         &self,
         parent: &Fence,
         admission: &Admission,
         link: &ChildLink,
         now_ms: i64,
     ) -> anyhow::Result<Option<Fence>>;
-    fn child_outcome(&self, parent: &str, key: &str, child: &str) -> anyhow::Result<Option<Status>>;
+    async fn child_outcome(&self, parent: &str, key: &str, child: &str) -> anyhow::Result<Option<Status>>;
     /// Spends one unit of the budget the run's tree shares (its root's
     /// counter, an owned child's included) under `key`, if fewer than
     /// `limit` are spent, and saves `Record::Budget` at `key` with the
@@ -570,27 +589,27 @@ pub trait RunStore: Send + Sync {
     /// unless the run has one, and names it (`first`). The count survives
     /// restarts and ends with the root; the store never interprets what a
     /// unit stands for.
-    fn spend(&self, fence: &Fence, key: &str, limit: u64, now_ms: i64) -> anyhow::Result<Record>;
+    async fn spend(&self, fence: &Fence, key: &str, limit: u64, now_ms: i64) -> anyhow::Result<Record>;
     /// Due runs for an undeclared worker: every application version.
-    fn due(&self, now_ms: i64, limit: usize) -> anyhow::Result<Vec<String>> {
-        self.due_as(now_ms, limit, &Compatibility::default())
+    async fn due(&self, now_ms: i64, limit: usize) -> anyhow::Result<Vec<String>> {
+        self.due_as(now_ms, limit, &Compatibility::default()).await
     }
     /// Up to `limit` due runs this worker is compatible with, earliest first.
-    fn due_as(&self, now_ms: i64, limit: usize, worker: &Compatibility) -> anyhow::Result<Vec<String>>;
-    fn cancel(&self, id: &str, now_ms: i64) -> anyhow::Result<bool>;
+    async fn due_as(&self, now_ms: i64, limit: usize, worker: &Compatibility) -> anyhow::Result<Vec<String>>;
+    async fn cancel(&self, id: &str, now_ms: i64) -> anyhow::Result<bool>;
     /// Removes finished runs' evidence older than `kept_ms`, expires due
     /// mailbox copies of unfinished runs (each into a `Record::Expired`) and
     /// drops expired ingress tombstones.
-    fn sweep(&self, now_ms: i64, kept_ms: i64) -> anyhow::Result<Swept>;
-    fn get(&self, id: &str) -> anyhow::Result<Option<SavedRun>>;
-    fn list(&self, name: Option<&str>, prefix: &str) -> anyhow::Result<Vec<SavedRun>>;
-    fn inspect(&self, id: &str) -> anyhow::Result<Option<RunSnapshot>>;
-    fn save_definition(&self, name: &str, yaml: &str) -> anyhow::Result<Definition>;
+    async fn sweep(&self, now_ms: i64, kept_ms: i64) -> anyhow::Result<Swept>;
+    async fn get(&self, id: &str) -> anyhow::Result<Option<SavedRun>>;
+    async fn list(&self, name: Option<&str>, prefix: &str) -> anyhow::Result<Vec<SavedRun>>;
+    async fn inspect(&self, id: &str) -> anyhow::Result<Option<RunSnapshot>>;
+    async fn save_definition(&self, name: &str, yaml: &str) -> anyhow::Result<Definition>;
     /// Activates `version` in a new epoch with no triggers.
-    fn activate(&self, name: &str, version: u64) -> anyhow::Result<()> {
+    async fn activate(&self, name: &str, version: u64) -> anyhow::Result<()> {
         loop {
-            let epoch = self.definitions(name)?.epoch;
-            if self.activate_with(name, version, epoch, &Arming::default())?.is_some() {
+            let epoch = self.definitions(name).await?.epoch;
+            if self.activate_with(name, version, epoch, &Arming::default()).await?.is_some() {
                 return Ok(());
             }
         }
@@ -599,22 +618,22 @@ pub trait RunStore: Send + Sync {
     /// its count) and arms `arming`, in one commit, provided the definition is still in `epoch`
     /// (`None` otherwise: read it again). Reactivating the active version
     /// also starts a new epoch.
-    fn activate_with(
+    async fn activate_with(
         &self,
         name: &str,
         version: u64,
         epoch: u64,
         arming: &Arming,
     ) -> anyhow::Result<Option<Definitions>>;
-    fn definitions(&self, name: &str) -> anyhow::Result<Definitions>;
+    async fn definitions(&self, name: &str) -> anyhow::Result<Definitions>;
     /// Up to `limit` notices, oldest first: CloudEvents the store committed
     /// for the host together with what they report (a breaker trip,
     /// `TRIPPED`), each kept under its key until acknowledged.
-    fn notices(&self, _limit: usize) -> anyhow::Result<Vec<(String, Value)>> {
+    async fn notices(&self, _limit: usize) -> anyhow::Result<Vec<(String, Value)>> {
         anyhow::bail!("this store does not support notices")
     }
     /// Removes a notice the host has handed on; `false`: already removed.
-    fn acknowledge(&self, _key: &str) -> anyhow::Result<bool> {
+    async fn acknowledge(&self, _key: &str) -> anyhow::Result<bool> {
         anyhow::bail!("this store does not support notices")
     }
 }
@@ -648,50 +667,52 @@ impl Clock for SystemClock {
     }
 }
 
-/// Binds an executor's fence to the interpreter's synchronous seams. Dropping
-/// it does not mutate storage; the owner releases on shutdown, and crashes
-/// recover after lease expiry. This works with asynchronous database clients.
+/// Binds an executor's fence to the interpreter's `Journal` and `Events`
+/// seams. Dropping it does not mutate storage; the owner releases on
+/// shutdown, and crashes recover after lease expiry.
 pub struct Lease {
     pub store: Arc<dyn RunStore>,
     pub fence: Fence,
     pub clock: Arc<dyn Clock>,
 }
+#[async_trait::async_trait]
 impl Journal for Lease {
-    fn load(&self) -> anyhow::Result<BTreeMap<String, Record>> {
-        self.store.load_records(&self.fence, self.clock.now_ms())
+    async fn load(&self) -> anyhow::Result<BTreeMap<String, Record>> {
+        self.store.load_records(&self.fence, self.clock.now_ms()).await
     }
-    fn save(&self, key: &str, record: &Record) -> anyhow::Result<()> {
-        self.store.save_record(&self.fence, key, record, self.clock.now_ms())
+    async fn save(&self, key: &str, record: &Record) -> anyhow::Result<()> {
+        self.store.save_record(&self.fence, key, record, self.clock.now_ms()).await
     }
-    fn spend(&self, key: &str, limit: u64) -> anyhow::Result<Option<Record>> {
-        self.store.spend(&self.fence, key, limit, self.clock.now_ms()).map(Some)
+    async fn spend(&self, key: &str, limit: u64) -> anyhow::Result<Option<Record>> {
+        self.store.spend(&self.fence, key, limit, self.clock.now_ms()).await.map(Some)
     }
 }
+#[async_trait::async_trait]
 impl Events for Lease {
-    fn waiting(&self, run_id: &str, key: &str, wait: &owf::events::PendingWait) -> anyhow::Result<()> {
+    async fn waiting(&self, run_id: &str, key: &str, wait: &owf::events::PendingWait) -> anyhow::Result<()> {
         anyhow::ensure!(run_id == self.fence.run_id, "event run does not own this lease");
-        self.store.describe_wait(&self.fence, key, wait, self.clock.now_ms())
+        self.store.describe_wait(&self.fence, key, wait, self.clock.now_ms()).await
     }
 
-    fn register(&self, run_id: &str, types: &[String]) -> anyhow::Result<()> {
+    async fn register(&self, run_id: &str, types: &[String]) -> anyhow::Result<()> {
         anyhow::ensure!(run_id == self.fence.run_id, "event run does not own this lease");
-        self.store.register_wait(&self.fence, types, self.clock.now_ms())
+        self.store.register_wait(&self.fence, types, self.clock.now_ms()).await
     }
-    fn unregister(&self, run_id: &str, key: &str, types: &[String]) -> anyhow::Result<()> {
+    async fn unregister(&self, run_id: &str, key: &str, types: &[String]) -> anyhow::Result<()> {
         anyhow::ensure!(run_id == self.fence.run_id, "event run does not own this lease");
-        self.store.unregister_wait(&self.fence, key, types, self.clock.now_ms())
+        self.store.unregister_wait(&self.fence, key, types, self.clock.now_ms()).await
     }
-    fn subscribe(&self, run_id: &str, key: &str, types: &[String]) -> anyhow::Result<()> {
+    async fn subscribe(&self, run_id: &str, key: &str, types: &[String]) -> anyhow::Result<()> {
         anyhow::ensure!(run_id == self.fence.run_id, "event run does not own this lease");
-        self.store.subscribe(&self.fence, key, types, self.clock.now_ms())
+        self.store.subscribe(&self.fence, key, types, self.clock.now_ms()).await
     }
-    fn unsubscribe(&self, run_id: &str, key: &str) -> anyhow::Result<()> {
+    async fn unsubscribe(&self, run_id: &str, key: &str) -> anyhow::Result<()> {
         anyhow::ensure!(run_id == self.fence.run_id, "event run does not own this lease");
-        self.store.unsubscribe(&self.fence, key, self.clock.now_ms())
+        self.store.unsubscribe(&self.fence, key, self.clock.now_ms()).await
     }
-    fn take(&self, run_id: &str, key: &str, types: &[String]) -> anyhow::Result<Option<Value>> {
+    async fn take(&self, run_id: &str, key: &str, types: &[String]) -> anyhow::Result<Option<Value>> {
         anyhow::ensure!(run_id == self.fence.run_id, "event run does not own this lease");
-        self.store.take_event(&self.fence, key, types, self.clock.now_ms())
+        self.store.take_event(&self.fence, key, types, self.clock.now_ms()).await
     }
     fn notification(&self, _: &str) -> futures::future::BoxFuture<'_, ()> {
         // Polling is also correct across independent connections and processes.

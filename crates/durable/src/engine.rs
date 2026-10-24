@@ -89,11 +89,11 @@ struct Tombstone {
 fn key(kind: &str, id: &str) -> Key {
     (kind.into(), id.into())
 }
-fn get<T: DeserializeOwned>(rows: &mut dyn Transaction, kind: &str, id: &str) -> anyhow::Result<Option<T>> {
-    rows.get(kind, id)?.map(serde_json::from_value).transpose().map_err(Into::into)
+async fn get<T: DeserializeOwned>(rows: &mut dyn Transaction, kind: &str, id: &str) -> anyhow::Result<Option<T>> {
+    rows.get(kind, id).await?.map(serde_json::from_value).transpose().map_err(Into::into)
 }
-fn put(rows: &mut dyn Transaction, kind: &str, id: &str, value: &impl Serialize) -> anyhow::Result<()> {
-    rows.put(kind, id, &serde_json::to_value(value)?)
+async fn put(rows: &mut dyn Transaction, kind: &str, id: &str, value: &impl Serialize) -> anyhow::Result<()> {
+    rows.put(kind, id, &serde_json::to_value(value)?).await
 }
 fn stored_run(value: Value) -> anyhow::Result<StoredRun> {
     let version = value.get("version").and_then(Value::as_u64);
@@ -104,18 +104,18 @@ fn stored_run(value: Value) -> anyhow::Result<StoredRun> {
     );
     Ok(serde_json::from_value(value)?)
 }
-fn find_run(rows: &mut dyn Transaction, id: &str) -> anyhow::Result<Option<StoredRun>> {
-    rows.get("run", id)?.map(stored_run).transpose()
+async fn find_run(rows: &mut dyn Transaction, id: &str) -> anyhow::Result<Option<StoredRun>> {
+    rows.get("run", id).await?.map(stored_run).transpose()
 }
-fn run(rows: &mut dyn Transaction, id: &str) -> anyhow::Result<StoredRun> {
-    find_run(rows, id)?.ok_or_else(|| anyhow::anyhow!("unknown run {id}"))
+async fn run(rows: &mut dyn Transaction, id: &str) -> anyhow::Result<StoredRun> {
+    find_run(rows, id).await?.ok_or_else(|| anyhow::anyhow!("unknown run {id}"))
 }
 /// The layout version of a `definitions` row. The earlier layout (none: it
 /// kept a predecessor and its triggers for a breaker rollback, and a boolean
 /// trip) is refused, never read as a definition that cannot be tripped.
 const DEFINITIONS_VERSION: u64 = 3;
-fn load_definitions(rows: &mut dyn Transaction, name: &str) -> anyhow::Result<Option<Definitions>> {
-    let Some(mut value) = rows.get("definitions", name)? else { return Ok(None) };
+async fn load_definitions(rows: &mut dyn Transaction, name: &str) -> anyhow::Result<Option<Definitions>> {
+    let Some(mut value) = rows.get("definitions", name).await? else { return Ok(None) };
     let version = value.as_object_mut().and_then(|m| m.remove("version")).and_then(|v| v.as_u64());
     anyhow::ensure!(
         version == Some(DEFINITIONS_VERSION),
@@ -124,12 +124,12 @@ fn load_definitions(rows: &mut dyn Transaction, name: &str) -> anyhow::Result<Op
     );
     Ok(Some(serde_json::from_value(value)?))
 }
-fn store_definitions(rows: &mut dyn Transaction, name: &str, defs: &Definitions) -> anyhow::Result<()> {
+async fn store_definitions(rows: &mut dyn Transaction, name: &str, defs: &Definitions) -> anyhow::Result<()> {
     let mut value = serde_json::to_value(defs)?;
     if let Value::Object(m) = &mut value {
         m.insert("version".into(), json!(DEFINITIONS_VERSION));
     }
-    rows.put("definitions", name, &value)
+    rows.put("definitions", name, &value).await
 }
 fn component(value: &str) -> String {
     value.as_bytes().iter().map(|b| format!("{b:02x}")).collect()
@@ -280,43 +280,44 @@ fn indexes(s: &StoredRun) -> Rows {
     }
     keys
 }
-fn store_run(rows: &mut dyn Transaction, snapshot: &StoredRun) -> anyhow::Result<()> {
+async fn store_run(rows: &mut dyn Transaction, snapshot: &StoredRun) -> anyhow::Result<()> {
     let id = &snapshot.run.admission.id;
-    let old = find_run(rows, id)?;
+    let old = find_run(rows, id).await?;
     let before = old.as_ref().map(indexes).unwrap_or_default();
-    store_run_indexed(rows, snapshot, &before)
+    store_run_indexed(rows, snapshot, &before).await
 }
-fn store_run_indexed(rows: &mut dyn Transaction, snapshot: &StoredRun, before: &Rows) -> anyhow::Result<()> {
+async fn store_run_indexed(rows: &mut dyn Transaction, snapshot: &StoredRun, before: &Rows) -> anyhow::Result<()> {
     let id = &snapshot.run.admission.id;
     let after = indexes(snapshot);
     for ((kind, id), value) in crate::backend::changes(before, &after) {
         if let Some(value) = value {
-            rows.put(kind, id, value)?;
+            rows.put(kind, id, value).await?;
         } else {
-            rows.delete(kind, id)?;
+            rows.delete(kind, id).await?;
         }
     }
-    put(rows, "run", id, snapshot)
+    put(rows, "run", id, snapshot).await
 }
-fn indexed_runs(
+async fn indexed_runs(
     rows: &mut dyn Transaction,
     kind: &str,
     start: &str,
     end: Option<&str>,
     limit: usize,
 ) -> anyhow::Result<Vec<StoredRun>> {
-    rows.scan(kind, start, end, limit)?
-        .into_values()
-        .map(|id| run(rows, id.as_str().ok_or_else(|| anyhow::anyhow!("invalid run index"))?))
-        .collect()
+    let mut runs = Vec::new();
+    for id in rows.scan(kind, start, end, limit).await?.into_values() {
+        runs.push(run(rows, id.as_str().ok_or_else(|| anyhow::anyhow!("invalid run index"))?).await?);
+    }
+    Ok(runs)
 }
 
 // ── 2. admission, leases and compatibility ─────────────────────────────────
 
 /// The current owner's authority: it acts only while its lease has more
 /// than the skew bound left, so no other worker can have taken over yet.
-fn authority(rows: &mut dyn Transaction, fence: &Fence, now: i64, skew: i64) -> anyhow::Result<StoredRun> {
-    let snapshot = run(rows, &fence.run_id)?;
+async fn authority(rows: &mut dyn Transaction, fence: &Fence, now: i64, skew: i64) -> anyhow::Result<StoredRun> {
+    let snapshot = run(rows, &fence.run_id).await?;
     anyhow::ensure!(
         snapshot.run.state == RunState::Running
             && snapshot.run.fence.as_ref() == Some(fence)
@@ -326,18 +327,18 @@ fn authority(rows: &mut dyn Transaction, fence: &Fence, now: i64, skew: i64) -> 
     );
     Ok(snapshot)
 }
-fn is_stopped(rows: &mut dyn Transaction) -> anyhow::Result<bool> {
-    Ok(get::<bool>(rows, "control", "stopped")?.unwrap_or(false))
+async fn is_stopped(rows: &mut dyn Transaction) -> anyhow::Result<bool> {
+    Ok(get::<bool>(rows, "control", "stopped").await?.unwrap_or(false))
 }
-fn running(rows: &mut dyn Transaction) -> anyhow::Result<()> {
-    if is_stopped(rows)? {
+async fn running(rows: &mut dyn Transaction) -> anyhow::Result<()> {
+    if is_stopped(rows).await? {
         return Err(control::Stopped.into());
     }
     Ok(())
 }
-fn checked(rows: &mut dyn Transaction, fence: &Fence, now: i64, skew: i64) -> anyhow::Result<StoredRun> {
-    running(rows)?;
-    authority(rows, fence, now, skew)
+async fn checked(rows: &mut dyn Transaction, fence: &Fence, now: i64, skew: i64) -> anyhow::Result<StoredRun> {
+    running(rows).await?;
+    authority(rows, fence, now, skew).await
 }
 fn claimable(r: &SavedRun, now: i64) -> bool {
     match r.state {
@@ -360,19 +361,19 @@ fn claim_run(snapshot: &mut StoredRun, now: i64, owner: &str) -> anyhow::Result<
 /// belongs to (when it runs the active version) are fixed here. A tripped
 /// definition admits no new run, of any version and by any path, in the
 /// same commit that reads the trip; an existing run is still joined.
-fn insert(rows: &mut dyn Transaction, admission: &Admission, now: i64) -> anyhow::Result<bool> {
-    let Some(snapshot) = admitted(rows, admission, now)? else { return Ok(false) };
-    store_run(rows, &snapshot)?;
+async fn insert(rows: &mut dyn Transaction, admission: &Admission, now: i64) -> anyhow::Result<bool> {
+    let Some(snapshot) = admitted(rows, admission, now).await? else { return Ok(false) };
+    store_run(rows, &snapshot).await?;
     Ok(true)
 }
 /// The row a new run starts with, not stored yet; `None`: already admitted.
-fn admitted(rows: &mut dyn Transaction, admission: &Admission, now: i64) -> anyhow::Result<Option<StoredRun>> {
-    if let Some(existing) = find_run(rows, &admission.id)? {
+async fn admitted(rows: &mut dyn Transaction, admission: &Admission, now: i64) -> anyhow::Result<Option<StoredRun>> {
+    if let Some(existing) = find_run(rows, &admission.id).await? {
         anyhow::ensure!(existing.run.admission.name == admission.name, "run already belongs to another definition");
         return Ok(None);
     }
-    running(rows)?;
-    let defs = load_definitions(rows, &admission.name)?;
+    running(rows).await?;
+    let defs = load_definitions(rows, &admission.name).await?;
     if let Some(trip) = defs.as_ref().and_then(|d| d.tripped.as_ref()) {
         return Err(trip.refusal(&admission.name).into());
     }
@@ -413,14 +414,14 @@ fn admitted(rows: &mut dyn Transaction, admission: &Admission, now: i64) -> anyh
 /// as `insert` and ended faulted in the same write, so it is never due and
 /// never claimed. Its fault feeds the breaker as a terminal one would. A
 /// run already stored under its id is joined: nothing is counted again.
-fn refuse(rows: &mut dyn Transaction, refused: &Refused, now: i64) -> anyhow::Result<()> {
-    let Some(mut snapshot) = admitted(rows, &refused.admission, now)? else { return Ok(()) };
+async fn refuse(rows: &mut dyn Transaction, refused: &Refused, now: i64) -> anyhow::Result<()> {
+    let Some(mut snapshot) = admitted(rows, &refused.admission, now).await? else { return Ok(()) };
     let status = Status::Faulted(refused.error.clone());
     snapshot.run.state = RunState::Failed;
     snapshot.run.outcome = Some(status);
     snapshot.run.ended_ms = Some(now);
-    store_run(rows, &snapshot)?;
-    breaker(rows, &snapshot.run, Some(&refused.error), false, refused.breaker_threshold, now)
+    store_run(rows, &snapshot).await?;
+    breaker(rows, &snapshot.run, Some(&refused.error), false, refused.breaker_threshold, now).await
 }
 fn close(snapshot: &mut StoredRun, types: &[String]) {
     for t in types {
@@ -469,8 +470,8 @@ fn envelope(event: &StoredEvent) -> anyhow::Result<Value> {
         None => json!({"type":event.type_, "data":event.data, "time":time}),
     })
 }
-fn copy(rows: &mut dyn Transaction, run: &str, n: u64) -> anyhow::Result<StoredEvent> {
-    get(rows, &events_of(run), &sequence(n))?.ok_or_else(|| anyhow::anyhow!("dangling event index {run}/{n}"))
+async fn copy(rows: &mut dyn Transaction, run: &str, n: u64) -> anyhow::Result<StoredEvent> {
+    get(rows, &events_of(run), &sequence(n)).await?.ok_or_else(|| anyhow::anyhow!("dangling event index {run}/{n}"))
 }
 /// The index rows of a pending copy: by type in arrival order and by expiry,
 /// the same for published copies, and the mailbox expiry.
@@ -491,24 +492,24 @@ fn pending_rows(run: &str, n: u64, e: &StoredEvent) -> Vec<(String, String, Valu
     keys
 }
 /// Stores a new copy with its rows and counters; the caller stores the run.
-fn push(rows: &mut dyn Transaction, s: &mut StoredRun, event: StoredEvent) -> anyhow::Result<()> {
+async fn push(rows: &mut dyn Transaction, s: &mut StoredRun, event: StoredEvent) -> anyhow::Result<()> {
     let id = s.run.admission.id.clone();
     let n = s.accepted;
     s.accepted = n.checked_add(1).ok_or_else(|| anyhow::anyhow!("event sequence overflow"))?;
-    put(rows, &events_of(&id), &sequence(n), &event)?;
+    put(rows, &events_of(&id), &sequence(n), &event).await?;
     if let Some(identity) = event.envelope.as_ref().and_then(identity) {
-        rows.put(&identities_of(&id), &component(&identity), &json!(n))?;
+        rows.put(&identities_of(&id), &component(&identity), &json!(n)).await?;
         // A delivered identity leads a redelivery back to its recipient for
         // as long as the recipient keeps that evidence.
         if event.delivered {
-            rows.put(&partition("delivered", &identity), &id, &json!(id))?;
+            rows.put(&partition("delivered", &identity), &id, &json!(id)).await?;
         }
     }
-    if rows.get(&types_of(&id), &component(&event.type_))?.is_none() {
-        rows.put(&types_of(&id), &component(&event.type_), &json!(n))?;
+    if rows.get(&types_of(&id), &component(&event.type_)).await?.is_none() {
+        rows.put(&types_of(&id), &component(&event.type_), &json!(n)).await?;
     }
     for (kind, k, value) in pending_rows(&id, n, &event) {
-        rows.put(&kind, &k, &value)?;
+        rows.put(&kind, &k, &value).await?;
     }
     let pending = s.pending.entry(event.type_.clone()).or_default();
     pending.copies += 1;
@@ -522,7 +523,7 @@ fn push(rows: &mut dyn Transaction, s: &mut StoredRun, event: StoredEvent) -> an
 }
 /// Marks a pending copy consumed under `k` and drops its pending rows and
 /// counters. The caller refreshes `mailbox` when it consumed a mailbox copy.
-fn consume(
+async fn consume(
     rows: &mut dyn Transaction,
     s: &mut StoredRun,
     n: u64,
@@ -531,7 +532,7 @@ fn consume(
 ) -> anyhow::Result<()> {
     let id = s.run.admission.id.clone();
     for (kind, key, _) in pending_rows(&id, n, &event) {
-        rows.delete(&kind, &key)?;
+        rows.delete(&kind, &key).await?;
     }
     if let Some(pending) = s.pending.get_mut(&event.type_) {
         pending.copies = pending.copies.saturating_sub(1);
@@ -542,11 +543,11 @@ fn consume(
     }
     s.published = s.published.saturating_sub(u64::from(published(&event)));
     event.consumed_key = Some(k.into());
-    put(rows, &events_of(&id), &sequence(n), &event)
+    put(rows, &events_of(&id), &sequence(n), &event).await
 }
 /// The earliest expiry left among pending mailbox copies: one indexed row.
-fn refresh_mailbox(rows: &mut dyn Transaction, s: &mut StoredRun) -> anyhow::Result<()> {
-    s.mailbox = match rows.scan(&expiring_of(&s.run.admission.id), "", None, 1)?.into_values().next() {
+async fn refresh_mailbox(rows: &mut dyn Transaction, s: &mut StoredRun) -> anyhow::Result<()> {
+    s.mailbox = match rows.scan(&expiring_of(&s.run.admission.id), "", None, 1).await?.into_values().next() {
         Some(v) => Some(serde_json::from_value::<(i64, u64)>(v)?.0),
         None => None,
     };
@@ -554,45 +555,46 @@ fn refresh_mailbox(rows: &mut dyn Transaction, s: &mut StoredRun) -> anyhow::Res
 }
 /// Consumes every pending copy whose mailbox time is over with an observable
 /// `Record::Expired`, keyed by its position. Reads only the expired copies.
-fn expire(rows: &mut dyn Transaction, s: &mut StoredRun, now: i64) -> anyhow::Result<usize> {
+async fn expire(rows: &mut dyn Transaction, s: &mut StoredRun, now: i64) -> anyhow::Result<usize> {
     if s.mailbox.is_none_or(|at| at > now) {
         return Ok(0);
     }
     let id = s.run.admission.id.clone();
-    let due = rows.scan(&expiring_of(&id), "", Some(&until(now)), usize::MAX)?;
+    let due = rows.scan(&expiring_of(&id), "", Some(&until(now)), usize::MAX).await?;
     for value in due.values() {
         let (_, n) = serde_json::from_value::<(i64, u64)>(value.clone())?;
-        let event = copy(rows, &id, n)?;
+        let event = copy(rows, &id, n).await?;
         let k = format!("mailbox#expired[{n}]");
-        put(rows, &records_of(&id), &k, &Record::Expired { event: envelope(&event)? })?;
-        consume(rows, s, n, event, &k)?;
+        put(rows, &records_of(&id), &k, &Record::Expired { event: envelope(&event)? }).await?;
+        consume(rows, s, n, event, &k).await?;
     }
-    refresh_mailbox(rows, s)?;
+    refresh_mailbox(rows, s).await?;
     Ok(due.len())
 }
 /// Whether a pending, unexpired copy is one the run waits or is subscribed
 /// for. The counters answer unless a copy has expired unconsumed; then one
 /// bounded read per waited or subscribed type with pending copies.
-fn pending_wanted(rows: &mut dyn Transaction, s: &StoredRun, now: i64) -> anyhow::Result<bool> {
+async fn pending_wanted(rows: &mut dyn Transaction, s: &StoredRun, now: i64) -> anyhow::Result<bool> {
     let id = &s.run.admission.id;
     let fresh = s.mailbox.is_none_or(|at| at > now);
     // Copies expiring after `now` (or never), at most `limit` of them.
-    let mut live = |kind: String, limit: usize| -> anyhow::Result<Vec<Value>> {
-        Ok(rows.scan(&kind, &until(now), None, limit)?.into_values().collect())
-    };
+    let until = until(now);
     for t in s.awaits.keys() {
-        if s.pending.contains_key(t) && (fresh || !live(live_of(id, t), 1)?.is_empty()) {
+        if s.pending.contains_key(t) && (fresh || !rows.scan(&live_of(id, t), &until, None, 1).await?.is_empty()) {
             return Ok(true);
         }
     }
     for t in s.subscriptions.values().flatten() {
-        if t == "*" && s.published > 0 && (fresh || !live(live_published_of(id), 1)?.is_empty()) {
+        if t == "*"
+            && s.published > 0
+            && (fresh || !rows.scan(&live_published_of(id), &until, None, 1).await?.is_empty())
+        {
             return Ok(true);
         }
         // A type keeps at most one pending lifecycle notification, so two
         // live copies include a CloudEvent if one is live.
         if s.pending.get(t).is_some_and(|p| p.cloud > 0)
-            && (fresh || live(live_of(id, t), 2)?.iter().any(|cloud| cloud == &json!(true)))
+            && (fresh || rows.scan(&live_of(id, t), &until, None, 2).await?.values().any(|cloud| cloud == &json!(true)))
         {
             return Ok(true);
         }
@@ -602,11 +604,16 @@ fn pending_wanted(rows: &mut dyn Transaction, s: &StoredRun, now: i64) -> anyhow
 /// Accepts `event` into the run, unless the run already holds its identity
 /// (pending, taken or expired): `false` for the same payload, an
 /// `IdentityConflict` for another. Wakes a run that waits for it.
-fn accept(rows: &mut dyn Transaction, snapshot: &mut StoredRun, event: StoredEvent, now: i64) -> anyhow::Result<bool> {
+async fn accept(
+    rows: &mut dyn Transaction,
+    snapshot: &mut StoredRun,
+    event: StoredEvent,
+    now: i64,
+) -> anyhow::Result<bool> {
     if let Some(id) = event.envelope.as_ref().and_then(identity) {
         let run = snapshot.run.admission.id.clone();
-        if let Some(n) = get::<u64>(rows, &identities_of(&run), &component(&id))? {
-            let held = copy(rows, &run, n)?;
+        if let Some(n) = get::<u64>(rows, &identities_of(&run), &component(&id)).await? {
+            let held = copy(rows, &run, n).await?;
             if event.envelope.as_ref().map(payload) != held.envelope.as_ref().map(payload) {
                 return Err(IdentityConflict(id.replace('\u{0}', "/")).into());
             }
@@ -616,10 +623,10 @@ fn accept(rows: &mut dyn Transaction, snapshot: &mut StoredRun, event: StoredEve
     if wanted(snapshot, &event, now) {
         snapshot.run.wake_at_ms = snapshot.run.wake_at_ms.min(now);
     }
-    push(rows, snapshot, event)?;
+    push(rows, snapshot, event).await?;
     Ok(true)
 }
-fn deliver(
+async fn deliver(
     rows: &mut dyn Transaction,
     event: &Value,
     target: Option<&str>,
@@ -642,30 +649,30 @@ fn deliver(
         expires_at_ms: Some(now.saturating_add(policy.mailbox_ms)),
     };
     let candidate = match target {
-        Some(target) => find_run(rows, target)?,
+        Some(target) => find_run(rows, target).await?,
         // A redelivery goes back to the run that accepted it first; a new
         // event to the oldest eligible registration of its type.
-        None => match indexed_runs(rows, &partition("delivered", &id), "", None, 1)?.pop() {
+        None => match indexed_runs(rows, &partition("delivered", &id), "", None, 1).await?.pop() {
             Some(first) => Some(first),
-            None => indexed_runs(rows, &partition("wait", t), "", None, 1)?.pop(),
+            None => indexed_runs(rows, &partition("wait", t), "", None, 1).await?.pop(),
         },
     };
     let Some(mut snapshot) = candidate else {
         return Ok(None);
     };
     let recipient = snapshot.run.admission.id.clone();
-    if snapshot.run.ended_ms.is_some() && rows.get(&identities_of(&recipient), &component(&id))?.is_none() {
+    if snapshot.run.ended_ms.is_some() && rows.get(&identities_of(&recipient), &component(&id)).await?.is_none() {
         return Ok(None);
     }
-    if accept(rows, &mut snapshot, stored, now)? {
-        store_run(rows, &snapshot)?;
+    if accept(rows, &mut snapshot, stored, now).await? {
+        store_run(rows, &snapshot).await?;
     }
     Ok(Some(recipient))
 }
 /// A child's lifecycle notification to its parent, which registered for it
 /// when it started the child: one pending copy per type, no identity.
-fn notify(rows: &mut dyn Transaction, parent: &str, t: &str, data: &Value, now: i64) -> anyhow::Result<()> {
-    let mut snapshot = run(rows, parent)?;
+async fn notify(rows: &mut dyn Transaction, parent: &str, t: &str, data: &Value, now: i64) -> anyhow::Result<()> {
+    let mut snapshot = run(rows, parent).await?;
     if snapshot.run.ended_ms.is_some() || !snapshot.awaits.contains_key(t) || snapshot.pending.contains_key(t) {
         return Ok(());
     }
@@ -678,13 +685,13 @@ fn notify(rows: &mut dyn Transaction, parent: &str, t: &str, data: &Value, now: 
         delivered: false,
         expires_at_ms: None,
     };
-    push(rows, &mut snapshot, event)?;
+    push(rows, &mut snapshot, event).await?;
     snapshot.run.wake_at_ms = now;
-    store_run(rows, &snapshot)
+    store_run(rows, &snapshot).await
 }
 /// Reads only the runs indexed under the event's type and `*` (or the
 /// target): bounded by the subscribers, never by the runs stored.
-fn publish(
+async fn publish(
     rows: &mut dyn Transaction,
     event: &Value,
     target: Option<&str>,
@@ -707,10 +714,10 @@ fn publish(
         expires_at_ms: target.map(|_| now.saturating_add(policy.mailbox_ms)),
     };
     let candidates = match target {
-        Some(id) => find_run(rows, id)?.into_iter().collect(),
+        Some(id) => find_run(rows, id).await?.into_iter().collect(),
         None => {
-            let mut runs = indexed_runs(rows, &partition("subs", t), "", None, usize::MAX)?;
-            for s in indexed_runs(rows, &partition("subs", "*"), "", None, usize::MAX)? {
+            let mut runs = indexed_runs(rows, &partition("subs", t), "", None, usize::MAX).await?;
+            for s in indexed_runs(rows, &partition("subs", "*"), "", None, usize::MAX).await? {
                 if !runs.iter().any(|r| r.run.admission.id == s.run.admission.id) {
                     runs.push(s);
                 }
@@ -722,39 +729,39 @@ fn publish(
     let mut receivers = Vec::new();
     for mut snapshot in candidates {
         let eligible = snapshot.run.ended_ms.is_none() && (target.is_some() || subscribed(&snapshot, &stored));
-        if eligible && accept(rows, &mut snapshot, stored.clone(), now)? {
+        if eligible && accept(rows, &mut snapshot, stored.clone(), now).await? {
             receivers.push(snapshot.run.admission.id.clone());
-            store_run(rows, &snapshot)?;
+            store_run(rows, &snapshot).await?;
         }
     }
     Ok(receivers)
 }
 /// Removes a finished run's evidence: its records and copies with all their
 /// rows. Reads only that run's rows; returns how many records it held.
-fn forget(rows: &mut dyn Transaction, s: &mut StoredRun) -> anyhow::Result<usize> {
+async fn forget(rows: &mut dyn Transaction, s: &mut StoredRun) -> anyhow::Result<usize> {
     let id = s.run.admission.id.clone();
-    let records = rows.scan(&records_of(&id), "", None, usize::MAX)?;
+    let records = rows.scan(&records_of(&id), "", None, usize::MAX).await?;
     for (kind, k) in records.keys() {
-        rows.delete(kind, k)?;
+        rows.delete(kind, k).await?;
     }
-    for ((kind, k), value) in rows.scan(&events_of(&id), "", None, usize::MAX)? {
+    for ((kind, k), value) in rows.scan(&events_of(&id), "", None, usize::MAX).await? {
         let event: StoredEvent = serde_json::from_value(value)?;
         let n = u64::from_str_radix(&k, 16)?;
         if event.consumed_key.is_none() {
             for (kind, key, _) in pending_rows(&id, n, &event) {
-                rows.delete(&kind, &key)?;
+                rows.delete(&kind, &key).await?;
             }
         }
         if let Some(identity) = event.envelope.as_ref().and_then(identity) {
-            rows.delete(&identities_of(&id), &component(&identity))?;
+            rows.delete(&identities_of(&id), &component(&identity)).await?;
             if event.delivered {
-                rows.delete(&partition("delivered", &identity), &id)?;
+                rows.delete(&partition("delivered", &identity), &id).await?;
             }
         }
-        rows.delete(&kind, &k)?;
+        rows.delete(&kind, &k).await?;
     }
-    for (kind, k) in rows.scan(&types_of(&id), "", None, usize::MAX)?.into_keys() {
-        rows.delete(&kind, &k)?;
+    for (kind, k) in rows.scan(&types_of(&id), "", None, usize::MAX).await?.into_keys() {
+        rows.delete(&kind, &k).await?;
     }
     s.pending.clear();
     s.published = 0;
@@ -775,22 +782,22 @@ struct Queued {
     max_concurrent_runs: usize,
     failure: Option<(WorkflowError, u32)>,
 }
-fn queued(rows: &mut dyn Transaction, k: &str) -> anyhow::Result<Option<Queued>> {
-    let q = get::<Queued>(rows, "trigger_queue", k)?;
+async fn queued(rows: &mut dyn Transaction, k: &str) -> anyhow::Result<Option<Queued>> {
+    let q = get::<Queued>(rows, "trigger_queue", k).await?;
     anyhow::ensure!(q.as_ref().is_none_or(|q| q.version == 1), "unsupported trigger queue layout");
     Ok(q)
 }
-fn remove_queue(rows: &mut dyn Transaction, k: &str) -> anyhow::Result<()> {
-    if let Some(q) = queued(rows, k)? {
-        rows.delete("trigger_queue", k)?;
-        rows.delete(&partition("queue_name", &q.admission.name), k)?;
+async fn remove_queue(rows: &mut dyn Transaction, k: &str) -> anyhow::Result<()> {
+    if let Some(q) = queued(rows, k).await? {
+        rows.delete("trigger_queue", k).await?;
+        rows.delete(&partition("queue_name", &q.admission.name), k).await?;
     }
     Ok(())
 }
-fn capacity(rows: &mut dyn Transaction, name: &str, max: usize) -> anyhow::Result<bool> {
-    Ok(max > 0 && rows.scan(&partition("live_name", name), "", None, max)?.len() < max)
+async fn capacity(rows: &mut dyn Transaction, name: &str, max: usize) -> anyhow::Result<bool> {
+    Ok(max > 0 && rows.scan(&partition("live_name", name), "", None, max).await?.len() < max)
 }
-fn admit_firing(
+async fn admit_firing(
     rows: &mut dyn Transaction,
     k: &str,
     a: &Admission,
@@ -798,48 +805,48 @@ fn admit_firing(
     next: Option<&Trigger>,
     now: i64,
 ) -> anyhow::Result<()> {
-    if insert(rows, a, now)? {
-        let mut s = run(rows, &a.id)?;
+    if insert(rows, a, now).await? {
+        let mut s = run(rows, &a.id).await?;
         s.trigger = Some(k.into());
         s.rearm = rearm.zip(next).map(|(r, t)| (r.clone(), t.clone()));
-        store_run(rows, &s)?;
+        store_run(rows, &s).await?;
     }
-    put(rows, "trigger_run", k, &a.id)
+    put(rows, "trigger_run", k, &a.id).await
 }
-fn drain_queues(rows: &mut dyn Transaction, name: &str, now: i64) -> anyhow::Result<()> {
-    if is_stopped(rows)? {
-        if !rows.scan(&partition("queue_name", name), "", None, 1)?.is_empty() {
-            put(rows, "control_drain", name, &true)?;
+async fn drain_queues(rows: &mut dyn Transaction, name: &str, now: i64) -> anyhow::Result<()> {
+    if is_stopped(rows).await? {
+        if !rows.scan(&partition("queue_name", name), "", None, 1).await?.is_empty() {
+            put(rows, "control_drain", name, &true).await?;
         }
         return Ok(());
     }
-    for ((_, k), _) in rows.scan(&partition("queue_name", name), "", None, usize::MAX)? {
-        let Some(q) = queued(rows, &k)? else {
+    for ((_, k), _) in rows.scan(&partition("queue_name", name), "", None, usize::MAX).await? {
+        let Some(q) = queued(rows, &k).await? else {
             // A prior promotion in this batch may trip and disarm the
             // definition, removing the remaining buffered slots.
-            anyhow::ensure!(rows.get(&partition("queue_name", name), &k)?.is_none(), "dangling queue index");
+            anyhow::ensure!(rows.get(&partition("queue_name", name), &k).await?.is_none(), "dangling queue index");
             continue;
         };
-        if !rows.scan(&partition("trigger_live", &k), "", None, 1)?.is_empty()
-            || !capacity(rows, name, q.max_concurrent_runs)?
+        if !rows.scan(&partition("trigger_live", &k), "", None, 1).await?.is_empty()
+            || !capacity(rows, name, q.max_concurrent_runs).await?
         {
             continue;
         }
-        let t = get::<Trigger>(rows, "trigger", &k)?.ok_or_else(|| anyhow::anyhow!("queue without trigger"))?;
-        remove_queue(rows, &k)?;
+        let t = get::<Trigger>(rows, "trigger", &k).await?.ok_or_else(|| anyhow::anyhow!("queue without trigger"))?;
+        remove_queue(rows, &k).await?;
         if let Some((error, breaker_threshold)) = q.failure {
-            refuse(rows, &Refused { admission: q.admission, error, breaker_threshold }, now)?;
+            refuse(rows, &Refused { admission: q.admission, error, breaker_threshold }, now).await?;
         } else {
-            admit_firing(rows, &k, &q.admission, q.rearm.as_ref(), Some(&t), now)?;
+            admit_firing(rows, &k, &q.admission, q.rearm.as_ref(), Some(&t), now).await?;
         }
     }
     Ok(())
 }
 
-fn drain_pending(rows: &mut dyn Transaction, now: i64, limit: usize) -> anyhow::Result<()> {
-    for ((_, name), _) in rows.scan("control_drain", "", None, limit)? {
-        rows.delete("control_drain", &name)?;
-        drain_queues(rows, &name, now)?;
+async fn drain_pending(rows: &mut dyn Transaction, now: i64, limit: usize) -> anyhow::Result<()> {
+    for ((_, name), _) in rows.scan("control_drain", "", None, limit).await? {
+        rows.delete("control_drain", &name).await?;
+        drain_queues(rows, &name, now).await?;
     }
     Ok(())
 }
@@ -855,7 +862,7 @@ fn trigger_indexes(key_: &str, t: &Trigger) -> Rows {
     keys
 }
 /// Writes a trigger and moves its index keys, like `store_run`.
-fn store_trigger(
+async fn store_trigger(
     rows: &mut dyn Transaction,
     key_: &str,
     before: Option<&Trigger>,
@@ -865,51 +872,59 @@ fn store_trigger(
     let new = after.map(|t| trigger_indexes(key_, t)).unwrap_or_default();
     for ((kind, id), value) in crate::backend::changes(&old, &new) {
         if let Some(value) = value {
-            rows.put(kind, id, value)?;
+            rows.put(kind, id, value).await?;
         } else {
-            rows.delete(kind, id)?;
+            rows.delete(kind, id).await?;
         }
     }
     match after {
-        Some(t) => put(rows, "trigger", key_, t),
-        None if before.is_some() => rows.delete("trigger", key_),
+        Some(t) => put(rows, "trigger", key_, t).await,
+        None if before.is_some() => rows.delete("trigger", key_).await,
         None => Ok(()),
     }
 }
-fn indexed_triggers(rows: &mut dyn Transaction, keys: Rows) -> anyhow::Result<Vec<(String, Trigger)>> {
+async fn indexed_triggers(rows: &mut dyn Transaction, keys: Rows) -> anyhow::Result<Vec<(String, Trigger)>> {
     let mut out: Vec<(String, Trigger)> = Vec::new();
     for value in keys.into_values() {
         let k = value.as_str().ok_or_else(|| anyhow::anyhow!("invalid trigger index"))?.to_owned();
         if out.iter().any(|(o, _)| *o == k) {
             continue;
         }
-        let t = get(rows, "trigger", &k)?.ok_or_else(|| anyhow::anyhow!("dangling trigger index {k}"))?;
+        let t = get(rows, "trigger", &k).await?.ok_or_else(|| anyhow::anyhow!("dangling trigger index {k}"))?;
         out.push((k, t));
     }
     Ok(out)
 }
 /// Replaces the triggers a definition owns with `wanted`, in this commit.
-fn arm(rows: &mut dyn Transaction, defs: &mut Definitions, wanted: &BTreeMap<String, Trigger>) -> anyhow::Result<()> {
+async fn arm(
+    rows: &mut dyn Transaction,
+    defs: &mut Definitions,
+    wanted: &BTreeMap<String, Trigger>,
+) -> anyhow::Result<()> {
     for k in &defs.triggers {
-        remove_queue(rows, k)?;
+        remove_queue(rows, k).await?;
     }
     for k in defs.triggers.iter().filter(|k| !wanted.contains_key(*k)) {
-        let current: Option<Trigger> = get(rows, "trigger", k)?;
-        store_trigger(rows, k, current.as_ref(), None)?;
+        let current: Option<Trigger> = get(rows, "trigger", k).await?;
+        store_trigger(rows, k, current.as_ref(), None).await?;
     }
     for (k, t) in wanted {
-        let current: Option<Trigger> = get(rows, "trigger", k)?;
-        store_trigger(rows, k, current.as_ref(), Some(t))?;
+        let current: Option<Trigger> = get(rows, "trigger", k).await?;
+        store_trigger(rows, k, current.as_ref(), Some(t)).await?;
     }
     defs.triggers = wanted.keys().cloned().collect();
     Ok(())
 }
 /// `Some(true)`: a trigger already took this event (same payload);
 /// `Some(false)`: its identity is free (absent or expired).
-fn tombstone(rows: &mut dyn Transaction, event: &Value, now: i64) -> anyhow::Result<(String, Option<Tombstone>, bool)> {
+async fn tombstone(
+    rows: &mut dyn Transaction,
+    event: &Value,
+    now: i64,
+) -> anyhow::Result<(String, Option<Tombstone>, bool)> {
     let id = identity(event).ok_or_else(|| anyhow::anyhow!("an ingress event needs a source and an id"))?;
     let k = component(&id);
-    let stored: Option<Tombstone> = get(rows, "ingress", &k)?;
+    let stored: Option<Tombstone> = get(rows, "ingress", &k).await?;
     let used = match &stored {
         Some(t) if t.expires_at_ms > now => {
             if t.payload != payload(event) {
@@ -921,19 +936,19 @@ fn tombstone(rows: &mut dyn Transaction, event: &Value, now: i64) -> anyhow::Res
     };
     Ok((k, stored, used))
 }
-fn fire(rows: &mut dyn Transaction, f: &Firing<'_>, now: i64, policy: &Policy) -> anyhow::Result<Fired> {
-    if is_stopped(rows)? {
+async fn fire(rows: &mut dyn Transaction, f: &Firing<'_>, now: i64, policy: &Policy) -> anyhow::Result<Fired> {
+    if is_stopped(rows).await? {
         return Ok(Fired::Changed);
     }
     anyhow::ensure!(f.refused.is_none() || f.admit.is_empty(), "a firing admits its runs or records a refusal");
-    let current: Option<Trigger> = get(rows, "trigger", f.key)?;
+    let current: Option<Trigger> = get(rows, "trigger", f.key).await?;
     if current.as_ref() != f.expected {
         return Ok(Fired::Changed);
     }
     // Validate ingress before any policy outcome: a skipped or buffered event
     // is consumed too, and a conflicting payload must never cancel a run.
     if let Some(event) = f.ingress
-        && tombstone(rows, event, now)?.2
+        && tombstone(rows, event, now).await?.2
     {
         return Ok(Fired::Ingested);
     }
@@ -946,20 +961,20 @@ fn fire(rows: &mut dyn Transaction, f: &Firing<'_>, now: i64, policy: &Policy) -
         anyhow::ensure!(f.next.is_some() && f.busy.is_some(), "overlap firing requires next and busy triggers");
         // A slot already admitted is joined, even after its ingress
         // tombstone expires. Replacement must never cancel its own run.
-        if find_run(rows, &a.id)?.is_none() {
+        if find_run(rows, &a.id).await?.is_none() {
             let limit = if guard.policy == Overlap::Replace { usize::MAX } else { 1 };
-            let live = rows.scan(&partition("trigger_live", f.key), "", None, limit)?;
+            let live = rows.scan(&partition("trigger_live", f.key), "", None, limit).await?;
             if guard.policy == Overlap::Replace {
                 for id in live.values() {
                     let id = id.as_str().ok_or_else(|| anyhow::anyhow!("invalid trigger run index"))?;
-                    cancel_run(rows, id, now)?;
+                    cancel_run(rows, id, now).await?;
                 }
             }
-            if !capacity(rows, &a.name, guard.max_concurrent_runs)? {
+            if !capacity(rows, &a.name, guard.max_concurrent_runs).await? {
                 next = Some(guard.ceiling);
                 disposition = Fired::Ceiling;
             } else if !live.is_empty() && guard.policy != Overlap::Allow && guard.policy != Overlap::Replace {
-                if guard.policy == Overlap::Queue && queued(rows, f.key)?.is_none() {
+                if guard.policy == Overlap::Queue && queued(rows, f.key).await?.is_none() {
                     let q = Queued {
                         version: 1,
                         admission: a.clone(),
@@ -967,8 +982,8 @@ fn fire(rows: &mut dyn Transaction, f: &Firing<'_>, now: i64, policy: &Policy) -
                         max_concurrent_runs: guard.max_concurrent_runs,
                         failure: f.refused.map(|r| (r.error.clone(), r.breaker_threshold)),
                     };
-                    put(rows, "trigger_queue", f.key, &q)?;
-                    rows.put(&partition("queue_name", &a.name), f.key, &json!(f.key))?;
+                    put(rows, "trigger_queue", f.key, &q).await?;
+                    rows.put(&partition("queue_name", &a.name), f.key, &json!(f.key)).await?;
                     disposition = Fired::Queued;
                 } else {
                     next = f.busy;
@@ -980,47 +995,47 @@ fn fire(rows: &mut dyn Transaction, f: &Firing<'_>, now: i64, policy: &Policy) -
         anyhow::bail!("overlap policy requires one admission");
     } else if let Some(busy) = f.busy
         && (!f.admit.is_empty() || f.refused.is_some())
-        && let Some(last) = get::<String>(rows, "trigger_run", f.key)?
-        && find_run(rows, &last)?.is_some_and(|s| s.run.ended_ms.is_none())
+        && let Some(last) = get::<String>(rows, "trigger_run", f.key).await?
+        && find_run(rows, &last).await?.is_some_and(|s| s.run.ended_ms.is_none())
     {
         next = Some(busy);
         disposition = Fired::Busy(last);
     }
     if let Some(event) = f.ingress {
-        let (k, old, used) = tombstone(rows, event, now)?;
+        let (k, old, used) = tombstone(rows, event, now).await?;
         if used {
             return Ok(Fired::Ingested);
         }
         if let Some(old) = old {
-            rows.delete("ingress_due", &timed(old.expires_at_ms, &k))?;
+            rows.delete("ingress_due", &timed(old.expires_at_ms, &k)).await?;
         }
         let expires_at_ms = now.saturating_add(policy.ingress_ms);
-        put(rows, "ingress", &k, &Tombstone { payload: payload(event), expires_at_ms })?;
-        rows.put("ingress_due", &timed(expires_at_ms, &k), &json!(k))?;
+        put(rows, "ingress", &k, &Tombstone { payload: payload(event), expires_at_ms }).await?;
+        rows.put("ingress_due", &timed(expires_at_ms, &k), &json!(k)).await?;
     }
-    store_trigger(rows, f.key, current.as_ref(), next)?;
+    store_trigger(rows, f.key, current.as_ref(), next).await?;
     if disposition == Fired::Committed {
         for a in f.admit {
-            admit_firing(rows, f.key, a, f.rearm, next, now)?;
+            admit_firing(rows, f.key, a, f.rearm, next, now).await?;
         }
     }
     if disposition == Fired::Committed
         && let Some(r) = f.refused
     {
-        refuse(rows, r, now)?;
-        put(rows, "trigger_run", f.key, &r.admission.id)?;
+        refuse(rows, r, now).await?;
+        put(rows, "trigger_run", f.key, &r.admission.id).await?;
     }
     Ok(disposition)
 }
 
-fn activate(
+async fn activate(
     rows: &mut dyn Transaction,
     name: &str,
     version: u64,
     epoch: Option<u64>,
     arming: &Arming,
 ) -> anyhow::Result<Option<Definitions>> {
-    let mut defs = load_definitions(rows, name)?.unwrap_or_default();
+    let mut defs = load_definitions(rows, name).await?.unwrap_or_default();
     anyhow::ensure!(defs.versions.contains_key(&version), "unknown definition version");
     if epoch.is_some_and(|e| e != defs.epoch) {
         return Ok(None);
@@ -1031,16 +1046,16 @@ fn activate(
     defs.epoch = defs.epoch.checked_add(1).ok_or_else(|| anyhow::anyhow!("activation epoch overflow"))?;
     defs.consecutive_faults = 0;
     defs.tripped = None;
-    rows.delete("paused", name)?;
-    arm(rows, &mut defs, &arming.triggers)?;
-    store_definitions(rows, name, &defs)?;
+    rows.delete("paused", name).await?;
+    arm(rows, &mut defs, &arming.triggers).await?;
+    store_definitions(rows, name, &defs).await?;
     Ok(Some(defs))
 }
 
 // ── 5. termination and the breaker ─────────────────────────────────────────
 
-fn lifecycle(rows: &mut dyn Transaction, id: &str, status: &Status, now: i64) -> anyhow::Result<()> {
-    let Some(link) = run(rows, id)?.run.child else {
+async fn lifecycle(rows: &mut dyn Transaction, id: &str, status: &Status, now: i64) -> anyhow::Result<()> {
+    let Some(link) = run(rows, id).await?.run.child else {
         return Ok(());
     };
     let (kind, data) = match status {
@@ -1051,26 +1066,26 @@ fn lifecycle(rows: &mut dyn Transaction, id: &str, status: &Status, now: i64) ->
         Status::Interrupted(_) => return Ok(()),
     };
     let t = format!("{kind}:{id}");
-    if kind == "done" && rows.get(&types_of(&link.parent), &component(&t))?.is_some() {
+    if kind == "done" && rows.get(&types_of(&link.parent), &component(&t)).await?.is_some() {
         return Ok(());
     }
     if kind == "done" {
         // A terminal child can never report waiting again. Close the automatic
         // registration, while retaining any explicit listen for that type.
-        let mut parent = run(rows, &link.parent)?;
+        let mut parent = run(rows, &link.parent).await?;
         let waiting = format!("waiting:{id}");
         let had = parent.awaits.contains_key(&waiting);
         close(&mut parent, std::slice::from_ref(&waiting));
         if had && !parent.awaits.contains_key(&waiting) {
-            store_run(rows, &parent)?;
+            store_run(rows, &parent).await?;
         }
     }
-    notify(rows, &link.parent, &t, &data, now)
+    notify(rows, &link.parent, &t, &data, now).await
 }
-fn terminate(rows: &mut dyn Transaction, id: &str, status: &Status, now: i64) -> anyhow::Result<()> {
-    let mut snapshot = run(rows, id)?;
+async fn terminate(rows: &mut dyn Transaction, id: &str, status: &Status, now: i64) -> anyhow::Result<()> {
+    let mut snapshot = run(rows, id).await?;
     let root = snapshot.run.root.as_deref().unwrap_or(id);
-    let spent: u64 = get(rows, "budget", root)?.unwrap_or(0);
+    let spent: u64 = get(rows, "budget", root).await?.unwrap_or(0);
     snapshot.budget_ended = Some(spent);
     snapshot.run.state = match status {
         Status::Completed(_) => RunState::Completed,
@@ -1086,27 +1101,27 @@ fn terminate(rows: &mut dyn Transaction, id: &str, status: &Status, now: i64) ->
     snapshot.listeners.clear();
     snapshot.subscriptions.clear();
     snapshot.waits.clear();
-    store_run(rows, &snapshot)?;
+    store_run(rows, &snapshot).await?;
     // The tree ends with its root (its owned descendants are cancelled
     // below, in this commit): nothing can spend its budget any more.
-    if snapshot.run.root.is_none() && rows.get("budget", id)?.is_some() {
-        rows.delete("budget", id)?;
+    if snapshot.run.root.is_none() && rows.get("budget", id).await?.is_some() {
+        rows.delete("budget", id).await?;
     }
     // Only the trigger the firing stored is re-armed: a later activation
     // (a new epoch) replaced it, and an old run cannot move the new one.
     if let Some((rearm, armed)) = &snapshot.rearm
-        && let Some(t) = get::<Trigger>(rows, "trigger", &rearm.trigger)?
+        && let Some(t) = get::<Trigger>(rows, "trigger", &rearm.trigger).await?
         && t == *armed
         && t.at_ms.is_none()
     {
         let due = Trigger { at_ms: Some(now.saturating_add(rearm.delay_ms)), ..t.clone() };
-        store_trigger(rows, &rearm.trigger, Some(&t), Some(&due))?;
+        store_trigger(rows, &rearm.trigger, Some(&t), Some(&due)).await?;
     }
     // Iterative cascade avoids stack growth on arbitrarily nested child runs.
     let mut names = std::collections::BTreeSet::from([snapshot.run.admission.name.clone()]);
     let mut parents = vec![id.to_string()];
     while let Some(parent) = parents.pop() {
-        for mut child in indexed_runs(rows, &partition("children", &parent), "", None, usize::MAX)? {
+        for mut child in indexed_runs(rows, &partition("children", &parent), "", None, usize::MAX).await? {
             // The indexed read already holds this child's primary row in
             // the transaction; reuse its indexes instead of reading it twice.
             let before = indexes(&child);
@@ -1123,22 +1138,22 @@ fn terminate(rows: &mut dyn Transaction, id: &str, status: &Status, now: i64) ->
             names.insert(child.run.admission.name.clone());
             child.waits.clear();
             parents.push(child.run.admission.id.clone());
-            store_run_indexed(rows, &child, &before)?;
-            lifecycle(rows, &child.run.admission.id, &Status::Cancelled, now)?;
+            store_run_indexed(rows, &child, &before).await?;
+            lifecycle(rows, &child.run.admission.id, &Status::Cancelled, now).await?;
         }
     }
-    lifecycle(rows, id, status, now)?;
+    lifecycle(rows, id, status, now).await?;
     for name in names {
-        drain_queues(rows, &name, now)?;
+        drain_queues(rows, &name, now).await?;
     }
     Ok(())
 }
-fn cancel_run(rows: &mut dyn Transaction, id: &str, now: i64) -> anyhow::Result<bool> {
-    let Some(s) = find_run(rows, id)? else { return Ok(false) };
+async fn cancel_run(rows: &mut dyn Transaction, id: &str, now: i64) -> anyhow::Result<bool> {
+    let Some(s) = find_run(rows, id).await? else { return Ok(false) };
     if s.run.ended_ms.is_some() {
         return Ok(false);
     }
-    terminate(rows, id, &Status::Cancelled, now)?;
+    terminate(rows, id, &Status::Cancelled, now).await?;
     Ok(true)
 }
 /// The notice of a trip, keyed by its time, then the definition and epoch.
@@ -1150,7 +1165,7 @@ fn notice_key(name: &str, trip: &Trip) -> String {
 /// while the breaker has not tripped. A trip reports, and nothing else: the
 /// active version and the epoch stay, the triggers go, and the notice is
 /// stored in this commit, so a trip is never committed unreported.
-fn breaker(
+async fn breaker(
     rows: &mut dyn Transaction,
     run: &SavedRun,
     fault: Option<&WorkflowError>,
@@ -1159,7 +1174,7 @@ fn breaker(
     now: i64,
 ) -> anyhow::Result<()> {
     let name = &run.admission.name;
-    let Some(mut defs) = load_definitions(rows, name)? else {
+    let Some(mut defs) = load_definitions(rows, name).await? else {
         return Ok(());
     };
     if defs.active != Some(run.admission.version) || run.epoch != Some(defs.epoch) || defs.tripped.is_some() {
@@ -1181,608 +1196,712 @@ fn breaker(
                     reason: reason.clone(),
                     at_ms: now,
                 };
-                arm(rows, &mut defs, &BTreeMap::new())?;
-                rows.put("notice", &notice_key(name, &trip), &trip.event(name))?;
+                arm(rows, &mut defs, &BTreeMap::new()).await?;
+                rows.put("notice", &notice_key(name, &trip), &trip.event(name)).await?;
                 defs.tripped = Some(trip);
             }
         }
         None => return Ok(()),
     }
-    store_definitions(rows, name, &defs)
+    store_definitions(rows, name, &defs).await
 }
 
 // ── 6. the RunStore implementation ─────────────────────────────────────────
 
+#[async_trait::async_trait]
 impl RunStore for TransactionalStore {
-    fn control(
+    async fn control(
         &self,
         request: &control::Request,
         command: &control::Command,
         now: i64,
     ) -> anyhow::Result<control::Reply> {
-        self.update(|rows| control_command(rows, request, command, now, &self.policy))
+        self.update(|rows| Box::pin(async move { control_command(rows, request, command, now, &self.policy).await }))
+            .await
     }
-    fn stopped(&self) -> anyhow::Result<bool> {
-        self.update(is_stopped)
+    async fn stopped(&self) -> anyhow::Result<bool> {
+        self.update(|rows| Box::pin(async move { is_stopped(rows).await })).await
     }
-    fn control_entry(&self, id: &str) -> anyhow::Result<Option<control::Entry>> {
-        self.update(|rows| get(rows, "control_command", id))
+    async fn control_entry(&self, id: &str) -> anyhow::Result<Option<control::Entry>> {
+        self.update(|rows| Box::pin(async move { get(rows, "control_command", id).await })).await
     }
-    fn control_history(
+    async fn control_history(
         &self,
         run: Option<&str>,
         cursor: Option<&control::Cursor>,
         limit: usize,
     ) -> anyhow::Result<control::Page<control::Entry>> {
         self.update(|rows| {
-            let kind = run.map_or_else(|| "control_history".into(), |r| partition("control_history_run", r));
-            let (found, next) = page_rows(rows, &kind, &kind, None, None, cursor, limit)?;
-            let items = found.into_values().map(|v| Ok(serde_json::from_value(v)?)).collect::<anyhow::Result<_>>()?;
-            Ok(control::Page { items, next })
+            Box::pin(async move {
+                let kind = run.map_or_else(|| "control_history".into(), |r| partition("control_history_run", r));
+                let (found, next) = page_rows(rows, &kind, &kind, None, None, cursor, limit).await?;
+                let items =
+                    found.into_values().map(|v| Ok(serde_json::from_value(v)?)).collect::<anyhow::Result<_>>()?;
+                Ok(control::Page { items, next })
+            })
         })
+        .await
     }
-    fn query_runs(
+    async fn query_runs(
         &self,
         filter: &control::Runs,
         history: bool,
         cursor: Option<&control::Cursor>,
         limit: usize,
     ) -> anyhow::Result<control::Page<SavedRun>> {
-        self.update(|rows| query_runs(rows, filter, history, cursor, limit))
+        self.update(|rows| Box::pin(async move { query_runs(rows, filter, history, cursor, limit).await })).await
     }
-    fn pending_waits(
+    async fn pending_waits(
         &self,
         f: &control::Waits,
         cursor: Option<&control::Cursor>,
         limit: usize,
     ) -> anyhow::Result<control::Page<control::Wait>> {
         self.update(|rows| {
-            let query = serde_json::to_string(&("waits", f))?;
-            let (found, next) = page_rows(rows, &wait_kind(f), &query, f.since_ms, f.before_ms, cursor, limit)?;
-            let mut items = Vec::new();
-            for v in found.into_values() {
-                let w: control::Wait = serde_json::from_value(v)?;
-                if f.definition.as_ref().is_none_or(|d| *d == w.definition)
-                    && f.run.as_ref().is_none_or(|r| *r == w.run)
-                    && f.event_type.as_ref().is_none_or(|t| w.waiting.types.contains(t))
-                {
-                    items.push(w);
+            Box::pin(async move {
+                let query = serde_json::to_string(&("waits", f))?;
+                let (found, next) =
+                    page_rows(rows, &wait_kind(f), &query, f.since_ms, f.before_ms, cursor, limit).await?;
+                let mut items = Vec::new();
+                for v in found.into_values() {
+                    let w: control::Wait = serde_json::from_value(v)?;
+                    if f.definition.as_ref().is_none_or(|d| *d == w.definition)
+                        && f.run.as_ref().is_none_or(|r| *r == w.run)
+                        && f.event_type.as_ref().is_none_or(|t| w.waiting.types.contains(t))
+                    {
+                        items.push(w);
+                    }
                 }
-            }
-            Ok(control::Page { items, next })
+                Ok(control::Page { items, next })
+            })
         })
+        .await
     }
-    fn describe_wait(&self, f: &Fence, k: &str, wait: &owf::events::PendingWait, now: i64) -> anyhow::Result<()> {
+    async fn describe_wait(&self, f: &Fence, k: &str, wait: &owf::events::PendingWait, now: i64) -> anyhow::Result<()> {
         self.update(|rows| {
-            let mut s = checked(rows, f, now, self.policy.skew_ms)?;
-            let mut wait = wait.clone();
-            if let Some(old) = s.waits.get(k) {
-                wait.since_ms = old.since_ms;
-            }
-            if s.waits.get(k) != Some(&wait) {
-                s.waits.insert(k.into(), wait);
-                store_run(rows, &s)?;
-            }
-            Ok(())
+            Box::pin(async move {
+                let mut s = checked(rows, f, now, self.policy.skew_ms).await?;
+                let mut wait = wait.clone();
+                if let Some(old) = s.waits.get(k) {
+                    wait.since_ms = old.since_ms;
+                }
+                if s.waits.get(k) != Some(&wait) {
+                    s.waits.insert(k.into(), wait);
+                    store_run(rows, &s).await?;
+                }
+                Ok(())
+            })
         })
+        .await
     }
-    fn inspect_control(&self, id: &str) -> anyhow::Result<Option<control::Inspection>> {
+    async fn inspect_control(&self, id: &str) -> anyhow::Result<Option<control::Inspection>> {
         self.update(|rows| {
-            let Some(s) = find_run(rows, id)? else {
-                return Ok(None);
-            };
-            let waits = s.waits.clone();
-            let root = s.run.root.as_deref().unwrap_or(id);
-            let budget_spent = match s.budget_ended {
-                Some(spent) => spent,
-                None => get::<u64>(rows, "budget", root)?.unwrap_or(0),
-            };
-            let children = indexed_runs(rows, &partition("control_parent", id), "", None, usize::MAX)?
-                .into_iter()
-                .map(|s| s.run)
-                .collect();
-            let runtime = &s.run.admission.runtime;
-            let budget_limit = runtime["limits"]["max_jumps"].as_u64().map(|host| {
-                owf::model::parse_yaml(&s.run.admission.definition).map_or(host, |w| w.budget.max_jumps(host))
-            });
-            let trace_id = runtime["trace_id"].as_str().map(str::to_owned);
-            let span_id = runtime["span_id"].as_str().map(str::to_owned);
-            let snapshot = snapshot(rows, s)?;
-            let calls = owf::durable::call_journal(&snapshot.records);
-            Ok(Some(control::Inspection {
-                snapshot,
-                calls,
-                waits,
-                children,
-                budget_spent,
-                budget_limit,
-                trace_id,
-                span_id,
-            }))
+            Box::pin(async move {
+                let Some(s) = find_run(rows, id).await? else {
+                    return Ok(None);
+                };
+                let waits = s.waits.clone();
+                let root = s.run.root.as_deref().unwrap_or(id);
+                let budget_spent = match s.budget_ended {
+                    Some(spent) => spent,
+                    None => get::<u64>(rows, "budget", root).await?.unwrap_or(0),
+                };
+                let children = indexed_runs(rows, &partition("control_parent", id), "", None, usize::MAX)
+                    .await?
+                    .into_iter()
+                    .map(|s| s.run)
+                    .collect();
+                let runtime = &s.run.admission.runtime;
+                let budget_limit = runtime["limits"]["max_jumps"].as_u64().map(|host| {
+                    owf::model::parse_yaml(&s.run.admission.definition).map_or(host, |w| w.budget.max_jumps(host))
+                });
+                let trace_id = runtime["trace_id"].as_str().map(str::to_owned);
+                let span_id = runtime["span_id"].as_str().map(str::to_owned);
+                let snapshot = snapshot(rows, s).await?;
+                let calls = owf::durable::call_journal(&snapshot.records);
+                Ok(Some(control::Inspection {
+                    snapshot,
+                    calls,
+                    waits,
+                    children,
+                    budget_spent,
+                    budget_limit,
+                    trace_id,
+                    span_id,
+                }))
+            })
         })
+        .await
     }
 
     fn policy(&self) -> Policy {
         self.policy
     }
-    fn admit(&self, a: &Admission, now: i64) -> anyhow::Result<bool> {
-        self.update(|rows| insert(rows, a, now))
+    async fn admit(&self, a: &Admission, now: i64) -> anyhow::Result<bool> {
+        self.update(|rows| Box::pin(async move { insert(rows, a, now).await })).await
     }
-    fn start(&self, a: &Admission, now: i64) -> anyhow::Result<Option<Fence>> {
-        let owner = uuid::Uuid::new_v4().to_string();
+    async fn start(&self, a: &Admission, now: i64) -> anyhow::Result<Option<Fence>> {
+        let owner = &uuid::Uuid::new_v4().to_string();
         self.update(|rows| {
-            let Some(mut s) = admitted(rows, a, now)? else {
-                return Ok(None);
-            };
-            let fence = claim_run(&mut s, now, &owner)?;
-            store_run(rows, &s)?;
-            Ok(Some(fence))
+            Box::pin(async move {
+                let Some(mut s) = admitted(rows, a, now).await? else {
+                    return Ok(None);
+                };
+                let fence = claim_run(&mut s, now, owner)?;
+                store_run(rows, &s).await?;
+                Ok(Some(fence))
+            })
         })
+        .await
     }
-    fn claim_as(&self, id: &str, now: i64, worker: &Compatibility) -> anyhow::Result<Option<Fence>> {
-        let owner = uuid::Uuid::new_v4().to_string();
+    async fn claim_as(&self, id: &str, now: i64, worker: &Compatibility) -> anyhow::Result<Option<Fence>> {
+        let owner = &uuid::Uuid::new_v4().to_string();
         self.update(|rows| {
-            if is_stopped(rows)? {
-                return Ok(None);
-            }
-            let Some(mut s) = find_run(rows, id)? else {
-                return Ok(None);
-            };
-            if !claimable(&s.run, now) || !worker.admits(s.run.admission.application_version()) {
-                return Ok(None);
-            }
-            let fence = claim_run(&mut s, now, &owner)?;
-            store_run(rows, &s)?;
-            Ok(Some(fence))
+            Box::pin(async move {
+                if is_stopped(rows).await? {
+                    return Ok(None);
+                }
+                let Some(mut s) = find_run(rows, id).await? else {
+                    return Ok(None);
+                };
+                if !claimable(&s.run, now) || !worker.admits(s.run.admission.application_version()) {
+                    return Ok(None);
+                }
+                let fence = claim_run(&mut s, now, owner)?;
+                store_run(rows, &s).await?;
+                Ok(Some(fence))
+            })
         })
+        .await
     }
-    fn check_lease(&self, f: &Fence, now: i64) -> anyhow::Result<()> {
-        self.update(|rows| checked(rows, f, now, self.policy.skew_ms).map(|_| ()))
+    async fn check_lease(&self, f: &Fence, now: i64) -> anyhow::Result<()> {
+        self.update(|rows| Box::pin(async move { checked(rows, f, now, self.policy.skew_ms).await.map(|_| ()) })).await
     }
-    fn renew(&self, f: &Fence, now: i64) -> anyhow::Result<()> {
+    async fn renew(&self, f: &Fence, now: i64) -> anyhow::Result<()> {
         self.update(|rows| {
-            let mut s = checked(rows, f, now, self.policy.skew_ms)?;
-            s.run.lease_until_ms = Some(now.saturating_add(LEASE_MS));
-            store_run(rows, &s)
+            Box::pin(async move {
+                let mut s = checked(rows, f, now, self.policy.skew_ms).await?;
+                s.run.lease_until_ms = Some(now.saturating_add(LEASE_MS));
+                store_run(rows, &s).await
+            })
         })
+        .await
     }
-    fn release(&self, f: &Fence, now: i64) -> anyhow::Result<()> {
+    async fn release(&self, f: &Fence, now: i64) -> anyhow::Result<()> {
         self.update(|rows| {
-            let mut s = authority(rows, f, now, self.policy.skew_ms)?;
-            s.run.state = RunState::Ready;
-            s.run.fence = None;
-            s.run.lease_until_ms = None;
-            s.run.wake_at_ms = now;
-            store_run(rows, &s)
+            Box::pin(async move {
+                let mut s = authority(rows, f, now, self.policy.skew_ms).await?;
+                s.run.state = RunState::Ready;
+                s.run.fence = None;
+                s.run.lease_until_ms = None;
+                s.run.wake_at_ms = now;
+                store_run(rows, &s).await
+            })
         })
+        .await
     }
     // One ordered range read of the run's own record rows.
-    fn load_records(&self, f: &Fence, now: i64) -> anyhow::Result<BTreeMap<String, Record>> {
+    async fn load_records(&self, f: &Fence, now: i64) -> anyhow::Result<BTreeMap<String, Record>> {
         self.update(|rows| {
-            checked(rows, f, now, self.policy.skew_ms)?;
-            rows.scan(&records_of(&f.run_id), "", None, usize::MAX)?
-                .into_iter()
-                .map(|((_, key), value)| Ok((key, serde_json::from_value(value)?)))
-                .collect()
+            Box::pin(async move {
+                checked(rows, f, now, self.policy.skew_ms).await?;
+                rows.scan(&records_of(&f.run_id), "", None, usize::MAX)
+                    .await?
+                    .into_iter()
+                    .map(|((_, key), value)| Ok((key, serde_json::from_value(value)?)))
+                    .collect()
+            })
         })
+        .await
     }
 
     // The fence check reads the run row and the save writes only the record's
     // row, in one serializable commit: an owner replaced before the commit
     // conflicts and fails the check on retry. Only a run's first record also
     // writes the run row, to mark evidence for `sweep`.
-    fn save_record(&self, f: &Fence, k: &str, r: &Record, now: i64) -> anyhow::Result<()> {
+    async fn save_record(&self, f: &Fence, k: &str, r: &Record, now: i64) -> anyhow::Result<()> {
         self.update(|rows| {
-            let mut s = checked(rows, f, now, self.policy.skew_ms)?;
-            let kind = records_of(&f.run_id);
-            let old = rows.get(&kind, k)?;
-            let value = serde_json::to_value(r)?;
-            if matches!(r, Record::Event { .. } | Record::Expired { .. }) {
-                anyhow::ensure!(old.as_ref() == Some(&value), "event records must be committed by take_event");
-            }
-            if matches!(r, Record::Budget { .. } | Record::Exceeded { .. }) {
-                anyhow::ensure!(old.as_ref() == Some(&value), "budget records must be committed by spend");
-            }
-            if let Some(old) = &old {
-                check_transition(&serde_json::from_value(old.clone())?, r)?;
-            }
-            if old.as_ref() != Some(&value) {
-                rows.put(&kind, k, &value)?;
-            }
-            if !s.evidence {
-                s.evidence = true;
-                store_run(rows, &s)?;
-            }
-            Ok(())
-        })
-    }
-    fn register_wait(&self, f: &Fence, types: &[String], now: i64) -> anyhow::Result<()> {
-        self.update(|rows| {
-            let mut s = checked(rows, f, now, self.policy.skew_ms)?;
-            for t in types {
-                s.addressed_waits.insert(t.clone());
-                s.awaits.entry(t.clone()).or_insert(now);
-            }
-            store_run(rows, &s)
-        })
-    }
-    fn unregister_wait(&self, f: &Fence, k: &str, types: &[String], now: i64) -> anyhow::Result<()> {
-        self.update(|rows| {
-            let mut s = checked(rows, f, now, self.policy.skew_ms)?;
-            s.listeners.remove(k);
-            close(&mut s, types);
-            store_run(rows, &s)
-        })
-    }
-    fn deliver(&self, event: &Value, target: Option<&str>, now: i64) -> anyhow::Result<Option<String>> {
-        self.update(|rows| deliver(rows, event, target, now, &self.policy))
-    }
-    fn take_event(&self, f: &Fence, k: &str, types: &[String], now: i64) -> anyhow::Result<Option<Value>> {
-        self.update(|rows| {
-            let mut s = checked(rows, f, now, self.policy.skew_ms)?;
-            let id = f.run_id.as_str();
-            if let Some(saved) = rows.get(&records_of(id), k)? {
-                let Record::Event { event } = serde_json::from_value(saved)? else {
-                    anyhow::bail!("invalid event checkpoint")
-                };
-                return Ok(Some(event));
-            }
-            // A copy past its mailbox time is consumed by its expiry record,
-            // never by this listen.
-            expire(rows, &mut s, now)?;
-            // The first pending copy, in arrival order, of a listed type or,
-            // for `*`, published: one indexed row per listed type.
-            let mut kinds: Vec<String> = types.iter().map(|t| pending_of(id, t)).collect();
-            if types.iter().any(|t| t == "*") {
-                kinds.push(published_of(id));
-            }
-            let mut candidate: Option<u64> = None;
-            for kind in kinds {
-                if let Some(n) = rows.scan(&kind, "", None, 1)?.into_values().next() {
-                    let n = n.as_u64().ok_or_else(|| anyhow::anyhow!("invalid pending event index"))?;
-                    candidate = Some(candidate.map_or(n, |c| c.min(n)));
+            Box::pin(async move {
+                let mut s = checked(rows, f, now, self.policy.skew_ms).await?;
+                let kind = records_of(&f.run_id);
+                let old = rows.get(&kind, k).await?;
+                let value = serde_json::to_value(r)?;
+                if matches!(r, Record::Event { .. } | Record::Expired { .. }) {
+                    anyhow::ensure!(old.as_ref() == Some(&value), "event records must be committed by take_event");
                 }
-            }
-            let result = if let Some(n) = candidate {
-                let stored = copy(rows, id, n)?;
-                let event = envelope(&stored)?;
-                if let Some(child) = stored.type_.strip_prefix("done:") {
-                    s.listeners.remove(&format!("child:{child}"));
+                if matches!(r, Record::Budget { .. } | Record::Exceeded { .. }) {
+                    anyhow::ensure!(old.as_ref() == Some(&value), "budget records must be committed by spend");
                 }
-                let mailbox = stored.expires_at_ms.is_some();
-                consume(rows, &mut s, n, stored, k)?;
-                if mailbox {
-                    refresh_mailbox(rows, &mut s)?;
+                if let Some(old) = &old {
+                    check_transition(&serde_json::from_value(old.clone())?, r)?;
                 }
+                if old.as_ref() != Some(&value) {
+                    rows.put(&kind, k, &value).await?;
+                }
+                if !s.evidence {
+                    s.evidence = true;
+                    store_run(rows, &s).await?;
+                }
+                Ok(())
+            })
+        })
+        .await
+    }
+    async fn register_wait(&self, f: &Fence, types: &[String], now: i64) -> anyhow::Result<()> {
+        self.update(|rows| {
+            Box::pin(async move {
+                let mut s = checked(rows, f, now, self.policy.skew_ms).await?;
+                for t in types {
+                    s.addressed_waits.insert(t.clone());
+                    s.awaits.entry(t.clone()).or_insert(now);
+                }
+                store_run(rows, &s).await
+            })
+        })
+        .await
+    }
+    async fn unregister_wait(&self, f: &Fence, k: &str, types: &[String], now: i64) -> anyhow::Result<()> {
+        self.update(|rows| {
+            Box::pin(async move {
+                let mut s = checked(rows, f, now, self.policy.skew_ms).await?;
                 s.listeners.remove(k);
-                s.waits.retain(|_, w| w.position != k);
                 close(&mut s, types);
-                put(rows, &records_of(id), k, &Record::Event { event: event.clone() })?;
-                Some(event)
-            } else {
-                s.listeners.insert(k.into(), types.to_vec());
-                None
-            };
-            store_run(rows, &s)?;
-            Ok(result)
+                store_run(rows, &s).await
+            })
         })
+        .await
     }
-    fn subscribe(&self, f: &Fence, k: &str, types: &[String], now: i64) -> anyhow::Result<()> {
+    async fn deliver(&self, event: &Value, target: Option<&str>, now: i64) -> anyhow::Result<Option<String>> {
+        self.update(|rows| Box::pin(async move { deliver(rows, event, target, now, &self.policy).await })).await
+    }
+    async fn take_event(&self, f: &Fence, k: &str, types: &[String], now: i64) -> anyhow::Result<Option<Value>> {
         self.update(|rows| {
-            let mut s = checked(rows, f, now, self.policy.skew_ms)?;
-            s.subscriptions.insert(k.into(), types.to_vec());
-            store_run(rows, &s)
-        })
-    }
-    fn unsubscribe(&self, f: &Fence, k: &str, now: i64) -> anyhow::Result<()> {
-        self.update(|rows| {
-            let mut s = checked(rows, f, now, self.policy.skew_ms)?;
-            s.subscriptions.remove(k);
-            s.waits.remove(k);
-            store_run(rows, &s)
-        })
-    }
-    fn publish(&self, event: &Value, target: Option<&str>, now: i64) -> anyhow::Result<Vec<String>> {
-        self.update(|rows| publish(rows, event, target, now, &self.policy))
-    }
-    fn ingested(&self, event: &Value, now: i64) -> anyhow::Result<bool> {
-        self.update(|rows| Ok(tombstone(rows, event, now)?.2))
-    }
-    fn trigger(&self, key: &str) -> anyhow::Result<Option<Trigger>> {
-        self.update(|rows| get(rows, "trigger", key))
-    }
-    fn due_triggers(&self, now: i64, limit: usize) -> anyhow::Result<Vec<(String, Trigger)>> {
-        self.update(|rows| {
-            if is_stopped(rows)? {
-                return Ok(Vec::new());
-            }
-            let keys = rows.scan("trigger_due", "", Some(&until(now)), limit)?;
-            indexed_triggers(rows, keys)
-        })
-    }
-    fn triggers_for(&self, t: &str, limit: usize) -> anyhow::Result<Vec<(String, Trigger)>> {
-        self.update(|rows| {
-            if is_stopped(rows)? {
-                return Ok(Vec::new());
-            }
-            let mut keys = rows.scan(&partition("trigger_type", t), "", None, limit)?;
-            if t != "*" && keys.len() < limit {
-                keys.extend(rows.scan(&partition("trigger_type", "*"), "", None, limit - keys.len())?);
-            }
-            indexed_triggers(rows, keys)
-        })
-    }
-    fn queued(&self, key: &str) -> anyhow::Result<Option<Admission>> {
-        self.update(|rows| Ok(queued(rows, key)?.map(|q| q.admission)))
-    }
-    fn fire(&self, firing: &Firing<'_>, now: i64) -> anyhow::Result<Fired> {
-        self.update(|rows| fire(rows, firing, now, &self.policy))
-    }
-    fn finish(&self, f: &Fence, outcome: &Status, now: i64, threshold: u32) -> anyhow::Result<Status> {
-        self.update(|rows| {
-            let mut s = checked(rows, f, now, self.policy.skew_ms)?;
-            let mut status = outcome.clone();
-            match &status {
-                Status::Waiting { wake_at_ms } => {
-                    s.run.state = RunState::Waiting;
-                    s.run.interruptions = 0;
-                    s.run.wake_at_ms = *wake_at_ms;
-                    if pending_wanted(rows, &s, now)? {
-                        s.run.wake_at_ms = now;
+            Box::pin(async move {
+                let mut s = checked(rows, f, now, self.policy.skew_ms).await?;
+                let id = f.run_id.as_str();
+                if let Some(saved) = rows.get(&records_of(id), k).await? {
+                    let Record::Event { event } = serde_json::from_value(saved)? else {
+                        anyhow::bail!("invalid event checkpoint")
+                    };
+                    return Ok(Some(event));
+                }
+                // A copy past its mailbox time is consumed by its expiry record,
+                // never by this listen.
+                expire(rows, &mut s, now).await?;
+                // The first pending copy, in arrival order, of a listed type or,
+                // for `*`, published: one indexed row per listed type.
+                let mut kinds: Vec<String> = types.iter().map(|t| pending_of(id, t)).collect();
+                if types.iter().any(|t| t == "*") {
+                    kinds.push(published_of(id));
+                }
+                let mut candidate: Option<u64> = None;
+                for kind in kinds {
+                    if let Some(n) = rows.scan(&kind, "", None, 1).await?.into_values().next() {
+                        let n = n.as_u64().ok_or_else(|| anyhow::anyhow!("invalid pending event index"))?;
+                        candidate = Some(candidate.map_or(n, |c| c.min(n)));
                     }
                 }
-                Status::Interrupted(error) => {
-                    s.run.interruptions = s.run.interruptions.saturating_add(1);
-                    if s.run.interruptions >= MAX_INTERRUPTIONS {
-                        status = Status::Faulted(WorkflowError::runtime(format!(
-                            "gave up after {} interruptions: {error}",
-                            s.run.interruptions
-                        )));
-                    } else {
-                        s.run.state = RunState::Ready;
-                        s.run.wake_at_ms =
-                            now.saturating_add((2_000_i64 << (s.run.interruptions - 1).min(20)).min(600_000));
+                let result = if let Some(n) = candidate {
+                    let stored = copy(rows, id, n).await?;
+                    let event = envelope(&stored)?;
+                    if let Some(child) = stored.type_.strip_prefix("done:") {
+                        s.listeners.remove(&format!("child:{child}"));
                     }
-                }
-                _ => {
-                    s.run.interruptions = 0;
-                }
-            }
-            s.run.fence = None;
-            s.run.lease_until_ms = None;
-            store_run(rows, &s)?;
-            if matches!(status, Status::Completed(_) | Status::Faulted(_) | Status::Cancelled) {
-                // The breaker update shares the terminal commit, so an
-                // ambiguous finish or a fast parent cannot count a run twice.
-                // Cancellation and infrastructure interruptions (including
-                // their exhaustion) are not faults of the version.
-                let fault = match &status {
-                    Status::Faulted(e) if !matches!(outcome, Status::Interrupted(_)) => Some(e),
-                    _ => None,
+                    let mailbox = stored.expires_at_ms.is_some();
+                    consume(rows, &mut s, n, stored, k).await?;
+                    if mailbox {
+                        refresh_mailbox(rows, &mut s).await?;
+                    }
+                    s.listeners.remove(k);
+                    s.waits.retain(|_, w| w.position != k);
+                    close(&mut s, types);
+                    put(rows, &records_of(id), k, &Record::Event { event: event.clone() }).await?;
+                    Some(event)
+                } else {
+                    s.listeners.insert(k.into(), types.to_vec());
+                    None
                 };
-                let success = matches!(status, Status::Completed(_));
-                breaker(rows, &s.run, fault, success, threshold, now)?;
-                terminate(rows, &f.run_id, &status, now)?;
-            } else {
-                lifecycle(rows, &f.run_id, &status, now)?;
-            }
-            Ok(status)
+                store_run(rows, &s).await?;
+                Ok(result)
+            })
         })
+        .await
     }
-    fn start_child(&self, parent: &Fence, a: &Admission, link: &ChildLink, now: i64) -> anyhow::Result<Option<Fence>> {
-        let owner = uuid::Uuid::new_v4().to_string();
+    async fn subscribe(&self, f: &Fence, k: &str, types: &[String], now: i64) -> anyhow::Result<()> {
         self.update(|rows| {
-            let mut p = checked(rows, parent, now, self.policy.skew_ms)?;
-            anyhow::ensure!(link.parent == parent.run_id && a.id != parent.run_id, "invalid child parent");
-            for t in [format!("done:{}", a.id), format!("waiting:{}", a.id)] {
-                p.awaits.entry(t).or_insert(now);
-            }
-            p.listeners.insert(format!("child:{}", a.id), vec![format!("done:{}", a.id)]);
-            store_run(rows, &p)?;
-            let fresh = admitted(rows, a, now)?;
-            let inserted = fresh.is_some();
-            let mut c = match fresh {
-                Some(c) => c,
-                None => run(rows, &a.id)?,
-            };
-            if inserted {
-                c.run.child = Some(link.clone());
-                c.run.root = Some(p.run.root.clone().unwrap_or_else(|| parent.run_id.clone()));
-            }
-            anyhow::ensure!(c.run.child.as_ref() == Some(link), "child belongs to another invocation");
-            let fence = if inserted { Some(claim_run(&mut c, now, &owner)?) } else { None };
-            store_run(rows, &c)?;
-            if let Some(outcome) = c.run.outcome {
-                lifecycle(rows, &a.id, &outcome, now)?;
-            } else if c.run.state == RunState::Waiting {
-                lifecycle(rows, &a.id, &Status::Waiting { wake_at_ms: 0 }, now)?;
-            }
-            Ok(fence)
+            Box::pin(async move {
+                let mut s = checked(rows, f, now, self.policy.skew_ms).await?;
+                s.subscriptions.insert(k.into(), types.to_vec());
+                store_run(rows, &s).await
+            })
         })
+        .await
     }
-    fn child_outcome(&self, parent: &str, k: &str, child: &str) -> anyhow::Result<Option<Status>> {
+    async fn unsubscribe(&self, f: &Fence, k: &str, now: i64) -> anyhow::Result<()> {
         self.update(|rows| {
-            let s = run(rows, child)?;
-            anyhow::ensure!(
-                s.run.child.as_ref().is_some_and(|l| l.parent == parent && l.key == k),
-                "child belongs to another parent or key"
-            );
-            Ok(s.run.outcome)
+            Box::pin(async move {
+                let mut s = checked(rows, f, now, self.policy.skew_ms).await?;
+                s.subscriptions.remove(k);
+                s.waits.remove(k);
+                store_run(rows, &s).await
+            })
         })
+        .await
+    }
+    async fn publish(&self, event: &Value, target: Option<&str>, now: i64) -> anyhow::Result<Vec<String>> {
+        self.update(|rows| Box::pin(async move { publish(rows, event, target, now, &self.policy).await })).await
+    }
+    async fn ingested(&self, event: &Value, now: i64) -> anyhow::Result<bool> {
+        self.update(|rows| Box::pin(async move { Ok(tombstone(rows, event, now).await?.2) })).await
+    }
+    async fn trigger(&self, key: &str) -> anyhow::Result<Option<Trigger>> {
+        self.update(|rows| Box::pin(async move { get(rows, "trigger", key).await })).await
+    }
+    async fn due_triggers(&self, now: i64, limit: usize) -> anyhow::Result<Vec<(String, Trigger)>> {
+        self.update(|rows| {
+            Box::pin(async move {
+                if is_stopped(rows).await? {
+                    return Ok(Vec::new());
+                }
+                let keys = rows.scan("trigger_due", "", Some(&until(now)), limit).await?;
+                indexed_triggers(rows, keys).await
+            })
+        })
+        .await
+    }
+    async fn triggers_for(&self, t: &str, limit: usize) -> anyhow::Result<Vec<(String, Trigger)>> {
+        self.update(|rows| {
+            Box::pin(async move {
+                if is_stopped(rows).await? {
+                    return Ok(Vec::new());
+                }
+                let mut keys = rows.scan(&partition("trigger_type", t), "", None, limit).await?;
+                if t != "*" && keys.len() < limit {
+                    keys.extend(rows.scan(&partition("trigger_type", "*"), "", None, limit - keys.len()).await?);
+                }
+                indexed_triggers(rows, keys).await
+            })
+        })
+        .await
+    }
+    async fn queued(&self, key: &str) -> anyhow::Result<Option<Admission>> {
+        self.update(|rows| Box::pin(async move { Ok(queued(rows, key).await?.map(|q| q.admission)) })).await
+    }
+    async fn fire(&self, firing: &Firing<'_>, now: i64) -> anyhow::Result<Fired> {
+        self.update(|rows| Box::pin(async move { fire(rows, firing, now, &self.policy).await })).await
+    }
+    async fn finish(&self, f: &Fence, outcome: &Status, now: i64, threshold: u32) -> anyhow::Result<Status> {
+        self.update(|rows| {
+            Box::pin(async move {
+                let mut s = checked(rows, f, now, self.policy.skew_ms).await?;
+                let mut status = outcome.clone();
+                match &status {
+                    Status::Waiting { wake_at_ms } => {
+                        s.run.state = RunState::Waiting;
+                        s.run.interruptions = 0;
+                        s.run.wake_at_ms = *wake_at_ms;
+                        if pending_wanted(rows, &s, now).await? {
+                            s.run.wake_at_ms = now;
+                        }
+                    }
+                    Status::Interrupted(error) => {
+                        s.run.interruptions = s.run.interruptions.saturating_add(1);
+                        if s.run.interruptions >= MAX_INTERRUPTIONS {
+                            status = Status::Faulted(WorkflowError::runtime(format!(
+                                "gave up after {} interruptions: {error}",
+                                s.run.interruptions
+                            )));
+                        } else {
+                            s.run.state = RunState::Ready;
+                            s.run.wake_at_ms =
+                                now.saturating_add((2_000_i64 << (s.run.interruptions - 1).min(20)).min(600_000));
+                        }
+                    }
+                    _ => {
+                        s.run.interruptions = 0;
+                    }
+                }
+                s.run.fence = None;
+                s.run.lease_until_ms = None;
+                store_run(rows, &s).await?;
+                if matches!(status, Status::Completed(_) | Status::Faulted(_) | Status::Cancelled) {
+                    // The breaker update shares the terminal commit, so an
+                    // ambiguous finish or a fast parent cannot count a run twice.
+                    // Cancellation and infrastructure interruptions (including
+                    // their exhaustion) are not faults of the version.
+                    let fault = match &status {
+                        Status::Faulted(e) if !matches!(outcome, Status::Interrupted(_)) => Some(e),
+                        _ => None,
+                    };
+                    let success = matches!(status, Status::Completed(_));
+                    breaker(rows, &s.run, fault, success, threshold, now).await?;
+                    terminate(rows, &f.run_id, &status, now).await?;
+                } else {
+                    lifecycle(rows, &f.run_id, &status, now).await?;
+                }
+                Ok(status)
+            })
+        })
+        .await
+    }
+    async fn start_child(
+        &self,
+        parent: &Fence,
+        a: &Admission,
+        link: &ChildLink,
+        now: i64,
+    ) -> anyhow::Result<Option<Fence>> {
+        let owner = &uuid::Uuid::new_v4().to_string();
+        self.update(|rows| {
+            Box::pin(async move {
+                let mut p = checked(rows, parent, now, self.policy.skew_ms).await?;
+                anyhow::ensure!(link.parent == parent.run_id && a.id != parent.run_id, "invalid child parent");
+                for t in [format!("done:{}", a.id), format!("waiting:{}", a.id)] {
+                    p.awaits.entry(t).or_insert(now);
+                }
+                p.listeners.insert(format!("child:{}", a.id), vec![format!("done:{}", a.id)]);
+                store_run(rows, &p).await?;
+                let fresh = admitted(rows, a, now).await?;
+                let inserted = fresh.is_some();
+                let mut c = match fresh {
+                    Some(c) => c,
+                    None => run(rows, &a.id).await?,
+                };
+                if inserted {
+                    c.run.child = Some(link.clone());
+                    c.run.root = Some(p.run.root.clone().unwrap_or_else(|| parent.run_id.clone()));
+                }
+                anyhow::ensure!(c.run.child.as_ref() == Some(link), "child belongs to another invocation");
+                let fence = if inserted { Some(claim_run(&mut c, now, owner)?) } else { None };
+                store_run(rows, &c).await?;
+                if let Some(outcome) = c.run.outcome {
+                    lifecycle(rows, &a.id, &outcome, now).await?;
+                } else if c.run.state == RunState::Waiting {
+                    lifecycle(rows, &a.id, &Status::Waiting { wake_at_ms: 0 }, now).await?;
+                }
+                Ok(fence)
+            })
+        })
+        .await
+    }
+    async fn child_outcome(&self, parent: &str, k: &str, child: &str) -> anyhow::Result<Option<Status>> {
+        self.update(|rows| {
+            Box::pin(async move {
+                let s = run(rows, child).await?;
+                anyhow::ensure!(
+                    s.run.child.as_ref().is_some_and(|l| l.parent == parent && l.key == k),
+                    "child belongs to another parent or key"
+                );
+                Ok(s.run.outcome)
+            })
+        })
+        .await
     }
     // The fence check reads the run row, the decision is the record's row and
     // the count the tree's `budget` row: one commit, three rows (the run row
     // again only for a run's first evidence).
-    fn spend(&self, f: &Fence, k: &str, limit: u64, now: i64) -> anyhow::Result<Record> {
+    async fn spend(&self, f: &Fence, k: &str, limit: u64, now: i64) -> anyhow::Result<Record> {
         self.update(|rows| {
-            let mut s = checked(rows, f, now, self.policy.skew_ms)?;
-            let kind = records_of(&f.run_id);
-            if let Some(saved) = rows.get(&kind, k)? {
-                let record: Record = serde_json::from_value(saved)?;
-                anyhow::ensure!(matches!(record, Record::Budget { .. }), "invalid budget record at {k}");
-                return Ok(record);
-            }
-            let root = s.run.root.clone().unwrap_or_else(|| f.run_id.clone());
-            let spent: u64 = get(rows, "budget", &root)?.unwrap_or(0);
-            let granted = spent < limit;
-            let spent = spent + u64::from(granted);
-            if granted {
-                put(rows, "budget", &root, &spent)?;
-            }
-            // A refusal names the run's first one, decided in the commit
-            // that refused it.
-            let first = if granted {
-                None
-            } else {
-                match rows.get(&kind, EXCEEDED)? {
-                    Some(saved) => match serde_json::from_value(saved)? {
-                        Record::Exceeded { by } => Some(by),
-                        _ => anyhow::bail!("invalid first refusal record"),
-                    },
-                    None => {
-                        rows.put(&kind, EXCEEDED, &serde_json::to_value(Record::Exceeded { by: k.into() })?)?;
-                        Some(k.to_string())
+            Box::pin(async move {
+                let mut s = checked(rows, f, now, self.policy.skew_ms).await?;
+                let kind = records_of(&f.run_id);
+                if let Some(saved) = rows.get(&kind, k).await? {
+                    let record: Record = serde_json::from_value(saved)?;
+                    anyhow::ensure!(matches!(record, Record::Budget { .. }), "invalid budget record at {k}");
+                    return Ok(record);
+                }
+                let root = s.run.root.clone().unwrap_or_else(|| f.run_id.clone());
+                let spent: u64 = get(rows, "budget", &root).await?.unwrap_or(0);
+                let granted = spent < limit;
+                let spent = spent + u64::from(granted);
+                if granted {
+                    put(rows, "budget", &root, &spent).await?;
+                }
+                // A refusal names the run's first one, decided in the commit
+                // that refused it.
+                let first = if granted {
+                    None
+                } else {
+                    match rows.get(&kind, EXCEEDED).await? {
+                        Some(saved) => match serde_json::from_value(saved)? {
+                            Record::Exceeded { by } => Some(by),
+                            _ => anyhow::bail!("invalid first refusal record"),
+                        },
+                        None => {
+                            rows.put(&kind, EXCEEDED, &serde_json::to_value(Record::Exceeded { by: k.into() })?)
+                                .await?;
+                            Some(k.to_string())
+                        }
+                    }
+                };
+                let record = Record::Budget { granted, spent, first };
+                rows.put(&kind, k, &serde_json::to_value(&record)?).await?;
+                if !s.evidence {
+                    s.evidence = true;
+                    store_run(rows, &s).await?;
+                }
+                Ok(record)
+            })
+        })
+        .await
+    }
+    async fn due_as(&self, now: i64, limit: usize, worker: &Compatibility) -> anyhow::Result<Vec<String>> {
+        self.update(|rows| {
+            Box::pin(async move {
+                if is_stopped(rows).await? {
+                    return Ok(Vec::new());
+                }
+                drain_pending(rows, now, limit).await?;
+                let Some(own) = &worker.version else {
+                    return rows
+                        .scan("due", "", Some(&until(now)), limit)
+                        .await?
+                        .into_values()
+                        .map(|id| id.as_str().map(str::to_owned).ok_or_else(|| anyhow::anyhow!("invalid due index")))
+                        .collect();
+                };
+                // Undeclared runs, its own version and the ones it accepts: one
+                // bounded page per partition, merged in due order.
+                let mut versions = vec!["", own.as_str()];
+                versions.extend(worker.accepts.iter().map(String::as_str));
+                versions.sort_unstable();
+                versions.dedup();
+                let mut due = Vec::new();
+                for v in versions {
+                    for ((_, k), id) in rows.scan(&partition("due_app", v), "", Some(&until(now)), limit).await? {
+                        let id = id.as_str().ok_or_else(|| anyhow::anyhow!("invalid due index"))?.to_owned();
+                        due.push((k, id));
                     }
                 }
-            };
-            let record = Record::Budget { granted, spent, first };
-            rows.put(&kind, k, &serde_json::to_value(&record)?)?;
-            if !s.evidence {
-                s.evidence = true;
-                store_run(rows, &s)?;
-            }
-            Ok(record)
+                due.sort();
+                Ok(due.into_iter().take(limit).map(|(_, id)| id).collect())
+            })
         })
-    }
-    fn due_as(&self, now: i64, limit: usize, worker: &Compatibility) -> anyhow::Result<Vec<String>> {
-        self.update(|rows| {
-            if is_stopped(rows)? {
-                return Ok(Vec::new());
-            }
-            drain_pending(rows, now, limit)?;
-            let Some(own) = &worker.version else {
-                return rows
-                    .scan("due", "", Some(&until(now)), limit)?
-                    .into_values()
-                    .map(|id| id.as_str().map(str::to_owned).ok_or_else(|| anyhow::anyhow!("invalid due index")))
-                    .collect();
-            };
-            // Undeclared runs, its own version and the ones it accepts: one
-            // bounded page per partition, merged in due order.
-            let mut versions = vec!["", own.as_str()];
-            versions.extend(worker.accepts.iter().map(String::as_str));
-            versions.sort_unstable();
-            versions.dedup();
-            let mut due = Vec::new();
-            for v in versions {
-                for ((_, k), id) in rows.scan(&partition("due_app", v), "", Some(&until(now)), limit)? {
-                    let id = id.as_str().ok_or_else(|| anyhow::anyhow!("invalid due index"))?.to_owned();
-                    due.push((k, id));
-                }
-            }
-            due.sort();
-            Ok(due.into_iter().take(limit).map(|(_, id)| id).collect())
-        })
+        .await
     }
 
-    fn cancel(&self, id: &str, now: i64) -> anyhow::Result<bool> {
-        self.update(|rows| cancel_run(rows, id, now))
+    async fn cancel(&self, id: &str, now: i64) -> anyhow::Result<bool> {
+        self.update(|rows| Box::pin(async move { cancel_run(rows, id, now).await })).await
     }
 
-    fn sweep(&self, now: i64, kept: i64) -> anyhow::Result<Swept> {
+    async fn sweep(&self, now: i64, kept: i64) -> anyhow::Result<Swept> {
         anyhow::ensure!(kept >= 0, "negative retention");
         self.update(|rows| {
-            let mut swept = Swept::default();
-            let horizon = now.saturating_sub(kept);
-            for mut s in indexed_runs(rows, "finished", "", Some(&until(horizon)), usize::MAX)? {
-                if s.run.ended_ms.is_some_and(|at| at <= horizon) {
-                    swept.records += forget(rows, &mut s)?;
-                    store_run(rows, &s)?;
+            Box::pin(async move {
+                let mut swept = Swept::default();
+                let horizon = now.saturating_sub(kept);
+                for mut s in indexed_runs(rows, "finished", "", Some(&until(horizon)), usize::MAX).await? {
+                    if s.run.ended_ms.is_some_and(|at| at <= horizon) {
+                        swept.records += forget(rows, &mut s).await?;
+                        store_run(rows, &s).await?;
+                    }
                 }
-            }
-            // Unfinished runs whose mailbox holds a copy past its time.
-            for mut s in indexed_runs(rows, "mailbox", "", Some(&until(now)), usize::MAX)? {
-                swept.expired += expire(rows, &mut s, now)?;
-                store_run(rows, &s)?;
-            }
-            for ((_, k), id) in rows.scan("ingress_due", "", Some(&until(now)), usize::MAX)? {
-                let id = id.as_str().ok_or_else(|| anyhow::anyhow!("invalid ingress index"))?.to_owned();
-                rows.delete("ingress_due", &k)?;
-                rows.delete("ingress", &id)?;
-                swept.tombstones += 1;
-            }
-            Ok(swept)
+                // Unfinished runs whose mailbox holds a copy past its time.
+                for mut s in indexed_runs(rows, "mailbox", "", Some(&until(now)), usize::MAX).await? {
+                    swept.expired += expire(rows, &mut s, now).await?;
+                    store_run(rows, &s).await?;
+                }
+                for ((_, k), id) in rows.scan("ingress_due", "", Some(&until(now)), usize::MAX).await? {
+                    let id = id.as_str().ok_or_else(|| anyhow::anyhow!("invalid ingress index"))?.to_owned();
+                    rows.delete("ingress_due", &k).await?;
+                    rows.delete("ingress", &id).await?;
+                    swept.tombstones += 1;
+                }
+                Ok(swept)
+            })
         })
+        .await
     }
-    fn get(&self, id: &str) -> anyhow::Result<Option<SavedRun>> {
-        self.update(|rows| Ok(find_run(rows, id)?.map(|s| s.run)))
+    async fn get(&self, id: &str) -> anyhow::Result<Option<SavedRun>> {
+        self.update(|rows| Box::pin(async move { Ok(find_run(rows, id).await?.map(|s| s.run)) })).await
     }
-    fn list(&self, name: Option<&str>, prefix: &str) -> anyhow::Result<Vec<SavedRun>> {
+    async fn list(&self, name: Option<&str>, prefix: &str) -> anyhow::Result<Vec<SavedRun>> {
         self.update(|rows| {
-            let end = prefix_end(prefix);
-            if let Some(name) = name {
-                Ok(indexed_runs(rows, &partition("name", name), prefix, end.as_deref(), usize::MAX)?
-                    .into_iter()
-                    .map(|s| s.run)
-                    .collect())
-            } else {
-                rows.scan("run", prefix, end.as_deref(), usize::MAX)?
-                    .into_values()
-                    .map(|v| Ok(stored_run(v)?.run))
-                    .collect()
-            }
+            Box::pin(async move {
+                let end = prefix_end(prefix);
+                if let Some(name) = name {
+                    Ok(indexed_runs(rows, &partition("name", name), prefix, end.as_deref(), usize::MAX)
+                        .await?
+                        .into_iter()
+                        .map(|s| s.run)
+                        .collect())
+                } else {
+                    rows.scan("run", prefix, end.as_deref(), usize::MAX)
+                        .await?
+                        .into_values()
+                        .map(|v| Ok(stored_run(v)?.run))
+                        .collect()
+                }
+            })
         })
+        .await
     }
-    fn inspect(&self, id: &str) -> anyhow::Result<Option<RunSnapshot>> {
+    async fn inspect(&self, id: &str) -> anyhow::Result<Option<RunSnapshot>> {
         self.update(|rows| {
-            let Some(s) = find_run(rows, id)? else {
-                return Ok(None);
-            };
-            Ok(Some(snapshot(rows, s)?))
+            Box::pin(async move {
+                let Some(s) = find_run(rows, id).await? else {
+                    return Ok(None);
+                };
+                Ok(Some(snapshot(rows, s).await?))
+            })
         })
+        .await
     }
 
-    fn save_definition(&self, name: &str, yaml: &str) -> anyhow::Result<Definition> {
+    async fn save_definition(&self, name: &str, yaml: &str) -> anyhow::Result<Definition> {
         self.update(|rows| {
-            let mut defs = load_definitions(rows, name)?.unwrap_or_default();
-            let version = defs
-                .versions
-                .last_key_value()
-                .map_or(Some(1), |(v, _)| v.checked_add(1))
-                .ok_or_else(|| anyhow::anyhow!("definition version overflow"))?;
-            let d = Definition { name: name.into(), version, yaml: yaml.into() };
-            defs.versions.insert(version, d.clone());
-            store_definitions(rows, name, &defs)?;
-            Ok(d)
+            Box::pin(async move {
+                let mut defs = load_definitions(rows, name).await?.unwrap_or_default();
+                let version = defs
+                    .versions
+                    .last_key_value()
+                    .map_or(Some(1), |(v, _)| v.checked_add(1))
+                    .ok_or_else(|| anyhow::anyhow!("definition version overflow"))?;
+                let d = Definition { name: name.into(), version, yaml: yaml.into() };
+                defs.versions.insert(version, d.clone());
+                store_definitions(rows, name, &defs).await?;
+                Ok(d)
+            })
         })
+        .await
     }
-    fn activate(&self, name: &str, version: u64) -> anyhow::Result<()> {
-        self.update(|rows| activate(rows, name, version, None, &Arming::default())).map(|_| ())
+    async fn activate(&self, name: &str, version: u64) -> anyhow::Result<()> {
+        self.update(|rows| Box::pin(async move { activate(rows, name, version, None, &Arming::default()).await }))
+            .await
+            .map(|_| ())
     }
-    fn activate_with(
+    async fn activate_with(
         &self,
         name: &str,
         version: u64,
         epoch: u64,
         arming: &Arming,
     ) -> anyhow::Result<Option<Definitions>> {
-        self.update(|rows| activate(rows, name, version, Some(epoch), arming))
+        self.update(|rows| Box::pin(async move { activate(rows, name, version, Some(epoch), arming).await })).await
     }
-    fn definitions(&self, name: &str) -> anyhow::Result<Definitions> {
-        self.update(|rows| Ok(load_definitions(rows, name)?.unwrap_or_default()))
+    async fn definitions(&self, name: &str) -> anyhow::Result<Definitions> {
+        self.update(|rows| Box::pin(async move { Ok(load_definitions(rows, name).await?.unwrap_or_default()) })).await
     }
     // One ordered range read of at most `limit` notice rows.
-    fn notices(&self, limit: usize) -> anyhow::Result<Vec<(String, Value)>> {
-        self.update(|rows| Ok(rows.scan("notice", "", None, limit)?.into_iter().map(|((_, k), v)| (k, v)).collect()))
-    }
-    fn acknowledge(&self, key: &str) -> anyhow::Result<bool> {
+    async fn notices(&self, limit: usize) -> anyhow::Result<Vec<(String, Value)>> {
         self.update(|rows| {
-            if rows.get("notice", key)?.is_none() {
-                return Ok(false);
-            }
-            rows.delete("notice", key)?;
-            Ok(true)
+            Box::pin(async move {
+                Ok(rows.scan("notice", "", None, limit).await?.into_iter().map(|((_, k), v)| (k, v)).collect())
+            })
         })
+        .await
+    }
+    async fn acknowledge(&self, key: &str) -> anyhow::Result<bool> {
+        self.update(|rows| {
+            Box::pin(async move {
+                if rows.get("notice", key).await?.is_none() {
+                    return Ok(false);
+                }
+                rows.delete("notice", key).await?;
+                Ok(true)
+            })
+        })
+        .await
     }
 }
 
@@ -1824,7 +1943,7 @@ fn wait_kind(f: &control::Waits) -> String {
         (None, None) => "control_wait".into(),
     }
 }
-fn page_rows(
+async fn page_rows(
     rows: &mut dyn Transaction,
     kind: &str,
     query: &str,
@@ -1846,7 +1965,7 @@ fn page_rows(
     if end.as_ref().is_some_and(|end| start >= *end) {
         return Ok((Rows::new(), None));
     }
-    let found = rows.scan(kind, &start, end.as_deref(), limit + usize::from(cursor.is_some()))?;
+    let found = rows.scan(kind, &start, end.as_deref(), limit + usize::from(cursor.is_some())).await?;
     let found: Rows = found.into_iter().filter(|((_, k), _)| cursor.is_none_or(|c| *k > c.after)).take(limit).collect();
     let next = if found.len() == limit {
         found.last_key_value().map(|((_, k), _)| control::Cursor { query: query.into(), after: k.clone() })
@@ -1855,7 +1974,7 @@ fn page_rows(
     };
     Ok((found, next))
 }
-fn query_runs(
+async fn query_runs(
     rows: &mut dyn Transaction,
     f: &control::Runs,
     history: bool,
@@ -1864,11 +1983,11 @@ fn query_runs(
 ) -> anyhow::Result<control::Page<SavedRun>> {
     let query = serde_json::to_string(&("runs", f, history))?;
     let kind = run_kind(f, history);
-    let (found, next) = page_rows(rows, &kind, &query, f.since_ms, f.before_ms, cursor, limit)?;
+    let (found, next) = page_rows(rows, &kind, &query, f.since_ms, f.before_ms, cursor, limit).await?;
     let mut items = Vec::new();
     for v in found.into_values() {
         let id = v.as_str().ok_or_else(|| anyhow::anyhow!("invalid control run index"))?;
-        let r = run(rows, id)?.run;
+        let r = run(rows, id).await?.run;
         if f.definition.as_ref().is_none_or(|d| *d == r.admission.name)
             && f.state.as_ref().is_none_or(|state| *state == r.state)
             && f.parent.as_ref().is_none_or(|p| r.child.as_ref().is_some_and(|c| c.parent == *p))
@@ -1878,19 +1997,19 @@ fn query_runs(
     }
     Ok(control::Page { items, next })
 }
-fn suspend(rows: &mut dyn Transaction, name: &str, defs: &mut Definitions) -> anyhow::Result<()> {
+async fn suspend(rows: &mut dyn Transaction, name: &str, defs: &mut Definitions) -> anyhow::Result<()> {
     let mut triggers = BTreeMap::new();
     let mut queues = BTreeMap::new();
     for k in &defs.triggers {
-        if let Some(t) = get(rows, "trigger", k)? {
+        if let Some(t) = get(rows, "trigger", k).await? {
             triggers.insert(k.clone(), t);
         }
-        if let Some(queue) = rows.get("trigger_queue", k)? {
+        if let Some(queue) = rows.get("trigger_queue", k).await? {
             queues.insert(k.clone(), queue);
         }
     }
-    put(rows, "paused", name, &control::Paused { epoch: defs.epoch, triggers, queues })?;
-    arm(rows, defs, &BTreeMap::new())
+    put(rows, "paused", name, &control::Paused { epoch: defs.epoch, triggers, queues }).await?;
+    arm(rows, defs, &BTreeMap::new()).await
 }
 fn normalize_command(command: &control::Command) -> control::Command {
     match command {
@@ -1904,7 +2023,7 @@ fn normalize_command(command: &control::Command) -> control::Command {
         c => c.clone(),
     }
 }
-fn control_command(
+async fn control_command(
     rows: &mut dyn Transaction,
     request: &control::Request,
     command: &control::Command,
@@ -1917,36 +2036,36 @@ fn control_command(
         "control request requires id, actor and reason"
     );
     let canonical = normalize_command(command);
-    if let Some(entry) = get::<control::Entry>(rows, "control_command", &request.id)? {
+    if let Some(entry) = get::<control::Entry>(rows, "control_command", &request.id).await? {
         anyhow::ensure!(entry.request == *request && entry.command == canonical, "control request identity conflict");
         return Ok(entry.reply);
     }
     let reply = match command {
         Command::Cancel { run: id } => {
-            let changed = find_run(rows, id)?.is_some_and(|s| s.run.ended_ms.is_none());
+            let changed = find_run(rows, id).await?.is_some_and(|s| s.run.ended_ms.is_none());
             if changed {
-                terminate(rows, id, &Status::Cancelled, now)?;
+                terminate(rows, id, &Status::Cancelled, now).await?;
             }
             Reply::Changed(changed)
         }
         Command::Stop { enabled } => {
-            let changed = is_stopped(rows)? != *enabled;
+            let changed = is_stopped(rows).await? != *enabled;
             if changed {
                 if *enabled {
-                    put(rows, "control", "stopped", enabled)?;
+                    put(rows, "control", "stopped", enabled).await?;
                 } else {
-                    rows.delete("control", "stopped")?;
-                    drain_pending(rows, now, control::MAX_PAGE)?;
+                    rows.delete("control", "stopped").await?;
+                    drain_pending(rows, now, control::MAX_PAGE).await?;
                 }
             }
             Reply::Changed(changed)
         }
         Command::Pause { definition: name, note } => {
-            let mut defs = load_definitions(rows, name)?.ok_or_else(|| anyhow::anyhow!("unknown definition"))?;
+            let mut defs = load_definitions(rows, name).await?.ok_or_else(|| anyhow::anyhow!("unknown definition"))?;
             let changed = defs.tripped.is_none();
             if changed {
                 let version = defs.active.ok_or_else(|| anyhow::anyhow!("definition has no active version"))?;
-                suspend(rows, name, &mut defs)?;
+                suspend(rows, name, &mut defs).await?;
                 defs.tripped = Some(Trip {
                     manual: Some(control::ManualTrip {
                         actor: request.actor.clone(),
@@ -1967,12 +2086,12 @@ fn control_command(
                     },
                     at_ms: now,
                 });
-                store_definitions(rows, name, &defs)?;
+                store_definitions(rows, name, &defs).await?;
             }
             Reply::Changed(changed)
         }
         Command::Resume { definition: name } => {
-            let mut defs = load_definitions(rows, name)?.ok_or_else(|| anyhow::anyhow!("unknown definition"))?;
+            let mut defs = load_definitions(rows, name).await?.ok_or_else(|| anyhow::anyhow!("unknown definition"))?;
             anyhow::ensure!(
                 defs.tripped.as_ref().is_none_or(|t| t.manual.is_some()),
                 "a breaker trip requires activation"
@@ -1980,19 +2099,19 @@ fn control_command(
             let changed = defs.tripped.is_some();
             if changed {
                 let paused: control::Paused =
-                    get(rows, "paused", name)?.ok_or_else(|| anyhow::anyhow!("missing suspended triggers"))?;
+                    get(rows, "paused", name).await?.ok_or_else(|| anyhow::anyhow!("missing suspended triggers"))?;
                 anyhow::ensure!(paused.epoch == defs.epoch, "suspended activation changed");
                 defs.tripped = None;
-                arm(rows, &mut defs, &paused.triggers)?;
+                arm(rows, &mut defs, &paused.triggers).await?;
                 for (key, value) in &paused.queues {
                     let q: Queued = serde_json::from_value(value.clone())?;
                     anyhow::ensure!(q.version == 1 && q.admission.name == *name, "invalid suspended queue");
-                    rows.put("trigger_queue", key, value)?;
-                    put(rows, &partition("queue_name", name), key, key)?;
+                    rows.put("trigger_queue", key, value).await?;
+                    put(rows, &partition("queue_name", name), key, key).await?;
                 }
-                rows.delete("paused", name)?;
-                store_definitions(rows, name, &defs)?;
-                drain_queues(rows, name, now)?;
+                rows.delete("paused", name).await?;
+                store_definitions(rows, name, &defs).await?;
+                drain_queues(rows, name, now).await?;
             }
             Reply::Changed(changed)
         }
@@ -2000,11 +2119,11 @@ fn control_command(
             let identity = identity(event).ok_or_else(|| anyhow::anyhow!("response requires event source and id"))?;
             let kind = partition("control_response", id);
             let dedup = component(&identity);
-            if let Some(entry) = get::<control::Entry>(rows, &kind, &dedup)? {
+            if let Some(entry) = get::<control::Entry>(rows, &kind, &dedup).await? {
                 anyhow::ensure!(entry.command == canonical, "response event identity conflict");
                 entry.reply
             } else {
-                let s = run(rows, id)?;
+                let s = run(rows, id).await?;
                 let w = s.waits.get(key).ok_or_else(|| anyhow::anyhow!("wait is no longer pending"))?;
                 anyhow::ensure!(
                     s.run.ended_ms.is_none() && w.timeout_ms.is_none_or(|at| now < at),
@@ -2019,30 +2138,31 @@ fn control_command(
                     m.entry("time").or_insert(json!(time));
                 }
                 anyhow::ensure!(w.accepts(&event).map_err(anyhow::Error::msg)?, "event does not match wait");
-                let result = Reply::Responded(deliver(rows, &event, Some(id), now, policy)?);
-                let sequence: u64 = get(rows, &identities_of(id), &dedup)?
+                let result = Reply::Responded(deliver(rows, &event, Some(id), now, policy).await?);
+                let sequence: u64 = get(rows, &identities_of(id), &dedup)
+                    .await?
                     .ok_or_else(|| anyhow::anyhow!("response was not accepted"))?;
                 // A validated answer is also offered to a wildcard listen.
                 // Ordinary addressed deliveries retain their type-only routing.
                 if w.types.iter().any(|t| t == "*") {
-                    let mut stored = copy(rows, id, sequence)?;
+                    let mut stored = copy(rows, id, sequence).await?;
                     anyhow::ensure!(stored.consumed_key.is_none(), "response event already consumed by another wait");
                     if stored.delivered {
                         stored.delivered = false;
-                        let mut current = run(rows, id)?;
+                        let mut current = run(rows, id).await?;
                         current.run.wake_at_ms = current.run.wake_at_ms.min(now);
                         current.published = current
                             .published
                             .checked_add(1)
                             .ok_or_else(|| anyhow::anyhow!("published counter overflow"))?;
-                        put(rows, &events_of(id), &self::sequence(sequence), &stored)?;
-                        put(rows, &published_of(id), &self::sequence(sequence), &sequence)?;
+                        put(rows, &events_of(id), &self::sequence(sequence), &stored).await?;
+                        put(rows, &published_of(id), &self::sequence(sequence), &sequence).await?;
                         let live = stored.expires_at_ms.map_or_else(
                             || format!("~:{}", self::sequence(sequence)),
                             |at| timed(at, &self::sequence(sequence)),
                         );
-                        put(rows, &live_published_of(id), &live, &sequence)?;
-                        store_run(rows, &current)?;
+                        put(rows, &live_published_of(id), &live, &sequence).await?;
+                        store_run(rows, &current).await?;
                     }
                 }
                 put(
@@ -2055,29 +2175,32 @@ fn control_command(
                         at_ms: now,
                         reply: result.clone(),
                     },
-                )?;
+                )
+                .await?;
                 result
             }
         }
     };
     let entry = control::Entry { request: request.clone(), command: canonical, at_ms: now, reply: reply.clone() };
-    put(rows, "control_command", &request.id, &entry)?;
+    put(rows, "control_command", &request.id, &entry).await?;
     let k = timed(now, &component(&request.id));
-    put(rows, "control_history", &k, &entry)?;
+    put(rows, "control_history", &k, &entry).await?;
     if let Command::Cancel { run } | Command::Respond { run, .. } = command {
-        put(rows, &partition("control_history_run", run), &k, &entry)?;
+        put(rows, &partition("control_history_run", run), &k, &entry).await?;
     }
     Ok(reply)
 }
 
-fn snapshot(rows: &mut dyn Transaction, s: StoredRun) -> anyhow::Result<RunSnapshot> {
+async fn snapshot(rows: &mut dyn Transaction, s: StoredRun) -> anyhow::Result<RunSnapshot> {
     let records = rows
-        .scan(&records_of(&s.run.admission.id), "", None, usize::MAX)?
+        .scan(&records_of(&s.run.admission.id), "", None, usize::MAX)
+        .await?
         .into_iter()
         .map(|((_, k), v)| Ok((k, serde_json::from_value(v)?)))
         .collect::<anyhow::Result<_>>()?;
     let events = rows
-        .scan(&events_of(&s.run.admission.id), "", None, usize::MAX)?
+        .scan(&events_of(&s.run.admission.id), "", None, usize::MAX)
+        .await?
         .into_values()
         .map(|v| Ok(serde_json::from_value(v)?))
         .collect::<anyhow::Result<_>>()?;
