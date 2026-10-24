@@ -27,7 +27,8 @@ crates depends on another checkout or on an application database.
 
 Register `Function::new(name, input_schema, output_schema, effect, handler)`
 with a `Registry`; `.with_delivery(Delivery::AtMostOnce)` declares a function
-that must never be repeated (calls are at least once otherwise). Handlers receive arguments and `FunctionContext`: a
+that must never be repeated (calls are at least once otherwise). Handlers
+receive arguments and `FunctionContext`: a
 cancellation token, run ID, task path, retry attempt, stable idempotency key
 and current OpenTelemetry context. Return JSON or `FunctionError` (OWF Problem
 Details); YAML `try/catch` handles ordinary function and schema errors.
@@ -40,16 +41,48 @@ for immediate execution or run `worker` at application startup. Admission
 persists before execution; `start` enqueues and is idempotent by run ID.
 
 `worker` recovers due and interrupted runs, renews leases, enforces concurrency
-limits and periodically sweeps retained evidence. A shutdown token releases
-work for recovery. `cancel` is terminal and cascades to owned descendants.
-`get`, `list`, `records`, `definitions`, `deliver` and `recover_once` support
-embedding applications that own their polling and control surface.
+limits and periodically sweeps retained evidence and expired mailbox events. A
+shutdown token releases work for recovery. `cancel` is terminal and cascades to
+owned descendants. `get`, `list`, `records`, `definitions`, `triggers`,
+`deliver`, `sweep` and `recover_once` support embedding applications that own
+their polling and control surface.
 
-Versions are immutable. Activation remembers the prior active version; N
-consecutive faults of the current version atomically roll back to it (default
-N = 3). A success resets the count. In-flight runs keep their admitted YAML,
-version, input and schema/effect/delivery bindings. Handler implementations remain the
-host's responsibility to keep compatible with those bindings.
+`deliver(event, target)` takes an identified CloudEvent (`source`, `id`,
+`type`). With a target it goes to that run's mailbox, whether or not the run
+listens yet; without one, to the oldest run waiting for its type. A `listen`
+reads its mailbox first, oldest first per type. A mailbox event no listen took
+within the store's lifetime (`Policy::mailbox_ms`, default one day) is consumed
+by a `Record::Expired` in the run's records (`mailbox#expired[i]`) and counted
+by the traced `sweep`. Accepting the same identity again returns its original
+recipient for as long as that run keeps its evidence; the same identity with
+another payload (the event without `time`) is an `IdentityConflict` error. A
+targeted `publish` uses the mailbox too; a broadcast `publish` still reaches
+only the runs subscribed at that moment.
+
+Versions are immutable. Every activation, including reactivating the active
+version, starts a new activation epoch; so does a breaker rollback. The breaker
+counts terminal faults (unhandled errors, timeouts, unknown outcomes) of runs
+admitted in the active version's current epoch; cancellations and interruptions
+(even exhausted ones) do not count, and a success resets the count. N
+consecutive faults (default N = 3) atomically roll back to the prior version in
+a new epoch. With no prior version the definition is `tripped` (visible in
+`definitions`): it admits no new runs and its schedule stops, running runs
+finish, and the next activation clears it. In-flight runs keep their admitted
+YAML, version, input and schema/effect/delivery bindings.
+
+Deadlines are absolute instants fixed when they start: the workflow's
+`timeout` counts from admission, not from the drive that first runs it, and a
+task's from its start. Workers share a clock within a skew bound ε
+(`Policy::skew_ms`, default one second): an owner stops acting ε before its
+lease ends, and a lease is taken over only after it ends.
+
+Handler implementations remain the host's responsibility. A host may declare
+its application version (`Config::application`, with the older versions its
+code still resumes); every run it admits records it, and only a compatible
+worker claims such a run. A run no worker is compatible with stays due and
+visible (`Runtime::compatible`) instead of being failed. Undeclared, every run
+and worker are compatible, as before versions existed. This is separate from
+the durable state version, which refuses an incompatible persisted format.
 
 `start_child` is available through the host API and as a reserved
 workflow function, for a parent that starts a child, keeps working and
@@ -100,15 +133,24 @@ the choices made where the specification is silent (`CHOICE` comments).
   spans, errors and outcomes. `schema.resource` resolves through a
   `ResourceResolver` (`with_resources`) and is pinned at admission.
 - `schedule` (`every`, `cron` in UTC, `after`, `on`) keeps generic
-  triggers in the store, armed on `activate`: indexed by the time they are
-  next due and by the event types they react to. The `worker` fires due
-  slots on each tick (`fire_due`, a range read of the due index); the
-  trigger moves to its next slot in the commit that admits the slot's run,
-  whose id derives from the slot, so concurrent workers start each once.
-  `after` re-arms when its run ends. `on` keeps the events matched so far
-  in its trigger and starts the workflow, with the consumed events as
-  input, once the strategy is satisfied; a publish reads only the triggers
-  indexed under its type.
+  triggers in the store, armed in the commit that activates the version
+  (a version without a schedule removes them) and, for the predecessor, in
+  the commit of a breaker rollback: indexed by the time they are next due
+  and by the event types they react to. A trigger of an older epoch never
+  fires. The `worker` fires due slots on each tick (`fire_due`, a range
+  read of the due index); the trigger moves to its next slot in the commit
+  that admits the slot's run, whose id derives from the slot, so concurrent
+  workers start each once. A slot whose previous run of the same trigger is
+  still running or waiting is skipped, as is a missed slot under
+  `document.metadata.catchup: none` (the default `latest` runs it once,
+  late); a skip is recorded in the trigger's state and traced. `after`
+  re-arms when its run ends, never across epochs. `on` keeps the events
+  matched so far in its trigger and starts the workflow, with the consumed
+  events as input, once the strategy is satisfied; a publish reads only the
+  triggers indexed under its type. An identified event is taken from
+  ingress by at most one trigger (a tombstone kept for
+  `Policy::ingress_ms`, default seven days): one event starts at most one
+  run.
 
 ## Durability and storage
 
@@ -145,12 +187,18 @@ The engine owns primary and secondary keys in `(kind, id)` order:
 | Kind | ID | Purpose |
 | --- | --- | --- |
 | `run` | run ID | One run's admission, lease, records, waits and events |
-| `definitions` | definition name | One name's immutable versions and activation/breaker state |
+| `definitions` | definition name | One name's immutable versions, epoch, breaker state and armed trigger keys |
 | `name:<hex name>` | run ID | Listing by name and run-ID prefix |
 | `due` | ordered time + run ID | Bounded pages of eligible runs; running runs use lease expiry |
+| `due_app:<hex application version>` | ordered time + run ID | The same per declared application version (empty: undeclared) |
 | `wait:<hex event type>` | ordered registration time + run ID | Oldest eligible delivery, excluding pending copies |
+| `delivered:<hex source, id>` | run ID | A delivered identity's recipient, while it keeps the evidence |
+| `mailbox` | ordered earliest expiry + run ID | Mailbox copies due to expire |
 | `children:<hex parent ID>` | child ID | Live descendants for atomic cancellation |
 | `finished` | ordered end time + run ID | Retained evidence due for sweeping |
+| `trigger`, `trigger_due`, `trigger_type:<hex type>` | trigger key | Triggers by key, next due time and event type |
+| `trigger_run` | trigger key | The run a trigger admitted last, for exclusive firing |
+| `ingress`, `ingress_due` | hex identity | Ingress tombstones and their expiry |
 
 Index entries contain the run ID and change in the same transaction as the
 run. Times use sign-adjusted, fixed-width hexadecimal; names and event types
@@ -171,7 +219,9 @@ Ambiguous commits and transport errors propagate without retry.
 Both initial migrations were replaced before any release or deployment. This
 layout requires a fresh database from the earlier development checkout; there
 is no conversion of that unreleased layout. Applied migrations are immutable
-from the next release onward.
+from the next release onward. The SQL schema is a generic key/value table, so
+the row shapes above (and the interpreter's durable state version, now 3) can
+change without a migration; nothing persisted before them is converted.
 
 The interpreter's persistence seams are synchronous. The Postgres adapter uses
 `tokio-postgres` and `deadpool-postgres` on a dedicated I/O thread with a
