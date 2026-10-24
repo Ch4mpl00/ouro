@@ -2032,6 +2032,12 @@ fn can_leave(t: &Task, functions: &[(String, Task)]) -> bool {
 /// them from inside, each as its task indices in order. Such a loop can
 /// never end; one with a way out is not proven to end either, which the
 /// jump budget covers at runtime.
+///
+/// This is also the check that a list has a reachable end (#11): following
+/// the edges from the first task, a path either reaches the list's end
+/// (`Next::Out`, or a task that can leave) or is trapped in a component it
+/// cannot leave, which is closed. So a list whose end no path reaches
+/// always has a closed cycle, and is rejected.
 pub(crate) fn closed_cycles(tasks: &TaskList, functions: &[(String, Task)]) -> Vec<Vec<usize>> {
     let n = tasks.len();
     let edges: Vec<Vec<Next>> = (0..n).map(|i| successors(tasks, i)).collect();
@@ -2465,6 +2471,30 @@ do:
         }
         let p = checked("do: [ { a: { set: { x: 1 } } }, { b: { set: { x: 2 }, then: a } } ]\n");
         assert!(p[0].starts_with("/do/0/a:") && p[0].contains("a, b"), "{p:?}");
+    }
+
+    #[test]
+    fn a_list_whose_end_no_path_reaches_is_rejected() {
+        let cycle = |p: &[String]| p.iter().any(|p| p.contains("jump in a cycle"));
+        for body in [
+            // A forward step into a trap, and a trap after a skippable task.
+            "do: [ { a: { set: { x: 1 }, then: b } }, { b: { set: { x: 2 }, then: c } }, { c: { set: { x: 3 }, then: b } } ]\n",
+            "do: [ { a: { if: .go, set: { x: 1 } } }, { b: { set: { x: 2 }, then: b } }, { c: { set: { x: 3 } } } ]\n",
+            // Every case of a switch, its default included, jumps back.
+            "do: [ { a: { switch: [ { x: { when: .x, then: b } }, { y: { then: b } } ] } }, { b: { set: { x: 1 }, then: a } } ]\n",
+            // A nested list with no reachable end.
+            "do: [ { o: { do: [ { a: { set: { x: 1 }, then: a } } ] } } ]\n",
+        ] {
+            assert!(cycle(&checked(body)), "{body}: {:?}", checked(body));
+        }
+        // An end reachable through a raise, a nested `end` or an empty list.
+        for body in [
+            "do: [ { t: { try: [ { r: { raise: { error: { type: x, status: 400 } } } } ], catch: {} } } ]\n",
+            "do: [ { o: { do: [ { e: { set: { x: 1 }, then: end } } ], then: o } } ]\n",
+            "do: []\n",
+        ] {
+            assert!(checked(body).is_empty(), "{body}: {:?}", checked(body));
+        }
     }
 
     #[test]
