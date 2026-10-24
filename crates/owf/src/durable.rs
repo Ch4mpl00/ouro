@@ -125,6 +125,14 @@
 //!     the parent's and the invocation's) and never starts another.
 //! 20. Secret values are never persisted: records hold markers restored on
 //!     load from the values resolved for this execution.
+//!
+//! ## Budgets
+//!
+//! 21. A jump to a named task spends one unit of the run tree's budget under
+//!     its own key (`<task>#jump`), saved as `Record::Budget` in the same
+//!     commit that counts it (`Journal::spend`), so a restart neither resets
+//!     the count nor spends a unit twice, and replay restores the decision.
+//!     A child run spends its root's budget; a refused unit stays refused.
 use crate::{
     model::Flow,
     run::{Effect, WorkflowError},
@@ -140,7 +148,8 @@ use std::collections::BTreeMap;
 /// took it leaves `Record::Expired` at `mailbox#expired[i]`.
 /// 4: the store keeps one row per record and per event copy instead of one
 /// aggregate per run; a run row of an earlier version is refused.
-pub const VERSION: u32 = 4;
+/// 5: every jump to a named task leaves `Record::Budget` at `<task>#jump`.
+pub const VERSION: u32 = 5;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -179,6 +188,14 @@ pub enum CallState {
 pub trait Journal: Send + Sync {
     fn load(&self) -> anyhow::Result<BTreeMap<String, Record>>;
     fn save(&self, key: &str, record: &Record) -> anyhow::Result<()>;
+    /// Spends one unit of the run tree's shared budget under `key` if fewer
+    /// than `limit` units are spent, and saves the `Record::Budget` that says
+    /// so at `key` in the same commit; repeating returns the saved record.
+    /// `None`: this journal keeps no shared budget, and the interpreter counts
+    /// the run's own units in records it saves itself.
+    fn spend(&self, _key: &str, _limit: u64) -> anyhow::Result<Option<Record>> {
+        Ok(None)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -228,6 +245,12 @@ pub enum Record {
     },
     Finished {
         status: crate::run::Status,
+    },
+    /// One unit of the run tree's budget asked for at this key: whether it
+    /// was granted, and the units the tree had spent after the decision.
+    Budget {
+        granted: bool,
+        spent: u64,
     },
 }
 

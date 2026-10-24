@@ -1,8 +1,8 @@
 // The interpreter: 1. the host's seams (functions, events, children,
 // secrets, resources, observer, clock) and the outcome; 2. errors (Problem
 // Details with the standard types); 3. the run (data flow, flow directives,
-// extensions, limits); 4. task kinds; 5. events: listen and emit; 6. child
-// workflows and processes; 7. try, retries and durations.
+// extensions, limits, the jump budget); 4. task kinds; 5. events: listen and
+// emit; 6. child workflows and processes; 7. try, retries and durations.
 //
 // Each step is reported to the observer under its task reference
 // (`/do/1/fetch/try/0/get`), so a trace names exactly which part of the
@@ -14,8 +14,8 @@ use crate::durable::{self, CallFailure, CallState, Delivery, Journal, Record, St
 use crate::events::{self, Offer};
 use crate::expr::{self, Args};
 use crate::model::{
-    self, Backoff, Catalog, Catch, DurationSpec, Extension, Flow, Foreach, Invalid, Items, Kind, Listen, Process,
-    Raise, Retry, Return, RunTask, Schema, Strategy, Task, TaskList, Until, Workflow,
+    self, Backoff, Catalog, Catch, DurationSpec, Exceeded, Extension, Flow, Foreach, Invalid, Items, Kind, Listen,
+    Problem, Process, Raise, Retry, Return, RunTask, Schema, Strategy, Task, TaskList, Until, Workflow,
 };
 use crate::secrets::Redaction;
 use async_trait::async_trait;
@@ -25,7 +25,7 @@ use futures::stream::{self, FuturesUnordered, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
@@ -302,6 +302,13 @@ impl Clock for SystemClock {
 pub struct Limits {
     /// Task executions per run; every loop pass and `then` jump counts.
     pub max_tasks: usize,
+    /// Jumps to a named task per run tree (`model::Budget`): a child run
+    /// spends its root's budget, through a journal that shares it
+    /// (`Journal::spend`). A definition may only tighten it.
+    pub max_jumps: u64,
+    /// How deep child runs nest below their root; the `Children` host
+    /// refuses a deeper child with `budget.exhausted`.
+    pub max_depth: u32,
     /// Attempts per `try`, the first included, whatever the policy says.
     pub max_attempts: u32,
     /// The longest a `wait` or a retry delay sleeps (a dry run's `ZERO`);
@@ -316,7 +323,7 @@ pub struct Limits {
 
 impl Default for Limits {
     fn default() -> Self {
-        Self { max_tasks: 10_000, max_attempts: 10, max_sleep: None, max_listen: None }
+        Self { max_tasks: 10_000, max_jumps: 100, max_depth: 10, max_attempts: 10, max_sleep: None, max_listen: None }
     }
 }
 
@@ -350,6 +357,10 @@ pub struct Outcome {
     /// nothing and can be handed over or rerun as if it had never happened.
     pub effects_started: bool,
     pub tasks_run: usize,
+    /// The run ran out of jump budget and that ended it: its `on_exceeded`
+    /// ended it (`end`, or a handler's output or fault), or an uncaught
+    /// `budget.exhausted` faulted it.
+    pub limit_exceeded: bool,
 }
 
 /// `model::validate` against the host's functions.
@@ -380,6 +391,24 @@ pub fn validate(wf: &Workflow, functions: &dyn Functions) -> Result<(), Invalid>
     }
     model::validate(wf, &Known(functions))
 }
+
+/// What validation cannot know without the host: a definition's jump
+/// budget may only tighten the host's ceiling.
+pub fn validate_limits(wf: &Workflow, limits: &Limits) -> Result<(), Invalid> {
+    match wf.budget.max_jumps {
+        Some(n) if n > limits.max_jumps => Err(Invalid(vec![Problem {
+            at: "/document/metadata/limits/max_jumps".into(),
+            message: format!("{n} is above this host's ceiling of {} jumps", limits.max_jumps),
+        }])),
+        _ => Ok(()),
+    }
+}
+
+/// The tasks an `on_exceeded` handler may run, itself included.
+pub const HANDLER_TASKS: usize = 10;
+
+/// The reference segment under a jumping task where its handler runs.
+const HANDLER: &str = "/limits/on_exceeded";
 
 // ── 2. errors ──────────────────────────────────────────────────────────────
 
@@ -425,6 +454,12 @@ impl WorkflowError {
     }
     pub fn runtime(detail: impl Into<String>) -> Self {
         Self::standard("runtime", 500, "Runtime Error", detail)
+    }
+    /// A host budget ran out: the run tree's jumps, an `on_exceeded`
+    /// handler's allowance, or the nesting depth of child runs. CHOICE: in
+    /// the standard namespace like `outcome_unknown`, status 508 (a loop).
+    pub fn budget(detail: impl Into<String>) -> Self {
+        Self::standard("budget.exhausted", 508, "Budget Exhausted", detail)
     }
     /// Whether this is the standard error `kind` (`"timeout"`, …).
     pub fn is(&self, kind: &str) -> bool {
@@ -476,6 +511,11 @@ enum Fault {
     /// Persistence failed, ownership was lost or the host interrupted a
     /// call: the run stops where it is and stays recoverable.
     Interrupted(WorkflowError),
+    /// The jump budget ran out and `on_exceeded` ends the run with this
+    /// output. Nothing catches it; no enclosing task checkpoints it, so
+    /// recovery reaches the refused jump (and the handler's saved result)
+    /// again.
+    Exceeded(Value),
 }
 
 impl From<WorkflowError> for Fault {
@@ -591,6 +631,7 @@ async fn execute(
         status: Status::Interrupted(WorkflowError::runtime(e)),
         effects_started: true,
         tasks_run: 0,
+        limit_exceeded: false,
     };
     // Secrets resolve again on every start, before anything is loaded: the
     // saved records hold markers, which loading turns back into values.
@@ -625,6 +666,7 @@ async fn execute(
                 status: Status::Interrupted(WorkflowError::runtime("incompatible durable version or execution limits")),
                 effects_started: true,
                 tasks_run: tasks,
+                limit_exceeded: false,
             };
         }
         Some(Record::Execution {
@@ -650,6 +692,7 @@ async fn execute(
                 status: Status::Faulted(WorkflowError::runtime("a run's definition or input changed")),
                 effects_started: writes > 0,
                 tasks_run: tasks,
+                limit_exceeded: false,
             };
         }
         None if records.is_empty() => {
@@ -660,6 +703,7 @@ async fn execute(
                 status: Status::Interrupted(WorkflowError::runtime("missing execution record")),
                 effects_started: true,
                 tasks_run: tasks,
+                limit_exceeded: false,
             };
         }
     };
@@ -675,11 +719,13 @@ async fn execute(
         Record::Expired { .. } => key.starts_with("mailbox#expired["),
         Record::Timer { .. } => key.ends_with("#wait") || key.contains("#retry[") || key.contains("#attempt["),
         Record::Retry { .. } => key.contains("#retry-decision["),
+        Record::Budget { .. } => key.ends_with("#jump"),
     }) {
         return Outcome {
             status: Status::Interrupted(WorkflowError::runtime("invalid durable record key or terminal state")),
             effects_started: true,
             tasks_run: tasks,
+            limit_exceeded: false,
         };
     }
     if records.values().any(|record| match record {
@@ -692,14 +738,21 @@ async fn execute(
             status: Status::Interrupted(WorkflowError::runtime("invalid saved timestamp")),
             effects_started: true,
             tasks_run: tasks,
+            limit_exceeded: false,
         };
     }
+    let jumps = records.values().filter(|r| matches!(r, Record::Budget { granted: true, .. })).count();
     let run = Run {
         host,
         wf,
         run_id,
         cancel,
         tasks_run: AtomicUsize::new(tasks),
+        jumps: AtomicU64::new(jumps as u64),
+        max_jumps: wf.budget.max_jumps(host.limits.max_jumps),
+        spending: Mutex::new(()),
+        handlers: Mutex::default(),
+        handler_failed: AtomicBool::new(false),
         writes: AtomicUsize::new(writes),
         workflow: json!({ "id": run_id, "definition": wf.definition, "input": input, "startedAt": datetime(DateTime::from_timestamp_millis(started_ms).expect("stored timestamp")) }),
         runtime: runtime.clone(),
@@ -709,7 +762,18 @@ async fn execute(
         secrets,
     };
     if let Some(Record::Finished { status }) = run.record("finished") {
-        return Outcome { status: run.secrets.status(&status), effects_started: writes > 0, tasks_run: tasks };
+        // A finished run that ended through its budget left a refused jump
+        // (or the uncaught error) behind.
+        let refused = run.records.lock().unwrap_or_else(|e| e.into_inner()).values().any(|r| {
+            matches!(r, Record::Budget { granted: false, .. }) && !matches!(run.wf.budget.on_exceeded, Exceeded::Raise)
+        });
+        let limit_exceeded = refused || matches!(&status, Status::Faulted(e) if e.is("budget.exhausted"));
+        return Outcome {
+            status: run.secrets.status(&status),
+            effects_started: writes > 0,
+            tasks_run: tasks,
+            limit_exceeded,
+        };
     }
     let result = async {
         if run.record("execution").is_none() {
@@ -756,9 +820,17 @@ async fn execute(
         }
     }
     .await;
+    let mut limit_exceeded = run.handler_failed.load(Ordering::SeqCst);
     let mut status = match result {
         Ok(v) => Status::Completed(v),
-        Err(Fault::Error(e) | Fault::Fatal(e)) => Status::Faulted(e),
+        Err(Fault::Exceeded(v)) => {
+            limit_exceeded = true;
+            Status::Completed(v)
+        }
+        Err(Fault::Error(e) | Fault::Fatal(e)) => {
+            limit_exceeded |= e.is("budget.exhausted");
+            Status::Faulted(e)
+        }
         Err(Fault::Cancelled) => Status::Cancelled,
         Err(Fault::Waiting(wake_at_ms)) => Status::Waiting { wake_at_ms },
         Err(Fault::Interrupted(e)) => Status::Interrupted(e),
@@ -772,6 +844,7 @@ async fn execute(
         status: run.secrets.status(&status),
         effects_started: run.writes.load(Ordering::SeqCst) > 0,
         tasks_run: run.tasks_run.load(Ordering::SeqCst),
+        limit_exceeded: limit_exceeded && matches!(status, Status::Completed(_) | Status::Faulted(_)),
     }
 }
 
@@ -781,6 +854,18 @@ struct Run<'a> {
     run_id: &'a str,
     cancel: &'a CancellationToken,
     tasks_run: AtomicUsize,
+    /// Jumps this run was granted (`$run.jumps`).
+    jumps: AtomicU64,
+    /// The run's jump budget: the host's ceiling, tightened by the definition.
+    max_jumps: u64,
+    /// Serializes this run's own decisions when its journal keeps no shared
+    /// budget, so concurrent branches cannot both take the last unit.
+    spending: Mutex<()>,
+    /// The `on_exceeded` handlers running now, by reference prefix, and the
+    /// tasks each has entered.
+    handlers: Mutex<Vec<(String, usize)>>,
+    /// A handler faulted, which ended the run through its budget.
+    handler_failed: AtomicBool,
     /// `Write` calls started so far.
     writes: AtomicUsize,
     /// `$workflow`.
@@ -1009,7 +1094,8 @@ impl Run<'_> {
             .with("output", output.clone())
             .with("task", task.clone())
             .with("workflow", self.workflow.clone())
-            .with("runtime", self.runtime.clone());
+            .with("runtime", self.runtime.clone())
+            .with(model::RUN, self.run_argument(json!({})));
         for (name, value) in scope {
             args.set(name, value.clone());
         }
@@ -1047,6 +1133,105 @@ impl Run<'_> {
         Ok(out)
     }
 
+    /// `$run` with the given visit counts.
+    fn run_argument(&self, visits: Value) -> Value {
+        json!({ "jumps": self.jumps.load(Ordering::SeqCst), "maxJumps": self.max_jumps, "visits": visits })
+    }
+
+    /// Takes the jump the task at `reference` chose, spending one unit of
+    /// the run tree's budget under `<reference>#jump` (or restoring the
+    /// decision saved there). `false`: the budget is spent.
+    fn jump(&self, reference: &str) -> Result<bool, Fault> {
+        if self.handler(reference, false).is_some() {
+            return Err(Fault::Fatal(WorkflowError {
+                instance: Some(reference.into()),
+                ..WorkflowError::budget("an on_exceeded handler cannot jump")
+            }));
+        }
+        let key = format!("{reference}#jump");
+        let invalid = || Fault::Interrupted(WorkflowError::runtime("invalid budget record"));
+        let granted = |r: &Record| match r {
+            Record::Budget { granted, .. } => Ok(*granted),
+            _ => Err(invalid()),
+        };
+        if let Some(saved) = self.record(&key) {
+            return granted(&saved);
+        }
+        let _one = self.spending.lock().unwrap_or_else(|e| e.into_inner());
+        let shared = match self.journal {
+            Some(journal) => journal.spend(&key, self.max_jumps).map_err(|e| {
+                Fault::Interrupted(WorkflowError::runtime(format!(
+                    "spending {key}: {}",
+                    self.secrets.text(&e.to_string())
+                )))
+            })?,
+            None => None,
+        };
+        let taken = match shared {
+            Some(record) => {
+                let taken = granted(&record)?;
+                self.records.lock().unwrap_or_else(|e| e.into_inner()).insert(key, record);
+                taken
+            }
+            None => {
+                let spent = self.jumps.load(Ordering::SeqCst);
+                let taken = spent < self.max_jumps;
+                self.save(&key, Record::Budget { granted: taken, spent: spent + u64::from(taken) })?;
+                taken
+            }
+        };
+        if taken {
+            self.jumps.fetch_add(1, Ordering::SeqCst);
+        }
+        Ok(taken)
+    }
+
+    /// The handler `reference` runs in, if any; `enter` counts a task.
+    fn handler(&self, reference: &str, enter: bool) -> Option<usize> {
+        let mut handlers = self.handlers.lock().unwrap_or_else(|e| e.into_inner());
+        let (_, entered) = handlers.iter_mut().find(|(prefix, _)| {
+            reference.strip_prefix(prefix.as_str()).is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+        })?;
+        if enter {
+            *entered += 1;
+        }
+        Some(*entered)
+    }
+
+    /// The jump the task at `reference` chose was refused: `on_exceeded`
+    /// decides. The task faults with `budget.exhausted` (catchable), or it
+    /// completes with `output` and the run ends with that output or with
+    /// what its handler returns.
+    async fn exceeded(&self, reference: &str, output: &Value, ctx: &mut Value, scope: &Scope) -> Result<(), Fault> {
+        let detail = format!("more than {} jumps in this run tree; a `then` loop did not end", self.max_jumps);
+        match &self.wf.budget.on_exceeded {
+            Exceeded::Raise => Err(WorkflowError::budget(detail).into()),
+            Exceeded::End => {
+                self.observe(Event::TaskCompleted { reference, output });
+                Err(Fault::Exceeded(output.clone()))
+            }
+            Exceeded::Task(handler) => {
+                let at = format!("{reference}{HANDLER}");
+                self.handlers.lock().unwrap_or_else(|e| e.into_inner()).push((at.clone(), 0));
+                let result = self.task(handler, "on_exceeded", &at, Some(reference), output.clone(), ctx, scope).await;
+                self.handlers.lock().unwrap_or_else(|e| e.into_inner()).retain(|(prefix, _)| *prefix != at);
+                match result {
+                    Ok((out, _)) => {
+                        self.observe(Event::TaskCompleted { reference, output });
+                        Err(Fault::Exceeded(out))
+                    }
+                    // The handler is the run's last word: its error ends the
+                    // run, whatever encloses the jump.
+                    Err(Fault::Error(e) | Fault::Fatal(e)) => {
+                        self.handler_failed.store(true, Ordering::SeqCst);
+                        Err(Fault::Fatal(e))
+                    }
+                    Err(other) => Err(other),
+                }
+            }
+        }
+    }
+
     /// Runs `tasks` in order, following each task's flow directive.
     fn list<'s>(
         &'s self,
@@ -1061,16 +1246,30 @@ impl Run<'_> {
             let mut data = input;
             let mut i = 0;
             let mut visits = vec![0usize; tasks.len()];
+            // `$run.visits`: the enclosing lists' counts, this list's on top.
+            let outer = scope
+                .iter()
+                .rev()
+                .find(|(n, _)| n == model::RUN)
+                .and_then(|(_, run)| run.get("visits").and_then(Value::as_object).cloned())
+                .unwrap_or_default();
             while let Some((name, task)) = tasks.get(i) {
                 let suffix = if visits[i] == 0 { String::new() } else { format!("[{}]", visits[i]) };
                 let reference = format!("{at}/{i}/{name}{suffix}");
                 visits[i] += 1;
-                let (out, flow) = self.task(task, name, &reference, parent, data, ctx, scope).await?;
+                let mut counts = outer.clone();
+                for ((n, _), v) in tasks.iter().zip(&visits).filter(|(_, v)| **v > 0) {
+                    counts.insert(n.clone(), json!(v));
+                }
+                let mut inner: Scope = scope.iter().filter(|(n, _)| n != model::RUN).cloned().collect();
+                inner.insert(0, (model::RUN.into(), self.run_argument(Value::Object(counts))));
+                let (out, flow) = self.task(task, name, &reference, parent, data, ctx, &inner).await?;
                 data = out;
                 i = match flow {
                     Flow::Continue => i + 1,
                     Flow::Exit => return Ok(Next::Exit(data)),
                     Flow::End => return Ok(Next::End(data)),
+                    // The task spent the jump's unit before it completed.
                     Flow::Goto(target) => tasks.iter().position(|(n, _)| *n == target).ok_or_else(|| {
                         Fault::Fatal(WorkflowError::runtime(format!("`then: {target}` names no task in {at}")))
                     })?,
@@ -1096,6 +1295,12 @@ impl Run<'_> {
         Box::pin(async move {
             if self.cancel.is_cancelled() {
                 return Err(Fault::Cancelled);
+            }
+            if self.handler(reference, true).is_some_and(|n| n > HANDLER_TASKS) {
+                let e = WorkflowError::budget(format!("an on_exceeded handler may run at most {HANDLER_TASKS} tasks"));
+                let e = WorkflowError { instance: Some(reference.into()), ..e };
+                self.observe(Event::TaskFaulted { reference, error: &e });
+                return Err(Fault::Fatal(e));
             }
             let key = format!("{reference}#task");
             let prior = self.record(&key);
@@ -1265,8 +1470,12 @@ impl Run<'_> {
                 self.conform(s, ctx, "the exported context")?;
             }
         }
+        let flow = flow.or_else(|| task.then.clone()).unwrap_or(Flow::Continue);
+        if matches!(flow, Flow::Goto(_)) && !self.jump(reference)? {
+            self.exceeded(reference, &out, ctx, scope).await?;
+        }
         self.observe(Event::TaskCompleted { reference, output: &out });
-        Ok((out, flow.or_else(|| task.then.clone()).unwrap_or(Flow::Continue)))
+        Ok((out, flow))
     }
 
     /// The extensions that apply to this task, in declaration order (those
@@ -2883,9 +3092,102 @@ do:
     async fn a_cycle_hits_the_task_limit_which_try_cannot_catch() {
         let mut s = setup(Fake::default());
         s.host.limits.max_tasks = 50;
-        let o = exec(&s, "do:\n  - t:\n      try:\n        - a: { set: { x: 1 }, then: b }\n        - b: { set: { x: 2 }, then: a }\n      catch: { do: [ { h: { set: { r: caught } } } ] }\n", Value::Null).await;
+        // Validation rejects this exit-less cycle; the ceiling still holds for
+        // a host that runs it anyway (the jump budget is above the ceiling).
+        let wf = model::parse_yaml(&format!("{HEAD}do:\n  - t:\n      try:\n        - a: {{ set: {{ x: 1 }}, then: b }}\n        - b: {{ set: {{ x: 2 }}, then: a }}\n      catch: {{ do: [ {{ h: {{ set: {{ r: caught }} }} }} ] }}\n")).unwrap();
+        assert!(validate(&wf, &*s.host.functions).is_err());
+        let o = run(&s.host, &wf, "run-1", Value::Null, &CancellationToken::new()).await;
         assert!(faulted(&o).detail.as_deref().is_some_and(|d| d.contains("more than 50 tasks")));
         assert_eq!(o.tasks_run, 51);
+    }
+
+    // A loop that only the budget stops: its exit never matches.
+    const LOOP: &str = r#"
+do:
+  - step: { set: { n: '${ .n + 1 }' } }
+  - again:
+      switch:
+        - done: { when: '${ .n < 0 }', then: exit }
+        - more: { then: step }
+"#;
+
+    fn limited(on_exceeded: &str, max: u64) -> String {
+        format!(
+            "document: {{ dsl: '1.0.4', namespace: test, name: w, version: '0.1.0', metadata: {{ limits: {{ max_jumps: {max}{on_exceeded} }} }} }}\n{LOOP}"
+        )
+    }
+
+    #[tokio::test]
+    async fn the_budget_raises_budget_exhausted_at_the_jumping_task_which_try_catches() {
+        let s = setup(Fake::default());
+        let o = exec(&s, &format!("{HEAD}{LOOP}"), json!({"n": 0})).await;
+        let e = faulted(&o);
+        assert!(e.is("budget.exhausted") && e.status == 508, "{e:?}");
+        assert_eq!(e.instance.as_deref(), Some("/do/1/again[100]"));
+        assert!(o.limit_exceeded);
+        // The host's ceiling is 100; a definition tightens it.
+        let o = exec(&s, &limited("", 3), json!({"n": 0})).await;
+        assert_eq!(faulted(&o).instance.as_deref(), Some("/do/1/again[3]"));
+        let caught = "do:\n  - guard:\n      try:\n        - step: { set: { n: '${ .n + 1 }' } }\n        - again: { switch: [ { done: { when: '${ .n < 0 }', then: exit } }, { more: { then: step } } ] }\n      catch: { as: e, do: [ { h: { set: { stopped: '${ .n }', type: '${ $e.type }' } } } ] }\n";
+        let o = exec(&s, &format!("{HEAD}{caught}"), json!({"n": 0})).await;
+        let out = completed(&o);
+        assert_eq!(out["stopped"], 0, "the catch sees the try's input");
+        assert!(out["type"].as_str().is_some_and(|t| t.ends_with("/budget.exhausted")));
+        assert!(!o.limit_exceeded, "a caught exhaustion did not end the run");
+    }
+
+    #[tokio::test]
+    async fn on_exceeded_end_or_a_handler_ends_the_run() {
+        let s = setup(Fake::default().with("report", Effect::Write, |args, _| Ok(json!({ "reported": args["n"] }))));
+        let o = exec(&s, &limited(", on_exceeded: end", 2), json!({"n": 0})).await;
+        assert_eq!(completed(&o), &json!({"n": 3}));
+        assert!(o.limit_exceeded);
+        let o = exec(&s, &limited(", on_exceeded: { call: report, with: { n: '${ .n }' } }", 2), json!({"n": 0})).await;
+        assert_eq!(completed(&o), &json!({"reported": 3}));
+        assert!(o.limit_exceeded);
+        assert_eq!(s.fake.calls.lock().unwrap()[0].2, "/do/1/again[2]/limits/on_exceeded");
+        // The handler cannot jump, nor run more than a few tasks.
+        let jumping = ", on_exceeded: { do: [ { a: { set: { x: 1 } } }, { b: { switch: [ { stop: { when: '${ false }', then: exit } }, { back: { then: a } } ] } } ] }";
+        let o = exec(&s, &limited(jumping, 1), json!({"n": 0})).await;
+        let e = faulted(&o);
+        assert!(e.is("budget.exhausted") && e.detail.as_deref().is_some_and(|d| d.contains("cannot jump")), "{e:?}");
+        let long: Vec<String> = (0..HANDLER_TASKS).map(|i| format!("{{ t{i}: {{ set: {{ x: {i} }} }} }}")).collect();
+        let o =
+            exec(&s, &limited(&format!(", on_exceeded: {{ do: [ {} ] }}", long.join(", ")), 1), json!({"n": 0})).await;
+        let e = faulted(&o);
+        assert!(e.detail.as_deref().is_some_and(|d| d.contains("at most 10 tasks")), "{e:?}");
+        assert!(o.limit_exceeded);
+    }
+
+    #[tokio::test]
+    async fn expressions_read_jumps_and_visits() {
+        let s = setup(Fake::default());
+        let o = exec(
+            &s,
+            r#"
+do:
+  - compose: { set: { n: '${ .n + 1 }', seen: '${ $run.visits.compose }' } }
+  - review:
+      switch:
+        - rewrite: { when: '${ $run.visits.compose < 3 }', then: compose }
+  - report: { set: { n: '${ .n }', jumps: '${ $run.jumps }', max: '${ $run.maxJumps }', inner: '${ $run.visits }' } }
+"#,
+            json!({"n": 0}),
+        )
+        .await;
+        assert_eq!(
+            completed(&o),
+            &json!({"n": 3, "jumps": 2, "max": 100, "inner": {"compose": 3, "review": 3, "report": 1}})
+        );
+    }
+
+    #[test]
+    fn a_definition_may_only_tighten_the_hosts_ceiling() {
+        let wf = model::parse_yaml(&limited("", 100)).unwrap();
+        assert!(validate_limits(&wf, &Limits::default()).is_ok());
+        let wf = model::parse_yaml(&limited("", 101)).unwrap();
+        let e = validate_limits(&wf, &Limits::default()).unwrap_err().to_string();
+        assert!(e.contains("/document/metadata/limits/max_jumps") && e.contains("ceiling of 100"), "{e}");
     }
 
     #[tokio::test]

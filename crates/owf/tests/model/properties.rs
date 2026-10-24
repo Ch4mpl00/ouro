@@ -7,7 +7,9 @@
 //      and its attempt number stays under the host's cap
 //   3. `then: continue` is the same as no `then`
 //   4. a task list wrapped in a `do` runs to the same result
-//   5. a program with nothing that can fail never faults, ceiling aside
+//   5. a program with nothing that can fail never faults, host limits aside
+//   6. jumps stay within the budget, and a refused one is caught or ends the
+//      run with `budget.exhausted`
 
 use proptest::prelude::*;
 use proptest::test_runner::{TestCaseError, TestRunner};
@@ -25,6 +27,11 @@ fn check(test: impl Fn(Program, serde_json::Value) -> Result<(), TestCaseError>)
 /// The model raises a runtime error only at the ceiling.
 fn ceiling(e: &model::Error) -> bool {
     e.type_.ends_with("/errors/runtime") && e.status == 500
+}
+
+/// A refused jump.
+fn exhausted(e: &model::Error) -> bool {
+    e.type_.ends_with("/errors/budget.exhausted") && e.status == 508
 }
 
 #[test]
@@ -131,8 +138,32 @@ fn p5_nothing_that_can_fail_never_faults() {
         }
         match model::run(&p, input, &model_limits()).result {
             Ok(_) => Ok(()),
-            Err(e) if ceiling(&e) => Ok(()),
+            Err(e) if ceiling(&e) || exhausted(&e) => Ok(()),
             Err(e) => Err(TestCaseError::fail(format!("{e:?}"))),
         }
     });
+}
+
+#[test]
+fn p6_jumps_stay_within_the_budget() {
+    TestRunner::new(crate::support::host::config(50, file!()))
+        .run(&(program(Profile::CORE), input(), 0u64..4), |(p, input, budget)| {
+            let l = model::Limits { max_jumps: budget, ..model_limits() };
+            let o = model::run(&p, input.clone(), &l);
+            prop_assert!(o.jumps <= budget, "{} jumps over a budget of {budget}", o.jumps);
+            // With the budget lifted, the same run jumps further only if the
+            // budget refused a jump, which raised the budget's error.
+            let free = model::run(&p, input, &model::Limits { max_jumps: u64::MAX, ..model_limits() });
+            if free.jumps > budget && free.tasks_run <= l.max_tasks {
+                prop_assert_eq!(o.jumps, budget);
+                prop_assert!(o.trace.len() <= free.trace.len());
+            }
+            if let Err(e) = &o.result
+                && exhausted(e)
+            {
+                prop_assert_eq!(o.jumps, budget);
+            }
+            Ok(())
+        })
+        .unwrap();
 }

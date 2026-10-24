@@ -37,7 +37,7 @@ use support::program::{Profile, Program, definition, input, program};
 
 pub fn model_limits() -> Limits {
     let l = limits();
-    Limits { max_tasks: l.max_tasks, max_attempts: l.max_attempts }
+    Limits { max_tasks: l.max_tasks, max_attempts: l.max_attempts, max_jumps: l.max_jumps }
 }
 
 fn real_shape(status: &Status) -> Value {

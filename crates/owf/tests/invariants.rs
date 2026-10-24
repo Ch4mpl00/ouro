@@ -92,7 +92,12 @@ fn a_then_cycle_hits_the_ceiling_which_no_try_catches() {
             let at = at.index(list.len() + 1);
             list.insert(at, cycle());
             shift_gotos(list, at);
-            let ran = execute(&p, input, &Options::default());
+            // Validation rejects the exit-less cycle; a host that runs it
+            // anyway still stops at the ceiling (below the jump budget).
+            let wf = owf::model::parse(definition(&p)).map_err(|e| TestCaseError::fail(e.to_string()))?;
+            ensure(run::validate(&wf, &Known).is_err(), &p, "an exit-less cycle validated")?;
+            let opts = Options { limits: Limits { max_jumps: u64::MAX, ..limits() }, ..Options::default() };
+            let ran = execute_workflow(&wf, input, &opts);
             let reached = ran
                 .journal
                 .iter()
@@ -535,7 +540,13 @@ fn a_mutated_definition_parses_validates_and_runs_without_panicking() {
         {
             // Whatever it does, it must not panic; a mutation may wait for days.
             let opts = Options {
-                limits: Limits { max_tasks: 60, max_attempts: 3, max_sleep: None, max_listen: None },
+                limits: Limits {
+                    max_tasks: 60,
+                    max_attempts: 3,
+                    max_sleep: None,
+                    max_listen: None,
+                    ..Limits::default()
+                },
                 ..Options::default()
             };
             let _ = try_execute_workflow(&wf, input, &opts);
@@ -545,7 +556,8 @@ fn a_mutated_definition_parses_validates_and_runs_without_panicking() {
 }
 
 /// A guard against a degenerate generator: random programs complete, fault
-/// and hit the ceiling, each often enough to matter.
+/// and loop into a host limit (the task ceiling or the jump budget), each
+/// often enough to matter.
 #[test]
 fn the_generator_reaches_every_kind_of_outcome() {
     let mut runner = TestRunner::deterministic();
@@ -555,15 +567,20 @@ fn the_generator_reaches_every_kind_of_outcome() {
         let (p, input) = strategy.new_tree(&mut runner).unwrap().current();
         let ran = execute(&p, input, &Options::default());
         match &ran.outcome.status {
-            _ if hit_limit(&ran.outcome) => limited += 1,
+            _ if hit_limit(&ran.outcome) || exhausted(&ran) => limited += 1,
             Status::Completed(_) => completed += 1,
             _ => faulted += 1,
         }
     }
     assert!(
         completed > 20 && faulted > 20 && limited > 5,
-        "completed {completed}, faulted {faulted}, ceiling {limited}"
+        "completed {completed}, faulted {faulted}, limited {limited}"
     );
+}
+
+/// Some task's jump was refused (caught or not).
+fn exhausted(ran: &support::host::Ran) -> bool {
+    ran.journal.iter().any(|e| matches!(e, Entry::Faulted { error, .. } if error.is("budget.exhausted")))
 }
 
 #[test]
@@ -577,7 +594,7 @@ fn the_task_ceiling_reports_a_fault_after_skipped_visits() {
     }))
     .unwrap();
     let opts = Options {
-        limits: Limits { max_tasks: 2, max_attempts: 1, max_sleep: None, max_listen: None },
+        limits: Limits { max_tasks: 2, max_attempts: 1, max_sleep: None, max_listen: None, ..Limits::default() },
         ..Options::default()
     };
     let ran = execute_workflow(&wf, json!({ "n": 1 }), &opts);

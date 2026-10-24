@@ -1592,3 +1592,128 @@ fn generated_faulty_histories_refine_crash_free_effect_histories() {
         })
         .unwrap();
 }
+
+/// One generated run under a jump budget, crashing before or after the
+/// commits `crashes` name: its status, whether it ended through the budget,
+/// and its records.
+fn budgeted(
+    wf: &model::Workflow,
+    input: Value,
+    crashes: &[(u8, bool)],
+) -> Result<(Status, bool, BTreeMap<String, Record>), String> {
+    let rt = tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap();
+    rt.block_on(async {
+        let time = Arc::new(Time(AtomicI64::new(1_000)));
+        let world = Arc::new(PropertyWorld::default());
+        let mut store = Store::default();
+        let mut crashes = crashes.iter();
+        // The ceiling is far: only the budget stops a loop.
+        let limits = Limits { max_tasks: 100_000, ..support::host::limits() };
+        let host = Host {
+            functions: world,
+            clock: time.clone(),
+            observer: Arc::new(Silent),
+            limits,
+            runtime: json!({"name":"budget-properties"}),
+        };
+        for _ in 0..512 {
+            if store.fail_at.load(Ordering::SeqCst) == 0
+                && let Some(&(distance, after)) = crashes.next()
+            {
+                store.fail_at.store(store.saves.load(Ordering::SeqCst) + usize::from(distance), Ordering::SeqCst);
+                store.after_commit = after;
+            }
+            let outcome = run::resume(&host, wf, "budget-run", input.clone(), &CancellationToken::new(), &store).await;
+            match outcome.status {
+                Status::Waiting { wake_at_ms } => time.0.store(wake_at_ms, Ordering::SeqCst),
+                Status::Interrupted(error) => {
+                    if store.saves.load(Ordering::SeqCst) != store.fail_at.load(Ordering::SeqCst) {
+                        return Err(format!("unexpected interruption: {error}"));
+                    }
+                    store.fail_at.store(0, Ordering::SeqCst);
+                }
+                terminal => return Ok((terminal, outcome.limit_exceeded, store.load().unwrap())),
+            }
+        }
+        Err("the budgeted run did not end".into())
+    })
+}
+
+#[test]
+fn generated_jump_budgets_end_every_run_within_the_budget_across_crashes() {
+    use proptest::{
+        prelude::*,
+        test_runner::{TestCaseError, TestRunner},
+    };
+    use support::program::{Profile, input, program};
+    let strategy = (
+        program(Profile { timeouts: false, ..Profile::DETERMINISTIC }),
+        input(),
+        0u64..5,
+        0usize..3,
+        prop::collection::vec((1u8..=16, any::<bool>()), 0..=6),
+    );
+    let refused = AtomicUsize::new(0);
+    TestRunner::new(support::host::config(64, file!()))
+        .run(&strategy, |(p, input, budget, handling, crashes)| {
+            let mut definition = support::program::definition(&p);
+            let on_exceeded = match handling {
+                0 => json!(null),
+                1 => json!("end"),
+                _ => json!({ "call": "inc", "with": { "n": 100 } }),
+            };
+            let mut limits = json!({ "max_jumps": budget });
+            if !on_exceeded.is_null() {
+                limits["on_exceeded"] = on_exceeded;
+            }
+            definition["document"]["metadata"] = json!({ "limits": limits });
+            let wf = model::parse(definition).map_err(|e| TestCaseError::fail(e.to_string()))?;
+            run::validate(&wf, &support::host::Known).map_err(|e| TestCaseError::fail(e.to_string()))?;
+            let (baseline, exceeded, records) = budgeted(&wf, input.clone(), &[]).map_err(TestCaseError::fail)?;
+            // Every run ends, completed or faulted.
+            prop_assert!(matches!(baseline, Status::Completed(_) | Status::Faulted(_)), "{baseline:?}");
+            let decisions: Vec<(bool, u64)> = records
+                .values()
+                .filter_map(|r| match r {
+                    Record::Budget { granted, spent } => Some((*granted, *spent)),
+                    _ => None,
+                })
+                .collect();
+            let granted = decisions.iter().filter(|(g, _)| *g).count() as u64;
+            // Within the budget: no more units granted than it holds.
+            prop_assert!(granted <= budget, "{granted} jumps over a budget of {budget}");
+            prop_assert!(decisions.iter().all(|(_, spent)| *spent <= budget));
+            let refusals = decisions.iter().filter(|(g, _)| !*g).count();
+            if refusals > 0 {
+                refused.fetch_add(1, Ordering::SeqCst);
+                prop_assert_eq!(granted, budget);
+            }
+            // A refused jump ends the run through on_exceeded, or raises the
+            // budget's error, which ends it unless a try catches it.
+            match handling {
+                0 => prop_assert!(
+                    !exceeded || matches!(&baseline, Status::Faulted(e) if e.is("budget.exhausted")),
+                    "{baseline:?}"
+                ),
+                _ => prop_assert_eq!(exceeded, refusals > 0, "{:?}", baseline),
+            }
+            if handling == 2 && exceeded {
+                prop_assert_eq!(&baseline, &Status::Completed(json!({ "n": 101 })));
+            }
+            // A restart neither resets the count nor changes a decision.
+            let (recovered, again, after) = budgeted(&wf, input, &crashes).map_err(TestCaseError::fail)?;
+            prop_assert_eq!(&recovered, &baseline);
+            prop_assert_eq!(again, exceeded);
+            let budgets = |r: &BTreeMap<String, Record>| -> Vec<(String, Record)> {
+                r.iter()
+                    .filter(|(_, r)| matches!(r, Record::Budget { .. }))
+                    .map(|(k, r)| (k.clone(), r.clone()))
+                    .collect()
+            };
+            prop_assert_eq!(budgets(&after), budgets(&records));
+            Ok(())
+        })
+        .unwrap();
+    eprintln!("runs with a refused jump: {}", refused.load(Ordering::SeqCst));
+    assert!(refused.load(Ordering::SeqCst) > 0, "no generated run ran out of budget");
+}
