@@ -439,6 +439,15 @@ pub trait RunStore: Send + Sync {
         cursor: Option<&control::Cursor>,
         limit: usize,
     ) -> anyhow::Result<control::Page<SavedRun>>;
+    /// Catalog summaries in binary name order, in one consistent transaction.
+    /// Limits and cursors follow the other control pages. No runs are scanned.
+    async fn query_definitions(
+        &self,
+        cursor: Option<&control::Cursor>,
+        limit: usize,
+    ) -> anyhow::Result<control::Page<control::DefinitionSummary>>;
+    /// One consistent catalog/schedule observation; None for an unknown name.
+    async fn definition_control(&self, name: &str) -> anyhow::Result<Option<control::DefinitionSummary>>;
     async fn pending_waits(
         &self,
         filter: &control::Waits,

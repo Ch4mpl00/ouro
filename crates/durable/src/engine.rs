@@ -115,14 +115,17 @@ async fn run(rows: &mut dyn Transaction, id: &str) -> anyhow::Result<StoredRun> 
 /// trip) is refused, never read as a definition that cannot be tripped.
 const DEFINITIONS_VERSION: u64 = 3;
 async fn load_definitions(rows: &mut dyn Transaction, name: &str) -> anyhow::Result<Option<Definitions>> {
-    let Some(mut value) = rows.get("definitions", name).await? else { return Ok(None) };
+    let Some(value) = rows.get("definitions", name).await? else { return Ok(None) };
+    Ok(Some(decode_definitions(name, value)?))
+}
+fn decode_definitions(name: &str, mut value: Value) -> anyhow::Result<Definitions> {
     let version = value.as_object_mut().and_then(|m| m.remove("version")).and_then(|v| v.as_u64());
     anyhow::ensure!(
         version == Some(DEFINITIONS_VERSION),
         "unsupported layout {} of the definitions row of {name} (expected {DEFINITIONS_VERSION}); earlier layouts are not converted",
         version.map_or_else(|| "none".into(), |v| v.to_string())
     );
-    Ok(Some(serde_json::from_value(value)?))
+    Ok(serde_json::from_value(value)?)
 }
 async fn store_definitions(rows: &mut dyn Transaction, name: &str, defs: &Definitions) -> anyhow::Result<()> {
     let mut value = serde_json::to_value(defs)?;
@@ -792,8 +795,11 @@ struct Queued {
     failure: Option<(WorkflowError, u32)>,
 }
 async fn queued(rows: &mut dyn Transaction, k: &str) -> anyhow::Result<Option<Queued>> {
-    let q = get::<Queued>(rows, "trigger_queue", k).await?;
-    anyhow::ensure!(q.as_ref().is_none_or(|q| q.version == 1), "unsupported trigger queue layout");
+    rows.get("trigger_queue", k).await?.map(decode_queue).transpose()
+}
+fn decode_queue(value: Value) -> anyhow::Result<Queued> {
+    let q: Queued = serde_json::from_value(value)?;
+    anyhow::ensure!(q.version == 1, "unsupported trigger queue layout");
     Ok(q)
 }
 async fn remove_queue(rows: &mut dyn Transaction, k: &str) -> anyhow::Result<()> {
@@ -1259,6 +1265,33 @@ impl RunStore for TransactionalStore {
         limit: usize,
     ) -> anyhow::Result<control::Page<SavedRun>> {
         self.update(|rows| Box::pin(async move { query_runs(rows, filter, history, cursor, limit).await })).await
+    }
+    async fn query_definitions(
+        &self,
+        cursor: Option<&control::Cursor>,
+        limit: usize,
+    ) -> anyhow::Result<control::Page<control::DefinitionSummary>> {
+        self.update(|rows| {
+            Box::pin(async move {
+                let (found, next) = page_rows(rows, "definitions", "definitions", None, None, cursor, limit).await?;
+                let mut items = Vec::new();
+                for ((_, name), value) in found {
+                    let defs = decode_definitions(&name, value)?;
+                    items.push(definition_summary(rows, &name, defs).await?);
+                }
+                Ok(control::Page { items, next })
+            })
+        })
+        .await
+    }
+    async fn definition_control(&self, name: &str) -> anyhow::Result<Option<control::DefinitionSummary>> {
+        self.update(|rows| {
+            Box::pin(async move {
+                let Some(defs) = load_definitions(rows, name).await? else { return Ok(None) };
+                Ok(Some(definition_summary(rows, name, defs).await?))
+            })
+        })
+        .await
     }
     async fn pending_waits(
         &self,
@@ -1961,6 +1994,77 @@ impl RunStore for TransactionalStore {
 }
 
 // ── 7. operator commands and bounded indexes ──────────────────────────────
+
+async fn definition_summary(
+    rows: &mut dyn Transaction,
+    name: &str,
+    defs: Definitions,
+) -> anyhow::Result<control::DefinitionSummary> {
+    use control::{QueuedSlot, ScheduleCatchup, ScheduleKind, ScheduleSummary, VersionSummary};
+    let mut schedules = Vec::new();
+    if let Some(active) = defs.active.and_then(|v| defs.versions.get(&v))
+        && let Some(schedule) = ows::model::parse_yaml(&active.yaml)?.schedule
+    {
+        let paused = if defs.tripped.as_ref().is_some_and(|t| t.manual.is_some()) {
+            get::<control::Paused>(rows, "paused", name).await?
+        } else {
+            None
+        };
+        for (kind, configured) in [
+            (ScheduleKind::Every, schedule.every.is_some()),
+            (ScheduleKind::Cron, schedule.cron.is_some()),
+            (ScheduleKind::After, schedule.after.is_some()),
+            (ScheduleKind::On, schedule.on.is_some()),
+        ] {
+            if configured {
+                schedules.push(ScheduleSummary {
+                    kind,
+                    next_due_ms: None,
+                    overlap: schedule.overlap,
+                    catchup: match schedule.catchup {
+                        ows::model::Catchup::Latest => ScheduleCatchup::Latest,
+                        ows::model::Catchup::None => ScheduleCatchup::None,
+                    },
+                    queued: None,
+                });
+            }
+        }
+        // Trigger ownership comes from the catalog, never from key naming.
+        // Manual pauses keep the same observation in their suspended state.
+        let keys: Vec<_> =
+            paused.as_ref().map_or_else(|| defs.triggers.iter().collect(), |p| p.triggers.keys().collect());
+        for key in keys {
+            let trigger = match &paused {
+                Some(p) => p.triggers.get(key).cloned(),
+                None => get::<Trigger>(rows, "trigger", key).await?,
+            };
+            let Some(t) = trigger else { continue };
+            let kind = match t.state["kind"].as_str() {
+                Some("every") => ScheduleKind::Every,
+                Some("cron") => ScheduleKind::Cron,
+                Some("after") => ScheduleKind::After,
+                Some("on") => ScheduleKind::On,
+                _ => continue,
+            };
+            let Some(summary) = schedules.iter_mut().find(|s| s.kind == kind) else { continue };
+            summary.next_due_ms = t.at_ms;
+            let q = match &paused {
+                Some(p) => p.queues.get(key).cloned().map(decode_queue).transpose()?,
+                None => queued(rows, key).await?,
+            };
+            summary.queued = q.map(|q| QueuedSlot { run: q.admission.id, version: q.admission.version });
+        }
+    }
+    Ok(control::DefinitionSummary {
+        name: name.into(),
+        versions: defs.versions.keys().map(|&version| VersionSummary { version, activated_ms: None }).collect(),
+        active: defs.active,
+        epoch: defs.epoch,
+        consecutive_faults: defs.consecutive_faults,
+        tripped: defs.tripped,
+        schedules,
+    })
+}
 
 fn run_kinds(r: &SavedRun, history: bool) -> Vec<String> {
     let base = if history { "control_end" } else { "control_run" };
