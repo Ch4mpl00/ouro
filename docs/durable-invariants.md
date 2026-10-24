@@ -1015,7 +1015,10 @@ Decision 5 and the epoch rule of decision 3 were revised on 2026-10-24
    slot resolves), and the fault is a terminal observation of the epoch (V2).
    It is not retried at the next poll, which would refire the slot on every
    poll, and it is never a scheduler error that stops other definitions'
-   slots.
+   slots. Only deterministic refusals are treated so: an admission the host
+   interrupts (its schema resolver failing) is an infrastructure
+   interruption (decision 5), so the slot stays represented by its trigger,
+   uncounted, and is retried after a capped backoff (T1, L4).
 4. **Time (T3, L4).** Deadlines are absolute instants fixed when they start
    (a workflow `timeout` from admission, not from the last resume), so moving
    between processes never resets them. Clock skew between workers is bounded
@@ -1027,7 +1030,7 @@ Decision 5 and the epoch rule of decision 3 were revised on 2026-10-24
    never chooses one. The breaker counts terminal faults of runs of the active
    version admitted in the current epoch: unhandled errors, timeouts,
    outcome-unknown that ended the run, and a schedule's run the host refused
-   to admit (decision 3). It does not count cancellations or
+   to admit deterministically (decision 3), never an interrupted admission. It does not count cancellations or
    infrastructure interruptions (a process or storage failure that a later
    attempt resumes, even when the interruptions run out). Success and a new
    activation reset the count. At the threshold the definition becomes

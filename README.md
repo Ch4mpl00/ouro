@@ -51,8 +51,9 @@ after a definition was activated: a new release of the host, or
 `set_registry` on a running one. At admission a missing function fails
 `start` (and a child's start) with a `MissingFunction` error naming it and
 the definitions that lead to it, and a definition that no longer validates
-against the host fails it with `InvalidDefinition`; a schedule's slot
-records either as a refused run instead (below). A resumed run checks again
+against the host fails it with `InvalidDefinition` (a schema resolver that
+fails, with `ResourceUnavailable`); a schedule's slot records either of the
+first two as a refused run instead and retries the third (below). A resumed run checks again
 before its next step and faults with a `configuration` error instead of
 failing halfway through. Each definition
 version's own needs are computed once per registry generation (replacing the
@@ -289,7 +290,12 @@ is bounded by its collection and `retry` by its attempts.
   fault toward the definition's breaker, so a definition that stays broken
   trips after the threshold and its schedule stops. CHOICE: the slot is
   consumed, not retried at the next tick, which would refire it on every
-  tick; it is not lost either, since its failed run holds it. `after`
+  tick; it is not lost either, since its failed run holds it. Only such
+  deterministic refusals count: a schema resolver that fails
+  (`ResourceUnavailable`) interrupts the admission, so the trigger keeps
+  the slot, uncounted, and retries it after a backoff of 1 s doubling to
+  five minutes, stored with the trigger (`retry` in its state); an `on`
+  schedule leaves the event untaken and `publish` returns the error. `after`
   re-arms when its run ends, never across epochs (a refused one is due one
   delay later). `on` keeps the events
   matched so far in its trigger and starts the workflow, with the consumed
