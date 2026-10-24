@@ -32,10 +32,36 @@ name, schemas and delivery only: the engine does not know whether a function
 reads or writes. That is the host's to judge, from a run's call journal and
 with its own dry-run mock rule (below). Handlers receive arguments and
 `FunctionContext`: a
-cancellation token, run ID, task path, retry attempt, stable idempotency key
-and current OpenTelemetry context. Return JSON or `FunctionError` (OWS Problem
-Details); YAML `try/catch` handles ordinary function and schema errors.
-Both input and output schemas are checked.
+cancellation token, run ID, task path, retry attempt, stable idempotency key,
+the call's span (current while the handler runs), the function, definition,
+version and delivery, and the runtime's meter (Observability, below). Return
+JSON, an annotated `Output`, or `FunctionError` (OWS Problem Details); YAML
+`try/catch` handles ordinary function and schema errors. Both input and
+output schemas are checked.
+
+```rust
+// A model step: its text, and its usage as annotations.
+Function::new("chat", input, output, |args: Value, cx: FunctionContext| async move {
+    let reply = model.chat(&args, &cx.span).await?; // the host's client
+    Ok(Output::new(json!({ "text": reply.text }))
+        .annotate("gen_ai.request.model", reply.model)
+        .annotate("gen_ai.usage.input_tokens", reply.input_tokens)
+        .annotate("gen_ai.usage.output_tokens", reply.output_tokens))
+})
+```
+
+Annotations are numbers and short strings, at most 32 per call and 4 KB as
+JSON (`ows::durable::MAX_ANNOTATIONS`, `MAX_ANNOTATION_BYTES`); a call
+answered beyond that is answered with a `validation` error instead. They are
+saved with the call's record in the commit that saves its result, returned
+by `calls` and restored on recovery and replay without calling the function
+again, copied to the call's span attributes under their own names, and, for
+non-negative numbers, summed into the `ouro.call.annotations` metric. The
+engine knows nothing about tokens or prices: a backend computes cost from
+the model and token counts, and an application may still annotate its own
+(`cost_usd`). `annotation_totals(&calls)` sums a journal's numbers per name.
+A handler is generic over its success type (`Value` or `Output`), so one
+that never succeeds names it: `Err::<Value, _>(error)`.
 
 `Runtime::embedded(path, registry)` uses default settings and SQLite.
 `Runtime::new` accepts an injected `RunStore`, registry, configuration, clock
@@ -166,22 +192,135 @@ The worker drives children under the same bounds. Native `run: workflow`
 (below) is the DSL's way to run a child and wait for it.
 
 `dry_run` takes the host's `Mock`: a rule over each call's function and
-arguments (`mocks`) and the answers to what it marks (`response`);
+arguments (`mocks`) and the answers to what it marks (`response`, a value or
+an annotated `Output`, whose annotations the dry run keeps);
 `mock(rule, response)` builds one from two closures. Its guarantee: a dry run
 dispatches no call (function or process run, `run:<kind>`) the rule marks.
 Every other call is dispatched for real. Emitted events are recorded, never
 published or handed to the sink. `DryRun::mocked` lists the mocked calls and
-the emitted events. All runs and definitions live in a private memory store;
+the emitted events; `DryRun::calls` is the dry run's whole call journal with
+annotations, so `annotation_totals` estimates what a run would use. A dry run
+or replay is traced but records no metrics: it is not a run of the host. All runs and definitions live in a private memory store;
 child definitions are read from the host's catalog. Durable delays advance
-without sleeping. `replay` and `replay_definition` take function results and
-event envelopes from a recorded run and execute in isolation, with no handler
-dispatch. Replay rejects missing or changed call bindings and requires evidence
+without sleeping. `replay` and `replay_definition` take function results, their
+annotations and event envelopes from a recorded run and execute in
+isolation, with no handler dispatch (`Replay::calls` is the replayed
+journal). Replay rejects missing or changed call bindings and requires evidence
 that has not been swept. Fork scheduling and all time-dependent decisions are
 not a deterministic simulation; that is future work.
 
-The runtime uses the OpenTelemetry API. Hosts inject a tracer and configure
-export/flush/shutdown themselves. `--features otlp` exposes the optional OTLP
-exporter crate; merely enabling it opens no connection.
+## Observability
+
+The runtime uses the OpenTelemetry API only. Hosts inject a tracer
+(`Runtime::new`) and a meter (`Runtime::with_meter`; without one no metric is
+recorded) and configure export, flush and shutdown themselves.
+`--features otlp` exposes the optional OTLP exporter crate (traces and
+metrics); merely enabling it opens no connection.
+
+**Spans.** Each drive of a run opens `workflow <name>`, with a `task <path>`
+span per task and a `function <name>` span per call, attributed with
+`ouro.run.id`, `ouro.definition.name`, `ouro.definition.version`,
+`ouro.task.path`, `ouro.attempt` and `ouro.outcome`. A run admitted inside a
+span (the host's request, a parent run's call) pins that span's
+`trace_id`/`span_id` in its admission; `inspect` returns them and every
+drive's root span links to them. The call's span is
+`FunctionContext::span`, current while its handler runs: a host adds
+attributes to it and opens child spans under it (an HTTP request to a model,
+a database query). For model steps, use the
+[GenAI semantic conventions](https://opentelemetry.io/docs/specs/semconv/gen-ai/):
+`gen_ai.operation.name`, `gen_ai.request.model`, `gen_ai.usage.input_tokens`,
+`gen_ai.usage.output_tokens`, as span attributes or as annotations (which
+become span attributes and summed metrics).
+
+**Metrics.** The runtime's own names are `ouro.*`. Durations are histograms
+in seconds.
+
+| Metric | Kind | Attributes | What |
+| --- | --- | --- | --- |
+| `ouro.runs.started` | counter | `ouro.definition` | Runs this runtime admitted: `start`, children, fired slots (a queued slot counts as a `queued` fire, not again when promoted) |
+| `ouro.runs` | counter | `ouro.definition`, `ouro.outcome` | Runs a drive of this runtime ended: `completed`, `faulted`, `cancelled` |
+| `ouro.run.duration` | histogram | `ouro.definition`, `ouro.outcome` | Admission to end, for those runs |
+| `ouro.run.schedule_to_start` | histogram | `ouro.definition` | From a run becoming due (admitted, woken, its lease expired) to its claim |
+| `ouro.step.duration` | histogram | `ouro.definition`, `ouro.task.kind`, `ouro.outcome` | A task within one drive: `completed`, `faulted`, `waiting`, `interrupted` |
+| `ouro.calls` | counter | `ouro.definition`, `ouro.function`, `ouro.delivery`, `ouro.outcome` | Calls by answer: `completed`, `failed`, `not_executed`, `unknown`, `interrupted` |
+| `ouro.call.duration` | histogram | as `ouro.calls` | Dispatch to answer |
+| `ouro.call.annotations` | counter | `ouro.definition`, `ouro.function`, `ouro.annotation` | Numeric annotations summed by name |
+| `ouro.breaker.trips` | counter | `ouro.definition` | Breaker trips, once each, when the worker hands the notice on |
+| `ouro.budget.exhausted` | counter | `ouro.definition` | Runs ended through their jump budget |
+| `ouro.schedule.fires` | counter | `ouro.definition`, `ouro.schedule.kind`, `ouro.outcome` | Slots fired: `admitted`, `refused`, `queued` |
+| `ouro.schedule.skips` | counter | `ouro.definition`, `ouro.schedule.kind`, `ouro.schedule.reason` | Slots skipped: `missed`, `overlap`, `ceiling` |
+| `ouro.schedule.retries` | counter | `ouro.definition`, `ouro.schedule.kind` | Slots whose admission was interrupted and is retried |
+| `ouro.backlog.runs`, `ouro.backlog.age` | gauge | none | Due, unclaimed runs and how late the oldest is |
+| `ouro.waits.pending`, `ouro.waits.age` | gauge | none | Open listens and how long the oldest has waited |
+
+The gauges are store-wide: each worker reads one bounded page (1,000) of the
+due index and of open listens on its heartbeat cadence, oldest first, so they
+are lower bounds beyond a page; an emergency stop reads as an empty backlog.
+`FunctionContext::attributes()` gives a function's own metrics the call's
+`ouro.definition`, `ouro.function` and `ouro.delivery`, recorded with
+`FunctionContext::meter`.
+
+**Cardinality.** Metric attributes come from bounded sets only: definition
+names, outcomes, function names, deliveries, task and schedule kinds, skip
+reasons, annotation names (and, in a host's own metrics, model names). Run
+ids, task paths, event ids and error texts are span attributes only. Keep
+annotation names a fixed vocabulary: each name is a series per function.
+
+**Workers.** `Runtime::worker` upserts one heartbeat row per runtime on its
+heartbeat cadence (`Config::heartbeat_interval`): its id
+(`Runtime::worker_id`), host name (`Config::host_name`, supplied by the
+host), application version, start, last beat and the runs it holds; the row
+is stale one lease (30 s) after its last beat and immediately after a clean
+stop, and `sweep` removes it a day after it went stale. A host that drives
+runs itself (a serverless invocation) calls `Runtime::heartbeat`.
+`Control::workers` pages the rows and marks the stale ones. A beat reads and
+writes the worker's own row and its expiry index entry, whatever the store
+holds.
+
+**Process metrics** (memory, CPU, file descriptors) are not collected by the
+engine; observe the process from outside, for instance with the
+OpenTelemetry Collector's `hostmetrics` receiver and its `process` scraper,
+next to the OTLP receiver the runtime exports to:
+
+```yaml
+receivers:
+  otlp:
+    protocols: { http: { endpoint: 127.0.0.1:4318 } }
+  hostmetrics:
+    collection_interval: 30s
+    scrapers:
+      process:
+        include: { names: [my-host-binary], match_type: strict }
+        mute_process_name_error: true
+processors:
+  resourcedetection: { detectors: [system] }
+exporters:
+  otlphttp: { endpoint: https://metrics.example.internal }
+service:
+  pipelines:
+    metrics:
+      receivers: [otlp, hostmetrics]
+      processors: [resourcedetection]
+      exporters: [otlphttp]
+    traces:
+      receivers: [otlp]
+      exporters: [otlphttp]
+```
+
+Breaking changes (issue #20), for hosts and adapters written before it:
+
+- `Handler::call` and `Mock::response` return `Output`; closures may still
+  return a `Value`, and one that only fails names its success type.
+- `FunctionContext` gains `function`, `definition`, `version`, `delivery` and
+  `meter`; `ows::run::CallInfo` gains `annotations` (an `Annotator` a host's
+  `Functions` fills while it answers).
+- `Record::Call`, `CallEntry` and `RecordedCall` carry `annotations`;
+  `Inspection` carries their totals; `DryRun` and `Replay` carry `calls`;
+  `Swept` counts `workers`; `Config` gains `host_name`. The durable state
+  version is 9: run rows written under 8 are refused.
+- `RunStore` gains `beat` and `workers` (a store that keeps no heartbeats
+  fails them, and with them `worker`).
+- A taken-over run's `wake_at_ms` is its previous lease's end.
 
 ## Operator control
 
@@ -237,10 +376,12 @@ the same evidence. Clearing promotes a bounded batch of deferred queues; subsequ
 clear. Events may still be accepted into mailboxes while stopped.
 
 `inspect` includes the admitted definition/version, state, lease, waits and
-mailbox copies, call journal, children (including ended children), and tree
-jump budget. A terminal run keeps the tree's spent count at its end. Existing
-host-pinned `trace_id`/`span_id` values are exposed when present; generating
-and persisting tracing context is issue #20.
+mailbox copies, call journal (each call with its annotations) and the
+annotations' numeric totals for the run, children (including ended children),
+and tree jump budget. A terminal run keeps the tree's spent count at its end.
+The `trace_id`/`span_id` the run was admitted in are exposed when there was
+one (Observability). `workers` pages worker heartbeat rows, marking stale
+ones.
 
 `list` filters by definition, state, admission time and parent; `history`
 uses end time and includes terminal errors. History requires a bounded
@@ -487,6 +628,8 @@ The engine owns primary and secondary keys in `(kind, id)` order:
 | `control_parent:<hex parent ID>` | ordered admission time + child ID | Owned children including terminal children |
 | `control_wait`, `control_wait_run:<hex run ID>`, `control_wait_definition:<hex name>` | ordered since time + hex run ID + hex wait key | Current listen matcher and position |
 | `control_wait_type:<hex type>`, `control_wait_definition:<hex name>:type:<hex type>` | same wait key | Current listens by routing type |
+| `worker` | worker ID | One worker's heartbeat row |
+| `worker_expiry` | ordered expiry + hex worker ID | Worker rows by staleness, for `sweep` |
 
 Index entries contain the run ID and change in the same transaction as the
 run. Times use sign-adjusted, fixed-width hexadecimal; names and event types
@@ -520,7 +663,8 @@ Both initial migrations were replaced before any release or deployment. This
 layout requires a fresh database from the earlier development checkout; there
 is no conversion of that unreleased layout. Applied migrations are immutable
 from the next release onward. The SQL schema is a generic key/value table, so
-the row shapes above (and the interpreter's durable state version, now 8) can
+the row shapes above (and the interpreter's durable state version, now 9: a
+call record keeps its annotations) can
 change without a migration; nothing persisted before them is converted. Each
 run row records the durable state version it was written under, and a row of
 another version (including the earlier one-aggregate-per-run layout) is

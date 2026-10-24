@@ -729,8 +729,63 @@ pub async fn run_all(factory: impl AsyncFn(&str) -> anyhow::Result<TestStore>) -
     overlap_policies(&factory, &mut report).await?;
     controls(&factory, &mut report).await?;
     control_overlap(&factory, &mut report).await?;
+    heartbeats(&factory, &mut report).await?;
     dropped(&factory, &mut report).await?;
     Ok(report)
+}
+
+/// Worker heartbeats: one row per worker id however often it beats, an
+/// older beat never replaces a newer one, pages in id order, and a stale
+/// row is removed by `sweep` only once it has been stale for
+/// `WORKERS_KEPT_MS`, together with its expiry index entry.
+async fn heartbeats(
+    factory: &impl AsyncFn(&str) -> anyhow::Result<TestStore>,
+    report: &mut Report,
+) -> anyhow::Result<()> {
+    use control::{WORKERS_KEPT_MS, Worker};
+    let t = factory("heartbeats").await?;
+    report.cases += 1;
+    let s = &t.store;
+    let worker = |id: &str, beat_ms: i64, held: u64| Worker {
+        id: id.into(),
+        host: Some("host-a".into()),
+        application: Some("1".into()),
+        started_ms: 0,
+        beat_ms,
+        expires_ms: beat_ms + LEASE_MS,
+        held,
+    };
+    s.beat(&worker("a", 0, 1)).await?;
+    s.beat(&worker("b", 0, 0)).await?;
+    s.beat(&worker("a", 10, 3)).await?;
+    // A delayed beat arriving after a newer one changes nothing.
+    s.beat(&worker("a", 5, 9)).await?;
+    assert!(s.beat(&worker("", 0, 0)).await.is_err());
+    let rows = async || -> anyhow::Result<(usize, usize)> {
+        let rows = t.backend.snapshot().await?.rows;
+        let count = |kind: &str| rows.keys().filter(|(k, _)| k == kind).count();
+        Ok((count("worker"), count("worker_expiry")))
+    };
+    assert_eq!(rows().await?, (2, 2));
+    let fresh = (t.reopen)().await?;
+    let first = fresh.workers(None, 1).await?;
+    assert_eq!(first.items, vec![worker("a", 10, 3)]);
+    let second = fresh.workers(first.next.as_ref(), 1).await?;
+    assert_eq!(second.items, vec![worker("b", 0, 0)]);
+    assert!(fresh.workers(second.next.as_ref(), 1).await?.items.is_empty());
+    assert!(fresh.workers(None, 0).await.is_err());
+    // `b` expired at LEASE_MS and `a` at 10 + LEASE_MS.
+    assert_eq!(fresh.sweep(LEASE_MS + WORKERS_KEPT_MS - 1, RECORDS_KEPT_MS).await?.workers, 0);
+    assert_eq!(fresh.sweep(LEASE_MS + WORKERS_KEPT_MS, RECORDS_KEPT_MS).await?.workers, 1);
+    assert_eq!(fresh.workers(None, 10).await?.items, vec![worker("a", 10, 3)]);
+    // A beat revives a stale row before it is swept.
+    s.beat(&worker("a", WORKERS_KEPT_MS, 0)).await?;
+    assert_eq!(fresh.sweep(10 + LEASE_MS + WORKERS_KEPT_MS, RECORDS_KEPT_MS).await?.workers, 0);
+    assert_eq!(fresh.sweep(2 * WORKERS_KEPT_MS + LEASE_MS, RECORDS_KEPT_MS).await?.workers, 1);
+    assert_eq!(rows().await?, (0, 0));
+    report.operations += 12;
+    report.witnesses.insert("one heartbeat row per worker, swept after it stays stale");
+    Ok(())
 }
 
 /// The persisted budget counter of `root`'s tree.
@@ -1781,6 +1836,7 @@ async fn overlap_policies(
                 arguments: json!({}),
                 delivery: ows::durable::Delivery::AtMostOnce,
                 state: ows::durable::CallState::Pending,
+                annotations: Default::default(),
             },
             1,
         )

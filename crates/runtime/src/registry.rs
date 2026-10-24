@@ -8,8 +8,9 @@
 //! called, how far each call got) and from its own dry-run mock rule.
 use crate::capabilities::{Capabilities, HostCatalog};
 use async_trait::async_trait;
-use opentelemetry::Context as SpanContext;
+use opentelemetry::{Context as SpanContext, KeyValue, metrics::Meter};
 pub use ows::durable::Delivery;
+use ows::durable::{Annotation, Annotations};
 use ows::{
     model::{self, Catalog, Process, Workflow},
     run::WorkflowError,
@@ -34,24 +35,74 @@ pub struct FunctionContext {
     pub task_path: String,
     pub attempt: u32,
     pub idempotency_key: String,
-    /// The current function span; use as the parent of client/SDK spans.
+    /// The call's span, current while the handler runs: add attributes to
+    /// it (`gen_ai.request.model`) and use it as the parent of client/SDK
+    /// spans (an HTTP request to a model, a database query).
     pub span: SpanContext,
     /// The task's transformed input, against which a protocol function
     /// resolves URI templates (`https://host/pet/{petId}`).
     pub input: Value,
+    /// The function called (`run:<kind>` for a process).
+    pub function: String,
+    /// The run's definition and version.
+    pub definition: String,
+    pub version: u64,
+    /// The call's effective delivery.
+    pub delivery: Delivery,
+    /// The runtime's meter (`Runtime::with_meter`), for a function's own
+    /// metrics; label them with `attributes`, never with the run id.
+    pub meter: Meter,
 }
+impl FunctionContext {
+    /// The call's bounded metric attributes: `ouro.definition`,
+    /// `ouro.function` and `ouro.delivery`. Run ids and task paths belong
+    /// on spans only: they would make a series per run.
+    pub fn attributes(&self) -> Vec<KeyValue> {
+        crate::telemetry::call_attributes(&self.definition, &self.function, self.delivery)
+    }
+}
+
+/// What a function returns: its result and the annotations it carries
+/// beside it (`ows::durable::Annotation`: numbers and short strings), saved
+/// with the call's record, returned on recovery and replay, copied to the
+/// call's span attributes and, for numbers, summed into the
+/// `ouro.call.annotations` metric. At most `ows::durable::MAX_ANNOTATIONS`
+/// of them and `MAX_ANNOTATION_BYTES` as JSON: beyond that, the call is
+/// answered with a validation error. A handler may return a bare `Value`.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Output {
+    pub value: Value,
+    pub annotations: Annotations,
+}
+impl Output {
+    pub fn new(value: Value) -> Self {
+        Self { value, annotations: Annotations::new() }
+    }
+    /// Adds an annotation; a later one of the same name replaces it.
+    pub fn annotate(mut self, name: impl Into<String>, value: impl Into<Annotation>) -> Self {
+        self.annotations.insert(name.into(), value.into());
+        self
+    }
+}
+impl From<Value> for Output {
+    fn from(value: Value) -> Self {
+        Self::new(value)
+    }
+}
+
 #[async_trait]
 pub trait Handler: Send + Sync {
-    async fn call(&self, arguments: Value, context: FunctionContext) -> Result<Value, FunctionError>;
+    async fn call(&self, arguments: Value, context: FunctionContext) -> Result<Output, FunctionError>;
 }
 #[async_trait]
-impl<F, Fut> Handler for F
+impl<F, Fut, O> Handler for F
 where
     F: Fn(Value, FunctionContext) -> Fut + Send + Sync,
-    Fut: Future<Output = Result<Value, FunctionError>> + Send,
+    Fut: Future<Output = Result<O, FunctionError>> + Send,
+    O: Into<Output>,
 {
-    async fn call(&self, a: Value, c: FunctionContext) -> Result<Value, FunctionError> {
-        self(a, c).await
+    async fn call(&self, a: Value, c: FunctionContext) -> Result<Output, FunctionError> {
+        self(a, c).await.map(Into::into)
     }
 }
 pub struct Function {

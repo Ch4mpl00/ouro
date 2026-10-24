@@ -1726,3 +1726,123 @@ fn generated_jump_budgets_end_every_run_within_the_budget_across_crashes() {
     eprintln!("runs with a refused jump: {}", refused.load(Ordering::SeqCst));
     assert!(refused.load(Ordering::SeqCst) > 0, "no generated run ran out of budget");
 }
+
+/// A host whose `model` calls hand back annotations with their result, as a
+/// model step reports its token counts; `bloated` hands back too many.
+#[derive(Default)]
+struct Annotating(AtomicUsize);
+#[async_trait]
+impl Functions for Annotating {
+    fn has(&self, _: &str) -> bool {
+        true
+    }
+    async fn call(&self, name: &str, args: Value, info: &CallInfo<'_>) -> Result<Value, WorkflowError> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        match name {
+            "bloated" => {
+                (0..=ows::durable::MAX_ANNOTATIONS).for_each(|n| info.annotations.annotate(format!("k{n}"), n))
+            }
+            _ => {
+                info.annotations.annotate("gen_ai.usage.input_tokens", 1830);
+                info.annotations.annotate("gen_ai.request.model", "small");
+                info.annotations.annotate("cost_usd", 0.004);
+            }
+        }
+        Ok(args)
+    }
+}
+
+fn annotations() -> ows::durable::Annotations {
+    [
+        ("cost_usd".to_owned(), 0.004.into()),
+        ("gen_ai.request.model".to_owned(), "small".into()),
+        ("gen_ai.usage.input_tokens".to_owned(), 1830.into()),
+    ]
+    .into()
+}
+
+#[tokio::test]
+async fn annotations_are_saved_with_the_result_and_restored_at_every_crash_boundary() {
+    let wf = workflow(
+        "do:\n  - first: { call: model, with: { n: 1 } }\n  - pause: { wait: PT0.001S }\n  - second: { call: model, with: { n: 2 } }\n",
+    );
+    let annotated = |records: &BTreeMap<String, Record>| {
+        records
+            .iter()
+            .filter_map(|(k, r)| match r {
+                Record::Call { annotations, .. } => Some((k.clone(), annotations.clone())),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    let expected =
+        vec![("/do/0/first#call".to_owned(), annotations()), ("/do/2/second#call".to_owned(), annotations())];
+    let baseline = Store::default();
+    let time = Arc::new(Time(AtomicI64::new(1_000)));
+    let host = |functions: Arc<Annotating>, time: Arc<Time>| Host {
+        functions,
+        clock: time,
+        observer: Arc::new(Silent),
+        limits: Limits::default(),
+        runtime: json!({"name":"test"}),
+    };
+    let functions = Arc::new(Annotating::default());
+    assert!(matches!(drive(&host(functions.clone(), time.clone()), &time, &wf, &baseline).await, Status::Completed(_)));
+    assert_eq!(annotated(&baseline.records()), expected);
+    assert_eq!(functions.0.load(Ordering::SeqCst), 2);
+    // The finished run restores both calls: no call, the same journal.
+    let outcome = run::resume(
+        &host(functions.clone(), time.clone()),
+        &wf,
+        "run",
+        json!({}),
+        &CancellationToken::new(),
+        &baseline,
+    )
+    .await;
+    assert_eq!(functions.0.load(Ordering::SeqCst), 2);
+    assert!(outcome.calls.iter().all(|c| c.annotations == annotations()), "{:?}", outcome.calls);
+    let totals = ows::durable::annotation_totals(&outcome.calls);
+    assert_eq!(totals["gen_ai.usage.input_tokens"], serde_json::Number::from(3660));
+    assert_eq!(totals["cost_usd"].as_f64(), Some(0.008));
+    assert!(!totals.contains_key("gen_ai.request.model"));
+    let count = baseline.saves.load(Ordering::SeqCst);
+    for after_commit in [false, true] {
+        for fail_at in 1..=count {
+            let store = Store { fail_at: AtomicUsize::new(fail_at), after_commit, ..Default::default() };
+            let time = Arc::new(Time(AtomicI64::new(1_000)));
+            let functions = Arc::new(Annotating::default());
+            assert!(matches!(
+                drive(&host(functions.clone(), time.clone()), &time, &wf, &store).await,
+                Status::Completed(_)
+            ));
+            assert_eq!(annotated(&store.records()), expected, "crash {fail_at}, after={after_commit}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn annotations_beyond_their_bounds_answer_with_a_validation_error() {
+    let wf = workflow("do:\n  - big: { call: bloated }\n");
+    let store = Store::default();
+    let time = Arc::new(Time(AtomicI64::new(1_000)));
+    let functions = Arc::new(Annotating::default());
+    let host = Host {
+        functions: functions.clone(),
+        clock: time.clone(),
+        observer: Arc::new(Silent),
+        limits: Limits::default(),
+        runtime: json!({"name":"test"}),
+    };
+    let status = drive(&host, &time, &wf, &store).await;
+    assert!(matches!(&status, Status::Faulted(e) if e.is("validation")), "{status:?}");
+    let call = store.records().remove("/do/0/big#call").unwrap();
+    assert!(
+        matches!(&call, Record::Call { state: ows::durable::CallState::Done(Err(_)), annotations, .. } if annotations.is_empty()),
+        "{call:?}"
+    );
+    let mut big = ows::durable::Annotations::new();
+    big.insert("text".into(), "x".repeat(ows::durable::MAX_ANNOTATION_BYTES).into());
+    assert!(ows::durable::check_annotations(&big).is_err());
+    assert!(ows::durable::check_annotations(&annotations()).is_ok());
+}

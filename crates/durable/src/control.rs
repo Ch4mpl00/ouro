@@ -112,15 +112,50 @@ pub struct Wait {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Inspection {
     pub snapshot: RunSnapshot,
+    /// The call journal, each call with its annotations.
     pub calls: Vec<CallEntry>,
+    /// The calls' numeric annotations summed per name
+    /// (`ows::durable::annotation_totals`): a run's tokens, its cost.
+    pub annotations: BTreeMap<String, serde_json::Number>,
     pub waits: BTreeMap<String, PendingWait>,
     pub children: Vec<SavedRun>,
     pub budget_spent: u64,
     pub budget_limit: Option<u64>,
-    /// Existing pinned identifiers, if the host supplied them. Creating span
-    /// context and new observability fields belongs to issue #20.
+    /// The span context the run was admitted in (the host's request, a
+    /// parent run's span), when there was one; every drive's root span
+    /// links to it.
     pub trace_id: Option<String>,
     pub span_id: Option<String>,
+}
+/// One worker's liveness row (`RunStore::beat`): who it is, how much it
+/// holds and when it last beat. One row per worker id, replaced by each
+/// beat, so a beat costs the same however many runs or workers there are. A
+/// serverless host writes one per invocation, under the invocation's id.
+/// Process memory and CPU are not here: an OpenTelemetry Collector or a
+/// process exporter observes the process from outside.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Worker {
+    pub id: String,
+    /// The host name, as the embedding application supplied it.
+    pub host: Option<String>,
+    /// The application version the worker declares.
+    pub application: Option<String>,
+    pub started_ms: i64,
+    pub beat_ms: i64,
+    /// Stale from then on unless it beats again; the row is removed by
+    /// `sweep` once it has been stale for `WORKERS_KEPT_MS`.
+    pub expires_ms: i64,
+    /// The runs it was executing at the beat.
+    pub held: u64,
+}
+/// How long a stale worker's row stays listed before `sweep` removes it.
+pub const WORKERS_KEPT_MS: i64 = 24 * 3_600_000;
+/// A worker row as the control API lists it: stale when it did not beat
+/// before its expiry.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkerStatus {
+    pub worker: Worker,
+    pub stale: bool,
 }
 /// Counts cover at most the supplied number of indexed entries. `next` means
 /// these are lower bounds; pass it back to accumulate the next bounded page.

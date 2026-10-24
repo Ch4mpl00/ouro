@@ -87,6 +87,15 @@ impl Control {
         }
         Ok(Counts { states, next: page.next })
     }
+    /// A page of worker heartbeat rows in id order, each marked stale when
+    /// its worker did not beat before its expiry (by this control's clock).
+    pub async fn workers(&self, cursor: Option<&Cursor>, limit: usize) -> anyhow::Result<Page<WorkerStatus>> {
+        let page = self.store.workers(cursor, limit).await?;
+        let now = self.clock.now_ms();
+        let items =
+            page.items.into_iter().map(|worker| WorkerStatus { stale: worker.expires_ms <= now, worker }).collect();
+        Ok(Page { items, next: page.next })
+    }
     pub async fn entry(&self, id: &str) -> anyhow::Result<Option<Entry>> {
         self.store.control_entry(id).await
     }

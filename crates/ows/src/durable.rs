@@ -138,6 +138,16 @@
 //!     refusal of the run carries that key (`Record::Budget::first`). Only
 //!     the jump it names acts on `on_exceeded`; other branches refused at the
 //!     same moment follow its outcome, and recovery and replay pick the same.
+//!
+//! ## Annotations
+//!
+//! 23. A call's answer may carry annotations: a few named numbers and short
+//!     strings (a model step's token counts) the host hands back with it
+//!     (`run::CallInfo::annotations`). They are saved in the same commit as
+//!     the call's result, within `MAX_ANNOTATIONS` keys and
+//!     `MAX_ANNOTATION_BYTES`; a call answered beyond those bounds is
+//!     answered with a validation error instead. A restored call returns its
+//!     saved annotations and is never asked for them again.
 use crate::{model::Flow, run::WorkflowError};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -158,7 +168,8 @@ use std::collections::BTreeMap;
 /// 7: run rows track their admitting trigger and maintain live-run indexes;
 /// one buffered firing per trigger is stored separately (queue layout 1).
 /// 8: current listen matching contexts, terminal budget counts and control indexes.
-pub const VERSION: u32 = 8;
+/// 9: a call record keeps the annotations its answer carried.
+pub const VERSION: u32 = 9;
 
 /// The key of a run's `Record::Exceeded`.
 pub const EXCEEDED: &str = "exceeded";
@@ -245,6 +256,9 @@ pub enum Record {
         arguments: Value,
         delivery: Delivery,
         state: CallState,
+        /// What the answer carried beside its result (decision 23).
+        #[serde(default, skip_serializing_if = "Annotations::is_empty")]
+        annotations: Annotations,
     },
     Event {
         event: Value,
@@ -283,13 +297,114 @@ pub enum Record {
     },
 }
 
+/// At most this many annotations per call.
+pub const MAX_ANNOTATIONS: usize = 32;
+/// At most this many bytes of a call's annotations, as JSON.
+pub const MAX_ANNOTATION_BYTES: usize = 4096;
+
+/// A small named value a call returns with its result: a number or a short
+/// string. Numbers are JSON numbers (an integer stays an integer).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum Annotation {
+    Number(serde_json::Number),
+    Text(String),
+}
+impl Annotation {
+    /// The value as a float, for a number.
+    pub fn as_f64(&self) -> Option<f64> {
+        match self {
+            Annotation::Number(n) => n.as_f64(),
+            Annotation::Text(_) => None,
+        }
+    }
+}
+impl From<&str> for Annotation {
+    fn from(value: &str) -> Self {
+        Annotation::Text(value.into())
+    }
+}
+impl From<String> for Annotation {
+    fn from(value: String) -> Self {
+        Annotation::Text(value)
+    }
+}
+macro_rules! numeric_annotation {
+    ($($t:ty),*) => {$(
+        impl From<$t> for Annotation {
+            fn from(value: $t) -> Self {
+                Annotation::Number(value.into())
+            }
+        }
+    )*};
+}
+numeric_annotation!(i8, i16, i32, i64, isize, u8, u16, u32, u64, usize);
+impl From<f64> for Annotation {
+    /// A float that is not finite has no JSON number: it is kept as text.
+    fn from(value: f64) -> Self {
+        serde_json::Number::from_f64(value).map_or_else(|| Annotation::Text(value.to_string()), Annotation::Number)
+    }
+}
+impl From<f32> for Annotation {
+    fn from(value: f32) -> Self {
+        Annotation::from(f64::from(value))
+    }
+}
+
+/// A call's annotations, by name.
+pub type Annotations = BTreeMap<String, Annotation>;
+
+/// Whether annotations fit the bounds: nonempty names, at most
+/// `MAX_ANNOTATIONS` of them and `MAX_ANNOTATION_BYTES` as JSON.
+pub fn check_annotations(annotations: &Annotations) -> Result<(), String> {
+    if annotations.len() > MAX_ANNOTATIONS {
+        return Err(format!("{} annotations, at most {MAX_ANNOTATIONS} allowed", annotations.len()));
+    }
+    if annotations.keys().any(String::is_empty) {
+        return Err("an annotation needs a name".into());
+    }
+    let bytes = serde_json::to_vec(annotations).map_or(usize::MAX, |b| b.len());
+    if bytes > MAX_ANNOTATION_BYTES {
+        return Err(format!("annotations take {bytes} bytes, at most {MAX_ANNOTATION_BYTES} allowed"));
+    }
+    Ok(())
+}
+
+/// The numeric annotations of `calls`, summed per name: integers stay
+/// integers while the sum fits; otherwise it is a float.
+pub fn annotation_totals<'a>(calls: impl IntoIterator<Item = &'a CallEntry>) -> BTreeMap<String, serde_json::Number> {
+    fn add(a: &serde_json::Number, b: &serde_json::Number) -> Option<serde_json::Number> {
+        if let (Some(x), Some(y)) = (a.as_i64(), b.as_i64())
+            && let Some(sum) = x.checked_add(y)
+        {
+            return Some(sum.into());
+        }
+        if let (Some(x), Some(y)) = (a.as_u64(), b.as_u64())
+            && let Some(sum) = x.checked_add(y)
+        {
+            return Some(sum.into());
+        }
+        serde_json::Number::from_f64(a.as_f64()? + b.as_f64()?)
+    }
+    let mut totals: BTreeMap<String, serde_json::Number> = BTreeMap::new();
+    for (name, value) in calls.into_iter().flat_map(|c| &c.annotations) {
+        let Annotation::Number(n) = value else { continue };
+        let sum = match totals.get(name) {
+            Some(total) => add(total, n).unwrap_or_else(|| total.clone()),
+            None => n.clone(),
+        };
+        totals.insert(name.clone(), sum);
+    }
+    totals
+}
+
 /// Only pending tasks/calls may advance. Everything else is immutable.
 pub fn check_transition(old: &Record, new: &Record) -> anyhow::Result<()> {
     let allowed = old == new
         || match (old, new) {
             (Record::Task { started_ms: a, result: None }, Record::Task { started_ms: b, .. }) => a == b,
             (
-                Record::Call { logical: l, function: a, arguments: b, delivery: d, state },
+                Record::Call { logical: l, function: a, arguments: b, delivery: d, state, .. },
                 Record::Call { logical: m, function: e, arguments: f, delivery: h, .. },
             ) => !matches!(state, CallState::Done(_)) && l == m && a == e && b == f && d == h,
             _ => false,
@@ -323,6 +438,9 @@ pub struct CallEntry {
     pub function: String,
     pub delivery: Delivery,
     pub state: CallStatus,
+    /// What its answer carried beside its result.
+    #[serde(default, skip_serializing_if = "Annotations::is_empty")]
+    pub annotations: Annotations,
 }
 
 /// How far a call got, from its durable record.
@@ -348,7 +466,7 @@ pub enum CallStatus {
 impl CallEntry {
     /// The entry a call record stands for; `None` for any other record.
     pub fn of(key: &str, record: &Record) -> Option<Self> {
-        let Record::Call { function, delivery, state, .. } = record else { return None };
+        let Record::Call { function, delivery, state, annotations, .. } = record else { return None };
         let state = match state {
             CallState::Pending if *delivery == Delivery::AtMostOnce => CallStatus::Unknown,
             CallState::Pending => CallStatus::Pending,
@@ -356,7 +474,13 @@ impl CallEntry {
             CallState::Done(Ok(_)) => CallStatus::Completed,
             CallState::Done(Err(_)) => CallStatus::Failed,
         };
-        Some(Self { key: key.into(), function: function.clone(), delivery: *delivery, state })
+        Some(Self {
+            key: key.into(),
+            function: function.clone(),
+            delivery: *delivery,
+            state,
+            annotations: annotations.clone(),
+        })
     }
 }
 

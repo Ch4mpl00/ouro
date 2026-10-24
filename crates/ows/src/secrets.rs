@@ -9,7 +9,7 @@
 // redacted for good. The function a call reaches gets the real value: that
 // is what the secret is for. Events a run takes are stored by the host as
 // delivered and are neither redacted nor restored.
-use crate::durable::{CallState, Record, StepOutcome, TaskResult};
+use crate::durable::{Annotation, CallState, Record, StepOutcome, TaskResult};
 use crate::run::{Status, WorkflowError};
 use serde_json::{Map, Value};
 
@@ -238,7 +238,7 @@ fn convert(r: &Record, f: &mut dyn FnMut(&str) -> Result<String, String>) -> Res
                 }),
             },
         },
-        Record::Call { logical, function, arguments, delivery, state } => Record::Call {
+        Record::Call { logical, function, arguments, delivery, state, annotations } => Record::Call {
             logical: logical.clone(),
             function: function.clone(),
             arguments: map_strings(arguments, f)?,
@@ -249,6 +249,17 @@ fn convert(r: &Record, f: &mut dyn FnMut(&str) -> Result<String, String>) -> Res
                 CallState::Done(Ok(v)) => CallState::Done(Ok(map_strings(v, f)?)),
                 CallState::Done(Err(e)) => CallState::Done(Err(map_error(e, f)?)),
             },
+            // A text annotation is a payload too: a secret in it is hidden.
+            annotations: annotations
+                .iter()
+                .map(|(k, v)| {
+                    let v = match v {
+                        Annotation::Text(text) => Annotation::Text(f(text)?),
+                        number => number.clone(),
+                    };
+                    Ok((k.clone(), v))
+                })
+                .collect::<Result<_, String>>()?,
         },
         Record::Winner { output } => Record::Winner { output: map_strings(output, f)? },
         Record::Finished { status } => Record::Finished {
@@ -310,6 +321,7 @@ mod tests {
             arguments: value.clone(),
             delivery: crate::durable::Delivery::AtLeastOnce,
             state: CallState::Done(Err(WorkflowError::runtime("bob said s3cr3t-token"))),
+            annotations: [("note".to_owned(), "s3cr3t-token".into()), ("tokens".to_owned(), 7.into())].into(),
         };
         let stored = r.record(&record);
         assert!(!serde_json::to_string(&stored).unwrap().contains("s3cr3t"));

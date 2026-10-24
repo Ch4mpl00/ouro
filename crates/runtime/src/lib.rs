@@ -14,6 +14,6 @@ pub use opentelemetry;
 pub use opentelemetry_otlp as otlp;
 pub use ouro_durable as durable;
 pub use ows;
-pub use ows::durable::{CallEntry, CallStatus};
-pub use registry::{Delivery, Function, FunctionContext, FunctionError, Handler, MissingFunction, Registry};
+pub use ows::durable::{Annotation, Annotations, CallEntry, CallStatus, annotation_totals};
+pub use registry::{Delivery, Function, FunctionContext, FunctionError, Handler, MissingFunction, Output, Registry};
 pub use testing::{DryRun, Mock, RecordedCall, Replay, mock};

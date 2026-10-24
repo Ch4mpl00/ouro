@@ -351,6 +351,15 @@ fn claimable(r: &SavedRun, now: i64) -> bool {
 fn claim_run(snapshot: &mut StoredRun, now: i64, owner: &str) -> anyhow::Result<Fence> {
     let r = &mut snapshot.run;
     r.generation = r.generation.checked_add(1).ok_or_else(|| anyhow::anyhow!("fence generation overflow"))?;
+    // A running run is due from its lease's end: a takeover records that
+    // instant as its wake-up, so `wake_at_ms` of a claimed run is always
+    // when it became due (schedule-to-start latency). A running run's own
+    // due position is its lease, so nothing else reads it.
+    if r.state == RunState::Running
+        && let Some(until) = r.lease_until_ms
+    {
+        r.wake_at_ms = until;
+    }
     let fence = Fence { run_id: r.admission.id.clone(), owner: owner.into(), generation: r.generation };
     r.fence = Some(fence.clone());
     r.lease_until_ms = Some(now.saturating_add(LEASE_MS));
@@ -1277,6 +1286,42 @@ impl RunStore for TransactionalStore {
         })
         .await
     }
+    // One point read of the worker's row; the row and its expiry entry are
+    // rewritten, whatever else the store holds.
+    async fn beat(&self, worker: &control::Worker) -> anyhow::Result<()> {
+        anyhow::ensure!(!worker.id.is_empty(), "a worker needs an id");
+        self.update(|rows| {
+            Box::pin(async move {
+                let old: Option<control::Worker> = get(rows, "worker", &worker.id).await?;
+                if let Some(old) = &old {
+                    if old.beat_ms > worker.beat_ms {
+                        return Ok(());
+                    }
+                    if old.expires_ms != worker.expires_ms {
+                        rows.delete("worker_expiry", &timed(old.expires_ms, &component(&old.id))).await?;
+                    }
+                }
+                rows.put("worker_expiry", &timed(worker.expires_ms, &component(&worker.id)), &json!(worker.id)).await?;
+                put(rows, "worker", &worker.id, worker).await
+            })
+        })
+        .await
+    }
+    async fn workers(
+        &self,
+        cursor: Option<&control::Cursor>,
+        limit: usize,
+    ) -> anyhow::Result<control::Page<control::Worker>> {
+        self.update(|rows| {
+            Box::pin(async move {
+                let (found, next) = page_rows(rows, "worker", "workers", None, None, cursor, limit).await?;
+                let items =
+                    found.into_values().map(|v| Ok(serde_json::from_value(v)?)).collect::<anyhow::Result<_>>()?;
+                Ok(control::Page { items, next })
+            })
+        })
+        .await
+    }
     async fn describe_wait(&self, f: &Fence, k: &str, wait: &ows::events::PendingWait, now: i64) -> anyhow::Result<()> {
         self.update(|rows| {
             Box::pin(async move {
@@ -1319,9 +1364,11 @@ impl RunStore for TransactionalStore {
                 let span_id = runtime["span_id"].as_str().map(str::to_owned);
                 let snapshot = snapshot(rows, s).await?;
                 let calls = ows::durable::call_journal(&snapshot.records);
+                let annotations = ows::durable::annotation_totals(&calls);
                 Ok(Some(control::Inspection {
                     snapshot,
                     calls,
+                    annotations,
                     waits,
                     children,
                     budget_spent,
@@ -1806,6 +1853,14 @@ impl RunStore for TransactionalStore {
                     rows.delete("ingress_due", &k).await?;
                     rows.delete("ingress", &id).await?;
                     swept.tombstones += 1;
+                }
+                // Workers stale for long enough: a range of the expiry index.
+                let stale = until(now.saturating_sub(control::WORKERS_KEPT_MS));
+                for ((_, k), id) in rows.scan("worker_expiry", "", Some(&stale), usize::MAX).await? {
+                    let id = id.as_str().ok_or_else(|| anyhow::anyhow!("invalid worker index"))?.to_owned();
+                    rows.delete("worker_expiry", &k).await?;
+                    rows.delete("worker", &id).await?;
+                    swept.workers += 1;
                 }
                 Ok(swept)
             })

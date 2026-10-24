@@ -33,6 +33,7 @@ async fn bounded<T>(
 async fn bounds(backend: Arc<dyn AtomicBackend>, metrics: Arc<Metrics>, validation: u64) -> anyhow::Result<()> {
     support::seed(&backend, 10_000).await?;
     control_bounds(&backend, &metrics).await?;
+    heartbeat_bounds(&backend, &metrics).await?;
     decided(&backend, &metrics).await?;
     overlap_bounds(&backend, &metrics).await?;
     let s = TransactionalStore::new(backend.clone());
@@ -361,6 +362,43 @@ async fn sweep_bounded(
     Ok(swept)
 }
 
+/// Worker heartbeats among the 10,000 seeded runs and 1,000 other workers:
+/// a beat reads the worker's row and writes it with its expiry entry, a page
+/// reads its rows, and `sweep` reads only the expiry entries of workers
+/// stale for long enough.
+async fn heartbeat_bounds(backend: &Arc<dyn AtomicBackend>, metrics: &Metrics) -> anyhow::Result<()> {
+    use ouro_durable::control::{WORKERS_KEPT_MS, Worker};
+    let s = TransactionalStore::new(backend.clone());
+    let worker = |id: &str, beat_ms: i64| Worker {
+        id: id.into(),
+        host: Some("host".into()),
+        application: Some("1".into()),
+        started_ms: 0,
+        beat_ms,
+        expires_ms: beat_ms + ouro_durable::LEASE_MS,
+        held: 4,
+    };
+    for n in 0..1_000 {
+        s.beat(&worker(&format!("live{n:04}"), 1_000_000_000)).await?;
+    }
+    for n in 0..50 {
+        s.beat(&worker(&format!("gone{n:02}"), 0)).await?;
+    }
+    bounded(metrics, "beat_first", 0, async || s.beat(&worker("target", 1)).await).await?;
+    bounded(metrics, "beat", 0, async || s.beat(&worker("target", 2)).await).await?;
+    bounded(metrics, "beat_delayed", 0, async || s.beat(&worker("target", 1)).await).await?;
+    let page = bounded(metrics, "workers", 10, async || s.workers(None, 10).await).await?;
+    assert_eq!(page.items.len(), 10);
+    bounded(metrics, "workers_cursor", 10, async || s.workers(page.next.as_ref(), 10).await).await?;
+    let swept = sweep_bounded(backend, metrics, "sweep_workers", async || {
+        s.sweep(ouro_durable::LEASE_MS + WORKERS_KEPT_MS, ouro_durable::RECORDS_KEPT_MS).await
+    })
+    .await?;
+    assert_eq!(swept.workers, 50);
+    assert_eq!(s.workers(None, 1_000).await?.items.len(), 1_000);
+    Ok(())
+}
+
 /// One run holding 10,000 records (1,000 of them consumed events) and a
 /// backlog of pending mailbox copies, among the 10,000 seeded runs: every
 /// per-record operation reads and writes a constant number of rows, and
@@ -398,13 +436,24 @@ async fn long_run(backend: &Arc<dyn AtomicBackend>, metrics: &Metrics, validatio
         arguments: json!({}),
         delivery: ows::durable::Delivery::AtMostOnce,
         state,
+        annotations: Default::default(),
     };
+    // An answer carrying the most annotations allowed: still one record row.
+    let mut annotations = ows::durable::Annotations::new();
+    for n in 0..ows::durable::MAX_ANNOTATIONS {
+        annotations.insert(format!("gen_ai.usage.k{n:02}"), ows::durable::Annotation::from(n * 1_000));
+    }
+    ows::durable::check_annotations(&annotations).map_err(anyhow::Error::msg)?;
     bounded(metrics, "long_save_record_intent", 0, async || {
         s.save_record(&f, "/do/call#call", &call(ows::durable::CallState::Pending), 1).await
     })
     .await?;
-    bounded(metrics, "long_save_record_result", 0, async || {
-        s.save_record(&f, "/do/call#call", &call(ows::durable::CallState::Done(Ok(json!(1)))), 1).await
+    bounded(metrics, "long_save_record_annotated_result", 0, async || {
+        let mut done = call(ows::durable::CallState::Done(Ok(json!(1))));
+        if let Record::Call { annotations: a, .. } = &mut done {
+            *a = annotations.clone();
+        }
+        s.save_record(&f, "/do/call#call", &done, 1).await
     })
     .await?;
     assert!(s.save_record(&f, "/do/1000/step#wait", &Record::Timer { deadline_ms: 43 }, 1).await.is_err());
