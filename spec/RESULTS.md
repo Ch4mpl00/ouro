@@ -4,18 +4,19 @@ The engine no longer classifies calls as reads or writes. In `contract.qnt`
 `writes(i)` became `mocked(i)`, the dry-run host's mock rule (it still marks
 invocations 0 and 2), and the unused `effects` ledger left the machine; X1 now
 says a dry run dispatches nothing the rule marks. No transition, monitor or
-witness changed otherwise. Rerun on the changed model, same environment as
-below:
+witness changed otherwise. Rerun on the model after the jump budget (#8)
+merged, same environment as below:
 
 | Check | Scope | Result | Time |
 | --- | --- | --- | --- |
 | Typecheck | all five modules | Pass | |
-| Witnesses | 29 histories | Pass | 6.6 s |
-| Simulation | 10,000 × 150 steps, seed 20261023, invariant `checked` | Pass | 149.9 s |
-| Fault rows | 11 switches × 1,000 × 150 steps | No violation | 16.5–22.8 s each, 211.2 s |
-| Safety mutants | 32 scripted witnesses | All targets detected, same footprints | 135.4 s |
-| Fault detection | 11 rows | All detected, same footprints | 45.7 s |
+| Witnesses | 30 histories | Pass | 7 s |
+| Simulation | 10,000 × 150 steps, seed 20261023, invariant `checked` | Pass | 170.5 s |
+| Fault rows | 11 switches × 1,000 × 150 steps | No violation | 17.9–23.4 s each, 219.1 s |
+| Safety mutants | 33 scripted witnesses (B1 included) | All targets detected, same footprints | 149.7 s |
+| Fault detection | 11 rows | All detected, same footprints | 48.5 s |
 | Serial and concurrent MBT | memory and SQLite, through `cargo test` | Pass | |
+| `spec/check.py --only rust` | fmt, Clippy, `OURO_REQUIRE_QUINT=1 cargo test --workspace`, restart example | Pass | 0.6 s, 1.0 s, 285.4 s, 7.9 s |
 
 Not rerun: the Apalache and TLC checks (deferred, as below);
 `contract_progress.qnt` is unchanged.
