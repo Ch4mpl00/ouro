@@ -41,11 +41,11 @@
     "L5"
   ],
   "source_sha256": {
-    "contract.qnt": "3df8a89d928c918e62e0c8c14820d35dff82defdd09f53dd03092b71961783b2",
+    "contract.qnt": "b1801902dd700290695f093ac75f4262794c92c21439750464238a5a3ff9e884",
     "contract_bounded.qnt": "73bf8d192bc6a1906da7eec55df41d77f038a2f4ae128d8a52e47a8d04b5ab90",
     "contract_concurrent.qnt": "09b4d5c932d2963a159defcdc0aa6bb6bbc0e218fdc9d76767eb03ddaaba479d",
     "contract_progress.qnt": "056253d12af27cb032ca3f30c82854be1d278c4f0a879bb50ae86a71475252fc",
-    "contract_witnesses.qnt": "5a1cd2b0eaf34c1eb204fdf95e65e1023ebc72a40ef814d8cecc971d0b339fba"
+    "contract_witnesses.qnt": "081abda5480cd80608af7c88f1514818498d430aeb6de6cd35ed5afc407c6790"
   },
   "mutants": [
     {
@@ -58,7 +58,7 @@
         "X3"
       ],
       "shadow_rejects": true,
-      "seconds": 4.277,
+      "seconds": 3.93,
       "steps": 3,
       "scope": "scripted witness; off-target clean cells are not exhaustive",
       "cells": {
@@ -110,7 +110,7 @@
         "A2"
       ],
       "shadow_rejects": false,
-      "seconds": 4.392,
+      "seconds": 4.052,
       "steps": 1,
       "scope": "scripted witness; off-target clean cells are not exhaustive",
       "cells": {
@@ -164,7 +164,7 @@
         "X3"
       ],
       "shadow_rejects": false,
-      "seconds": 7.599,
+      "seconds": 4.08,
       "steps": 4,
       "scope": "scripted witness; off-target clean cells are not exhaustive",
       "cells": {
@@ -216,7 +216,7 @@
         "A4"
       ],
       "shadow_rejects": false,
-      "seconds": 4.871,
+      "seconds": 4.119,
       "steps": 5,
       "scope": "scripted witness; off-target clean cells are not exhaustive",
       "cells": {
@@ -268,7 +268,7 @@
         "A5"
       ],
       "shadow_rejects": false,
-      "seconds": 4.169,
+      "seconds": 4.001,
       "steps": 7,
       "scope": "scripted witness; off-target clean cells are not exhaustive",
       "cells": {
@@ -320,7 +320,7 @@
         "E1"
       ],
       "shadow_rejects": true,
-      "seconds": 4.192,
+      "seconds": 3.942,
       "steps": 4,
       "scope": "scripted witness; off-target clean cells are not exhaustive",
       "cells": {
@@ -372,7 +372,7 @@
         "E2"
       ],
       "shadow_rejects": true,
-      "seconds": 4.199,
+      "seconds": 4.011,
       "steps": 5,
       "scope": "scripted witness; off-target clean cells are not exhaustive",
       "cells": {
@@ -425,7 +425,7 @@
         "R2"
       ],
       "shadow_rejects": true,
-      "seconds": 4.135,
+      "seconds": 4.058,
       "steps": 4,
       "scope": "scripted witness; off-target clean cells are not exhaustive",
       "cells": {
@@ -477,7 +477,7 @@
         "E4"
       ],
       "shadow_rejects": false,
-      "seconds": 4.339,
+      "seconds": 3.97,
       "steps": 6,
       "scope": "scripted witness; off-target clean cells are not exhaustive",
       "cells": {
@@ -529,7 +529,7 @@
         "R1"
       ],
       "shadow_rejects": false,
-      "seconds": 4.174,
+      "seconds": 3.984,
       "steps": 6,
       "scope": "scripted witness; off-target clean cells are not exhaustive",
       "cells": {
@@ -581,7 +581,7 @@
         "R2"
       ],
       "shadow_rejects": false,
-      "seconds": 4.474,
+      "seconds": 4.009,
       "steps": 3,
       "scope": "scripted witness; off-target clean cells are not exhaustive",
       "cells": {
@@ -633,7 +633,7 @@
         "R3"
       ],
       "shadow_rejects": true,
-      "seconds": 4.752,
+      "seconds": 3.925,
       "steps": 3,
       "scope": "scripted witness; off-target clean cells are not exhaustive",
       "cells": {
@@ -685,7 +685,7 @@
         "W1"
       ],
       "shadow_rejects": false,
-      "seconds": 5.158,
+      "seconds": 3.947,
       "steps": 4,
       "scope": "scripted witness; off-target clean cells are not exhaustive",
       "cells": {
@@ -737,7 +737,7 @@
         "W2"
       ],
       "shadow_rejects": true,
-      "seconds": 4.235,
+      "seconds": 3.977,
       "steps": 5,
       "scope": "scripted witness; off-target clean cells are not exhaustive",
       "cells": {
@@ -789,7 +789,7 @@
         "W3"
       ],
       "shadow_rejects": false,
-      "seconds": 4.271,
+      "seconds": 4.003,
       "steps": 3,
       "scope": "scripted witness; off-target clean cells are not exhaustive",
       "cells": {
@@ -841,7 +841,7 @@
         "W4"
       ],
       "shadow_rejects": false,
-      "seconds": 5.489,
+      "seconds": 4.009,
       "steps": 5,
       "scope": "scripted witness; off-target clean cells are not exhaustive",
       "cells": {
@@ -893,7 +893,7 @@
         "W5"
       ],
       "shadow_rejects": false,
-      "seconds": 4.663,
+      "seconds": 4.109,
       "steps": 4,
       "scope": "scripted witness; off-target clean cells are not exhaustive",
       "cells": {
@@ -945,7 +945,7 @@
         "C1"
       ],
       "shadow_rejects": false,
-      "seconds": 4.294,
+      "seconds": 3.972,
       "steps": 3,
       "scope": "scripted witness; off-target clean cells are not exhaustive",
       "cells": {
@@ -997,7 +997,7 @@
         "C2"
       ],
       "shadow_rejects": false,
-      "seconds": 4.189,
+      "seconds": 4.016,
       "steps": 10,
       "scope": "scripted witness; off-target clean cells are not exhaustive",
       "cells": {
@@ -1049,7 +1049,7 @@
         "C3"
       ],
       "shadow_rejects": false,
-      "seconds": 4.478,
+      "seconds": 3.933,
       "steps": 4,
       "scope": "scripted witness; off-target clean cells are not exhaustive",
       "cells": {
@@ -1101,7 +1101,7 @@
         "T1"
       ],
       "shadow_rejects": false,
-      "seconds": 4.212,
+      "seconds": 3.973,
       "steps": 3,
       "scope": "scripted witness; off-target clean cells are not exhaustive",
       "cells": {
@@ -1153,7 +1153,7 @@
         "T2"
       ],
       "shadow_rejects": false,
-      "seconds": 4.137,
+      "seconds": 3.959,
       "steps": 1,
       "scope": "scripted witness; off-target clean cells are not exhaustive",
       "cells": {
@@ -1205,7 +1205,7 @@
         "T3"
       ],
       "shadow_rejects": false,
-      "seconds": 4.14,
+      "seconds": 4.059,
       "steps": 7,
       "scope": "scripted witness; off-target clean cells are not exhaustive",
       "cells": {
@@ -1257,7 +1257,7 @@
         "V1"
       ],
       "shadow_rejects": false,
-      "seconds": 4.143,
+      "seconds": 3.969,
       "steps": 1,
       "scope": "scripted witness; off-target clean cells are not exhaustive",
       "cells": {
@@ -1309,7 +1309,7 @@
         "V2"
       ],
       "shadow_rejects": false,
-      "seconds": 4.288,
+      "seconds": 3.971,
       "steps": 4,
       "scope": "scripted witness; off-target clean cells are not exhaustive",
       "cells": {
@@ -1361,7 +1361,7 @@
         "V3"
       ],
       "shadow_rejects": false,
-      "seconds": 4.423,
+      "seconds": 3.982,
       "steps": 2,
       "scope": "scripted witness; off-target clean cells are not exhaustive",
       "cells": {
@@ -1413,7 +1413,7 @@
         "O1"
       ],
       "shadow_rejects": false,
-      "seconds": 4.704,
+      "seconds": 4.058,
       "steps": 4,
       "scope": "scripted witness; off-target clean cells are not exhaustive",
       "cells": {
@@ -1465,7 +1465,7 @@
         "O2"
       ],
       "shadow_rejects": false,
-      "seconds": 4.528,
+      "seconds": 4.208,
       "steps": 3,
       "scope": "scripted witness; off-target clean cells are not exhaustive",
       "cells": {
@@ -1517,7 +1517,7 @@
         "O3"
       ],
       "shadow_rejects": false,
-      "seconds": 4.756,
+      "seconds": 4.225,
       "steps": 4,
       "scope": "scripted witness; off-target clean cells are not exhaustive",
       "cells": {
@@ -1569,7 +1569,7 @@
         "X1"
       ],
       "shadow_rejects": false,
-      "seconds": 4.196,
+      "seconds": 3.965,
       "steps": 5,
       "scope": "scripted witness; off-target clean cells are not exhaustive",
       "cells": {
@@ -1621,7 +1621,7 @@
         "X2"
       ],
       "shadow_rejects": false,
-      "seconds": 4.802,
+      "seconds": 4.109,
       "steps": 5,
       "scope": "scripted witness; off-target clean cells are not exhaustive",
       "cells": {
@@ -1677,7 +1677,7 @@
         "X3"
       ],
       "shadow_rejects": true,
-      "seconds": 4.747,
+      "seconds": 4.064,
       "steps": 4,
       "scope": "scripted witness; off-target clean cells are not exhaustive",
       "cells": {
@@ -1729,7 +1729,7 @@
         "B1"
       ],
       "shadow_rejects": true,
-      "seconds": 4.283,
+      "seconds": 4.459,
       "steps": 5,
       "scope": "scripted witness; off-target clean cells are not exhaustive",
       "cells": {
@@ -2083,7 +2083,7 @@
         "O1"
       ],
       "shadow_rejects": true,
-      "seconds": 4.517,
+      "seconds": 4.006,
       "steps": 4,
       "scope": "scripted witness; off-target clean cells are not exhaustive",
       "fault": "boundary crash",
@@ -2139,7 +2139,7 @@
         "R2"
       ],
       "shadow_rejects": true,
-      "seconds": 4.116,
+      "seconds": 3.94,
       "steps": 9,
       "scope": "scripted witness; off-target clean cells are not exhaustive",
       "fault": "ambiguous commit",
@@ -2194,7 +2194,7 @@
         "W2"
       ],
       "shadow_rejects": true,
-      "seconds": 5.058,
+      "seconds": 3.942,
       "steps": 5,
       "scope": "scripted witness; off-target clean cells are not exhaustive",
       "fault": "duplicate delivery",
@@ -2249,7 +2249,7 @@
         "W4"
       ],
       "shadow_rejects": false,
-      "seconds": 5.119,
+      "seconds": 3.939,
       "steps": 5,
       "scope": "scripted witness; off-target clean cells are not exhaustive",
       "fault": "reordering",
@@ -2304,7 +2304,7 @@
         "W1"
       ],
       "shadow_rejects": false,
-      "seconds": 4.232,
+      "seconds": 4.027,
       "steps": 4,
       "scope": "scripted witness; off-target clean cells are not exhaustive",
       "fault": "concurrent racers",
@@ -2359,7 +2359,7 @@
         "A5"
       ],
       "shadow_rejects": false,
-      "seconds": 4.32,
+      "seconds": 3.972,
       "steps": 3,
       "scope": "scripted witness; off-target clean cells are not exhaustive",
       "fault": "lease expiry",
@@ -2414,7 +2414,7 @@
         "T3"
       ],
       "shadow_rejects": false,
-      "seconds": 4.519,
+      "seconds": 4.001,
       "steps": 7,
       "scope": "scripted witness; off-target clean cells are not exhaustive",
       "fault": "clock jump",
@@ -2470,7 +2470,7 @@
         "O1"
       ],
       "shadow_rejects": true,
-      "seconds": 4.104,
+      "seconds": 3.933,
       "steps": 4,
       "scope": "scripted witness; off-target clean cells are not exhaustive",
       "fault": "storage disconnect",
@@ -2525,7 +2525,7 @@
         "A4"
       ],
       "shadow_rejects": false,
-      "seconds": 4.074,
+      "seconds": 3.929,
       "steps": 5,
       "scope": "scripted witness; off-target clean cells are not exhaustive",
       "fault": "schema-invalid data",
@@ -2580,7 +2580,7 @@
         "V2"
       ],
       "shadow_rejects": false,
-      "seconds": 4.116,
+      "seconds": 3.916,
       "steps": 3,
       "scope": "scripted witness; off-target clean cells are not exhaustive",
       "fault": "version change",
@@ -2635,7 +2635,7 @@
         "V3"
       ],
       "shadow_rejects": false,
-      "seconds": 4.287,
+      "seconds": 3.937,
       "steps": 2,
       "scope": "scripted witness; off-target clean cells are not exhaustive",
       "fault": "mixed deployment",
@@ -2690,7 +2690,7 @@
       "switch": 1,
       "samples": 1000,
       "steps": 150,
-      "seconds": 18.961,
+      "seconds": 18.702,
       "exit": 0,
       "result": "no violation",
       "scope": "sampled correct-model fault tolerance; not an oracle separation result"
@@ -2700,7 +2700,7 @@
       "switch": 2,
       "samples": 1000,
       "steps": 150,
-      "seconds": 20.32,
+      "seconds": 19.083,
       "exit": 0,
       "result": "no violation",
       "scope": "sampled correct-model fault tolerance; not an oracle separation result"
@@ -2710,7 +2710,7 @@
       "switch": 3,
       "samples": 1000,
       "steps": 150,
-      "seconds": 23.445,
+      "seconds": 23.778,
       "exit": 0,
       "result": "no violation",
       "scope": "sampled correct-model fault tolerance; not an oracle separation result"
@@ -2720,7 +2720,7 @@
       "switch": 4,
       "samples": 1000,
       "steps": 150,
-      "seconds": 21.61,
+      "seconds": 21.55,
       "exit": 0,
       "result": "no violation",
       "scope": "sampled correct-model fault tolerance; not an oracle separation result"
@@ -2730,7 +2730,7 @@
       "switch": 5,
       "samples": 1000,
       "steps": 150,
-      "seconds": 20.735,
+      "seconds": 19.204,
       "exit": 0,
       "result": "no violation",
       "scope": "sampled correct-model fault tolerance; not an oracle separation result"
@@ -2740,7 +2740,7 @@
       "switch": 6,
       "samples": 1000,
       "steps": 150,
-      "seconds": 19.569,
+      "seconds": 19.199,
       "exit": 0,
       "result": "no violation",
       "scope": "sampled correct-model fault tolerance; not an oracle separation result"
@@ -2750,7 +2750,7 @@
       "switch": 7,
       "samples": 1000,
       "steps": 150,
-      "seconds": 18.93,
+      "seconds": 19.192,
       "exit": 0,
       "result": "no violation",
       "scope": "sampled correct-model fault tolerance; not an oracle separation result"
@@ -2760,7 +2760,7 @@
       "switch": 8,
       "samples": 1000,
       "steps": 150,
-      "seconds": 17.888,
+      "seconds": 18.065,
       "exit": 0,
       "result": "no violation",
       "scope": "sampled correct-model fault tolerance; not an oracle separation result"
@@ -2770,7 +2770,7 @@
       "switch": 9,
       "samples": 1000,
       "steps": 150,
-      "seconds": 18.088,
+      "seconds": 18.648,
       "exit": 0,
       "result": "no violation",
       "scope": "sampled correct-model fault tolerance; not an oracle separation result"
@@ -2780,7 +2780,7 @@
       "switch": 10,
       "samples": 1000,
       "steps": 150,
-      "seconds": 20.128,
+      "seconds": 19.69,
       "exit": 0,
       "result": "no violation",
       "scope": "sampled correct-model fault tolerance; not an oracle separation result"
@@ -2790,7 +2790,7 @@
       "switch": 11,
       "samples": 1000,
       "steps": 150,
-      "seconds": 19.429,
+      "seconds": 19.127,
       "exit": 0,
       "result": "no violation",
       "scope": "sampled correct-model fault tolerance; not an oracle separation result"
@@ -2869,17 +2869,17 @@
   "rust_checks": [
     {
       "check": "fmt-final",
-      "seconds": 0.629,
+      "seconds": 1.0,
       "exit": 0
     },
     {
       "check": "clippy-final",
-      "seconds": 0.951,
+      "seconds": 1.0,
       "exit": 0
     },
     {
       "check": "workspace-final",
-      "seconds": 285.44,
+      "seconds": 280.0,
       "exit": 0
     }
   ],

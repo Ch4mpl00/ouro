@@ -1,4 +1,38 @@
-# Contract checking — 2026-10-24, the mock rule (#13)
+# Contract checking — 2026-10-24, the breaker reports (#10)
+
+Decision 5 and the epoch rule of decision 3 were revised: a tripped breaker
+records its report and commits a notice, never rolls back, and refuses every
+new admission of its definition (children included); only an activation
+starts an epoch or clears a trip. Rerun after rebasing onto the jump budget
+(#8) and the mock rule (#13), same environment as below. Quick checks only:
+
+| Check | Scope | Result | Time |
+| --- | --- | --- | --- |
+| Typecheck | all five modules | Pass | under 7 s each |
+| Witnesses | 31 histories (`noRollbackTest` and `reactivationTest` replace `rollbackTest`) | Pass | 8 s |
+| Simulation | 10,000 × 150 steps, seed 20261023, invariant `checked` | No violation | 168 s |
+| Concurrent table | 8 batches, every order | Computed | 4 s |
+| Safety mutants | 33 scripted witnesses (V1's text adapted) | All targets detected, same footprints | 133 s |
+| Fault rows | 11 switches × 1,000 × 150 steps | No violation | 217 s |
+| Fault detection | 11 rows | All detected, same footprints | 43 s |
+| Serial and concurrent MBT | memory and SQLite, 100 × 150 + `bridgeSuite`, 12 rounds × 8 batches | Pass | 42 s |
+| fmt, Clippy, `OURO_REQUIRE_QUINT=1 cargo test --workspace --no-fail-fast`, restart example | Postgres conformance and scalability on testcontainers | Pass | 1 s, 1 s, 280 s, 8 s |
+
+Not run: the Postgres MBT bridges (no `TEST_DATABASE_URL`), Apalache and
+TLC; `contract_progress.qnt` is unchanged.
+
+Model changes: the catalog lost `previous` and `fallback` and gained `notices`
+(the epochs of committed trip notices). A trip freezes the count at the
+threshold, disarms the schedule and appends its epoch; a tripped breaker
+ignores later observations and admits nothing (a child included). V1 forbids
+any change of the active version but by activation, T2 any change of the
+epoch but by activation; V2 checks the frozen trip, its single notice, that
+nothing is admitted while tripped and that only an activation clears it. With
+two runs the model cannot trip and then start a child, so child refusal is
+evidenced by conformance and the runtime tests, not a witness. No
+implementation bug was found by the bridges.
+
+## Contract checking — 2026-10-24, the mock rule (#13)
 
 The engine no longer classifies calls as reads or writes. In `contract.qnt`
 `writes(i)` became `mocked(i)`, the dry-run host's mock rule (it still marks
