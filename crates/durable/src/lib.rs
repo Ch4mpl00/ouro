@@ -478,11 +478,11 @@ pub trait RunStore: Send + Sync {
     fn triggers_for(&self, _type_: &str, _limit: usize) -> anyhow::Result<Vec<(String, Trigger)>> {
         anyhow::bail!("this store does not support triggers")
     }
-    /// The claim-once primitive (`Firing`).
     /// The single buffered admission of a trigger, pinned when queued.
     fn queued(&self, _key: &str) -> anyhow::Result<Option<Admission>> {
         Ok(None)
     }
+    /// The claim-once primitive (`Firing`).
     fn fire(&self, _firing: &Firing<'_>, _now_ms: i64) -> anyhow::Result<Fired> {
         anyhow::bail!("this store does not support triggers")
     }

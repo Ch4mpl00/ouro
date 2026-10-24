@@ -459,7 +459,10 @@ module contract {
       d.faults == faults and d.tripped == (faults >= 2) and d.armed == (c.armed and faults < 2) and
         d.notices == (if (faults >= 2) c.notices.append(c.epoch) else c.notices)
     } else if (not(terminalObservation)) d.notices == c.notices
-      else if (execution.epoch != c.epoch or c.tripped) c == d
+      else if (execution.epoch != c.epoch or c.tripped)
+        (if (c.queued >= 0 and d.queued < 0 and a.db.admissions != b.db.admissions)
+          d == { ...c,queued:-1,queueSlot:-1,running:c.queued } else c == d)
+
       else if (qualifying and c.faults == 1) d.faults == 2 and d.tripped and d.due == -1 and not(d.armed) and
         d.notices == c.notices.append(c.epoch)
       else d.faults == (if (qualifying) c.faults+1 else if (execution.outcome == 1) 0 else c.faults) and

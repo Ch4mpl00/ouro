@@ -161,11 +161,15 @@ module contract_witnesses {
   run queueCrashTest = queueCrash.expect(checked and m.db.admissions == [1,1,0] and m.db.runs.nth(1).input == 7)
   action replaceCrash = policyCrash(3)
   run replaceCrashTest = replaceCrash.expect(checked and m.db.runs.nth(0).outcome == 5 and live(m.db.runs.nth(1)))
+  action oldCompletionPromotes = init.then(execute("policy",0,0,1,2,0)).then(ticks(2)).then(do("fire"))
+    .then(do("activate")).then(ticks(2)).then(execute("fire",1,0,0,7,0)).then(do("claim")).then(do("finish"))
+  run oldCompletionPromotesTest = oldCompletionPromotes.expect(checked and m.db.admissions == [1,1,0] and
+    m.db.runs.nth(0).epoch == 1 and m.db.runs.nth(1).epoch == 2 and m.db.catalog.faults == 0)
   // Every history above in one trace (each starts with init), replayed
   // against the stores by crates/durable/tests/quint.rs.
   run bridgeSuite = continuation.then(unknown).then(mailbox).then(expiry).then(child).then(childFinish).then(grandchild).then(activation)
     .then(deadline).then(compatibility).then(dry).then(replay).then(schedule).then(breaker).then(rearm)
     .then(noCatchup).then(overlap).then(ingress).then(ingressExpiry).then(redispatch).then(protectedUnknown)
     .then(notExecuted).then(errorResponse).then(conflict).then(release).then(staleFence).then(admission)
-    .then(successResetsBreaker).then(noRollback).then(reactivation).then(broadcast).then(retention).then(budget).then(skipPolicy).then(allowPolicy).then(queuePolicy).then(replacePolicy).then(ceilingPolicy).then(skipCrash).then(allowCrash).then(queueCrash).then(replaceCrash).then(refused)
+    .then(successResetsBreaker).then(noRollback).then(reactivation).then(broadcast).then(retention).then(budget).then(skipPolicy).then(allowPolicy).then(queuePolicy).then(replacePolicy).then(ceilingPolicy).then(skipCrash).then(allowCrash).then(queueCrash).then(replaceCrash).then(refused).then(oldCompletionPromotes)
 }
