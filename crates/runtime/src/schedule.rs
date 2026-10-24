@@ -35,7 +35,10 @@
 //! calls is not registered, or it no longer validates) is a per-definition
 //! outcome, never an error of the scheduler: the firing consumes the slot
 //! and records the run as ended faulted at its admission, which counts
-//! toward the definition's breaker (`ouro_durable::Firing::refused`).
+//! toward the definition's breaker (`ouro_durable::Firing::refused`). Only
+//! such deterministic refusals do: an admission interrupted by the host (its
+//! schema resolver failing, `ResourceUnavailable`) keeps the slot in the
+//! trigger, uncounted, and retries it after a capped backoff.
 //!
 //! `on` keeps the events matched so far in its trigger's state and replays
 //! them through the same consumer a `listen` uses (`owf::events`), so `all`,
@@ -44,7 +47,11 @@
 //! that wants it, under a tombstone with its own lifetime: one event starts
 //! at most one run. CHOICE: no listener run is involved (an earlier version
 //! kept one per schedule): a run exists only once its events have arrived.
-use crate::{Runtime, execution::Admitter, telemetry};
+use crate::{
+    Runtime,
+    execution::{Admitter, ResourceUnavailable},
+    telemetry,
+};
 use opentelemetry::KeyValue;
 use ouro_durable::{
     Admission, Arming, DefinitionTripped, Definitions, Fired, Firing, Rearm, Refused, RunStore, Trigger,
@@ -65,6 +72,10 @@ const BATCH: usize = 256;
 
 /// How many skipped slots a trigger keeps in its state.
 const SKIPS_KEPT: usize = 16;
+
+/// The trigger state of a slot whose admission was interrupted, waiting for
+/// its retry: `{ slot, failures, error }`.
+const RETRY: &str = "retry";
 
 fn key(name: &str, kind: &str) -> String {
     format!("{name}#{kind}")
@@ -226,8 +237,13 @@ impl Runtime {
     /// after `Config::breaker_threshold` slots, which removes its schedule
     /// and stores the trip's notice. CHOICE: consumed, not retried at the
     /// next tick: a retry would refire the same slot on every tick, and a
-    /// consumed slot is never lost silently, it holds its failed run. Only
-    /// storage errors are returned.
+    /// consumed slot is never lost silently, it holds its failed run.
+    ///
+    /// An admission the host interrupts (its schema resolver fails,
+    /// `ResourceUnavailable`) is no property of the definition (decision 5):
+    /// the slot is neither consumed nor counted; the trigger keeps it and is
+    /// due again after a capped backoff (`interrupted`). Only storage errors
+    /// are returned.
     pub fn fire_due(&self) -> anyhow::Result<Vec<String>> {
         let now = self.clock.now_ms();
         let mut started = Vec::new();
@@ -238,15 +254,21 @@ impl Runtime {
     }
 
     fn fire(&self, k: &str, t: &Trigger, now: i64) -> anyhow::Result<Option<String>> {
-        let (Some(name), Some(kind), Some(slot)) = (t.state["name"].as_str(), t.state["kind"].as_str(), t.at_ms) else {
+        // A slot whose admission was interrupted keeps its identity while
+        // its trigger waits for the retry (`retry`).
+        let slot = t.state[RETRY]["slot"].as_i64().or(t.at_ms);
+        let (Some(name), Some(kind), Some(slot)) = (t.state["name"].as_str(), t.state["kind"].as_str(), slot) else {
             anyhow::bail!("trigger {k} is not a schedule's");
         };
         let definitions = self.store.definitions(name)?;
         // Replaced by a newer epoch since it was read: its swap would fail.
         let Some(schedule) = active(&definitions)?.filter(|_| current(&definitions, t)) else { return Ok(None) };
         let mut next = t.clone();
+        if let Value::Object(state) = &mut next.state {
+            state.remove(RETRY);
+        }
         let mut rearm = None;
-        let mut busy = t.clone();
+        let mut busy = next.clone();
         let id = match kind {
             "every" | "cron" => {
                 let Some(following) = next_slot(&schedule, kind, slot)? else { return Ok(None) };
@@ -274,7 +296,12 @@ impl Runtime {
             _ => return Ok(None),
         };
         let busy = skipped(busy, slot, "overlap");
-        let Some(admission) = triggered(&self.admitter(), &id, name, json!({}))? else { return Ok(None) };
+        let admission = match triggered(&self.admitter(), &id, name, json!({})) {
+            Ok(Some(admission)) => admission,
+            Ok(None) => return Ok(None),
+            Err(e) if e.is::<ResourceUnavailable>() => return self.interrupted(k, t, slot, &e, now),
+            Err(e) => return Err(e),
+        };
         let refused = admission.as_ref().err();
         if refused.is_some()
             && let Some(rearm) = &rearm
@@ -305,6 +332,40 @@ impl Runtime {
             }
             Fired::Changed | Fired::Ingested => Ok(None),
         }
+    }
+
+    /// The admission of `t`'s slot was interrupted (`ResourceUnavailable`):
+    /// an infrastructure failure, not the definition's. The slot is neither
+    /// consumed nor counted toward the breaker: the trigger keeps it
+    /// (`retry`: the slot and the failures so far) and is due again after a
+    /// capped backoff, 1 s doubling to five minutes, kept with the trigger
+    /// so a restart does not shorten it and a waiting retry never holds the
+    /// head of the due index. The worker goes on with the other triggers.
+    fn interrupted(
+        &self,
+        k: &str,
+        t: &Trigger,
+        slot: i64,
+        e: &anyhow::Error,
+        now: i64,
+    ) -> anyhow::Result<Option<String>> {
+        let failures = t.state[RETRY]["failures"].as_u64().unwrap_or(0).saturating_add(1);
+        let mut retried = t.clone();
+        retried.at_ms = Some(retry_at(now, u32::try_from(failures).unwrap_or(u32::MAX)));
+        retried.state[RETRY] = json!({ "slot": slot, "failures": failures, "error": e.to_string() });
+        self.store.fire(&Firing { key: k, expected: Some(t), next: Some(&retried), ..Firing::default() }, now)?;
+        telemetry::mark(
+            &self.tracer,
+            "schedule interrupted",
+            vec![
+                KeyValue::new("ouro.definition.name", t.state["name"].as_str().unwrap_or_default().to_string()),
+                KeyValue::new("ouro.schedule.kind", t.state["kind"].as_str().unwrap_or_default().to_string()),
+                KeyValue::new("ouro.schedule.slot", slot),
+                KeyValue::new("ouro.schedule.failures", i64::try_from(failures).unwrap_or(i64::MAX)),
+                KeyValue::new("ouro.schedule.failure", e.to_string()),
+            ],
+        );
+        Ok(None)
     }
 
     fn refused(&self, name: &str, kind: &str, run: &str, error: &WorkflowError) {
@@ -341,8 +402,11 @@ impl Runtime {
     /// run listening for it and to the event-triggered schedules it may
     /// start. `specversion` and `time` are filled in when absent.
     /// Publishing the same `source` + `id` again delivers nothing new and
-    /// starts nothing; another payload under it is an error. Returns the
-    /// runs it reached or started.
+    /// starts nothing; another payload under it is an error. An `on`
+    /// schedule the host refuses records a failed run (as `fire_due`); one
+    /// whose admission it interrupts (`ResourceUnavailable`) does not take the
+    /// event and the error is returned: publishing it again later is safe.
+    /// Returns the runs it reached or started.
     pub fn publish(&self, mut event: Value) -> anyhow::Result<Vec<String>> {
         let now = self.clock.now_ms();
         complete(&mut event, now)?;
@@ -529,7 +593,24 @@ impl Runtime {
             if self.notice_backoff.lock().unwrap().get(&k).is_some_and(|(_, at)| *at > now) {
                 continue;
             }
-            publish(&*self.store, &self.admitter(), &event, now)?;
+            let failed = |k: String, e: &dyn std::fmt::Display| {
+                let mut backoff = self.notice_backoff.lock().unwrap();
+                let failures = backoff.get(&k).map_or(0, |(n, _)| *n).saturating_add(1);
+                backoff.insert(k, (failures, retry_at(self.clock.now_ms(), failures)));
+                drop(backoff);
+                self.noticed(&event, Some(&e.to_string()));
+            };
+            // An `on` schedule whose admission was interrupted (its schema
+            // resolver failed) leaves the notice for a later hand-off, like a
+            // sink failure; a publish repeated under the same identity
+            // delivers nothing twice.
+            match publish(&*self.store, &self.admitter(), &event, now) {
+                Err(e) if e.is::<ResourceUnavailable>() => {
+                    failed(k, &e);
+                    continue;
+                }
+                result => result?,
+            };
             if let Some(sink) = &self.capabilities.sink {
                 let sent = tokio::select! {
                     biased;
@@ -537,11 +618,7 @@ impl Runtime {
                     sent = sink.emit(&event) => sent,
                 };
                 if let Err(e) = sent {
-                    let mut backoff = self.notice_backoff.lock().unwrap();
-                    let failures = backoff.get(&k).map_or(0, |(n, _)| *n).saturating_add(1);
-                    backoff.insert(k, (failures, retry_at(self.clock.now_ms(), failures)));
-                    drop(backoff);
-                    self.noticed(&event, Some(&e.to_string()));
+                    failed(k, &e);
                     continue;
                 }
             }

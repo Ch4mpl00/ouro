@@ -557,7 +557,8 @@ pub(crate) struct Admitter {
 
 /// A definition this host cannot admit a run of because it no longer
 /// validates against the host (its registry, capabilities, ceilings or
-/// external schemas): `start` returns it, a trigger records it (`Refused`).
+/// resolved external schemas): `start` returns it, a trigger records it
+/// (`Refused`).
 /// It reads as the validation error it wraps.
 #[derive(Debug)]
 pub struct InvalidDefinition(pub anyhow::Error);
@@ -578,10 +579,30 @@ impl std::error::Error for InvalidDefinition {
     }
 }
 
+/// The host's resource resolver failed to resolve an external schema
+/// (`schema.resource`) now: an infrastructure interruption, never a property
+/// of the definition. `start` returns it; a trigger neither consumes its
+/// slot nor counts it toward the breaker, and tries the slot again after a
+/// backoff. (A resolved document that is not a JSON Schema, or no resolver
+/// at all, is the definition failing validation on this host:
+/// `InvalidDefinition`.)
+#[derive(Debug)]
+pub struct ResourceUnavailable {
+    pub uri: String,
+    pub error: String,
+}
+impl std::fmt::Display for ResourceUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "schema {}: {}", self.uri, self.error)
+    }
+}
+impl std::error::Error for ResourceUnavailable {}
+
 /// Why this host refuses to admit a run of a definition, as the fault a
 /// trigger records: a function it calls is not registered, or it does not
-/// validate. `None` for every other error (storage, a tripped definition),
-/// which the caller handles as before.
+/// validate. Deterministic only: `None` for every other error (storage, a
+/// tripped definition, `ResourceUnavailable`), which the caller handles as
+/// an interruption.
 pub(crate) fn refusal(e: &anyhow::Error) -> Option<WorkflowError> {
     if let Some(missing) = e.downcast_ref::<MissingFunction>() {
         return Some(missing.error());
@@ -639,7 +660,9 @@ impl Admitter {
                 .resources
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("no resource resolver for {uri}"))?;
-            let document = resolver.resolve(&uri).map_err(|e| anyhow::anyhow!("schema {uri}: {e}"))?;
+            let document = resolver
+                .resolve(&uri)
+                .map_err(|e| anyhow::Error::new(ResourceUnavailable { uri: uri.clone(), error: format!("{e:#}") }))?;
             jsonschema::validator_for(&document)
                 .map_err(|e| anyhow::anyhow!("schema {uri} is not a JSON Schema: {e}"))?;
             out.insert(uri, document);
@@ -672,7 +695,9 @@ impl Admitter {
     /// (`InvalidDefinition`) and bound.
     pub fn of(&self, id: &str, d: &Definition, input: Value, lineage: &Lineage) -> anyhow::Result<Admission> {
         self.check(&d.name, d.version, &d.yaml)?;
-        let invalid = |e: anyhow::Error| anyhow::Error::new(InvalidDefinition(e));
+        // A resolver that fails now is no property of the definition.
+        let invalid =
+            |e: anyhow::Error| if e.is::<ResourceUnavailable>() { e } else { anyhow::Error::new(InvalidDefinition(e)) };
         let wf = self.validate(&d.yaml).map_err(invalid)?;
         let schemas = self.schemas(&wf).map_err(invalid)?;
         Ok(self.admission(id, d, input, lineage, Some((self.registry.bindings(&wf), schemas))))

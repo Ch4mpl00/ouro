@@ -1082,3 +1082,103 @@ async fn invalid_definitions_and_event_schedules_are_refused_per_definition() {
     assert!(lowered.publish(order).unwrap().is_empty());
     assert_eq!(lowered.list(Some("orders"), "").unwrap().len(), 1, "one event starts at most one run");
 }
+
+/// A schema resolver that fails is an interruption of the host, not a fault
+/// of the definition: the slot is neither consumed nor counted toward the
+/// breaker; its trigger keeps it and retries after a capped backoff, stored
+/// with the trigger, while the other schedules go on. Once the resolver
+/// answers, the kept slot runs.
+#[tokio::test]
+async fn a_failing_schema_resolver_retries_the_slot_without_consuming_or_counting_it() {
+    struct Flaky(std::sync::atomic::AtomicBool);
+    impl ouro_runtime::ResourceResolver for Flaky {
+        fn resolve(&self, uri: &str) -> anyhow::Result<Value> {
+            anyhow::ensure!(self.0.load(Ordering::SeqCst), "{uri} unreachable");
+            Ok(json!({ "type": "object" }))
+        }
+    }
+    let store: Arc<dyn RunStore> = Arc::new(durable::memory::memory());
+    let time = Arc::new(Time::default());
+    let resolver = Arc::new(Flaky(std::sync::atomic::AtomicBool::new(true)));
+    let open = || runtime(store.clone(), Registry::new(), time.clone()).with_resources(resolver.clone());
+    let rt = open();
+    let typed = "input: { schema: { format: json, resource: { endpoint: 'https://schemas.test/in.json' } } }\n";
+    for (name, schedule, extra) in [
+        ("typed", "every: PT1S", typed),
+        ("healthy", "every: PT1S", ""),
+        ("orders", "on: { one: { with: { type: order } } }", typed),
+    ] {
+        let definition = yaml("  - ok: { set: { ok: true } }")
+            .replace("name: workflow", &format!("name: {name}"))
+            .replace("\ndo:", &format!("\nschedule: {{ {schedule} }}\n{extra}do:"));
+        let d = rt.save(name, &definition).unwrap();
+        rt.activate(name, d.version).unwrap();
+    }
+    resolver.0.store(false, Ordering::SeqCst);
+    let stop = CancellationToken::new();
+    let tick = |rt: &Runtime, at: i64| {
+        time.0.store(at, Ordering::SeqCst);
+        rt.fire_due().expect("an interrupted admission does not stop the scheduler")
+    };
+    let retry = |rt: &Runtime| {
+        let (_, t) = rt.triggers("typed").unwrap().remove(0);
+        (t.at_ms, t.state["retry"]["slot"].as_i64(), t.state["retry"]["failures"].as_u64())
+    };
+    // Due at 1, 2, 4 s: 1 s doubling, the slot kept, nothing recorded or counted.
+    for (at, next, failures) in [(1000, 2000, 1), (2000, 4000, 2), (4000, 8000, 3)] {
+        for id in tick(&rt, at) {
+            assert!(id.starts_with("schedule:healthy:"), "{id}");
+            rt.drive(&id, &stop).await.unwrap();
+        }
+        assert_eq!(retry(&rt), (Some(next), Some(1000), Some(failures)));
+    }
+    assert!(rt.list(Some("typed"), "").unwrap().is_empty(), "the slot is not consumed");
+    let d = rt.definitions("typed").unwrap();
+    assert_eq!((d.consecutive_faults, d.tripped), (0, None), "past the threshold of 3, still not counted");
+    assert_eq!(rt.list(Some("healthy"), "").unwrap().len(), 3, "the others went on");
+    // An `on` schedule: the event is not taken, the publisher hears why.
+    let order = json!({ "id": "1", "source": "/shop", "type": "order" });
+    let e = rt.publish(order.clone()).unwrap_err();
+    assert!(e.is::<ouro_runtime::ResourceUnavailable>(), "{e:#}");
+    assert!(rt.list(Some("orders"), "").unwrap().is_empty());
+    assert_eq!(rt.definitions("orders").unwrap().consecutive_faults, 0);
+    // The backoff is stored with the trigger: a restart does not shorten it.
+    drop(rt);
+    let rt = open();
+    tick(&rt, 5000);
+    assert_eq!(retry(&rt).0, Some(8000));
+    // The resolver answers again: the kept slot runs, late, once.
+    resolver.0.store(true, Ordering::SeqCst);
+    assert!(tick(&rt, 8000).contains(&"schedule:typed:every:1000".to_string()));
+    assert_eq!(retry(&rt), (Some(9000), None, None));
+    assert_eq!(
+        rt.drive("schedule:typed:every:1000", &stop).await.unwrap(),
+        Some(Status::Completed(json!({ "ok": true })))
+    );
+    assert_eq!(rt.publish(order).unwrap().len(), 1, "republished, the event starts its run");
+    // The worker's hand-off of a trip notice to such an `on` schedule keeps
+    // the notice, after its backoff, until the resolver answers.
+    let watch = yaml("  - ok: { set: { ok: true } }").replace("name: workflow", "name: watch").replace(
+        "\ndo:",
+        &format!("\nschedule: {{ on: {{ one: {{ with: {{ type: ouro.definition.tripped }} }} }} }}\n{typed}do:"),
+    );
+    let d = rt.save("watch", &watch).unwrap();
+    rt.activate("watch", d.version).unwrap();
+    let boom = yaml("  - boom: { raise: { error: { type: 'urn:test:boom', status: 500 } } }")
+        .replace("name: workflow", "name: boom");
+    let d = rt.save("boom", &boom).unwrap();
+    rt.activate("boom", d.version).unwrap();
+    for n in 0..3 {
+        rt.start(&format!("boom{n}"), "boom", json!({})).unwrap();
+        rt.drive(&format!("boom{n}"), &stop).await.unwrap();
+    }
+    assert!(rt.definitions("boom").unwrap().tripped.is_some());
+    resolver.0.store(false, Ordering::SeqCst);
+    assert_eq!(rt.notify(&stop).await.unwrap(), 0, "kept");
+    assert!(rt.list(Some("watch"), "").unwrap().is_empty());
+    resolver.0.store(true, Ordering::SeqCst);
+    assert_eq!(rt.notify(&stop).await.unwrap(), 0, "still backing off");
+    time.0.store(9000, Ordering::SeqCst);
+    assert_eq!(rt.notify(&stop).await.unwrap(), 1);
+    assert_eq!(rt.list(Some("watch"), "").unwrap().len(), 1);
+}

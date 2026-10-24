@@ -297,7 +297,9 @@ pub struct Firing<'a> {
 /// calls is no longer registered, or the definition no longer validates
 /// against the host. Recorded with the slot (`Firing::refused`) so a broken
 /// definition is a per-definition outcome, visible in the runs API and
-/// counted by its breaker, never an error that stops the scheduler.
+/// counted by its breaker, never an error that stops the scheduler. Only a
+/// deterministic refusal belongs here: an admission interrupted by the
+/// host's infrastructure is no fault of the definition and consumes nothing.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Refused {
     /// The run as far as the host could build its admission: the slot's id,
