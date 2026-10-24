@@ -1055,25 +1055,26 @@ struct ReplayJournal {
     budgets: Arc<BTreeMap<String, bool>>,
     first: Option<String>,
 }
+#[async_trait]
 impl owf::durable::Journal for ReplayJournal {
-    fn load(&self) -> anyhow::Result<BTreeMap<String, owf::durable::Record>> {
-        self.lease.load()
+    async fn load(&self) -> anyhow::Result<BTreeMap<String, owf::durable::Record>> {
+        self.lease.load().await
     }
-    fn save(&self, key: &str, record: &owf::durable::Record) -> anyhow::Result<()> {
-        self.lease.save(key, record)
+    async fn save(&self, key: &str, record: &owf::durable::Record) -> anyhow::Result<()> {
+        self.lease.save(key, record).await
     }
-    fn spend(&self, key: &str, limit: u64) -> anyhow::Result<Option<owf::durable::Record>> {
+    async fn spend(&self, key: &str, limit: u64) -> anyhow::Result<Option<owf::durable::Record>> {
         let limit = match self.budgets.get(key) {
             Some(true) => u64::MAX,
             Some(false) => {
                 if let Some(first) = self.first.as_deref().filter(|first| *first != key) {
-                    self.lease.spend(first, 0)?;
+                    self.lease.spend(first, 0).await?;
                 }
                 0
             }
             None => limit,
         };
-        self.lease.spend(key, limit)
+        self.lease.spend(key, limit).await
     }
 }
 
@@ -1081,24 +1082,25 @@ impl owf::durable::Journal for ReplayJournal {
 fn child_id(run_id: &str, key: &str) -> String {
     format!("child:{}", serde_json::to_string(&(run_id, key)).expect("string tuple serializes"))
 }
+#[async_trait]
 impl run::Events for ExecutionFunctions {
-    fn waiting(&self, id: &str, key: &str, wait: &owf::events::PendingWait) -> anyhow::Result<()> {
-        run::Events::waiting(&*self.lease, id, key, wait)
+    async fn waiting(&self, id: &str, key: &str, wait: &owf::events::PendingWait) -> anyhow::Result<()> {
+        run::Events::waiting(&*self.lease, id, key, wait).await
     }
 
-    fn register(&self, id: &str, types: &[String]) -> anyhow::Result<()> {
-        run::Events::register(&*self.lease, id, types)
+    async fn register(&self, id: &str, types: &[String]) -> anyhow::Result<()> {
+        run::Events::register(&*self.lease, id, types).await
     }
-    fn unregister(&self, id: &str, key: &str, types: &[String]) -> anyhow::Result<()> {
-        run::Events::unregister(&*self.lease, id, key, types)
+    async fn unregister(&self, id: &str, key: &str, types: &[String]) -> anyhow::Result<()> {
+        run::Events::unregister(&*self.lease, id, key, types).await
     }
-    fn subscribe(&self, id: &str, key: &str, types: &[String]) -> anyhow::Result<()> {
-        run::Events::subscribe(&*self.lease, id, key, types)
+    async fn subscribe(&self, id: &str, key: &str, types: &[String]) -> anyhow::Result<()> {
+        run::Events::subscribe(&*self.lease, id, key, types).await
     }
-    fn unsubscribe(&self, id: &str, key: &str) -> anyhow::Result<()> {
-        run::Events::unsubscribe(&*self.lease, id, key)
+    async fn unsubscribe(&self, id: &str, key: &str) -> anyhow::Result<()> {
+        run::Events::unsubscribe(&*self.lease, id, key).await
     }
-    fn take(&self, id: &str, key: &str, types: &[String]) -> anyhow::Result<Option<Value>> {
+    async fn take(&self, id: &str, key: &str, types: &[String]) -> anyhow::Result<Option<Value>> {
         if let Mode::Replay { events, .. } = &self.mode
             && let Some(event) = events.get(key)
         {
@@ -1107,14 +1109,15 @@ impl run::Events for ExecutionFunctions {
             let delivered_at = chrono::DateTime::parse_from_rfc3339(time)?.timestamp_millis();
             self.lease.store.publish(event, Some(id), delivered_at)?;
         }
-        run::Events::take(&*self.lease, id, key, types)
+        run::Events::take(&*self.lease, id, key, types).await
     }
     fn notification(&self, id: &str) -> BoxFuture<'_, ()> {
         run::Events::notification(&*self.lease, id)
     }
 }
+#[async_trait]
 impl run::Children for ExecutionFunctions {
-    fn start(
+    async fn start(
         &self,
         run_id: &str,
         key: &str,

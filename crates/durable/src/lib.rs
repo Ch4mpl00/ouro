@@ -648,48 +648,50 @@ impl Clock for SystemClock {
     }
 }
 
-/// Binds an executor's fence to the interpreter's synchronous seams. Dropping
-/// it does not mutate storage; the owner releases on shutdown, and crashes
-/// recover after lease expiry. This works with asynchronous database clients.
+/// Binds an executor's fence to the interpreter's `Journal` and `Events`
+/// seams. Dropping it does not mutate storage; the owner releases on
+/// shutdown, and crashes recover after lease expiry.
 pub struct Lease {
     pub store: Arc<dyn RunStore>,
     pub fence: Fence,
     pub clock: Arc<dyn Clock>,
 }
+#[async_trait::async_trait]
 impl Journal for Lease {
-    fn load(&self) -> anyhow::Result<BTreeMap<String, Record>> {
+    async fn load(&self) -> anyhow::Result<BTreeMap<String, Record>> {
         self.store.load_records(&self.fence, self.clock.now_ms())
     }
-    fn save(&self, key: &str, record: &Record) -> anyhow::Result<()> {
+    async fn save(&self, key: &str, record: &Record) -> anyhow::Result<()> {
         self.store.save_record(&self.fence, key, record, self.clock.now_ms())
     }
-    fn spend(&self, key: &str, limit: u64) -> anyhow::Result<Option<Record>> {
+    async fn spend(&self, key: &str, limit: u64) -> anyhow::Result<Option<Record>> {
         self.store.spend(&self.fence, key, limit, self.clock.now_ms()).map(Some)
     }
 }
+#[async_trait::async_trait]
 impl Events for Lease {
-    fn waiting(&self, run_id: &str, key: &str, wait: &owf::events::PendingWait) -> anyhow::Result<()> {
+    async fn waiting(&self, run_id: &str, key: &str, wait: &owf::events::PendingWait) -> anyhow::Result<()> {
         anyhow::ensure!(run_id == self.fence.run_id, "event run does not own this lease");
         self.store.describe_wait(&self.fence, key, wait, self.clock.now_ms())
     }
 
-    fn register(&self, run_id: &str, types: &[String]) -> anyhow::Result<()> {
+    async fn register(&self, run_id: &str, types: &[String]) -> anyhow::Result<()> {
         anyhow::ensure!(run_id == self.fence.run_id, "event run does not own this lease");
         self.store.register_wait(&self.fence, types, self.clock.now_ms())
     }
-    fn unregister(&self, run_id: &str, key: &str, types: &[String]) -> anyhow::Result<()> {
+    async fn unregister(&self, run_id: &str, key: &str, types: &[String]) -> anyhow::Result<()> {
         anyhow::ensure!(run_id == self.fence.run_id, "event run does not own this lease");
         self.store.unregister_wait(&self.fence, key, types, self.clock.now_ms())
     }
-    fn subscribe(&self, run_id: &str, key: &str, types: &[String]) -> anyhow::Result<()> {
+    async fn subscribe(&self, run_id: &str, key: &str, types: &[String]) -> anyhow::Result<()> {
         anyhow::ensure!(run_id == self.fence.run_id, "event run does not own this lease");
         self.store.subscribe(&self.fence, key, types, self.clock.now_ms())
     }
-    fn unsubscribe(&self, run_id: &str, key: &str) -> anyhow::Result<()> {
+    async fn unsubscribe(&self, run_id: &str, key: &str) -> anyhow::Result<()> {
         anyhow::ensure!(run_id == self.fence.run_id, "event run does not own this lease");
         self.store.unsubscribe(&self.fence, key, self.clock.now_ms())
     }
-    fn take(&self, run_id: &str, key: &str, types: &[String]) -> anyhow::Result<Option<Value>> {
+    async fn take(&self, run_id: &str, key: &str, types: &[String]) -> anyhow::Result<Option<Value>> {
         anyhow::ensure!(run_id == self.fence.run_id, "event run does not own this lease");
         self.store.take_event(&self.fence, key, types, self.clock.now_ms())
     }

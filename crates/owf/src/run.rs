@@ -226,19 +226,21 @@ impl Drop for DeadlineGuard<'_> {
 /// executor just like Journal::save. Repeating a take returns the saved event.
 /// Registration is idempotent, including registration before a question is sent.
 /// A type `*` in `take` and `subscribe` stands for every published event.
+/// Like `Journal`, a dropped call leaves its commit whole or absent.
+#[async_trait]
 pub trait Events: Send + Sync {
     /// Persist the currently unfilled listen position for external control.
-    fn waiting(&self, _run_id: &str, _key: &str, _wait: &events::PendingWait) -> anyhow::Result<()> {
+    async fn waiting(&self, _run_id: &str, _key: &str, _wait: &events::PendingWait) -> anyhow::Result<()> {
         Ok(())
     }
 
     /// Opens (idempotently) a subscription under `key` that keeps receiving
     /// published events of `types` until `unsubscribe`, across takes, so a
     /// listen consuming several events misses none in between.
-    fn subscribe(&self, run_id: &str, _key: &str, types: &[String]) -> anyhow::Result<()> {
-        self.register(run_id, types)
+    async fn subscribe(&self, run_id: &str, _key: &str, types: &[String]) -> anyhow::Result<()> {
+        self.register(run_id, types).await
     }
-    fn unsubscribe(&self, _run_id: &str, _key: &str) -> anyhow::Result<()> {
+    async fn unsubscribe(&self, _run_id: &str, _key: &str) -> anyhow::Result<()> {
         Ok(())
     }
     /// Subscribe before taking, so a delivery between take and wait is not lost.
@@ -246,14 +248,15 @@ pub trait Events: Send + Sync {
     fn notification(&self, _run_id: &str) -> BoxFuture<'_, ()> {
         Box::pin(std::future::pending())
     }
-    fn register(&self, run_id: &str, types: &[String]) -> anyhow::Result<()>;
+    async fn register(&self, run_id: &str, types: &[String]) -> anyhow::Result<()>;
     /// Close a timed-out wait. Delivered events remain available to a future
     /// matching listen, but cannot keep an unrelated wait awake.
-    fn unregister(&self, run_id: &str, key: &str, types: &[String]) -> anyhow::Result<()>;
-    fn take(&self, run_id: &str, key: &str, types: &[String]) -> anyhow::Result<Option<Value>>;
+    async fn unregister(&self, run_id: &str, key: &str, types: &[String]) -> anyhow::Result<()>;
+    async fn take(&self, run_id: &str, key: &str, types: &[String]) -> anyhow::Result<Option<Value>>;
 }
 
 /// Child runs for `run: workflow`.
+#[async_trait]
 pub trait Children: Send + Sync {
     /// Starts, or with the same `key` joins, a run of the target workflow and
     /// returns its id and the event type that carries its outcome, with
@@ -263,7 +266,7 @@ pub trait Children: Send + Sync {
     /// subscription to that event; `owned: false` starts an independent run
     /// that nothing awaits. `NotExecuted`/`Response` are catchable (no such
     /// workflow); `Interrupted`/`Unknown` stop the run recoverably.
-    fn start(
+    async fn start(
         &self,
         run_id: &str,
         key: &str,
@@ -652,7 +655,11 @@ async fn execute(
         },
         (false, None) => return interrupted("this host has no secret resolver".into()),
     };
-    let loaded = journal.map(Journal::load).transpose().map_err(|e| e.to_string()).and_then(|records| {
+    let loaded = match journal {
+        Some(journal) => journal.load().await.map(Some),
+        None => Ok(None),
+    };
+    let loaded = loaded.map_err(|e| e.to_string()).and_then(|records| {
         records
             .unwrap_or_default()
             .into_iter()
@@ -734,7 +741,7 @@ async fn execute(
         tasks_run: AtomicUsize::new(tasks),
         jumps: AtomicU64::new(jumps as u64),
         max_jumps: wf.budget.max_jumps(host.limits.max_jumps),
-        spending: Mutex::new(()),
+        spending: tokio::sync::Mutex::new(()),
         handlers: Mutex::default(),
         handler_failed: AtomicBool::new(false),
         exceeded: tokio::sync::watch::channel(None).0,
@@ -771,7 +778,8 @@ async fn execute(
                     max_tasks: host.limits.max_tasks,
                     max_attempts: host.limits.max_attempts,
                 },
-            )?;
+            )
+            .await?;
         }
         // Cancelled before anything ran: that wins over a fault the
         // workflow's own input expression would raise.
@@ -821,7 +829,7 @@ async fn execute(
         Err(Fault::Interrupted(e)) => Status::Interrupted(e),
     };
     if matches!(status, Status::Completed(_) | Status::Faulted(_) | Status::Cancelled)
-        && let Err(Fault::Interrupted(error)) = run.save("finished", Record::Finished { status: status.clone() })
+        && let Err(Fault::Interrupted(error)) = run.save("finished", Record::Finished { status: status.clone() }).await
     {
         status = Status::Interrupted(error);
     }
@@ -845,7 +853,7 @@ struct Run<'a> {
     max_jumps: u64,
     /// Serializes this run's own decisions when its journal keeps no shared
     /// budget, so concurrent branches cannot both take the last unit.
-    spending: Mutex<()>,
+    spending: tokio::sync::Mutex<()>,
     /// The `on_exceeded` handlers running now, by reference prefix, and the
     /// tasks each has entered.
     handlers: Mutex<Vec<(String, usize)>>,
@@ -876,7 +884,7 @@ impl Run<'_> {
         self.records.lock().unwrap_or_else(|e| e.into_inner()).get(key).cloned()
     }
 
-    fn save(&self, key: &str, record: Record) -> Result<(), Fault> {
+    async fn save(&self, key: &str, record: Record) -> Result<(), Fault> {
         if self.journal.is_none() {
             self.note(key, &record);
         }
@@ -885,7 +893,7 @@ impl Run<'_> {
                 durable::check_transition(&old, &record)
                     .map_err(|e| Fault::Interrupted(WorkflowError::runtime(e.to_string())))?;
             }
-            journal.save(key, &self.secrets.record(&record)).map_err(|e| {
+            journal.save(key, &self.secrets.record(&record)).await.map_err(|e| {
                 Fault::Interrupted(WorkflowError::runtime(format!(
                     "checkpoint {key}: {}",
                     self.secrets.text(&e.to_string())
@@ -1146,7 +1154,7 @@ impl Run<'_> {
     /// the run tree's budget under `<reference>#jump` (or restoring the
     /// decision saved there). `Some(first)`: the budget is spent, and `first`
     /// is the key of the run's first refusal, the one that acts on it.
-    fn jump(&self, reference: &str) -> Result<Option<String>, Fault> {
+    async fn jump(&self, reference: &str) -> Result<Option<String>, Fault> {
         if self.handler(reference, false).is_some() {
             return Err(Fault::Fatal(WorkflowError {
                 instance: Some(reference.into()),
@@ -1163,9 +1171,9 @@ impl Run<'_> {
         if let Some(saved) = self.record(&key) {
             return refused(&saved);
         }
-        let _one = self.spending.lock().unwrap_or_else(|e| e.into_inner());
+        let _one = self.spending.lock().await;
         let shared = match self.journal {
-            Some(journal) => journal.spend(&key, self.max_jumps).map_err(|e| {
+            Some(journal) => journal.spend(&key, self.max_jumps).await.map_err(|e| {
                 Fault::Interrupted(WorkflowError::runtime(format!(
                     "spending {key}: {}",
                     self.secrets.text(&e.to_string())
@@ -1196,7 +1204,7 @@ impl Run<'_> {
                         .unwrap_or_else(|| key.clone())
                 });
                 let record = Record::Budget { granted: taken, spent: spent + u64::from(taken), first: first.clone() };
-                self.save(&key, record)?;
+                self.save(&key, record).await?;
                 first
             }
         };
@@ -1375,7 +1383,7 @@ impl Run<'_> {
                 Some(Record::Task { started_ms, .. }) => started_ms,
                 _ => self.host.clock.now().timestamp_millis(),
             };
-            self.save(&key, Record::Task { started_ms, result: None })?;
+            self.save(&key, Record::Task { started_ms, result: None }).await?;
             let mut span = TaskSpan { observer: self.host.observer.as_ref(), reference, active: false };
             let result = self.steps(task, name, reference, parent, raw, ctx, scope, started_ms, &mut span).await;
             if let Err(Fault::Waiting(wake_at_ms)) = &result {
@@ -1407,7 +1415,8 @@ impl Run<'_> {
                 self.save(
                     &key,
                     Record::Task { started_ms, result: Some(TaskResult { context: ctx.clone(), outcome }) },
-                )?;
+                )
+                .await?;
             }
             result
         })
@@ -1528,7 +1537,7 @@ impl Run<'_> {
         }
         let flow = flow.or_else(|| task.then.clone()).unwrap_or(Flow::Continue);
         if matches!(flow, Flow::Goto(_))
-            && let Some(first) = self.jump(reference)?
+            && let Some(first) = self.jump(reference).await?
         {
             self.exceeded(reference, &first, &out, ctx, scope).await?;
         }
@@ -1776,7 +1785,7 @@ impl Run<'_> {
             match state {
                 CallState::Done(result) => return result.clone().map_err(Fault::Error),
                 CallState::Pending if delivery == Delivery::AtMostOnce => {
-                    return self.unknown_call(&key, logical, name, args, reference);
+                    return self.unknown_call(&key, logical, name, args, reference).await;
                 }
                 _ => {}
             }
@@ -1809,7 +1818,8 @@ impl Run<'_> {
                 delivery,
                 state: CallState::Pending,
             },
-        )?;
+        )
+        .await?;
         if delivery == Delivery::AtMostOnce {
             self.protected.fetch_add(1, Ordering::SeqCst);
         }
@@ -1889,7 +1899,7 @@ impl Run<'_> {
             Err(CallFailure::NotExecuted(error)) => (CallState::NotExecuted(error.clone()), Err(Fault::Error(error))),
             Err(CallFailure::Unknown(error)) => {
                 if delivery == Delivery::AtMostOnce {
-                    return self.unknown_call(&key, logical, name, args, reference);
+                    return self.unknown_call(&key, logical, name, args, reference).await;
                 }
                 // A transient transport failure remains retryable, including after restart.
                 return Err(Fault::Error(error));
@@ -1902,12 +1912,12 @@ impl Run<'_> {
                     return Err(Fault::Cancelled);
                 }
                 if delivery == Delivery::AtMostOnce {
-                    return self.unknown_call(&key, logical, name, args, reference);
+                    return self.unknown_call(&key, logical, name, args, reference).await;
                 }
                 return Err(Fault::Interrupted(error));
             }
         };
-        self.save(&key, Record::Call { logical, function: name.into(), arguments: args, delivery, state })?;
+        self.save(&key, Record::Call { logical, function: name.into(), arguments: args, delivery, state }).await?;
         result
     }
 
@@ -1965,7 +1975,7 @@ impl Run<'_> {
 
     /// An at-most-once call that may have run: the host's marker for it,
     /// saved as its result, or a fatal fault when the host has none.
-    fn unknown_call(
+    async fn unknown_call(
         &self,
         key: &str,
         logical: String,
@@ -1988,7 +1998,8 @@ impl Run<'_> {
                 delivery: Delivery::AtMostOnce,
                 state: CallState::Done(Ok(marker.clone())),
             },
-        )?;
+        )
+        .await?;
         Ok(marker)
     }
 
@@ -2046,7 +2057,7 @@ impl Run<'_> {
         while let Some(r) = racing.next().await {
             match r {
                 Ok(v) => {
-                    self.save(&winner_key, Record::Winner { output: v.clone() })?;
+                    self.save(&winner_key, Record::Winner { output: v.clone() }).await?;
                     return Ok(v);
                 }
                 Err(Fault::Waiting(deadline)) => wake = Some(wake.map_or(deadline, |old| old.min(deadline))),
@@ -2138,9 +2149,9 @@ impl Run<'_> {
                     if !subscribed {
                         let typed: Vec<String> = routes.iter().filter(|r| *r != "*").cloned().collect();
                         if !typed.is_empty() {
-                            events.register(self.run_id, &typed).map_err(storage)?;
+                            events.register(self.run_id, &typed).await.map_err(storage)?;
                         }
-                        events.subscribe(self.run_id, reference, &routes).map_err(storage)?;
+                        events.subscribe(self.run_id, reference, &routes).await.map_err(storage)?;
                         subscribed = true;
                     }
                     let wait = events::PendingWait {
@@ -2173,7 +2184,7 @@ impl Run<'_> {
                     let mut wait: events::PendingWait =
                         serde_json::from_value(redacted.clone()).map_err(|e| storage(e.into()))?;
                     wait.redacted = raw != redacted;
-                    events.waiting(self.run_id, reference, &wait).map_err(storage)?;
+                    events.waiting(self.run_id, reference, &wait).await.map_err(storage)?;
                     self.next_event(events, task, reference, &key, &routes, input, ctx, scope, desc, deadline).await?
                 }
             };
@@ -2188,7 +2199,7 @@ impl Run<'_> {
                 match self.foreach(f, reference, n, item, ctx, scope).await? {
                     (out, None) => outputs.push(out),
                     (out, Some(flow)) => {
-                        events.unsubscribe(self.run_id, reference).map_err(storage)?;
+                        events.unsubscribe(self.run_id, reference).await.map_err(storage)?;
                         return Ok((out, Some(flow)));
                     }
                 }
@@ -2200,7 +2211,7 @@ impl Run<'_> {
                 }
             }
         }
-        events.unsubscribe(self.run_id, reference).map_err(storage)?;
+        events.unsubscribe(self.run_id, reference).await.map_err(storage)?;
         Ok((Value::Array(if listen.foreach.is_some() { outputs } else { consumed }), None))
     }
 
@@ -2223,18 +2234,18 @@ impl Run<'_> {
         deadline: Option<i64>,
     ) -> Result<Value, Fault> {
         let storage = |e: anyhow::Error| Fault::Interrupted(WorkflowError::runtime(e.to_string()));
-        let expire = |detail: String| -> Fault {
+        let expire = async |detail: String| -> Fault {
             let typed: Vec<String> = routes.iter().filter(|r| *r != "*").cloned().collect();
-            if let Err(e) = events.unregister(self.run_id, key, &typed) {
+            if let Err(e) = events.unregister(self.run_id, key, &typed).await {
                 return storage(e);
             }
-            if let Err(e) = events.unsubscribe(self.run_id, reference) {
+            if let Err(e) = events.unsubscribe(self.run_id, reference).await {
                 return storage(e);
             }
             WorkflowError::timeout(detail).into()
         };
         if self.journal.is_none() {
-            if let Some(event) = events.take(self.run_id, key, routes).map_err(storage)? {
+            if let Some(event) = events.take(self.run_id, key, routes).await.map_err(storage)? {
                 return Ok(event);
             }
             return Err(WorkflowError::runtime("listen requires a durable journal; cannot wait in a dry run").into());
@@ -2244,7 +2255,7 @@ impl Run<'_> {
         let mut expires = None;
         if let Some(at) = deadline {
             if now >= at {
-                return Err(expire(format!("{reference}: no event before its deadline")));
+                return Err(expire(format!("{reference}: no event before its deadline")).await);
             }
             hold = hold.min(Duration::from_millis(u64::try_from(at - now).unwrap_or(0)));
             if let Some(max) = self.host.limits.max_listen.filter(|max| *max <= hold) {
@@ -2261,8 +2272,8 @@ impl Run<'_> {
         let until = tokio::time::Instant::now() + hold;
         loop {
             let notification = events.notification(self.run_id);
-            if let Some(event) = events.take(self.run_id, key, routes).map_err(storage)? {
-                self.save(key, Record::Event { event: event.clone() })?;
+            if let Some(event) = events.take(self.run_id, key, routes).await.map_err(storage)? {
+                self.save(key, Record::Event { event: event.clone() }).await?;
                 return Ok(event);
             }
             if tokio::time::Instant::now() >= until {
@@ -2276,7 +2287,8 @@ impl Run<'_> {
         if let Some(limit) = expires {
             return Err(expire(format!(
                 "no event within {hold:?}, the most this host waits (the timeout allows {limit:?})"
-            )));
+            ))
+            .await);
         }
         Err(Fault::Waiting(NO_DEADLINE))
     }
@@ -2376,7 +2388,7 @@ impl Run<'_> {
             delivery: Delivery::AtLeastOnce,
             state,
         };
-        self.save(&key, pending(CallState::Pending))?;
+        self.save(&key, pending(CallState::Pending)).await?;
         let info = CallInfo {
             run_id: self.run_id,
             reference,
@@ -2394,15 +2406,15 @@ impl Run<'_> {
         };
         match result {
             Ok(()) => {
-                self.save(&key, pending(CallState::Done(Ok(envelope.clone()))))?;
+                self.save(&key, pending(CallState::Done(Ok(envelope.clone())))).await?;
                 Ok(envelope)
             }
             Err(CallFailure::Response(e)) => {
-                self.save(&key, pending(CallState::Done(Err(e.clone()))))?;
+                self.save(&key, pending(CallState::Done(Err(e.clone())))).await?;
                 Err(Fault::Error(e))
             }
             Err(CallFailure::NotExecuted(e)) => {
-                self.save(&key, pending(CallState::NotExecuted(e.clone())))?;
+                self.save(&key, pending(CallState::NotExecuted(e.clone()))).await?;
                 Err(Fault::Error(e))
             }
             // Delivered at least once: recovery hands the same envelope over.
@@ -2464,7 +2476,7 @@ impl Run<'_> {
             CallFailure::Unknown(e) | CallFailure::Interrupted(e) => Fault::Interrupted(e),
         };
         if !run.await_ {
-            children.start(self.run_id, reference, &target, &child_input, false).map_err(failed)?;
+            children.start(self.run_id, reference, &target, &child_input, false).await.map_err(failed)?;
             return Ok(input.clone());
         }
         let key = format!("{reference}#child");
@@ -2482,13 +2494,14 @@ impl Run<'_> {
                     .ok_or_else(|| WorkflowError::validation("child workflows need events on this host"))?;
                 // The raw reference, not the logical one: a DSL retry starts a
                 // new child, while recovery joins the one it started.
-                let child = children.start(self.run_id, reference, &target, &child_input, true).map_err(failed)?;
+                let child =
+                    children.start(self.run_id, reference, &target, &child_input, true).await.map_err(failed)?;
                 let storage = |e: anyhow::Error| Fault::Interrupted(WorkflowError::runtime(e.to_string()));
                 let types = [child.done];
-                events.register(self.run_id, &types).map_err(storage)?;
-                match events.take(self.run_id, &key, &types).map_err(storage)? {
+                events.register(self.run_id, &types).await.map_err(storage)?;
+                match events.take(self.run_id, &key, &types).await.map_err(storage)? {
                     Some(event) => {
-                        self.save(&key, Record::Event { event: event.clone() })?;
+                        self.save(&key, Record::Event { event: event.clone() }).await?;
                         event
                     }
                     None => return Err(Fault::Waiting(NO_DEADLINE)),
@@ -2598,7 +2611,8 @@ impl Run<'_> {
                     self.save(
                         &decision_key,
                         Record::Retry { delay_ms: delay.map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX)) },
-                    )?;
+                    )
+                    .await?;
                     delay
                 }
             };
@@ -2651,7 +2665,7 @@ impl Run<'_> {
                     .now()
                     .timestamp_millis()
                     .saturating_add(i64::try_from(limit.as_millis()).unwrap_or(i64::MAX));
-                self.save(key, Record::Timer { deadline_ms })?;
+                self.save(key, Record::Timer { deadline_ms }).await?;
                 deadline_ms
             }
         };
@@ -2751,7 +2765,7 @@ impl Run<'_> {
                         .now()
                         .timestamp_millis()
                         .saturating_add(i64::try_from(d.as_millis()).unwrap_or(i64::MAX));
-                    self.save(key, Record::Timer { deadline_ms })?;
+                    self.save(key, Record::Timer { deadline_ms }).await?;
                     deadline_ms
                 }
             };

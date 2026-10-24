@@ -24,11 +24,17 @@ struct Store {
     fail_at: AtomicUsize,
     after_commit: bool,
 }
+impl Store {
+    fn records(&self) -> BTreeMap<String, Record> {
+        self.records.lock().unwrap().clone()
+    }
+}
+#[async_trait]
 impl Journal for Store {
-    fn load(&self) -> anyhow::Result<BTreeMap<String, Record>> {
+    async fn load(&self) -> anyhow::Result<BTreeMap<String, Record>> {
         Ok(self.records.lock().unwrap().clone())
     }
-    fn save(&self, key: &str, record: &Record) -> anyhow::Result<()> {
+    async fn save(&self, key: &str, record: &Record) -> anyhow::Result<()> {
         let n = self.saves.fetch_add(1, Ordering::SeqCst) + 1;
         let fail = n == self.fail_at.load(Ordering::SeqCst);
         if fail && !self.after_commit {
@@ -470,7 +476,7 @@ fn recover_generated(
             }
             let before = world.calls.lock().unwrap().len();
             let stops = world.interrupted.load(Ordering::SeqCst);
-            let saved = store.load().unwrap();
+            let saved = store.records();
             let host = Host {
                 functions: world.clone(),
                 clock: time.clone(),
@@ -529,8 +535,7 @@ fn recover_generated(
                         }
                     }
                     let completed = store
-                        .load()
-                        .unwrap()
+                        .records()
                         .into_iter()
                         .filter_map(|(key, record)| match record {
                             Record::Task { result: Some(result), .. } => Some((key, result)),
@@ -543,7 +548,7 @@ fn recover_generated(
             }
             // A new worker sees only serialized state, not the old Run/Host
             // or any in-memory interpreter context. External effects persist.
-            let records = serde_json::from_slice(&serde_json::to_vec(&store.load().unwrap()).unwrap()).unwrap();
+            let records = serde_json::from_slice(&serde_json::to_vec(&store.records()).unwrap()).unwrap();
             store = Store {
                 records: Mutex::new(records),
                 saves: AtomicUsize::new(store.saves.load(Ordering::SeqCst)),
@@ -1173,6 +1178,7 @@ struct Inbox {
     registered: Mutex<Vec<String>>,
     notify: tokio::sync::Notify,
 }
+#[async_trait]
 impl run::Events for Inbox {
     fn notification(&self, _: &str) -> futures::future::BoxFuture<'_, ()> {
         let mut future = Box::pin(self.notify.notified());
@@ -1180,16 +1186,16 @@ impl run::Events for Inbox {
         Box::pin(future)
     }
 
-    fn unregister(&self, _: &str, _: &str, types: &[String]) -> anyhow::Result<()> {
+    async fn unregister(&self, _: &str, _: &str, types: &[String]) -> anyhow::Result<()> {
         self.registered.lock().unwrap().retain(|t| !types.contains(t));
         Ok(())
     }
 
-    fn register(&self, _: &str, types: &[String]) -> anyhow::Result<()> {
+    async fn register(&self, _: &str, types: &[String]) -> anyhow::Result<()> {
         self.registered.lock().unwrap().extend_from_slice(types);
         Ok(())
     }
-    fn take(&self, _: &str, key: &str, types: &[String]) -> anyhow::Result<Option<Value>> {
+    async fn take(&self, _: &str, key: &str, types: &[String]) -> anyhow::Result<Option<Value>> {
         let mut records = self.journal.records.lock().unwrap();
         if let Some(Record::Event { event }) = records.get(key) {
             return Ok(Some(event.clone()));
@@ -1454,12 +1460,18 @@ struct RecoveryJournal {
     store: Store,
     decisions: Mutex<Vec<(String, Record)>>,
 }
-impl Journal for RecoveryJournal {
-    fn load(&self) -> anyhow::Result<BTreeMap<String, Record>> {
-        self.store.load()
+impl RecoveryJournal {
+    fn records(&self) -> BTreeMap<String, Record> {
+        self.store.records()
     }
-    fn save(&self, key: &str, record: &Record) -> anyhow::Result<()> {
-        self.store.save(key, record)?;
+}
+#[async_trait]
+impl Journal for RecoveryJournal {
+    async fn load(&self) -> anyhow::Result<BTreeMap<String, Record>> {
+        self.store.load().await
+    }
+    async fn save(&self, key: &str, record: &Record) -> anyhow::Result<()> {
+        self.store.save(key, record).await?;
         self.decisions.lock().unwrap().push((key.into(), record.clone()));
         Ok(())
     }
@@ -1487,7 +1499,7 @@ fn r2_generated_recoveries_from_one_journal_make_identical_decisions() {
                 runtime: json!({}),
             };
             rt.block_on(run::resume(&h, &wf, "same-cut", input.clone(), &CancellationToken::new(), &store));
-            let bytes = serde_json::to_vec(&store.load().unwrap()).unwrap();
+            let bytes = serde_json::to_vec(&store.records()).unwrap();
             let recover = || {
                 let records = serde_json::from_slice(&bytes).unwrap();
                 let recovered = RecoveryJournal {
@@ -1506,7 +1518,7 @@ fn r2_generated_recoveries_from_one_journal_make_identical_decisions() {
                     rt.block_on(run::resume(&h, &wf, "same-cut", input.clone(), &CancellationToken::new(), &recovered));
                 let dispatches = calls.calls.lock().unwrap().clone();
                 let decisions = recovered.decisions.lock().unwrap().clone();
-                (outcome.status, recovered.load().unwrap(), decisions, dispatches)
+                (outcome.status, recovered.records(), decisions, dispatches)
             };
             prop_assert_eq!(recover(), recover());
             Ok(())
@@ -1566,7 +1578,7 @@ fn generated_faulty_histories_refine_crash_free_effect_histories() {
                     panic!("recovery did not drain")
                 });
                 let ledger = world.0.lock().unwrap().clone();
-                (status, ledger, store.load().unwrap())
+                (status, ledger, store.records())
             };
             let (ideal, expected, _) = execute(0);
             let (actual, effects, evidence) = execute(cut);
@@ -1629,7 +1641,7 @@ fn budgeted(
                     }
                     store.fail_at.store(0, Ordering::SeqCst);
                 }
-                terminal => return Ok((terminal, outcome.limit_exceeded, store.load().unwrap())),
+                terminal => return Ok((terminal, outcome.limit_exceeded, store.records())),
             }
         }
         Err("the budgeted run did not end".into())

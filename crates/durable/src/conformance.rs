@@ -1203,30 +1203,32 @@ struct Inbox {
     after_save: bool,
     after_take: bool,
 }
+#[async_trait::async_trait]
 impl Journal for Inbox {
-    fn load(&self) -> anyhow::Result<BTreeMap<String, Record>> {
-        self.lease.load()
+    async fn load(&self) -> anyhow::Result<BTreeMap<String, Record>> {
+        self.lease.load().await
     }
-    fn save(&self, key: &str, record: &Record) -> anyhow::Result<()> {
+    async fn save(&self, key: &str, record: &Record) -> anyhow::Result<()> {
         let n = self.saves.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         anyhow::ensure!(self.after_save || n != self.fail, "crash before checkpoint {n}");
-        self.lease.save(key, record)?;
+        self.lease.save(key, record).await?;
         anyhow::ensure!(!self.after_save || n != self.fail, "crash after checkpoint {n}");
         Ok(())
     }
 }
+#[async_trait::async_trait]
 impl Events for Inbox {
     fn notification(&self, id: &str) -> futures::future::BoxFuture<'_, ()> {
         self.lease.notification(id)
     }
-    fn register(&self, id: &str, types: &[String]) -> anyhow::Result<()> {
-        self.lease.register(id, types)
+    async fn register(&self, id: &str, types: &[String]) -> anyhow::Result<()> {
+        self.lease.register(id, types).await
     }
-    fn unregister(&self, id: &str, key: &str, types: &[String]) -> anyhow::Result<()> {
-        self.lease.unregister(id, key, types)
+    async fn unregister(&self, id: &str, key: &str, types: &[String]) -> anyhow::Result<()> {
+        self.lease.unregister(id, key, types).await
     }
-    fn take(&self, id: &str, key: &str, types: &[String]) -> anyhow::Result<Option<Value>> {
-        let event = self.lease.take(id, key, types)?;
+    async fn take(&self, id: &str, key: &str, types: &[String]) -> anyhow::Result<Option<Value>> {
+        let event = self.lease.take(id, key, types).await?;
         anyhow::ensure!(!self.after_take || event.is_none(), "crash after atomic event consumption");
         Ok(event)
     }
@@ -1275,7 +1277,7 @@ async fn listen_case(
     };
     let token = tokio_util::sync::CancellationToken::new();
     if mode == 0 {
-        lease.register("r", &["answer".into()])?;
+        lease.register("r", &["answer".into()]).await?;
         t.store.deliver(&event("first", "answer", json!("answer")), None, 1000)?;
     }
     let mut future = Box::pin(run::resume(&host, &wf, "r", json!({}), &token, &*inbox));
@@ -1319,7 +1321,7 @@ async fn listen_case(
             runtime: json!({}),
         };
         if mode != 3 {
-            current.register("r", &["answer".into()])?;
+            current.register("r", &["answer".into()]).await?;
             reopened.deliver(&event("recovery", "answer", json!("answer")), None, now)?;
         } else {
             tokio::time::advance(Duration::from_millis(100)).await;

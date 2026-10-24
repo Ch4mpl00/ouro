@@ -139,6 +139,7 @@
 //!     the jump it names acts on `on_exceeded`; other branches refused at the
 //!     same moment follow its outcome, and recovery and replay pick the same.
 use crate::{model::Flow, run::WorkflowError};
+use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -196,9 +197,15 @@ pub enum CallState {
 /// must be durable before it returns, including before an external call.
 /// Load returns one consistent snapshot of this run; save replaces one record
 /// atomically and must enforce `check_transition` against persisted state.
+///
+/// The methods are asynchronous so a journal over a network database needs
+/// no thread per pending call. A dropped call must leave nothing half
+/// applied: either its commit happened (and the caller, which no longer
+/// knows, recovers from storage) or nothing did.
+#[async_trait]
 pub trait Journal: Send + Sync {
-    fn load(&self) -> anyhow::Result<BTreeMap<String, Record>>;
-    fn save(&self, key: &str, record: &Record) -> anyhow::Result<()>;
+    async fn load(&self) -> anyhow::Result<BTreeMap<String, Record>>;
+    async fn save(&self, key: &str, record: &Record) -> anyhow::Result<()>;
     /// Spends one unit of the run tree's shared budget under `key` if fewer
     /// than `limit` units are spent, and saves the `Record::Budget` that says
     /// so at `key` in the same commit; repeating returns the saved record. A
@@ -207,7 +214,7 @@ pub trait Journal: Send + Sync {
     /// first refused key (`first`). `None`: this journal keeps no shared
     /// budget, and the interpreter counts the run's own units in records it
     /// saves itself (each refusal naming the first in its one record).
-    fn spend(&self, _key: &str, _limit: u64) -> anyhow::Result<Option<Record>> {
+    async fn spend(&self, _key: &str, _limit: u64) -> anyhow::Result<Option<Record>> {
         Ok(None)
     }
 }
