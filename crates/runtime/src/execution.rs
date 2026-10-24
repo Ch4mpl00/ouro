@@ -13,7 +13,9 @@ use crate::{
 use async_trait::async_trait;
 use futures::{StreamExt, future::BoxFuture, stream::FuturesUnordered};
 use opentelemetry::{Context, global::BoxedTracer, trace::FutureExt};
-use ouro_durable::{Admission, ChildLink, Clock, Definition, Fence, Lease, RunStore, SavedRun, SystemClock};
+use ouro_durable::{
+    Admission, ChildLink, Clock, Compatibility, Definition, Fence, Lease, RunStore, SavedRun, Swept, SystemClock,
+};
 use owf::{
     durable::{CallFailure, Delivery},
     model::{self, Process, Workflow},
@@ -40,6 +42,12 @@ pub struct Config {
     /// `$runtime.metadata`: implementation-specific facts the host exposes
     /// to every expression (a tenant, feature flags).
     pub metadata: Value,
+    /// The application version this runtime declares, recorded in every run
+    /// it admits, and the older versions its code still resumes. Undeclared
+    /// (the default): every run is compatible, as before versions existed.
+    /// Declared: this runtime claims only runs of a compatible version; the
+    /// others wait, visibly, for a compatible worker (`Runtime::compatible`).
+    pub application: Compatibility,
 }
 impl Default for Config {
     fn default() -> Self {
@@ -52,6 +60,7 @@ impl Default for Config {
             retention_ms: ouro_durable::RECORDS_KEPT_MS,
             limits: Limits::default(),
             metadata: json!({}),
+            application: Compatibility::default(),
         }
     }
 }
@@ -95,10 +104,13 @@ impl Runtime {
             "concurrency must be positive"
         );
         anyhow::ensure!(config.breaker_threshold > 0 && config.retention_ms >= 0, "invalid breaker or retention");
+        // A worker stops acting the skew bound before its lease ends, so it
+        // must renew before then.
+        let acting = ouro_durable::LEASE_MS.saturating_sub(store.policy().skew_ms);
         anyhow::ensure!(
             !config.poll_interval.is_zero()
                 && !config.heartbeat_interval.is_zero()
-                && config.heartbeat_interval < Duration::from_millis(u64::try_from(ouro_durable::LEASE_MS)?),
+                && config.heartbeat_interval < Duration::from_millis(u64::try_from(acting.max(0))?),
             "invalid polling/heartbeat interval"
         );
         Ok(Self {
@@ -152,12 +164,14 @@ impl Runtime {
         self.validate(yaml)?;
         self.store.save_definition(name, yaml)
     }
+    /// Activates a saved version in a new activation epoch, clearing a
+    /// tripped breaker; its schedule's triggers replace the definition's
+    /// current ones in the same commit.
     pub fn activate(&self, name: &str, version: u64) -> anyhow::Result<()> {
         let definitions = self.store.definitions(name)?;
         let d = definitions.versions.get(&version).ok_or_else(|| anyhow::anyhow!("unknown definition version"))?;
         self.validate(&d.yaml)?;
-        self.store.activate(name, version)?;
-        self.arm(name)
+        self.activate_armed(name, version)
     }
     pub(crate) fn admitter(&self) -> Admitter {
         Admitter {
@@ -165,6 +179,7 @@ impl Runtime {
             registry: self.registry.clone(),
             capabilities: self.capabilities.clone(),
             metadata: self.config.metadata.clone(),
+            application: self.config.application.version.clone(),
         }
     }
     pub(crate) fn admission(&self, id: &str, name: &str, input: Value) -> anyhow::Result<Admission> {
@@ -193,8 +208,41 @@ impl Runtime {
     pub fn records(&self, id: &str) -> anyhow::Result<BTreeMap<String, owf::durable::Record>> {
         Ok(self.store.inspect(id)?.ok_or_else(|| anyhow::anyhow!("unknown run"))?.records)
     }
-    pub fn deliver(&self, type_: &str, data: Value) -> anyhow::Result<Option<String>> {
-        self.store.deliver(type_, &data, self.clock.now_ms())
+    /// Delivers an identified CloudEvent (`id`, `source`, `type`; the
+    /// `specversion` and `time` are filled in when absent): to `target`'s
+    /// mailbox, where a listen takes it until it expires, or to the oldest
+    /// run waiting for its type. Delivering it again returns the same
+    /// recipient; another payload under its identity is an error. Returns
+    /// the recipient, `None` when no run is eligible.
+    pub fn deliver(&self, mut event: Value, target: Option<&str>) -> anyhow::Result<Option<String>> {
+        let now = self.clock.now_ms();
+        crate::schedule::complete(&mut event, now)?;
+        self.store.deliver(&event, target, now)
+    }
+    /// Whether this runtime may resume `run`: its application version is
+    /// undeclared, or one this runtime declares or accepts. An unfinished run
+    /// no running worker is compatible with waits for one.
+    pub fn compatible(&self, run: &SavedRun) -> bool {
+        self.config.application.admits(run.admission.application_version())
+    }
+    /// Removes evidence past retention, expires mailbox events no listen
+    /// took in time (each leaves a `Record::Expired`) and old ingress
+    /// tombstones; traced as `sweep` with the counts. The worker calls it.
+    pub fn sweep(&self) -> anyhow::Result<Swept> {
+        let swept = self.store.sweep(self.clock.now_ms(), self.config.retention_ms)?;
+        crate::telemetry::mark(
+            &self.tracer,
+            "sweep",
+            vec![
+                opentelemetry::KeyValue::new("ouro.sweep.records", i64::try_from(swept.records).unwrap_or(i64::MAX)),
+                opentelemetry::KeyValue::new("ouro.sweep.expired", i64::try_from(swept.expired).unwrap_or(i64::MAX)),
+                opentelemetry::KeyValue::new(
+                    "ouro.sweep.tombstones",
+                    i64::try_from(swept.tombstones).unwrap_or(i64::MAX),
+                ),
+            ],
+        );
+        Ok(swept)
     }
     pub fn cancel(&self, id: &str) -> anyhow::Result<bool> {
         let changed = self.store.cancel(id, self.clock.now_ms())?;
@@ -238,7 +286,7 @@ impl Runtime {
         mode: Mode,
     ) -> anyhow::Result<Option<Status>> {
         let _permit = tokio::select! {biased; _=stop.cancelled()=>return Ok(None),p=self.permits.acquire()=>p?};
-        let Some(fence) = self.store.claim(id, self.clock.now_ms())? else {
+        let Some(fence) = self.store.claim_as(id, self.clock.now_ms(), &self.config.application)? else {
             return Ok(self.store.get(id)?.and_then(|r| r.outcome));
         };
         let saved = self.store.get(id)?.ok_or_else(|| anyhow::anyhow!("claimed run disappeared"))?;
@@ -315,7 +363,10 @@ impl Runtime {
                 "metadata": runtime.get("metadata").cloned().unwrap_or_else(|| json!({})),
             }),
         };
-        let run = run::resume(&host, &wf, &saved.admission.id, saved.admission.input.clone(), local_cancel, &*lease)
+        // The workflow's deadline counts from admission, whichever process
+        // first drives the run.
+        let input = saved.admission.input.clone();
+        let run = run::resume_from(&host, &wf, &saved.admission.id, input, saved.admitted_ms, local_cancel, &*lease)
             .with_context(spans.root());
         tokio::pin!(run);
         let mut heartbeat = tokio::time::interval(self.config.heartbeat_interval);
@@ -345,7 +396,7 @@ impl Runtime {
         }
     }
     pub async fn recover_once(&self, stop: &CancellationToken) -> anyhow::Result<usize> {
-        let ids = self.store.due(self.clock.now_ms(), self.config.max_concurrency)?;
+        let ids = self.store.due_as(self.clock.now_ms(), self.config.max_concurrency, &self.config.application)?;
         let count = ids.len();
         let mut pending = FuturesUnordered::new();
         for id in &ids {
@@ -372,10 +423,10 @@ impl Runtime {
                 _=stop.cancelled()=>break,
                 Some((id,result))=running.next(),if !running.is_empty()=> {ids.remove(&id);if let Err(e)=result {failure=Some(e);break;}},
                 _=tick.tick()=> {
-                    if sweep.elapsed()>=Duration::from_secs(3600) {if let Err(e)=self.store.sweep(self.clock.now_ms(),self.config.retention_ms) {failure=Some(e);break;} sweep=tokio::time::Instant::now();}
+                    if sweep.elapsed()>=Duration::from_secs(3600) {if let Err(e)=self.sweep() {failure=Some(e);break;} sweep=tokio::time::Instant::now();}
                     // Due schedule slots: a range of the trigger index ending now.
                     if let Err(e)=self.fire_due() {failure=Some(e);break;}
-                    let due=match self.store.due(self.clock.now_ms(),self.config.max_concurrency) {Ok(due)=>due,Err(e)=>{failure=Some(e);break;}};
+                    let due=match self.store.due_as(self.clock.now_ms(),self.config.max_concurrency,&self.config.application) {Ok(due)=>due,Err(e)=>{failure=Some(e);break;}};
                     for id in due {
                         if ids.len()>=self.config.max_concurrency {break;}
                         if ids.insert(id.clone()) {let token=shutdown.clone();running.push(Box::pin(async move {let result=self.drive(&id,&token).await;(id,result)}));}
@@ -405,6 +456,8 @@ pub(crate) struct Admitter {
     pub registry: Arc<Registry>,
     pub capabilities: Capabilities,
     pub metadata: Value,
+    /// The declared application version, recorded in every admission.
+    pub application: Option<String>,
 }
 
 impl Admitter {
@@ -429,9 +482,13 @@ impl Admitter {
         }
         Ok(out)
     }
-    /// A run of `name`'s active version.
+    /// A run of `name`'s active version, unless its breaker tripped.
     pub fn active(&self, id: &str, name: &str, input: Value) -> anyhow::Result<Admission> {
         let definitions = self.definitions.definitions(name)?;
+        anyhow::ensure!(
+            !definitions.tripped,
+            "{name} is tripped: its breaker found no version to roll back to; activate a version to resume"
+        );
         let d = definitions
             .active
             .and_then(|v| definitions.versions.get(&v))
@@ -440,19 +497,23 @@ impl Admitter {
     }
     pub fn of(&self, id: &str, d: &Definition, input: Value) -> anyhow::Result<Admission> {
         let wf = self.validate(&d.yaml)?;
+        let mut runtime = json!({
+            "name": "ouro-runtime",
+            "version": env!("CARGO_PKG_VERSION"),
+            "metadata": self.metadata,
+            "bindings": self.registry.bindings(&wf),
+            "schemas": self.schemas(&wf)?,
+        });
+        if let Some(version) = &self.application {
+            runtime[ouro_durable::APPLICATION_VERSION] = json!(version);
+        }
         Ok(Admission {
             id: id.into(),
             name: d.name.clone(),
             version: d.version,
             definition: d.yaml.clone(),
             input,
-            runtime: json!({
-                "name": "ouro-runtime",
-                "version": env!("CARGO_PKG_VERSION"),
-                "metadata": self.metadata,
-                "bindings": self.registry.bindings(&wf),
-                "schemas": self.schemas(&wf)?,
-            }),
+            runtime,
         })
     }
     /// `run.workflow`'s target. CHOICE: the catalog entry named `name`

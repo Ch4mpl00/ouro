@@ -124,7 +124,9 @@ fn linearizable(initial: &Abstract, history: &[Completed], final_state: &Abstrac
 }
 
 fn envelope() -> Value {
-    json!({"type":"event","data":42,"time":"1970-01-01T00:00:00+00:00"})
+    let mut event = ouro_durable::conformance::event("event", "event", json!(42));
+    event["time"] = json!("1970-01-01T00:00:00+00:00");
+    event
 }
 fn trigger(winner: usize) -> Trigger {
     Trigger { at_ms: Some(100), types: vec![], state: json!({"winner":winner}) }
@@ -206,7 +208,8 @@ fn suite(adapter: Adapter) {
             let ops = match scenario {
                 0 | 1 => {
                     driver.store.register_wait(&fence, &["event".into()], 0).unwrap();
-                    assert_eq!(driver.store.deliver("event", &json!(42), 0).unwrap(), Some("batch".into()));
+                    let event = ouro_durable::conformance::event("event", "event", json!(42));
+                    assert_eq!(driver.store.deliver(&event, None, 0).unwrap(), Some("batch".into()));
                     initial.pending = true;
                     (0..4).map(|k| Op::Take(format!("take-{}", if scenario == 0 { k } else { 0 }))).collect()
                 }
@@ -223,7 +226,7 @@ fn suite(adapter: Adapter) {
             let mut actual = Abstract {
                 terminal: snapshot.run.outcome.is_some(),
                 pending: snapshot.events.iter().any(|e| e.consumed_key.is_none()),
-                published: snapshot.events.iter().any(|e| e.envelope.is_some()),
+                published: snapshot.events.iter().any(|e| e.envelope.is_some() && !e.delivered),
                 consumed: snapshot.events.iter().find_map(|e| e.consumed_key.clone()),
                 claimed: snapshot.run.generation > 1,
                 ..Abstract::default()

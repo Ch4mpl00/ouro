@@ -1,13 +1,20 @@
 use ouro_durable::{
-    AtomicBackend, Conflict, Fence, IoCounts, Metrics, Rearm, RunState, RunStore, TransactionalStore, Trigger,
-    conformance::admission, memory::MemoryBackend, postgres::PostgresBackend, sqlite::SqliteBackend,
+    Arming, AtomicBackend, Compatibility, Conflict, Fence, Fired, Firing, IoCounts, Metrics, Policy, Rearm, RunState,
+    RunStore, TransactionalStore, Trigger,
+    conformance::{admission, event},
+    memory::MemoryBackend,
+    postgres::PostgresBackend,
+    sqlite::SqliteBackend,
 };
 use owf::{
     durable::Record,
     run::{Status, WorkflowError},
 };
 use serde_json::json;
-use std::sync::{Arc, Barrier};
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, Barrier},
+};
 mod support;
 
 fn bounded<T>(
@@ -27,6 +34,7 @@ fn bounded<T>(
 }
 fn bounds(backend: Arc<dyn AtomicBackend>, metrics: Arc<Metrics>) -> anyhow::Result<()> {
     support::seed(&backend, 10_000)?;
+    decided(&backend, &metrics)?;
     let s = TransactionalStore::new(backend);
     let mut a = admission("target:r");
     a.name = "target".into();
@@ -48,16 +56,21 @@ fn bounds(backend: Arc<dyn AtomicBackend>, metrics: Arc<Metrics>) -> anyhow::Res
     for n in 0..64 {
         let f = s.start(&admission(&format!("saturated:{n}")), 1)?.unwrap();
         s.register_wait(&f, &["crowded".into()], 1)?;
-        s.deliver("crowded", &json!(n), 1)?.unwrap();
+        s.deliver(&event(&format!("crowded{n}"), "crowded", json!(n)), None, 1)?.unwrap();
         s.finish(&f, &Status::Waiting { wake_at_ms: i64::MAX }, 1, 3)?;
     }
-    assert!(bounded(&metrics, "deliver_saturated", 0, || s.deliver("crowded", &json!(0), 1))?.is_none());
+    assert!(
+        bounded(&metrics, "deliver_saturated", 0, || s.deliver(&event("crowded", "crowded", json!(0)), None, 1))?
+            .is_none()
+    );
     let types = vec!["answer".into()];
     bounded(&metrics, "register_wait", 0, || s.register_wait(&f, &types, 1))?;
     assert!(bounded(&metrics, "take_event_pending", 0, || s.take_event(&f, "answer", &types, 1))?.is_none());
-    assert_eq!(bounded(&metrics, "deliver", 1, || s.deliver("answer", &json!(42), 1))?, Some(a.id.clone()));
-    assert!(bounded(&metrics, "deliver_full", 0, || s.deliver("answer", &json!(42), 1))?.is_none());
-    assert!(bounded(&metrics, "deliver_absent", 0, || s.deliver("absent", &json!(42), 1))?.is_none());
+    let answer = |id: &str| event(id, "answer", json!(42));
+    assert_eq!(bounded(&metrics, "deliver", 1, || s.deliver(&answer("1"), None, 1))?, Some(a.id.clone()));
+    assert_eq!(bounded(&metrics, "deliver_again", 1, || s.deliver(&answer("1"), None, 1))?, Some(a.id.clone()));
+    assert!(bounded(&metrics, "deliver_full", 0, || s.deliver(&answer("2"), None, 1))?.is_none());
+    assert!(bounded(&metrics, "deliver_absent", 0, || s.deliver(&event("3", "absent", json!(42)), None, 1))?.is_none());
     assert!(bounded(&metrics, "take_event", 0, || s.take_event(&f, "answer", &types, 1))?.is_some());
     bounded(&metrics, "take_event_replay", 0, || s.take_event(&f, "answer", &types, 1))?;
     bounded(&metrics, "unregister_wait", 0, || s.unregister_wait(&f, "answer", &types, 1))?;
@@ -128,8 +141,116 @@ fn bounds(backend: Arc<dyn AtomicBackend>, metrics: Arc<Metrics>) -> anyhow::Res
     assert!(bounded(&metrics, "due_empty", 0, || s.due(-1, 7))?.is_empty());
     assert!(bounded(&metrics, "due_zero_limit", 0, || s.due(i64::MAX, 0))?.is_empty());
     bounded(&metrics, "sweep", 6, || s.sweep(1, 0))?;
-    assert_eq!(bounded(&metrics, "sweep_already_swept", 0, || s.sweep(1, 0))?, 0);
+    assert_eq!(bounded(&metrics, "sweep_already_swept", 0, || s.sweep(1, 0))?, ouro_durable::Swept::default());
     assert_eq!(s.list(None, "seed").unwrap().len(), 10_000);
+    Ok(())
+}
+
+/// The paths the #3/#4 decisions added or changed, against the same 10,000
+/// unrelated persisted runs (seeded, undeclared, subscribed elsewhere).
+fn decided(backend: &Arc<dyn AtomicBackend>, metrics: &Metrics) -> anyhow::Result<()> {
+    // Short lifetimes so expiry happens at small clock values.
+    let s = TransactionalStore::new(backend.clone()).with_policy(Policy {
+        mailbox_ms: 10,
+        ingress_ms: 10,
+        ..Policy::default()
+    });
+    // Mailbox: an addressed event to a run that does not listen yet.
+    let mut a = admission("decided:mailbox");
+    a.name = "decided".into();
+    s.admit(&a, 0)?;
+    let early = event("early", "early", json!(1));
+    assert_eq!(bounded(metrics, "deliver_addressed", 1, || s.deliver(&early, Some(&a.id), 0))?, Some(a.id.clone()));
+    assert_eq!(
+        bounded(metrics, "deliver_addressed_again", 1, || s.deliver(&early, Some(&a.id), 0))?,
+        Some(a.id.clone())
+    );
+    let changed = event("early", "early", json!(2));
+    assert!(bounded(metrics, "deliver_conflict", 1, || Ok(s.deliver(&changed, Some(&a.id), 0).is_err()))?);
+    // Expiry by a later take, and by sweep for a run that never takes.
+    let f = s.claim(&a.id, 10)?.unwrap();
+    assert!(bounded(metrics, "take_event_expired", 1, || s.take_event(&f, "late", &["early".into()], 10))?.is_none());
+    s.finish(&f, &Status::Waiting { wake_at_ms: i64::MAX }, 10, 3)?;
+    s.deliver(&event("idle", "early", json!(3)), Some(&a.id), 10)?;
+    assert_eq!(bounded(metrics, "sweep_mailbox", 1, || s.sweep(20, i64::MAX / 2))?.expired, 1);
+    // Ingress: one tombstone per identity, refused afterwards, then swept.
+    let on = Trigger { at_ms: None, types: vec!["decided".into()], state: json!({ "events": [] }) };
+    s.swap_trigger("decided#on", None, Some(&on), &[], None, 0)?;
+    let order = event("order", "decided", json!(1));
+    let mut started = a.clone();
+    started.id = "decided:order".into();
+    let admit = [started];
+    let firing = Firing {
+        key: "decided#on",
+        expected: Some(&on),
+        next: Some(&on),
+        admit: &admit,
+        ingress: Some(&order),
+        ..Firing::default()
+    };
+    assert!(!bounded(metrics, "ingested", 0, || s.ingested(&order, 0))?);
+    assert_eq!(bounded(metrics, "fire_ingress", 1, || s.fire(&firing, 0))?, Fired::Committed);
+    assert_eq!(bounded(metrics, "fire_ingested", 1, || s.fire(&firing, 1))?, Fired::Ingested);
+    assert_eq!(bounded(metrics, "sweep_tombstones", 1, || s.sweep(10, i64::MAX / 2))?.tombstones, 1);
+    // Exclusive firing with the previous run still unfinished.
+    // Far in the future: the bounds below read the due-trigger index.
+    let slot = |at: i64| Trigger { at_ms: Some(2_000_000_000 + at), types: vec![], state: json!({ "at": at }) };
+    s.swap_trigger("decided#every", None, Some(&slot(1)), &[], None, 0)?;
+    let mut first = a.clone();
+    first.id = "decided:slot1".into();
+    let mut second = a.clone();
+    second.id = "decided:slot2".into();
+    let exclusive = |expected: &Trigger, next: &Trigger, admit: &[ouro_durable::Admission]| {
+        s.fire(
+            &Firing {
+                key: "decided#every",
+                expected: Some(expected),
+                next: Some(next),
+                admit,
+                busy: Some(next),
+                ..Firing::default()
+            },
+            1,
+        )
+    };
+    let one = std::slice::from_ref(&first);
+    let two = std::slice::from_ref(&second);
+    assert_eq!(bounded(metrics, "fire_exclusive", 1, || exclusive(&slot(1), &slot(2), one))?, Fired::Committed);
+    let busy = bounded(metrics, "fire_busy", 1, || exclusive(&slot(2), &slot(3), two))?;
+    assert_eq!(busy, Fired::Busy(first.id.clone()));
+    // Activation epochs: arm, roll back (arming the fallback), trip.
+    let v1 = s.save_definition("decided", "one")?;
+    let v2 = s.save_definition("decided", "two")?;
+    let arm = |keys: &[&str]| keys.iter().map(|k| ((*k).to_string(), slot(100))).collect();
+    let arming = Arming { triggers: arm(&["decided#a", "decided#b"]), fallback: BTreeMap::new() };
+    let epoch = s.definitions("decided")?.epoch;
+    bounded(metrics, "activate_with", 2, || s.activate_with("decided", v1.version, epoch, &arming))?.unwrap();
+    let arming = Arming { triggers: arm(&["decided#c"]), fallback: arm(&["decided#a", "decided#b"]) };
+    let epoch = s.definitions("decided")?.epoch;
+    bounded(metrics, "activate_rearm", 3, || s.activate_with("decided", v2.version, epoch, &arming))?.unwrap();
+    let mut faulty = a.clone();
+    faulty.id = "decided:fault".into();
+    faulty.version = v2.version;
+    let f = s.start(&faulty, 0)?.unwrap();
+    let fault = Status::Faulted(WorkflowError::runtime("fault"));
+    bounded(metrics, "finish_rollback", 3, || s.finish(&f, &fault, 0, 1))?;
+    assert_eq!(s.definitions("decided")?.active, Some(v1.version));
+    faulty.id = "decided:trip".into();
+    faulty.version = v1.version;
+    let f = s.start(&faulty, 0)?.unwrap();
+    bounded(metrics, "finish_trip", 2, || s.finish(&f, &fault, 0, 1))?;
+    assert!(s.definitions("decided")?.tripped);
+    // Version-aware claims page through their own partitions only.
+    let mut versioned = a.clone();
+    versioned.id = "decided:versioned".into();
+    versioned.runtime = json!({ "application_version": "2" });
+    s.admit(&versioned, 0)?;
+    let worker = Compatibility { version: Some("2".into()), accepts: vec!["1".into()] };
+    let due = bounded(metrics, "due_as", 8, || s.due_as(0, 8, &worker))?;
+    assert!(due.contains(&versioned.id) && due.len() == 8);
+    let other = Compatibility { version: Some("3".into()), accepts: vec![] };
+    assert!(bounded(metrics, "claim_as_incompatible", 0, || s.claim_as(&versioned.id, 0, &other))?.is_none());
+    assert!(bounded(metrics, "claim_as", 0, || s.claim_as(&versioned.id, 0, &worker))?.is_some());
     Ok(())
 }
 
@@ -171,7 +292,7 @@ fn workers(
                     }
                     let types = vec![format!("event:{id}")];
                     s.register_wait(&f, &types, now)?;
-                    assert_eq!(s.deliver(&types[0], &json!(n), now)?, Some(id.clone()));
+                    assert_eq!(s.deliver(&event(&id, &types[0], json!(n)), None, now)?, Some(id.clone()));
                     assert_eq!(s.take_event(&f, "event", &types, now)?.unwrap()["data"], json!(n));
                     s.finish(&f, &Status::Faulted(WorkflowError::runtime("counted")), now, u32::MAX)?;
                     completed += 1;
@@ -296,9 +417,22 @@ fn ordering(store: &dyn RunStore) -> anyhow::Result<()> {
     }
     Ok(())
 }
+/// Every range-scanned index kind, the #3/#4 ones included.
+const INDEX_KINDS: [&str; 10] = [
+    "due",
+    "due_app:",
+    "wait:616e73776572",
+    "children:70",
+    "name:746172676574",
+    "finished",
+    "mailbox",
+    "ingress_due",
+    "delivered:2f",
+    "trigger_due",
+];
 fn sqlite_query_plans(path: &std::path::Path) -> anyhow::Result<()> {
     let connection = rusqlite::Connection::open(path)?;
-    for kind in ["due", "wait:616e73776572", "children:70", "name:746172676574", "finished"] {
+    for kind in INDEX_KINDS {
         let mut query = connection.prepare(
             "EXPLAIN QUERY PLAN SELECT id,value FROM ouro_rows WHERE kind=?1 AND id>=?2 AND id<?3 ORDER BY id LIMIT ?4",
         )?;
@@ -317,7 +451,7 @@ fn postgres_query_plans(config: &tokio_postgres::Config) -> anyhow::Result<()> {
         let driver = tokio::spawn(connection);
         let result = async {
             client.batch_execute("ANALYZE ouro_rows").await?;
-            for kind in ["due","wait:616e73776572","children:70","name:746172676574","finished"] {
+            for kind in INDEX_KINDS {
                 let plan = client.query("EXPLAIN SELECT id,value FROM ouro_rows WHERE kind=$1 AND id>=$2 AND id<$3 ORDER BY id LIMIT $4",&[&kind,&"",&"g",&7_i64]).await?.into_iter().map(|r| r.get::<_,String>(0)).collect::<Vec<_>>().join(" ");
                 assert!((plan.contains("Index Scan using ouro_rows_pkey") || plan.contains("Bitmap Index Scan on ouro_rows_pkey")),"{kind}: {plan}");
                 assert!(!plan.contains("Seq Scan"),"{kind}: {plan}");
@@ -356,13 +490,16 @@ fn index_atomicity(
         "subscribe",
         "publish",
         "trigger",
+        "mailbox",
+        "ingress",
+        "arm",
     ] {
         let before = backend.snapshot()?;
         assert!(backend.compare_exchange(&before, &ouro_durable::Rows::new())?);
         let p = s.start(&admission("p"), 0)?.unwrap();
         s.register_wait(&p, &["answer".into(), "deliverable".into()], 0)?;
         s.take_event(&p, "event", &["answer".into()], 0)?;
-        s.deliver("answer", &json!(42), 0)?;
+        s.deliver(&event("42", "answer", json!(42)), None, 0)?;
         let c = s
             .start_child(
                 &p,
@@ -375,6 +512,7 @@ fn index_atomicity(
         let first = s.save_definition("workflow", "first")?;
         s.activate("workflow", first.version)?;
         let second = s.save_definition("workflow", "second")?;
+        let epoch = s.definitions("workflow")?.epoch;
         if operation == "sweep" {
             s.finish(&p, &Status::Completed(json!(42)), 0, 3)?;
         }
@@ -391,7 +529,7 @@ fn index_atomicity(
                     .map(|_| ()),
                 "finish" => s.finish(&c, &Status::Completed(json!(42)), 0, 3).map(|_| ()),
                 "cancel" => s.cancel("p", 0).map(|_| ()),
-                "deliver" => s.deliver("deliverable", &json!(42), 0).map(|_| ()),
+                "deliver" => s.deliver(&event("deliverable", "deliverable", json!(42)), None, 0).map(|_| ()),
                 "take" => s.take_event(&p, "event", &["answer".into()], 0).map(|_| ()),
                 "sweep" => s.sweep(1, 0).map(|_| ()),
                 "release" => s.release(&p, 0),
@@ -403,6 +541,33 @@ fn index_atomicity(
                 "activate" => s.activate("workflow", second.version),
                 "subscribe" => s.subscribe(&p, "listen", &["answer".into()], 0),
                 "publish" => s.publish(&json!({"id":"1","source":"/s","type":"published"}), Some("p"), 0).map(|_| ()),
+                "mailbox" => s.deliver(&event("early", "early", json!(1)), Some("p"), 0).map(|_| ()),
+                "ingress" => s
+                    .fire(
+                        &Firing {
+                            key: "on",
+                            next: Some(&Trigger { at_ms: None, types: vec!["t".into()], state: json!(1) }),
+                            admit: &[admission("ingress")],
+                            ingress: Some(&event("ingress", "t", json!(1))),
+                            ..Firing::default()
+                        },
+                        0,
+                    )
+                    .map(|_| ()),
+                "arm" => s
+                    .activate_with(
+                        "workflow",
+                        second.version,
+                        epoch,
+                        &Arming {
+                            triggers: BTreeMap::from([(
+                                "armed".to_string(),
+                                Trigger { at_ms: Some(5), types: vec!["t".into()], state: json!(1) },
+                            )]),
+                            fallback: BTreeMap::new(),
+                        },
+                    )
+                    .map(|_| ()),
                 "trigger" => s
                     .swap_trigger(
                         "slot",

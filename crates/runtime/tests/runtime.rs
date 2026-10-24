@@ -211,8 +211,9 @@ async fn events_resume_a_waiting_listen_and_cancel_is_terminal() {
     save(&rt, &yaml("  - listen: { listen: { to: { one: { with: { type: answer } } }, read: envelope } }"));
     rt.start("r", "workflow", Value::Null).unwrap();
     assert!(matches!(rt.drive("r", &CancellationToken::new()).await.unwrap(), Some(Status::Waiting { .. })));
-    assert_eq!(rt.deliver("answer", json!(42)).unwrap(), Some("r".into()));
-    assert!(rt.deliver("answer", json!(0)).unwrap().is_none());
+    let answer = |id: &str, data: Value| json!({"id": id, "source": "/test", "type": "answer", "data": data});
+    assert_eq!(rt.deliver(answer("1", json!(42)), None).unwrap(), Some("r".into()));
+    assert!(rt.deliver(answer("2", json!(0)), None).unwrap().is_none());
     assert!(
         matches!(rt.drive("r",&CancellationToken::new()).await.unwrap(),Some(Status::Completed(v)) if v[0]["data"]==42)
     );
@@ -379,6 +380,44 @@ async fn delivery_is_declared_not_derived_from_the_effect() {
     let changed = runtime(store, registry(keys.clone(), Delivery::AtMostOnce), Arc::new(Time::default()));
     let outcome = changed.drive("default", &CancellationToken::new()).await.unwrap();
     assert!(matches!(outcome, Some(Status::Interrupted(e)) if e.to_string().contains("bindings changed")));
+}
+
+// #3: a declared application version is recorded at admission; a worker of
+// an incompatible version never claims the run, which stays visible and
+// waiting; a compatible or undeclared one resumes it.
+#[tokio::test]
+async fn runs_wait_for_a_compatible_application_version() {
+    let store: Arc<dyn RunStore> = Arc::new(durable::memory::memory());
+    let time: Arc<Time> = Arc::new(Time::default());
+    let at = |version: Option<&str>, accepts: &[&str]| {
+        let application = durable::Compatibility {
+            version: version.map(Into::into),
+            accepts: accepts.iter().map(|v| v.to_string()).collect(),
+        };
+        let config = Config { application, ..Config::default() };
+        Runtime::new(store.clone(), Arc::new(Registry::new()), config, time.clone(), tracer()).unwrap()
+    };
+    let one = at(Some("1"), &[]);
+    save(&one, &yaml("  - done: { set: { ok: true } }"));
+    let run = one.start("r", "workflow", json!({})).unwrap();
+    assert_eq!(run.admission.application_version(), Some("1"));
+    let two = at(Some("2"), &[]);
+    assert_eq!(two.drive("r", &CancellationToken::new()).await.unwrap(), None);
+    assert_eq!(two.recover_once(&CancellationToken::new()).await.unwrap(), 0);
+    let waiting = two.get("r").unwrap().unwrap();
+    assert!(waiting.outcome.is_none() && !two.compatible(&waiting), "waiting for a compatible worker");
+    let upgraded = at(Some("2"), &["1"]);
+    assert!(upgraded.compatible(&waiting));
+    assert_eq!(
+        upgraded.drive("r", &CancellationToken::new()).await.unwrap(),
+        Some(Status::Completed(json!({"ok":true})))
+    );
+    // Undeclared on either side: compatible, as before versions existed.
+    let undeclared = at(None, &[]);
+    undeclared.start("u", "workflow", json!({})).unwrap();
+    assert_eq!(two.drive("u", &CancellationToken::new()).await.unwrap(), Some(Status::Completed(json!({"ok":true}))));
+    one.start("v", "workflow", json!({})).unwrap();
+    assert!(undeclared.compatible(&undeclared.get("v").unwrap().unwrap()));
 }
 
 #[tokio::test]
@@ -604,7 +643,6 @@ fn x1_x2_generated_dry_runs_and_replays_are_isolated() {
 }
 
 #[tokio::test]
-#[ignore = "pending #4: workflow deadline starts at admission, before the first drive"]
 async fn t3_admission_fixes_the_workflow_deadline() {
     let reads = Arc::new(AtomicUsize::new(0));
     let clock = Arc::new(Time::default());
@@ -623,7 +661,6 @@ async fn t3_admission_fixes_the_workflow_deadline() {
 }
 
 #[test]
-#[ignore = "pending #4: one ingress identity starts at most one run across trigger names"]
 fn t1_ingress_identity_is_global_across_triggers() {
     let rt = runtime(Arc::new(durable::memory::memory()), Registry::new(), Arc::new(Time::default()));
     let definition = yaml("  - done: { set: { ok: true } }")
@@ -639,7 +676,6 @@ fn t1_ingress_identity_is_global_across_triggers() {
 }
 
 #[tokio::test]
-#[ignore = "pending #4: a live prior schedule run makes the next slot an explicit skip"]
 async fn t1_live_schedule_run_prevents_overlap() {
     let clock = Arc::new(Time::default());
     let rt = runtime(Arc::new(durable::memory::memory()), Registry::new(), clock.clone());
