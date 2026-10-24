@@ -14,9 +14,9 @@
 //! deduplication, overlap, breaker, expiry) come from the store under test.
 use anyhow::{Context, ensure};
 use ouro_durable::{
-    Admission, Arming, ChildLink, CommitFault, Compatibility, FaultInjector, Fence, Fired, Firing, IdentityConflict,
-    Policy, Rearm, RunSnapshot, RunState, RunStore, TransactionalStore, Trigger, memory::MemoryBackend,
-    sqlite::SqliteBackend,
+    Admission, Arming, ChildLink, CommitFault, Compatibility, DefinitionTripped, FaultInjector, Fence, Fired, Firing,
+    IdentityConflict, Policy, Rearm, RunSnapshot, RunState, RunStore, TransactionalStore, Trigger,
+    memory::MemoryBackend, sqlite::SqliteBackend,
 };
 use owf::{
     durable::{CallState, Delivery, Record, StepOutcome, TaskResult},
@@ -204,12 +204,12 @@ struct TriggerView {
 #[derive(Debug, PartialEq, Eq)]
 struct CatalogView {
     active: i64,
-    previous: i64,
     epoch: i64,
     faults: i64,
     tripped: bool,
     trigger: Option<TriggerView>,
-    fallback: i64,
+    /// The epochs whose trip has a notice, oldest first.
+    notices: Vec<i64>,
 }
 #[derive(Debug, PartialEq, Eq, Deserialize)]
 #[serde(from = "Machine")]
@@ -276,7 +276,6 @@ struct ModelCopy {
 #[derive(Deserialize)]
 struct ModelCatalog {
     active: i64,
-    previous: i64,
     epoch: i64,
     faults: i64,
     tripped: bool,
@@ -287,7 +286,7 @@ struct ModelCatalog {
     catchup: i64,
     rearm: bool,
     armed: bool,
-    fallback: i64,
+    notices: Vec<i64>,
 }
 /// The model's `never`: a broadcast copy's expiry.
 const NEVER: i64 = 1_000_000_000;
@@ -359,7 +358,6 @@ impl From<Machine> for View {
             copies,
             catalog: CatalogView {
                 active: c.active,
-                previous: c.previous,
                 epoch: c.epoch,
                 faults: c.faults,
                 tripped: c.tripped,
@@ -370,7 +368,7 @@ impl From<Machine> for View {
                     catchup: c.catchup,
                     rearm: c.rearm,
                 }),
-                fallback: c.fallback,
+                notices: c.notices,
             },
             admissions: d.admissions,
             fired: d.fired,
@@ -420,6 +418,21 @@ impl State<StoreDriver> for View {
                 })
             })
             .transpose()?;
+        // A trip reports its own epoch and count, and each has one notice.
+        if let Some(t) = &defs.tripped {
+            ensure!(
+                (Some(t.version), t.epoch, t.faults) == (defs.active, defs.epoch, defs.consecutive_faults),
+                "the trip disagrees with its definition: {t:?}"
+            );
+        }
+        let notices = store
+            .notices(64)?
+            .into_iter()
+            .map(|(_, e)| {
+                ensure!(e["type"] == ouro_durable::TRIPPED && e["subject"] == NAME, "unexpected notice {e}");
+                e["data"]["epoch"].as_i64().context("notice epoch")
+            })
+            .collect::<anyhow::Result<_>>()?;
         let mut ingress = Vec::new();
         for i in 0..CALLS {
             let mut live = None;
@@ -439,12 +452,11 @@ impl State<StoreDriver> for View {
             copies,
             catalog: CatalogView {
                 active: defs.active.map_or(0, |v| v as i64),
-                previous: defs.previous.map_or(0, |v| v as i64),
                 epoch: defs.epoch as i64,
                 faults: i64::from(defs.consecutive_faults),
-                tripped: defs.tripped,
+                tripped: defs.tripped.is_some(),
                 trigger,
-                fallback: ticks(defs.fallback.get(SCHEDULE).and_then(|t| t.at_ms)),
+                notices,
             },
             admissions,
             fired,
@@ -582,10 +594,8 @@ impl StoreDriver {
         for v in 1..=3 {
             self.store.save_definition(NAME, &format!("definition{v}"))?;
         }
-        let arming = Arming {
-            triggers: BTreeMap::from([(SCHEDULE.to_string(), schedule_trigger(Some(2), 1, 0, 0, false))]),
-            fallback: BTreeMap::new(),
-        };
+        let arming =
+            Arming { triggers: BTreeMap::from([(SCHEDULE.to_string(), schedule_trigger(Some(2), 1, 0, 0, false))]) };
         ensure!(self.store.activate_with(NAME, 1, 0, &arming)?.is_some(), "initial activation");
         let ingress = Trigger { at_ms: None, types: vec![INGRESS.into()], state: json!({}) };
         ensure!(self.store.swap_trigger(INGRESS, None, Some(&ingress), &[], None, 0)?, "ingress trigger");
@@ -769,7 +779,7 @@ impl StoreDriver {
         match op {
             "admit" | "dry" | "replay" => {
                 let defs = self.store.definitions(NAME)?;
-                if value < 0 || defs.tripped || self.store.get(&run_id(r))?.is_some() {
+                if value < 0 || defs.tripped.is_some() || self.store.get(&run_id(r))?.is_some() {
                     return Ok(());
                 }
                 let mode = match op {
@@ -964,8 +974,16 @@ impl StoreDriver {
                 let mode = parent.runtime["mode"].as_i64().unwrap_or(0);
                 let a = self.admission(1, parent.input.as_i64().context("input")?, app, mode, None)?;
                 let link = ChildLink { parent: run_id(0), key: "child".into(), reference: "child".into() };
-                // The child's first lease stays with the parent's host.
-                let _ = self.write(fault, |s| s.start_child(&f, &a, &link, ms));
+                // The child's first lease stays with the parent's host. A
+                // tripped definition refuses it, typed, in the same commit.
+                let refusal = self.store.definitions(NAME)?.tripped.is_some() && self.valid(&f)?;
+                let (result, _) = self.write(fault, |s| s.start_child(&f, &a, &link, ms));
+                if refusal {
+                    ensure!(
+                        result.err().is_some_and(|e| e.is::<DefinitionTripped>()),
+                        "a tripped definition admitted a child"
+                    );
+                }
             }
             "finish" | "timeout" => {
                 let Some(f) = self.fence(w, r) else { return Ok(()) };
@@ -997,17 +1015,12 @@ impl StoreDriver {
                 }
                 let defs = self.store.definitions(NAME)?;
                 let version = i as u64 + 1;
-                let predecessor = if defs.active == Some(version) { defs.previous } else { defs.active };
                 let (catchup, rearm) = (value % 2, value >= 2);
-                // Version 1 has the schedule; a rollback to it arms it again.
+                // Version 1 has the schedule.
                 let mut arming = Arming::default();
                 if version == 1 {
                     let t = schedule_trigger(Some(self.now + 2), defs.epoch + 1, 0, catchup, rearm);
                     arming.triggers.insert(SCHEDULE.into(), t);
-                }
-                if predecessor == Some(1) {
-                    let t = schedule_trigger(Some(self.now + 2), defs.epoch + 2, 0, catchup, rearm);
-                    arming.fallback.insert(SCHEDULE.into(), t);
                 }
                 let (result, _) = self.write(fault, |s| s.activate_with(NAME, version, defs.epoch, &arming));
                 if !injected {
@@ -1018,7 +1031,7 @@ impl StoreDriver {
                 let defs = self.store.definitions(NAME)?;
                 let Some(t) = self.store.trigger(SCHEDULE)? else { return Ok(()) };
                 let Some(at) = t.at_ms else { return Ok(()) };
-                if value < 0 || at > ms || defs.tripped || t.state["epoch"] != json!(defs.epoch) {
+                if value < 0 || at > ms || defs.tripped.is_some() || t.state["epoch"] != json!(defs.epoch) {
                     return Ok(());
                 }
                 let slot = t.state["slot"].as_i64().context("slot")?;
@@ -1064,7 +1077,7 @@ impl StoreDriver {
                     Ok(false) => {}
                 }
                 let defs = self.store.definitions(NAME)?;
-                if value < 0 || defs.tripped || self.store.get(&run_id(r))?.is_some() {
+                if value < 0 || defs.tripped.is_some() || self.store.get(&run_id(r))?.is_some() {
                     return Ok(());
                 }
                 let t = self.store.trigger(INGRESS)?.context("ingress trigger")?;

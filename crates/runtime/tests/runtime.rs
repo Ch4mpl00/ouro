@@ -161,20 +161,37 @@ async fn dry_run_mocks_what_the_host_rule_marks_and_replay_calls_no_handlers() {
     assert_eq!(writes.load(Ordering::SeqCst), 1);
 }
 #[tokio::test]
-async fn breaker_rolls_back_after_configured_faults_and_success_resets_count() {
+async fn breaker_trips_after_configured_faults_and_success_resets_count() {
     let rt = runtime(Arc::new(durable::memory::memory()), Registry::new(), Arc::new(Time::default()));
     save(&rt, &yaml("  - ok: { set: { result: old } }"));
-    let bad = rt
-        .save("workflow", &yaml("  - fail: { raise: { error: { type: 'urn:test:failure', status: 500 } } }"))
-        .unwrap();
+    let flaky = "  - fail: { if: '${ .fail }', raise: { error: { type: 'urn:test:failure', status: 500 } } }";
+    let bad = rt.save("workflow", &yaml(flaky)).unwrap();
     rt.activate("workflow", bad.version).unwrap();
-    for n in 0..3 {
-        let id = format!("r{n}");
-        rt.start(&id, "workflow", Value::Null).unwrap();
-        assert!(matches!(rt.drive(&id, &CancellationToken::new()).await.unwrap(), Some(Status::Faulted(_))));
+    let stop = CancellationToken::new();
+    let run = |id: &'static str, fail: bool| {
+        rt.start(id, "workflow", json!({ "fail": fail })).unwrap();
+        rt.drive(id, &stop)
+    };
+    let faults = || rt.definitions("workflow").unwrap().consecutive_faults;
+    for id in ["f0", "f1"] {
+        assert!(matches!(run(id, true).await.unwrap(), Some(Status::Faulted(_))));
     }
-    assert_eq!(rt.definitions("workflow").unwrap().active, Some(1));
-    assert_eq!(rt.get("r0").unwrap().unwrap().admission.version, bad.version);
+    assert_eq!(faults(), 2);
+    assert!(matches!(run("s0", false).await.unwrap(), Some(Status::Completed(_))));
+    assert_eq!(faults(), 0, "a success resets the count");
+    // Admitted before the trip; it finishes after it.
+    rt.start("late", "workflow", json!({ "fail": true })).unwrap();
+    for id in ["f2", "f3", "f4"] {
+        assert!(matches!(run(id, true).await.unwrap(), Some(Status::Faulted(_))));
+    }
+    let d = rt.definitions("workflow").unwrap();
+    assert_eq!(d.active, Some(bad.version), "the breaker never picks another version");
+    let trip = d.tripped.expect("tripped at the configured threshold");
+    assert_eq!((trip.faults, trip.threshold, trip.run.as_str()), (3, 3, "f4"));
+    assert_eq!(rt.get("f0").unwrap().unwrap().admission.version, bad.version);
+    assert!(matches!(rt.drive("late", &CancellationToken::new()).await.unwrap(), Some(Status::Faulted(_))));
+    assert_eq!(faults(), 3, "a tripped breaker counts nothing more");
+    assert_eq!(rt.definitions("workflow").unwrap().tripped.unwrap().run, "f4");
 }
 #[tokio::test]
 async fn shutdown_releases_the_lease_and_unknown_writes_never_dispatch_again() {
@@ -834,4 +851,36 @@ async fn a_dry_run_dispatches_no_call_the_rule_marks() {
     let mocked: Vec<_> = dry.mocked.iter().map(|c| (c.task_path.as_str(), c.function.as_str())).collect();
     assert_eq!(mocked, [("/do/1/two", "write"), ("/do/2/three", "read")]);
     assert_eq!((writes.load(Ordering::SeqCst), reads.load(Ordering::SeqCst)), (1, 0), "only `one` was dispatched");
+}
+// The worker hands a trip's notice on by itself, polled beside the runs.
+#[tokio::test]
+async fn worker_hands_a_breaker_trip_to_the_event_sink() {
+    struct Sink(tokio::sync::mpsc::UnboundedSender<Value>);
+    #[async_trait::async_trait]
+    impl ouro_runtime::EventSink for Sink {
+        async fn emit(&self, event: &Value) -> Result<(), ouro_runtime::FunctionError> {
+            self.0.send(event.clone()).ok();
+            Ok(())
+        }
+    }
+    let (sent, mut received) = tokio::sync::mpsc::unbounded_channel();
+    let config = Config { breaker_threshold: 1, poll_interval: Duration::from_millis(5), ..Config::default() };
+    let store = Arc::new(durable::memory::memory());
+    let rt = Runtime::new(store, Arc::new(Registry::new()), config, Arc::new(Time::default()), tracer())
+        .unwrap()
+        .with_event_sink(Arc::new(Sink(sent)));
+    save(&rt, &yaml("  - fail: { raise: { error: { type: 'urn:test:failure', status: 500 } } }"));
+    rt.start("r", "workflow", Value::Null).unwrap();
+    let stop = CancellationToken::new();
+    let watch = async {
+        let event = tokio::time::timeout(Duration::from_secs(10), received.recv()).await;
+        stop.cancel();
+        event
+    };
+    let (result, event) = tokio::join!(rt.worker(stop.clone()), watch);
+    result.unwrap();
+    let event = event.expect("the worker handed the notice on").unwrap();
+    assert_eq!(event["type"], durable::TRIPPED);
+    assert_eq!((event["data"]["run"].as_str(), event["data"]["faults"].as_u64()), (Some("r"), Some(1)));
+    assert_eq!(rt.notify(&CancellationToken::new()).await.unwrap(), 0, "acknowledged by the worker");
 }

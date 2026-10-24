@@ -15,7 +15,8 @@ use async_trait::async_trait;
 use futures::{StreamExt, future::BoxFuture, stream::FuturesUnordered};
 use opentelemetry::{Context, global::BoxedTracer, trace::FutureExt};
 use ouro_durable::{
-    Admission, ChildLink, Clock, Compatibility, Definition, Fence, Lease, RunStore, SavedRun, Swept, SystemClock,
+    Admission, ChildLink, Clock, Compatibility, Definition, DefinitionTripped, Fence, Lease, RunStore, SavedRun, Swept,
+    SystemClock,
 };
 use owf::{
     durable::{CallEntry, CallFailure, Delivery},
@@ -93,6 +94,10 @@ pub struct Runtime {
     permits: Semaphore,
     function_permits: Arc<Semaphore>,
     executions: Mutex<BTreeMap<(String, u64), CancellationToken>>,
+    /// Per notice key, the sink failures so far and when to try it again.
+    /// In memory: another process, or a restart, may try sooner, which
+    /// at-least-once allows.
+    pub(crate) notice_backoff: Mutex<BTreeMap<String, (u32, i64)>>,
 }
 impl Runtime {
     /// Dependencies are built once by the embedding host. No exporter or
@@ -129,6 +134,7 @@ impl Runtime {
             function_permits: Arc::new(Semaphore::new(config.max_function_concurrency)),
             config,
             executions: Mutex::new(BTreeMap::new()),
+            notice_backoff: Mutex::new(BTreeMap::new()),
         })
     }
     pub fn embedded(path: impl AsRef<std::path::Path>, registry: Registry) -> anyhow::Result<Self> {
@@ -181,7 +187,9 @@ impl Runtime {
     }
     /// Activates a saved version in a new activation epoch, clearing a
     /// tripped breaker; its schedule's triggers replace the definition's
-    /// current ones in the same commit.
+    /// current ones in the same commit. Only an activation does either: a
+    /// tripped breaker reports (`definitions`, `notify`) and the host decides
+    /// which version, if any, to activate.
     pub fn activate(&self, name: &str, version: u64) -> anyhow::Result<()> {
         let definitions = self.store.definitions(name)?;
         let d = definitions.versions.get(&version).ok_or_else(|| anyhow::anyhow!("unknown definition version"))?;
@@ -482,6 +490,9 @@ impl Runtime {
         let mut sweep = tokio::time::Instant::now();
         let mut running: FuturesUnordered<BoxFuture<'_, (String, anyhow::Result<Option<Status>>)>> =
             FuturesUnordered::new();
+        // At most one hand-off of notices at a time, polled with the runs so
+        // a slow event sink never stalls their heartbeats.
+        let mut notifying: FuturesUnordered<BoxFuture<'_, anyhow::Result<usize>>> = FuturesUnordered::new();
         let mut ids = std::collections::BTreeSet::new();
         let mut failure = None;
         let shutdown = stop.child_token();
@@ -490,10 +501,13 @@ impl Runtime {
                 biased;
                 _=stop.cancelled()=>break,
                 Some((id,result))=running.next(),if !running.is_empty()=> {ids.remove(&id);if let Err(e)=result {failure=Some(e);break;}},
+                Some(result)=notifying.next(),if !notifying.is_empty()=> {if let Err(e)=result {failure=Some(e);break;}},
                 _=tick.tick()=> {
                     if sweep.elapsed()>=Duration::from_secs(3600) {if let Err(e)=self.sweep() {failure=Some(e);break;} sweep=tokio::time::Instant::now();}
                     // Due schedule slots: a range of the trigger index ending now.
                     if let Err(e)=self.fire_due() {failure=Some(e);break;}
+                    // Breaker trips and other notices, handed on to the host.
+                    if notifying.is_empty() {let token=shutdown.clone();notifying.push(Box::pin(async move {self.notify(&token).await}));}
                     let due=match self.store.due_as(self.clock.now_ms(),self.config.max_concurrency,&self.config.application) {Ok(due)=>due,Err(e)=>{failure=Some(e);break;}};
                     for id in due {
                         if ids.len()>=self.config.max_concurrency {break;}
@@ -504,6 +518,11 @@ impl Runtime {
         }
         shutdown.cancel();
         while let Some((_, result)) = running.next().await {
+            if let Err(e) = result {
+                failure = Some(e);
+            }
+        }
+        while let Some(result) = notifying.next().await {
             if let Err(e) = result {
                 failure = Some(e);
             }
@@ -600,10 +619,9 @@ impl Admitter {
     /// `active` at a place in a run tree.
     pub fn active_in(&self, id: &str, name: &str, input: Value, lineage: &Lineage) -> anyhow::Result<Admission> {
         let definitions = self.definitions.definitions(name)?;
-        anyhow::ensure!(
-            !definitions.tripped,
-            "{name} is tripped: its breaker found no version to roll back to; activate a version to resume"
-        );
+        if let Some(trip) = &definitions.tripped {
+            return Err(trip.refusal(name).into());
+        }
         let d = definitions
             .active
             .and_then(|v| definitions.versions.get(&v))
@@ -944,6 +962,12 @@ impl run::Children for ExecutionFunctions {
         owned: bool,
     ) -> Result<Child, CallFailure> {
         let interrupted = |e: anyhow::Error| CallFailure::Interrupted(WorkflowError::runtime(e.to_string()));
+        // A tripped definition admits no child: a definite, typed answer the
+        // parent may catch, never a retry. Other storage errors interrupt.
+        let refused = |e: anyhow::Error| match e.downcast_ref::<DefinitionTripped>() {
+            Some(tripped) => CallFailure::NotExecuted(tripped.error()),
+            None => interrupted(e),
+        };
         let store = &self.lease.store;
         let id = child_id(run_id, key);
         let done = format!("done:{id}");
@@ -976,11 +1000,11 @@ impl run::Children for ExecutionFunctions {
         };
         let now = self.lease.clock.now_ms();
         if !owned {
-            store.admit(&a, now).map_err(interrupted)?;
+            store.admit(&a, now).map_err(refused)?;
             return Ok(Child { id, done });
         }
         let link = ChildLink { parent: run_id.into(), key: key.into(), reference: key.into() };
-        if let Some(fence) = store.start_child(&self.lease.fence, &a, &link, now).map_err(interrupted)? {
+        if let Some(fence) = store.start_child(&self.lease.fence, &a, &link, now).map_err(refused)? {
             store.release(&fence, now).map_err(interrupted)?;
         }
         Ok(Child { id, done })

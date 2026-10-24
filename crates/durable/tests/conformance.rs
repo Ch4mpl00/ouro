@@ -175,3 +175,28 @@ fn run_rows_of_another_state_version_are_refused() {
         assert!(backend.compare_exchange(&current, &before.rows).unwrap());
     }
 }
+
+#[test]
+fn definitions_rows_of_an_earlier_layout_are_refused() {
+    use ouro_durable::RunStore;
+    let backend = Arc::new(MemoryBackend::default());
+    let s = TransactionalStore::new(backend.clone());
+    let d = s.save_definition("workflow", "yaml").unwrap();
+    s.activate("workflow", d.version).unwrap();
+    let key = ("definitions".to_string(), "workflow".to_string());
+    let before = backend.snapshot().unwrap();
+    let mut rows = before.rows.clone();
+    let row = rows.get_mut(&key).unwrap().as_object_mut().unwrap();
+    // The earlier layout: a predecessor and its triggers kept for a breaker
+    // rollback, a boolean trip, no version.
+    row.remove("version");
+    row.insert("previous".into(), serde_json::json!(null));
+    row.insert("fallback".into(), serde_json::json!({}));
+    row.insert("tripped".into(), serde_json::json!(true));
+    assert!(backend.compare_exchange(&before, &rows).unwrap());
+    let refused = s.definitions("workflow").unwrap_err().to_string();
+    assert!(refused.contains("unsupported layout"), "{refused}");
+    assert!(s.activate("workflow", d.version).is_err() && s.save_definition("workflow", "next").is_err());
+    assert!(s.admit(&conformance::admission("r"), 0).is_err(), "admission reads the definition's epoch");
+    assert_eq!(backend.snapshot().unwrap(), Snapshot { rows }, "a refused row is left as it is");
+}

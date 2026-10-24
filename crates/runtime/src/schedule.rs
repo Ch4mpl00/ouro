@@ -2,7 +2,8 @@
 //! `schedule` keeps in the store, armed in the commit that activates it;
 //! 2. firing due triggers (`every`, `cron`, `after`), with the missed-slot
 //! and overlap policies; 3. publishing an event to the runs listening for it
-//! and to event-triggered schedules (`on`), each ingress event at most once.
+//! and to event-triggered schedules (`on`), each ingress event at most once;
+//! 4. handing the store's notices (breaker trips) on to the host.
 //!
 //! The store holds generic triggers (`ouro_durable::Trigger`): indexed by
 //! the time they are next due and by the event types they react to, and
@@ -12,14 +13,14 @@
 //! index (a range ending now), and a publish reads the trigger index of the
 //! event's type.
 //!
-//! Every activation and every breaker rollback starts an activation epoch.
-//! The activation's commit replaces the definition's triggers with the
-//! activated version's (a version without a schedule leaves none) and stores
-//! those of its predecessor, which a rollback arms in the breaker's commit.
-//! Each trigger's state names its epoch, so a trigger of an older epoch is
-//! never the stored one again: it cannot fire, and an old run's end cannot
-//! re-arm the new epoch's trigger (the store re-arms only the exact trigger
-//! the run's firing stored).
+//! Every activation, and nothing else, starts an activation epoch. The
+//! activation's commit replaces the definition's triggers with the activated
+//! version's (a version without a schedule leaves none); a breaker trip
+//! removes them in its own commit, and only the next activation arms any
+//! again. Each trigger's state names its epoch, so a trigger of an older
+//! epoch is never the stored one again: it cannot fire, and an old run's end
+//! cannot re-arm the new epoch's trigger (the store re-arms only the exact
+//! trigger the run's firing stored).
 //!
 //! A slot's run id is derived from the slot (`schedule:<name>:every:<ms>`,
 //! `…:cron:<ms>`, `…:after:<epoch>:<n>`, `…:on:<digest of the events>`) and
@@ -47,6 +48,7 @@ use owf::{
 };
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
+use tokio_util::sync::CancellationToken;
 
 /// How many due triggers one call fires, and how many triggers one event
 /// may reach; more wait for the next tick.
@@ -96,17 +98,16 @@ fn active(definitions: &Definitions) -> anyhow::Result<Option<Schedule>> {
     Ok(model::parse_yaml(&d.yaml)?.schedule)
 }
 
-/// Whether a trigger belongs to the definition's current epoch.
+/// Whether a trigger belongs to the definition's current, untripped epoch.
 fn current(definitions: &Definitions, trigger: &Trigger) -> bool {
-    !definitions.tripped && trigger.state["epoch"] == json!(definitions.epoch)
+    definitions.tripped.is_none() && trigger.state["epoch"] == json!(definitions.epoch)
 }
 
 // ── 1. arming ──────────────────────────────────────────────────────────────
 
 /// The triggers `yaml`'s schedule arms for `name` in `epoch`. A version
-/// without a schedule arms none. `rollback`: armed later, by a breaker
-/// rollback, so a time trigger is due at once and first finds its slot.
-fn arming(name: &str, yaml: &str, epoch: u64, now: i64, rollback: bool) -> anyhow::Result<BTreeMap<String, Trigger>> {
+/// without a schedule arms none.
+fn arming(name: &str, yaml: &str, epoch: u64, now: i64) -> anyhow::Result<BTreeMap<String, Trigger>> {
     let wf = model::parse_yaml(yaml)?;
     let Some(s) = wf.schedule else { return Ok(BTreeMap::new()) };
     let state = |kind: &str, extra: Value| {
@@ -119,12 +120,10 @@ fn arming(name: &str, yaml: &str, epoch: u64, now: i64, rollback: bool) -> anyho
     let mut out = BTreeMap::new();
     for kind in ["every", "cron"] {
         if let Some(slot) = next_slot(&s, kind, now)? {
-            let trigger = if rollback {
-                Trigger { at_ms: Some(now), types: Vec::new(), state: state(kind, json!({ "rebase": true })) }
-            } else {
-                Trigger { at_ms: Some(slot), types: Vec::new(), state: state(kind, json!({})) }
-            };
-            out.insert(key(name, kind), trigger);
+            out.insert(
+                key(name, kind),
+                Trigger { at_ms: Some(slot), types: Vec::new(), state: state(kind, json!({})) },
+            );
         }
     }
     if s.after.is_some() {
@@ -140,23 +139,13 @@ fn arming(name: &str, yaml: &str, epoch: u64, now: i64, rollback: bool) -> anyho
 
 impl Runtime {
     /// Activates `version` of `name` in a new epoch: its triggers replace
-    /// the definition's ones in the activation's commit, and its
-    /// predecessor's are kept for a breaker rollback.
+    /// the definition's ones in the activation's commit.
     pub(crate) fn activate_armed(&self, name: &str, version: u64) -> anyhow::Result<()> {
         for _ in 0..16 {
             let definitions = self.store.definitions(name)?;
             let d = definitions.versions.get(&version).ok_or_else(|| anyhow::anyhow!("unknown definition version"))?;
-            let now = self.clock.now_ms();
-            let epoch = definitions.epoch + 1;
-            let triggers = arming(name, &d.yaml, epoch, now, false)?;
-            let predecessor =
-                if definitions.active == Some(version) { definitions.previous } else { definitions.active };
-            let fallback = match predecessor.and_then(|v| definitions.versions.get(&v)) {
-                Some(p) => arming(name, &p.yaml, epoch + 1, now, true)?,
-                None => BTreeMap::new(),
-            };
-            let arming = Arming { triggers, fallback };
-            if self.store.activate_with(name, version, definitions.epoch, &arming)?.is_some() {
+            let triggers = arming(name, &d.yaml, definitions.epoch + 1, self.clock.now_ms())?;
+            if self.store.activate_with(name, version, definitions.epoch, &Arming { triggers })?.is_some() {
                 return Ok(());
             }
         }
@@ -226,16 +215,6 @@ impl Runtime {
         // Replaced by a newer epoch since it was read: its swap would fail.
         let Some(schedule) = active(&definitions)?.filter(|_| current(&definitions, t)) else { return Ok(None) };
         let firing = |next, admit, rearm, busy| moved(k, t, next, admit, rearm, busy);
-        if t.state.get("rebase").is_some() {
-            // Armed by a rollback: find the first slot from now; no run.
-            let mut next = t.clone();
-            if let Value::Object(m) = &mut next.state {
-                m.remove("rebase");
-            }
-            next.at_ms = next_slot(&schedule, kind, now)?;
-            self.store.fire(&firing(&next, &[], None, None), now)?;
-            return Ok(None);
-        }
         let mut next = t.clone();
         let mut rearm = None;
         let mut busy = t.clone();
@@ -441,4 +420,92 @@ fn consume(strategy: &Strategy, events: &[Value]) -> anyhow::Result<Option<Optio
         _ if consumer.done() => Some(Some(consumed)),
         _ => Some(None),
     })
+}
+
+// ── 4. notices ─────────────────────────────────────────────────────────────
+
+/// How many notices one call hands on; more wait for the next tick.
+const NOTICES: usize = 64;
+/// A notice the sink refused waits 1 s, then twice as long after each
+/// further failure, at most five minutes.
+const NOTICE_RETRY_MS: i64 = 1_000;
+const NOTICE_RETRY_MAX_MS: i64 = 300_000;
+
+/// When a notice that failed `failures` times may be tried again.
+fn retry_at(now: i64, failures: u32) -> i64 {
+    let delay = NOTICE_RETRY_MS.saturating_mul(1_i64 << failures.saturating_sub(1).min(20));
+    now.saturating_add(delay.min(NOTICE_RETRY_MAX_MS))
+}
+
+impl Runtime {
+    /// Hands each pending notice of the store on, oldest first: a breaker
+    /// trip (`ouro_durable::TRIPPED`, `Trip::event`), committed with the trip
+    /// itself. It goes to the runs and `on` schedules listening for its type,
+    /// as `publish` does, then to the event sink, and is then acknowledged.
+    /// At least once: a hand-off interrupted before its acknowledgement is
+    /// repeated with the same `source` + `id`, which `publish` deduplicates
+    /// and a sink must. A sink failure leaves the notice for a later call,
+    /// after a capped exponential backoff of its own (1 s doubling to five
+    /// minutes); a storage error is returned. The worker calls it on every
+    /// tick; returns how many notices were acknowledged.
+    pub async fn notify(&self, stop: &CancellationToken) -> anyhow::Result<usize> {
+        let notices = self.store.notices(NOTICES)?;
+        // Forget the backoff of notices no longer pending (acknowledged
+        // elsewhere), so the map stays bounded by the pending page.
+        self.notice_backoff.lock().unwrap().retain(|k, _| notices.iter().any(|(n, _)| n == k));
+        let mut acknowledged = 0;
+        for (k, event) in notices {
+            if stop.is_cancelled() {
+                break;
+            }
+            let now = self.clock.now_ms();
+            if self.notice_backoff.lock().unwrap().get(&k).is_some_and(|(_, at)| *at > now) {
+                continue;
+            }
+            publish(&*self.store, &self.admitter(), &event, now)?;
+            if let Some(sink) = &self.capabilities.sink {
+                let sent = tokio::select! {
+                    biased;
+                    _ = stop.cancelled() => break,
+                    sent = sink.emit(&event) => sent,
+                };
+                if let Err(e) = sent {
+                    let mut backoff = self.notice_backoff.lock().unwrap();
+                    let failures = backoff.get(&k).map_or(0, |(n, _)| *n).saturating_add(1);
+                    backoff.insert(k, (failures, retry_at(self.clock.now_ms(), failures)));
+                    drop(backoff);
+                    self.noticed(&event, Some(&e.to_string()));
+                    continue;
+                }
+            }
+            self.noticed(&event, None);
+            if self.store.acknowledge(&k)? {
+                acknowledged += 1;
+            }
+            self.notice_backoff.lock().unwrap().remove(&k);
+        }
+        Ok(acknowledged)
+    }
+
+    fn noticed(&self, event: &Value, failure: Option<&str>) {
+        let text = |k: &str| event[k].as_str().unwrap_or_default().to_string();
+        let mut attributes = vec![
+            KeyValue::new("ouro.event.type", text("type")),
+            KeyValue::new("ouro.event.source", text("source")),
+            KeyValue::new("ouro.event.id", text("id")),
+        ];
+        if let Some(failure) = failure {
+            attributes.push(KeyValue::new("ouro.notice.failure", failure.to_string()));
+        }
+        telemetry::mark(&self.tracer, if failure.is_some() { "notice failed" } else { "notice" }, attributes);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn notice_retries_back_off_exponentially_up_to_a_cap() {
+        let delays: Vec<i64> = [1, 2, 3, 9, 10, u32::MAX].iter().map(|n| super::retry_at(0, *n)).collect();
+        assert_eq!(delays, vec![1_000, 2_000, 4_000, 256_000, 300_000, 300_000]);
+    }
 }

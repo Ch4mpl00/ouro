@@ -595,44 +595,150 @@ async fn schedule_on_starts_a_run_per_match() {
 }
 
 // Activation epochs: a version without a schedule removes the triggers in
-// its activation's commit; the breaker's rollback re-arms the predecessor's
-// in its own commit; with no predecessor the definition trips.
+// its activation's commit. The breaker reports and never rolls back: a trip
+// stops new runs and the schedule in its own commit, is visible in the runs
+// API and is handed on as a CloudEvent (to the event sink and to an `on`
+// schedule); only an activation, of the version the host picks, clears it.
 #[tokio::test]
-async fn rollback_rearms_the_predecessor_schedule_and_no_predecessor_trips() {
+async fn a_trip_reports_and_only_an_activation_clears_it() {
+    struct Sink {
+        seen: Mutex<Vec<Value>>,
+        failures: AtomicUsize,
+    }
+    #[async_trait]
+    impl EventSink for Sink {
+        async fn emit(&self, event: &Value) -> Result<(), FunctionError> {
+            self.seen.lock().unwrap().push(event.clone());
+            if self.failures.load(Ordering::SeqCst) > 0 {
+                self.failures.fetch_sub(1, Ordering::SeqCst);
+                return Err(FunctionError::communication(503, "sink unavailable"));
+            }
+            Ok(())
+        }
+    }
+    let sink = Arc::new(Sink { seen: Mutex::default(), failures: AtomicUsize::new(1) });
     let f = fixture();
+    let rt = f.rt.with_event_sink(sink.clone());
     let ok = "schedule: { every: PT1M }\ndo: [ { a: { set: { ok: true } } } ]";
-    let boom = "do: [ { boom: { raise: { error: { type: 'urn:t:boom', status: 500 } } } } ]";
-    save(&f.rt, "flaky", &doc("flaky", ok));
-    assert_eq!(f.rt.triggers("flaky").unwrap().len(), 1);
-    save(&f.rt, "flaky", &doc("flaky", boom));
-    assert!(f.rt.triggers("flaky").unwrap().is_empty(), "removed with the activation");
+    let boom = "schedule: { every: PT1M }\ndo: [ { boom: { raise: { error: { type: 'urn:t:boom', status: 500 } } } } ]";
+    save(&rt, "flaky", &doc("flaky", ok));
+    save(&rt, "flaky", &doc("flaky", "do: [ { a: { set: { ok: true } } } ]"));
+    assert!(rt.triggers("flaky").unwrap().is_empty(), "removed with the activation");
+    save(&rt, "flaky", &doc("flaky", boom));
+    assert_eq!(rt.triggers("flaky").unwrap().len(), 1);
+    // The host's own reaction, a workflow started once per trip.
+    let watch = "schedule: { on: { one: { with: { type: ouro.definition.tripped } } } }\ndo: [ { a: { set: { tripped: '${ .[0] }' } } } ]";
+    save(&rt, "watch", &doc("watch", watch));
     for n in 0..3 {
         let id = format!("boom{n}");
-        f.rt.start(&id, "flaky", json!({})).unwrap();
-        assert!(matches!(settle(&f.rt, &id).await, Some(Status::Faulted(_))));
+        rt.start(&id, "flaky", json!({})).unwrap();
+        assert!(matches!(settle(&rt, &id).await, Some(Status::Faulted(_))));
     }
-    let d = f.rt.definitions("flaky").unwrap();
-    assert_eq!((d.active, d.epoch), (Some(1), 3), "rolled back in a new epoch");
-    assert_eq!(f.rt.triggers("flaky").unwrap().len(), 1, "re-armed with the rollback");
-    // The re-armed trigger first finds its slot, then fires as before.
-    assert!(f.rt.fire_due().unwrap().is_empty());
-    f.time.set(60_000);
-    assert_eq!(f.rt.fire_due().unwrap(), vec!["schedule:flaky:every:60000".to_string()]);
-    // Nothing to roll back to: the definition trips and its schedule stops.
-    save(&f.rt, "lonely", &doc("lonely", &boom.replace("do:", "schedule: { every: PT1M }\ndo:")));
-    for n in 0..3 {
-        let id = format!("lonely{n}");
-        f.rt.start(&id, "lonely", json!({})).unwrap();
-        settle(&f.rt, &id).await;
-    }
-    assert!(f.rt.definitions("lonely").unwrap().tripped, "visible in the runs API");
-    assert!(f.rt.triggers("lonely").unwrap().is_empty());
-    assert!(f.rt.start("refused", "lonely", json!({})).unwrap_err().to_string().contains("tripped"));
+    let d = rt.definitions("flaky").unwrap();
+    assert_eq!((d.active, d.epoch), (Some(3), 3), "no rollback and no new epoch");
+    let trip = d.tripped.clone().expect("visible in the runs API");
+    assert_eq!((trip.version, trip.epoch, trip.faults, trip.threshold), (3, 3, 3, 3));
+    assert_eq!((trip.run.as_str(), trip.reason.type_.as_str()), ("boom2", "urn:t:boom"));
+    assert!(rt.triggers("flaky").unwrap().is_empty(), "its schedule stops");
+    assert!(rt.start("refused", "flaky", json!({})).unwrap_err().to_string().contains("tripped"));
     f.time.set(10_000_000);
-    assert!(!f.rt.fire_due().unwrap().iter().any(|id| id.contains("lonely")));
-    f.rt.activate("lonely", 1).unwrap();
-    assert!(!f.rt.definitions("lonely").unwrap().tripped, "a new activation clears it");
-    assert!(f.rt.start("accepted", "lonely", json!({})).is_ok());
+    assert!(!rt.fire_due().unwrap().iter().any(|id| id.contains("flaky")));
+    // A failing sink leaves the notice, retried after its own backoff (1 s
+    // after the first failure) with the same identity, which starts the
+    // host's workflow once.
+    let stop = CancellationToken::new();
+    assert_eq!(rt.notify(&stop).await.unwrap(), 0);
+    assert_eq!(rt.notify(&stop).await.unwrap(), 0, "backing off");
+    f.time.set(10_000_999);
+    assert_eq!(rt.notify(&stop).await.unwrap(), 0, "still backing off");
+    assert_eq!(sink.seen.lock().unwrap().len(), 1, "not offered to the sink while backing off");
+    f.time.set(10_001_000);
+    assert_eq!(rt.notify(&stop).await.unwrap(), 1);
+    assert_eq!(rt.notify(&stop).await.unwrap(), 0, "acknowledged");
+    let seen = sink.seen.lock().unwrap().clone();
+    assert_eq!(seen.len(), 2);
+    assert_eq!(seen[0], seen[1]);
+    assert_eq!(seen[0], trip.event("flaky"));
+    assert_eq!(seen[0]["type"], durable::TRIPPED);
+    let watched = rt.list(Some("watch"), "").unwrap();
+    assert_eq!(watched.len(), 1, "one run per trip: {watched:?}");
+    let id = watched[0].admission.id.clone();
+    let output = completed(settle(&rt, &id).await);
+    assert_eq!(output["tripped"]["run"], "boom2");
+    assert_eq!(output["tripped"]["faults"], 3);
+    // The host decides: here it activates the earlier version, in a new epoch.
+    rt.activate("flaky", 1).unwrap();
+    let d = rt.definitions("flaky").unwrap();
+    assert!(d.tripped.is_none() && d.epoch == 4 && d.active == Some(1), "a new activation clears it");
+    assert_eq!(rt.triggers("flaky").unwrap().len(), 1);
+    rt.start("accepted", "flaky", json!({})).unwrap();
+    assert_eq!(completed(settle(&rt, "accepted").await), json!({"ok": true}));
+}
+
+// A tripped definition admits no child either: `run: workflow` answers with
+// a typed error, never "no workflow" and never a retry. A parent may catch
+// it; uncaught, it faults the parent, which counts toward the parent's own
+// breaker as an unhandled error.
+#[tokio::test]
+async fn children_of_a_tripped_definition_are_refused_with_a_typed_error() {
+    let f = fixture();
+    let rt = &f.rt;
+    save(rt, "broken", &doc("broken", "do: [ { boom: { raise: { error: { type: 'urn:t:boom', status: 500 } } } } ]"));
+    for n in 0..3 {
+        let id = format!("broken{n}");
+        rt.start(&id, "broken", json!({})).unwrap();
+        settle(rt, &id).await;
+    }
+    let epoch = rt.definitions("broken").unwrap().tripped.expect("tripped").epoch;
+    let refused = rt.start("direct", "broken", json!({})).unwrap_err();
+    let refused = refused.downcast_ref::<durable::DefinitionTripped>().expect("typed");
+    assert_eq!((refused.name.as_str(), refused.epoch), ("broken", epoch));
+    save(
+        rt,
+        "careful",
+        &doc(
+            "careful",
+            r#"do:
+  - owned:
+      try: [ { sub: { run: { workflow: { namespace: test, name: broken, version: latest } } } } ]
+      catch:
+        errors: { with: { type: 'urn:ouro:errors:definition.tripped' } }
+        as: e
+        do: [ { keep: { set: '${ { type: $e.type, status: $e.status, detail: $e.detail } }' } } ]
+  - independent:
+      try: [ { fire: { run: { workflow: { namespace: test, name: broken, version: '1.0.0' }, await: false } } } ]
+      catch:
+        errors: { with: { type: 'urn:ouro:errors:definition.tripped' } }
+        do: [ { keep: { set: '${ . + { independent: "refused" } }' } } ]"#,
+        ),
+    );
+    rt.start("careful", "careful", json!({})).unwrap();
+    let out = completed(settle(rt, "careful").await);
+    assert_eq!(out["type"], durable::TRIPPED_ERROR);
+    assert_eq!(out["status"], 409);
+    let detail = out["detail"].as_str().unwrap();
+    assert!(detail.contains("broken") && detail.contains(&format!("epoch {epoch}")), "{detail}");
+    assert_eq!(out["independent"], "refused");
+    assert_eq!(rt.list(Some("broken"), "").unwrap().len(), 3, "no child was admitted");
+    save(
+        rt,
+        "careless",
+        &doc("careless", "do: [ { sub: { run: { workflow: { namespace: test, name: broken, version: latest } } } } ]"),
+    );
+    rt.start("careless", "careless", json!({})).unwrap();
+    match settle(rt, "careless").await {
+        Some(Status::Faulted(e)) => assert_eq!(e.type_, durable::TRIPPED_ERROR),
+        other => panic!("expected the parent to fault, got {other:?}"),
+    }
+    let parent = rt.definitions("careless").unwrap();
+    assert_eq!((parent.consecutive_faults, parent.tripped.is_none()), (1, true), "an unhandled error of the parent");
+    // The host's activation clears the trip; children are admitted again.
+    rt.activate("broken", 1).unwrap();
+    rt.start("careless-again", "careless", json!({})).unwrap();
+    match settle(rt, "careless-again").await {
+        Some(Status::Faulted(e)) => assert_eq!(e.type_, "urn:t:boom", "the child ran and faulted"),
+        other => panic!("expected the child's own fault, got {other:?}"),
+    }
 }
 
 #[tokio::test]

@@ -105,6 +105,27 @@ fn find_run(rows: &mut dyn Transaction, id: &str) -> anyhow::Result<Option<Store
 fn run(rows: &mut dyn Transaction, id: &str) -> anyhow::Result<StoredRun> {
     find_run(rows, id)?.ok_or_else(|| anyhow::anyhow!("unknown run {id}"))
 }
+/// The layout version of a `definitions` row. The earlier layout (none: it
+/// kept a predecessor and its triggers for a breaker rollback, and a boolean
+/// trip) is refused, never read as a definition that cannot be tripped.
+const DEFINITIONS_VERSION: u64 = 2;
+fn load_definitions(rows: &mut dyn Transaction, name: &str) -> anyhow::Result<Option<Definitions>> {
+    let Some(mut value) = rows.get("definitions", name)? else { return Ok(None) };
+    let version = value.as_object_mut().and_then(|m| m.remove("version")).and_then(|v| v.as_u64());
+    anyhow::ensure!(
+        version == Some(DEFINITIONS_VERSION),
+        "unsupported layout {} of the definitions row of {name} (expected {DEFINITIONS_VERSION}); earlier layouts are not converted",
+        version.map_or_else(|| "none".into(), |v| v.to_string())
+    );
+    Ok(Some(serde_json::from_value(value)?))
+}
+fn store_definitions(rows: &mut dyn Transaction, name: &str, defs: &Definitions) -> anyhow::Result<()> {
+    let mut value = serde_json::to_value(defs)?;
+    if let Value::Object(m) = &mut value {
+        m.insert("version".into(), json!(DEFINITIONS_VERSION));
+    }
+    rows.put("definitions", name, &value)
+}
 fn component(value: &str) -> String {
     value.as_bytes().iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -281,15 +302,19 @@ fn claim_run(snapshot: &mut StoredRun, now: i64, owner: &str) -> anyhow::Result<
     Ok(fence)
 }
 /// Admits a run once. Its admission instant and the activation epoch it
-/// belongs to (when it runs the active version) are fixed here.
+/// belongs to (when it runs the active version) are fixed here. A tripped
+/// definition admits no new run, of any version and by any path, in the
+/// same commit that reads the trip; an existing run is still joined.
 fn insert(rows: &mut dyn Transaction, admission: &Admission, now: i64) -> anyhow::Result<bool> {
     if let Some(existing) = find_run(rows, &admission.id)? {
         anyhow::ensure!(existing.run.admission.name == admission.name, "run already belongs to another definition");
         return Ok(false);
     }
-    let epoch = get::<Definitions>(rows, "definitions", &admission.name)?
-        .filter(|d| d.active == Some(admission.version))
-        .map(|d| d.epoch);
+    let defs = load_definitions(rows, &admission.name)?;
+    if let Some(trip) = defs.as_ref().and_then(|d| d.tripped.as_ref()) {
+        return Err(trip.refusal(&admission.name).into());
+    }
+    let epoch = defs.filter(|d| d.active == Some(admission.version)).map(|d| d.epoch);
     store_run(
         rows,
         &StoredRun {
@@ -786,21 +811,19 @@ fn activate(
     epoch: Option<u64>,
     arming: &Arming,
 ) -> anyhow::Result<Option<Definitions>> {
-    let mut defs: Definitions = get(rows, "definitions", name)?.unwrap_or_default();
+    let mut defs = load_definitions(rows, name)?.unwrap_or_default();
     anyhow::ensure!(defs.versions.contains_key(&version), "unknown definition version");
     if epoch.is_some_and(|e| e != defs.epoch) {
         return Ok(None);
     }
-    if defs.active != Some(version) {
-        defs.previous = defs.active;
-    }
+    // The only transition that starts an epoch and the only one that clears
+    // a trip. A trip's notice stays until the host acknowledges it.
     defs.active = Some(version);
     defs.epoch = defs.epoch.checked_add(1).ok_or_else(|| anyhow::anyhow!("activation epoch overflow"))?;
     defs.consecutive_faults = 0;
-    defs.tripped = false;
+    defs.tripped = None;
     arm(rows, &mut defs, &arming.triggers)?;
-    defs.fallback = arming.fallback.clone();
-    put(rows, "definitions", name, &defs)?;
+    store_definitions(rows, name, &defs)?;
     Ok(Some(defs))
 }
 
@@ -872,39 +895,53 @@ fn terminate(rows: &mut dyn Transaction, id: &str, status: &Status, now: i64) ->
     }
     lifecycle(rows, id, status, now)
 }
+/// The notice of a trip, keyed by its time, then the definition and epoch.
+fn notice_key(name: &str, trip: &Trip) -> String {
+    timed(trip.at_ms, &format!("{}:{:016x}", component(name), trip.epoch))
+}
 /// A terminal outcome's breaker observation, in the terminal commit. Only a
-/// run admitted in the active version's current epoch counts.
-fn breaker(rows: &mut dyn Transaction, run: &SavedRun, fault: Option<bool>, threshold: u32) -> anyhow::Result<()> {
+/// run admitted in the active version's current epoch counts, and only
+/// while the breaker has not tripped. A trip reports, and nothing else: the
+/// active version and the epoch stay, the triggers go, and the notice is
+/// stored in this commit, so a trip is never committed unreported.
+fn breaker(
+    rows: &mut dyn Transaction,
+    run: &SavedRun,
+    fault: Option<&WorkflowError>,
+    success: bool,
+    threshold: u32,
+    now: i64,
+) -> anyhow::Result<()> {
     let name = &run.admission.name;
-    let Some(mut defs) = get::<Definitions>(rows, "definitions", name)? else {
+    let Some(mut defs) = load_definitions(rows, name)? else {
         return Ok(());
     };
-    if defs.active != Some(run.admission.version) || run.epoch != Some(defs.epoch) {
+    if defs.active != Some(run.admission.version) || run.epoch != Some(defs.epoch) || defs.tripped.is_some() {
         return Ok(());
     }
     match fault {
-        Some(false) if defs.consecutive_faults > 0 => defs.consecutive_faults = 0,
-        Some(true) => {
+        None if success && defs.consecutive_faults > 0 => defs.consecutive_faults = 0,
+        Some(reason) => {
             defs.consecutive_faults = defs.consecutive_faults.saturating_add(1);
-            if defs.consecutive_faults >= threshold.max(1) {
-                defs.consecutive_faults = 0;
-                if let Some(previous) = defs.previous.take() {
-                    // Rollback: the predecessor in a new epoch, with its triggers.
-                    defs.active = Some(previous);
-                    defs.epoch =
-                        defs.epoch.checked_add(1).ok_or_else(|| anyhow::anyhow!("activation epoch overflow"))?;
-                    let fallback = std::mem::take(&mut defs.fallback);
-                    arm(rows, &mut defs, &fallback)?;
-                } else {
-                    // Nothing to roll back to: no new runs, no schedule.
-                    defs.tripped = true;
-                    arm(rows, &mut defs, &BTreeMap::new())?;
-                }
+            let threshold = threshold.max(1);
+            if defs.consecutive_faults >= threshold {
+                let trip = Trip {
+                    version: run.admission.version,
+                    epoch: defs.epoch,
+                    faults: defs.consecutive_faults,
+                    threshold,
+                    run: run.admission.id.clone(),
+                    reason: reason.clone(),
+                    at_ms: now,
+                };
+                arm(rows, &mut defs, &BTreeMap::new())?;
+                rows.put("notice", &notice_key(name, &trip), &trip.event(name))?;
+                defs.tripped = Some(trip);
             }
         }
-        _ => return Ok(()),
+        None => return Ok(()),
     }
-    put(rows, "definitions", name, &defs)
+    store_definitions(rows, name, &defs)
 }
 
 // ── 6. the RunStore implementation ─────────────────────────────────────────
@@ -1148,11 +1185,11 @@ impl RunStore for TransactionalStore {
                 // Cancellation and infrastructure interruptions (including
                 // their exhaustion) are not faults of the version.
                 let fault = match &status {
-                    Status::Completed(_) => Some(false),
-                    Status::Faulted(_) if !matches!(outcome, Status::Interrupted(_)) => Some(true),
+                    Status::Faulted(e) if !matches!(outcome, Status::Interrupted(_)) => Some(e),
                     _ => None,
                 };
-                breaker(rows, &s.run, fault, threshold)?;
+                let success = matches!(status, Status::Completed(_));
+                breaker(rows, &s.run, fault, success, threshold, now)?;
                 terminate(rows, &f.run_id, &status, now)?;
             } else {
                 lifecycle(rows, &f.run_id, &status, now)?;
@@ -1352,7 +1389,7 @@ impl RunStore for TransactionalStore {
 
     fn save_definition(&self, name: &str, yaml: &str) -> anyhow::Result<Definition> {
         self.update(|rows| {
-            let mut defs: Definitions = get(rows, "definitions", name)?.unwrap_or_default();
+            let mut defs = load_definitions(rows, name)?.unwrap_or_default();
             let version = defs
                 .versions
                 .last_key_value()
@@ -1360,7 +1397,7 @@ impl RunStore for TransactionalStore {
                 .ok_or_else(|| anyhow::anyhow!("definition version overflow"))?;
             let d = Definition { name: name.into(), version, yaml: yaml.into() };
             defs.versions.insert(version, d.clone());
-            put(rows, "definitions", name, &defs)?;
+            store_definitions(rows, name, &defs)?;
             Ok(d)
         })
     }
@@ -1377,6 +1414,19 @@ impl RunStore for TransactionalStore {
         self.update(|rows| activate(rows, name, version, Some(epoch), arming))
     }
     fn definitions(&self, name: &str) -> anyhow::Result<Definitions> {
-        self.update(|rows| Ok(get(rows, "definitions", name)?.unwrap_or_default()))
+        self.update(|rows| Ok(load_definitions(rows, name)?.unwrap_or_default()))
+    }
+    // One ordered range read of at most `limit` notice rows.
+    fn notices(&self, limit: usize) -> anyhow::Result<Vec<(String, Value)>> {
+        self.update(|rows| Ok(rows.scan("notice", "", None, limit)?.into_iter().map(|((_, k), v)| (k, v)).collect()))
+    }
+    fn acknowledge(&self, key: &str) -> anyhow::Result<bool> {
+        self.update(|rows| {
+            if rows.get("notice", key)?.is_none() {
+                return Ok(false);
+            }
+            rows.delete("notice", key)?;
+            Ok(true)
+        })
     }
 }
