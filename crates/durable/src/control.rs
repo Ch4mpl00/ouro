@@ -1,0 +1,130 @@
+//! Store-only operator commands and bounded observations. Authorization belongs
+//! to the embedding host; request identities make ambiguous commits retryable.
+use crate::{RunSnapshot, RunState, SavedRun, Trigger};
+use owf::{durable::CallEntry, events::PendingWait};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::collections::BTreeMap;
+
+pub const MAX_PAGE: usize = 1_000;
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Request {
+    pub id: String,
+    pub actor: String,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum Command {
+    /// Cancels the run and its transitive owned descendants atomically.
+    Cancel {
+        run: String,
+    },
+    Pause {
+        definition: String,
+        note: String,
+    },
+    Resume {
+        definition: String,
+    },
+    Stop {
+        enabled: bool,
+    },
+    Respond {
+        run: String,
+        wait: String,
+        event: Value,
+    },
+}
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum Reply {
+    Changed(bool),
+    Responded(Option<String>),
+}
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Entry {
+    pub request: Request,
+    pub command: Command,
+    pub at_ms: i64,
+    pub reply: Reply,
+}
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ManualTrip {
+    pub actor: String,
+    pub reason: String,
+    pub note: String,
+}
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub(crate) struct Paused {
+    pub epoch: u64,
+    pub triggers: BTreeMap<String, Trigger>,
+}
+
+#[derive(Debug)]
+pub struct Stopped;
+impl std::fmt::Display for Stopped {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("runtime emergency stop is set")
+    }
+}
+impl std::error::Error for Stopped {}
+
+/// Cursors are opaque and bound to their query. Pages examine at most `limit`
+/// index entries: combined residual filters may yield an empty page with a
+/// continuation. Keep paging until `next` is absent.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Cursor {
+    pub(crate) query: String,
+    pub(crate) after: String,
+}
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Page<T> {
+    pub items: Vec<T>,
+    pub next: Option<Cursor>,
+}
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Runs {
+    pub definition: Option<String>,
+    pub state: Option<RunState>,
+    pub parent: Option<String>,
+    /// Inclusive admission instant (end instant for history).
+    pub since_ms: Option<i64>,
+    /// Exclusive admission instant (end instant for history).
+    pub before_ms: Option<i64>,
+}
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Waits {
+    pub definition: Option<String>,
+    pub run: Option<String>,
+    pub event_type: Option<String>,
+    pub since_ms: Option<i64>,
+    pub before_ms: Option<i64>,
+}
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Wait {
+    pub run: String,
+    pub definition: String,
+    pub key: String,
+    pub waiting: PendingWait,
+}
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Inspection {
+    pub snapshot: RunSnapshot,
+    pub calls: Vec<CallEntry>,
+    pub waits: BTreeMap<String, PendingWait>,
+    pub children: Vec<SavedRun>,
+    pub budget_spent: u64,
+    pub budget_limit: Option<u64>,
+    /// Existing pinned identifiers, if the host supplied them. Creating span
+    /// context and new observability fields belongs to issue #20.
+    pub trace_id: Option<String>,
+    pub span_id: Option<String>,
+}
+/// Counts cover at most the supplied number of indexed entries. `next` means
+/// these are lower bounds; pass it back to accumulate the next bounded page.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Counts {
+    pub states: BTreeMap<String, usize>,
+    pub next: Option<Cursor>,
+}

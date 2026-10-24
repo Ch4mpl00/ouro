@@ -156,7 +156,8 @@ use std::collections::BTreeMap;
 /// pinned function bindings.
 /// 7: run rows track their admitting trigger and maintain live-run indexes;
 /// one buffered firing per trigger is stored separately (queue layout 1).
-pub const VERSION: u32 = 7;
+/// 8: current listen matching contexts, terminal budget counts and control indexes.
+pub const VERSION: u32 = 8;
 
 /// The key of a run's `Record::Exceeded`.
 pub const EXCEEDED: &str = "exceeded";

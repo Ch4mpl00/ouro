@@ -15,6 +15,14 @@ pub fn seed(backend: &Arc<dyn AtomicBackend>, size: usize) -> anyhow::Result<()>
         store.register_wait(&f, &["unrelated".into()], now)?;
         // Unfinished seeds also subscribe to published events of another type.
         store.subscribe(&f, "listen", &["unrelated".into()], now)?;
+        let mut wait = ouro_durable::conformance::control_wait();
+        wait.types = vec!["unrelated".into()];
+        if let owf::model::Strategy::One(filter) = &mut wait.strategy {
+            filter.with.insert("type".into(), json!("unrelated"));
+        }
+        wait.since_ms = now;
+        wait.timeout_ms = None;
+        store.describe_wait(&f, "listen", &wait, now)?;
         let outcome = if mode == 1 {
             Status::Completed(json!(42))
         } else {
@@ -35,6 +43,14 @@ pub fn seed(backend: &Arc<dyn AtomicBackend>, size: usize) -> anyhow::Result<()>
                     let mut value = value.clone();
                     value["run"]["admission"]["id"] = json!(id);
                     tx.put(kind, &id, &value)?;
+                } else if kind.starts_with("control_wait") && value.get("run") == Some(&json!(original)) {
+                    let mut value = value.clone();
+                    value["run"] = json!(id);
+                    tx.put(
+                        &kind.replace(&hex(&original), &hex(&id)),
+                        &key.replace(&hex(&original), &hex(&id)),
+                        &value,
+                    )?;
                 } else if kind.contains(&hex(&original)) {
                     // The run's own rows (its records), partitioned by its id.
                     tx.put(&kind.replace(&hex(&original), &hex(&id)), key, value)?;

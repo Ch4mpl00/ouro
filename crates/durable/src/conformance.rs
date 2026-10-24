@@ -704,6 +704,7 @@ pub fn run_all(factory: impl Fn(&str) -> anyhow::Result<TestStore>) -> anyhow::R
         .extend(["listen recovery before and after every interpreter commit", "held delivery and catchable timeout"]);
     budgets(&factory, &mut report)?;
     overlap_policies(&factory, &mut report)?;
+    controls(&factory, &mut report)?;
     Ok(report)
 }
 
@@ -963,6 +964,7 @@ fn decisions(factory: &impl Fn(&str) -> anyhow::Result<TestStore>, report: &mut 
     let d = s.definitions("w")?;
     assert_eq!((d.active, d.epoch, d.consecutive_faults), (Some(two.version), 2, 2), "no rollback, no new epoch");
     let trip = Trip {
+        manual: None,
         version: two.version,
         epoch: 2,
         faults: 2,
@@ -1645,5 +1647,385 @@ fn overlap_policies(factory: &impl Fn(&str) -> anyhow::Result<TestStore>, report
         assert!(reopened.queued("policy")?.is_none());
     }
     report.witnesses.insert("all overlap policies and queue promotion survive decision/admission crashes");
+    Ok(())
+}
+
+/// A listen with an expression, a literal filter and expected correlation.
+/// Kept public so adapter scalability tests exercise the same matcher.
+pub fn control_wait() -> owf::events::PendingWait {
+    use owf::{
+        events::Consumer,
+        expr::Args,
+        model::{Correlation, EventFilter, Strategy},
+    };
+    let strategy = Strategy::One(EventFilter {
+        with: json!({"type":"answer", "data":{"approved":"${ . == true }"}}).as_object().unwrap().clone(),
+        correlate: vec![(
+            "ticket".into(),
+            Correlation { from: ".ticket".into(), expect: Some("${ $input.ticket }".into()) },
+        )],
+    });
+    let progress = Consumer::new(&strategy).progress();
+    owf::events::PendingWait {
+        types: vec!["answer".into()],
+        strategy,
+        input: json!({"ticket":42}),
+        args: Args::new().with("input", json!({"ticket":42})),
+        progress,
+        position: "listen#event[0]".into(),
+        since_ms: 2,
+        timeout_ms: Some(100),
+        redacted: false,
+    }
+}
+fn control_request(id: &str) -> control::Request {
+    control::Request { id: id.into(), actor: "operator".into(), reason: "maintenance".into() }
+}
+fn controls(factory: &impl Fn(&str) -> anyhow::Result<TestStore>, report: &mut Report) -> anyhow::Result<()> {
+    use control::{Command, Reply, Runs, Waits};
+    let t = factory("control")?;
+    report.cases += 1;
+    let s = &t.store;
+    let d = s.save_definition("workflow", "yaml")?;
+    let trigger = Trigger { at_ms: Some(4), types: vec!["start".into()], state: json!({}) };
+    let arming = Arming { triggers: BTreeMap::from([("schedule".into(), trigger.clone())]) };
+    s.activate_with("workflow", d.version, 0, &arming)?;
+    let parent = s.start(&admission("p"), 0)?.unwrap();
+    let child = s
+        .start_child(
+            &parent,
+            &admission("c"),
+            &ChildLink { parent: "p".into(), key: "c".into(), reference: "c".into() },
+            0,
+        )?
+        .unwrap();
+    s.start_child(
+        &child,
+        &admission("g"),
+        &ChildLink { parent: "c".into(), key: "g".into(), reference: "g".into() },
+        0,
+    )?;
+    let independent = s.start(&admission("independent"), 0)?.unwrap();
+    let pause = Command::Pause { definition: "workflow".into(), note: "investigate".into() };
+    assert_eq!(s.control(&control_request("pause"), &pause, 1)?, Reply::Changed(true));
+    let remote = (t.reopen)()?;
+    let defs = remote.definitions("workflow")?;
+    let trip = defs.tripped.unwrap();
+    assert_eq!(trip.reason.type_, "manual");
+    assert_eq!(
+        trip.manual.unwrap(),
+        control::ManualTrip { actor: "operator".into(), reason: "maintenance".into(), note: "investigate".into() }
+    );
+    assert_eq!(defs.epoch, 1);
+    assert!(remote.trigger("schedule")?.is_none());
+    assert!(remote.admit(&admission("blocked"), 1).unwrap_err().is::<DefinitionTripped>());
+    assert!(remote.start(&admission("blocked"), 1).unwrap_err().is::<DefinitionTripped>());
+    assert!(
+        remote
+            .start_child(
+                &parent,
+                &admission("blocked"),
+                &ChildLink { parent: "p".into(), key: "blocked".into(), reference: "blocked".into() },
+                1
+            )
+            .unwrap_err()
+            .is::<DefinitionTripped>()
+    );
+    assert_eq!(
+        s.control(&control_request("resume"), &Command::Resume { definition: "workflow".into() }, 2)?,
+        Reply::Changed(true)
+    );
+    assert_eq!(s.definitions("workflow")?.epoch, 1);
+    assert_eq!(s.trigger("schedule")?, Some(trigger.clone()));
+    // A late retry must not undo the intervening resume.
+    assert_eq!(remote.control(&control_request("pause"), &pause, 3)?, Reply::Changed(true));
+    assert!(s.definitions("workflow")?.tripped.is_none());
+    assert!(s.control(&control_request("pause"), &Command::Stop { enabled: true }, 3).is_err());
+    s.control(&control_request("pause-again"), &pause, 3)?;
+    s.activate_with("workflow", d.version, 1, &arming)?;
+    assert!(s.definitions("workflow")?.tripped.is_none());
+    assert_eq!(s.definitions("workflow")?.epoch, 2);
+
+    s.register_wait(&parent, &["answer".into()], 2)?;
+    s.subscribe(&parent, "listen", &["answer".into()], 2)?;
+    let mut wait = control_wait();
+    s.describe_wait(&parent, "listen", &wait, 2)?;
+    wait.since_ms = 3;
+    s.describe_wait(&parent, "listen", &wait, 3)?;
+    assert_eq!(
+        remote
+            .pending_waits(
+                &Waits { definition: Some("workflow".into()), event_type: Some("answer".into()), ..Waits::default() },
+                None,
+                10
+            )?
+            .items[0]
+            .waiting
+            .since_ms,
+        2
+    );
+    let inspected = remote.inspect_control("p")?.unwrap();
+    assert_eq!(inspected.snapshot.run.fence.as_ref(), Some(&parent));
+    assert_eq!(inspected.snapshot.run.lease_until_ms, Some(LEASE_MS));
+    assert_eq!(inspected.children.len(), 1);
+    assert_eq!(inspected.waits.len(), 1);
+    assert_eq!(inspected.budget_spent, 0);
+    let response = |ticket, approved| {
+        let mut e = event("response", "answer", json!({"approved":approved}));
+        e["ticket"] = json!(ticket);
+        e
+    };
+    for (id, event) in [("wrong-correlation", response(43, true)), ("wrong-filter", response(42, false))] {
+        assert!(
+            remote
+                .control(&control_request(id), &Command::Respond { run: "p".into(), wait: "listen".into(), event }, 4)
+                .is_err()
+        );
+    }
+    assert!(s.inspect("p")?.unwrap().events.is_empty());
+    let answer = Command::Respond { run: "p".into(), wait: "listen".into(), event: response(42, true) };
+    let reply = remote.control(&control_request("answer"), &answer, 4)?;
+    assert_eq!(reply, Reply::Responded(Some("p".into())));
+    assert_eq!(s.take_event(&parent, "listen#event[0]", &["answer".into()], 4)?.unwrap()["ticket"], 42);
+    assert!(s.pending_waits(&Waits::default(), None, 10)?.items.is_empty());
+    assert_eq!(s.control(&control_request("answer-retry"), &answer, 5)?, reply);
+    let mut conflict = answer.clone();
+    if let Command::Respond { event, .. } = &mut conflict {
+        event["ticket"] = json!(43);
+    }
+    assert!(s.control(&control_request("answer-conflict"), &conflict, 5).is_err());
+    assert_eq!(s.control_history(Some("p"), None, 10)?.items.len(), 2);
+    assert_eq!(s.control_entry("answer")?.unwrap().request.actor, "operator");
+
+    s.spend(&parent, "control-jump", 100, 5)?;
+    assert_eq!(s.inspect_control("p")?.unwrap().budget_spent, 1);
+    let stop = Command::Stop { enabled: true };
+    s.control(&control_request("stop"), &stop, 5)?;
+    assert!(remote.stopped()?);
+    assert!(remote.due(LEASE_MS, 10)?.is_empty());
+    assert!(remote.due_triggers(10, 10)?.is_empty());
+    assert!(remote.triggers_for("start", 10)?.is_empty());
+    assert!(remote.claim("independent", LEASE_MS)?.is_none());
+    assert!(remote.admit(&admission("stopped"), 5).unwrap_err().is::<control::Stopped>());
+    assert!(remote.start(&admission("stopped"), 5).unwrap_err().is::<control::Stopped>());
+    assert!(remote.renew(&parent, 5).unwrap_err().is::<control::Stopped>());
+    assert!(remote.save_record(&parent, "blocked", &Record::Timer { deadline_ms: 99 }, 5).is_err());
+    assert!(remote.spend(&parent, "blocked-jump", 10, 5).is_err());
+    assert_eq!(
+        remote.fire(&Firing { key: "schedule", expected: Some(&trigger), next: None, ..Firing::default() }, 5)?,
+        Fired::Changed
+    );
+    assert_eq!(remote.trigger("schedule")?, Some(trigger));
+    remote.release(&independent, 5)?;
+    s.control(&control_request("clear"), &Command::Stop { enabled: false }, 6)?;
+    s.control(&control_request("stop"), &stop, 7)?;
+    assert!(!s.stopped()?);
+    assert!(s.claim("independent", 7)?.is_some());
+
+    let cancel = Command::Cancel { run: "p".into() };
+    assert_eq!(remote.control(&control_request("cancel"), &cancel, 8)?, Reply::Changed(true));
+    for id in ["p", "c", "g"] {
+        assert_eq!(s.get(id)?.unwrap().state, RunState::Cancelled);
+    }
+    assert_eq!(remote.control(&control_request("cancel"), &cancel, 9)?, Reply::Changed(true));
+    assert_eq!(remote.control(&control_request("cancel-again"), &cancel, 9)?, Reply::Changed(false));
+    assert!(s.get("independent")?.unwrap().ended_ms.is_none());
+    assert_eq!(s.inspect_control("p")?.unwrap().children[0].state, RunState::Cancelled);
+    assert_eq!(s.inspect_control("p")?.unwrap().budget_spent, 1);
+    assert_eq!(s.inspect_control("c")?.unwrap().budget_spent, 1);
+    // All indexes retain terminal history and parent links.
+    let filter = Runs {
+        definition: Some("workflow".into()),
+        state: Some(RunState::Cancelled),
+        since_ms: Some(0),
+        before_ms: Some(10),
+        ..Runs::default()
+    };
+    let mut ids = BTreeSet::new();
+    let mut cursor = None;
+    loop {
+        let page = remote.query_runs(&filter, false, cursor.as_ref(), 1)?;
+        for r in page.items {
+            assert!(ids.insert(r.admission.id));
+        }
+        cursor = page.next;
+        if cursor.is_none() {
+            break;
+        }
+    }
+    assert_eq!(ids, BTreeSet::from(["p".into(), "c".into(), "g".into()]));
+    assert_eq!(s.query_runs(&Runs { parent: Some("p".into()), ..filter.clone() }, false, None, 10)?.items.len(), 1);
+    assert_eq!(s.query_runs(&filter, true, None, 10)?.items.len(), 3);
+    let page = s.query_runs(&filter, false, None, 1)?;
+    assert!(s.query_runs(&Runs::default(), false, page.next.as_ref(), 1).is_err());
+    assert!(s.query_runs(&filter, false, None, 0).is_err());
+    assert!(s.query_runs(&filter, false, None, control::MAX_PAGE + 1).is_err());
+    audit(&*remote)?;
+    audit_control(&t)?;
+    report.operations += 80;
+    report.witnesses.insert("store-only attributed control, bounded pages, waits and matched responses");
+
+    let t = factory("control-concurrent")?;
+    report.cases += 1;
+    let f = t.store.start(&admission("r"), 0)?.unwrap();
+    t.store.describe_wait(&f, "listen", &control_wait(), 2)?;
+    let barrier = Arc::new(std::sync::Barrier::new(2));
+    let mut racers = Vec::new();
+    for _ in 0..2 {
+        let store = (t.reopen)()?;
+        let barrier = barrier.clone();
+        let answer = response(42, true);
+        racers.push(std::thread::spawn(move || {
+            barrier.wait();
+            store.control(
+                &control_request("race"),
+                &Command::Respond { run: "r".into(), wait: "listen".into(), event: answer },
+                3,
+            )
+        }));
+    }
+    for racer in racers {
+        assert_eq!(racer.join().unwrap()?, Reply::Responded(Some("r".into())));
+    }
+    assert_eq!(t.store.inspect("r")?.unwrap().events.len(), 1);
+    assert_eq!(t.store.control_history(Some("r"), None, 10)?.items.len(), 1);
+    audit_control(&t)?;
+
+    // The audit row, event receipt and each command's indexes commit together.
+    for op in ["cancel", "pause", "resume", "stop", "clear", "respond", "describe"] {
+        for fault in [
+            CommitFault::BeforeWrite(0),
+            CommitFault::BeforeWrite(1),
+            CommitFault::BeforeCommit,
+            CommitFault::AfterCommit,
+        ] {
+            let t = factory("control-fault")?;
+            report.cases += 1;
+            let s = &t.store;
+            let d = s.save_definition("workflow", "yaml")?;
+            s.activate_with("workflow", d.version, 0, &arming)?;
+            let f = s.start(&admission("r"), 0)?.unwrap();
+            s.describe_wait(&f, "listen", &control_wait(), 2)?;
+            if op == "resume" {
+                s.control(&control_request("prepare"), &pause, 2)?;
+            }
+            if op == "clear" {
+                s.control(&control_request("prepare"), &stop, 2)?;
+            }
+            let command = match op {
+                "cancel" => Command::Cancel { run: "r".into() },
+                "pause" | "resume" => {
+                    if op == "pause" {
+                        pause.clone()
+                    } else {
+                        Command::Resume { definition: "workflow".into() }
+                    }
+                }
+                "stop" => stop.clone(),
+                "clear" => Command::Stop { enabled: false },
+                _ => Command::Respond { run: "r".into(), wait: "listen".into(), event: response(42, true) },
+            };
+            let before = t.backend.snapshot()?;
+            t.faults.arm(fault);
+            let result = if op == "describe" {
+                let mut w = control_wait();
+                w.position = "next".into();
+                s.describe_wait(&f, "listen", &w, 3)
+            } else {
+                s.control(&control_request("command"), &command, 3).map(|_| ())
+            };
+            t.faults.clear();
+            assert!(result.is_err(), "control {op} at {fault:?}");
+            let fresh = (t.reopen)()?;
+            if fault == CommitFault::AfterCommit {
+                assert_ne!(t.backend.snapshot()?, before);
+                if op != "describe" {
+                    assert_eq!(fresh.control_entry("command")?.unwrap().command, normalize_test_command(&command));
+                }
+            } else {
+                assert_eq!(t.backend.snapshot()?, before, "atomic control {op}");
+            }
+            audit(&*fresh)?;
+            audit_control(&t)?;
+            report.crash_points += 1;
+        }
+    }
+    Ok(())
+}
+fn normalize_test_command(command: &control::Command) -> control::Command {
+    let mut command = command.clone();
+    if let control::Command::Respond { event: Value::Object(m), .. } = &mut command {
+        m.remove("time");
+    }
+    command
+}
+
+fn audit_control(t: &TestStore) -> anyhow::Result<()> {
+    // Derive expected index rows from persisted primary facts, independently
+    // of query answers and of the transition engine's index generator.
+    let rows = t.backend.snapshot()?.rows;
+    let hex = |v: &str| v.bytes().map(|b| format!("{b:02x}")).collect::<String>();
+    let time = |ms: i64, id: &str| format!("{:016x}:{id}", u64::from_be_bytes((ms ^ i64::MIN).to_be_bytes()));
+    let mut expected = Rows::new();
+    for ((kind, _), value) in &rows {
+        if kind == "run" {
+            let r: SavedRun = serde_json::from_value(value["run"].clone())?;
+            let id = &r.admission.id;
+            for base in ["control_run".to_string(), format!("control_run:{}", hex(&r.admission.name))] {
+                expected.insert((base, time(r.admitted_ms, id)), json!(id));
+            }
+            if let Some(end) = r.ended_ms {
+                for base in ["control_end".to_string(), format!("control_end:{}", hex(&r.admission.name))] {
+                    expected.insert((base, time(end, id)), json!(id));
+                }
+            }
+            if let Some(link) = r.child {
+                expected.insert((format!("control_parent:{}", hex(&link.parent)), time(r.admitted_ms, id)), json!(id));
+            }
+            let waits: BTreeMap<String, owf::events::PendingWait> = serde_json::from_value(value["waits"].clone())?;
+            assert!(r.ended_ms.is_none() || waits.is_empty());
+            for (key, waiting) in waits {
+                let k = time(waiting.since_ms, &format!("{}:{}", hex(id), hex(&key)));
+                let mut families = BTreeSet::from([
+                    "control_wait".to_string(),
+                    format!("control_wait_run:{}", hex(id)),
+                    format!("control_wait_definition:{}", hex(&r.admission.name)),
+                ]);
+                for ty in &waiting.types {
+                    families.insert(format!("control_wait_type:{}", hex(ty)));
+                    families.insert(format!("control_wait_definition:{}:type:{}", hex(&r.admission.name), hex(ty)));
+                }
+                let v = serde_json::to_value(control::Wait {
+                    run: id.clone(),
+                    definition: r.admission.name.clone(),
+                    key,
+                    waiting,
+                })?;
+                for family in families {
+                    expected.insert((family, k.clone()), v.clone());
+                }
+            }
+        }
+        if kind == "control_command" {
+            let e: control::Entry = serde_json::from_value(value.clone())?;
+            let k = time(e.at_ms, &hex(&e.request.id));
+            expected.insert(("control_history".into(), k.clone()), value.clone());
+            if let control::Command::Cancel { run } | control::Command::Respond { run, .. } = &e.command {
+                expected.insert((format!("control_history_run:{}", hex(run)), k), value.clone());
+            }
+        }
+    }
+    let actual: Rows = rows
+        .into_iter()
+        .filter(|((kind, _), _)| {
+            ["control_run", "control_end", "control_parent", "control_wait", "control_history"].iter().any(|prefix| {
+                kind == prefix
+                    || kind.starts_with(&format!("{prefix}:"))
+                    || (*prefix == "control_wait" && kind.starts_with("control_wait_"))
+                    || (*prefix == "control_history" && kind.starts_with("control_history_run:"))
+            })
+        })
+        .collect();
+    assert_eq!(actual, expected, "persisted control indexes disagree with primary facts");
     Ok(())
 }

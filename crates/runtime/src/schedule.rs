@@ -565,6 +565,7 @@ fn offer(
                 return Ok(Taken::Yes(id));
             }
             Fired::Ingested | Fired::Busy(_) | Fired::Queued | Fired::Ceiling => return Ok(Taken::Yes(None)),
+            Fired::Changed if store.stopped()? => return Ok(Taken::No),
             Fired::Changed => match store.trigger(k)? {
                 Some(t) => trigger = t,
                 None => return Ok(Taken::No),

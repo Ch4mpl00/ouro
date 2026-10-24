@@ -34,6 +34,7 @@ fn bounded<T>(
 }
 fn bounds(backend: Arc<dyn AtomicBackend>, metrics: Arc<Metrics>, validation: u64) -> anyhow::Result<()> {
     support::seed(&backend, 10_000)?;
+    control_bounds(&backend, &metrics)?;
     decided(&backend, &metrics)?;
     overlap_bounds(&backend, &metrics)?;
     let s = TransactionalStore::new(backend.clone());
@@ -1025,4 +1026,111 @@ fn memory_transactions_validate_absence_ranges_and_independent_keys() {
     c.put("test", "0", &json!(0)).unwrap();
     c.commit().unwrap();
     assert!(a.commit().unwrap_err().is::<Conflict>());
+}
+
+fn control_bounds(backend: &Arc<dyn AtomicBackend>, metrics: &Metrics) -> anyhow::Result<()> {
+    use ouro_durable::{
+        conformance::control_wait,
+        control::{Command, Request, Runs, Waits},
+    };
+    let s = TransactionalStore::new(backend.clone());
+    let now = 2_000_000;
+    let mut a = admission("operator:root");
+    a.name = "operator".into();
+    s.save_definition("operator", "yaml")?;
+    s.activate("operator", 1)?;
+    let f = s.start(&a, now)?.unwrap();
+    bounded(metrics, "control_check_lease", 0, || s.check_lease(&f, now))?;
+    let mut child = a.clone();
+    child.id = "operator:child".into();
+    s.start_child(
+        &f,
+        &child,
+        &ouro_durable::ChildLink { parent: a.id.clone(), key: "child".into(), reference: "child".into() },
+        now,
+    )?;
+    let req = |id: &str| Request { id: id.into(), actor: "operator".into(), reason: "row bounds".into() };
+    let mut w = control_wait();
+    w.since_ms = now;
+    w.timeout_ms = Some(now + 100);
+    bounded(metrics, "control_describe_wait", 2, || s.describe_wait(&f, "listen", &w, now))?;
+    bounded(metrics, "control_describe_wait_retry", 2, || s.describe_wait(&f, "listen", &w, now))?;
+    let filter = Runs { definition: Some("operator".into()), ..Runs::default() };
+    for (label, f) in [
+        ("control_list_definition", filter.clone()),
+        ("control_list_state", Runs { state: Some(RunState::Running), ..filter.clone() }),
+        ("control_list_parent", Runs { parent: Some(a.id.clone()), ..filter.clone() }),
+        ("control_list_age", Runs { since_ms: Some(now), before_ms: Some(now + 1), ..Runs::default() }),
+    ] {
+        assert!(!bounded(metrics, label, 2, || s.query_runs(&f, false, None, 2))?.items.is_empty());
+    }
+    let page = s.query_runs(&filter, false, None, 1)?;
+    bounded(metrics, "control_list_cursor", 1, || s.query_runs(&filter, false, page.next.as_ref(), 1))?;
+    for (label, f) in [
+        ("control_waits_definition", Waits { definition: Some("operator".into()), ..Waits::default() }),
+        ("control_waits_type", Waits { event_type: Some("answer".into()), ..Waits::default() }),
+        ("control_waits_run", Waits { run: Some(a.id.clone()), ..Waits::default() }),
+        ("control_waits_age", Waits { since_ms: Some(now), before_ms: Some(now + 1), ..Waits::default() }),
+        (
+            "control_waits_definition_type",
+            Waits { definition: Some("operator".into()), event_type: Some("answer".into()), ..Waits::default() },
+        ),
+    ] {
+        assert_eq!(bounded(metrics, label, 1, || s.pending_waits(&f, None, 2))?.items.len(), 1);
+    }
+    let page = s.pending_waits(&Waits::default(), None, 1)?;
+    bounded(metrics, "control_waits_cursor", 0, || s.pending_waits(&Waits::default(), page.next.as_ref(), 1))?;
+    bounded(metrics, "control_inspect", 3, || s.inspect_control(&a.id))?;
+    let pause = Command::Pause { definition: "operator".into(), note: "pause".into() };
+    bounded(metrics, "control_pause", 1, || s.control(&req("pause"), &pause, now))?;
+    bounded(metrics, "control_pause_retry", 0, || s.control(&req("pause"), &pause, now))?;
+    bounded(metrics, "control_resume", 1, || {
+        s.control(&req("resume"), &Command::Resume { definition: "operator".into() }, now)
+    })?;
+    bounded(metrics, "control_stop", 0, || s.control(&req("stop"), &Command::Stop { enabled: true }, now))?;
+    assert!(bounded(metrics, "control_stopped", 0, || s.stopped())?);
+    assert!(bounded(metrics, "control_claim_stopped", 0, || s.claim(&a.id, i64::MAX))?.is_none());
+    bounded(metrics, "control_clear_stop", 0, || s.control(&req("clear"), &Command::Stop { enabled: false }, now))?;
+    let mut event = event("response", "answer", json!({"approved":true}));
+    event["ticket"] = json!(42);
+    let respond = Command::Respond { run: a.id.clone(), wait: "listen".into(), event };
+    bounded(metrics, "control_respond", 2, || s.control(&req("respond"), &respond, now))?;
+    bounded(metrics, "control_respond_retry", 0, || s.control(&req("respond"), &respond, now))?;
+    bounded(metrics, "control_respond_identity", 0, || s.control(&req("respond-identity"), &respond, now))?;
+    bounded(metrics, "control_respond_take", 2, || s.take_event(&f, &w.position, &w.types, now))?;
+    bounded(metrics, "control_cancel_tree", 3, || {
+        s.control(&req("cancel"), &Command::Cancel { run: a.id.clone() }, now + 1)
+    })?;
+    bounded(metrics, "control_cancel_retry", 0, || {
+        s.control(&req("cancel"), &Command::Cancel { run: a.id.clone() }, now + 1)
+    })?;
+    bounded(metrics, "control_entry", 0, || s.control_entry("cancel"))?;
+    bounded(metrics, "control_journal_run", 2, || s.control_history(Some(&a.id), None, 2))?;
+    let journal = bounded(metrics, "control_journal", 2, || s.control_history(None, None, 2))?;
+    bounded(metrics, "control_journal_cursor", 2, || s.control_history(None, journal.next.as_ref(), 2))?;
+    assert_eq!(
+        bounded(metrics, "control_history_definition", 2, || s.query_runs(&filter, true, None, 2))?.items.len(),
+        2
+    );
+    let recent = Runs { since_ms: Some(now), before_ms: Some(now + 2), ..Runs::default() };
+    assert_eq!(bounded(metrics, "control_history_window", 2, || s.query_runs(&recent, true, None, 2))?.items.len(), 2);
+    let mut a = a.clone();
+    a.id = "operator:wildcard".into();
+    let f = s.start(&a, now)?.unwrap();
+    let mut w = control_wait();
+    w.types = vec!["*".into()];
+    w.strategy = owf::model::Strategy::Any { filters: Vec::new(), until: None };
+    w.progress = owf::events::Consumer::new(&w.strategy).progress();
+    w.since_ms = now;
+    w.timeout_ms = None;
+    bounded(metrics, "control_describe_wildcard", 1, || s.describe_wait(&f, "listen", &w, now))?;
+    let respond = Command::Respond {
+        run: a.id.clone(),
+        wait: "listen".into(),
+        event: ouro_durable::conformance::event("wildcard", "choice", json!(42)),
+    };
+    bounded(metrics, "control_respond_wildcard", 2, || s.control(&req("wildcard"), &respond, now))?;
+    bounded(metrics, "control_take_wildcard", 2, || s.take_event(&f, &w.position, &w.types, now))?;
+    s.finish(&f, &Status::Completed(json!(42)), now, 3)?;
+    Ok(())
 }
