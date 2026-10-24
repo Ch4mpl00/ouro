@@ -100,11 +100,19 @@ module contract_witnesses {
     .then(ticks(5)).then(do("sweep"))
   run retentionTest = retention
     .expect(checked and not(m.db.runs.nth(0).retained) and m.db.runs.nth(0).records.nth(0) == 1)
+  // A child spends its root's budget: the parent's first unit and the
+  // child's take the tree to the ceiling, so the parent's next is refused
+  // (asked again, the same refusal); the counter ends with the root.
+  action budget = init.then(boot).then(at("spend",0)).then(do("child")).then(ticks(4))
+    .then(execute("claim",1,1,0,0,0)).then(execute("spend",1,1,0,0,0)).then(execute("release",1,1,0,0,0))
+    .then(do("claim")).then(at("spend",1)).then(at("spend",1)).then(do("cancel"))
+  run budgetTest = budget.expect(checked and m.db.runs.nth(0).spends == [1,2,0] and
+    m.db.runs.nth(1).spends == [1,0,0] and m.db.runs.nth(1).spent == [2,0,0] and m.db.budget == [0,0])
   // Every history above in one trace (each starts with init), replayed
   // against the stores by crates/durable/tests/quint.rs.
   run bridgeSuite = continuation.then(unknown).then(mailbox).then(expiry).then(child).then(activation)
     .then(deadline).then(compatibility).then(dry).then(replay).then(schedule).then(breaker).then(rearm)
     .then(noCatchup).then(overlap).then(ingress).then(ingressExpiry).then(redispatch).then(protectedUnknown)
     .then(notExecuted).then(errorResponse).then(conflict).then(release).then(staleFence).then(admission)
-    .then(successResetsBreaker).then(rollback).then(broadcast).then(retention)
+    .then(successResetsBreaker).then(rollback).then(broadcast).then(retention).then(budget)
 }

@@ -4,7 +4,7 @@ import hashlib
 import json
 import pathlib
 ROOT=pathlib.Path(__file__).resolve().parent
-IDS=[f"{group}{n}" for group,count in [("A",5),("E",5),("R",3),("W",5),("C",3),("T",3),("V",3),("O",3),("X",3),("L",5)] for n in range(1,count+1)]
+IDS=[f"{group}{n}" for group,count in [("A",5),("E",5),("R",3),("W",5),("C",3),("T",3),("V",3),("O",3),("X",3),("B",1),("L",5)] for n in range(1,count+1)]
 TEMPORAL={"E5","L1","L2","L3","L4","L5"}
 def read(name):return json.loads((ROOT/".results"/name).read_text())
 def optional(name):

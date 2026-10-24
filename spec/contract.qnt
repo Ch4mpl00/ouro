@@ -14,18 +14,23 @@ module contract {
   pure val never = 1000000000
   pure val Workers = Set(0, 1)
   pure val epsilon = 1
+  // A run tree's jump budget (issue #8): its root's counter, which an owned
+  // child spends too. Spend keys are the invocation IDs.
+  pure val ceiling = 2
   type Run = {
     admitted: bool, input: int, version: int, epoch: int, app: int, mode: int,
     outcome: int, ended: int, deadline: int, owner: int, generation: int, lease: int,
     records: List[int], values: List[int], frontier: Set[int], continuation: int,
-    subscription: bool, parent: int, notified: bool, retained: bool
+    subscription: bool, parent: int, notified: bool, retained: bool,
+    spends: List[int], spent: List[int]
   }
   type Copy = { id: int, recipient: int, payload: int, expires: int, disposition: int, key: int }
   type Catalog = { active: int, previous: int, epoch: int, faults: int, tripped: bool,
     triggerEpoch: int, due: int, slot: int, running: int, catchup: int, rearm: bool,
     armed: bool, fallback: int }
   type Durable = { runs: List[Run], copies: List[Copy], catalog: Catalog,
-    admissions: List[int], fired: Set[(int, int)], skipped: Set[(int, int)], ingress: int -> int, ingressPayload: int -> int }
+    admissions: List[int], fired: Set[(int, int)], skipped: Set[(int, int)], ingress: int -> int, ingressPayload: int -> int,
+    budget: List[int] }
   type Local = { fence: int, execution: int, phase: int, invocation: int, stopped: bool, permit: bool }
   type Observation = { op: str, execution: int, invocation: int, value: int, result: int }
   type Machine = { db: Durable, workers: List[Local], now: int,
@@ -34,9 +39,9 @@ module contract {
   pure val emptyRun: Run = { admitted: false, input: 0, version: 0, epoch: 0, app: 0, mode: 0,
     outcome: 0, ended: -1, deadline: -1, owner: -1, generation: 0, lease: -1,
     records: [0,0,0], values: [0,0,0], frontier: Set(), continuation: 0,
-    subscription: false, parent: -1, notified: false, retained: true }
+    subscription: false, parent: -1, notified: false, retained: true, spends: [0,0,0], spent: [0,0,0] }
   pure val emptyLocal: Local = { fence: 0, execution: 0, phase: 0, invocation: 0, stopped: false, permit: false }
-  pure val initialDb: Durable = { runs: [emptyRun,emptyRun], copies: [], admissions: [0,0],
+  pure val initialDb: Durable = { runs: [emptyRun,emptyRun], copies: [], admissions: [0,0], budget: [0,0],
     fired: Set(), skipped: Set(), ingress: Map(), ingressPayload:Map(), catalog: { active: 1, previous: 0, epoch: 1,
       faults: 0, tripped: false, triggerEpoch: 1, due: 2, slot: 0, running: -1, catchup: 0, rearm:false,
       armed: true, fallback: -1 } }
@@ -50,9 +55,11 @@ module contract {
   // relation below consumes visible labels, not the concrete post-state.
   type Ideal = { admitted: Set[int], intents: Set[(int,int)], dispatched: Set[(int,int)],
     results: (int,int) -> int, checkpoints: Set[(int,int)], terminal: int -> int,
-    inputs: int -> int, consumed: Set[(int,int)], takes: (int,int) -> int, accepted: (int,int) -> int, legal: bool }
+    inputs: int -> int, consumed: Set[(int,int)], takes: (int,int) -> int, accepted: (int,int) -> int,
+    spends: (int,int) -> int, legal: bool }
   pure val emptyIdeal: Ideal = { admitted: Set(), intents: Set(), dispatched: Set(),
-    results: Map(), checkpoints: Set(), terminal: Map(), inputs:Map(), consumed: Set(), takes:Map(), accepted: Map(), legal: true }
+    results: Map(), checkpoints: Set(), terminal: Map(), inputs:Map(), consumed: Set(), takes:Map(), accepted: Map(),
+    spends: Map(), legal: true }
   var ideal: Ideal
   pure def live(r: Run): bool = r.admitted and r.outcome == 0
   pure def compatible(app: int, worker: int): bool = app == 0 or app == worker + 1
@@ -62,6 +69,13 @@ module contract {
     live(execution) and execution.owner == w and worker.execution == r and worker.fence == execution.generation and
       not(worker.stopped) and s.now + epsilon < execution.lease and compatible(execution.app,w)
   }
+  // The run whose counter `r` spends: its parent for an owned child.
+  pure def rootOf(s: Machine, r: int): int =
+    if (s.db.runs.nth(r).parent >= 0) s.db.runs.nth(r).parent else r
+  // A tree's counter ends with its root (its owned children end with it).
+  pure def settle(s: Machine): Machine =
+    { ...s, db: { ...s.db, budget: Runs.fold(s.db.budget,(a,k) =>
+      if (s.db.runs.nth(k).outcome != 0 and s.db.runs.nth(k).parent < 0) a.replaceAt(k,0) else a) } }
   pure def update(s: Machine, r: int, execution: Run): Machine =
     { ...s, db: { ...s.db, runs: s.db.runs.replaceAt(r,execution) } }
   pure def observe(s: Machine, op: str, r: int, i: int, v: int, result: int): Machine =
@@ -79,7 +93,9 @@ module contract {
     if (not(retained)) 4 else if (record == 2) 2 else if (record == 3) 5 else if (record == 4) 6 else if (record == 1) 3 else 0
   // Records 0/1/2/3/4 are absent/intent/result/error response/proven not
   // executed. Values are admitted-input + invocation, not live inputs.
-  pure def transition(s: Machine, op: str, r: int, w: int, i: int, value: int): Machine = {
+  pure def transition(s: Machine, op: str, r: int, w: int, i: int, value: int): Machine =
+    settle(act(s,op,r,w,i,value))
+  pure def act(s: Machine, op: str, r: int, w: int, i: int, value: int): Machine = {
     val execution = s.db.runs.nth(r)
     val local = s.workers.nth(w)
     val c = s.db.catalog
@@ -126,6 +142,17 @@ module contract {
       val updated = update(s,r,{ ...execution, frontier:frontier,
         continuation:frontier.fold(0,(a,k) => a + execution.values.nth(k)) })
       observe(updated,op,r,i,execution.values.nth(i),1)
+    } else if (op == "spend" and authorized and execution.spends.nth(i) == 0) {
+      // One unit of the tree's budget at key i: granted below the ceiling,
+      // refused at it; the decision and the counter commit together.
+      val root = rootOf(s,r)
+      val count = s.db.budget.nth(root)
+      val granted = count < ceiling
+      val after = if (granted) count+1 else count
+      val updated = update(s,r,{ ...execution, spends:execution.spends.replaceAt(i,if (granted) 1 else 2),
+        spent:execution.spent.replaceAt(i,after) })
+      observe({ ...updated, db: { ...updated.db, budget:updated.db.budget.replaceAt(root,after) } },
+        op,r,i,after,if (granted) 1 else 2)
     } else if (op == "subscribe" and authorized)
       update(s,r,{ ...execution, subscription:true })
     else if ((op == "address" or op == "publish") and value >= 0) {
@@ -232,7 +259,7 @@ module contract {
     val c = b.db.catalog
     val d = a.db.catalog
     val workerMutation = Set("renew","intent","result","notExecuted","checkpoint","subscribe","take","child","finish",
-      "timeout","conflict","release").contains(op)
+      "timeout","conflict","release","spend").contains(op)
     val callsStable = Runs.forall(k => Calls.forall(j => {
       val x = b.db.runs.nth(k)
       val y = a.db.runs.nth(k)
@@ -346,7 +373,20 @@ module contract {
     val error26 = flag(error25,"O3",a.workers.select(x => x.permit).length() <= 1)
     val error27 = flag(error26,"X1",Runs.forall(k => a.db.runs.nth(k).mode != 1 or Calls.forall(j => not(writes(j)) or a.sends.nth(k).nth(j) == 0)))
     val error28 = flag(error27,"X2",Runs.forall(k => a.db.runs.nth(k).mode != 2 or a.sends.nth(k) == [0,0,0]))
-    flag(error28,"X3",admissionStable and terminalStable)
+    val error29 = flag(error28,"X3",admissionStable and terminalStable)
+    // B1: a tree never spends more than the ceiling; a live root's counter
+    // is the sum of its tree's granted decisions; a decision never changes;
+    // a refusal happens only at the ceiling.
+    flag(error29,"B1",Runs.forall(k => a.db.budget.nth(k) <= ceiling) and
+      Runs.filter(k => live(a.db.runs.nth(k)) and a.db.runs.nth(k).parent < 0).forall(k =>
+        a.db.budget.nth(k) == Runs.filter(j => a.db.runs.nth(j).admitted and rootOf(a,j) == k).fold(0,(sum,j) =>
+          sum + Calls.filter(c => a.db.runs.nth(j).spends.nth(c) == 1).size())) and
+      Runs.forall(k => Calls.forall(c => {
+        val x = b.db.runs.nth(k)
+        val y = a.db.runs.nth(k)
+        (x.spends.nth(c) == 0 or (y.spends.nth(c) == x.spends.nth(c) and y.spent.nth(c) == x.spent.nth(c))) and
+          (y.spends.nth(c) != 2 or y.spent.nth(c) == ceiling)
+      })))
   }
   pure def idealEvent(s: Ideal, e: Observation): Ideal = {
     val key = (e.execution,e.invocation)
@@ -371,6 +411,9 @@ module contract {
       { ...s,terminal:s.terminal.put(e.execution,e.value),legal:s.legal and not(s.terminal.keys().contains(e.execution)) }
     else if (e.op == "accept")
       { ...s,accepted:s.accepted.put(key,e.value),legal:s.legal and not(s.accepted.keys().contains(key)) and s.admitted.contains(e.execution) }
+    else if (e.op == "spend")
+      { ...s,spends:s.spends.put(key,e.result),legal:s.legal and s.admitted.contains(e.execution) and
+        not(s.spends.keys().contains(key)) and e.value <= ceiling and (e.result == 1 or e.value == ceiling) }
     else if (e.op == "take") {
       val copy = (e.execution,e.result)
       { ...s,consumed:s.consumed.union(Set(copy)),takes:s.takes.put(key,e.result),legal:s.legal and
@@ -403,6 +446,7 @@ module contract {
       else if (e.op == "result") Set(2,3).contains(persisted.db.runs.nth(e.execution).records.nth(e.invocation))
       else if (e.op == "notExecuted") persisted.db.runs.nth(e.execution).records.nth(e.invocation) == 4
       else if (e.op == "checkpoint") persisted.db.runs.nth(e.execution).frontier.contains(e.invocation)
+      else if (e.op == "spend") persisted.db.runs.nth(e.execution).spends.nth(e.invocation) == e.result
       else if (e.op == "admit") persisted.db.runs.nth(e.execution).admitted else true)
     val stoppedOnError = (not(Set(1,2,8).contains(fault)) or stopped.workers.nth(actor).stopped) and (op != "dispatch" or persisted.sends == before.sends or not(before.workers.nth(actor).stopped))
     val observations = persisted.observations.slice(before.observations.length(),persisted.observations.length())
@@ -415,7 +459,7 @@ module contract {
   action step = {
     nondet op = Set("admit","dry","replay","claim","renew","release","intent","dispatch","result","notExecuted","recover",
       "checkpoint","conflict","subscribe","address","publish","take","expire","child","finish","timeout","cancel",
-      "activate","fire","ingress","sweep","crash","tick").oneOf()
+      "activate","fire","ingress","sweep","crash","tick","spend").oneOf()
     nondet r = Runs.oneOf()
     nondet w = Workers.oneOf()
     nondet i = Calls.oneOf()
@@ -455,7 +499,8 @@ module contract {
   val X1 = not(m.violations.contains("X1"))
   val X2 = not(m.violations.contains("X2"))
   val X3 = not(m.violations.contains("X3"))
-  val safety = A1 and A2 and A3 and A4 and A5 and E1 and E2 and E3 and E4 and R1 and R2 and R3 and W1 and W2 and W3 and W4 and W5 and C1 and C2 and C3 and T1 and T2 and T3 and V1 and V2 and V3 and O1 and O2 and O3 and X1 and X2 and X3
+  val B1 = not(m.violations.contains("B1"))
+  val safety = A1 and A2 and A3 and A4 and A5 and E1 and E2 and E3 and E4 and R1 and R2 and R3 and W1 and W2 and W3 and W4 and W5 and C1 and C2 and C3 and T1 and T2 and T3 and V1 and V2 and V3 and O1 and O2 and O3 and X1 and X2 and X3 and B1
   val compatibilityWaiting = Runs.filter(r => live(m.db.runs.nth(r)) and not(Workers.exists(w => compatible(m.db.runs.nth(r).app,w))))
   // State correspondence prevents an acknowledged label from fabricating a
   // committed fact. The event checker itself never reads the concrete state.
@@ -470,7 +515,9 @@ module contract {
         (Set(2,3).contains(x.records.nth(i)) == ideal.results.keys().contains(k)) and
         (not(Set(2,3).contains(x.records.nth(i))) or ideal.results.get(k) == x.values.nth(i)) and
         (x.frontier.contains(i) == ideal.checkpoints.contains(k)) and
-        (m.sends.nth(r).nth(i) > 0 == ideal.dispatched.contains(k))
+        (m.sends.nth(r).nth(i) > 0 == ideal.dispatched.contains(k)) and
+        (x.spends.nth(i) != 0 == ideal.spends.keys().contains(k)) and
+        (x.spends.nth(i) == 0 or ideal.spends.get(k) == x.spends.nth(i))
       })
     }) and m.db.copies.elems().forall(e => {
       val k = (e.recipient,e.id)
@@ -487,4 +534,5 @@ module contract {
   val deliveredNeverLost = W3
   val childOutcomeAtomic = C2
   val evidenceRetained = O2
+  val budgetBounded = B1
 }

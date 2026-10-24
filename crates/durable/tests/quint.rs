@@ -43,6 +43,8 @@ pub fn model_policy() -> Policy {
 }
 const RUNS: usize = 2;
 const CALLS: usize = 3;
+/// The model's jump budget per run tree (`ceiling`); spend keys are `jump<i>`.
+const CEILING: u64 = 2;
 const SWEEP_KEPT: i64 = 5 * TICK;
 const DEADLINE: i64 = 8;
 const NAME: &str = "model";
@@ -158,6 +160,10 @@ struct RunView {
     continuation: i64,
     subscription: bool,
     parent: i64,
+    /// Budget decisions by key: 0 none, 1 granted, 2 refused; and the tree's
+    /// count after each (`Record::Budget`).
+    spends: Vec<i64>,
+    spent: Vec<i64>,
 }
 impl RunView {
     fn absent() -> Self {
@@ -169,6 +175,8 @@ impl RunView {
             records: vec![0; CALLS],
             values: vec![0; CALLS],
             parent: -1,
+            spends: vec![0; CALLS],
+            spent: vec![0; CALLS],
             ..Self::default()
         }
     }
@@ -254,6 +262,8 @@ struct ModelRun {
     subscription: bool,
     parent: i64,
     retained: bool,
+    spends: Vec<i64>,
+    spent: Vec<i64>,
 }
 #[derive(Deserialize)]
 struct ModelCopy {
@@ -318,6 +328,8 @@ impl From<Machine> for View {
                     continuation: if kept { x.continuation } else { 0 },
                     subscription: x.subscription,
                     parent: x.parent,
+                    spends: if kept { x.spends.clone() } else { vec![0; CALLS] },
+                    spent: if kept { x.spent.clone() } else { vec![0; CALLS] },
                 }
             })
             .collect();
@@ -920,6 +932,11 @@ impl StoreDriver {
                     let _ = self.write(fault, |s| s.subscribe(&f, "listen", &["event".into()], ms));
                 }
             }
+            "spend" => {
+                if let Some(f) = self.fence(w, r) {
+                    let _ = self.write(fault, |s| s.spend(&f, &format!("jump{i}"), CEILING, ms));
+                }
+            }
             "address" | "publish" => {
                 if value >= 0 {
                     let target = (op == "address").then(|| run_id(r));
@@ -1141,6 +1158,11 @@ impl StoreDriver {
                 };
                 view.frontier.insert(i.parse()?);
                 view.continuation = view.continuation.max(output.as_i64().context("continuation")?);
+            } else if let Some(i) = key.strip_prefix("jump") {
+                let i: usize = i.parse()?;
+                let Record::Budget { granted, spent } = record else { anyhow::bail!("not a budget decision") };
+                view.spends[i] = if *granted { 1 } else { 2 };
+                view.spent[i] = i64::try_from(*spent)?;
             } else {
                 ensure!(key.starts_with("event") || key.starts_with("mailbox#expired["), "unexpected record {key}");
             }
@@ -1280,7 +1302,7 @@ pub fn with_quint(name: &str, run: impl FnOnce() -> anyhow::Result<()>) {
     assert!(result.success(), "Quint child test failed");
 }
 /// Every command of the contract model, and initialization.
-const COMMANDS: usize = 29;
+const COMMANDS: usize = 30;
 fn simulation(adapter: Adapter) -> anyhow::Result<()> {
     use quint_connect::runner::{self, RunConfig};
     let seed = std::env::var("QUINT_SEED").unwrap_or_else(|_| "20261023".into());

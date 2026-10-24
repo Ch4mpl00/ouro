@@ -52,6 +52,7 @@ MUTANTS = {
  "X1": ('not(execution.mode == 1 and writes(i))','true',[op("dry"),op("claim")]+CALL),
  "X2": ('execution.mode != 2','true',[op("replay"),op("claim")]+CALL),
  "X3": ('Set("admit","dry","replay").contains(op) and value >= 0 and not(execution.admitted)','Set("admit","dry","replay").contains(op) and value >= 0',BOOT+[op("finish"),op("admit",value=1)]),
+ "B1": ('val granted = count < ceiling','val granted = true',BOOT+[op("spend"),op("spend",i=1),op("spend",i=2)]),
 }
 
 def harness(commands):
