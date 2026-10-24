@@ -385,7 +385,9 @@ impl Runtime {
         // Replay restores the recorded budget decisions, not its private
         // store's: the store saves each one (granted or refused) as it was.
         let replayed = match &mode {
-            Mode::Replay { budgets, .. } => Some(ReplayJournal { lease: lease.clone(), budgets: budgets.clone() }),
+            Mode::Replay { budgets, first, .. } => {
+                Some(ReplayJournal { lease: lease.clone(), budgets: budgets.clone(), first: first.clone() })
+            }
             _ => None,
         };
         let journal: &dyn owf::durable::Journal = match &replayed {
@@ -797,10 +799,12 @@ impl std::error::Error for Refused {}
 /// Replay's journal: a recorded budget decision is saved again as it was
 /// (a granted one with no limit, a refused one with none left), so the
 /// replayed run jumps where the recorded one did whatever its private
-/// store counted; an unrecorded one spends the private budget.
+/// store counted; an unrecorded one spends the private budget. The recorded
+/// first refusal is saved before any other, so the same jump acts on it.
 struct ReplayJournal {
     lease: Arc<Lease>,
     budgets: Arc<BTreeMap<String, bool>>,
+    first: Option<String>,
 }
 impl owf::durable::Journal for ReplayJournal {
     fn load(&self) -> anyhow::Result<BTreeMap<String, owf::durable::Record>> {
@@ -812,7 +816,12 @@ impl owf::durable::Journal for ReplayJournal {
     fn spend(&self, key: &str, limit: u64) -> anyhow::Result<Option<owf::durable::Record>> {
         let limit = match self.budgets.get(key) {
             Some(true) => u64::MAX,
-            Some(false) => 0,
+            Some(false) => {
+                if let Some(first) = self.first.as_deref().filter(|first| *first != key) {
+                    self.lease.spend(first, 0)?;
+                }
+                0
+            }
             None => limit,
         };
         self.lease.spend(key, limit)

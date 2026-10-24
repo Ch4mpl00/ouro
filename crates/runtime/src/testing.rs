@@ -56,6 +56,8 @@ pub(crate) enum Mode {
         events: Arc<BTreeMap<String, Value>>,
         /// The recorded jump decisions by key: granted or refused.
         budgets: Arc<BTreeMap<String, bool>>,
+        /// The recorded first refusal's key, the one that acted.
+        first: Option<String>,
     },
 }
 /// A test clock advances durable waits instantly during isolated execution.
@@ -127,6 +129,10 @@ impl Runtime {
                 |(k, r)| if let Record::Budget { granted, .. } = r { Some((k.clone(), *granted)) } else { None },
             )
             .collect();
+        let first = original.records.values().find_map(|r| match r {
+            Record::Exceeded { by } => Some(by.clone()),
+            _ => None,
+        });
         if let Some(yaml) = yaml {
             let wf = self.validate(yaml)?;
             original.run.admission.definition = yaml.into();
@@ -180,6 +186,7 @@ impl Runtime {
                 used: used.clone(),
                 events: Arc::new(events),
                 budgets: Arc::new(budgets),
+                first,
             },
             &clock,
             stop,

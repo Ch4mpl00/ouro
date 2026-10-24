@@ -164,7 +164,11 @@ is bounded by its collection and `retry` by its attempts.
   `RunStore::spend`, which saves the decision (`Record::Budget`) and moves the
   tree's counter in one fenced commit; a child's unit updates its root's
   counter in that same commit. A restart neither resets the count nor spends
-  a unit twice, and replay restores the recorded decisions.
+  a unit twice, and replay restores the recorded decisions. A run's first
+  refusal is decided in the commit that refuses it (`Record::Exceeded`), and
+  every refusal names it: only that jump acts on `on_exceeded`, while fork
+  branches refused at the same moment end as it does, so the handler runs
+  once and recovery and replay pick the same branch.
 
 - `run: workflow` starts a durable child run of a saved definition (the
   catalog entry named `name`, the active version for `latest`, else the

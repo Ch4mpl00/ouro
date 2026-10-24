@@ -133,6 +133,11 @@
 //!     commit that counts it (`Journal::spend`), so a restart neither resets
 //!     the count nor spends a unit twice, and replay restores the decision.
 //!     A child run spends its root's budget; a refused unit stays refused.
+//! 22. A run's first refusal is decided once: the commit that refuses it
+//!     also saves `Record::Exceeded` at `EXCEEDED` naming its key, and every
+//!     refusal of the run carries that key (`Record::Budget::first`). Only
+//!     the jump it names acts on `on_exceeded`; other branches refused at the
+//!     same moment follow its outcome, and recovery and replay pick the same.
 use crate::{
     model::Flow,
     run::{Effect, WorkflowError},
@@ -148,8 +153,12 @@ use std::collections::BTreeMap;
 /// took it leaves `Record::Expired` at `mailbox#expired[i]`.
 /// 4: the store keeps one row per record and per event copy instead of one
 /// aggregate per run; a run row of an earlier version is refused.
-/// 5: every jump to a named task leaves `Record::Budget` at `<task>#jump`.
+/// 5: every jump to a named task leaves `Record::Budget` at `<task>#jump`,
+/// and a run's first refusal `Record::Exceeded` at `EXCEEDED`.
 pub const VERSION: u32 = 5;
+
+/// The key of a run's `Record::Exceeded`.
+pub const EXCEEDED: &str = "exceeded";
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -190,9 +199,12 @@ pub trait Journal: Send + Sync {
     fn save(&self, key: &str, record: &Record) -> anyhow::Result<()>;
     /// Spends one unit of the run tree's shared budget under `key` if fewer
     /// than `limit` units are spent, and saves the `Record::Budget` that says
-    /// so at `key` in the same commit; repeating returns the saved record.
-    /// `None`: this journal keeps no shared budget, and the interpreter counts
-    /// the run's own units in records it saves itself.
+    /// so at `key` in the same commit; repeating returns the saved record. A
+    /// refusal's commit also saves `Record::Exceeded { by: key }` at
+    /// `EXCEEDED` unless the run has one, and the refusal names the run's
+    /// first refused key (`first`). `None`: this journal keeps no shared
+    /// budget, and the interpreter counts the run's own units in records it
+    /// saves itself (each refusal naming the first in its one record).
     fn spend(&self, _key: &str, _limit: u64) -> anyhow::Result<Option<Record>> {
         Ok(None)
     }
@@ -251,6 +263,15 @@ pub enum Record {
     Budget {
         granted: bool,
         spent: u64,
+        /// For a refusal: the run's first refused key, the only jump that
+        /// acts on `on_exceeded`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        first: Option<String>,
+    },
+    /// The run's first refused jump (`by`, its key), decided in the commit
+    /// that refused it.
+    Exceeded {
+        by: String,
     },
 }
 

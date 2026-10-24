@@ -985,7 +985,7 @@ fn decisions(records: &BTreeMap<String, owf::durable::Record>) -> Vec<(String, b
     records
         .iter()
         .filter_map(|(k, r)| match r {
-            owf::durable::Record::Budget { granted, spent } => Some((k.clone(), *granted, *spent)),
+            owf::durable::Record::Budget { granted, spent, .. } => Some((k.clone(), *granted, *spent)),
             _ => None,
         })
         .collect()
@@ -1179,4 +1179,191 @@ async fn a_run_ended_by_its_budget_says_so_on_its_span() {
     };
     assert!(flagged("loop"));
     assert!(!flagged("plain"));
+}
+
+/// A memory backend whose `n`th commit fails (before or after it lands),
+/// noting the commit that saved a run's first refusal.
+struct Claiming {
+    inner: durable::memory::MemoryBackend,
+    commits: AtomicUsize,
+    claimed: AtomicUsize,
+    fail_at: usize,
+    after: bool,
+}
+impl AtomicBackend for Claiming {
+    fn begin(&self) -> anyhow::Result<Box<dyn durable::Transaction + '_>> {
+        Ok(Box::new(ClaimingTx { inner: self.inner.begin()?, backend: self, claims: false }))
+    }
+    fn snapshot(&self) -> anyhow::Result<durable::Snapshot> {
+        self.inner.snapshot()
+    }
+}
+struct ClaimingTx<'a> {
+    inner: Box<dyn durable::Transaction + 'a>,
+    backend: &'a Claiming,
+    claims: bool,
+}
+impl durable::Transaction for ClaimingTx<'_> {
+    fn get(&mut self, kind: &str, id: &str) -> anyhow::Result<Option<Value>> {
+        self.inner.get(kind, id)
+    }
+    fn scan(&mut self, kind: &str, start: &str, end: Option<&str>, limit: usize) -> anyhow::Result<durable::Rows> {
+        self.inner.scan(kind, start, end, limit)
+    }
+    fn put(&mut self, kind: &str, id: &str, value: &Value) -> anyhow::Result<()> {
+        self.claims |= kind.starts_with("record:") && id == owf::durable::EXCEEDED;
+        self.inner.put(kind, id, value)
+    }
+    fn delete(&mut self, kind: &str, id: &str) -> anyhow::Result<()> {
+        self.inner.delete(kind, id)
+    }
+    fn commit(self: Box<Self>) -> anyhow::Result<()> {
+        let b = self.backend;
+        let n = b.commits.fetch_add(1, Ordering::SeqCst) + 1;
+        if n == b.fail_at && !b.after {
+            anyhow::bail!("injected crash before commit {n}");
+        }
+        self.inner.commit()?;
+        if self.claims {
+            b.claimed.store(n, Ordering::SeqCst);
+        }
+        if n == b.fail_at && b.after {
+            anyhow::bail!("injected crash after commit {n}");
+        }
+        Ok(())
+    }
+}
+
+/// Two fork branches loop on one budget; `tick` yields, so they take turns
+/// and both are refused. The handler reports which branch acted.
+const RACING: &str = r#"document:
+  dsl: '1.0.4'
+  namespace: test
+  name: race
+  version: '1.0.0'
+  metadata: { limits: { max_jumps: 3, on_exceeded: { call: report, with: { by: '${ .b }' } } } }
+do:
+  - both:
+      fork:
+        branches:
+          - a:
+              do:
+                - tick: { call: tick, with: { b: a } }
+                - again: { switch: [ { stop: { when: '${ .b == "none" }', then: exit } }, { more: { then: tick } } ] }
+          - b:
+              do:
+                - tick: { call: tick, with: { b: b } }
+                - again: { switch: [ { stop: { when: '${ .b == "none" }', then: exit } }, { more: { then: tick } } ] }
+"#;
+
+/// The racing run to its end with a crash at commit `fail_at`: its status,
+/// the task paths `report` was called at, its refusals, the commits made and
+/// the commit that saved the first refusal.
+async fn race_crash(fail_at: usize, after: bool) -> (Option<Status>, Vec<String>, usize, usize, usize) {
+    let backend = Arc::new(Claiming {
+        inner: durable::memory::MemoryBackend::default(),
+        commits: AtomicUsize::new(0),
+        claimed: AtomicUsize::new(0),
+        fail_at,
+        after,
+    });
+    let store = Arc::new(durable::TransactionalStore::new(backend.clone()));
+    let reports = Arc::new(Mutex::new(Vec::new()));
+    let mut registry = Registry::new();
+    registry
+        .register(Function::new(
+            "tick",
+            json!({}),
+            json!({}),
+            Effect::Read,
+            |a: Value, _: FunctionContext| async move {
+                tokio::task::yield_now().await;
+                Ok(a)
+            },
+        ))
+        .unwrap();
+    let seen = reports.clone();
+    registry
+        .register(Function::new("report", json!({}), json!({}), Effect::Write, move |a: Value, c: FunctionContext| {
+            seen.lock().unwrap().push(c.task_path.clone());
+            async move {
+                // Long enough for the other branch to be refused meanwhile.
+                for _ in 0..8 {
+                    tokio::task::yield_now().await;
+                }
+                Ok(json!({ "reported": a["by"] }))
+            }
+        }))
+        .unwrap();
+    let time = Arc::new(Time::default());
+    let rt = Runtime::new(store.clone(), Arc::new(registry), Config::default(), time.clone(), tracer()).unwrap();
+    let setup = |rt: &Runtime| -> anyhow::Result<()> {
+        let d = rt.save("race", RACING)?;
+        rt.activate("race", d.version)?;
+        rt.start("r", "race", json!({}))?;
+        Ok(())
+    };
+    while setup(&rt).is_err() {}
+    for step in 1..200 {
+        if let Some(status) = store.get("r").ok().flatten().and_then(|r| r.outcome) {
+            let records = loop {
+                if let Ok(Some(s)) = store.inspect("r") {
+                    break s.records;
+                }
+            };
+            let refused = decisions(&records).iter().filter(|(_, granted, _)| !granted).count();
+            let reports = reports.lock().unwrap().clone();
+            if fail_at == usize::MAX {
+                // Replay takes no turns (recorded calls answer at once), yet
+                // the recorded first refusal acts again.
+                let replay = rt.replay("r", &CancellationToken::new()).await.unwrap();
+                assert_eq!(Some(&replay.status), Some(&status));
+            }
+            return (
+                Some(status),
+                reports,
+                refused,
+                backend.commits.load(Ordering::SeqCst),
+                backend.claimed.load(Ordering::SeqCst),
+            );
+        }
+        let _ = rt.recover_once(&CancellationToken::new()).await;
+        time.set(step * (durable::LEASE_MS + 600_001));
+    }
+    (None, Vec::new(), 0, 0, 0)
+}
+
+#[tokio::test]
+async fn branches_refused_together_follow_the_first_refusal_across_crashes() {
+    let (status, baseline_reports, refused, commits, claimed) = race_crash(usize::MAX, false).await;
+    let reports = baseline_reports;
+    let Some(Status::Completed(baseline)) = status else { panic!("{status:?}") };
+    // Both branches were refused; one handler ran, for the first refusal.
+    assert_eq!(refused, 2, "both branches were refused");
+    assert_eq!(reports.len(), 1, "{reports:?}");
+    assert!(claimed > 0 && claimed < commits);
+    let either = [json!({ "reported": "a" }), json!({ "reported": "b" })];
+    assert!(either.contains(&baseline), "{baseline}");
+    let mut decided = 0;
+    for after in [false, true] {
+        for fail_at in 1..=commits {
+            let (status, calls, _, _, _) = race_crash(fail_at, after).await;
+            let label = format!("crash at commit {fail_at}, after={after}: {status:?} {calls:?}");
+            let Some(Status::Completed(output)) = status else { panic!("{label}") };
+            // One handler: every call (a lost answer resends the same call)
+            // has one identity.
+            let mut paths = calls.clone();
+            paths.dedup();
+            assert_eq!(paths.len(), 1, "{label}");
+            assert!(either.contains(&output), "{label}");
+            // Once the first refusal is saved, recovery follows it: the same
+            // branch acts and the run ends with the same output.
+            if fail_at > claimed || (fail_at == claimed && after) {
+                decided += 1;
+                assert_eq!(output, baseline, "{label}");
+                assert_eq!(paths, reports, "{label}");
+            }
+        }
+    }
+    assert!(decided > 2, "crash points after the first refusal: {decided}");
 }

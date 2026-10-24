@@ -1675,7 +1675,7 @@ fn generated_jump_budgets_end_every_run_within_the_budget_across_crashes() {
             let decisions: Vec<(bool, u64)> = records
                 .values()
                 .filter_map(|r| match r {
-                    Record::Budget { granted, spent } => Some((*granted, *spent)),
+                    Record::Budget { granted, spent, .. } => Some((*granted, *spent)),
                     _ => None,
                 })
                 .collect();

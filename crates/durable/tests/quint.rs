@@ -1158,9 +1158,23 @@ impl StoreDriver {
                 };
                 view.frontier.insert(i.parse()?);
                 view.continuation = view.continuation.max(output.as_i64().context("continuation")?);
+            } else if key == owf::durable::EXCEEDED {
+                // The run's first refusal: one of its refused decisions, the
+                // one every refusal names.
+                let Record::Exceeded { by } = record else { anyhow::bail!("not a first refusal") };
+                ensure!(
+                    matches!(snapshot.records.get(by), Some(Record::Budget { granted: false, .. })),
+                    "the first refusal names no refused decision"
+                );
             } else if let Some(i) = key.strip_prefix("jump") {
                 let i: usize = i.parse()?;
-                let Record::Budget { granted, spent } = record else { anyhow::bail!("not a budget decision") };
+                let Record::Budget { granted, spent, first } = record else { anyhow::bail!("not a budget decision") };
+                let named = snapshot.records.get(owf::durable::EXCEEDED);
+                ensure!(
+                    *granted == first.is_none()
+                        && first.as_ref().is_none_or(|by| named == Some(&Record::Exceeded { by: by.clone() })),
+                    "a refusal does not name the run's first"
+                );
                 view.spends[i] = if *granted { 1 } else { 2 };
                 view.spent[i] = i64::try_from(*spent)?;
             } else {

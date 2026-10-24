@@ -686,7 +686,9 @@ fn counter(t: &TestStore, root: &str) -> anyhow::Result<Option<Value>> {
 /// decision, never reset by a restart, refused past the limit, and gone
 /// with the root.
 fn budgets(factory: &impl Fn(&str) -> anyhow::Result<TestStore>, report: &mut Report) -> anyhow::Result<()> {
-    let budget = |granted: bool, spent: u64| Record::Budget { granted, spent };
+    // A refusal names the run's first refused key, decided once.
+    let budget =
+        |granted: bool, spent: u64| Record::Budget { granted, spent, first: (!granted).then(|| "c#jump".to_string()) };
     let t = factory("budget")?;
     report.cases += 1;
     let s = &t.store;
@@ -695,6 +697,9 @@ fn budgets(factory: &impl Fn(&str) -> anyhow::Result<TestStore>, report: &mut Re
     assert_eq!(s.spend(&f, "a#jump", 2, 1)?, budget(true, 1), "repeating returns the saved decision");
     assert_eq!(s.spend(&f, "b#jump", 2, 1)?, budget(true, 2));
     assert_eq!(s.spend(&f, "c#jump", 2, 1)?, budget(false, 2));
+    assert_eq!(s.spend(&f, "c2#jump", 2, 1)?, budget(false, 2), "a later refusal names the first");
+    assert_eq!(s.load_records(&f, 1)?.get(owf::durable::EXCEEDED), Some(&Record::Exceeded { by: "c#jump".into() }));
+    assert!(s.save_record(&f, owf::durable::EXCEEDED, &Record::Exceeded { by: "a#jump".into() }, 1).is_err());
     assert_eq!(counter(&t, "root")?, Some(json!(2)));
     // Only `spend` commits a decision: a forged one is refused.
     assert!(s.save_record(&f, "d#jump", &budget(true, 0), 1).is_err());

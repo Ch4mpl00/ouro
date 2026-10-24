@@ -9,7 +9,7 @@
 //! root's count commit together without touching the root's run row.
 use crate::*;
 use owf::{
-    durable::{VERSION, check_transition},
+    durable::{EXCEEDED, VERSION, check_transition},
     run::WorkflowError,
 };
 use serde::{Deserialize, de::DeserializeOwned};
@@ -983,7 +983,7 @@ impl RunStore for TransactionalStore {
             if matches!(r, Record::Event { .. } | Record::Expired { .. }) {
                 anyhow::ensure!(old.as_ref() == Some(&value), "event records must be committed by take_event");
             }
-            if matches!(r, Record::Budget { .. }) {
+            if matches!(r, Record::Budget { .. } | Record::Exceeded { .. }) {
                 anyhow::ensure!(old.as_ref() == Some(&value), "budget records must be committed by spend");
             }
             if let Some(old) = &old {
@@ -1216,7 +1216,23 @@ impl RunStore for TransactionalStore {
             if granted {
                 put(rows, "budget", &root, &spent)?;
             }
-            let record = Record::Budget { granted, spent };
+            // A refusal names the run's first one, decided in the commit
+            // that refused it.
+            let first = if granted {
+                None
+            } else {
+                match rows.get(&kind, EXCEEDED)? {
+                    Some(saved) => match serde_json::from_value(saved)? {
+                        Record::Exceeded { by } => Some(by),
+                        _ => anyhow::bail!("invalid first refusal record"),
+                    },
+                    None => {
+                        rows.put(&kind, EXCEEDED, &serde_json::to_value(Record::Exceeded { by: k.into() })?)?;
+                        Some(k.to_string())
+                    }
+                }
+            };
+            let record = Record::Budget { granted, spent, first };
             rows.put(&kind, k, &serde_json::to_value(&record)?)?;
             if !s.evidence {
                 s.evidence = true;

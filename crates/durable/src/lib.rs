@@ -394,8 +394,11 @@ pub trait RunStore: Send + Sync {
     /// counter, an owned child's included) under `key`, if fewer than
     /// `limit` are spent, and saves `Record::Budget` at `key` with the
     /// decision and the count after it, in one fenced commit; repeating
-    /// returns the saved record. The count survives restarts and ends with
-    /// the root; the store never interprets what a unit stands for.
+    /// returns the saved record. A refusal also saves the run's first
+    /// refusal (`Record::Exceeded` at `owf::durable::EXCEEDED`) in that commit
+    /// unless the run has one, and names it (`first`). The count survives
+    /// restarts and ends with the root; the store never interprets what a
+    /// unit stands for.
     fn spend(&self, fence: &Fence, key: &str, limit: u64, now_ms: i64) -> anyhow::Result<Record>;
     /// Due runs for an undeclared worker: every application version.
     fn due(&self, now_ms: i64, limit: usize) -> anyhow::Result<Vec<String>> {

@@ -502,6 +502,7 @@ impl std::fmt::Display for WorkflowError {
 impl std::error::Error for WorkflowError {}
 
 /// Why a step stopped. Only `Error` can be caught by `try`.
+#[derive(Clone)]
 enum Fault {
     Error(WorkflowError),
     /// A host limit was hit: the run stops whatever the definition says.
@@ -720,6 +721,7 @@ async fn execute(
         Record::Timer { .. } => key.ends_with("#wait") || key.contains("#retry[") || key.contains("#attempt["),
         Record::Retry { .. } => key.contains("#retry-decision["),
         Record::Budget { .. } => key.ends_with("#jump"),
+        Record::Exceeded { .. } => key == durable::EXCEEDED,
     }) {
         return Outcome {
             status: Status::Interrupted(WorkflowError::runtime("invalid durable record key or terminal state")),
@@ -753,6 +755,7 @@ async fn execute(
         spending: Mutex::new(()),
         handlers: Mutex::default(),
         handler_failed: AtomicBool::new(false),
+        exceeded: tokio::sync::watch::channel(None).0,
         writes: AtomicUsize::new(writes),
         workflow: json!({ "id": run_id, "definition": wf.definition, "input": input, "startedAt": datetime(DateTime::from_timestamp_millis(started_ms).expect("stored timestamp")) }),
         runtime: runtime.clone(),
@@ -866,6 +869,9 @@ struct Run<'a> {
     handlers: Mutex<Vec<(String, usize)>>,
     /// A handler faulted, which ended the run through its budget.
     handler_failed: AtomicBool,
+    /// How the run's first refused jump ended this execution, for the
+    /// branches refused at the same moment, which follow it.
+    exceeded: tokio::sync::watch::Sender<Option<Fault>>,
     /// `Write` calls started so far.
     writes: AtomicUsize,
     /// `$workflow`.
@@ -1140,8 +1146,9 @@ impl Run<'_> {
 
     /// Takes the jump the task at `reference` chose, spending one unit of
     /// the run tree's budget under `<reference>#jump` (or restoring the
-    /// decision saved there). `false`: the budget is spent.
-    fn jump(&self, reference: &str) -> Result<bool, Fault> {
+    /// decision saved there). `Some(first)`: the budget is spent, and `first`
+    /// is the key of the run's first refusal, the one that acts on it.
+    fn jump(&self, reference: &str) -> Result<Option<String>, Fault> {
         if self.handler(reference, false).is_some() {
             return Err(Fault::Fatal(WorkflowError {
                 instance: Some(reference.into()),
@@ -1150,12 +1157,13 @@ impl Run<'_> {
         }
         let key = format!("{reference}#jump");
         let invalid = || Fault::Interrupted(WorkflowError::runtime("invalid budget record"));
-        let granted = |r: &Record| match r {
-            Record::Budget { granted, .. } => Ok(*granted),
+        let refused = |r: &Record| match r {
+            Record::Budget { granted: true, .. } => Ok(None),
+            Record::Budget { granted: false, first: Some(first), .. } => Ok(Some(first.clone())),
             _ => Err(invalid()),
         };
         if let Some(saved) = self.record(&key) {
-            return granted(&saved);
+            return refused(&saved);
         }
         let _one = self.spending.lock().unwrap_or_else(|e| e.into_inner());
         let shared = match self.journal {
@@ -1167,23 +1175,37 @@ impl Run<'_> {
             })?,
             None => None,
         };
-        let taken = match shared {
+        let decided = match shared {
             Some(record) => {
-                let taken = granted(&record)?;
+                let decided = refused(&record)?;
                 self.records.lock().unwrap_or_else(|e| e.into_inner()).insert(key, record);
-                taken
+                decided
             }
             None => {
                 let spent = self.jumps.load(Ordering::SeqCst);
                 let taken = spent < self.max_jumps;
-                self.save(&key, Record::Budget { granted: taken, spent: spent + u64::from(taken) })?;
-                taken
+                // Every refusal of the run names its first: an earlier one
+                // already does, else this one is it, in its one record.
+                let first = (!taken).then(|| {
+                    self.records
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .values()
+                        .find_map(|r| match r {
+                            Record::Budget { granted: false, first, .. } => first.clone(),
+                            _ => None,
+                        })
+                        .unwrap_or_else(|| key.clone())
+                });
+                let record = Record::Budget { granted: taken, spent: spent + u64::from(taken), first: first.clone() };
+                self.save(&key, record)?;
+                first
             }
         };
-        if taken {
+        if decided.is_none() {
             self.jumps.fetch_add(1, Ordering::SeqCst);
         }
-        Ok(taken)
+        Ok(decided)
     }
 
     /// The handler `reference` runs in, if any; `enter` counts a task.
@@ -1201,14 +1223,45 @@ impl Run<'_> {
     /// The jump the task at `reference` chose was refused: `on_exceeded`
     /// decides. The task faults with `budget.exhausted` (catchable), or it
     /// completes with `output` and the run ends with that output or with
-    /// what its handler returns.
-    async fn exceeded(&self, reference: &str, output: &Value, ctx: &mut Value, scope: &Scope) -> Result<(), Fault> {
+    /// what its handler returns. Only the run's first refusal (`first`) acts:
+    /// a branch refused at the same moment ends as that one does, so the
+    /// handler runs once and recovery and replay end the run the same way.
+    async fn exceeded(
+        &self,
+        reference: &str,
+        first: &str,
+        output: &Value,
+        ctx: &mut Value,
+        scope: &Scope,
+    ) -> Result<(), Fault> {
         let detail = format!("more than {} jumps in this run tree; a `then` loop did not end", self.max_jumps);
+        if matches!(self.wf.budget.on_exceeded, Exceeded::Raise) {
+            return Err(WorkflowError::budget(detail).into());
+        }
+        if first != format!("{reference}#jump") {
+            let mut ended = self.exceeded.subscribe();
+            let fault = tokio::select! {
+                _ = self.cancel.cancelled() => Fault::Cancelled,
+                fault = ended.wait_for(Option::is_some) => match fault {
+                    Ok(fault) => fault.clone().unwrap_or(Fault::Cancelled),
+                    Err(_) => Fault::Cancelled,
+                },
+            };
+            return Err(fault);
+        }
+        let fault = self.act_on_exceeded(reference, output, ctx, scope).await;
+        self.exceeded.send_replace(Some(fault.clone()));
+        Err(fault)
+    }
+
+    /// `on_exceeded` for the run's first refusal: how it ends the run.
+    async fn act_on_exceeded(&self, reference: &str, output: &Value, ctx: &mut Value, scope: &Scope) -> Fault {
         match &self.wf.budget.on_exceeded {
-            Exceeded::Raise => Err(WorkflowError::budget(detail).into()),
+            // Answered by `exceeded` before any branch acts.
+            Exceeded::Raise => Fault::Error(WorkflowError::budget("the jump budget is spent")),
             Exceeded::End => {
                 self.observe(Event::TaskCompleted { reference, output });
-                Err(Fault::Exceeded(output.clone()))
+                Fault::Exceeded(output.clone())
             }
             Exceeded::Task(handler) => {
                 let at = format!("{reference}{HANDLER}");
@@ -1218,15 +1271,15 @@ impl Run<'_> {
                 match result {
                     Ok((out, _)) => {
                         self.observe(Event::TaskCompleted { reference, output });
-                        Err(Fault::Exceeded(out))
+                        Fault::Exceeded(out)
                     }
                     // The handler is the run's last word: its error ends the
                     // run, whatever encloses the jump.
                     Err(Fault::Error(e) | Fault::Fatal(e)) => {
                         self.handler_failed.store(true, Ordering::SeqCst);
-                        Err(Fault::Fatal(e))
+                        Fault::Fatal(e)
                     }
-                    Err(other) => Err(other),
+                    Err(other) => other,
                 }
             }
         }
@@ -1471,8 +1524,10 @@ impl Run<'_> {
             }
         }
         let flow = flow.or_else(|| task.then.clone()).unwrap_or(Flow::Continue);
-        if matches!(flow, Flow::Goto(_)) && !self.jump(reference)? {
-            self.exceeded(reference, &out, ctx, scope).await?;
+        if matches!(flow, Flow::Goto(_))
+            && let Some(first) = self.jump(reference)?
+        {
+            self.exceeded(reference, &first, &out, ctx, scope).await?;
         }
         self.observe(Event::TaskCompleted { reference, output: &out });
         Ok((out, flow))

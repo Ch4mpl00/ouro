@@ -263,7 +263,8 @@ fn convert(r: &Record, f: &mut dyn FnMut(&str) -> Result<String, String>) -> Res
         | Record::Expired { .. }
         | Record::Timer { .. }
         | Record::Retry { .. }
-        | Record::Budget { .. } => r.clone(),
+        | Record::Budget { .. }
+        | Record::Exceeded { .. } => r.clone(),
     })
 }
 

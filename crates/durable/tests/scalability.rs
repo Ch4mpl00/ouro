@@ -122,7 +122,7 @@ fn bounds(backend: Arc<dyn AtomicBackend>, metrics: Arc<Metrics>, validation: u6
     let f = s.claim(&a.id, 1)?.unwrap();
     assert_eq!(
         bounded(&metrics, "spend", 0, || s.spend(&f, "loop#jump", 100, 1))?,
-        Record::Budget { granted: true, spent: 1 }
+        Record::Budget { granted: true, spent: 1, first: None }
     );
     bounded(&metrics, "spend_replayed", 0, || s.spend(&f, "loop#jump", 100, 1))?;
     assert!(matches!(
@@ -237,7 +237,7 @@ fn long_run(backend: &Arc<dyn AtomicBackend>, metrics: &Metrics, validation: u64
     // A jump decision of a run holding 10,000 records: its record row and its
     // tree's counter, nothing that grows with the run.
     let spent = bounded(metrics, "long_spend", 0, || s.spend(&f, "/do/loop#jump", 100, 1))?;
-    assert_eq!(spent, Record::Budget { granted: true, spent: 1 });
+    assert_eq!(spent, Record::Budget { granted: true, spent: 1, first: None });
     bounded(metrics, "long_spend_replayed", 0, || s.spend(&f, "/do/loop#jump", 100, 1))?;
     bounded(metrics, "long_register_wait", 0, || s.register_wait(&f, &types, 1))?;
     let next = event("long-next", "long", json!("next"));
