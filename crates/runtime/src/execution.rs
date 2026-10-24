@@ -5,10 +5,10 @@
 //! and resources. A process stop releases work; explicit cancellation is a
 //! terminal storage transaction. Lease loss always stops forward progress.
 use crate::{
-    FunctionContext, Registry,
+    FunctionContext, Output, Registry,
     capabilities::{Capabilities, EventSink, ProcessRunner, ResourceResolver, SecretResolver},
     registry::{Checks, Installed, MissingFunction},
-    telemetry::Spans,
+    telemetry::{Metrics, Spans},
     testing::{Mode, RecordedCall},
 };
 use async_trait::async_trait;
@@ -19,7 +19,7 @@ use ouro_durable::{
     SystemClock,
 };
 use ows::{
-    durable::{CallEntry, CallFailure, Delivery},
+    durable::{Annotations, CallEntry, CallFailure, Delivery},
     model::{self, Process, Workflow},
     run::{self, CallInfo, Child, ChildTarget, Functions, Host, Limits, Status, WorkflowError},
 };
@@ -27,7 +27,7 @@ use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
@@ -57,6 +57,9 @@ pub struct Config {
     /// Declared: this runtime claims only runs of a compatible version; the
     /// others wait, visibly, for a compatible worker (`Runtime::compatible`).
     pub application: Compatibility,
+    /// The host name this runtime's heartbeat rows carry, as the embedding
+    /// application knows it (the runtime reads no environment).
+    pub host_name: Option<String>,
 }
 impl Default for Config {
     fn default() -> Self {
@@ -71,9 +74,14 @@ impl Default for Config {
             limits: Limits::default(),
             metadata: json!({}),
             application: Compatibility::default(),
+            host_name: None,
         }
     }
 }
+
+/// How many due runs and open listens one backlog observation reads: the
+/// gauges are lower bounds at this size.
+const BACKLOG_PAGE: usize = ouro_durable::control::MAX_PAGE;
 
 struct ExecutionGuard<'a> {
     executions: &'a Mutex<BTreeMap<(String, u64), CancellationToken>>,
@@ -93,11 +101,15 @@ pub struct Runtime {
     pub(crate) definition_source: Arc<dyn RunStore>,
     pub(crate) clock: Arc<dyn Clock>,
     pub(crate) tracer: Arc<BoxedTracer>,
+    pub(crate) metrics: Arc<Metrics>,
     pub(crate) config: Config,
     pub(crate) capabilities: Capabilities,
     permits: Semaphore,
     function_permits: Arc<Semaphore>,
     executions: Arc<Mutex<BTreeMap<(String, u64), CancellationToken>>>,
+    /// This runtime's identity in heartbeat rows, and when it was built.
+    worker_id: String,
+    started_ms: i64,
     /// Per notice key, the sink failures so far and when to try it again.
     /// In memory: another process, or a restart, may try sooner, which
     /// at-least-once allows.
@@ -131,24 +143,88 @@ impl Runtime {
             definition_source: store.clone(),
             store,
             installed: Installed::new(registry),
-            clock,
             tracer: Arc::new(tracer),
+            metrics: Arc::new(Metrics::new(crate::telemetry::noop_meter())),
             capabilities: Capabilities::default(),
             permits: Semaphore::new(config.max_concurrency),
             function_permits: Arc::new(Semaphore::new(config.max_function_concurrency)),
             config,
             executions: Arc::new(Mutex::new(BTreeMap::new())),
+            worker_id: uuid::Uuid::new_v4().to_string(),
+            started_ms: clock.now_ms(),
             notice_backoff: Mutex::new(BTreeMap::new()),
+            clock,
         })
     }
     pub fn embedded(path: impl AsRef<std::path::Path>, registry: Registry) -> anyhow::Result<Self> {
-        Self::new(
+        Ok(Self::new(
             Arc::new(ouro_durable::sqlite::open(path)?),
             Arc::new(registry),
             Config::default(),
             Arc::new(SystemClock),
             opentelemetry::global::tracer("ouro-runtime"),
-        )
+        )?
+        .with_meter(opentelemetry::global::meter("ouro-runtime")))
+    }
+    /// Records the runtime's metrics (`ouro.*`, see the README) with this
+    /// meter; without one, none are recorded. The host owns the meter
+    /// provider, its exporter and its shutdown. Function handlers get the
+    /// same meter in `FunctionContext::meter`.
+    pub fn with_meter(mut self, meter: opentelemetry::metrics::Meter) -> Self {
+        self.metrics = Arc::new(Metrics::new(meter).enabled());
+        self
+    }
+    /// This runtime's worker id in heartbeat rows, new for every runtime.
+    pub fn worker_id(&self) -> &str {
+        &self.worker_id
+    }
+    /// Upserts this runtime's heartbeat row: its id, host name, application
+    /// version, the runs it is executing now and the beat, stale after one
+    /// lease (`ouro_durable::LEASE_MS`) without another beat. One row per
+    /// runtime, constant cost. `worker` beats on its heartbeat cadence; a
+    /// host that drives runs itself (a serverless invocation) beats when it
+    /// runs. `Control::workers` lists the rows and marks the stale ones.
+    pub async fn heartbeat(&self) -> anyhow::Result<()> {
+        let now = self.clock.now_ms();
+        self.beat(now, now.saturating_add(ouro_durable::LEASE_MS)).await
+    }
+    async fn beat(&self, now: i64, expires_ms: i64) -> anyhow::Result<()> {
+        let held = u64::try_from(self.executions.lock().unwrap().len())?;
+        let worker = ouro_durable::control::Worker {
+            id: self.worker_id.clone(),
+            host: self.config.host_name.clone(),
+            application: self.config.application.version.clone(),
+            started_ms: self.started_ms,
+            beat_ms: now,
+            expires_ms,
+            held,
+        };
+        self.store.beat(&worker).await
+    }
+    /// The store-wide backlog as gauges (`ouro.backlog.*`, `ouro.waits.*`):
+    /// one bounded page of due runs and one of open listens, oldest first,
+    /// and the oldest run's row. Read only when the host injected a meter.
+    async fn observe_backlog(&self) -> anyhow::Result<()> {
+        if !self.metrics.is_enabled() {
+            return Ok(());
+        }
+        let now = self.clock.now_ms();
+        let due = self.store.due(now, BACKLOG_PAGE).await?;
+        let due_age = match due.first() {
+            Some(id) => self.store.get(id).await?.map_or(0, |r| {
+                let since = if r.state == ouro_durable::RunState::Running {
+                    r.lease_until_ms.unwrap_or(r.wake_at_ms)
+                } else {
+                    r.wake_at_ms
+                };
+                now.saturating_sub(since)
+            }),
+            None => 0,
+        };
+        let waits = self.store.pending_waits(&ouro_durable::control::Waits::default(), None, BACKLOG_PAGE).await?;
+        let wait_age = waits.items.first().map_or(0, |w| now.saturating_sub(w.waiting.since_ms));
+        self.metrics.backlog(u64::try_from(due.len())?, due_age, u64::try_from(waits.items.len())?, wait_age);
+        Ok(())
     }
     /// The registry runs call through now.
     pub fn registry(&self) -> Arc<Registry> {
@@ -213,6 +289,7 @@ impl Runtime {
             limits: self.config.limits.clone(),
             breaker_threshold: self.config.breaker_threshold,
             max_concurrent_runs: self.config.max_concurrent_runs,
+            metrics: self.metrics.clone(),
             executions: self.executions.clone(),
         }
     }
@@ -227,7 +304,9 @@ impl Runtime {
             return Ok(saved);
         }
         let a = self.admission(id, name, input).await?;
-        self.store.admit(&a, self.clock.now_ms()).await?;
+        if self.store.admit(&a, self.clock.now_ms()).await? {
+            self.metrics.started(name);
+        }
         self.store.get(id).await?.ok_or_else(|| anyhow::anyhow!("admitted run disappeared"))
     }
     pub async fn get(&self, id: &str) -> anyhow::Result<Option<SavedRun>> {
@@ -327,6 +406,7 @@ impl Runtime {
         };
         let link = ChildLink { parent: parent.run_id.clone(), key: key.into(), reference: key.into() };
         if let Some(f) = self.store.start_child(parent, &a, &link, self.clock.now_ms()).await? {
+            self.metrics.started(name);
             self.store.release(&f, self.clock.now_ms()).await?;
         }
         self.store.get(id).await?.ok_or_else(|| anyhow::anyhow!("child disappeared"))
@@ -351,7 +431,11 @@ impl Runtime {
         self.executions.lock().unwrap().insert(execution_key.clone(), local_cancel.clone());
         let _execution_guard =
             ExecutionGuard { executions: &self.executions, key: execution_key, token: local_cancel.clone() };
-        let spans = Arc::new(Spans::new(self.tracer.clone(), &Context::current(), &saved.admission));
+        let a = &saved.admission;
+        // Due since `wake_at_ms`: a waiting or ready run's wake-up, a taken
+        // over run's lease expiry (the store records it at the claim).
+        self.metrics.claimed(&a.name, self.clock.now_ms().saturating_sub(saved.wake_at_ms));
+        let spans = Arc::new(Spans::new(self.tracer.clone(), self.metrics.clone(), &Context::current(), a));
         let result = self.execute(&saved, lease.clone(), spans.clone(), &local_cancel, stop, mode).await;
         let label = match &result {
             Ok(Status::Completed(_)) => "completed",
@@ -360,6 +444,9 @@ impl Runtime {
             Ok(Status::Waiting { .. }) => "waiting",
             _ => "interrupted",
         };
+        if matches!(label, "completed" | "faulted" | "cancelled") {
+            self.metrics.ended(&saved.admission.name, label, self.clock.now_ms().saturating_sub(saved.admitted_ms));
+        }
         spans.finish(label);
         result.map(Some)
     }
@@ -432,6 +519,8 @@ impl Runtime {
                 ),
                 lease: lease.clone(),
                 spans: spans.clone(),
+                metrics: self.metrics.clone(),
+                definition: (a.name.clone(), a.version),
                 function_permits: self.function_permits.clone(),
                 lineage,
                 mode: mode.clone(),
@@ -513,6 +602,7 @@ impl Runtime {
         };
         if outcome.limit_exceeded {
             spans.limit_exceeded();
+            self.metrics.budget_exhausted(&saved.admission.name);
         }
         // Explicit cancel may already have committed and fenced us.
         if let Some(status) = self.store.get(&saved.admission.id).await?.and_then(|r| r.outcome) {
@@ -558,6 +648,10 @@ impl Runtime {
         // runs' heartbeats either.
         let mut ticking: FuturesUnordered<BoxFuture<'_, anyhow::Result<Vec<String>>>> = FuturesUnordered::new();
         let mut notifying: FuturesUnordered<BoxFuture<'_, anyhow::Result<usize>>> = FuturesUnordered::new();
+        // The heartbeat row and the backlog gauges, on the lease renewal
+        // cadence, one beat at a time.
+        let mut beat = tokio::time::interval(self.config.heartbeat_interval);
+        let mut beating: FuturesUnordered<BoxFuture<'_, anyhow::Result<()>>> = FuturesUnordered::new();
         let mut ids = std::collections::BTreeSet::new();
         let mut failure = None;
         let shutdown = stop.child_token();
@@ -576,6 +670,20 @@ impl Runtime {
                     if let Err(e) = result {
                         failure = Some(e);
                         break;
+                    }
+                }
+                Some(result) = beating.next(), if !beating.is_empty() => {
+                    if let Err(e) = result {
+                        failure = Some(e);
+                        break;
+                    }
+                }
+                _ = beat.tick() => {
+                    if beating.is_empty() {
+                        beating.push(Box::pin(async move {
+                            self.heartbeat().await?;
+                            self.observe_backlog().await
+                        }));
                     }
                 }
                 Some(result) = ticking.next(), if !ticking.is_empty() => {
@@ -624,7 +732,7 @@ impl Runtime {
         }
         shutdown.cancel();
         // Drained together, for the same reason they ran together.
-        let (runs, ticks, notices) = futures::join!(
+        let (runs, ticks, notices, beats) = futures::join!(
             async {
                 let mut failure = None;
                 while let Some((_, result)) = running.next().await {
@@ -646,11 +754,20 @@ impl Runtime {
                 }
                 failure
             },
+            async {
+                let mut failure = None;
+                while let Some(result) = beating.next().await {
+                    failure = result.err().or(failure);
+                }
+                failure
+            },
         );
-        if let Some(e) = notices.or(ticks).or(runs).or(failure) {
+        if let Some(e) = beats.or(notices).or(ticks).or(runs).or(failure) {
             return Err(e);
         }
-        Ok(())
+        // A worker that stopped cleanly is stale at once, holding nothing.
+        let now = self.clock.now_ms();
+        self.beat(now, now).await
     }
 }
 // ── 2. admission ───────────────────────────────────────────────────────────
@@ -673,6 +790,8 @@ pub(crate) struct Admitter {
     /// What a refused trigger run counts against (`Admitter::triggered`).
     pub breaker_threshold: u32,
     pub max_concurrent_runs: usize,
+    /// The runtime's metrics, for the schedules an event fires.
+    pub metrics: Arc<Metrics>,
     executions: Arc<Mutex<BTreeMap<(String, u64), CancellationToken>>>,
 }
 
@@ -866,6 +985,7 @@ impl Admitter {
         if let Some(version) = &self.application {
             runtime[ouro_durable::APPLICATION_VERSION] = json!(version);
         }
+        crate::telemetry::pin_trace(&mut runtime);
         Admission {
             id: id.into(),
             name: d.name.clone(),
@@ -979,6 +1099,9 @@ pub(crate) struct ExecutionFunctions {
     schemas: Pinned,
     pub lease: Arc<Lease>,
     pub spans: Arc<Spans>,
+    pub metrics: Arc<Metrics>,
+    /// The run's definition name and version, for its calls' context.
+    pub definition: (String, u64),
     pub function_permits: Arc<Semaphore>,
     /// This run's budget (its definition's included) and depth, which its
     /// owned children inherit.
@@ -1005,6 +1128,7 @@ impl ExecutionFunctions {
             return Err(CallFailure::NotExecuted(WorkflowError::validation(format!("unknown function {name}"))));
         }
         let mut span = self.spans.function(name, info.reference, info.attempt);
+        let admission = &self.definition;
         let context = FunctionContext {
             cancel: info.cancel.clone(),
             run_id: info.run_id.into(),
@@ -1013,15 +1137,24 @@ impl ExecutionFunctions {
             idempotency_key: serde_json::to_string(&(info.run_id, info.logical)).expect("string tuple serializes"),
             span: span.context.clone(),
             input: info.input.clone(),
+            function: name.into(),
+            definition: admission.0.clone(),
+            version: admission.1,
+            delivery: info.delivery,
+            meter: self.metrics.meter.clone(),
         };
+        let attributes = context.attributes();
+        let started = Instant::now();
         let result = async {
             if let Mode::Replay { .. } = &self.mode {
                 return self.replayed(name, &args, info);
             }
             if crate::registry::builtin(name) {
-                return self.builtin(name, args, info).await.map_err(|e| match e.downcast::<Refused>() {
-                    Ok(Refused(error)) => CallFailure::NotExecuted(error),
-                    Err(e) => CallFailure::Interrupted(WorkflowError::runtime(e.to_string())),
+                return self.builtin(name, args, info).await.map(Output::new).map_err(|e| {
+                    match e.downcast::<Refused>() {
+                        Ok(Refused(error)) => CallFailure::NotExecuted(error),
+                        Err(e) => CallFailure::Interrupted(WorkflowError::runtime(e.to_string())),
+                    }
                 });
             }
             let registered = match process {
@@ -1045,28 +1178,31 @@ impl ExecutionFunctions {
                 .check_lease(&self.lease.fence, self.lease.clock.now_ms())
                 .await
                 .map_err(|e| CallFailure::Interrupted(WorkflowError::runtime(e.to_string())))?;
-            let result = match &self.mode {
+            let output = match &self.mode {
                 // The dry run's guarantee: a call the host's rule marks is
                 // answered here and never reaches its handler or runner.
                 Mode::Dry { mock, mocked } if mock.mocks(name, &args) => {
-                    let result = mock.response(name, &args, &context);
+                    let output = mock.response(name, &args, &context);
                     mocked.lock().unwrap().push(RecordedCall {
                         task_path: info.reference.into(),
                         logical: info.logical.into(),
                         function: name.into(),
                         arguments: args.clone(),
                         delivery: info.delivery,
-                        result: result.clone(),
+                        result: output.as_ref().map(|o| o.value.clone()).map_err(Clone::clone),
+                        annotations: output.as_ref().map(|o| o.annotations.clone()).unwrap_or_default(),
                     });
-                    result
+                    output
                 }
                 Mode::Live | Mode::Dry { .. } => match (registered, process, runner) {
                     (Some(f), _, _) => {
                         f.function.handler.call(args, context.clone()).with_context(context.span.clone()).await
                     }
-                    (None, Some(kind), Some(runner)) => {
-                        runner.run(kind, args, context.clone()).with_context(context.span.clone()).await
-                    }
+                    (None, Some(kind), Some(runner)) => runner
+                        .run(kind, args, context.clone())
+                        .with_context(context.span.clone())
+                        .await
+                        .map(Output::new),
                     _ => Err(WorkflowError::runtime(format!("no runner for {name}"))),
                 },
                 Mode::Replay { .. } => unreachable!("replay returns before dispatch"),
@@ -1074,22 +1210,43 @@ impl ExecutionFunctions {
             .map_err(CallFailure::Response)?;
             if let Some(f) = registered {
                 f.output
-                    .validate(&result)
+                    .validate(&output.value)
                     .map_err(|e| CallFailure::Response(WorkflowError::validation(format!("{name} output: {e}"))))?;
             }
-            Ok(result)
+            ows::durable::check_annotations(&output.annotations)
+                .map_err(|e| CallFailure::Response(WorkflowError::validation(format!("{name} annotations: {e}"))))?;
+            Ok(output)
         }
         .await;
+        let outcome = match &result {
+            Ok(_) => "completed",
+            Err(CallFailure::Response(_)) => "failed",
+            Err(CallFailure::NotExecuted(_)) => "not_executed",
+            Err(CallFailure::Unknown(_)) => "unknown",
+            Err(CallFailure::Interrupted(_)) => "interrupted",
+        };
+        let annotations = result.as_ref().map(|o| &o.annotations);
+        // A replayed answer is no call: it is neither timed nor counted again.
+        if !matches!(self.mode, Mode::Replay { .. }) {
+            self.metrics.call(&attributes, outcome, started, annotations.unwrap_or(&Annotations::new()));
+        }
+        if let Ok(annotations) = annotations {
+            span.annotate(annotations);
+        }
         span.finish(
             if result.is_ok() { "completed" } else { "faulted" },
             result.as_ref().err().map(|e| info.secrets.text(&format!("{e:?}"))),
         );
-        result
+        result.map(|output| {
+            // The interpreter saves them with the result.
+            info.annotations.extend(output.annotations);
+            output.value
+        })
     }
     /// A recorded call's result. Records hold redacted values, so the
     /// comparison is between redacted forms and the result gets its
     /// secrets back.
-    fn replayed(&self, name: &str, args: &Value, info: &CallInfo<'_>) -> Result<Value, CallFailure> {
+    fn replayed(&self, name: &str, args: &Value, info: &CallInfo<'_>) -> Result<Output, CallFailure> {
         let Mode::Replay { calls, used, .. } = &self.mode else { unreachable!("only replay mode has recorded calls") };
         let call = calls.get(info.reference).ok_or_else(|| {
             CallFailure::NotExecuted(WorkflowError::runtime(format!("missing replay result at {}", info.reference)))
@@ -1103,8 +1260,22 @@ impl ExecutionFunctions {
         }
         used.lock().unwrap().insert(info.reference.to_string());
         match &call.result {
-            Ok(v) => info.secrets.restore_value(v).map_err(|e| CallFailure::NotExecuted(WorkflowError::runtime(e))),
-            Err(e) => Err(CallFailure::Response(e.clone())),
+            Ok(v) => {
+                let restore = |v: &Value| info.secrets.restore_value(v).map_err(WorkflowError::runtime);
+                let annotations = serde_json::to_value(&call.annotations)
+                    .map_err(|e| WorkflowError::runtime(e.to_string()))
+                    .and_then(|a| restore(&a))
+                    .and_then(|a| serde_json::from_value(a).map_err(|e| WorkflowError::runtime(e.to_string())));
+                match (restore(v), annotations) {
+                    (Ok(value), Ok(annotations)) => Ok(Output { value, annotations }),
+                    (Err(e), _) | (_, Err(e)) => Err(CallFailure::NotExecuted(e)),
+                }
+            }
+            Err(e) => {
+                // An error answer keeps what it carried, as it was recorded.
+                info.annotations.extend(call.annotations.clone());
+                Err(CallFailure::Response(e.clone()))
+            }
         }
     }
     async fn builtin(&self, name: &str, args: Value, info: &CallInfo<'_>) -> anyhow::Result<Value> {
@@ -1127,6 +1298,7 @@ impl ExecutionFunctions {
         let now = self.lease.clock.now_ms();
         let link = ChildLink { parent: info.run_id.into(), key: info.logical.into(), reference: info.reference.into() };
         if let Some(fence) = store.start_child(&self.lease.fence, &a, &link, now).await? {
+            self.metrics.started(&a.name);
             store.release(&fence, now).await?;
         }
         Ok(json!({"id":id,"key":info.logical,"done":format!("done:{id}"),"waiting":format!("waiting:{id}")}))
@@ -1262,11 +1434,14 @@ impl run::Children for ExecutionFunctions {
         };
         let now = self.lease.clock.now_ms();
         if !owned {
-            store.admit(&a, now).await.map_err(refused)?;
+            if store.admit(&a, now).await.map_err(refused)? {
+                self.metrics.started(&a.name);
+            }
             return Ok(Child { id, done });
         }
         let link = ChildLink { parent: run_id.into(), key: key.into(), reference: key.into() };
         if let Some(fence) = store.start_child(&self.lease.fence, &a, &link, now).await.map_err(refused)? {
+            self.metrics.started(&a.name);
             store.release(&fence, now).await.map_err(interrupted)?;
         }
         Ok(Child { id, done })
@@ -1301,6 +1476,7 @@ impl Functions for ExecutionFunctions {
                     arguments: event.clone(),
                     delivery: info.delivery,
                     result: Ok(event.clone()),
+                    annotations: Annotations::new(),
                 });
                 Ok(())
             }

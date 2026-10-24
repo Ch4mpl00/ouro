@@ -2,10 +2,10 @@
 //! run dispatches every call except those its host's mock rule marks, which
 //! the mock answers; replay dispatches nothing and takes results from
 //! durable call records.
-use crate::{FunctionContext, FunctionError, Runtime};
+use crate::{FunctionContext, FunctionError, Output, Runtime};
 use ouro_durable::{Clock, RunStore};
 use ows::{
-    durable::{CallState, Delivery, Record},
+    durable::{Annotations, CallEntry, CallState, Delivery, Record},
     run::{Status, WorkflowError},
 };
 use serde_json::Value;
@@ -23,28 +23,31 @@ use tokio_util::sync::CancellationToken;
 pub trait Mock: Send + Sync {
     /// Whether the call is mocked rather than dispatched.
     fn mocks(&self, function: &str, arguments: &Value) -> bool;
-    /// The answer to a mocked call.
-    fn response(&self, function: &str, arguments: &Value, context: &FunctionContext) -> Result<Value, FunctionError>;
+    /// The answer to a mocked call, with the annotations a real one would
+    /// carry (a model step's token counts): the dry run keeps them.
+    fn response(&self, function: &str, arguments: &Value, context: &FunctionContext) -> Result<Output, FunctionError>;
 }
-/// A `Mock` from the host's rule and the answers to what it marks.
-pub fn mock(
+/// A `Mock` from the host's rule and the answers to what it marks (a
+/// `Value` or an annotated `Output`).
+pub fn mock<O: Into<Output> + 'static>(
     rule: impl Fn(&str, &Value) -> bool + Send + Sync + 'static,
-    response: impl Fn(&str, &Value, &FunctionContext) -> Result<Value, FunctionError> + Send + Sync + 'static,
+    response: impl Fn(&str, &Value, &FunctionContext) -> Result<O, FunctionError> + Send + Sync + 'static,
 ) -> Arc<dyn Mock> {
-    struct Rule<R, F>(R, F);
-    impl<R, F> Mock for Rule<R, F>
+    struct Rule<R, F, O>(R, F, std::marker::PhantomData<fn() -> O>);
+    impl<R, F, O> Mock for Rule<R, F, O>
     where
         R: Fn(&str, &Value) -> bool + Send + Sync,
-        F: Fn(&str, &Value, &FunctionContext) -> Result<Value, FunctionError> + Send + Sync,
+        F: Fn(&str, &Value, &FunctionContext) -> Result<O, FunctionError> + Send + Sync,
+        O: Into<Output>,
     {
         fn mocks(&self, f: &str, a: &Value) -> bool {
             (self.0)(f, a)
         }
-        fn response(&self, f: &str, a: &Value, c: &FunctionContext) -> Result<Value, FunctionError> {
-            (self.1)(f, a, c)
+        fn response(&self, f: &str, a: &Value, c: &FunctionContext) -> Result<Output, FunctionError> {
+            (self.1)(f, a, c).map(Into::into)
         }
     }
-    Arc::new(Rule(rule, response))
+    Arc::new(Rule(rule, response, std::marker::PhantomData))
 }
 #[derive(Clone, Debug, PartialEq)]
 pub struct RecordedCall {
@@ -54,16 +57,23 @@ pub struct RecordedCall {
     pub arguments: Value,
     pub delivery: Delivery,
     pub result: Result<Value, WorkflowError>,
+    /// The annotations the answer carried.
+    pub annotations: Annotations,
 }
 pub struct DryRun {
     pub status: Status,
     /// The calls the mock answered and the events the run emitted (as
     /// `emit`; a dry run publishes none), in the order they happened.
     pub mocked: Vec<RecordedCall>,
+    /// The dry run's call journal, mocked and dispatched calls alike, with
+    /// their annotations (`annotation_totals` sums what it would cost).
+    pub calls: Vec<CallEntry>,
 }
 pub struct Replay {
     pub status: Status,
     pub calls_replayed: usize,
+    /// The replayed run's call journal: the recorded results and annotations.
+    pub calls: Vec<CallEntry>,
 }
 #[derive(Clone)]
 pub(crate) enum Mode {
@@ -125,7 +135,8 @@ impl Runtime {
         let status =
             run_isolated(&runtime, "dry-run", Mode::Dry { mock, mocked: mocked.clone() }, &clock, stop).await?;
         let mocked = mocked.lock().unwrap().clone();
-        Ok(DryRun { status, mocked })
+        let calls = runtime.calls("dry-run").await?;
+        Ok(DryRun { status, mocked, calls })
     }
     pub async fn replay(&self, id: &str, stop: &CancellationToken) -> anyhow::Result<Replay> {
         self.replay_inner(id, None, stop).await
@@ -161,12 +172,27 @@ impl Runtime {
             original.run.admission.runtime["bindings"] = self.registry().bindings(&wf);
         }
         for (key, record) in original.records {
-            if let Record::Call { logical, function, arguments, delivery, state: CallState::Done(result), .. } = record
+            if let Record::Call {
+                logical,
+                function,
+                arguments,
+                delivery,
+                state: CallState::Done(result),
+                annotations,
+            } = record
             {
                 let reference = key.strip_suffix("#call").ok_or_else(|| anyhow::anyhow!("invalid call record key"))?;
                 calls.insert(
                     reference.to_string(),
-                    RecordedCall { task_path: reference.into(), logical, function, arguments, delivery, result },
+                    RecordedCall {
+                        task_path: reference.into(),
+                        logical,
+                        function,
+                        arguments,
+                        delivery,
+                        result,
+                        annotations,
+                    },
                 );
             }
         }
@@ -210,7 +236,8 @@ impl Runtime {
         if matches!(status, Status::Completed(_)) {
             anyhow::ensure!(calls_replayed == count, "replay left unused call results");
         }
-        Ok(Replay { status, calls_replayed })
+        let calls = runtime.calls(id).await?;
+        Ok(Replay { status, calls_replayed, calls })
     }
 }
 async fn run_isolated(

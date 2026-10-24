@@ -116,7 +116,7 @@ async fn schema_validation_and_typed_errors_are_caught_by_yaml() {
     let calls = Arc::new(AtomicUsize::new(0));
     let c = calls.clone();
     let mut registry = Registry::new();
-    registry.register(Function::new("typed",json!({"type":"object","required":["n"],"properties":{"n":{"type":"integer"}},"additionalProperties":false}),json!({"type":"integer"}), move |_:Value,_:FunctionContext| {c.fetch_add(1,Ordering::SeqCst);async {Err(WorkflowError {type_:"urn:test:rejected".into(),status:409,title:Some("Rejected".into()),detail:None,instance:None})}})).unwrap();
+    registry.register(Function::new("typed",json!({"type":"object","required":["n"],"properties":{"n":{"type":"integer"}},"additionalProperties":false}),json!({"type":"integer"}), move |_:Value,_:FunctionContext| {c.fetch_add(1,Ordering::SeqCst);async {Err::<Value, _>(WorkflowError {type_:"urn:test:rejected".into(),status:409,title:Some("Rejected".into()),detail:None,instance:None})}})).unwrap();
     let rt = runtime(Arc::new(durable::memory::memory()), registry, Arc::new(Time::default()));
     assert!(rt.save("bad", &yaml("  - bad: { call: typed, with: { n: text } }")).await.is_err());
     assert!(rt.save("bad", &yaml("  - bad: { call: absent }")).await.is_err());
@@ -279,7 +279,7 @@ async fn retries_receive_stable_idempotency_keys_and_increasing_attempts() {
     registry
         .register(Function::new("read", json!({}), json!({}), move |_: Value, ctx: FunctionContext| {
             c.lock().unwrap().push((ctx.attempt, ctx.idempotency_key));
-            async { Err(WorkflowError::runtime("retry")) }
+            async { Err::<Value, _>(WorkflowError::runtime("retry")) }
         }))
         .unwrap();
     let rt = runtime(Arc::new(durable::memory::memory()), registry, Arc::new(Time::default()));
@@ -1200,7 +1200,7 @@ async fn independent_store_cancel_fires_in_flight_token_within_one_heartbeat() {
         .register(Function::new("hold", json!({}), json!({}), move |_: Value, ctx: FunctionContext| {
             *observed.lock().unwrap() = Some(ctx.cancel.clone());
             ready.notify_one();
-            async move { std::future::pending().await }
+            async move { std::future::pending::<Result<Value, _>>().await }
         }))
         .unwrap();
     let heartbeat = Duration::from_secs(1);

@@ -121,8 +121,9 @@ pub struct Inspection {
     pub children: Vec<SavedRun>,
     pub budget_spent: u64,
     pub budget_limit: Option<u64>,
-    /// Existing pinned identifiers, if the host supplied them. Creating span
-    /// context and new observability fields belongs to issue #20.
+    /// The span context the run was admitted in (the host's request, a
+    /// parent run's span), when there was one; every drive's root span
+    /// links to it.
     pub trace_id: Option<String>,
     pub span_id: Option<String>,
 }

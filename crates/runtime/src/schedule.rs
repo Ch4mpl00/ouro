@@ -347,10 +347,15 @@ impl Runtime {
         match result {
             Fired::Committed => match refused {
                 Some(refused) => {
+                    self.metrics.fired(name, kind, "refused");
                     self.refused(name, kind, &id, &refused.error);
                     Ok(None)
                 }
-                None => Ok(Some(id)),
+                None => {
+                    self.metrics.fired(name, kind, "admitted");
+                    self.metrics.started(name);
+                    Ok(Some(id))
+                }
             },
             Fired::Busy(_) => {
                 self.skip(name, kind, slot, "overlap");
@@ -360,7 +365,11 @@ impl Runtime {
                 self.skip(name, kind, slot, "overlap: ceiling");
                 Ok(None)
             }
-            Fired::Changed | Fired::Ingested | Fired::Queued => Ok(None),
+            Fired::Queued => {
+                self.metrics.fired(name, kind, "queued");
+                Ok(None)
+            }
+            Fired::Changed | Fired::Ingested => Ok(None),
         }
     }
 
@@ -384,6 +393,8 @@ impl Runtime {
         retried.at_ms = Some(retry_at(now, u32::try_from(failures).unwrap_or(u32::MAX)));
         retried.state[RETRY] = json!({ "slot": slot, "failures": failures, "error": e.to_string() });
         self.store.fire(&Firing { key: k, expected: Some(t), next: Some(&retried), ..Firing::default() }, now).await?;
+        self.metrics
+            .retried(t.state["name"].as_str().unwrap_or_default(), t.state["kind"].as_str().unwrap_or_default());
         telemetry::mark(
             &self.tracer,
             "schedule interrupted",
@@ -412,6 +423,7 @@ impl Runtime {
     }
 
     fn skip(&self, name: &str, kind: &str, slot: i64, reason: &str) {
+        self.metrics.skipped(name, kind, skip_reason(reason));
         telemetry::mark(
             &self.tracer,
             "schedule skip",
@@ -422,6 +434,15 @@ impl Runtime {
                 KeyValue::new("ouro.schedule.reason", reason.to_string()),
             ],
         );
+    }
+}
+
+/// A skip's bounded metric reason (`ouro.schedule.reason`).
+fn skip_reason(reason: &str) -> &'static str {
+    match reason {
+        "missed" => "missed",
+        "overlap: ceiling" => "ceiling",
+        _ => "overlap",
     }
 }
 
@@ -560,6 +581,21 @@ async fn offer(
         if overlap == Overlap::Replace {
             admitter.signal_cancelled(store).await?;
         }
+        let metrics = &admitter.metrics;
+        match &result {
+            Fired::Committed => match &admission {
+                Some(Ok(_)) => {
+                    metrics.fired(&name, "on", "admitted");
+                    metrics.started(&name);
+                }
+                Some(Err(_)) => metrics.fired(&name, "on", "refused"),
+                None => {}
+            },
+            Fired::Queued => metrics.fired(&name, "on", "queued"),
+            Fired::Busy(_) if admission.is_some() => metrics.skipped(&name, "on", "overlap"),
+            Fired::Ceiling if admission.is_some() => metrics.skipped(&name, "on", "ceiling"),
+            _ => {}
+        }
         match result {
             Fired::Committed => {
                 return Ok(Taken::Yes(id));
@@ -675,6 +711,11 @@ impl Runtime {
             self.noticed(&event, None);
             if self.store.acknowledge(&k).await? {
                 acknowledged += 1;
+                // Counted by the one hand-off whose acknowledgement removed
+                // the notice: once per trip, whichever worker hands it on.
+                if event["type"] == ouro_durable::TRIPPED {
+                    self.metrics.tripped(event["subject"].as_str().unwrap_or_default());
+                }
             }
             self.notice_backoff.lock().unwrap().remove(&k);
         }

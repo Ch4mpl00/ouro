@@ -20,8 +20,9 @@ serde_yaml_ng = "0.10.0"
 croner = "4.0.1"
 tokio = { version = "1.53.1", features = ["rt", "sync", "time", "macros"] }
 tokio-util = "0.7.19"
-opentelemetry = { version = "0.31", default-features = false, features = ["trace", "futures"] }
-opentelemetry-otlp = { version = "0.31", optional = true, default-features = false, features = ["trace", "http-proto", "reqwest-client"] }
+uuid = { version = "1", features = ["v4"] }
+opentelemetry = { version = "0.31", default-features = false, features = ["trace", "metrics", "futures"] }
+opentelemetry-otlp = { version = "0.31", optional = true, default-features = false, features = ["trace", "metrics", "http-proto", "reqwest-client"] }
 
 [dev-dependencies]
 proptest = "1"

@@ -458,7 +458,10 @@ async fn secret_values_never_reach_records_spans_errors_or_outcomes() {
         .register(Function::new("call_api", json!({}), json!({}), move |a: Value, _: FunctionContext| {
             r.lock().unwrap().push(a.clone());
             async move {
-                Err(WorkflowError::communication(401, format!("rejected header {}", a["auth"].as_str().unwrap_or(""))))
+                Err::<Value, _>(WorkflowError::communication(
+                    401,
+                    format!("rejected header {}", a["auth"].as_str().unwrap_or("")),
+                ))
             }
         }))
         .unwrap();
