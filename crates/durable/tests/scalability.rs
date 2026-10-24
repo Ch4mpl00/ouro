@@ -1,6 +1,6 @@
 use ouro_durable::{
-    Arming, AtomicBackend, Compatibility, Conflict, Fence, Fired, Firing, IoCounts, Metrics, Policy, Rearm, Refused,
-    RunState, RunStore, TransactionalStore, Trigger,
+    Arming, AtomicBackend, Compatibility, Conflict, Fence, Fired, Firing, IoCounts, Metrics, Overlap, OverlapGuard,
+    Policy, Rearm, Refused, RunState, RunStore, TransactionalStore, Trigger,
     conformance::{admission, event},
     memory::MemoryBackend,
     postgres::PostgresBackend,
@@ -35,6 +35,7 @@ fn bounded<T>(
 fn bounds(backend: Arc<dyn AtomicBackend>, metrics: Arc<Metrics>, validation: u64) -> anyhow::Result<()> {
     support::seed(&backend, 10_000)?;
     decided(&backend, &metrics)?;
+    overlap_bounds(&backend, &metrics)?;
     let s = TransactionalStore::new(backend.clone());
     let mut a = admission("target:r");
     a.name = "target".into();
@@ -209,6 +210,78 @@ fn cascade(backend: &Arc<dyn AtomicBackend>, metrics: &Metrics) -> anyhow::Resul
     for n in (0..64).step_by(4) {
         assert_eq!(s.get(&format!("tree:child{n:02}"))?.unwrap().outcome, Some(Status::Completed(json!(n))));
     }
+    Ok(())
+}
+
+/// Every policy uses only this trigger's live members, this definition's
+/// bounded capacity page and its single buffered admission, among 10,000 runs.
+fn overlap_bounds(backend: &Arc<dyn AtomicBackend>, metrics: &Metrics) -> anyhow::Result<()> {
+    let s = TransactionalStore::new(backend.clone());
+    for policy in [Overlap::Skip, Overlap::Allow, Overlap::Queue, Overlap::Replace] {
+        let name = format!("overlap:{policy:?}");
+        let k = format!("{name}#every");
+        let slot = |n| Trigger { at_ms: None, types: vec![], state: json!(n) };
+        s.swap_trigger(&k, None, Some(&slot(1)), &[], None, 0)?;
+        let fire = |n, max| {
+            let mut a = admission(&format!("{name}:{n}"));
+            a.name = name.clone();
+            s.fire(
+                &Firing {
+                    key: &k,
+                    expected: Some(&slot(n)),
+                    next: Some(&slot(n + 1)),
+                    admit: &[a],
+                    busy: Some(&slot(n + 1)),
+                    overlap: Some(OverlapGuard { policy, max_concurrent_runs: max, ceiling: &slot(n + 1) }),
+                    ..Firing::default()
+                },
+                n,
+            )
+        };
+        assert_eq!(bounded(metrics, &format!("overlap_{policy:?}_first"), 1, || fire(1, 10))?, Fired::Committed);
+        let second = bounded(metrics, &format!("overlap_{policy:?}_second"), 2, || fire(2, 10))?;
+        assert_eq!(
+            second,
+            match policy {
+                Overlap::Skip => Fired::Busy(format!("{name}:1")),
+                Overlap::Queue => Fired::Queued,
+                _ => Fired::Committed,
+            }
+        );
+        if policy == Overlap::Queue {
+            assert!(bounded(metrics, "queue_lookup", 0, || s.queued(&k))?.is_some());
+            assert!(matches!(bounded(metrics, "queue_full", 2, || fire(3, 10))?, Fired::Busy(_)));
+            bounded(metrics, "queue_promote", 2, || s.cancel(&format!("{name}:1"), 4))?;
+            assert!(s.get(&format!("{name}:2"))?.is_some());
+        }
+    }
+    // Capacity is a limited live-name range; 10,000 unrelated runs never
+    // contribute rows, even when the definition already has ten live runs.
+    let k = "ceiling-bound";
+    let t = Trigger { at_ms: None, types: vec![], state: json!({}) };
+    s.swap_trigger(k, None, Some(&t), &[], None, 0)?;
+    for n in 0..10 {
+        let mut a = admission(&format!("ceiling-bound:{n}"));
+        a.name = k.into();
+        s.admit(&a, 0)?;
+    }
+    let mut a = admission("ceiling-bound:refused");
+    a.name = k.into();
+    assert_eq!(
+        bounded(metrics, "overlap_ceiling", 10, || s.fire(
+            &Firing {
+                key: k,
+                expected: Some(&t),
+                next: Some(&t),
+                busy: Some(&t),
+                admit: &[a],
+                overlap: Some(OverlapGuard { policy: Overlap::Allow, max_concurrent_runs: 10, ceiling: &t }),
+                ..Firing::default()
+            },
+            1
+        ))?,
+        Fired::Ceiling
+    );
     Ok(())
 }
 

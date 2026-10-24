@@ -54,7 +54,8 @@ use crate::{
 };
 use opentelemetry::KeyValue;
 use ouro_durable::{
-    Admission, Arming, DefinitionTripped, Definitions, Fired, Firing, Rearm, Refused, RunStore, Trigger,
+    Admission, Arming, DefinitionTripped, Definitions, Fired, Firing, Overlap, OverlapGuard, Rearm, Refused, RunStore,
+    Trigger,
 };
 use owf::{
     events::{self, Consumer, Offer},
@@ -183,6 +184,16 @@ impl Runtime {
         }
         Ok(out)
     }
+    /// Buffered slots, with their pinned definitions, inputs and bindings.
+    /// They are admitted when this trigger's live runs have ended and the
+    /// definition has capacity. A new activation discards its old buffers.
+    pub fn queued(&self, name: &str) -> anyhow::Result<Vec<Admission>> {
+        let mut queued = Vec::new();
+        for k in self.store.definitions(name)?.triggers {
+            queued.extend(self.store.queued(&k)?);
+        }
+        Ok(queued)
+    }
 }
 
 // ── 2. firing ──────────────────────────────────────────────────────────────
@@ -211,7 +222,11 @@ fn triggered(
 /// `t` with a skipped slot recorded in its state.
 fn skipped(mut t: Trigger, slot: i64, reason: &str) -> Trigger {
     let mut skipped: Vec<Value> = t.state["skipped"].as_array().cloned().unwrap_or_default();
-    skipped.push(json!({ "slot": slot, "reason": reason }));
+    let mut record = json!({ "slot": slot, "reason": reason });
+    if reason == "overlap: ceiling" {
+        record["overlap"] = json!("ceiling");
+    }
+    skipped.push(record);
     let excess = skipped.len().saturating_sub(SKIPS_KEPT);
     skipped.drain(..excess);
     t.state["skipped"] = Value::Array(skipped);
@@ -295,6 +310,7 @@ impl Runtime {
             }
             _ => return Ok(None),
         };
+        let ceiling = skipped(busy.clone(), slot, "overlap: ceiling");
         let busy = skipped(busy, slot, "overlap");
         let admission = match triggered(&self.admitter(), &id, name, json!({})) {
             Ok(Some(admission)) => admission,
@@ -318,7 +334,16 @@ impl Runtime {
             }
             Err(refused) => firing.refused = Some(refused),
         }
-        match self.store.fire(&firing, now)? {
+        firing.overlap = Some(OverlapGuard {
+            policy: schedule.overlap,
+            max_concurrent_runs: self.config.max_concurrent_runs,
+            ceiling: &ceiling,
+        });
+        let result = self.store.fire(&firing, now)?;
+        if schedule.overlap == Overlap::Replace {
+            self.signal_cancelled()?;
+        }
+        match result {
             Fired::Committed => match refused {
                 Some(refused) => {
                     self.refused(name, kind, &id, &refused.error);
@@ -330,7 +355,11 @@ impl Runtime {
                 self.skip(name, kind, slot, "overlap");
                 Ok(None)
             }
-            Fired::Changed | Fired::Ingested | Fired::Queued | Fired::Ceiling => Ok(None),
+            Fired::Ceiling => {
+                self.skip(name, kind, slot, "overlap: ceiling");
+                Ok(None)
+            }
+            Fired::Changed | Fired::Ingested | Fired::Queued => Ok(None),
         }
     }
 
@@ -475,7 +504,7 @@ fn offer(
     for _ in 0..16 {
         let name = trigger.state["name"].as_str().unwrap_or_default().to_owned();
         let definitions = admitter.definitions.definitions(&name)?;
-        let Some(Schedule { on: Some(on), read, .. }) =
+        let Some(Schedule { on: Some(on), read, overlap, .. }) =
             active(&definitions)?.filter(|_| current(&definitions, &trigger))
         else {
             return Ok(Taken::No);
@@ -506,15 +535,34 @@ fn offer(
             }
             None => next.state["events"] = Value::Array(matched),
         }
-        let mut firing =
-            Firing { key: k, expected: Some(&trigger), next: Some(&next), ingress: Some(event), ..Firing::default() };
+        let busy = skipped(next.clone(), now, "overlap");
+        let ceiling = skipped(next.clone(), now, "overlap: ceiling");
+        let mut firing = Firing {
+            key: k,
+            expected: Some(&trigger),
+            next: Some(&next),
+            ingress: Some(event),
+            busy: Some(&busy),
+            overlap: Some(OverlapGuard {
+                policy: overlap,
+                max_concurrent_runs: admitter.max_concurrent_runs,
+                ceiling: &ceiling,
+            }),
+            ..Firing::default()
+        };
         match &admission {
             Some(Ok(admission)) => firing.admit = std::slice::from_ref(admission),
             Some(Err(refused)) => firing.refused = Some(refused),
             None => {}
         }
-        match store.fire(&firing, now)? {
-            Fired::Committed => return Ok(Taken::Yes(id)),
+        let result = store.fire(&firing, now)?;
+        if overlap == Overlap::Replace {
+            admitter.signal_cancelled(store)?;
+        }
+        match result {
+            Fired::Committed => {
+                return Ok(Taken::Yes(id));
+            }
             Fired::Ingested | Fired::Busy(_) | Fired::Queued | Fired::Ceiling => return Ok(Taken::Yes(None)),
             Fired::Changed => match store.trigger(k)? {
                 Some(t) => trigger = t,

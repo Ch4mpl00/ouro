@@ -35,6 +35,9 @@ use tokio_util::sync::CancellationToken;
 #[derive(Clone, Debug)]
 pub struct Config {
     pub max_concurrency: usize,
+    /// Maximum unfinished runs of one definition when admitting a schedule
+    /// slot, shared across workers and trigger kinds (default 10).
+    pub max_concurrent_runs: usize,
     pub max_function_concurrency: usize,
     pub breaker_threshold: u32,
     pub poll_interval: Duration,
@@ -59,6 +62,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             max_concurrency: 4,
+            max_concurrent_runs: 10,
             max_function_concurrency: 16,
             breaker_threshold: 3,
             poll_interval: Duration::from_millis(100),
@@ -93,7 +97,7 @@ pub struct Runtime {
     pub(crate) capabilities: Capabilities,
     permits: Semaphore,
     function_permits: Arc<Semaphore>,
-    executions: Mutex<BTreeMap<(String, u64), CancellationToken>>,
+    executions: Arc<Mutex<BTreeMap<(String, u64), CancellationToken>>>,
     /// Per notice key, the sink failures so far and when to try it again.
     /// In memory: another process, or a restart, may try sooner, which
     /// at-least-once allows.
@@ -110,7 +114,7 @@ impl Runtime {
         tracer: BoxedTracer,
     ) -> anyhow::Result<Self> {
         anyhow::ensure!(
-            config.max_concurrency > 0 && config.max_function_concurrency > 0,
+            config.max_concurrency > 0 && config.max_function_concurrency > 0 && config.max_concurrent_runs > 0,
             "concurrency must be positive"
         );
         anyhow::ensure!(config.breaker_threshold > 0 && config.retention_ms >= 0, "invalid breaker or retention");
@@ -133,7 +137,7 @@ impl Runtime {
             permits: Semaphore::new(config.max_concurrency),
             function_permits: Arc::new(Semaphore::new(config.max_function_concurrency)),
             config,
-            executions: Mutex::new(BTreeMap::new()),
+            executions: Arc::new(Mutex::new(BTreeMap::new())),
             notice_backoff: Mutex::new(BTreeMap::new()),
         })
     }
@@ -208,6 +212,8 @@ impl Runtime {
             application: self.config.application.version.clone(),
             limits: self.config.limits.clone(),
             breaker_threshold: self.config.breaker_threshold,
+            max_concurrent_runs: self.config.max_concurrent_runs,
+            executions: self.executions.clone(),
         }
     }
     pub(crate) fn admission(&self, id: &str, name: &str, input: Value) -> anyhow::Result<Admission> {
@@ -281,15 +287,11 @@ impl Runtime {
     }
     pub fn cancel(&self, id: &str) -> anyhow::Result<bool> {
         let changed = self.store.cancel(id, self.clock.now_ms())?;
-        // A parent cancellation also fences/cancels descendants. Local child
-        // handlers see it immediately; remote workers see it at renewal.
-        let executions = self.executions.lock().unwrap();
-        for ((id, _), token) in executions.iter() {
-            if self.store.get(id)?.is_some_and(|r| r.ended_ms.is_some()) {
-                token.cancel();
-            }
-        }
+        self.signal_cancelled()?;
         Ok(changed)
+    }
+    pub(crate) fn signal_cancelled(&self) -> anyhow::Result<()> {
+        signal_cancelled(&*self.store, &self.executions)
     }
     pub fn start_child(
         &self,
@@ -553,6 +555,8 @@ pub(crate) struct Admitter {
     pub limits: Limits,
     /// What a refused trigger run counts against (`Admitter::triggered`).
     pub breaker_threshold: u32,
+    pub max_concurrent_runs: usize,
+    executions: Arc<Mutex<BTreeMap<(String, u64), CancellationToken>>>,
 }
 
 /// A definition this host cannot admit a run of because it no longer
@@ -644,7 +648,24 @@ impl Lineage {
     }
 }
 
+/// Local handlers see terminal cancellation immediately; remote workers see
+/// it at their next fenced operation or renewal, as for an explicit cancel.
+fn signal_cancelled(
+    store: &dyn RunStore,
+    executions: &Mutex<BTreeMap<(String, u64), CancellationToken>>,
+) -> anyhow::Result<()> {
+    for ((id, _), token) in executions.lock().unwrap().iter() {
+        if store.get(id)?.is_some_and(|r| r.ended_ms.is_some()) {
+            token.cancel();
+        }
+    }
+    Ok(())
+}
+
 impl Admitter {
+    pub(crate) fn signal_cancelled(&self, store: &dyn RunStore) -> anyhow::Result<()> {
+        signal_cancelled(store, &self.executions)
+    }
     pub fn validate(&self, yaml: &str) -> anyhow::Result<Workflow> {
         let wf = self.registry.validate_with(yaml, &self.capabilities)?;
         run::validate_limits(&wf, &self.limits)?;
