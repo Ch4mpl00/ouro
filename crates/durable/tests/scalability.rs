@@ -570,23 +570,25 @@ fn workers(
                 let mut completed = 0;
                 for n in 0..RUNS {
                     let id = format!("load:{n:04}");
-                    let Some(old) = s.claim(&id, 0)? else {
+                    let Some(old) = s.claim(&id, 0).map_err(|e| e.context(format!("initial claim of {id}")))? else {
                         continue;
                     };
                     let now = ouro_durable::LEASE_MS + 1;
-                    let f = s.claim(&id, now)?.unwrap();
+                    let f = s.claim(&id, now).map_err(|e| e.context(format!("recovery claim of {id}")))?.unwrap();
                     assert_eq!(f.generation, old.generation + 1);
                     assert!(s.save_record(&old, "stale", &Record::Timer { deadline_ms: 42 }, now).is_err());
                     assert!(s.renew(&old, now).is_err());
                     assert!(s.finish(&old, &Status::Completed(json!(0)), now, 3).is_err());
                     for k in ["one", "two", "three"] {
-                        s.save_record(&f, k, &Record::Timer { deadline_ms: 42 }, now)?;
+                        s.save_record(&f, k, &Record::Timer { deadline_ms: 42 }, now)
+                            .map_err(|e| e.context(format!("save {id}/{k}")))?;
                     }
                     let types = vec![format!("event:{id}")];
-                    s.register_wait(&f, &types, now)?;
+                    s.register_wait(&f, &types, now).map_err(|e| e.context(format!("register {id}")))?;
                     assert_eq!(s.deliver(&event(&id, &types[0], json!(n)), None, now)?, Some(id.clone()));
                     assert_eq!(s.take_event(&f, "event", &types, now)?.unwrap()["data"], json!(n));
-                    s.finish(&f, &Status::Faulted(WorkflowError::runtime("counted")), now, u32::MAX)?;
+                    s.finish(&f, &Status::Faulted(WorkflowError::runtime("counted")), now, u32::MAX)
+                        .map_err(|e| e.context(format!("finish {id}")))?;
                     completed += 1;
                 }
                 Ok(completed)

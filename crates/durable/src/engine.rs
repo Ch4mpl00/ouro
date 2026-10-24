@@ -1025,8 +1025,8 @@ fn activate(
     if epoch.is_some_and(|e| e != defs.epoch) {
         return Ok(None);
     }
-    // The only transition that starts an epoch and the only one that clears
-    // a trip. A trip's notice stays until the host acknowledges it.
+    // Only activation starts an epoch and clears an automatic trip. Manual
+    // pauses can resume in place; notices stay until the host acknowledges them.
     defs.active = Some(version);
     defs.epoch = defs.epoch.checked_add(1).ok_or_else(|| anyhow::anyhow!("activation epoch overflow"))?;
     defs.consecutive_faults = 0;

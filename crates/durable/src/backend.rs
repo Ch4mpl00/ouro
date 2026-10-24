@@ -152,7 +152,11 @@ impl TransactionalStore {
             })();
             match result {
                 Err(e) if e.is::<Conflict>() => {
-                    std::thread::sleep(std::time::Duration::from_micros(50 * (1_u64 << attempt.min(7))));
+                    // Independent workers must not retry in lockstep. Jitter
+                    // stays below the existing per-attempt backoff ceiling.
+                    let ceiling = 50 * (1_u64 << attempt.min(7));
+                    let jitter = uuid::Uuid::new_v4().as_u64_pair().0 % (ceiling / 2 + 1);
+                    std::thread::sleep(std::time::Duration::from_micros(ceiling / 2 + jitter));
                 }
                 other => return other,
             }

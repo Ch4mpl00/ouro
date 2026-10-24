@@ -509,7 +509,7 @@ those, and with the versions of the affected definition name.
 SQLite uses `BEGIN IMMEDIATE`, WAL and `synchronous = FULL`. Postgres uses
 `SERIALIZABLE`; memory validates per-key versions and limited range results,
 including missing keys and phantoms. The engine retries only definite
-serialization/deadlock aborts, at most 128 attempts with capped backoff.
+serialization/deadlock aborts, at most 128 attempts with capped jittered backoff.
 Unrelated runs share no revision or validation counter. Runs finishing against
 the same active definition intentionally share its breaker transaction.
 Ambiguous commits and transport errors propagate without retry.
