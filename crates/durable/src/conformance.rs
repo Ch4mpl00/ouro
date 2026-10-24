@@ -43,6 +43,13 @@ fn audit(store: &dyn RunStore) -> anyhow::Result<()> {
             assert!(s.awaits.is_empty() && s.listeners.is_empty() && s.subscriptions.is_empty());
             assert!(r.fence.is_none());
         }
+        // An owned child never outlives its parent: the parent's end, of any
+        // kind, cancels it in the same commit (C3).
+        if let Some(link) = &r.child
+            && let Some(end) = store.get(&link.parent)?.and_then(|p| p.ended_ms)
+        {
+            assert!(r.ended_ms.is_some_and(|c| c <= end), "owned child {} outlived its parent", r.admission.id);
+        }
         let mut pending = BTreeSet::new();
         let mut consumed = BTreeSet::new();
         for e in &s.events {

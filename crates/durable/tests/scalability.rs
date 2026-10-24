@@ -157,7 +157,58 @@ fn bounds(backend: Arc<dyn AtomicBackend>, metrics: Arc<Metrics>, validation: u6
     sweep_bounded(&backend, &metrics, "sweep", || s.sweep(1, 0))?;
     assert_eq!(bounded(&metrics, "sweep_already_swept", 0, || s.sweep(1, 0))?, ouro_durable::Swept::default());
     assert_eq!(s.list(None, "seed").unwrap().len(), 10_000);
+    cascade(&backend, &metrics)?;
     long_run(&backend, &metrics, validation)?;
+    Ok(())
+}
+
+/// A parent's end cancels its owned live descendants, transitively, in its
+/// own commit (#14). The cascade walks only the `children` index of live
+/// runs, so finished children cost nothing and each live descendant a
+/// constant: its index entry and run row, its run row rewritten with the
+/// index entries it loses, and its terminal notification to its parent.
+fn cascade(backend: &Arc<dyn AtomicBackend>, metrics: &Metrics) -> anyhow::Result<()> {
+    let s = TransactionalStore::new(backend.clone());
+    let root = s.start(&admission("tree:root"), 1)?.unwrap();
+    let link = |parent: &str, key: &str| ouro_durable::ChildLink {
+        parent: parent.into(),
+        key: key.into(),
+        reference: "/child".into(),
+    };
+    let mut live = Vec::new();
+    for n in 0..64 {
+        let id = format!("tree:child{n:02}");
+        let c = s.start_child(&root, &admission(&id), &link("tree:root", &id), 1)?.unwrap();
+        if n % 4 == 0 {
+            s.finish(&c, &Status::Completed(json!(n)), 1, 3)?;
+        } else {
+            live.push(id);
+        }
+    }
+    // A chain four levels below the root.
+    let mut parent = s.start_child(&root, &admission("tree:chain1"), &link("tree:root", "chain"), 1)?.unwrap();
+    live.push("tree:chain1".into());
+    for depth in 2..=4 {
+        let id = format!("tree:chain{depth}");
+        let fence = s.start_child(&parent, &admission(&id), &link(&parent.run_id, "chain"), 1)?.unwrap();
+        live.push(id);
+        parent = fence;
+    }
+    let matches = live.len() as u64;
+    metrics.reset();
+    s.finish(&root, &Status::Completed(json!(0)), 2, 3)?;
+    let counts = metrics.counts();
+    eprintln!("BOUND,finish_cascade,{},{},descendants={matches}", counts.rows_read, counts.rows_written);
+    assert!(counts.rows_read <= 32 + 16 * matches, "finish_cascade: {counts:?}");
+    assert!(counts.rows_written <= 16 + 8 * matches, "finish_cascade: {counts:?}");
+    assert_eq!(counts.conflicts, 0);
+    for id in &live {
+        let r = s.get(id)?.unwrap();
+        assert_eq!((r.outcome, r.ended_ms), (Some(Status::Cancelled), Some(2)), "{id} outlived its parent");
+    }
+    for n in (0..64).step_by(4) {
+        assert_eq!(s.get(&format!("tree:child{n:02}"))?.unwrap().outcome, Some(Status::Completed(json!(n))));
+    }
     Ok(())
 }
 
