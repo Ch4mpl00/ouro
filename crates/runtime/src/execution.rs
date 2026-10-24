@@ -181,7 +181,9 @@ impl Runtime {
     }
     /// Activates a saved version in a new activation epoch, clearing a
     /// tripped breaker; its schedule's triggers replace the definition's
-    /// current ones in the same commit.
+    /// current ones in the same commit. Only an activation does either: a
+    /// tripped breaker reports (`definitions`) and the host decides
+    /// which version, if any, to activate.
     pub fn activate(&self, name: &str, version: u64) -> anyhow::Result<()> {
         let definitions = self.store.definitions(name)?;
         let d = definitions.versions.get(&version).ok_or_else(|| anyhow::anyhow!("unknown definition version"))?;
@@ -600,10 +602,13 @@ impl Admitter {
     /// `active` at a place in a run tree.
     pub fn active_in(&self, id: &str, name: &str, input: Value, lineage: &Lineage) -> anyhow::Result<Admission> {
         let definitions = self.definitions.definitions(name)?;
-        anyhow::ensure!(
-            !definitions.tripped,
-            "{name} is tripped: its breaker found no version to roll back to; activate a version to resume"
-        );
+        if let Some(trip) = &definitions.tripped {
+            anyhow::bail!(
+                "{name} is tripped: version {} faulted {} times in a row; activate a version to resume",
+                trip.version,
+                trip.faults
+            );
+        }
         let d = definitions
             .active
             .and_then(|v| definitions.versions.get(&v))

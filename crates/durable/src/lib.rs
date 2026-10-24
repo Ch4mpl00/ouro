@@ -17,7 +17,7 @@ pub use backend::{
 };
 use owf::{
     durable::{Journal, Record},
-    run::{Events, Status},
+    run::{Events, Status, WorkflowError},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -193,32 +193,69 @@ pub struct Definition {
 pub struct Definitions {
     pub versions: BTreeMap<u64, Definition>,
     pub active: Option<u64>,
-    pub previous: Option<u64>,
+    /// Consecutive faults of runs admitted in the current epoch. Frozen at
+    /// the threshold once the breaker trips.
     pub consecutive_faults: u32,
-    /// Every activation and every breaker rollback starts a new epoch. Only
-    /// runs admitted in the current epoch count toward its breaker.
-    #[serde(default)]
+    /// Only an activation starts an epoch, and only runs admitted in the
+    /// current epoch count toward its breaker.
     pub epoch: u64,
-    /// The breaker reached its threshold with no predecessor: no new runs
-    /// and no schedule until the next activation.
-    #[serde(default)]
-    pub tripped: bool,
-    /// Trigger keys the current activation armed. Activation, rollback and
-    /// tripping replace them in their own commit.
-    #[serde(default)]
+    /// The breaker's report once it reached its threshold: no new runs and
+    /// no schedule until the next activation, which alone clears it. The
+    /// engine never chooses another version; the host decides.
+    pub tripped: Option<Trip>,
+    /// Trigger keys the current activation armed. Activation and tripping
+    /// replace them in their own commit.
     pub triggers: Vec<String>,
-    /// The triggers a breaker rollback arms for the predecessor.
-    #[serde(default)]
-    pub fallback: BTreeMap<String, Trigger>,
+}
+
+/// The CloudEvent type of a breaker trip's notice (`Trip::event`).
+pub const TRIPPED: &str = "ouro.definition.tripped";
+
+/// What a tripped breaker reports, in `Definitions::tripped` and as a notice.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Trip {
+    /// The active version and the epoch the breaker tripped in.
+    pub version: u64,
+    pub epoch: u64,
+    /// The consecutive faults counted, which reached `threshold`.
+    pub faults: u32,
+    pub threshold: u32,
+    /// The run whose terminal fault reached the threshold, and its error.
+    pub run: String,
+    pub reason: WorkflowError,
+    pub at_ms: i64,
+}
+impl Trip {
+    /// The trip as an identified CloudEvent of type `TRIPPED`: its `source`
+    /// names the definition and its `id` the epoch (one trip per epoch), so a
+    /// repeated hand-off is recognisably the same event.
+    pub fn event(&self, name: &str) -> Value {
+        let time = chrono::DateTime::from_timestamp_millis(self.at_ms).map(|t| t.to_rfc3339()).unwrap_or_default();
+        serde_json::json!({
+            "specversion": "1.0",
+            "type": TRIPPED,
+            "source": format!("ouro/definitions/{name}"),
+            "id": format!("tripped:{}", self.epoch),
+            "subject": name,
+            "time": time,
+            "data": {
+                "name": name,
+                "version": self.version,
+                "epoch": self.epoch,
+                "faults": self.faults,
+                "threshold": self.threshold,
+                "run": self.run,
+                "reason": self.reason,
+            },
+        })
+    }
 }
 
 /// What an activation arms: the triggers of the activated version, which
-/// replace the definition's current ones in the activation's commit, and
-/// those a breaker rollback would arm for its predecessor.
+/// replace the definition's current ones in the activation's commit.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Arming {
     pub triggers: BTreeMap<String, Trigger>,
-    pub fallback: BTreeMap<String, Trigger>,
 }
 
 /// One trigger firing: a compare-and-swap on the trigger `key` from
@@ -376,9 +413,10 @@ pub trait RunStore: Send + Sync {
     /// epoch feed its breaker in the same commit: a fault (an unhandled
     /// error, a timeout, an unknown outcome) counts, a success resets the
     /// count; cancellation and running out of interruptions do not count.
-    /// At `breaker_threshold` it rolls back to the predecessor in a new
-    /// epoch, arming the predecessor's triggers, or, with none, trips the
-    /// definition and removes its triggers.
+    /// At `breaker_threshold` it trips: the definition records the `Trip`,
+    /// its triggers are removed and a `TRIPPED` notice is stored, in that
+    /// commit. A tripped breaker observes nothing more until an activation.
+    /// It never changes the active version or the epoch.
     fn finish(&self, fence: &Fence, outcome: &Status, now_ms: i64, breaker_threshold: u32) -> anyhow::Result<Status>;
     /// Parent ownership, child admission, and completion subscriptions commit
     /// together. Replaying a link joins the original immutable child.
@@ -424,8 +462,8 @@ pub trait RunStore: Send + Sync {
             }
         }
     }
-    /// Activates `version` in a new epoch, clears the breaker and arms
-    /// `arming`, in one commit, provided the definition is still in `epoch`
+    /// Activates `version` in a new epoch, clears the breaker (a trip and
+    /// its count) and arms `arming`, in one commit, provided the definition is still in `epoch`
     /// (`None` otherwise: read it again). Reactivating the active version
     /// also starts a new epoch.
     fn activate_with(
@@ -436,6 +474,16 @@ pub trait RunStore: Send + Sync {
         arming: &Arming,
     ) -> anyhow::Result<Option<Definitions>>;
     fn definitions(&self, name: &str) -> anyhow::Result<Definitions>;
+    /// Up to `limit` notices, oldest first: CloudEvents the store committed
+    /// for the host together with what they report (a breaker trip,
+    /// `TRIPPED`), each kept under its key until acknowledged.
+    fn notices(&self, _limit: usize) -> anyhow::Result<Vec<(String, Value)>> {
+        anyhow::bail!("this store does not support notices")
+    }
+    /// Removes a notice the host has handed on; `false`: already removed.
+    fn acknowledge(&self, _key: &str) -> anyhow::Result<bool> {
+        anyhow::bail!("this store does not support notices")
+    }
 }
 
 /// A host-defined trigger: a keyed record the store indexes by the time it

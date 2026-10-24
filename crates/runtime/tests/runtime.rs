@@ -161,20 +161,37 @@ async fn dry_run_mocks_what_the_host_rule_marks_and_replay_calls_no_handlers() {
     assert_eq!(writes.load(Ordering::SeqCst), 1);
 }
 #[tokio::test]
-async fn breaker_rolls_back_after_configured_faults_and_success_resets_count() {
+async fn breaker_trips_after_configured_faults_and_success_resets_count() {
     let rt = runtime(Arc::new(durable::memory::memory()), Registry::new(), Arc::new(Time::default()));
     save(&rt, &yaml("  - ok: { set: { result: old } }"));
-    let bad = rt
-        .save("workflow", &yaml("  - fail: { raise: { error: { type: 'urn:test:failure', status: 500 } } }"))
-        .unwrap();
+    let flaky = "  - fail: { if: '${ .fail }', raise: { error: { type: 'urn:test:failure', status: 500 } } }";
+    let bad = rt.save("workflow", &yaml(flaky)).unwrap();
     rt.activate("workflow", bad.version).unwrap();
-    for n in 0..3 {
-        let id = format!("r{n}");
-        rt.start(&id, "workflow", Value::Null).unwrap();
-        assert!(matches!(rt.drive(&id, &CancellationToken::new()).await.unwrap(), Some(Status::Faulted(_))));
+    let stop = CancellationToken::new();
+    let run = |id: &'static str, fail: bool| {
+        rt.start(id, "workflow", json!({ "fail": fail })).unwrap();
+        rt.drive(id, &stop)
+    };
+    let faults = || rt.definitions("workflow").unwrap().consecutive_faults;
+    for id in ["f0", "f1"] {
+        assert!(matches!(run(id, true).await.unwrap(), Some(Status::Faulted(_))));
     }
-    assert_eq!(rt.definitions("workflow").unwrap().active, Some(1));
-    assert_eq!(rt.get("r0").unwrap().unwrap().admission.version, bad.version);
+    assert_eq!(faults(), 2);
+    assert!(matches!(run("s0", false).await.unwrap(), Some(Status::Completed(_))));
+    assert_eq!(faults(), 0, "a success resets the count");
+    // Admitted before the trip; it finishes after it.
+    rt.start("late", "workflow", json!({ "fail": true })).unwrap();
+    for id in ["f2", "f3", "f4"] {
+        assert!(matches!(run(id, true).await.unwrap(), Some(Status::Faulted(_))));
+    }
+    let d = rt.definitions("workflow").unwrap();
+    assert_eq!(d.active, Some(bad.version), "the breaker never picks another version");
+    let trip = d.tripped.expect("tripped at the configured threshold");
+    assert_eq!((trip.faults, trip.threshold, trip.run.as_str()), (3, 3, "f4"));
+    assert_eq!(rt.get("f0").unwrap().unwrap().admission.version, bad.version);
+    assert!(matches!(rt.drive("late", &CancellationToken::new()).await.unwrap(), Some(Status::Faulted(_))));
+    assert_eq!(faults(), 3, "a tripped breaker counts nothing more");
+    assert_eq!(rt.definitions("workflow").unwrap().tripped.unwrap().run, "f4");
 }
 #[tokio::test]
 async fn shutdown_releases_the_lease_and_unknown_writes_never_dispatch_again() {

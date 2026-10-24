@@ -595,44 +595,41 @@ async fn schedule_on_starts_a_run_per_match() {
 }
 
 // Activation epochs: a version without a schedule removes the triggers in
-// its activation's commit; the breaker's rollback re-arms the predecessor's
-// in its own commit; with no predecessor the definition trips.
+// its activation's commit. The breaker reports and never rolls back: a trip
+// stops new runs and the schedule in its own commit and is visible in the
+// runs API; only an activation, of the version the host picks, clears it.
 #[tokio::test]
-async fn rollback_rearms_the_predecessor_schedule_and_no_predecessor_trips() {
+async fn a_trip_reports_and_only_an_activation_clears_it() {
     let f = fixture();
+    let rt = &f.rt;
     let ok = "schedule: { every: PT1M }\ndo: [ { a: { set: { ok: true } } } ]";
-    let boom = "do: [ { boom: { raise: { error: { type: 'urn:t:boom', status: 500 } } } } ]";
-    save(&f.rt, "flaky", &doc("flaky", ok));
-    assert_eq!(f.rt.triggers("flaky").unwrap().len(), 1);
-    save(&f.rt, "flaky", &doc("flaky", boom));
-    assert!(f.rt.triggers("flaky").unwrap().is_empty(), "removed with the activation");
+    let boom = "schedule: { every: PT1M }\ndo: [ { boom: { raise: { error: { type: 'urn:t:boom', status: 500 } } } } ]";
+    save(rt, "flaky", &doc("flaky", ok));
+    save(rt, "flaky", &doc("flaky", "do: [ { a: { set: { ok: true } } } ]"));
+    assert!(rt.triggers("flaky").unwrap().is_empty(), "removed with the activation");
+    save(rt, "flaky", &doc("flaky", boom));
+    assert_eq!(rt.triggers("flaky").unwrap().len(), 1);
     for n in 0..3 {
         let id = format!("boom{n}");
-        f.rt.start(&id, "flaky", json!({})).unwrap();
-        assert!(matches!(settle(&f.rt, &id).await, Some(Status::Faulted(_))));
+        rt.start(&id, "flaky", json!({})).unwrap();
+        assert!(matches!(settle(rt, &id).await, Some(Status::Faulted(_))));
     }
-    let d = f.rt.definitions("flaky").unwrap();
-    assert_eq!((d.active, d.epoch), (Some(1), 3), "rolled back in a new epoch");
-    assert_eq!(f.rt.triggers("flaky").unwrap().len(), 1, "re-armed with the rollback");
-    // The re-armed trigger first finds its slot, then fires as before.
-    assert!(f.rt.fire_due().unwrap().is_empty());
-    f.time.set(60_000);
-    assert_eq!(f.rt.fire_due().unwrap(), vec!["schedule:flaky:every:60000".to_string()]);
-    // Nothing to roll back to: the definition trips and its schedule stops.
-    save(&f.rt, "lonely", &doc("lonely", &boom.replace("do:", "schedule: { every: PT1M }\ndo:")));
-    for n in 0..3 {
-        let id = format!("lonely{n}");
-        f.rt.start(&id, "lonely", json!({})).unwrap();
-        settle(&f.rt, &id).await;
-    }
-    assert!(f.rt.definitions("lonely").unwrap().tripped, "visible in the runs API");
-    assert!(f.rt.triggers("lonely").unwrap().is_empty());
-    assert!(f.rt.start("refused", "lonely", json!({})).unwrap_err().to_string().contains("tripped"));
+    let d = rt.definitions("flaky").unwrap();
+    assert_eq!((d.active, d.epoch), (Some(3), 3), "no rollback and no new epoch");
+    let trip = d.tripped.clone().expect("visible in the runs API");
+    assert_eq!((trip.version, trip.epoch, trip.faults, trip.threshold), (3, 3, 3, 3));
+    assert_eq!((trip.run.as_str(), trip.reason.type_.as_str()), ("boom2", "urn:t:boom"));
+    assert!(rt.triggers("flaky").unwrap().is_empty(), "its schedule stops");
+    assert!(rt.start("refused", "flaky", json!({})).unwrap_err().to_string().contains("tripped"));
     f.time.set(10_000_000);
-    assert!(!f.rt.fire_due().unwrap().iter().any(|id| id.contains("lonely")));
-    f.rt.activate("lonely", 1).unwrap();
-    assert!(!f.rt.definitions("lonely").unwrap().tripped, "a new activation clears it");
-    assert!(f.rt.start("accepted", "lonely", json!({})).is_ok());
+    assert!(!rt.fire_due().unwrap().iter().any(|id| id.contains("flaky")));
+    // The host decides: here it activates the earlier version, in a new epoch.
+    rt.activate("flaky", 1).unwrap();
+    let d = rt.definitions("flaky").unwrap();
+    assert!(d.tripped.is_none() && d.epoch == 4 && d.active == Some(1), "a new activation clears it");
+    assert_eq!(rt.triggers("flaky").unwrap().len(), 1);
+    rt.start("accepted", "flaky", json!({})).unwrap();
+    assert_eq!(completed(settle(rt, "accepted").await), json!({"ok": true}));
 }
 
 #[tokio::test]

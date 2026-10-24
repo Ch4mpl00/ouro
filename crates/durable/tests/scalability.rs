@@ -344,28 +344,28 @@ fn decided(backend: &Arc<dyn AtomicBackend>, metrics: &Metrics) -> anyhow::Resul
     assert_eq!(bounded(metrics, "fire_exclusive", 1, || exclusive(&slot(1), &slot(2), one))?, Fired::Committed);
     let busy = bounded(metrics, "fire_busy", 1, || exclusive(&slot(2), &slot(3), two))?;
     assert_eq!(busy, Fired::Busy(first.id.clone()));
-    // Activation epochs: arm, roll back (arming the fallback), trip.
+    // Activation epochs: arm, re-arm, trip (removing the trigger and storing
+    // the notice in the terminal commit), then hand the notice on.
     let v1 = s.save_definition("decided", "one")?;
     let v2 = s.save_definition("decided", "two")?;
     let arm = |keys: &[&str]| keys.iter().map(|k| ((*k).to_string(), slot(100))).collect();
-    let arming = Arming { triggers: arm(&["decided#a", "decided#b"]), fallback: BTreeMap::new() };
+    let arming = Arming { triggers: arm(&["decided#a", "decided#b"]) };
     let epoch = s.definitions("decided")?.epoch;
     bounded(metrics, "activate_with", 2, || s.activate_with("decided", v1.version, epoch, &arming))?.unwrap();
-    let arming = Arming { triggers: arm(&["decided#c"]), fallback: arm(&["decided#a", "decided#b"]) };
+    let arming = Arming { triggers: arm(&["decided#c"]) };
     let epoch = s.definitions("decided")?.epoch;
     bounded(metrics, "activate_rearm", 3, || s.activate_with("decided", v2.version, epoch, &arming))?.unwrap();
     let mut faulty = a.clone();
-    faulty.id = "decided:fault".into();
+    faulty.id = "decided:trip".into();
     faulty.version = v2.version;
     let f = s.start(&faulty, 0)?.unwrap();
     let fault = Status::Faulted(WorkflowError::runtime("fault"));
-    bounded(metrics, "finish_rollback", 3, || s.finish(&f, &fault, 0, 1))?;
-    assert_eq!(s.definitions("decided")?.active, Some(v1.version));
-    faulty.id = "decided:trip".into();
-    faulty.version = v1.version;
-    let f = s.start(&faulty, 0)?.unwrap();
     bounded(metrics, "finish_trip", 2, || s.finish(&f, &fault, 0, 1))?;
-    assert!(s.definitions("decided")?.tripped);
+    let d = s.definitions("decided")?;
+    assert!(d.tripped.is_some() && d.active == Some(v2.version) && d.triggers.is_empty());
+    let notices = bounded(metrics, "notices", 1, || s.notices(8))?;
+    assert_eq!(notices.len(), 1);
+    assert!(bounded(metrics, "acknowledge", 1, || s.acknowledge(&notices[0].0))?);
     // Version-aware claims page through their own partitions only.
     let mut versioned = a.clone();
     versioned.id = "decided:versioned".into();
@@ -626,6 +626,7 @@ fn index_atomicity(
         "mailbox",
         "ingress",
         "arm",
+        "trip",
     ] {
         let before = backend.snapshot()?;
         assert!(backend.compare_exchange(&before, &ouro_durable::Rows::new())?);
@@ -648,6 +649,16 @@ fn index_atomicity(
         let epoch = s.definitions("workflow")?.epoch;
         if operation == "sweep" {
             s.finish(&p, &Status::Completed(json!(42)), 0, 3)?;
+        }
+        // A run whose fault trips the breaker of an activation with a trigger.
+        let mut tripping = None;
+        if operation == "trip" {
+            let trigger = Trigger { at_ms: Some(5), types: vec!["t".into()], state: json!(1) };
+            let arming = Arming { triggers: BTreeMap::from([("armed".to_string(), trigger)]) };
+            s.activate_with("workflow", second.version, epoch, &arming)?;
+            let mut a = admission("tripping");
+            a.version = second.version;
+            tripping = s.start(&a, 0)?;
         }
         let action = || -> anyhow::Result<()> {
             match operation {
@@ -697,7 +708,6 @@ fn index_atomicity(
                                 "armed".to_string(),
                                 Trigger { at_ms: Some(5), types: vec!["t".into()], state: json!(1) },
                             )]),
-                            fallback: BTreeMap::new(),
                         },
                     )
                     .map(|_| ()),
@@ -711,6 +721,12 @@ fn index_atomicity(
                         0,
                     )
                     .map(|_| ()),
+                "trip" => {
+                    let fault = Status::Faulted(WorkflowError::runtime("fault"));
+                    s.finish(tripping.as_ref().unwrap(), &fault, 0, 1)?;
+                    anyhow::ensure!(s.definitions("workflow")?.tripped.is_some(), "the fault did not trip");
+                    Ok(())
+                }
                 _ => unreachable!(),
             }
         };

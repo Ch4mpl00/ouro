@@ -12,14 +12,14 @@
 //! index (a range ending now), and a publish reads the trigger index of the
 //! event's type.
 //!
-//! Every activation and every breaker rollback starts an activation epoch.
-//! The activation's commit replaces the definition's triggers with the
-//! activated version's (a version without a schedule leaves none) and stores
-//! those of its predecessor, which a rollback arms in the breaker's commit.
-//! Each trigger's state names its epoch, so a trigger of an older epoch is
-//! never the stored one again: it cannot fire, and an old run's end cannot
-//! re-arm the new epoch's trigger (the store re-arms only the exact trigger
-//! the run's firing stored).
+//! Every activation, and nothing else, starts an activation epoch. The
+//! activation's commit replaces the definition's triggers with the activated
+//! version's (a version without a schedule leaves none); a breaker trip
+//! removes them in its own commit, and only the next activation arms any
+//! again. Each trigger's state names its epoch, so a trigger of an older
+//! epoch is never the stored one again: it cannot fire, and an old run's end
+//! cannot re-arm the new epoch's trigger (the store re-arms only the exact
+//! trigger the run's firing stored).
 //!
 //! A slot's run id is derived from the slot (`schedule:<name>:every:<ms>`,
 //! `…:cron:<ms>`, `…:after:<epoch>:<n>`, `…:on:<digest of the events>`) and
@@ -96,17 +96,16 @@ fn active(definitions: &Definitions) -> anyhow::Result<Option<Schedule>> {
     Ok(model::parse_yaml(&d.yaml)?.schedule)
 }
 
-/// Whether a trigger belongs to the definition's current epoch.
+/// Whether a trigger belongs to the definition's current, untripped epoch.
 fn current(definitions: &Definitions, trigger: &Trigger) -> bool {
-    !definitions.tripped && trigger.state["epoch"] == json!(definitions.epoch)
+    definitions.tripped.is_none() && trigger.state["epoch"] == json!(definitions.epoch)
 }
 
 // ── 1. arming ──────────────────────────────────────────────────────────────
 
 /// The triggers `yaml`'s schedule arms for `name` in `epoch`. A version
-/// without a schedule arms none. `rollback`: armed later, by a breaker
-/// rollback, so a time trigger is due at once and first finds its slot.
-fn arming(name: &str, yaml: &str, epoch: u64, now: i64, rollback: bool) -> anyhow::Result<BTreeMap<String, Trigger>> {
+/// without a schedule arms none.
+fn arming(name: &str, yaml: &str, epoch: u64, now: i64) -> anyhow::Result<BTreeMap<String, Trigger>> {
     let wf = model::parse_yaml(yaml)?;
     let Some(s) = wf.schedule else { return Ok(BTreeMap::new()) };
     let state = |kind: &str, extra: Value| {
@@ -119,12 +118,10 @@ fn arming(name: &str, yaml: &str, epoch: u64, now: i64, rollback: bool) -> anyho
     let mut out = BTreeMap::new();
     for kind in ["every", "cron"] {
         if let Some(slot) = next_slot(&s, kind, now)? {
-            let trigger = if rollback {
-                Trigger { at_ms: Some(now), types: Vec::new(), state: state(kind, json!({ "rebase": true })) }
-            } else {
-                Trigger { at_ms: Some(slot), types: Vec::new(), state: state(kind, json!({})) }
-            };
-            out.insert(key(name, kind), trigger);
+            out.insert(
+                key(name, kind),
+                Trigger { at_ms: Some(slot), types: Vec::new(), state: state(kind, json!({})) },
+            );
         }
     }
     if s.after.is_some() {
@@ -140,23 +137,13 @@ fn arming(name: &str, yaml: &str, epoch: u64, now: i64, rollback: bool) -> anyho
 
 impl Runtime {
     /// Activates `version` of `name` in a new epoch: its triggers replace
-    /// the definition's ones in the activation's commit, and its
-    /// predecessor's are kept for a breaker rollback.
+    /// the definition's ones in the activation's commit.
     pub(crate) fn activate_armed(&self, name: &str, version: u64) -> anyhow::Result<()> {
         for _ in 0..16 {
             let definitions = self.store.definitions(name)?;
             let d = definitions.versions.get(&version).ok_or_else(|| anyhow::anyhow!("unknown definition version"))?;
-            let now = self.clock.now_ms();
-            let epoch = definitions.epoch + 1;
-            let triggers = arming(name, &d.yaml, epoch, now, false)?;
-            let predecessor =
-                if definitions.active == Some(version) { definitions.previous } else { definitions.active };
-            let fallback = match predecessor.and_then(|v| definitions.versions.get(&v)) {
-                Some(p) => arming(name, &p.yaml, epoch + 1, now, true)?,
-                None => BTreeMap::new(),
-            };
-            let arming = Arming { triggers, fallback };
-            if self.store.activate_with(name, version, definitions.epoch, &arming)?.is_some() {
+            let triggers = arming(name, &d.yaml, definitions.epoch + 1, self.clock.now_ms())?;
+            if self.store.activate_with(name, version, definitions.epoch, &Arming { triggers })?.is_some() {
                 return Ok(());
             }
         }
@@ -226,16 +213,6 @@ impl Runtime {
         // Replaced by a newer epoch since it was read: its swap would fail.
         let Some(schedule) = active(&definitions)?.filter(|_| current(&definitions, t)) else { return Ok(None) };
         let firing = |next, admit, rearm, busy| moved(k, t, next, admit, rearm, busy);
-        if t.state.get("rebase").is_some() {
-            // Armed by a rollback: find the first slot from now; no run.
-            let mut next = t.clone();
-            if let Value::Object(m) = &mut next.state {
-                m.remove("rebase");
-            }
-            next.at_ms = next_slot(&schedule, kind, now)?;
-            self.store.fire(&firing(&next, &[], None, None), now)?;
-            return Ok(None);
-        }
         let mut next = t.clone();
         let mut rearm = None;
         let mut busy = t.clone();

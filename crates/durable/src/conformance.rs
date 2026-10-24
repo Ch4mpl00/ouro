@@ -341,11 +341,15 @@ pub fn run_all(factory: impl Fn(&str) -> anyhow::Result<TestStore>) -> anyhow::R
         let f = s.start(&a, 0)?.unwrap();
         s.finish(&f, &Status::Faulted(WorkflowError::runtime("fault")), 0, 3)?;
     }
-    assert_eq!(s.definitions("workflow")?.active, Some(first.version));
+    let d = s.definitions("workflow")?;
+    assert_eq!((d.active, d.epoch), (Some(second.version), 2), "a trip keeps the active version and the epoch");
+    let trip = d.tripped.expect("tripped at the threshold");
+    assert_eq!((trip.version, trip.epoch, trip.faults, trip.threshold), (second.version, 2, 3, 3));
+    assert_eq!(trip.run, "fault2");
     assert_eq!(s.get("fault0")?.unwrap().admission.version, second.version);
     assert!(s.activate("workflow", 99).is_err());
     report.operations += 13;
-    report.witnesses.insert("breaker rolls back without changing pinned runs");
+    report.witnesses.insert("breaker trips without changing the active version or pinned runs");
     decisions(&factory, &mut report)?;
 
     // Inject before each of the first row writes, before commit, and after commit.
@@ -372,7 +376,8 @@ pub fn run_all(factory: impl Fn(&str) -> anyhow::Result<TestStore>) -> anyhow::R
         "expire",
         "ingress",
         "arm",
-        "rollback",
+        "trip",
+        "acknowledge",
     ] {
         for point in [
             CommitFault::BeforeWrite(0),
@@ -400,27 +405,25 @@ pub fn run_all(factory: impl Fn(&str) -> anyhow::Result<TestStore>) -> anyhow::R
                 s.deliver(&event("expiring", "answer", json!(1)), Some("p"), 0)?;
             }
             let d = s.save_definition("workflow", "yaml")?;
-            let mut rolling = None;
-            if operation == "rollback" {
-                // An activation with a predecessor and a fallback trigger,
-                // and a run of its epoch whose fault rolls it back.
-                s.activate("workflow", d.version)?;
-                let second = s.save_definition("workflow", "next")?;
-                let epoch = s.definitions("workflow")?.epoch;
+            let mut tripping = None;
+            let mut notice = None;
+            if matches!(operation, "trip" | "acknowledge") {
+                // An activation with an armed trigger and a run of its epoch
+                // whose fault trips the breaker (removing the trigger and
+                // storing the notice); `acknowledge` then removes the notice.
                 let arming = Arming {
                     triggers: BTreeMap::from([(
                         "armed".into(),
-                        Trigger { at_ms: Some(9), types: vec![], state: json!(2) },
-                    )]),
-                    fallback: BTreeMap::from([(
-                        "fallback".into(),
-                        Trigger { at_ms: None, types: vec!["t".into()], state: json!(1) },
+                        Trigger { at_ms: Some(9), types: vec!["t".into()], state: json!(2) },
                     )]),
                 };
-                s.activate_with("workflow", second.version, epoch, &arming)?;
-                let mut a = admission("rolling");
-                a.version = second.version;
-                rolling = s.start(&a, 0)?;
+                let epoch = s.definitions("workflow")?.epoch;
+                s.activate_with("workflow", d.version, epoch, &arming)?;
+                tripping = s.start(&admission("tripping"), 0)?;
+                if operation == "acknowledge" {
+                    s.finish(tripping.as_ref().unwrap(), &Status::Faulted(WorkflowError::runtime("fault")), 0, 1)?;
+                    notice = s.notices(1)?.pop().map(|(k, _)| k);
+                }
             }
             if matches!(operation, "finish" | "cancel") {
                 s.activate("workflow", d.version)?;
@@ -499,13 +502,13 @@ pub fn run_all(factory: impl Fn(&str) -> anyhow::Result<TestStore>) -> anyhow::R
                                 "armed".into(),
                                 Trigger { at_ms: Some(5), types: vec!["t".into()], state: json!(1) },
                             )]),
-                            fallback: BTreeMap::new(),
                         },
                     )
                     .map(|_| ()),
-                "rollback" => s
-                    .finish(rolling.as_ref().unwrap(), &Status::Faulted(WorkflowError::runtime("fault")), 0, 1)
+                "trip" => s
+                    .finish(tripping.as_ref().unwrap(), &Status::Faulted(WorkflowError::runtime("fault")), 0, 1)
                     .map(|_| ()),
+                "acknowledge" => s.acknowledge(notice.as_ref().unwrap()).map(|_| ()),
                 _ => unreachable!(),
             };
             t.faults.clear();
@@ -609,7 +612,7 @@ pub fn run_all(factory: impl Fn(&str) -> anyhow::Result<TestStore>) -> anyhow::R
         audit(&*s)?;
     }
     report.witnesses.insert("finite histories drain every live listener");
-    assert_eq!(report.witnesses.len(), 24);
+    assert_eq!(report.witnesses.len(), 25);
     let t = factory("concurrent-claims")?;
     report.cases += 1;
     t.store.admit(&admission("r"), 0)?;
@@ -883,23 +886,22 @@ fn decisions(factory: &impl Fn(&str) -> anyhow::Result<TestStore>, report: &mut 
     report.operations += 10;
     report.witnesses.insert("ingress identities start one run per tombstone lifetime");
 
-    // Epochs: activation arms atomically; rollback arms the fallback in the
-    // breaker's commit; with no predecessor the definition trips.
+    // Epochs: only an activation starts one, arming atomically. The breaker
+    // trips in the terminal commit and reports; it never picks a version.
     let t = factory("epochs")?;
     report.cases += 1;
     let s = &t.store;
     let one = s.save_definition("w", "one")?;
     let two = s.save_definition("w", "two")?;
     let trigger = |n: i64| Trigger { at_ms: Some(n), types: vec![], state: json!({ "n": n }) };
-    let arming = |triggers: &[(&str, i64)], fallback: &[(&str, i64)]| Arming {
+    let arming = |triggers: &[(&str, i64)]| Arming {
         triggers: triggers.iter().map(|(k, n)| ((*k).into(), trigger(*n))).collect(),
-        fallback: fallback.iter().map(|(k, n)| ((*k).into(), trigger(*n))).collect(),
     };
-    let d = s.activate_with("w", one.version, 0, &arming(&[("w#every", 10)], &[]))?.unwrap();
+    let d = s.activate_with("w", one.version, 0, &arming(&[("w#every", 10)]))?.unwrap();
     assert_eq!((d.epoch, d.triggers.clone()), (1, vec!["w#every".to_string()]));
-    assert!(s.activate_with("w", two.version, 0, &arming(&[], &[]))?.is_none(), "a stale epoch is refused");
-    let d = s.activate_with("w", two.version, 1, &arming(&[("w#after", 20)], &[("w#every", 30)]))?.unwrap();
-    assert_eq!((d.epoch, d.previous), (2, Some(one.version)));
+    assert!(s.activate_with("w", two.version, 0, &arming(&[]))?.is_none(), "a stale epoch is refused");
+    let d = s.activate_with("w", two.version, 1, &arming(&[("w#after", 20)]))?.unwrap();
+    assert_eq!(d.epoch, 2);
     assert!(s.trigger("w#every")?.is_none() && s.trigger("w#after")?.is_some(), "replaced in one commit");
     let run_of = |id: &str, version: u64| {
         let mut a = admission(id);
@@ -909,6 +911,8 @@ fn decisions(factory: &impl Fn(&str) -> anyhow::Result<TestStore>, report: &mut 
     };
     let old = s.start(&run_of("before", two.version), 0)?.unwrap();
     assert_eq!(s.get("before")?.unwrap().epoch, Some(2));
+    let late = s.start(&run_of("late", two.version), 0)?.unwrap();
+    let late_success = s.start(&run_of("late-success", two.version), 0)?.unwrap();
     // Cancellation and running out of interruptions do not count.
     let cancelled = s.start(&run_of("cancelled", two.version), 0)?.unwrap();
     s.finish(&cancelled, &Status::Cancelled, 0, 2)?;
@@ -923,28 +927,47 @@ fn decisions(factory: &impl Fn(&str) -> anyhow::Result<TestStore>, report: &mut 
         }
     }
     assert_eq!(s.definitions("w")?.consecutive_faults, 0);
+    assert!(s.notices(10)?.is_empty());
     for n in 0..2 {
         let f = s.start(&run_of(&format!("fault{n}"), two.version), 0)?.unwrap();
-        s.finish(&f, &Status::Faulted(WorkflowError::runtime("fault")), 0, 2)?;
+        s.finish(&f, &Status::Faulted(WorkflowError::runtime(format!("fault {n}"))), 5, 2)?;
     }
     let d = s.definitions("w")?;
-    assert_eq!((d.active, d.epoch, d.consecutive_faults), (Some(one.version), 3, 0), "rolled back in a new epoch");
-    assert_eq!(d.triggers, vec!["w#every".to_string()]);
-    assert_eq!(s.trigger("w#every")?, Some(trigger(30)), "the fallback, armed with the rollback");
-    assert!(s.trigger("w#after")?.is_none());
+    assert_eq!((d.active, d.epoch, d.consecutive_faults), (Some(two.version), 2, 2), "no rollback, no new epoch");
+    let trip = Trip {
+        version: two.version,
+        epoch: 2,
+        faults: 2,
+        threshold: 2,
+        run: "fault1".into(),
+        reason: WorkflowError::runtime("fault 1"),
+        at_ms: 5,
+    };
+    assert_eq!(d.tripped.as_ref(), Some(&trip), "the reason and the counts, visible in the runs API");
+    assert!(d.triggers.is_empty() && s.trigger("w#after")?.is_none(), "the schedule stops in the trip's commit");
+    // The trip's notice is committed with it: an identified CloudEvent.
+    let notices = s.notices(10)?;
+    assert_eq!(notices.len(), 1);
+    assert_eq!(notices[0].1, trip.event("w"));
+    assert_eq!((notices[0].1["type"].as_str(), notices[0].1["id"].as_str()), (Some(TRIPPED), Some("tripped:2")));
+    // Tripped, the breaker observes nothing more until an activation.
+    s.finish(&late, &Status::Faulted(WorkflowError::runtime("late")), 6, 2)?;
+    s.finish(&late_success, &Status::Completed(json!(0)), 6, 2)?;
+    let d = s.definitions("w")?;
+    assert_eq!((d.consecutive_faults, d.tripped.as_ref()), (2, Some(&trip)));
+    assert_eq!(s.notices(10)?.len(), 1, "one trip, one notice");
+    // Only an activation clears it, in a new epoch, with the version the
+    // host chooses (here the earlier one). The notice stays until handed on.
+    let d = s.activate_with("w", one.version, 2, &arming(&[("w#every", 40)]))?.unwrap();
+    assert!(d.tripped.is_none() && d.epoch == 3 && d.consecutive_faults == 0, "a new activation clears it");
+    assert_eq!(s.trigger("w#every")?, Some(trigger(40)));
+    assert_eq!(s.notices(10)?, notices);
+    assert!(s.acknowledge(&notices[0].0)?);
+    assert!(!s.acknowledge(&notices[0].0)?, "already acknowledged");
+    assert!(s.notices(10)?.is_empty());
     // An earlier epoch's fault cannot touch the new one.
     s.finish(&old, &Status::Faulted(WorkflowError::runtime("late")), 0, 2)?;
     assert_eq!(s.definitions("w")?.consecutive_faults, 0);
-    // No predecessor left: two faults trip the definition and stop its triggers.
-    for n in 0..2 {
-        let f = s.start(&run_of(&format!("trip{n}"), one.version), 0)?.unwrap();
-        s.finish(&f, &Status::Faulted(WorkflowError::runtime("fault")), 0, 2)?;
-    }
-    let d = s.definitions("w")?;
-    assert!(d.tripped && d.triggers.is_empty() && s.trigger("w#every")?.is_none());
-    assert_eq!(d.active, Some(one.version), "running runs keep their version; visible as tripped");
-    let d = s.activate_with("w", one.version, d.epoch, &arming(&[("w#every", 40)], &[]))?.unwrap();
-    assert!(!d.tripped && d.epoch == 4, "a new activation clears it");
     // A success resets the count.
     let f = s.start(&run_of("fault", one.version), 0)?.unwrap();
     s.finish(&f, &Status::Faulted(WorkflowError::runtime("fault")), 0, 2)?;
@@ -952,8 +975,9 @@ fn decisions(factory: &impl Fn(&str) -> anyhow::Result<TestStore>, report: &mut 
     s.finish(&f, &Status::Completed(json!(0)), 0, 2)?;
     assert_eq!(s.definitions("w")?.consecutive_faults, 0);
     audit(&**s)?;
-    report.operations += 40;
+    report.operations += 52;
     report.witnesses.insert("epochs arm atomically and isolate the breaker");
+    report.witnesses.insert("a trip reports with a committed notice and only activation clears it");
 
     // Exclusive firing: a slot whose previous run is unfinished is skipped.
     let t = factory("overlap")?;

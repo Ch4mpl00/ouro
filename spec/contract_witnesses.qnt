@@ -37,7 +37,8 @@ module contract_witnesses {
   run scheduleTest = schedule.expect(checked and m.db.admissions == [1,0] and m.db.fired == Set((1,0)))
   action breaker = init.then(boot).then(execute("finish",0,0,0,1,0)).then(execute("admit",1,0,0,0,0))
     .then(execute("claim",1,0,0,0,0)).then(execute("finish",1,0,0,3,0))
-  run breakerTest = breaker.expect(checked and m.db.catalog.tripped)
+  run breakerTest = breaker.expect(checked and m.db.catalog.tripped and m.db.catalog.notices == [1] and
+    m.db.catalog.active == 1 and m.db.catalog.epoch == 1 and m.db.catalog.faults == 2 and not(m.db.catalog.armed))
   action rearm = init.then(execute("activate",0,0,0,2,0)).then(do("tick")).then(do("tick")).then(do("fire"))
     .then(do("claim")).then(do("finish"))
   run rearmTest = rearm.expect(checked and m.db.catalog.due == 4 and m.db.catalog.rearm)
@@ -89,10 +90,17 @@ module contract_witnesses {
     .then(execute("admit",1,0,0,0,0)).then(execute("claim",1,0,0,0,0)).then(execute("finish",1,0,0,0,0))
   run successResetsBreakerTest = successResetsBreaker
     .expect(checked and m.db.catalog.faults == 0 and not(m.db.catalog.tripped))
-  action rollback = init.then(execute("activate",0,0,1,0,0)).then(boot).then(execute("finish",0,0,0,1,0))
+  // A version with a predecessor trips like any other: no rollback, no new
+  // epoch. Only the host's next activation clears it, in a new epoch.
+  action noRollback = init.then(execute("activate",0,0,1,0,0)).then(boot).then(execute("finish",0,0,0,1,0))
     .then(execute("admit",1,0,0,0,0)).then(execute("claim",1,0,0,0,0)).then(execute("finish",1,0,0,3,0))
-  run rollbackTest = rollback
-    .expect(checked and m.db.catalog.active == 1 and m.db.catalog.epoch == 3 and m.db.catalog.armed and m.db.catalog.due == 2)
+  run noRollbackTest = noRollback
+    .expect(checked and m.db.catalog.tripped and m.db.catalog.active == 2 and m.db.catalog.epoch == 2 and
+      not(m.db.catalog.armed) and m.db.catalog.notices == [2])
+  action reactivation = noRollback.then(execute("activate",0,0,0,0,0))
+  run reactivationTest = reactivation
+    .expect(checked and not(m.db.catalog.tripped) and m.db.catalog.active == 1 and m.db.catalog.epoch == 3 and
+      m.db.catalog.faults == 0 and m.db.catalog.armed and m.db.catalog.due == 2 and m.db.catalog.notices == [2])
   action broadcast = init.then(boot).then(do("subscribe")).then(do("publish")).then(ticks(3))
     .then(do("claim")).then(ticks(3)).then(do("claim")).then(do("take"))
   run broadcastTest = broadcast.expect(checked and m.db.copies.nth(0).disposition == 1)
@@ -114,5 +122,5 @@ module contract_witnesses {
     .then(deadline).then(compatibility).then(dry).then(replay).then(schedule).then(breaker).then(rearm)
     .then(noCatchup).then(overlap).then(ingress).then(ingressExpiry).then(redispatch).then(protectedUnknown)
     .then(notExecuted).then(errorResponse).then(conflict).then(release).then(staleFence).then(admission)
-    .then(successResetsBreaker).then(rollback).then(broadcast).then(retention).then(budget)
+    .then(successResetsBreaker).then(noRollback).then(reactivation).then(broadcast).then(retention).then(budget)
 }

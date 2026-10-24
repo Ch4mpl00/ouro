@@ -26,9 +26,10 @@ module contract {
     spends: List[int], spent: List[int]
   }
   type Copy = { id: int, recipient: int, payload: int, expires: int, disposition: int, key: int }
-  type Catalog = { active: int, previous: int, epoch: int, faults: int, tripped: bool,
+  // `notices`: the epochs whose trip was reported, one committed notice each.
+  type Catalog = { active: int, epoch: int, faults: int, tripped: bool,
     triggerEpoch: int, due: int, slot: int, running: int, catchup: int, rearm: bool,
-    armed: bool, fallback: int }
+    armed: bool, notices: List[int] }
   type Durable = { runs: List[Run], copies: List[Copy], catalog: Catalog,
     admissions: List[int], fired: Set[(int, int)], skipped: Set[(int, int)], ingress: int -> int, ingressPayload: int -> int,
     budget: List[int] }
@@ -43,9 +44,9 @@ module contract {
     subscription: false, parent: -1, notified: false, retained: true, spends: [0,0,0], spent: [0,0,0] }
   pure val emptyLocal: Local = { fence: 0, execution: 0, phase: 0, invocation: 0, stopped: false, permit: false }
   pure val initialDb: Durable = { runs: [emptyRun,emptyRun], copies: [], admissions: [0,0], budget: [0,0],
-    fired: Set(), skipped: Set(), ingress: Map(), ingressPayload:Map(), catalog: { active: 1, previous: 0, epoch: 1,
+    fired: Set(), skipped: Set(), ingress: Map(), ingressPayload:Map(), catalog: { active: 1, epoch: 1,
       faults: 0, tripped: false, triggerEpoch: 1, due: 2, slot: 0, running: -1, catchup: 0, rearm:false,
-      armed: true, fallback: -1 } }
+      armed: true, notices: [] } }
   pure val initial: Machine = { db: initialDb, workers: [emptyLocal,emptyLocal], now: 0,
     sends: [[0,0,0],[0,0,0]], observations: [], violations: Set(), faultsSeen: Set() }
   var m: Machine
@@ -188,16 +189,16 @@ module contract {
       // 4 unknown, 5 cancellation. The owner decides a timeout.
       val outcome = if (op == "timeout") 3 else if (op == "conflict") 2 else value + 1
       val faults = if (outcome == 1) 0 else if (outcome >= 2 and outcome <= 4) c.faults+1 else c.faults
-      val counted = execution.epoch == c.epoch
+      // A tripped breaker observes nothing until the next activation.
+      val counted = execution.epoch == c.epoch and not(c.tripped)
       val trip = counted and faults >= 2
-      // A rollback arms the predecessor's triggers its activation prepared; a
-      // trip removes them. Neither forgets the schedule's last run.
-      val catalog = if (not(counted)) c else if (trip and c.previous > 0)
-        { ...c, active:c.previous, previous:0, epoch:c.epoch+1, faults:0, slot:0,
-          triggerEpoch:c.epoch+1, due:c.fallback, armed:c.fallback >= 0, fallback:-1, running:if (c.running == r) -1 else c.running }
-        else { ...c, faults:if (trip) 0 else faults, tripped:c.tripped or trip, armed:c.armed and not(trip),
+      // A trip only reports: the active version, the epoch and the count stay,
+      // its triggers go and its notice is committed with it. The host decides
+      // what to activate. It does not forget the schedule's last run.
+      val catalog = if (not(counted)) c
+        else { ...c, faults:faults, tripped:trip, armed:c.armed and not(trip),
           due:if (trip) -1 else if (c.armed and c.rearm and c.due < 0 and c.running == r and execution.epoch == c.triggerEpoch) s.now+2 else c.due,
-          running:if (c.running == r) -1 else c.running }
+          running:if (c.running == r) -1 else c.running, notices:if (trip) c.notices.append(c.epoch) else c.notices }
       val updated = update(s,r,{ ...execution,outcome:outcome,ended:s.now,owner:-1,lease:-1,subscription:false,
         notified:execution.parent >= 0 })
       val descendants = if (outcome == 5) Runs.filter(k => live(s.db.runs.nth(k)) and s.db.runs.nth(k).parent == r) else Set()
@@ -217,12 +218,11 @@ module contract {
         if (runs.nth(x.execution).outcome != 0) { ...x,stopped:true,permit:false } else x) }
       Runs.filter(k => s.db.runs.nth(k).outcome == 0 and runs.nth(k).outcome == 5).fold(cancelled,(a,k) => observe(a,"finish",k,0,5,1))
     } else if (op == "activate" and value >= 0) {
-      // Version 1 has a schedule. Reactivating the active version keeps its
-      // predecessor, whose triggers this commit prepares for a rollback.
+      // Version 1 has a schedule. Only an activation starts an epoch and only
+      // an activation clears a trip; reported notices stay.
       val epoch = c.epoch+1
-      val predecessor = if (i+1 == c.active) c.previous else c.active
-      { ...s,db:{ ...s.db,catalog:{ ...c,active:i+1,previous:predecessor,epoch:epoch,faults:0,tripped:false,catchup:value % 2,rearm:value >= 2,
-        triggerEpoch:epoch,due:if (i == 0) s.now+2 else -1,armed:i == 0,slot:0,fallback:if (predecessor == 1) s.now+2 else -1 } } }
+      { ...s,db:{ ...s.db,catalog:{ ...c,active:i+1,epoch:epoch,faults:0,tripped:false,catchup:value % 2,rearm:value >= 2,
+        triggerEpoch:epoch,due:if (i == 0) s.now+2 else -1,armed:i == 0,slot:0 } } }
     } else if (op == "fire" and value >= 0 and c.due >= 0 and c.due <= s.now and c.triggerEpoch == c.epoch and not(c.tripped)) {
       val slot = (c.epoch,c.slot)
       val skip = (c.catchup == 1 and c.due < s.now) or
@@ -346,7 +346,8 @@ module contract {
         else a.db.admissions == b.db.admissions)))
     val rearmDue = Set("finish","timeout","conflict","cancel").contains(op) and old.outcome == 0 and execution.outcome != 0 and
       old.epoch == c.triggerEpoch and c.rearm and c.due < 0 and c.running == r and not(c.tripped)
-    val error20 = flag(error19,"T2",d.triggerEpoch == d.epoch and
+    // Nothing but an activation starts an epoch.
+    val error20 = flag(error19,"T2",d.triggerEpoch == d.epoch and (op == "activate" or d.epoch == c.epoch) and
       (not(rearmDue) or d.epoch != c.epoch or d.tripped or d.due == b.now+2) and
       (op != "activate" or c == d or (d.epoch == c.epoch+1 and d.due == (if (i == 0) b.now+2 else -1))))
     val error21 = flag(error20,"T3",Runs.forall(k => {
@@ -354,14 +355,22 @@ module contract {
       val y = a.db.runs.nth(k)
       not(x.admitted) or x.deadline == y.deadline
     }) and (op != "intent" or a.db == b.db or b.now < old.deadline))
-    val error22 = flag(error21,"V1",admissionStable and (op != "activate" or c == d or d.active == i+1))
+    // Nothing but an activation selects the active version: no rollback.
+    val error22 = flag(error21,"V1",admissionStable and (op != "activate" or c == d or d.active == i+1) and
+      (op == "activate" or d.active == c.active))
     val terminalObservation = Set("finish","timeout","conflict").contains(op) and old.outcome == 0 and execution.outcome != 0
     val qualifying = execution.outcome >= 2 and execution.outcome <= 4
-    val breakerCorrect = if (not(terminalObservation)) true else if (old.epoch != c.epoch) c == d
-      else if (qualifying and c.faults == 1) d.faults == 0 and
-        (if (c.previous > 0) d.active == c.previous and d.epoch == c.epoch+1 else d.tripped and d.due == -1)
-      else d.faults == (if (qualifying) c.faults+1 else if (execution.outcome == 1) 0 else c.faults)
-    val error23 = flag(error22,"V2",d.faults < 2 and breakerCorrect and
+    // The threshold observation trips and reports it once, stopping the
+    // schedule; a tripped breaker ignores later observations; only an
+    // activation clears it; notices change only at a trip.
+    val breakerCorrect = if (not(terminalObservation)) d.notices == c.notices
+      else if (old.epoch != c.epoch or c.tripped) c == d
+      else if (qualifying and c.faults == 1) d.faults == 2 and d.tripped and d.due == -1 and not(d.armed) and
+        d.notices == c.notices.append(c.epoch)
+      else d.faults == (if (qualifying) c.faults+1 else if (execution.outcome == 1) 0 else c.faults) and
+        not(d.tripped) and d.notices == c.notices
+    val error23 = flag(error22,"V2",(d.faults < 2 or d.tripped) and breakerCorrect and
+      (not(c.tripped) or d.tripped or op == "activate") and
       (op != "activate" or c == d or (d.faults == 0 and not(d.tripped))))
     val error24 = flag(error23,"V3",(op != "claim" or b.db == a.db or compatible(old.app,w)) and
       (not(workerMutation) or b.db == a.db or compatible(old.app,w)))

@@ -102,8 +102,6 @@ struct Prepared {
     schedule: Option<Trigger>,
     ingress: Option<Trigger>,
     epoch: u64,
-    active: Option<u64>,
-    previous: Option<u64>,
 }
 impl Prepared {
     fn new(d: &StoreDriver, commands: &[Cmd]) -> anyhow::Result<Self> {
@@ -125,8 +123,6 @@ impl Prepared {
             schedule: d.store.trigger(SCHEDULE)?,
             ingress: d.store.trigger(INGRESS)?,
             epoch: defs.epoch,
-            active: defs.active,
-            previous: defs.previous,
         })
     }
     fn fence(&self, w: usize) -> &Fence {
@@ -197,18 +193,12 @@ fn race(store: &dyn RunStore, p: &Prepared, k: usize, c: &Cmd) -> (i64, Option<F
         }
         "activate" => {
             let version = c.i as u64 + 1;
-            let predecessor = if p.active == Some(version) { p.previous } else { p.active };
             let (catchup, rearm) = (c.value % 2, c.value >= 2);
             let mut arming = Arming::default();
             if version == 1 {
                 arming
                     .triggers
                     .insert(SCHEDULE.into(), schedule_trigger(Some(ms / TICK + 2), p.epoch + 1, 0, catchup, rearm));
-            }
-            if predecessor == Some(1) {
-                arming
-                    .fallback
-                    .insert(SCHEDULE.into(), schedule_trigger(Some(ms / TICK + 2), p.epoch + 2, 0, catchup, rearm));
             }
             i64::from(store.activate_with(NAME, version, p.epoch, &arming).unwrap().is_some())
         }

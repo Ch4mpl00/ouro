@@ -43,7 +43,7 @@ MUTANTS = {
  "T1": ('fired:if (skip) s.db.fired else s.db.fired.union(Set(slot))','fired:s.db.fired',[op("tick"),op("tick"),op("fire")]),
  "T2": ('val epoch = c.epoch+1','val epoch = c.epoch',[op("activate",i=1)]),
  "T3": ('owner:w, generation:execution.generation+1, lease:s.now+4','owner:w, generation:execution.generation+1, lease:s.now+4, deadline:s.now+8',BOOT+TICKS+[op("claim")]),
- "V1": ('active:i+1,previous:predecessor','active:c.active,previous:predecessor',[op("activate",i=1)]),
+ "V1": ('active:i+1,epoch:epoch','active:c.active,epoch:epoch',[op("activate",i=1)]),
  "V2": ('val counted = execution.epoch == c.epoch','val counted = true',BOOT+[op("activate"),op("finish",value=1)]),
  "V3": ('execution.lease <= s.now and compatible(execution.app,w)','execution.lease <= s.now',[op("admit",i=1),op("claim",w=1)]),
  "O1": ('{ ...persisted.workers.nth(actor),stopped:true,phase:0,permit:false }','{ ...persisted.workers.nth(actor),stopped:false,phase:1,permit:false }',BOOT+[op("intent",fault=2),op("dispatch")]),
