@@ -2057,6 +2057,9 @@ impl Run<'_> {
         while let Some(r) = racing.next().await {
             match r {
                 Ok(v) => {
+                    // The losers go before the winner is saved: one suspended
+                    // inside a store call may hold the connection it needs.
+                    drop(racing);
                     self.save(&winner_key, Record::Winner { output: v.clone() }).await?;
                     return Ok(v);
                 }

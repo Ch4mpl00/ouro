@@ -93,9 +93,9 @@ async fn main() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     {
         let runtime = runtime(dir.path(), false)?;
-        let d = runtime.save("restart", YAML)?;
-        runtime.activate(&d.name, d.version)?;
-        runtime.start("example", "restart", json!({}))?;
+        let d = runtime.save("restart", YAML).await?;
+        runtime.activate(&d.name, d.version).await?;
+        runtime.start("example", "restart", json!({})).await?;
     }
     let mut worker = Worker(Command::new(std::env::current_exe()?).arg("worker").arg(dir.path()).spawn()?);
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -108,7 +108,7 @@ async fn main() -> anyhow::Result<()> {
     worker.0.wait()?;
     let runtime = runtime(dir.path(), true)?;
     runtime.recover_once(&CancellationToken::new()).await?;
-    let run = runtime.get("example")?.unwrap();
+    let run = runtime.get("example").await?.unwrap();
     assert_eq!(run.outcome, Some(Status::Completed(json!({"value":42}))));
     let sends = std::fs::read_to_string(dir.path().join("ledger"))?.lines().count();
     assert_eq!(sends, 1);

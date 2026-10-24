@@ -93,22 +93,22 @@ fn fixture() -> Fixture {
     fixture_on(Arc::new(durable::memory::memory()), Arc::default(), Arc::default(), Arc::default())
 }
 
-fn save(rt: &Runtime, name: &str, yaml: &str) {
-    let d = rt.save(name, yaml).unwrap_or_else(|e| panic!("{e}"));
-    rt.activate(name, d.version).unwrap();
+async fn save(rt: &Runtime, name: &str, yaml: &str) {
+    let d = rt.save(name, yaml).await.unwrap_or_else(|e| panic!("{e}"));
+    rt.activate(name, d.version).await.unwrap();
 }
 
 /// Drives everything due until `id` ends or nothing is left to do.
 async fn settle(rt: &Runtime, id: &str) -> Option<Status> {
     for _ in 0..50 {
-        if let Some(status) = rt.get(id).unwrap().and_then(|r| r.outcome) {
+        if let Some(status) = rt.get(id).await.unwrap().and_then(|r| r.outcome) {
             return Some(status);
         }
         if rt.recover_once(&CancellationToken::new()).await.unwrap() == 0 {
             break;
         }
     }
-    rt.get(id).unwrap().and_then(|r| r.outcome)
+    rt.get(id).await.unwrap().and_then(|r| r.outcome)
 }
 
 fn completed(status: Option<Status>) -> Value {
@@ -137,7 +137,7 @@ async fn run_workflow_awaits_the_child_and_a_restart_never_reruns_it() {
             "child",
             "do:\n  - w: { call: write, with: { n: '${ .n }' } }\n  - pause: { wait: PT1S }\n  - out: { set: { doubled: '${ .n * 2 }' } }",
         ),
-    );
+    ).await;
     save(
         &f.rt,
         "parent",
@@ -145,10 +145,10 @@ async fn run_workflow_awaits_the_child_and_a_restart_never_reruns_it() {
             "parent",
             "do:\n  - sub: { run: { workflow: { namespace: test, name: child, version: '1.0.0', input: { n: '${ .n }' } } } }\n  - after: { set: { got: '${ .doubled }' } }",
         ),
-    );
-    f.rt.start("p", "parent", json!({"n": 21})).unwrap();
+    ).await;
+    f.rt.start("p", "parent", json!({"n": 21})).await.unwrap();
     assert!(matches!(f.rt.drive("p", &CancellationToken::new()).await.unwrap(), Some(Status::Waiting { .. })));
-    let child = f.rt.list(Some("child"), "").unwrap().pop().unwrap().admission.id;
+    let child = f.rt.list(Some("child"), "").await.unwrap().pop().unwrap().admission.id;
     // The child writes, then waits; the parent waits for it.
     assert!(matches!(f.rt.drive(&child, &CancellationToken::new()).await.unwrap(), Some(Status::Waiting { .. })));
     drop(f);
@@ -158,9 +158,9 @@ async fn run_workflow_awaits_the_child_and_a_restart_never_reruns_it() {
     let f = fixture_on(Arc::new(durable::sqlite::open(&path).unwrap()), time, writes.clone(), Arc::default());
     assert_eq!(completed(settle(&f.rt, "p").await), json!({"got": 42}));
     assert_eq!(writes.load(Ordering::SeqCst), 1);
-    assert_eq!(f.rt.list(Some("child"), "").unwrap().len(), 1);
+    assert_eq!(f.rt.list(Some("child"), "").await.unwrap().len(), 1);
     // Replaying a finished parent joins the same child.
-    f.rt.start("p", "parent", json!({"n": 21})).unwrap();
+    f.rt.start("p", "parent", json!({"n": 21})).await.unwrap();
     assert_eq!(completed(settle(&f.rt, "p").await), json!({"got": 42}));
 }
 
@@ -171,8 +171,9 @@ async fn a_faulted_child_is_caught_and_await_false_outlives_the_parent() {
         &f.rt,
         "bad",
         &doc("bad", "do: [ { r: { raise: { error: { type: 'urn:t:bad', status: 418, title: Bad } } } } ]"),
-    );
-    save(&f.rt, "slow", &doc("slow", "do: [ { w: { wait: PT1H } }, { done: { set: { ok: true } } } ]"));
+    )
+    .await;
+    save(&f.rt, "slow", &doc("slow", "do: [ { w: { wait: PT1H } }, { done: { set: { ok: true } } } ]")).await;
     save(
         &f.rt,
         "parent",
@@ -187,11 +188,12 @@ async fn a_faulted_child_is_caught_and_await_false_outlives_the_parent() {
       try: [ { sub: { run: { workflow: { namespace: test, name: absent, version: '1.0.0' } } } } ]
       catch: { as: e, do: [ { keep: { set: '${ . + { missing: $e.status } }' } } ] }"#,
         ),
-    );
-    f.rt.start("p", "parent", json!({})).unwrap();
+    )
+    .await;
+    f.rt.start("p", "parent", json!({})).await.unwrap();
     let out = completed(settle(&f.rt, "p").await);
     assert_eq!(out, json!({"status": 418, "instance": "/do/1/guarded/try/0/sub", "type": "urn:t:bad", "missing": 400}));
-    let slow = f.rt.list(Some("slow"), "").unwrap();
+    let slow = f.rt.list(Some("slow"), "").await.unwrap();
     assert_eq!(slow.len(), 1);
     assert!(slow[0].ended_ms.is_none(), "an independent run is not cancelled with its parent");
 }
@@ -199,7 +201,7 @@ async fn a_faulted_child_is_caught_and_await_false_outlives_the_parent() {
 #[tokio::test]
 async fn reserved_child_functions_still_join_later() {
     let f = fixture();
-    save(&f.rt, "child", &doc("child", "do: [ { r: { set: { answer: 42 } } } ]"));
+    save(&f.rt, "child", &doc("child", "do: [ { r: { set: { answer: 42 } } } ]")).await;
     save(
         &f.rt,
         "parent",
@@ -207,8 +209,8 @@ async fn reserved_child_functions_still_join_later() {
             "parent",
             "do:\n  - start: { call: start_child, with: { name: child, input: {} }, export: { as: '${ . }' } }\n  - join: { listen: { to: { one: { with: { type: '${ $context.done }' } } } } }",
         ),
-    );
-    f.rt.start("p", "parent", json!({})).unwrap();
+    ).await;
+    f.rt.start("p", "parent", json!({})).await.unwrap();
     assert_eq!(completed(settle(&f.rt, "p").await)[0]["output"], json!({"answer": 42}));
 }
 
@@ -234,7 +236,7 @@ async fn emitted_events_reach_listens_and_the_sink_once() {
             "listener",
             "do: [ { l: { listen: { to: { any: [ { with: { type: reading, data: '${ .v > 1 }' } } ], until: '${ length >= 2 }' } } } } ]",
         ),
-    );
+    ).await;
     save(
         &rt,
         "emitter",
@@ -242,10 +244,10 @@ async fn emitted_events_reach_listens_and_the_sink_once() {
             "emitter",
             "do:\n  - loop:\n      for: { in: [ 1, 2, 3 ] }\n      do: [ { e: { emit: { event: { with: { type: reading, source: 'https://sensor', data: { v: '${ $item }' } } } } } } ]",
         ),
-    );
-    rt.start("l", "listener", json!({})).unwrap();
+    ).await;
+    rt.start("l", "listener", json!({})).await.unwrap();
     assert!(matches!(rt.drive("l", &CancellationToken::new()).await.unwrap(), Some(Status::Waiting { .. })));
-    rt.start("e", "emitter", json!({})).unwrap();
+    rt.start("e", "emitter", json!({})).await.unwrap();
     // A `for` outputs its last pass: the last emitted envelope.
     assert_eq!(completed(settle(&rt, "e").await)["data"], json!({"v": 3}));
     let emitted = sink.0.lock().unwrap().clone();
@@ -277,8 +279,9 @@ async fn all_with_correlation_waits_for_matching_events() {
         read: envelope
       output: { as: '${ map(.data) }' }"#,
         ),
-    );
-    f.rt.start("r", "room", json!({"room": "kitchen"})).unwrap();
+    )
+    .await;
+    f.rt.start("r", "room", json!({"room": "kitchen"})).await.unwrap();
     f.rt.drive("r", &CancellationToken::new()).await.unwrap();
     let mut other = event("1", "temperature", json!(30));
     other["roomid"] = json!("hall");
@@ -287,7 +290,7 @@ async fn all_with_correlation_waits_for_matching_events() {
     let mut hum = event("3", "humidity", json!(40));
     hum["roomid"] = json!("kitchen");
     for e in [other, temp.clone(), temp, hum] {
-        f.rt.publish(e).unwrap();
+        f.rt.publish(e).await.unwrap();
     }
     assert_eq!(completed(settle(&f.rt, "r").await), json!([21, 40]));
 }
@@ -317,18 +320,19 @@ async fn foreach_survives_a_restart_without_repeating_an_item_or_an_event() {
         export: { as: '${ $context + { last: . } }' }
   - result: { set: '${ { items: ., last: $context.last } }' }"#,
         ),
-    );
-    f.rt.start("s", "stream", json!({})).unwrap();
+    )
+    .await;
+    f.rt.start("s", "stream", json!({})).await.unwrap();
     f.rt.drive("s", &CancellationToken::new()).await.unwrap();
-    f.rt.publish(event("1", "order", json!({"n": 1}))).unwrap();
+    f.rt.publish(event("1", "order", json!({"n": 1}))).await.unwrap();
     f.rt.drive("s", &CancellationToken::new()).await.unwrap();
     assert_eq!(writes.load(Ordering::SeqCst), 1);
     drop(f);
     let f = open(&writes);
     // The same event again is not consumed twice.
-    assert!(f.rt.publish(event("1", "order", json!({"n": 1}))).unwrap().is_empty());
-    f.rt.publish(event("2", "order", json!({"n": 2}))).unwrap();
-    f.rt.publish(event("3", "closed", json!({}))).unwrap();
+    assert!(f.rt.publish(event("1", "order", json!({"n": 1}))).await.unwrap().is_empty());
+    f.rt.publish(event("2", "order", json!({"n": 2}))).await.unwrap();
+    f.rt.publish(event("3", "closed", json!({}))).await.unwrap();
     assert_eq!(completed(settle(&f.rt, "s").await), json!({"items": [1, 2], "last": 2}));
     assert_eq!(writes.load(Ordering::SeqCst), 2);
 }
@@ -356,8 +360,9 @@ do:
   - real: { call: read, with: { mock: false, v: 1 } }
   - mocked: { call: write, with: { mock: true } }"#,
         ),
-    );
-    f.rt.start("x", "ext", json!({})).unwrap();
+    )
+    .await;
+    f.rt.start("x", "ext", json!({})).await.unwrap();
     assert_eq!(completed(settle(&f.rt, "x").await), json!({"mocked": true}));
     let seen = f.seen.lock().unwrap().clone();
     // The logging extension ran around both tasks (and not around its own
@@ -381,21 +386,22 @@ async fn an_attempt_deadline_is_a_retried_timeout() {
         retry: { limit: { attempt: { count: 2, duration: PT1S } } }
         do: [ { r: { set: '${ { status: $e.status } }' } } ]"#,
         ),
-    );
-    f.rt.start("a", "attempts", json!({})).unwrap();
+    )
+    .await;
+    f.rt.start("a", "attempts", json!({})).await.unwrap();
     for t in [0, 1_000, 2_000, 3_000] {
         f.time.set(t);
         if settle(&f.rt, "a").await.is_some() {
             break;
         }
     }
-    assert_eq!(completed(f.rt.get("a").unwrap().unwrap().outcome), json!({"status": 408}));
+    assert_eq!(completed(f.rt.get("a").await.unwrap().unwrap().outcome), json!({"status": 408}));
 }
 
 // ── processes, secrets, resources ──────────────────────────────────────────
 
 struct Shell(AtomicUsize);
-#[async_trait]
+#[async_trait::async_trait]
 impl ProcessRunner for Shell {
     fn runs(&self, kind: &str) -> bool {
         kind == "shell"
@@ -412,7 +418,7 @@ async fn processes_need_a_runner_and_return_what_is_asked() {
     let body = |r: &str| {
         doc("p", &format!("do: [ {{ s: {{ run: {{ shell: {{ command: '${{ .cmd }}' }}, return: {r} }} }} }} ]"))
     };
-    assert!(f.rt.save("p", &body("all")).unwrap_err().to_string().contains("process runner"));
+    assert!(f.rt.save("p", &body("all")).await.unwrap_err().to_string().contains("process runner"));
     let shell = Arc::new(Shell(AtomicUsize::new(0)));
     let rt = f.rt.with_process_runner(shell.clone());
     for (r, expected) in [
@@ -422,8 +428,8 @@ async fn processes_need_a_runner_and_return_what_is_asked() {
         ("code", json!(3)),
         ("none", Value::Null),
     ] {
-        save(&rt, "p", &body(r));
-        rt.start(r, "p", json!({"cmd": "ls"})).unwrap();
+        save(&rt, "p", &body(r)).await;
+        rt.start(r, "p", json!({"cmd": "ls"})).await.unwrap();
         assert_eq!(completed(settle(&rt, r).await), expected, "{r}");
     }
     assert_eq!(shell.0.load(Ordering::SeqCst), 5);
@@ -481,14 +487,15 @@ do:
       catch: { as: e, do: [ { keep: { set: '${ { error: $e.detail, auth: .auth } }' } } ] }
   - fail: { raise: { error: { type: 'urn:t:leak', status: 500, detail: '${ .error }' } } }"#,
         ),
-    );
-    rt.start("s", "secret", json!({})).unwrap();
+    )
+    .await;
+    rt.start("s", "secret", json!({})).await.unwrap();
     let status = rt.drive("s", &CancellationToken::new()).await.unwrap().unwrap();
     assert_eq!(received.lock().unwrap()[0]["auth"], format!("Bearer {SECRET}"), "the function gets the value");
     let Status::Faulted(e) = &status else { panic!("{status:?}") };
     assert!(e.detail.as_deref().is_some_and(|d| d.contains("rejected header")), "{e:?}");
     // Every persisted row, the outcome and every span: no secret value.
-    let rows = serde_json::to_string(&backend.snapshot().unwrap().rows.values().collect::<Vec<_>>()).unwrap();
+    let rows = serde_json::to_string(&backend.snapshot().await.unwrap().rows.values().collect::<Vec<_>>()).unwrap();
     assert!(rows.contains("rejected header"), "the records are there");
     assert!(!rows.contains(SECRET), "a secret was persisted");
     assert!(!format!("{status:?}").contains(SECRET), "a secret is in the outcome");
@@ -501,7 +508,7 @@ do:
     // Validation: $secrets only in input.from, only declared names.
     let bad =
         doc("bad", "use: { secrets: [ api ] }\ndo: [ { a: { call: call_api, with: { t: '${ $secrets.api }' } } } ]");
-    assert!(rt.save("bad", &bad).unwrap_err().to_string().contains("input.from"));
+    assert!(rt.save("bad", &bad).await.unwrap_err().to_string().contains("input.from"));
 }
 
 struct Schemas(Mutex<BTreeMap<String, Value>>);
@@ -518,15 +525,15 @@ async fn external_schemas_resolve_through_the_host_and_are_pinned() {
         "typed",
         "input: { schema: { format: json, resource: { endpoint: 'https://schemas.test/n.json' } } }\ndo: [ { a: { set: { ok: true } } } ]",
     );
-    assert!(f.rt.save("typed", &body).unwrap_err().to_string().contains("resource resolver"));
+    assert!(f.rt.save("typed", &body).await.unwrap_err().to_string().contains("resource resolver"));
     let schemas = Arc::new(Schemas(Mutex::new(BTreeMap::from([(
         "https://schemas.test/n.json".to_string(),
         json!({"type": "object", "required": ["n"]}),
     )]))));
     let rt = f.rt.with_resources(schemas.clone());
-    save(&rt, "typed", &body);
-    rt.start("ok", "typed", json!({"n": 1})).unwrap();
-    rt.start("bad", "typed", json!({})).unwrap();
+    save(&rt, "typed", &body).await;
+    rt.start("ok", "typed", json!({"n": 1})).await.unwrap();
+    rt.start("bad", "typed", json!({})).await.unwrap();
     // A schema that changes after admission does not change admitted runs.
     schemas.0.lock().unwrap().insert("https://schemas.test/n.json".into(), json!({"type": "string"}));
     assert_eq!(completed(settle(&rt, "ok").await), json!({"ok": true}));
@@ -538,34 +545,34 @@ async fn external_schemas_resolve_through_the_host_and_are_pinned() {
 #[tokio::test]
 async fn every_cron_and_after_start_each_slot_once() {
     let f = fixture();
-    save(&f.rt, "every", &doc("every", "schedule: { every: PT1M }\ndo: [ { a: { set: { ok: true } } } ]"));
-    save(&f.rt, "cron", &doc("cron", "schedule: { cron: '*/5 * * * *' }\ndo: [ { a: { set: { ok: true } } } ]"));
-    save(&f.rt, "after", &doc("after", "schedule: { after: PT10S }\ndo: [ { a: { set: { ok: true } } } ]"));
+    save(&f.rt, "every", &doc("every", "schedule: { every: PT1M }\ndo: [ { a: { set: { ok: true } } } ]")).await;
+    save(&f.rt, "cron", &doc("cron", "schedule: { cron: '*/5 * * * *' }\ndo: [ { a: { set: { ok: true } } } ]")).await;
+    save(&f.rt, "after", &doc("after", "schedule: { after: PT10S }\ndo: [ { a: { set: { ok: true } } } ]")).await;
     // Activation at 0 arms the first `after` run at once and the others at
     // their next slots.
-    assert_eq!(f.rt.fire_due().unwrap(), vec!["schedule:after:after:1:0000000001".to_string()]);
+    assert_eq!(f.rt.fire_due().await.unwrap(), vec!["schedule:after:after:1:0000000001".to_string()]);
     f.time.set(60_000);
-    assert_eq!(f.rt.fire_due().unwrap(), vec!["schedule:every:every:60000".to_string()]);
+    assert_eq!(f.rt.fire_due().await.unwrap(), vec!["schedule:every:every:60000".to_string()]);
     // A second scheduler at the same time starts nothing more.
-    assert!(f.rt.fire_due().unwrap().is_empty());
+    assert!(f.rt.fire_due().await.unwrap().is_empty());
     // Down until 10 minutes: each missed schedule starts once, late. (The
     // previous `every` run ends first: an unfinished one would skip the slot.)
     f.rt.drive("schedule:every:every:60000", &CancellationToken::new()).await.unwrap();
     f.time.set(600_000);
-    let mut started = f.rt.fire_due().unwrap();
+    let mut started = f.rt.fire_due().await.unwrap();
     started.sort();
     assert_eq!(started, vec!["schedule:cron:cron:300000".to_string(), "schedule:every:every:120000".into()]);
-    assert!(f.rt.fire_due().unwrap().is_empty());
+    assert!(f.rt.fire_due().await.unwrap().is_empty());
     // The next `after` run waits for the previous one to end, plus the delay.
     settle(&f.rt, "schedule:after:after:1:0000000001").await;
     f.time.set(609_999);
-    assert!(f.rt.fire_due().unwrap().is_empty());
+    assert!(f.rt.fire_due().await.unwrap().is_empty());
     f.time.set(610_000);
-    assert_eq!(f.rt.fire_due().unwrap(), vec!["schedule:after:after:1:0000000002".to_string()]);
+    assert_eq!(f.rt.fire_due().await.unwrap(), vec!["schedule:after:after:1:0000000002".to_string()]);
     // A version without the schedule removes its trigger.
-    save(&f.rt, "every", &doc("every", "do: [ { a: { set: { ok: true } } } ]"));
+    save(&f.rt, "every", &doc("every", "do: [ { a: { set: { ok: true } } } ]")).await;
     f.time.set(10_000_000);
-    assert!(!f.rt.fire_due().unwrap().iter().any(|id| id.starts_with("schedule:every:")));
+    assert!(!f.rt.fire_due().await.unwrap().iter().any(|id| id.starts_with("schedule:every:")));
 }
 
 #[tokio::test]
@@ -578,20 +585,26 @@ async fn schedule_on_starts_a_run_per_match() {
             "alarm",
             "schedule: { on: { one: { with: { type: heartbeat.low, data: '${ .bpm < 50 }' } } } }\ndo: [ { a: { set: { patient: '${ .[0].patient }' } } } ]",
         ).replace("version: '1.0.0' }", "version: '1.0.0', metadata: { overlap: allow } }"),
-    );
+    ).await;
     let mut started = Vec::new();
     for (id, bpm, patient) in [("1", 40, "ann"), ("2", 70, "bob"), ("3", 45, "cid"), ("1", 40, "ann")] {
-        started.extend(f.rt.publish(event(id, "heartbeat.low", json!({"bpm": bpm, "patient": patient}))).unwrap());
+        started
+            .extend(f.rt.publish(event(id, "heartbeat.low", json!({"bpm": bpm, "patient": patient}))).await.unwrap());
     }
     assert_eq!(started.len(), 2, "one run per match, none for a republished event: {started:?}");
     while f.rt.recover_once(&CancellationToken::new()).await.unwrap() > 0 {}
     let mut outputs: Vec<Value> =
-        f.rt.list(Some("alarm"), "").unwrap().into_iter().map(|r| completed(r.outcome)["patient"].clone()).collect();
+        f.rt.list(Some("alarm"), "")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| completed(r.outcome)["patient"].clone())
+            .collect();
     outputs.sort_by_key(|v| v.to_string());
     assert_eq!(outputs, vec![json!("ann"), json!("cid")]);
     // A version without the schedule stops reacting.
-    save(&f.rt, "alarm", &doc("alarm", "do: [ { a: { set: { ok: true } } } ]"));
-    assert!(f.rt.publish(event("4", "heartbeat.low", json!({"bpm": 1}))).unwrap().is_empty());
+    save(&f.rt, "alarm", &doc("alarm", "do: [ { a: { set: { ok: true } } } ]")).await;
+    assert!(f.rt.publish(event("4", "heartbeat.low", json!({"bpm": 1}))).await.unwrap().is_empty());
 }
 
 // Activation epochs: a version without a schedule removes the triggers in
@@ -621,28 +634,28 @@ async fn a_trip_reports_and_only_an_activation_clears_it() {
     let rt = f.rt.with_event_sink(sink.clone());
     let ok = "schedule: { every: PT1M }\ndo: [ { a: { set: { ok: true } } } ]";
     let boom = "schedule: { every: PT1M }\ndo: [ { boom: { raise: { error: { type: 'urn:t:boom', status: 500 } } } } ]";
-    save(&rt, "flaky", &doc("flaky", ok));
-    save(&rt, "flaky", &doc("flaky", "do: [ { a: { set: { ok: true } } } ]"));
-    assert!(rt.triggers("flaky").unwrap().is_empty(), "removed with the activation");
-    save(&rt, "flaky", &doc("flaky", boom));
-    assert_eq!(rt.triggers("flaky").unwrap().len(), 1);
+    save(&rt, "flaky", &doc("flaky", ok)).await;
+    save(&rt, "flaky", &doc("flaky", "do: [ { a: { set: { ok: true } } } ]")).await;
+    assert!(rt.triggers("flaky").await.unwrap().is_empty(), "removed with the activation");
+    save(&rt, "flaky", &doc("flaky", boom)).await;
+    assert_eq!(rt.triggers("flaky").await.unwrap().len(), 1);
     // The host's own reaction, a workflow started once per trip.
     let watch = "schedule: { on: { one: { with: { type: ouro.definition.tripped } } } }\ndo: [ { a: { set: { tripped: '${ .[0] }' } } } ]";
-    save(&rt, "watch", &doc("watch", watch));
+    save(&rt, "watch", &doc("watch", watch)).await;
     for n in 0..3 {
         let id = format!("boom{n}");
-        rt.start(&id, "flaky", json!({})).unwrap();
+        rt.start(&id, "flaky", json!({})).await.unwrap();
         assert!(matches!(settle(&rt, &id).await, Some(Status::Faulted(_))));
     }
-    let d = rt.definitions("flaky").unwrap();
+    let d = rt.definitions("flaky").await.unwrap();
     assert_eq!((d.active, d.epoch), (Some(3), 3), "no rollback and no new epoch");
     let trip = d.tripped.clone().expect("visible in the runs API");
     assert_eq!((trip.version, trip.epoch, trip.faults, trip.threshold), (3, 3, 3, 3));
     assert_eq!((trip.run.as_str(), trip.reason.type_.as_str()), ("boom2", "urn:t:boom"));
-    assert!(rt.triggers("flaky").unwrap().is_empty(), "its schedule stops");
-    assert!(rt.start("refused", "flaky", json!({})).unwrap_err().to_string().contains("tripped"));
+    assert!(rt.triggers("flaky").await.unwrap().is_empty(), "its schedule stops");
+    assert!(rt.start("refused", "flaky", json!({})).await.unwrap_err().to_string().contains("tripped"));
     f.time.set(10_000_000);
-    assert!(!rt.fire_due().unwrap().iter().any(|id| id.contains("flaky")));
+    assert!(!rt.fire_due().await.unwrap().iter().any(|id| id.contains("flaky")));
     // A failing sink leaves the notice, retried after its own backoff (1 s
     // after the first failure) with the same identity, which starts the
     // host's workflow once.
@@ -660,18 +673,18 @@ async fn a_trip_reports_and_only_an_activation_clears_it() {
     assert_eq!(seen[0], seen[1]);
     assert_eq!(seen[0], trip.event("flaky"));
     assert_eq!(seen[0]["type"], durable::TRIPPED);
-    let watched = rt.list(Some("watch"), "").unwrap();
+    let watched = rt.list(Some("watch"), "").await.unwrap();
     assert_eq!(watched.len(), 1, "one run per trip: {watched:?}");
     let id = watched[0].admission.id.clone();
     let output = completed(settle(&rt, &id).await);
     assert_eq!(output["tripped"]["run"], "boom2");
     assert_eq!(output["tripped"]["faults"], 3);
     // The host decides: here it activates the earlier version, in a new epoch.
-    rt.activate("flaky", 1).unwrap();
-    let d = rt.definitions("flaky").unwrap();
+    rt.activate("flaky", 1).await.unwrap();
+    let d = rt.definitions("flaky").await.unwrap();
     assert!(d.tripped.is_none() && d.epoch == 4 && d.active == Some(1), "a new activation clears it");
-    assert_eq!(rt.triggers("flaky").unwrap().len(), 1);
-    rt.start("accepted", "flaky", json!({})).unwrap();
+    assert_eq!(rt.triggers("flaky").await.unwrap().len(), 1);
+    rt.start("accepted", "flaky", json!({})).await.unwrap();
     assert_eq!(completed(settle(&rt, "accepted").await), json!({"ok": true}));
 }
 
@@ -683,14 +696,15 @@ async fn a_trip_reports_and_only_an_activation_clears_it() {
 async fn children_of_a_tripped_definition_are_refused_with_a_typed_error() {
     let f = fixture();
     let rt = &f.rt;
-    save(rt, "broken", &doc("broken", "do: [ { boom: { raise: { error: { type: 'urn:t:boom', status: 500 } } } } ]"));
+    save(rt, "broken", &doc("broken", "do: [ { boom: { raise: { error: { type: 'urn:t:boom', status: 500 } } } } ]"))
+        .await;
     for n in 0..3 {
         let id = format!("broken{n}");
-        rt.start(&id, "broken", json!({})).unwrap();
+        rt.start(&id, "broken", json!({})).await.unwrap();
         settle(rt, &id).await;
     }
-    let epoch = rt.definitions("broken").unwrap().tripped.expect("tripped").epoch;
-    let refused = rt.start("direct", "broken", json!({})).unwrap_err();
+    let epoch = rt.definitions("broken").await.unwrap().tripped.expect("tripped").epoch;
+    let refused = rt.start("direct", "broken", json!({})).await.unwrap_err();
     let refused = refused.downcast_ref::<durable::DefinitionTripped>().expect("typed");
     assert_eq!((refused.name.as_str(), refused.epoch), ("broken", epoch));
     save(
@@ -711,30 +725,32 @@ async fn children_of_a_tripped_definition_are_refused_with_a_typed_error() {
         errors: { with: { type: 'urn:ouro:errors:definition.tripped' } }
         do: [ { keep: { set: '${ . + { independent: "refused" } }' } } ]"#,
         ),
-    );
-    rt.start("careful", "careful", json!({})).unwrap();
+    )
+    .await;
+    rt.start("careful", "careful", json!({})).await.unwrap();
     let out = completed(settle(rt, "careful").await);
     assert_eq!(out["type"], durable::TRIPPED_ERROR);
     assert_eq!(out["status"], 409);
     let detail = out["detail"].as_str().unwrap();
     assert!(detail.contains("broken") && detail.contains(&format!("epoch {epoch}")), "{detail}");
     assert_eq!(out["independent"], "refused");
-    assert_eq!(rt.list(Some("broken"), "").unwrap().len(), 3, "no child was admitted");
+    assert_eq!(rt.list(Some("broken"), "").await.unwrap().len(), 3, "no child was admitted");
     save(
         rt,
         "careless",
         &doc("careless", "do: [ { sub: { run: { workflow: { namespace: test, name: broken, version: latest } } } } ]"),
-    );
-    rt.start("careless", "careless", json!({})).unwrap();
+    )
+    .await;
+    rt.start("careless", "careless", json!({})).await.unwrap();
     match settle(rt, "careless").await {
         Some(Status::Faulted(e)) => assert_eq!(e.type_, durable::TRIPPED_ERROR),
         other => panic!("expected the parent to fault, got {other:?}"),
     }
-    let parent = rt.definitions("careless").unwrap();
+    let parent = rt.definitions("careless").await.unwrap();
     assert_eq!((parent.consecutive_faults, parent.tripped.is_none()), (1, true), "an unhandled error of the parent");
     // The host's activation clears the trip; children are admitted again.
-    rt.activate("broken", 1).unwrap();
-    rt.start("careless-again", "careless", json!({})).unwrap();
+    rt.activate("broken", 1).await.unwrap();
+    rt.start("careless-again", "careless", json!({})).await.unwrap();
     match settle(rt, "careless-again").await {
         Some(Status::Faulted(e)) => assert_eq!(e.type_, "urn:t:boom", "the child ran and faulted"),
         other => panic!("expected the child's own fault, got {other:?}"),
@@ -746,21 +762,21 @@ async fn catchup_none_skips_missed_slots_with_a_record() {
     let f = fixture();
     let body = "schedule: { every: PT1M }\ndo: [ { a: { set: { ok: true } } } ]";
     let yaml = doc("strict", body).replace("version: '1.0.0' }", "version: '1.0.0', metadata: { catchup: none } }");
-    save(&f.rt, "strict", &yaml);
+    save(&f.rt, "strict", &yaml).await;
     f.time.set(60_000);
-    assert_eq!(f.rt.fire_due().unwrap(), vec!["schedule:strict:every:60000".to_string()]);
+    assert_eq!(f.rt.fire_due().await.unwrap(), vec!["schedule:strict:every:60000".to_string()]);
     settle(&f.rt, "schedule:strict:every:60000").await;
     // Down until 10 minutes: the missed slot is skipped, recorded, not run.
     f.time.set(600_000);
-    assert!(f.rt.fire_due().unwrap().is_empty());
-    let (_, trigger) = f.rt.triggers("strict").unwrap().pop().unwrap();
+    assert!(f.rt.fire_due().await.unwrap().is_empty());
+    let (_, trigger) = f.rt.triggers("strict").await.unwrap().pop().unwrap();
     assert_eq!(trigger.state["skipped"], json!([{ "slot": 120_000, "reason": "missed" }]));
     assert_eq!(trigger.at_ms, Some(660_000));
     f.time.set(660_000);
-    assert_eq!(f.rt.fire_due().unwrap(), vec!["schedule:strict:every:660000".to_string()]);
+    assert_eq!(f.rt.fire_due().await.unwrap(), vec!["schedule:strict:every:660000".to_string()]);
     let bad = doc("bad", "do: [ { a: { set: { ok: true } } } ]")
         .replace("version: '1.0.0' }", "version: '1.0.0', metadata: { catchup: none } }");
-    assert!(f.rt.save("bad", &bad).unwrap_err().to_string().contains("catchup"));
+    assert!(f.rt.save("bad", &bad).await.unwrap_err().to_string().contains("catchup"));
 }
 
 // The mailbox: an event addressed to a run waits for its listen (which reads
@@ -773,16 +789,16 @@ async fn the_mailbox_keeps_addressed_events_until_a_listen_or_expiry() {
     );
     let f = fixture_on(store, Arc::default(), Arc::default(), Arc::default());
     let body = "do:\n  - pause: { wait: PT1S }\n  - answer: { listen: { to: { one: { with: { type: answer } } } } }";
-    save(&f.rt, "late", &doc("late", body));
-    save(&f.rt, "later", &doc("later", &body.replace("PT1S", "PT10S")));
+    save(&f.rt, "late", &doc("late", body)).await;
+    save(&f.rt, "later", &doc("later", &body.replace("PT1S", "PT10S"))).await;
     let answer = |id: &str, data: Value| json!({"id": id, "source": "/test", "type": "answer", "data": data});
     for (run, name) in [("listens", "late"), ("too-late", "later")] {
-        f.rt.start(run, name, json!({})).unwrap();
+        f.rt.start(run, name, json!({})).await.unwrap();
         // Before the run has run at all, let alone listened.
-        assert_eq!(f.rt.deliver(answer(run, json!(42)), Some(run)).unwrap(), Some(run.to_string()));
+        assert_eq!(f.rt.deliver(answer(run, json!(42)), Some(run)).await.unwrap(), Some(run.to_string()));
     }
-    assert_eq!(f.rt.deliver(answer("listens", json!(42)), Some("listens")).unwrap(), Some("listens".into()));
-    assert!(f.rt.deliver(answer("listens", json!(0)), Some("listens")).is_err(), "same identity, other payload");
+    assert_eq!(f.rt.deliver(answer("listens", json!(42)), Some("listens")).await.unwrap(), Some("listens".into()));
+    assert!(f.rt.deliver(answer("listens", json!(0)), Some("listens")).await.is_err(), "same identity, other payload");
     for run in ["listens", "too-late"] {
         assert_eq!(settle(&f.rt, run).await, None, "pausing");
     }
@@ -790,17 +806,17 @@ async fn the_mailbox_keeps_addressed_events_until_a_listen_or_expiry() {
     assert_eq!(completed(settle(&f.rt, "listens").await), json!([42]));
     // The other one listens only after the event's lifetime.
     f.time.set(10_000);
-    assert!(f.rt.records("too-late").unwrap().keys().all(|k| !k.starts_with("mailbox#")));
+    assert!(f.rt.records("too-late").await.unwrap().keys().all(|k| !k.starts_with("mailbox#")));
     assert_eq!(settle(&f.rt, "too-late").await, None, "still listening");
-    assert_eq!(f.rt.get("too-late").unwrap().unwrap().state, durable::RunState::Waiting);
-    let expired = f.rt.records("too-late").unwrap();
+    assert_eq!(f.rt.get("too-late").await.unwrap().unwrap().state, durable::RunState::Waiting);
+    let expired = f.rt.records("too-late").await.unwrap();
     assert!(expired.iter().any(|(k, r)| k == "mailbox#expired[0]"
         && matches!(r, owf::durable::Record::Expired { event } if event["id"] == "too-late")));
     // A run that never listens again: the sweep expires it, observably.
-    f.rt.start("idle", "late", json!({})).unwrap();
-    f.rt.deliver(answer("idle", json!(1)), Some("idle")).unwrap();
+    f.rt.start("idle", "late", json!({})).await.unwrap();
+    f.rt.deliver(answer("idle", json!(1)), Some("idle")).await.unwrap();
     f.time.set(15_000);
-    assert_eq!(f.rt.sweep().unwrap().expired, 1);
+    assert_eq!(f.rt.sweep().await.unwrap().expired, 1);
 }
 
 // ── crashes at every commit ────────────────────────────────────────────────
@@ -812,38 +828,46 @@ struct Crashing {
     fail_at: usize,
     after: bool,
 }
+#[async_trait::async_trait]
 impl AtomicBackend for Crashing {
-    fn begin(&self) -> anyhow::Result<Box<dyn durable::Transaction + '_>> {
-        Ok(Box::new(CrashingTx { inner: self.inner.begin()?, backend: self }))
+    async fn begin(&self) -> anyhow::Result<Box<dyn durable::Transaction + '_>> {
+        Ok(Box::new(CrashingTx { inner: self.inner.begin().await?, backend: self }))
     }
-    fn snapshot(&self) -> anyhow::Result<durable::Snapshot> {
-        self.inner.snapshot()
+    async fn snapshot(&self) -> anyhow::Result<durable::Snapshot> {
+        self.inner.snapshot().await
     }
 }
 struct CrashingTx<'a> {
     inner: Box<dyn durable::Transaction + 'a>,
     backend: &'a Crashing,
 }
+#[async_trait::async_trait]
 impl durable::Transaction for CrashingTx<'_> {
-    fn get(&mut self, kind: &str, id: &str) -> anyhow::Result<Option<Value>> {
-        self.inner.get(kind, id)
+    async fn get(&mut self, kind: &str, id: &str) -> anyhow::Result<Option<Value>> {
+        self.inner.get(kind, id).await
     }
-    fn scan(&mut self, kind: &str, start: &str, end: Option<&str>, limit: usize) -> anyhow::Result<durable::Rows> {
-        self.inner.scan(kind, start, end, limit)
+    async fn scan(
+        &mut self,
+        kind: &str,
+        start: &str,
+        end: Option<&str>,
+        limit: usize,
+    ) -> anyhow::Result<durable::Rows> {
+        self.inner.scan(kind, start, end, limit).await
     }
-    fn put(&mut self, kind: &str, id: &str, value: &Value) -> anyhow::Result<()> {
-        self.inner.put(kind, id, value)
+    async fn put(&mut self, kind: &str, id: &str, value: &Value) -> anyhow::Result<()> {
+        self.inner.put(kind, id, value).await
     }
-    fn delete(&mut self, kind: &str, id: &str) -> anyhow::Result<()> {
-        self.inner.delete(kind, id)
+    async fn delete(&mut self, kind: &str, id: &str) -> anyhow::Result<()> {
+        self.inner.delete(kind, id).await
     }
-    fn commit(self: Box<Self>) -> anyhow::Result<()> {
+    async fn commit(self: Box<Self>) -> anyhow::Result<()> {
         let b = self.backend;
         let n = b.commits.fetch_add(1, Ordering::SeqCst) + 1;
         if n == b.fail_at && !b.after {
             anyhow::bail!("injected crash before commit {n}");
         }
-        self.inner.commit()?;
+        self.inner.commit().await?;
         if n == b.fail_at && b.after {
             anyhow::bail!("injected crash after commit {n}");
         }
@@ -873,29 +897,29 @@ async fn crash_run(fail_at: usize, after: bool) -> (Option<Status>, Vec<Value>, 
     });
     let store = Arc::new(durable::TransactionalStore::new(backend.clone()));
     let f = fixture_on(store.clone(), Arc::default(), Arc::default(), Arc::default());
-    let setup = |rt: &Runtime| -> anyhow::Result<()> {
+    let setup = async |rt: &Runtime| -> anyhow::Result<()> {
         for (name, body) in
             [("child", "do: [ { w: { call: write, with: { child: '${ .n }' } } } ]"), ("parent", PARENT)]
         {
-            let d = rt.save(name, &doc(name, body))?;
-            rt.activate(name, d.version)?;
+            let d = rt.save(name, &doc(name, body)).await?;
+            rt.activate(name, d.version).await?;
         }
-        rt.start("p", "parent", json!({}))?;
+        rt.start("p", "parent", json!({})).await?;
         Ok(())
     };
-    while setup(&f.rt).is_err() {}
+    while setup(&f.rt).await.is_err() {}
     let mut published = 0;
     for step in 1..200 {
-        if let Some(status) = store.get("p").ok().flatten().and_then(|r| r.outcome) {
+        if let Some(status) = store.get("p").await.ok().flatten().and_then(|r| r.outcome) {
             // Reads commit too: one may meet the injected crash; read again.
             let snapshot = loop {
-                if let Ok(Some(s)) = store.inspect("p") {
+                if let Ok(Some(s)) = store.inspect("p").await {
                     break s;
                 }
             };
             let consumed = snapshot.events.iter().filter(|e| e.consumed_key.is_some() && e.type_ == "order").count();
             let children = loop {
-                if let Ok(runs) = store.list(Some("child"), "") {
+                if let Ok(runs) = store.list(Some("child"), "").await {
                     break runs.len();
                 }
             };
@@ -903,10 +927,10 @@ async fn crash_run(fail_at: usize, after: bool) -> (Option<Status>, Vec<Value>, 
             return (Some(status), f.seen.lock().unwrap().clone(), consumed, children, commits);
         }
         let _ = f.rt.recover_once(&CancellationToken::new()).await;
-        let listening = store.inspect("p").ok().flatten().is_some_and(|s| !s.subscriptions.is_empty());
+        let listening = store.inspect("p").await.ok().flatten().is_some_and(|s| !s.subscriptions.is_empty());
         while listening && published < 2 {
             let n = published + 1;
-            if f.rt.publish(event(&n.to_string(), "order", json!({ "n": n }))).is_err() {
+            if f.rt.publish(event(&n.to_string(), "order", json!({ "n": n }))).await.is_err() {
                 break;
             }
             published += 1;
@@ -986,8 +1010,9 @@ do:
       export: { as: '${ { output: $output.task.name } }' }
   - last: { set: '${ . + { exported: $context } }' }"#,
         ),
-    );
-    rt.start("r", "args", json!({ "n": 1 })).unwrap();
+    )
+    .await;
+    rt.start("r", "args", json!({ "n": 1 })).await.unwrap();
     let out = completed(settle(&rt, "r").await);
     assert_eq!(out["runtime"]["name"], "ouro-runtime");
     assert!(out["runtime"]["version"].is_string());
@@ -1011,13 +1036,13 @@ do:
     assert_eq!(out["raw"], json!({ "n": 1 }), "$task.output is the raw output");
     assert_eq!(out["exported"], json!({ "output": "probe" }), "$output in export.as");
     let bad = doc("bad", "do: [ { a: { set: { x: '${ $authorization }' } } } ]");
-    assert!(rt.save("bad", &bad).unwrap_err().to_string().contains("$authorization"));
+    assert!(rt.save("bad", &bad).await.unwrap_err().to_string().contains("$authorization"));
 }
 
 #[tokio::test]
 async fn dry_runs_record_emits_and_run_children_from_the_catalog() {
     let f = fixture();
-    save(&f.rt, "child", &doc("child", "do: [ { w: { call: write, with: { from: child } } } ]"));
+    save(&f.rt, "child", &doc("child", "do: [ { w: { call: write, with: { from: child } } } ]")).await;
     let definition = doc(
         "parent",
         "do:\n  - sub: { run: { workflow: { namespace: test, name: child, version: latest } } }\n  - say: { emit: { event: { with: { type: said, source: 'https://p', data: '${ . }' } } } }",
@@ -1038,7 +1063,7 @@ async fn dry_runs_record_emits_and_run_children_from_the_catalog() {
     let functions: Vec<&str> = dry.mocked.iter().map(|w| w.function.as_str()).collect();
     assert_eq!(functions, ["write", "emit"]);
     assert_eq!(f.seen.lock().unwrap().len(), 0, "nothing reached the real write");
-    assert!(f.rt.list(None, "").unwrap().is_empty(), "nothing was admitted for real");
+    assert!(f.rt.list(None, "").await.unwrap().is_empty(), "nothing was admitted for real");
 }
 
 // The host's mock rule covers process runs too: a dry run dispatches no
@@ -1075,13 +1100,13 @@ async fn schedule_on_all_starts_once_every_filter_has_matched() {
             "pair",
             "schedule:\n  on: { all: [ { with: { type: a } }, { with: { type: b } } ] }\n  read: envelope\ndo: [ { s: { set: '${ map(.type) }' } } ]",
         ),
-    );
-    assert!(f.rt.publish(event("1", "a", json!(1))).unwrap().is_empty(), "one of two is not enough");
-    assert!(f.rt.publish(event("2", "a", json!(2))).unwrap().is_empty(), "a filled filter drops a second match");
-    let started = f.rt.publish(event("3", "b", json!(3))).unwrap();
+    ).await;
+    assert!(f.rt.publish(event("1", "a", json!(1))).await.unwrap().is_empty(), "one of two is not enough");
+    assert!(f.rt.publish(event("2", "a", json!(2))).await.unwrap().is_empty(), "a filled filter drops a second match");
+    let started = f.rt.publish(event("3", "b", json!(3))).await.unwrap();
     assert_eq!(started.len(), 1);
     assert_eq!(completed(settle(&f.rt, &started[0]).await), json!(["a", "b"]));
-    assert!(f.rt.publish(event("4", "b", json!(4))).unwrap().is_empty(), "the next pair starts afresh");
+    assert!(f.rt.publish(event("4", "b", json!(4))).await.unwrap().is_empty(), "the next pair starts afresh");
 }
 
 // ── the jump budget (issue #8) ─────────────────────────────────────────────
@@ -1120,17 +1145,17 @@ async fn budget_crash(fail_at: usize, after: bool) -> (Option<Status>, Vec<(Stri
     });
     let store = Arc::new(durable::TransactionalStore::new(backend.clone()));
     let f = fixture_on(store.clone(), Arc::default(), Arc::default(), Arc::default());
-    let setup = |rt: &Runtime| -> anyhow::Result<()> {
-        let d = rt.save("loop", &budgeted())?;
-        rt.activate("loop", d.version)?;
-        rt.start("l", "loop", json!({ "n": 0 }))?;
+    let setup = async |rt: &Runtime| -> anyhow::Result<()> {
+        let d = rt.save("loop", &budgeted()).await?;
+        rt.activate("loop", d.version).await?;
+        rt.start("l", "loop", json!({ "n": 0 })).await?;
         Ok(())
     };
-    while setup(&f.rt).is_err() {}
+    while setup(&f.rt).await.is_err() {}
     for step in 1..200 {
-        if let Some(status) = store.get("l").ok().flatten().and_then(|r| r.outcome) {
+        if let Some(status) = store.get("l").await.ok().flatten().and_then(|r| r.outcome) {
             let records = loop {
-                if let Ok(Some(s)) = store.inspect("l") {
+                if let Ok(Some(s)) = store.inspect("l").await {
                     break s.records;
                 }
             };
@@ -1174,22 +1199,22 @@ async fn a_restarted_process_resumes_the_count_and_replay_repeats_the_decisions(
     // The loop pauses after every jump, so a process can stop between them.
     let paused = budgeted().replace("- tick: { call: read", "- pause: { wait: PT1S }\n  - tick: { call: read");
     let paused = paused.replace("then: tick", "then: pause");
-    save(&f.rt, "loop", &paused);
-    f.rt.start("l", "loop", json!({ "n": 0 })).unwrap();
+    save(&f.rt, "loop", &paused).await;
+    f.rt.start("l", "loop", json!({ "n": 0 })).await.unwrap();
     for at in [0, 1_000] {
         time.set(at);
         assert!(matches!(f.rt.drive("l", &CancellationToken::new()).await.unwrap(), Some(Status::Waiting { .. })));
     }
-    assert_eq!(decisions(&f.rt.records("l").unwrap()).len(), 1);
+    assert_eq!(decisions(&f.rt.records("l").await.unwrap()).len(), 1);
     drop(f);
     let f = fixture_on(Arc::new(durable::sqlite::open(&path).unwrap()), time.clone(), Arc::default(), Arc::default());
     for at in 2..6 {
         time.set(at * 1_000);
         f.rt.drive("l", &CancellationToken::new()).await.unwrap();
     }
-    let status = f.rt.get("l").unwrap().and_then(|r| r.outcome);
+    let status = f.rt.get("l").await.unwrap().and_then(|r| r.outcome);
     assert_eq!(status, Some(Status::Completed(json!({ "n": 4 }))));
-    let made = decisions(&f.rt.records("l").unwrap());
+    let made = decisions(&f.rt.records("l").await.unwrap());
     assert_eq!(
         made.iter().map(|(_, g, s)| (*g, *s)).collect::<Vec<_>>(),
         [(true, 1), (true, 2), (true, 3), (false, 3)]
@@ -1215,18 +1240,18 @@ async fn children_spend_their_roots_budget_and_nesting_is_capped() {
     .unwrap();
     // A child jumps twice; the parent starts a fresh child on every pass.
     let child = "do:\n  - step: { set: { k: '${ (.k // 0) + 1 }' } }\n  - again: { switch: [ { stop: { when: '${ .k >= 3 }', then: exit } }, { more: { then: step } } ] }";
-    save(&rt, "child", &doc("child", child));
+    save(&rt, "child", &doc("child", child)).await;
     let parent = "do:\n  - spawn: { run: { workflow: { namespace: test, name: child, version: latest, input: {} } }, output: { as: '${ $input }' } }\n  - count: { set: { i: '${ .i + 1 }' } }\n  - loop: { switch: [ { stop: { when: '${ .i >= 100 }', then: exit } }, { more: { then: spawn } } ] }";
-    save(&rt, "parent", &doc("parent", parent));
-    rt.start("p", "parent", json!({ "i": 0 })).unwrap();
+    save(&rt, "parent", &doc("parent", parent)).await;
+    rt.start("p", "parent", json!({ "i": 0 })).await.unwrap();
     let Some(Status::Faulted(e)) = settle(&rt, "p").await else { panic!("the tree did not run out of budget") };
     // Two passes spend 2 + 1 jumps each; the third child is refused.
     assert!(e.is("budget.exhausted"), "{e:?}");
     assert_eq!(e.instance.as_deref(), Some("/do/0/spawn[2]"));
     let mut granted = 0;
-    let runs = rt.list(None, "").unwrap();
+    let runs = rt.list(None, "").await.unwrap();
     for r in &runs {
-        let made = decisions(&rt.records(&r.admission.id).unwrap());
+        let made = decisions(&rt.records(&r.admission.id).await.unwrap());
         granted += made.iter().filter(|(_, g, _)| *g).count();
         assert!(made.iter().all(|(_, _, spent)| *spent <= 6));
         if r.admission.name == "child" {
@@ -1245,11 +1270,12 @@ async fn children_spend_their_roots_budget_and_nesting_is_capped() {
         &rt,
         "rec",
         &doc("rec", "do:\n  - deeper: { run: { workflow: { namespace: test, name: rec, version: latest } } }"),
-    );
-    rt.start("r", "rec", json!({})).unwrap();
+    )
+    .await;
+    rt.start("r", "rec", json!({})).await.unwrap();
     let Some(Status::Faulted(e)) = settle(&rt, "r").await else { panic!("recursion did not stop") };
     assert!(e.is("budget.exhausted"), "{e:?}");
-    assert_eq!(rt.list(Some("rec"), "").unwrap().len(), 4, "the root and three nested children");
+    assert_eq!(rt.list(Some("rec"), "").await.unwrap().len(), 4, "the root and three nested children");
 }
 
 #[tokio::test]
@@ -1261,10 +1287,11 @@ async fn definitions_only_tighten_the_budget_and_cannot_loop_without_a_way_out()
         )
     };
     assert!(f.rt.validate(&limited(100)).is_ok());
-    let e = f.rt.save("l", &limited(101)).unwrap_err().to_string();
+    let e = f.rt.save("l", &limited(101)).await.unwrap_err().to_string();
     assert!(e.contains("ceiling of 100"), "{e}");
     let e =
         f.rt.save("c", &doc("c", "do:\n  - a: { call: read }\n  - b: { call: read, then: a }"))
+            .await
             .unwrap_err()
             .to_string();
     assert!(e.contains("jump in a cycle"), "{e}");
@@ -1284,10 +1311,10 @@ async fn a_run_ended_by_its_budget_says_so_on_its_span() {
         opentelemetry::global::BoxedTracer::new(Box::new(provider.tracer("budget"))),
     )
     .unwrap();
-    save(&rt, "loop", &budgeted());
-    save(&rt, "plain", &doc("plain", "do: [ { a: { set: { x: 1 } } } ]"));
+    save(&rt, "loop", &budgeted()).await;
+    save(&rt, "plain", &doc("plain", "do: [ { a: { set: { x: 1 } } } ]")).await;
     for (id, name) in [("l", "loop"), ("p", "plain")] {
-        rt.start(id, name, json!({ "n": 0 })).unwrap();
+        rt.start(id, name, json!({ "n": 0 })).await.unwrap();
         settle(&rt, id).await;
     }
     let flagged = |definition: &str| {
@@ -1309,12 +1336,13 @@ struct Claiming {
     fail_at: usize,
     after: bool,
 }
+#[async_trait::async_trait]
 impl AtomicBackend for Claiming {
-    fn begin(&self) -> anyhow::Result<Box<dyn durable::Transaction + '_>> {
-        Ok(Box::new(ClaimingTx { inner: self.inner.begin()?, backend: self, claims: false }))
+    async fn begin(&self) -> anyhow::Result<Box<dyn durable::Transaction + '_>> {
+        Ok(Box::new(ClaimingTx { inner: self.inner.begin().await?, backend: self, claims: false }))
     }
-    fn snapshot(&self) -> anyhow::Result<durable::Snapshot> {
-        self.inner.snapshot()
+    async fn snapshot(&self) -> anyhow::Result<durable::Snapshot> {
+        self.inner.snapshot().await
     }
 }
 struct ClaimingTx<'a> {
@@ -1322,27 +1350,34 @@ struct ClaimingTx<'a> {
     backend: &'a Claiming,
     claims: bool,
 }
+#[async_trait::async_trait]
 impl durable::Transaction for ClaimingTx<'_> {
-    fn get(&mut self, kind: &str, id: &str) -> anyhow::Result<Option<Value>> {
-        self.inner.get(kind, id)
+    async fn get(&mut self, kind: &str, id: &str) -> anyhow::Result<Option<Value>> {
+        self.inner.get(kind, id).await
     }
-    fn scan(&mut self, kind: &str, start: &str, end: Option<&str>, limit: usize) -> anyhow::Result<durable::Rows> {
-        self.inner.scan(kind, start, end, limit)
+    async fn scan(
+        &mut self,
+        kind: &str,
+        start: &str,
+        end: Option<&str>,
+        limit: usize,
+    ) -> anyhow::Result<durable::Rows> {
+        self.inner.scan(kind, start, end, limit).await
     }
-    fn put(&mut self, kind: &str, id: &str, value: &Value) -> anyhow::Result<()> {
+    async fn put(&mut self, kind: &str, id: &str, value: &Value) -> anyhow::Result<()> {
         self.claims |= kind.starts_with("record:") && id == owf::durable::EXCEEDED;
-        self.inner.put(kind, id, value)
+        self.inner.put(kind, id, value).await
     }
-    fn delete(&mut self, kind: &str, id: &str) -> anyhow::Result<()> {
-        self.inner.delete(kind, id)
+    async fn delete(&mut self, kind: &str, id: &str) -> anyhow::Result<()> {
+        self.inner.delete(kind, id).await
     }
-    fn commit(self: Box<Self>) -> anyhow::Result<()> {
+    async fn commit(self: Box<Self>) -> anyhow::Result<()> {
         let b = self.backend;
         let n = b.commits.fetch_add(1, Ordering::SeqCst) + 1;
         if n == b.fail_at && !b.after {
             anyhow::bail!("injected crash before commit {n}");
         }
-        self.inner.commit()?;
+        self.inner.commit().await?;
         if self.claims {
             b.claimed.store(n, Ordering::SeqCst);
         }
@@ -1410,17 +1445,17 @@ async fn race_crash(fail_at: usize, after: bool) -> (Option<Status>, Vec<String>
         .unwrap();
     let time = Arc::new(Time::default());
     let rt = Runtime::new(store.clone(), Arc::new(registry), Config::default(), time.clone(), tracer()).unwrap();
-    let setup = |rt: &Runtime| -> anyhow::Result<()> {
-        let d = rt.save("race", RACING)?;
-        rt.activate("race", d.version)?;
-        rt.start("r", "race", json!({}))?;
+    let setup = async |rt: &Runtime| -> anyhow::Result<()> {
+        let d = rt.save("race", RACING).await?;
+        rt.activate("race", d.version).await?;
+        rt.start("r", "race", json!({})).await?;
         Ok(())
     };
-    while setup(&rt).is_err() {}
+    while setup(&rt).await.is_err() {}
     for step in 1..200 {
-        if let Some(status) = store.get("r").ok().flatten().and_then(|r| r.outcome) {
+        if let Some(status) = store.get("r").await.ok().flatten().and_then(|r| r.outcome) {
             let records = loop {
-                if let Ok(Some(s)) = store.inspect("r") {
+                if let Ok(Some(s)) = store.inspect("r").await {
                     break s.records;
                 }
             };
@@ -1493,34 +1528,34 @@ async fn schedule_overlap_policies_apply_to_time_and_event_slots() {
             };
             let yaml = doc("overlap", &format!("schedule: {{ {schedule} }}\ndo: [ {{ pause: {{ wait: PT1H }} }} ]"))
                 .replace("version: '1.0.0' }", &format!("version: '1.0.0', metadata: {{ overlap: {policy} }} }}"));
-            save(&f.rt, "overlap", &yaml);
-            let fire = |n: i64| {
+            save(&f.rt, "overlap", &yaml).await;
+            let fire = async |n: i64| {
                 f.time.set(n * 60_000);
                 if kind == "on" {
-                    f.rt.publish(json!({"source":"test", "id":format!("{n}"), "type":"tick", "data":n})).unwrap()
+                    f.rt.publish(json!({"source":"test", "id":format!("{n}"), "type":"tick", "data":n})).await.unwrap()
                 } else {
-                    f.rt.fire_due().unwrap()
+                    f.rt.fire_due().await.unwrap()
                 }
             };
-            let first = fire(1).pop().unwrap();
+            let first = fire(1).await.pop().unwrap();
             assert_eq!(settle(&f.rt, &first).await, None, "waiting counts as overlap");
-            let second = fire(2);
-            let third = fire(3);
+            let second = fire(2).await;
+            let third = fire(3).await;
             match policy {
                 "skip" => {
                     assert!(second.is_empty() && third.is_empty());
-                    assert_eq!(f.rt.list(Some("overlap"), "").unwrap().len(), 1);
+                    assert_eq!(f.rt.list(Some("overlap"), "").await.unwrap().len(), 1);
                 }
                 "allow" => {
                     assert_eq!((second.len(), third.len()), (1, 1));
-                    assert!(f.rt.get(&first).unwrap().unwrap().ended_ms.is_none());
+                    assert!(f.rt.get(&first).await.unwrap().unwrap().ended_ms.is_none());
                 }
                 "queue" => {
                     assert!(second.is_empty() && third.is_empty());
-                    assert_eq!(f.rt.queued("overlap").unwrap().len(), 1);
-                    f.rt.cancel(&first).unwrap();
-                    assert!(f.rt.queued("overlap").unwrap().is_empty());
-                    let runs = f.rt.list(Some("overlap"), "").unwrap();
+                    assert_eq!(f.rt.queued("overlap").await.unwrap().len(), 1);
+                    f.rt.cancel(&first).await.unwrap();
+                    assert!(f.rt.queued("overlap").await.unwrap().is_empty());
+                    let runs = f.rt.list(Some("overlap"), "").await.unwrap();
                     assert_eq!(runs.len(), 2);
                     let promoted = runs.iter().find(|r| r.admission.id != first).unwrap();
                     assert_eq!(promoted.admitted_ms, 180_000);
@@ -1532,16 +1567,16 @@ async fn schedule_overlap_policies_apply_to_time_and_event_slots() {
                 }
                 _ => {
                     assert_eq!((second.len(), third.len()), (1, 1));
-                    assert_eq!(f.rt.get(&first).unwrap().unwrap().outcome, Some(Status::Cancelled));
-                    assert_eq!(f.rt.get(&second[0]).unwrap().unwrap().outcome, Some(Status::Cancelled));
+                    assert_eq!(f.rt.get(&first).await.unwrap().unwrap().outcome, Some(Status::Cancelled));
+                    assert_eq!(f.rt.get(&second[0]).await.unwrap().unwrap().outcome, Some(Status::Cancelled));
                 }
             }
             // Reoffering the same event or ticking the same slot never admits
             // a second run, even after a policy's skip or replacement.
-            let count = f.rt.list(Some("overlap"), "").unwrap().len();
-            fire(3);
-            assert_eq!(f.rt.list(Some("overlap"), "").unwrap().len(), count);
-            let (_, t) = f.rt.triggers("overlap").unwrap().pop().unwrap();
+            let count = f.rt.list(Some("overlap"), "").await.unwrap().len();
+            fire(3).await;
+            assert_eq!(f.rt.list(Some("overlap"), "").await.unwrap().len(), count);
+            let (_, t) = f.rt.triggers("overlap").await.unwrap().pop().unwrap();
             if policy == "skip" || policy == "queue" {
                 assert!(t.state["skips"].as_u64().unwrap() >= 1);
             }
@@ -1549,28 +1584,28 @@ async fn schedule_overlap_policies_apply_to_time_and_event_slots() {
     }
 }
 
-#[test]
-fn schedule_allow_stops_at_the_host_ceiling_across_trigger_kinds() {
+#[tokio::test]
+async fn schedule_allow_stops_at_the_host_ceiling_across_trigger_kinds() {
     let f = fixture();
     let yaml = doc(
         "bounded",
         "schedule: { every: PT1M, on: { one: { with: { type: tick } } } }\ndo: [ { pause: { wait: PT1H } } ]",
     )
     .replace("version: '1.0.0' }", "version: '1.0.0', metadata: { overlap: allow } }");
-    save(&f.rt, "bounded", &yaml);
+    save(&f.rt, "bounded", &yaml).await;
     for n in 1..=10 {
         f.time.set(n * 60_000);
-        assert_eq!(f.rt.fire_due().unwrap().len(), 1);
+        assert_eq!(f.rt.fire_due().await.unwrap().len(), 1);
     }
     f.time.set(660_000);
-    assert!(f.rt.fire_due().unwrap().is_empty());
-    assert!(f.rt.publish(json!({"source":"test", "id":"ceiling", "type":"tick"})).unwrap().is_empty());
-    assert_eq!(f.rt.list(Some("bounded"), "").unwrap().len(), 10);
-    for (_, t) in f.rt.triggers("bounded").unwrap() {
+    assert!(f.rt.fire_due().await.unwrap().is_empty());
+    assert!(f.rt.publish(json!({"source":"test", "id":"ceiling", "type":"tick"})).await.unwrap().is_empty());
+    assert_eq!(f.rt.list(Some("bounded"), "").await.unwrap().len(), 10);
+    for (_, t) in f.rt.triggers("bounded").await.unwrap() {
         assert_eq!(t.state["skipped"][0]["overlap"], "ceiling");
     }
-    f.rt.cancel("schedule:bounded:every:60000").unwrap();
-    assert_eq!(f.rt.publish(json!({"source":"test", "id":"free", "type":"tick"})).unwrap().len(), 1);
+    f.rt.cancel("schedule:bounded:every:60000").await.unwrap();
+    assert_eq!(f.rt.publish(json!({"source":"test", "id":"free", "type":"tick"})).await.unwrap().len(), 1);
 }
 
 #[tokio::test]
@@ -1579,39 +1614,39 @@ async fn after_overlap_and_ceiling_rearm_without_stranding_the_trigger() {
         let f = fixture();
         let yaml = doc("after-overlap", "schedule: { after: PT1M }\ndo: [ { pause: { wait: PT1H } } ]")
             .replace("version: '1.0.0' }", &format!("version: '1.0.0', metadata: {{ overlap: {policy} }} }}"));
-        save(&f.rt, "after-overlap", &yaml);
-        let first = f.rt.fire_due().unwrap().pop().unwrap();
+        save(&f.rt, "after-overlap", &yaml).await;
+        let first = f.rt.fire_due().await.unwrap().pop().unwrap();
         settle(&f.rt, &first).await;
         // Reactivation arms a fresh after trigger while the older run lives.
-        f.rt.activate("after-overlap", 1).unwrap();
-        let second = f.rt.fire_due().unwrap();
+        f.rt.activate("after-overlap", 1).await.unwrap();
+        let second = f.rt.fire_due().await.unwrap();
         match policy {
             "skip" => {
                 assert!(second.is_empty());
-                assert_eq!(f.rt.triggers("after-overlap").unwrap()[0].1.at_ms, Some(60_000));
+                assert_eq!(f.rt.triggers("after-overlap").await.unwrap()[0].1.at_ms, Some(60_000));
             }
             "queue" => {
                 assert!(second.is_empty());
-                let queued = f.rt.queued("after-overlap").unwrap().pop().unwrap();
-                f.rt.cancel(&first).unwrap();
-                assert!(f.rt.get(&queued.id).unwrap().is_some());
-                f.rt.cancel(&queued.id).unwrap();
-                assert_eq!(f.rt.triggers("after-overlap").unwrap()[0].1.at_ms, Some(60_000));
+                let queued = f.rt.queued("after-overlap").await.unwrap().pop().unwrap();
+                f.rt.cancel(&first).await.unwrap();
+                assert!(f.rt.get(&queued.id).await.unwrap().is_some());
+                f.rt.cancel(&queued.id).await.unwrap();
+                assert_eq!(f.rt.triggers("after-overlap").await.unwrap()[0].1.at_ms, Some(60_000));
             }
             _ => assert_eq!(second.len(), 1),
         }
     }
     let f = fixture();
     let yaml = doc("after-ceiling", "schedule: { after: PT1M }\ndo: [ { pause: { wait: PT1H } } ]");
-    save(&f.rt, "after-ceiling", &yaml);
+    save(&f.rt, "after-ceiling", &yaml).await;
     for n in 0..10 {
-        f.rt.start(&format!("manual{n}"), "after-ceiling", json!({})).unwrap();
+        f.rt.start(&format!("manual{n}"), "after-ceiling", json!({})).await.unwrap();
     }
-    assert!(f.rt.fire_due().unwrap().is_empty());
-    assert_eq!(f.rt.triggers("after-ceiling").unwrap()[0].1.at_ms, Some(60_000));
-    f.rt.cancel("manual0").unwrap();
+    assert!(f.rt.fire_due().await.unwrap().is_empty());
+    assert_eq!(f.rt.triggers("after-ceiling").await.unwrap()[0].1.at_ms, Some(60_000));
+    f.rt.cancel("manual0").await.unwrap();
     f.time.set(60_000);
-    assert_eq!(f.rt.fire_due().unwrap().len(), 1);
+    assert_eq!(f.rt.fire_due().await.unwrap().len(), 1);
 }
 
 #[tokio::test]
@@ -1646,28 +1681,28 @@ async fn replacing_a_slot_signals_its_running_handler() {
     .unwrap();
     let yaml = doc("replace-handler", "schedule: { every: PT1M }\ndo: [ { block: { call: block } } ]")
         .replace("version: '1.0.0' }", "version: '1.0.0', metadata: { overlap: replace } }");
-    save(&rt, "replace-handler", &yaml);
+    save(&rt, "replace-handler", &yaml).await;
     time.set(60_000);
-    let first = rt.fire_due().unwrap().pop().unwrap();
+    let first = rt.fire_due().await.unwrap().pop().unwrap();
     let stop = CancellationToken::new();
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
         tokio::join!(rt.drive(&first, &stop), async {
             entered.notified().await;
             time.set(120_000);
-            assert_eq!(rt.fire_due().unwrap().len(), 1);
+            assert_eq!(rt.fire_due().await.unwrap().len(), 1);
         })
     })
     .await
     .unwrap()
     .0
     .ok();
-    assert_eq!(rt.get(&first).unwrap().unwrap().outcome, Some(Status::Cancelled));
+    assert_eq!(rt.get(&first).await.unwrap().unwrap().outcome, Some(Status::Cancelled));
     // The interpreter may drop an in-flight handler after signaling it; the
     // durable cancellation and prompt return are the required observations.
 }
 
-#[test]
-fn schedule_ceiling_is_supplied_by_the_host() {
+#[tokio::test]
+async fn schedule_ceiling_is_supplied_by_the_host() {
     let time = Arc::new(Time::default());
     let config = Config { max_concurrent_runs: 1, ..Config::default() };
     let rt =
@@ -1675,12 +1710,12 @@ fn schedule_ceiling_is_supplied_by_the_host() {
             .unwrap();
     let yaml = doc("host-ceiling", "schedule: { every: PT1M }\ndo: [ { pause: { wait: PT1H } } ]")
         .replace("version: '1.0.0' }", "version: '1.0.0', metadata: { overlap: allow } }");
-    save(&rt, "host-ceiling", &yaml);
+    save(&rt, "host-ceiling", &yaml).await;
     time.set(60_000);
-    assert_eq!(rt.fire_due().unwrap().len(), 1);
+    assert_eq!(rt.fire_due().await.unwrap().len(), 1);
     time.set(120_000);
-    assert!(rt.fire_due().unwrap().is_empty());
-    assert_eq!(rt.triggers("host-ceiling").unwrap()[0].1.state["skipped"][0]["overlap"], "ceiling");
+    assert!(rt.fire_due().await.unwrap().is_empty());
+    assert_eq!(rt.triggers("host-ceiling").await.unwrap()[0].1.state["skipped"][0]["overlap"], "ceiling");
     assert!(
         Runtime::new(
             Arc::new(durable::memory::memory()),
@@ -1702,29 +1737,29 @@ async fn refused_slots_follow_the_selected_overlap_policy() {
             "schedule: { every: PT1M }\ndo: [ { pause: { wait: PT1H } }, { write: { call: write } } ]",
         )
         .replace("version: '1.0.0' }", &format!("version: '1.0.0', metadata: {{ overlap: {policy} }} }}"));
-        save(&f.rt, "refused-overlap", &yaml);
+        save(&f.rt, "refused-overlap", &yaml).await;
         f.time.set(60_000);
-        let first = f.rt.fire_due().unwrap().pop().unwrap();
+        let first = f.rt.fire_due().await.unwrap().pop().unwrap();
         assert_eq!(settle(&f.rt, &first).await, None);
         f.rt.set_registry(Arc::new(Registry::new()));
         f.time.set(120_000);
-        assert!(f.rt.fire_due().unwrap().is_empty());
+        assert!(f.rt.fire_due().await.unwrap().is_empty());
         let second = "schedule:refused-overlap:every:120000";
         if policy == "skip" {
-            assert!(f.rt.get(second).unwrap().is_none());
-            assert_eq!(f.rt.definitions("refused-overlap").unwrap().consecutive_faults, 0);
+            assert!(f.rt.get(second).await.unwrap().is_none());
+            assert_eq!(f.rt.definitions("refused-overlap").await.unwrap().consecutive_faults, 0);
             continue;
         }
         if policy == "queue" {
-            assert_eq!(f.rt.queued("refused-overlap").unwrap()[0].id, second);
-            assert!(f.rt.get(second).unwrap().is_none());
-            f.rt.cancel(&first).unwrap();
-            assert!(f.rt.queued("refused-overlap").unwrap().is_empty());
+            assert_eq!(f.rt.queued("refused-overlap").await.unwrap()[0].id, second);
+            assert!(f.rt.get(second).await.unwrap().is_none());
+            f.rt.cancel(&first).await.unwrap();
+            assert!(f.rt.queued("refused-overlap").await.unwrap().is_empty());
         }
-        assert!(matches!(f.rt.get(second).unwrap().unwrap().outcome, Some(Status::Faulted(_))));
-        assert_eq!(f.rt.definitions("refused-overlap").unwrap().consecutive_faults, 1);
+        assert!(matches!(f.rt.get(second).await.unwrap().unwrap().outcome, Some(Status::Faulted(_))));
+        assert_eq!(f.rt.definitions("refused-overlap").await.unwrap().consecutive_faults, 1);
         if policy == "replace" {
-            assert_eq!(f.rt.get(&first).unwrap().unwrap().outcome, Some(Status::Cancelled));
+            assert_eq!(f.rt.get(&first).await.unwrap().unwrap().outcome, Some(Status::Cancelled));
         }
     }
 }

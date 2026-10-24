@@ -429,7 +429,7 @@ impl State<StoreDriver> for View {
         let mut fired = BTreeSet::new();
         let mut snapshots = Vec::new();
         for r in 0..RUNS {
-            let snapshot = store.inspect(&run_id(r))?;
+            let snapshot = d.block(store.inspect(&run_id(r)))?;
             admissions.push(i64::from(snapshot.is_some()));
             let Some(snapshot) = snapshot else {
                 runs.push(RunView::absent());
@@ -443,8 +443,8 @@ impl State<StoreDriver> for View {
             snapshots.push(Some(snapshot));
         }
         d.audit(&snapshots)?;
-        let defs = store.definitions(NAME)?;
-        let trigger = store.trigger(SCHEDULE)?;
+        let defs = d.block(store.definitions(NAME))?;
+        let trigger = d.block(store.trigger(SCHEDULE))?;
         ensure!(
             defs.triggers == trigger.iter().map(|_| SCHEDULE.to_string()).collect::<Vec<_>>(),
             "the definition's triggers and the stored triggers differ"
@@ -470,8 +470,8 @@ impl State<StoreDriver> for View {
                 "the trip disagrees with its definition: {t:?}"
             );
         }
-        let notices = store
-            .notices(64)?
+        let notices = d
+            .block(store.notices(64))?
             .into_iter()
             .map(|(_, e)| {
                 ensure!(e["type"] == ouro_durable::TRIPPED && e["subject"] == NAME, "unexpected notice {e}");
@@ -482,7 +482,7 @@ impl State<StoreDriver> for View {
         for i in 0..CALLS {
             let mut live = None;
             for payload in 0..5 {
-                match store.ingested(&ingress_event(i, payload), d.ms()) {
+                match d.block(store.ingested(&ingress_event(i, payload), d.ms())) {
                     Ok(true) => live = Some(payload),
                     Ok(false) => break,
                     Err(e) if e.is::<IdentityConflict>() => {}
@@ -492,7 +492,7 @@ impl State<StoreDriver> for View {
             ingress.push(live);
         }
         Ok(View {
-            stopped: store.stopped()?,
+            stopped: d.block(store.stopped())?,
             now: d.now,
             runs,
             copies,
@@ -504,8 +504,8 @@ impl State<StoreDriver> for View {
                 trigger,
                 notices,
             },
-            queued: store
-                .queued(SCHEDULE)?
+            queued: d
+                .block(store.queued(SCHEDULE))?
                 .map(|a| -> anyhow::Result<QueueView> {
                     Ok(QueueView {
                         run: i64::try_from(run_index(&a.id).context("queued run id")?)?,
@@ -571,6 +571,10 @@ struct Coverage {
     rejected: usize,
 }
 pub struct StoreDriver {
+    /// Drives the store's operations: the model's histories are serial
+    /// steps, so each one blocks on its operation; concurrent batches run
+    /// their commands as tasks on its workers.
+    pub rt: tokio::runtime::Runtime,
     coverage: Arc<Mutex<Coverage>>,
     pub adapter: Adapter,
     pub directory: tempfile::TempDir,
@@ -597,6 +601,7 @@ impl StoreDriver {
         Self::with_policy(adapter, model_policy())
     }
     fn with_policy(adapter: Adapter, policy: Policy) -> anyhow::Result<Self> {
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(4).enable_all().build()?;
         let directory = tempfile::tempdir()?;
         let mut database = None;
         let (store, faults): (Arc<dyn RunStore>, _) = match adapter {
@@ -617,12 +622,13 @@ impl StoreDriver {
                 db.execute(&format!("CREATE DATABASE {}", db.name))?;
                 let mut child = config;
                 child.dbname(&db.name);
-                let b = Arc::new(ouro_durable::postgres::PostgresBackend::connect_config(child)?);
+                let b = Arc::new(rt.block_on(ouro_durable::postgres::PostgresBackend::connect_config(child))?);
                 database = Some(db);
                 (Arc::new(TransactionalStore::new(b.clone()).with_policy(policy)), b.faults.clone())
             }
         };
         Ok(Self {
+            rt,
             coverage: Arc::new(Mutex::new(Coverage::default())),
             adapter,
             directory,
@@ -654,14 +660,18 @@ impl StoreDriver {
     /// generic trigger that takes ingress events.
     pub fn initialize(&mut self) -> anyhow::Result<()> {
         for v in 1..=3 {
-            self.store.save_definition(NAME, &format!("definition{v}"))?;
+            self.block(self.store.save_definition(NAME, &format!("definition{v}")))?;
         }
         let arming =
             Arming { triggers: BTreeMap::from([(SCHEDULE.to_string(), schedule_trigger(Some(2), 1, 0, 0, false))]) };
-        ensure!(self.store.activate_with(NAME, 1, 0, &arming)?.is_some(), "initial activation");
+        ensure!(self.block(self.store.activate_with(NAME, 1, 0, &arming))?.is_some(), "initial activation");
         let ingress = Trigger { at_ms: None, types: vec![INGRESS.into()], state: json!({}) };
-        ensure!(self.store.swap_trigger(INGRESS, None, Some(&ingress), &[], None, 0)?, "ingress trigger");
+        ensure!(self.block(self.store.swap_trigger(INGRESS, None, Some(&ingress), &[], None, 0))?, "ingress trigger");
         Ok(())
+    }
+    /// Waits for one store operation.
+    pub fn block<T>(&self, operation: impl std::future::Future<Output = T>) -> T {
+        self.rt.block_on(operation)
     }
     pub fn ms(&self) -> i64 {
         self.now * TICK
@@ -674,7 +684,7 @@ impl StoreDriver {
         mode: i64,
         slot: Option<(u64, i64)>,
     ) -> anyhow::Result<Admission> {
-        let version = self.store.definitions(NAME)?.active.context("no active definition")?;
+        let version = self.block(self.store.definitions(NAME))?.active.context("no active definition")?;
         let mut runtime = json!({"bindings": "fixed", "mode": mode});
         if app > 0 {
             runtime[ouro_durable::APPLICATION_VERSION] = json!(app.to_string());
@@ -700,8 +710,8 @@ impl StoreDriver {
     }
     fn valid(&self, f: &Fence) -> anyhow::Result<bool> {
         let skew = self.policy.skew_ms;
-        Ok(!self.store.stopped()?
-            && self.store.get(&f.run_id)?.is_some_and(|r| {
+        Ok(!self.block(self.store.stopped())?
+            && self.block(self.store.get(&f.run_id))?.is_some_and(|r| {
                 r.fence.as_ref() == Some(f)
                     && r.state == RunState::Running
                     && r.lease_until_ms.is_some_and(|t| t > self.ms() + skew)
@@ -713,12 +723,13 @@ impl StoreDriver {
     fn write<T>(
         &self,
         fault: Option<CommitFault>,
-        call: impl FnOnce(&dyn RunStore) -> anyhow::Result<T>,
+        call: impl std::future::Future<Output = anyhow::Result<T>>,
     ) -> (anyhow::Result<T>, bool) {
         if let Some(fault) = fault {
             self.faults.arm(fault);
         }
-        let result = call(self.store.as_ref());
+        // The operation runs only when awaited, after the fault is armed.
+        let result = self.block(call);
         // Probing an armed fault disarms it; one still armed did not fire.
         let fired = fault.is_some_and(|f| self.faults.check(f).is_ok());
         let committed = result.is_ok() || (fault == Some(CommitFault::AfterCommit) && fired);
@@ -728,7 +739,7 @@ impl StoreDriver {
     fn stop_terminal(&mut self) -> anyhow::Result<()> {
         for w in 0..2 {
             let r = self.workers[w].execution;
-            if self.store.get(&run_id(r))?.is_some_and(|x| x.outcome.is_some()) {
+            if self.block(self.store.get(&run_id(r)))?.is_some_and(|x| x.outcome.is_some()) {
                 self.workers[w].stopped = true;
                 self.workers[w].permit = false;
             }
@@ -839,7 +850,7 @@ impl StoreDriver {
                 _ => Ok(()),
             }
         };
-        if self.store.stopped()?
+        if self.block(self.store.stopped())?
             && [
                 "admit",
                 "dry",
@@ -878,11 +889,11 @@ impl StoreDriver {
                     reason: "contract stop".into(),
                 };
                 let command = ouro_durable::control::Command::Stop { enabled: value != 0 };
-                expect(self.write(fault, |s| s.control(&request, &command, ms)).0.map(drop))?;
+                expect(self.write(fault, self.store.control(&request, &command, ms)).0.map(drop))?;
             }
             "admit" | "dry" | "replay" => {
-                let defs = self.store.definitions(NAME)?;
-                if value < 0 || defs.tripped.is_some() || self.store.get(&run_id(r))?.is_some() {
+                let defs = self.block(self.store.definitions(NAME))?;
+                if value < 0 || defs.tripped.is_some() || self.block(self.store.get(&run_id(r)))?.is_some() {
                     return Ok(());
                 }
                 let mode = match op {
@@ -891,21 +902,22 @@ impl StoreDriver {
                     _ => 0,
                 };
                 let a = self.admission(r, value, i as i64, mode, None)?;
-                expect(self.write(fault, |s| s.admit(&a, ms)).0.map(drop))?;
+                expect(self.write(fault, self.store.admit(&a, ms)).0.map(drop))?;
             }
             "claim" => {
                 if self.workers.iter().any(|x| x.permit) {
                     return Ok(());
                 }
-                let before = self.store.get(&run_id(r))?.map(|x| x.generation);
-                let (result, committed) = self.write(fault, |s| s.claim_as(&run_id(r), ms, &worker(w)));
+                let before = self.block(self.store.get(&run_id(r)))?.map(|x| x.generation);
+                let (result, committed) = self.write(fault, self.store.claim_as(&run_id(r), ms, &worker(w)));
                 let fence = match result {
                     Ok(fence) => fence,
                     // A claim whose reply was lost: the new owner is read back
                     // only to name it; the worker stops anyway.
-                    Err(_) if committed => {
-                        self.store.get(&run_id(r))?.filter(|x| Some(x.generation) != before).and_then(|x| x.fence)
-                    }
+                    Err(_) if committed => self
+                        .block(self.store.get(&run_id(r)))?
+                        .filter(|x| Some(x.generation) != before)
+                        .and_then(|x| x.fence),
                     Err(e) if !injected => return Err(e),
                     Err(_) => None,
                 };
@@ -916,12 +928,12 @@ impl StoreDriver {
             }
             "renew" => {
                 if let Some(f) = self.fence(w, r) {
-                    let _ = self.write(fault, |s| s.renew(&f, ms));
+                    let _ = self.write(fault, self.store.renew(&f, ms));
                 }
             }
             "release" => {
                 if let Some(f) = self.fence(w, r)
-                    && self.write(fault, |s| s.release(&f, ms)).1
+                    && self.write(fault, self.store.release(&f, ms)).1
                 {
                     let x = &mut self.workers[w];
                     x.stopped = true;
@@ -931,8 +943,8 @@ impl StoreDriver {
             }
             "intent" => {
                 let Some(f) = self.fence(w, r) else { return Ok(()) };
-                let Ok(records) = self.store.load_records(&f, ms) else { return Ok(()) };
-                let saved = self.store.get(&run_id(r))?.context("leased run missing")?;
+                let Ok(records) = self.block(self.store.load_records(&f, ms)) else { return Ok(()) };
+                let saved = self.block(self.store.get(&run_id(r)))?.context("leased run missing")?;
                 let mode = saved.admission.runtime["mode"].as_i64().unwrap_or(0);
                 let fresh = matches!(
                     records.get(&format!("call{i}")),
@@ -941,7 +953,7 @@ impl StoreDriver {
                 let deadline = saved.admitted_ms / TICK + DEADLINE;
                 if fresh && mode != 2 && !(mode == 1 && mocked(i)) && self.now < deadline {
                     let record = call_record(i, CallState::Pending);
-                    if self.write(fault, |s| s.save_record(&f, &format!("call{i}"), &record, ms)).1 {
+                    if self.write(fault, self.store.save_record(&f, &format!("call{i}"), &record, ms)).1 {
                         self.workers[w].phase = 1;
                         self.workers[w].invocation = i;
                     }
@@ -960,7 +972,8 @@ impl StoreDriver {
                 let x = &self.workers[w];
                 let state = match op {
                     "result" if x.phase == 2 && x.invocation == i && value >= 0 => {
-                        let admission = self.store.get(&run_id(r))?.context("leased run missing")?.admission;
+                        let admission =
+                            self.block(self.store.get(&run_id(r)))?.context("leased run missing")?.admission;
                         let v = admission.input.as_i64().context("input")? + i as i64;
                         // Value 1: the function answered with an error.
                         if value == 1 {
@@ -975,13 +988,13 @@ impl StoreDriver {
                     _ => return Ok(()),
                 };
                 let record = call_record(i, state);
-                if self.write(fault, |s| s.save_record(&f, &format!("call{i}"), &record, ms)).1 {
+                if self.write(fault, self.store.save_record(&f, &format!("call{i}"), &record, ms)).1 {
                     self.workers[w].phase = 0;
                 }
             }
             "recover" => {
                 let Some(f) = self.fence(w, r) else { return Ok(()) };
-                let Ok(records) = self.store.load_records(&f, ms) else { return Ok(()) };
+                let Ok(records) = self.block(self.store.load_records(&f, ms)) else { return Ok(()) };
                 // An unknown at-least-once call may be sent again.
                 if let Some(Record::Call { state: CallState::Pending, delivery: Delivery::AtLeastOnce, .. }) =
                     records.get(&format!("call{i}"))
@@ -992,7 +1005,7 @@ impl StoreDriver {
             }
             "checkpoint" => {
                 let Some(f) = self.fence(w, r) else { return Ok(()) };
-                let Ok(records) = self.store.load_records(&f, ms) else { return Ok(()) };
+                let Ok(records) = self.block(self.store.load_records(&f, ms)) else { return Ok(()) };
                 let result = |k: usize| match records.get(&format!("call{k}")) {
                     Some(Record::Call { state: CallState::Done(Ok(v)), .. }) => v.as_i64(),
                     _ => None,
@@ -1006,11 +1019,11 @@ impl StoreDriver {
                     .map(|k| result(k).unwrap_or(0))
                     .sum();
                 let record = task_record(continuation);
-                let _ = self.write(fault, |s| s.save_record(&f, &format!("task{i}"), &record, ms));
+                let _ = self.write(fault, self.store.save_record(&f, &format!("task{i}"), &record, ms));
             }
             "conflict" => {
                 let Some(f) = self.fence(w, r) else { return Ok(()) };
-                let Ok(records) = self.store.load_records(&f, ms) else { return Ok(()) };
+                let Ok(records) = self.block(self.store.load_records(&f, ms)) else { return Ok(()) };
                 if !records.contains_key(&format!("call{i}")) {
                     return Ok(());
                 }
@@ -1031,56 +1044,56 @@ impl StoreDriver {
                         }
                     }
                     ensure!(
-                        self.store.save_record(&f, &format!("call{i}"), &record, ms).is_err(),
+                        self.block(self.store.save_record(&f, &format!("call{i}"), &record, ms)).is_err(),
                         "binding conflict accepted"
                     );
                 }
-                if self.write(fault, |s| s.finish(&f, &status(2), ms, 2)).1 {
+                if self.write(fault, self.store.finish(&f, &status(2), ms, 2)).1 {
                     self.stop_terminal()?;
                 }
             }
             "subscribe" => {
                 if let Some(f) = self.fence(w, r) {
-                    let _ = self.write(fault, |s| s.subscribe(&f, "listen", &["event".into()], ms));
+                    let _ = self.write(fault, self.store.subscribe(&f, "listen", &["event".into()], ms));
                 }
             }
             "spend" => {
                 if let Some(f) = self.fence(w, r) {
-                    let _ = self.write(fault, |s| s.spend(&f, &format!("jump{i}"), CEILING, ms));
+                    let _ = self.write(fault, self.store.spend(&f, &format!("jump{i}"), CEILING, ms));
                 }
             }
             "address" | "publish" => {
                 if value >= 0 {
                     let target = (op == "address").then(|| run_id(r));
                     let e = event(i, value);
-                    expect(self.write(fault, |s| s.publish(&e, target.as_deref(), ms)).0.map(drop))?;
+                    expect(self.write(fault, self.store.publish(&e, target.as_deref(), ms)).0.map(drop))?;
                 }
             }
             "take" => {
                 if let Some(f) = self.fence(w, r) {
-                    let _ = self.write(fault, |s| s.take_event(&f, &format!("event{i}"), &["event".into()], ms));
+                    let _ = self.write(fault, self.store.take_event(&f, &format!("event{i}"), &["event".into()], ms));
                 }
             }
             "expire" => {
-                expect(self.write(fault, |s| s.sweep(ms, i64::MAX)).0.map(drop))?;
+                expect(self.write(fault, self.store.sweep(ms, i64::MAX)).0.map(drop))?;
             }
             "sweep" => {
-                expect(self.write(fault, |s| s.sweep(ms, SWEEP_KEPT)).0.map(drop))?;
+                expect(self.write(fault, self.store.sweep(ms, SWEEP_KEPT)).0.map(drop))?;
             }
             "child" => {
                 let Some(f) = self.fence(w, r) else { return Ok(()) };
-                if r + 1 >= RUNS || self.store.get(&run_id(r + 1))?.is_some() {
+                if r + 1 >= RUNS || self.block(self.store.get(&run_id(r + 1)))?.is_some() {
                     return Ok(());
                 }
-                let parent = self.store.get(&run_id(r))?.context("leased parent missing")?.admission;
+                let parent = self.block(self.store.get(&run_id(r)))?.context("leased parent missing")?.admission;
                 let app = parent.application_version().map_or(Ok(0), str::parse)?;
                 let mode = parent.runtime["mode"].as_i64().unwrap_or(0);
                 let a = self.admission(r + 1, parent.input.as_i64().context("input")?, app, mode, None)?;
                 let link = ChildLink { parent: run_id(r), key: "child".into(), reference: "child".into() };
                 // The child's first lease stays with the parent's host. A
                 // tripped definition refuses it, typed, in the same commit.
-                let refusal = self.store.definitions(NAME)?.tripped.is_some() && self.valid(&f)?;
-                let (result, _) = self.write(fault, |s| s.start_child(&f, &a, &link, ms));
+                let refusal = self.block(self.store.definitions(NAME))?.tripped.is_some() && self.valid(&f)?;
+                let (result, _) = self.write(fault, self.store.start_child(&f, &a, &link, ms));
                 if refusal {
                     ensure!(
                         result.err().is_some_and(|e| e.is::<DefinitionTripped>()),
@@ -1091,7 +1104,7 @@ impl StoreDriver {
             "finish" | "timeout" => {
                 let Some(f) = self.fence(w, r) else { return Ok(()) };
                 let outcome = if op == "timeout" {
-                    let saved = self.store.get(&run_id(r))?.context("leased run missing")?;
+                    let saved = self.block(self.store.get(&run_id(r)))?.context("leased run missing")?;
                     if self.now < saved.admitted_ms / TICK + DEADLINE {
                         return Ok(());
                     }
@@ -1101,24 +1114,24 @@ impl StoreDriver {
                 } else {
                     return Ok(());
                 };
-                if self.write(fault, |s| s.finish(&f, &status(outcome), ms, 2)).1 {
+                if self.write(fault, self.store.finish(&f, &status(outcome), ms, 2)).1 {
                     self.stop_terminal()?;
                 }
             }
             "cancel" => {
-                let (result, committed) = self.write(fault, |s| s.cancel(&run_id(r), ms));
+                let (result, committed) = self.write(fault, self.store.cancel(&run_id(r), ms));
                 expect(result.map(drop))?;
                 if committed {
                     self.stop_terminal()?;
                 }
             }
             "policy" => {
-                let Some(t) = self.store.trigger(SCHEDULE)? else { return Ok(()) };
+                let Some(t) = self.block(self.store.trigger(SCHEDULE))? else { return Ok(()) };
                 if value < 0 || t.state["slot"] != json!(0) {
                     return Ok(());
                 }
                 for r in 0..RUNS {
-                    if self.store.get(&run_id(r))?.is_some() {
+                    if self.block(self.store.get(&run_id(r)))?.is_some() {
                         return Ok(());
                     }
                 }
@@ -1126,7 +1139,7 @@ impl StoreDriver {
                 next.state["overlap"] = json!(value % 4);
                 next.state["maxRuns"] = json!(i + 1);
                 let (result, committed) =
-                    self.write(fault, |s| s.swap_trigger(SCHEDULE, Some(&t), Some(&next), &[], None, ms));
+                    self.write(fault, self.store.swap_trigger(SCHEDULE, Some(&t), Some(&next), &[], None, ms));
                 expect(result.map(drop))?;
                 if committed {
                     self.overlap = value % 4;
@@ -1137,7 +1150,7 @@ impl StoreDriver {
                 if value < 0 {
                     return Ok(());
                 }
-                let defs = self.store.definitions(NAME)?;
+                let defs = self.block(self.store.definitions(NAME))?;
                 let version = i as u64 + 1;
                 let (catchup, rearm) = (value % 2, value >= 2);
                 // Version 1 has the schedule.
@@ -1148,7 +1161,7 @@ impl StoreDriver {
                     t.state["maxRuns"] = json!(self.max_runs);
                     arming.triggers.insert(SCHEDULE.into(), t);
                 }
-                let (result, _) = self.write(fault, |s| s.activate_with(NAME, version, defs.epoch, &arming));
+                let (result, _) = self.write(fault, self.store.activate_with(NAME, version, defs.epoch, &arming));
                 if !injected {
                     ensure!(result?.is_some(), "the definition changed under a serial activation");
                 }
@@ -1156,8 +1169,8 @@ impl StoreDriver {
             // `refuse`: the host cannot admit the slot's run, so the firing
             // records it refused (`Firing::refused`) in place of admitting it.
             "fire" | "refuse" => {
-                let defs = self.store.definitions(NAME)?;
-                let Some(t) = self.store.trigger(SCHEDULE)? else { return Ok(()) };
+                let defs = self.block(self.store.definitions(NAME))?;
+                let Some(t) = self.block(self.store.trigger(SCHEDULE))? else { return Ok(()) };
                 let Some(at) = t.at_ms else { return Ok(()) };
                 if value < 0 || at > ms || defs.tripped.is_some() || t.state["epoch"] != json!(defs.epoch) {
                     return Ok(());
@@ -1174,9 +1187,9 @@ impl StoreDriver {
                 let skip = moved(Some(self.now + 2));
                 // A missed slot under `catchup: none`, or a slot whose run id
                 // is taken, is skipped; the next slot is two ticks on.
-                if (catchup == 1 && at < ms) || self.store.get(&run_id(r))?.is_some() {
+                if (catchup == 1 && at < ms) || self.block(self.store.get(&run_id(r)))?.is_some() {
                     let firing = Firing { key: SCHEDULE, expected: Some(&t), next: Some(&skip), ..Firing::default() };
-                    let (result, _) = self.write(fault, |s| s.fire(&firing, ms));
+                    let (result, _) = self.write(fault, self.store.fire(&firing, ms));
                     if !injected {
                         ensure!(result? == Fired::Committed, "a serial skip did not commit");
                     }
@@ -1214,7 +1227,7 @@ impl StoreDriver {
                         ceiling: &skip,
                     }),
                 };
-                let (result, _) = self.write(fault, |s| s.fire(&firing, ms));
+                let (result, _) = self.write(fault, self.store.fire(&firing, ms));
                 if !injected {
                     ensure!(
                         matches!(result?, Fired::Committed | Fired::Busy(_) | Fired::Queued | Fired::Ceiling),
@@ -1225,17 +1238,17 @@ impl StoreDriver {
             }
             "ingress" => {
                 let e = ingress_event(i, value);
-                match self.store.ingested(&e, ms) {
+                match self.block(self.store.ingested(&e, ms)) {
                     Err(e) if e.is::<IdentityConflict>() => return Ok(()),
                     Err(e) => return Err(e),
                     Ok(true) => return Ok(()),
                     Ok(false) => {}
                 }
-                let defs = self.store.definitions(NAME)?;
-                if value < 0 || defs.tripped.is_some() || self.store.get(&run_id(r))?.is_some() {
+                let defs = self.block(self.store.definitions(NAME))?;
+                if value < 0 || defs.tripped.is_some() || self.block(self.store.get(&run_id(r)))?.is_some() {
                     return Ok(());
                 }
-                let t = self.store.trigger(INGRESS)?.context("ingress trigger")?;
+                let t = self.block(self.store.trigger(INGRESS))?.context("ingress trigger")?;
                 let admit = [self.admission(r, value, 0, 0, None)?];
                 let firing = Firing {
                     key: INGRESS,
@@ -1245,7 +1258,7 @@ impl StoreDriver {
                     ingress: Some(&e),
                     ..Firing::default()
                 };
-                let (result, _) = self.write(fault, |s| s.fire(&firing, ms));
+                let (result, _) = self.write(fault, self.store.fire(&firing, ms));
                 if !injected {
                     ensure!(result? == Fired::Committed, "a fresh ingress identity was refused");
                 }
@@ -1262,7 +1275,8 @@ impl StoreDriver {
             "tick" => {
                 self.now += 1;
                 for w in 0..2 {
-                    let lease = self.store.get(&run_id(self.workers[w].execution))?.and_then(|r| r.lease_until_ms);
+                    let lease =
+                        self.block(self.store.get(&run_id(self.workers[w].execution)))?.and_then(|r| r.lease_until_ms);
                     if ticks(lease) <= self.now {
                         self.workers[w].permit = false;
                         self.workers[w].stopped = true;
@@ -1393,9 +1407,9 @@ impl StoreDriver {
     fn audit(&self, snapshots: &[Option<RunSnapshot>]) -> anyhow::Result<()> {
         for x in &self.workers {
             if let Some(fence) = &x.fence {
-                let loaded = self.store.load_records(fence, self.ms());
+                let loaded = self.block(self.store.load_records(fence, self.ms()));
                 if self.valid(fence)? {
-                    let records = self.store.inspect(&fence.run_id)?.context("leased run missing")?.records;
+                    let records = self.block(self.store.inspect(&fence.run_id))?.context("leased run missing")?.records;
                     ensure!(loaded? == records, "load differs from snapshot");
                 } else {
                     ensure!(loaded.is_err(), "load outside the lease succeeded");
@@ -1416,7 +1430,7 @@ impl StoreDriver {
                 (eligible <= self.ms()).then(|| (eligible, r.admission.id.clone(), app))
             })
             .collect();
-        if self.store.stopped()? {
+        if self.block(self.store.stopped())? {
             due.clear();
         }
         due.sort();
@@ -1426,9 +1440,12 @@ impl StoreDriver {
                 .map(|(_, id, _)| id.clone())
                 .collect()
         };
-        ensure!(self.store.due(self.ms(), 3)? == ids(None), "due projection differs");
+        ensure!(self.block(self.store.due(self.ms(), 3))? == ids(None), "due projection differs");
         for w in 0..2 {
-            ensure!(self.store.due_as(self.ms(), 3, &worker(w))? == ids(Some(w)), "versioned due projection differs");
+            ensure!(
+                self.block(self.store.due_as(self.ms(), 3, &worker(w)))? == ids(Some(w)),
+                "versioned due projection differs"
+            );
         }
         for child in snapshots.iter().flatten() {
             let Some(link) = &child.run.child else { continue };
@@ -1437,10 +1454,10 @@ impl StoreDriver {
                 .context("an owned child without its parent")?;
             let id = &child.run.admission.id;
             ensure!(
-                self.store.child_outcome(&link.parent, &link.key, id)? == child.run.outcome,
+                self.block(self.store.child_outcome(&link.parent, &link.key, id))? == child.run.outcome,
                 "child outcome differs"
             );
-            ensure!(self.store.child_outcome("unowned", &link.key, id).is_err(), "child ownership bypass");
+            ensure!(self.block(self.store.child_outcome("unowned", &link.key, id)).is_err(), "child ownership bypass");
             // A child that ended while its parent was live left the parent
             // its terminal notification, unless the parent's evidence is swept.
             let swept = parent.run.ended_ms.is_some() && parent.events.is_empty();

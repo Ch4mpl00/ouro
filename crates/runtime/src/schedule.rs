@@ -162,12 +162,12 @@ fn arming(name: &str, yaml: &str, epoch: u64, now: i64) -> anyhow::Result<BTreeM
 impl Runtime {
     /// Activates `version` of `name` in a new epoch: its triggers replace
     /// the definition's ones in the activation's commit.
-    pub(crate) fn activate_armed(&self, name: &str, version: u64) -> anyhow::Result<()> {
+    pub(crate) async fn activate_armed(&self, name: &str, version: u64) -> anyhow::Result<()> {
         for _ in 0..16 {
-            let definitions = self.store.definitions(name)?;
+            let definitions = self.store.definitions(name).await?;
             let d = definitions.versions.get(&version).ok_or_else(|| anyhow::anyhow!("unknown definition version"))?;
             let triggers = arming(name, &d.yaml, definitions.epoch + 1, self.clock.now_ms())?;
-            if self.store.activate_with(name, version, definitions.epoch, &Arming { triggers })?.is_some() {
+            if self.store.activate_with(name, version, definitions.epoch, &Arming { triggers }).await?.is_some() {
                 return Ok(());
             }
         }
@@ -175,11 +175,11 @@ impl Runtime {
     }
     /// The triggers `name`'s current activation armed, with their state
     /// (the next slot, skipped slots, matched events).
-    pub fn triggers(&self, name: &str) -> anyhow::Result<Vec<(String, Trigger)>> {
-        let definitions = self.store.definitions(name)?;
+    pub async fn triggers(&self, name: &str) -> anyhow::Result<Vec<(String, Trigger)>> {
+        let definitions = self.store.definitions(name).await?;
         let mut out = Vec::new();
         for k in definitions.triggers {
-            if let Some(t) = self.store.trigger(&k)? {
+            if let Some(t) = self.store.trigger(&k).await? {
                 out.push((k, t));
             }
         }
@@ -188,10 +188,10 @@ impl Runtime {
     /// Buffered slots, with their pinned definitions, inputs and bindings.
     /// They are admitted when this trigger's live runs have ended and the
     /// definition has capacity. A new activation discards its old buffers.
-    pub fn queued(&self, name: &str) -> anyhow::Result<Vec<Admission>> {
+    pub async fn queued(&self, name: &str) -> anyhow::Result<Vec<Admission>> {
         let mut queued = Vec::new();
-        for k in self.store.definitions(name)?.triggers {
-            queued.extend(self.store.queued(&k)?);
+        for k in self.store.definitions(name).await?.triggers {
+            queued.extend(self.store.queued(&k).await?);
         }
         Ok(queued)
     }
@@ -207,13 +207,13 @@ fn moved<'a>(key: &'a str, t: &'a Trigger, next: &'a Trigger, busy: Option<&'a T
 /// A trigger's run: admitted, refused by this host (recorded with the slot,
 /// `Firing::refused`), or not at all because its definition tripped since
 /// the trigger was read (the trip removed the trigger: nothing to fire).
-fn triggered(
+async fn triggered(
     admitter: &Admitter,
     id: &str,
     name: &str,
     input: Value,
 ) -> anyhow::Result<Option<Result<Admission, Refused>>> {
-    match admitter.triggered(id, name, input) {
+    match admitter.triggered(id, name, input).await {
         Ok(admitted) => Ok(Some(admitted)),
         Err(e) if e.is::<DefinitionTripped>() => Ok(None),
         Err(e) => Err(e),
@@ -260,23 +260,23 @@ impl Runtime {
     /// the slot is neither consumed nor counted; the trigger keeps it and is
     /// due again after a capped backoff (`interrupted`). Only storage errors
     /// are returned.
-    pub fn fire_due(&self) -> anyhow::Result<Vec<String>> {
+    pub async fn fire_due(&self) -> anyhow::Result<Vec<String>> {
         let now = self.clock.now_ms();
         let mut started = Vec::new();
-        for (k, t) in self.store.due_triggers(now, BATCH)? {
-            started.extend(self.fire(&k, &t, now)?);
+        for (k, t) in self.store.due_triggers(now, BATCH).await? {
+            started.extend(self.fire(&k, &t, now).await?);
         }
         Ok(started)
     }
 
-    fn fire(&self, k: &str, t: &Trigger, now: i64) -> anyhow::Result<Option<String>> {
+    async fn fire(&self, k: &str, t: &Trigger, now: i64) -> anyhow::Result<Option<String>> {
         // A slot whose admission was interrupted keeps its identity while
         // its trigger waits for the retry (`retry`).
         let slot = t.state[RETRY]["slot"].as_i64().or(t.at_ms);
         let (Some(name), Some(kind), Some(slot)) = (t.state["name"].as_str(), t.state["kind"].as_str(), slot) else {
             anyhow::bail!("trigger {k} is not a schedule's");
         };
-        let definitions = self.store.definitions(name)?;
+        let definitions = self.store.definitions(name).await?;
         // Replaced by a newer epoch since it was read: its swap would fail.
         let Some(schedule) = active(&definitions)?.filter(|_| current(&definitions, t)) else { return Ok(None) };
         let mut next = t.clone();
@@ -292,7 +292,7 @@ impl Runtime {
                 busy.at_ms = next.at_ms;
                 if following <= now && schedule.catchup == Catchup::None {
                     let skip = skipped(next, slot, "missed");
-                    self.store.fire(&moved(k, t, &skip, None), now)?;
+                    self.store.fire(&moved(k, t, &skip, None), now).await?;
                     self.skip(name, kind, slot, "missed");
                     return Ok(None);
                 }
@@ -313,10 +313,10 @@ impl Runtime {
         };
         let ceiling = skipped(busy.clone(), slot, "overlap: ceiling");
         let busy = skipped(busy, slot, "overlap");
-        let admission = match triggered(&self.admitter(), &id, name, json!({})) {
+        let admission = match triggered(&self.admitter(), &id, name, json!({})).await {
             Ok(Some(admission)) => admission,
             Ok(None) => return Ok(None),
-            Err(e) if e.is::<ResourceUnavailable>() => return self.interrupted(k, t, slot, &e, now),
+            Err(e) if e.is::<ResourceUnavailable>() => return self.interrupted(k, t, slot, &e, now).await,
             Err(e) => return Err(e),
         };
         let refused = admission.as_ref().err();
@@ -340,9 +340,9 @@ impl Runtime {
             max_concurrent_runs: self.config.max_concurrent_runs,
             ceiling: &ceiling,
         });
-        let result = self.store.fire(&firing, now)?;
+        let result = self.store.fire(&firing, now).await?;
         if schedule.overlap == Overlap::Replace {
-            self.signal_cancelled()?;
+            self.signal_cancelled().await?;
         }
         match result {
             Fired::Committed => match refused {
@@ -371,7 +371,7 @@ impl Runtime {
     /// capped backoff, 1 s doubling to five minutes, kept with the trigger
     /// so a restart does not shorten it and a waiting retry never holds the
     /// head of the due index. The worker goes on with the other triggers.
-    fn interrupted(
+    async fn interrupted(
         &self,
         k: &str,
         t: &Trigger,
@@ -383,7 +383,7 @@ impl Runtime {
         let mut retried = t.clone();
         retried.at_ms = Some(retry_at(now, u32::try_from(failures).unwrap_or(u32::MAX)));
         retried.state[RETRY] = json!({ "slot": slot, "failures": failures, "error": e.to_string() });
-        self.store.fire(&Firing { key: k, expected: Some(t), next: Some(&retried), ..Firing::default() }, now)?;
+        self.store.fire(&Firing { key: k, expected: Some(t), next: Some(&retried), ..Firing::default() }, now).await?;
         telemetry::mark(
             &self.tracer,
             "schedule interrupted",
@@ -437,10 +437,10 @@ impl Runtime {
     /// whose admission it interrupts (`ResourceUnavailable`) does not take the
     /// event and the error is returned: publishing it again later is safe.
     /// Returns the runs it reached or started.
-    pub fn publish(&self, mut event: Value) -> anyhow::Result<Vec<String>> {
+    pub async fn publish(&self, mut event: Value) -> anyhow::Result<Vec<String>> {
         let now = self.clock.now_ms();
         complete(&mut event, now)?;
-        publish(&*self.store, &self.admitter(), &event, now)
+        publish(&*self.store, &self.admitter(), &event, now).await
     }
 }
 
@@ -460,7 +460,7 @@ pub(crate) fn complete(event: &mut Value, now: i64) -> anyhow::Result<()> {
 /// The runs a published event reaches, and the run it starts through the
 /// `on` schedules indexed under its type (runs and triggers in `store`,
 /// definitions where the admitter reads them).
-pub(crate) fn publish(
+pub(crate) async fn publish(
     store: &dyn RunStore,
     admitter: &Admitter,
     event: &Value,
@@ -468,14 +468,14 @@ pub(crate) fn publish(
 ) -> anyhow::Result<Vec<String>> {
     // An identity some trigger already took is not offered again (and
     // another payload under it is an error, before anything is accepted).
-    let ingested = store.ingested(event, now)?;
-    let mut reached = store.publish(event, None, now)?;
+    let ingested = store.ingested(event, now).await?;
+    let mut reached = store.publish(event, None, now).await?;
     if ingested {
         return Ok(reached);
     }
     let t = event.get("type").and_then(Value::as_str).unwrap_or_default();
-    for (k, trigger) in store.triggers_for(t, BATCH)? {
-        if let Taken::Yes(run) = offer(store, admitter, &k, trigger, event, now)? {
+    for (k, trigger) in store.triggers_for(t, BATCH).await? {
+        if let Taken::Yes(run) = offer(store, admitter, &k, trigger, event, now).await? {
             reached.extend(run);
             break;
         }
@@ -493,7 +493,7 @@ enum Taken {
 /// go through the schedule's strategy again; a complete match starts the
 /// workflow and empties the trigger in one commit, a partial one is kept.
 /// Either way the commit takes the event's identity from ingress.
-fn offer(
+async fn offer(
     store: &dyn RunStore,
     admitter: &Admitter,
     k: &str,
@@ -504,7 +504,7 @@ fn offer(
     let same = |a: &Value| a.get("id") == event.get("id") && a.get("source") == event.get("source");
     for _ in 0..16 {
         let name = trigger.state["name"].as_str().unwrap_or_default().to_owned();
-        let definitions = admitter.definitions.definitions(&name)?;
+        let definitions = admitter.definitions.definitions(&name).await?;
         let Some(Schedule { on: Some(on), read, overlap, .. }) =
             active(&definitions)?.filter(|_| current(&definitions, &trigger))
         else {
@@ -528,7 +528,7 @@ fn offer(
                 let input: Vec<Value> = consumed.iter().map(|e| events::read(e, read)).collect();
                 // Refused like a time slot's run (`fire_due`): the match is
                 // consumed and the failed run recorded in its place.
-                let Some(triggered) = triggered(admitter, &run, &name, Value::Array(input))? else {
+                let Some(triggered) = triggered(admitter, &run, &name, Value::Array(input)).await? else {
                     return Ok(Taken::No);
                 };
                 id = triggered.is_ok().then_some(run);
@@ -556,17 +556,17 @@ fn offer(
             Some(Err(refused)) => firing.refused = Some(refused),
             None => {}
         }
-        let result = store.fire(&firing, now)?;
+        let result = store.fire(&firing, now).await?;
         if overlap == Overlap::Replace {
-            admitter.signal_cancelled(store)?;
+            admitter.signal_cancelled(store).await?;
         }
         match result {
             Fired::Committed => {
                 return Ok(Taken::Yes(id));
             }
             Fired::Ingested | Fired::Busy(_) | Fired::Queued | Fired::Ceiling => return Ok(Taken::Yes(None)),
-            Fired::Changed if store.stopped()? => return Ok(Taken::No),
-            Fired::Changed => match store.trigger(k)? {
+            Fired::Changed if store.stopped().await? => return Ok(Taken::No),
+            Fired::Changed => match store.trigger(k).await? {
                 Some(t) => trigger = t,
                 None => return Ok(Taken::No),
             },
@@ -630,7 +630,7 @@ impl Runtime {
     /// minutes); a storage error is returned. The worker calls it on every
     /// tick; returns how many notices were acknowledged.
     pub async fn notify(&self, stop: &CancellationToken) -> anyhow::Result<usize> {
-        let notices = self.store.notices(NOTICES)?;
+        let notices = self.store.notices(NOTICES).await?;
         // Forget the backoff of notices no longer pending (acknowledged
         // elsewhere), so the map stays bounded by the pending page.
         self.notice_backoff.lock().unwrap().retain(|k, _| notices.iter().any(|(n, _)| n == k));
@@ -654,7 +654,7 @@ impl Runtime {
             // resolver failed) leaves the notice for a later hand-off, like a
             // sink failure; a publish repeated under the same identity
             // delivers nothing twice.
-            match publish(&*self.store, &self.admitter(), &event, now) {
+            match publish(&*self.store, &self.admitter(), &event, now).await {
                 Err(e) if e.is::<ResourceUnavailable>() => {
                     failed(k, &e);
                     continue;
@@ -673,7 +673,7 @@ impl Runtime {
                 }
             }
             self.noticed(&event, None);
-            if self.store.acknowledge(&k)? {
+            if self.store.acknowledge(&k).await? {
                 acknowledged += 1;
             }
             self.notice_backoff.lock().unwrap().remove(&k);

@@ -41,8 +41,9 @@ fn range<'a>(
     let upper = end.map_or_else(|| (format!("{kind}\0"), String::new()), |end| (kind.into(), end.into()));
     rows.range((Bound::Included((kind.into(), start.into())), Bound::Excluded(upper))).take(limit)
 }
+#[async_trait::async_trait]
 impl AtomicBackend for MemoryBackend {
-    fn begin(&self) -> anyhow::Result<Box<dyn Transaction + '_>> {
+    async fn begin(&self) -> anyhow::Result<Box<dyn Transaction + '_>> {
         Ok(Box::new(MemoryTransaction {
             backend: self,
             reads: BTreeMap::new(),
@@ -50,14 +51,15 @@ impl AtomicBackend for MemoryBackend {
             writes: BTreeMap::new(),
         }))
     }
-    fn snapshot(&self) -> anyhow::Result<Snapshot> {
+    async fn snapshot(&self) -> anyhow::Result<Snapshot> {
         let state = self.state.lock().unwrap();
         self.metrics.read(state.rows.len());
         Ok(Snapshot { rows: state.rows.iter().map(|(k, (_, v))| (k.clone(), v.clone())).collect() })
     }
 }
+#[async_trait::async_trait]
 impl Transaction for MemoryTransaction<'_> {
-    fn get(&mut self, kind: &str, id: &str) -> anyhow::Result<Option<serde_json::Value>> {
+    async fn get(&mut self, kind: &str, id: &str) -> anyhow::Result<Option<serde_json::Value>> {
         let key = (kind.into(), id.into());
         if let Some(value) = self.writes.get(&key) {
             return Ok(value.clone());
@@ -69,7 +71,7 @@ impl Transaction for MemoryTransaction<'_> {
         });
         Ok(value.as_ref().map(|(_, v)| v.clone()))
     }
-    fn scan(&mut self, kind: &str, start: &str, end: Option<&str>, limit: usize) -> anyhow::Result<Rows> {
+    async fn scan(&mut self, kind: &str, start: &str, end: Option<&str>, limit: usize) -> anyhow::Result<Rows> {
         if limit == 0 || end.is_some_and(|end| end <= start) {
             return Ok(Rows::new());
         }
@@ -96,17 +98,17 @@ impl Transaction for MemoryTransaction<'_> {
         }
         Ok(rows.into_iter().take(limit).collect())
     }
-    fn put(&mut self, kind: &str, id: &str, value: &serde_json::Value) -> anyhow::Result<()> {
-        self.get(kind, id)?;
+    async fn put(&mut self, kind: &str, id: &str, value: &serde_json::Value) -> anyhow::Result<()> {
+        self.get(kind, id).await?;
         self.writes.insert((kind.into(), id.into()), Some(value.clone()));
         Ok(())
     }
-    fn delete(&mut self, kind: &str, id: &str) -> anyhow::Result<()> {
-        self.get(kind, id)?;
+    async fn delete(&mut self, kind: &str, id: &str) -> anyhow::Result<()> {
+        self.get(kind, id).await?;
         self.writes.insert((kind.into(), id.into()), None);
         Ok(())
     }
-    fn commit(self: Box<Self>) -> anyhow::Result<()> {
+    async fn commit(self: Box<Self>) -> anyhow::Result<()> {
         let mut state = self.backend.state.lock().unwrap();
         // A range validates every returned key's version below. A point
         // observation of that same version needs no second lookup; a point

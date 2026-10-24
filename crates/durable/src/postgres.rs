@@ -56,17 +56,20 @@ impl Drop for PostgresBackend {
     }
 }
 impl PostgresBackend {
-    pub fn connect(url: &str) -> anyhow::Result<Self> {
-        Self::connect_config(url.parse::<tokio_postgres::Config>()?)
+    pub async fn connect(url: &str) -> anyhow::Result<Self> {
+        Self::connect_config(url.parse::<tokio_postgres::Config>()?).await
     }
-    pub fn connect_config(config: tokio_postgres::Config) -> anyhow::Result<Self> {
-        Self::connect_with_faults(config, Arc::new(FaultInjector::default()))
+    pub async fn connect_config(config: tokio_postgres::Config) -> anyhow::Result<Self> {
+        Self::connect_with_faults(config, Arc::new(FaultInjector::default())).await
     }
-    pub fn connect_with_faults(config: tokio_postgres::Config, faults: Arc<FaultInjector>) -> anyhow::Result<Self> {
-        Self::with_manager(Manager::new(config, NoTls), faults)
+    pub async fn connect_with_faults(
+        config: tokio_postgres::Config,
+        faults: Arc<FaultInjector>,
+    ) -> anyhow::Result<Self> {
+        Self::with_manager(Manager::new(config, NoTls), faults).await
     }
     /// The host can inject a manager with TLS or custom connection settings.
-    pub fn with_manager(manager: Manager, faults: Arc<FaultInjector>) -> anyhow::Result<Self> {
+    pub async fn with_manager(manager: Manager, faults: Arc<FaultInjector>) -> anyhow::Result<Self> {
         let (sender, mut receiver) = channel::channel(64);
         let (ready, started) = mpsc::sync_channel(1);
         let worker_faults = faults.clone();
@@ -128,34 +131,36 @@ impl PostgresTransaction<'_> {
         result
     }
 }
+#[async_trait::async_trait]
 impl AtomicBackend for PostgresBackend {
-    fn begin(&self) -> anyhow::Result<Box<dyn Transaction + '_>> {
+    async fn begin(&self) -> anyhow::Result<Box<dyn Transaction + '_>> {
         let (sender, receiver) = channel::channel(1);
         let (tx, rx) = mpsc::sync_channel(1);
         send(self.sender.as_ref().unwrap(), Request::Begin(receiver, tx))?;
         receive(rx)?;
         Ok(Box::new(PostgresTransaction { sender, backend: self }))
     }
-    fn snapshot(&self) -> anyhow::Result<Snapshot> {
+    async fn snapshot(&self) -> anyhow::Result<Snapshot> {
         let (tx, rx) = mpsc::sync_channel(1);
         send(self.sender.as_ref().unwrap(), Request::Snapshot(tx))?;
         receive(rx)
     }
 }
+#[async_trait::async_trait]
 impl Transaction for PostgresTransaction<'_> {
-    fn get(&mut self, kind: &str, id: &str) -> anyhow::Result<Option<Value>> {
+    async fn get(&mut self, kind: &str, id: &str) -> anyhow::Result<Option<Value>> {
         self.call(|r| Command::Get(kind.into(), id.into(), r))
     }
-    fn scan(&mut self, kind: &str, start: &str, end: Option<&str>, limit: usize) -> anyhow::Result<Rows> {
+    async fn scan(&mut self, kind: &str, start: &str, end: Option<&str>, limit: usize) -> anyhow::Result<Rows> {
         self.call(|r| Command::Scan(kind.into(), start.into(), end.map(str::to_owned), limit, r))
     }
-    fn put(&mut self, kind: &str, id: &str, value: &Value) -> anyhow::Result<()> {
+    async fn put(&mut self, kind: &str, id: &str, value: &Value) -> anyhow::Result<()> {
         self.call(|r| Command::Put(kind.into(), id.into(), Some(value.clone()), r))
     }
-    fn delete(&mut self, kind: &str, id: &str) -> anyhow::Result<()> {
+    async fn delete(&mut self, kind: &str, id: &str) -> anyhow::Result<()> {
         self.call(|r| Command::Put(kind.into(), id.into(), None, r))
     }
-    fn commit(self: Box<Self>) -> anyhow::Result<()> {
+    async fn commit(self: Box<Self>) -> anyhow::Result<()> {
         self.call(Command::Commit)
     }
 }
@@ -303,8 +308,8 @@ async fn snapshot(pool: &Pool, metrics: &Metrics) -> anyhow::Result<Snapshot> {
         .collect::<anyhow::Result<_>>()?;
     Ok(Snapshot { rows })
 }
-pub fn connect(url: &str) -> anyhow::Result<TransactionalStore> {
-    Ok(TransactionalStore::new(Arc::new(PostgresBackend::connect(url)?)))
+pub async fn connect(url: &str) -> anyhow::Result<TransactionalStore> {
+    Ok(TransactionalStore::new(Arc::new(PostgresBackend::connect(url).await?)))
 }
 async fn bounded<T>(operation: impl std::future::Future<Output = anyhow::Result<T>>) -> anyhow::Result<T> {
     tokio::time::timeout(Duration::from_secs(30), operation)
