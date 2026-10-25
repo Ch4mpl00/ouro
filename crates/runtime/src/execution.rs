@@ -7,8 +7,9 @@
 use crate::{
     FunctionContext, Output, Registry,
     capabilities::{Capabilities, EventSink, ProcessRunner, ResourceResolver, SecretResolver},
+    observer::{Observer, Observers, RunEvents},
     registry::{Checks, Installed, MissingFunction},
-    telemetry::{Metrics, Spans},
+    telemetry::{Metrics, Telemetry},
     testing::{Mode, RecordedCall},
 };
 use async_trait::async_trait;
@@ -27,7 +28,7 @@ use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::{Arc, Mutex},
-    time::{Duration, Instant},
+    time::Duration,
 };
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
@@ -60,6 +61,10 @@ pub struct Config {
     /// The host name this runtime's heartbeat rows carry, as the embedding
     /// application knows it (the runtime reads no environment).
     pub host_name: Option<String>,
+    /// The largest payload (a task's input or output, a call's arguments or
+    /// result, an event) an observer's event carries, as JSON bytes; a
+    /// larger one is left out (default 16 KiB; 0 leaves every one out).
+    pub event_payload_bytes: usize,
 }
 impl Default for Config {
     fn default() -> Self {
@@ -75,6 +80,7 @@ impl Default for Config {
             metadata: json!({}),
             application: Compatibility::default(),
             host_name: None,
+            event_payload_bytes: 16 * 1024,
         }
     }
 }
@@ -102,6 +108,8 @@ pub struct Runtime {
     pub(crate) clock: Arc<dyn Clock>,
     pub(crate) tracer: Arc<BoxedTracer>,
     pub(crate) metrics: Arc<Metrics>,
+    /// The built-in OpenTelemetry observer and the host's.
+    pub(crate) observers: Arc<Observers>,
     pub(crate) config: Config,
     pub(crate) capabilities: Capabilities,
     permits: Semaphore,
@@ -139,12 +147,20 @@ impl Runtime {
                 && config.heartbeat_interval < Duration::from_millis(u64::try_from(acting.max(0))?),
             "invalid polling/heartbeat interval"
         );
+        let tracer = Arc::new(tracer);
+        let metrics = Arc::new(Metrics::new(crate::telemetry::noop_meter()));
+        let observers = Arc::new(Observers {
+            telemetry: Some(Arc::new(Telemetry::new(tracer.clone(), metrics.clone()))),
+            host: Vec::new(),
+            payload_bytes: config.event_payload_bytes,
+        });
         Ok(Self {
             definition_source: store.clone(),
             store,
             installed: Installed::new(registry),
-            tracer: Arc::new(tracer),
-            metrics: Arc::new(Metrics::new(crate::telemetry::noop_meter())),
+            tracer,
+            metrics,
+            observers,
             capabilities: Capabilities::default(),
             permits: Semaphore::new(config.max_concurrency),
             function_permits: Arc::new(Semaphore::new(config.max_function_concurrency)),
@@ -172,6 +188,25 @@ impl Runtime {
     /// same meter in `FunctionContext::meter`.
     pub fn with_meter(mut self, meter: opentelemetry::metrics::Meter) -> Self {
         self.metrics = Arc::new(Metrics::new(meter).enabled());
+        let observers = Arc::make_mut(&mut self.observers);
+        if observers.telemetry.is_some() {
+            observers.telemetry = Some(Arc::new(Telemetry::new(self.tracer.clone(), self.metrics.clone())));
+        }
+        self
+    }
+    /// Adds an observer of the runtime's events (`observer`), called after
+    /// the built-in OpenTelemetry observer and the observers added before.
+    pub fn with_observer(mut self, observer: Arc<dyn Observer>) -> Self {
+        Arc::make_mut(&mut self.observers).host.push(observer);
+        self
+    }
+    /// Removes the built-in OpenTelemetry observer: no run, task or call
+    /// spans, no run, step, call, breaker or budget metrics (the schedule
+    /// and backlog metrics, which are no run's events, stay with the
+    /// meter). Handlers then run in the context `drive` was called in. With
+    /// `with_observer`, a host replaces it.
+    pub fn without_telemetry(mut self) -> Self {
+        Arc::make_mut(&mut self.observers).telemetry = None;
         self
     }
     /// This runtime's worker id in heartbeat rows, new for every runtime.
@@ -300,6 +335,7 @@ impl Runtime {
             breaker_threshold: self.config.breaker_threshold,
             max_concurrent_runs: self.config.max_concurrent_runs,
             metrics: self.metrics.clone(),
+            observers: self.observers.clone(),
             executions: self.executions.clone(),
         }
     }
@@ -314,8 +350,9 @@ impl Runtime {
             return Ok(saved);
         }
         let a = self.admission(id, name, input).await?;
-        if self.store.admit(&a, self.clock.now_ms()).await? {
-            self.metrics.started(name);
+        let now = self.clock.now_ms();
+        if self.store.admit(&a, now).await? {
+            self.observers.admitted(&a, None, id, now);
         }
         self.store.get(id).await?.ok_or_else(|| anyhow::anyhow!("admitted run disappeared"))
     }
@@ -432,11 +469,11 @@ impl Runtime {
         name: &str,
         input: Value,
     ) -> anyhow::Result<SavedRun> {
+        let owner = self.store.get(&parent.run_id).await?.ok_or_else(|| anyhow::anyhow!("unknown parent run"))?;
         let a = if let Some(saved) = self.store.get(id).await? {
             anyhow::ensure!(saved.admission.name == name, "child definition changed");
             saved.admission
         } else {
-            let owner = self.store.get(&parent.run_id).await?.ok_or_else(|| anyhow::anyhow!("unknown parent run"))?;
             let declared = model::parse_yaml(&owner.admission.definition)?.budget;
             let lineage = Lineage::of(&owner.admission, &self.config.limits);
             let lineage = Lineage { max_jumps: declared.max_jumps(lineage.max_jumps), ..lineage };
@@ -444,8 +481,10 @@ impl Runtime {
             self.admitter().active_in(id, name, input, &child).await?
         };
         let link = ChildLink { parent: parent.run_id.clone(), key: key.into(), reference: key.into() };
-        if let Some(f) = self.store.start_child(parent, &a, &link, self.clock.now_ms()).await? {
-            self.metrics.started(name);
+        let now = self.clock.now_ms();
+        if let Some(f) = self.store.start_child(parent, &a, &link, now).await? {
+            let root = owner.root.as_deref().unwrap_or(&owner.admission.id);
+            self.observers.admitted(&a, Some(&parent.run_id), root, now);
             self.store.release(&f, self.clock.now_ms()).await?;
         }
         self.store.get(id).await?.ok_or_else(|| anyhow::anyhow!("child disappeared"))
@@ -470,34 +509,49 @@ impl Runtime {
         self.executions.lock().unwrap().insert(execution_key.clone(), local_cancel.clone());
         let _execution_guard =
             ExecutionGuard { executions: &self.executions, key: execution_key, token: local_cancel.clone() };
-        let a = &saved.admission;
-        // Due since `wake_at_ms`: a waiting or ready run's wake-up, a taken
-        // over run's lease expiry (the store records it at the claim).
-        self.metrics.claimed(&a.name, self.clock.now_ms().saturating_sub(saved.wake_at_ms));
-        let spans = Arc::new(Spans::new(self.tracer.clone(), self.metrics.clone(), &Context::current(), a));
-        let result = self.execute(&saved, lease.clone(), spans.clone(), &local_cancel, stop, mode).await;
-        let label = match &result {
-            Ok(Status::Completed(_)) => "completed",
-            Ok(Status::Faulted(_)) => "faulted",
-            Ok(Status::Cancelled) => "cancelled",
-            Ok(Status::Waiting { .. }) => "waiting",
-            _ => "interrupted",
-        };
-        if matches!(label, "completed" | "faulted" | "cancelled") {
-            self.metrics.ended(&saved.admission.name, label, self.clock.now_ms().saturating_sub(saved.admitted_ms));
+        let events = Arc::new(RunEvents::new(self.observers.clone(), self.clock.clone(), &saved));
+        let result = self.execute(&saved, lease.clone(), events.clone(), &local_cancel, stop, mode).await;
+        // The drive's end: what this drive committed or found. A terminal
+        // state another drive committed (one that took the run over after
+        // this one lost its lease) is that drive's to report; a
+        // cancellation, which no drive commits, is reported by the drive
+        // that finds it.
+        match &result {
+            Ok(Ending { status: Status::Completed(_) | Status::Faulted(_), foreign: true, .. }) => {
+                events.ended(&Status::Interrupted(WorkflowError::runtime("the run ended in another execution")), false)
+            }
+            Ok(Ending { status, limit_exceeded, .. }) => events.ended(status, *limit_exceeded),
+            Err(e) => events.ended(&Status::Interrupted(WorkflowError::runtime(e.to_string())), false),
         }
-        spans.finish(label);
-        result.map(Some)
+        result.map(|ending| Some(ending.status))
     }
     async fn execute(
         &self,
         saved: &SavedRun,
         lease: Arc<Lease>,
-        spans: Arc<Spans>,
+        events: Arc<RunEvents>,
         local_cancel: &CancellationToken,
         stop: &CancellationToken,
         mode: Mode,
-    ) -> anyhow::Result<Status> {
+    ) -> anyhow::Result<Ending> {
+        // Replay restores the recorded budget decisions, not its private
+        // store's: the store saves each one (granted or refused) as it was.
+        let replayed = match &mode {
+            Mode::Replay { budgets, first, .. } => {
+                Some(ReplayJournal { lease: lease.clone(), budgets: budgets.clone(), first: first.clone() })
+            }
+            _ => None,
+        };
+        let journal: &dyn ows::durable::Journal = match &replayed {
+            Some(replayed) => replayed,
+            None => &*lease,
+        };
+        // The run's records, read once: whether an earlier execution left
+        // any decides between started and resumed, and the interpreter
+        // starts from the same read.
+        let journal = Preloaded::read(journal).await;
+        events.began(saved, journal.resumed());
+        let root = events.root_context().unwrap_or_else(Context::current);
         // Before the run's next step: every function it can call is still
         // registered (the registry may have changed since admission, by a
         // new release of the host or `set_registry`). A run that cannot
@@ -514,7 +568,8 @@ impl Runtime {
                     self.clock.now_ms(),
                     self.config.breaker_threshold,
                 )
-                .await;
+                .await
+                .map(Ending::own);
         }
         let registry = admitter.registry.clone();
         let checked = registry.validate_with(&a.definition, &self.capabilities).and_then(|wf| {
@@ -535,7 +590,8 @@ impl Runtime {
                         self.clock.now_ms(),
                         self.config.breaker_threshold,
                     )
-                    .await;
+                    .await
+                    .map(Ending::own);
             }
         };
         let mut limits = self.config.limits.clone();
@@ -557,14 +613,14 @@ impl Runtime {
                     runtime["schemas"].as_object().map(|m| m.clone().into_iter().collect()).unwrap_or_default(),
                 ),
                 lease: lease.clone(),
-                spans: spans.clone(),
+                events: events.clone(),
                 metrics: self.metrics.clone(),
                 definition: (a.name.clone(), a.version),
                 function_permits: self.function_permits.clone(),
                 lineage,
                 mode: mode.clone(),
             }),
-            observer: spans.clone(),
+            observer: events.clone(),
             clock: Arc::new(InterpreterClock(self.clock.clone())),
             limits,
             // `$runtime`: the descriptor the DSL defines, without the pins;
@@ -579,18 +635,6 @@ impl Runtime {
         // The workflow's deadline counts from admission, whichever process
         // first drives the run.
         let input = saved.admission.input.clone();
-        // Replay restores the recorded budget decisions, not its private
-        // store's: the store saves each one (granted or refused) as it was.
-        let replayed = match &mode {
-            Mode::Replay { budgets, first, .. } => {
-                Some(ReplayJournal { lease: lease.clone(), budgets: budgets.clone(), first: first.clone() })
-            }
-            _ => None,
-        };
-        let journal: &dyn ows::durable::Journal = match &replayed {
-            Some(replayed) => replayed,
-            None => &*lease,
-        };
         let mut run = Box::pin(run::resume_from(
             &host,
             &wf,
@@ -598,9 +642,9 @@ impl Runtime {
             input,
             saved.admitted_ms,
             local_cancel,
-            journal,
+            &journal,
         ))
-        .with_context(spans.root());
+        .with_context(root);
         // The heartbeat is polled together with the run, never instead of
         // it: a store operation the run has started may hold a connection
         // (SQLite's only one) until it is polled to its end. For the same
@@ -630,36 +674,32 @@ impl Runtime {
                 drop(run);
                 let Some(error) = lost else {
                     self.store.release(&lease.fence, self.clock.now_ms()).await?;
-                    return Ok(Status::Interrupted(WorkflowError::runtime("worker stopped")));
+                    return Ok(Ending::own(Status::Interrupted(WorkflowError::runtime("worker stopped"))));
                 };
                 if error.is::<ouro_durable::control::Stopped>() {
                     self.store.release(&lease.fence, self.clock.now_ms()).await?;
                 }
                 if let Some(status) = self.store.get(&saved.admission.id).await?.and_then(|r| r.outcome) {
-                    return Ok(status);
+                    return Ok(Ending { status, foreign: true, limit_exceeded: false });
                 }
-                return Ok(Status::Interrupted(WorkflowError::runtime(error.to_string())));
+                return Ok(Ending::own(Status::Interrupted(WorkflowError::runtime(error.to_string()))));
             }
         };
-        if outcome.limit_exceeded {
-            spans.limit_exceeded();
-            self.metrics.budget_exhausted(&saved.admission.name);
-        }
         // Explicit cancel may already have committed and fenced us.
         if let Some(status) = self.store.get(&saved.admission.id).await?.and_then(|r| r.outcome) {
-            return Ok(status);
+            return Ok(Ending { status, foreign: true, limit_exceeded: false });
         }
         if self.store.stopped().await? {
             self.store.release(&lease.fence, self.clock.now_ms()).await?;
-            return Ok(Status::Interrupted(WorkflowError::runtime("runtime emergency stop is set")));
+            return Ok(Ending::own(Status::Interrupted(WorkflowError::runtime("runtime emergency stop is set"))));
         }
         match self.store.finish(&lease.fence, &outcome.status, self.clock.now_ms(), self.config.breaker_threshold).await
         {
             Err(e) if e.is::<ouro_durable::control::Stopped>() => {
                 self.store.release(&lease.fence, self.clock.now_ms()).await?;
-                Ok(Status::Interrupted(WorkflowError::runtime(e.to_string())))
+                Ok(Ending::own(Status::Interrupted(WorkflowError::runtime(e.to_string()))))
             }
-            result => result,
+            result => result.map(|status| Ending { status, foreign: false, limit_exceeded: outcome.limit_exceeded }),
         }
     }
     pub async fn recover_once(&self, stop: &CancellationToken) -> anyhow::Result<usize> {
@@ -811,6 +851,57 @@ impl Runtime {
         self.beat(now, now).await
     }
 }
+/// How a drive ended: the status it returns, whether another execution
+/// committed it (a takeover after this drive lost its lease, an operator's
+/// or parent's cancellation), and whether the run ended through its jump
+/// budget.
+struct Ending {
+    status: Status,
+    foreign: bool,
+    limit_exceeded: bool,
+}
+impl Ending {
+    fn own(status: Status) -> Self {
+        Ending { status, foreign: false, limit_exceeded: false }
+    }
+}
+
+/// A journal whose first load returns the records read before the run
+/// started (`Preloaded::read`), so the drive and the interpreter share one
+/// read of them.
+struct Preloaded<'a> {
+    journal: &'a dyn ows::durable::Journal,
+    first: Mutex<Option<anyhow::Result<BTreeMap<String, ows::durable::Record>>>>,
+    resumed: bool,
+}
+impl<'a> Preloaded<'a> {
+    async fn read(journal: &'a dyn ows::durable::Journal) -> Self {
+        let first = journal.load().await;
+        // Unreadable records count as an earlier execution's.
+        let resumed = first.as_ref().map_or(true, |records| !records.is_empty());
+        Preloaded { journal, first: Mutex::new(Some(first)), resumed }
+    }
+    fn resumed(&self) -> bool {
+        self.resumed
+    }
+}
+#[async_trait]
+impl ows::durable::Journal for Preloaded<'_> {
+    async fn load(&self) -> anyhow::Result<BTreeMap<String, ows::durable::Record>> {
+        let first = self.first.lock().unwrap().take();
+        match first {
+            Some(first) => first,
+            None => self.journal.load().await,
+        }
+    }
+    async fn save(&self, key: &str, record: &ows::durable::Record) -> anyhow::Result<()> {
+        self.journal.save(key, record).await
+    }
+    async fn spend(&self, key: &str, limit: u64) -> anyhow::Result<Option<ows::durable::Record>> {
+        self.journal.spend(key, limit).await
+    }
+}
+
 // ── 2. admission ───────────────────────────────────────────────────────────
 
 /// Builds admissions: the definition version, its input, and the bindings
@@ -831,8 +922,9 @@ pub(crate) struct Admitter {
     /// What a refused trigger run counts against (`Admitter::triggered`).
     pub breaker_threshold: u32,
     pub max_concurrent_runs: usize,
-    /// The runtime's metrics, for the schedules an event fires.
+    /// The runtime's metrics and observers, for the schedules an event fires.
     pub metrics: Arc<Metrics>,
+    pub observers: Arc<Observers>,
     executions: Arc<Mutex<BTreeMap<(String, u64), CancellationToken>>>,
 }
 
@@ -1159,7 +1251,8 @@ pub(crate) struct ExecutionFunctions {
     pub admitter: Admitter,
     schemas: Pinned,
     pub lease: Arc<Lease>,
-    pub spans: Arc<Spans>,
+    /// The drive's events, and through them the call spans.
+    pub events: Arc<RunEvents>,
     pub metrics: Arc<Metrics>,
     /// The run's definition name and version, for its calls' context.
     pub definition: (String, u64),
@@ -1188,7 +1281,9 @@ impl ExecutionFunctions {
         if !known {
             return Err(CallFailure::NotExecuted(WorkflowError::validation(format!("unknown function {name}"))));
         }
-        let mut span = self.spans.function(name, info.reference, info.attempt);
+        // The call's span, which the OpenTelemetry observer opened when the
+        // interpreter reported its dispatch.
+        let span = self.events.call_context(info.reference).unwrap_or_else(Context::current);
         let (definition, version) = &self.definition;
         let context = FunctionContext {
             cancel: info.cancel.clone(),
@@ -1196,7 +1291,7 @@ impl ExecutionFunctions {
             task_path: info.reference.into(),
             attempt: info.attempt,
             idempotency_key: serde_json::to_string(&(info.run_id, info.logical)).expect("string tuple serializes"),
-            span: span.context.clone(),
+            span,
             input: info.input.clone(),
             function: name.into(),
             definition: definition.clone(),
@@ -1204,8 +1299,6 @@ impl ExecutionFunctions {
             delivery: info.delivery,
             meter: self.metrics.meter.clone(),
         };
-        let attributes = context.attributes();
-        let started = Instant::now();
         let result = async {
             if let Mode::Replay { .. } = &self.mode {
                 return self.replayed(name, &args, info);
@@ -1279,25 +1372,6 @@ impl ExecutionFunctions {
             Ok(output)
         }
         .await;
-        let outcome = match &result {
-            Ok(_) => "completed",
-            Err(CallFailure::Response(_)) => "failed",
-            Err(CallFailure::NotExecuted(_)) => "not_executed",
-            Err(CallFailure::Unknown(_)) => "unknown",
-            Err(CallFailure::Interrupted(_)) => "interrupted",
-        };
-        let annotations = result.as_ref().map(|o| &o.annotations);
-        // A replayed answer is no call: it is neither timed nor counted again.
-        if !matches!(self.mode, Mode::Replay { .. }) {
-            self.metrics.call(&attributes, outcome, started, annotations.unwrap_or(&Annotations::new()));
-        }
-        if let Ok(annotations) = annotations {
-            span.annotate(annotations);
-        }
-        span.finish(
-            if result.is_ok() { "completed" } else { "faulted" },
-            result.as_ref().err().map(|e| info.secrets.text(&format!("{e:?}"))),
-        );
         result.map(|output| {
             // The interpreter saves them with the result.
             info.annotations.extend(output.annotations);
@@ -1359,7 +1433,7 @@ impl ExecutionFunctions {
         let now = self.lease.clock.now_ms();
         let link = ChildLink { parent: info.run_id.into(), key: info.logical.into(), reference: info.reference.into() };
         if let Some(fence) = store.start_child(&self.lease.fence, &a, &link, now).await? {
-            self.metrics.started(&a.name);
+            self.events.observers().admitted(&a, Some(info.run_id), self.events.root(), now);
             store.release(&fence, now).await?;
         }
         Ok(json!({"id":id,"key":info.logical,"done":format!("done:{id}"),"waiting":format!("waiting:{id}")}))
@@ -1496,13 +1570,13 @@ impl run::Children for ExecutionFunctions {
         let now = self.lease.clock.now_ms();
         if !owned {
             if store.admit(&a, now).await.map_err(refused)? {
-                self.metrics.started(&a.name);
+                self.events.observers().admitted(&a, None, &id, now);
             }
             return Ok(Child { id, done });
         }
         let link = ChildLink { parent: run_id.into(), key: key.into(), reference: key.into() };
         if let Some(fence) = store.start_child(&self.lease.fence, &a, &link, now).await.map_err(refused)? {
-            self.metrics.started(&a.name);
+            self.events.observers().admitted(&a, Some(run_id), self.events.root(), now);
             store.release(&fence, now).await.map_err(interrupted)?;
         }
         Ok(Child { id, done })

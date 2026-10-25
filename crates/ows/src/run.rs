@@ -27,7 +27,7 @@ use futures::future::{BoxFuture, try_join_all};
 use futures::stream::{self, FuturesUnordered, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -178,47 +178,78 @@ pub trait Functions: Send + Sync {
     }
 }
 
-/// One step of a run, keyed by task reference.
+/// One step of a run, keyed by task reference: a fact this execution
+/// established, reported once.
+///
+/// Replaying what an earlier execution recorded reports nothing: a task it
+/// entered is re-entered silently, a restored call, timer, retry decision,
+/// jump or event is not reported again, and a decision a re-entered task
+/// evaluates again (a switch case, the listen position it waited at) is not
+/// either. What this execution does is reported: a task it enters, every
+/// dispatch of a call (a call left without an answer by a crash is
+/// dispatched, and reported, again), every exit it commits.
+///
+/// Most events follow the commit that records them (a task's result, a
+/// call's answer, a timer, a retry decision, a jump, a consumed event), so a
+/// crash between the commit and the event loses the event and nothing
+/// reports it later: at most once per fact. A few belong to one execution
+/// and recur with each: a task's suspension or interruption, and the run's
+/// own start, resumption and end, which the host reports around it. A task
+/// interrupted or suspended in one execution is re-entered silently by the
+/// next, which reports its final exit.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum Event<'a> {
     /// `parent` is the task this one runs inside (a reusable function's
-    /// caller), `None` at the top level.
-    TaskStarted {
-        reference: &'a str,
-        parent: Option<&'a str>,
-        kind: &'static str,
-        input: &'a Value,
-    },
+    /// caller), `None` at the top level. Only an execution that enters the
+    /// task first reports it.
+    TaskStarted { reference: &'a str, parent: Option<&'a str>, kind: &'static str, input: &'a Value },
     /// `if` was false; the task's input passes through.
-    TaskSkipped {
-        reference: &'a str,
-        parent: Option<&'a str>,
-    },
-    TaskCompleted {
-        reference: &'a str,
-        output: &'a Value,
-    },
-    TaskSuspended {
-        reference: &'a str,
-        wake_at_ms: i64,
-    },
+    TaskSkipped { reference: &'a str, parent: Option<&'a str> },
+    /// The task's result was committed (in a run with a journal).
+    TaskCompleted { reference: &'a str, output: &'a Value },
+    /// The task waits in this execution until `wake_at_ms` (a delivery may
+    /// wake it sooner).
+    TaskSuspended { reference: &'a str, wake_at_ms: i64 },
     /// A `switch` took `case` (its default case included). A switch whose
     /// cases all miss with no default takes none and reports none.
-    SwitchCase {
-        reference: &'a str,
-        case: &'a str,
-    },
-    TaskFaulted {
-        reference: &'a str,
-        error: &'a WorkflowError,
-    },
+    SwitchCase { reference: &'a str, case: &'a str },
+    /// The task's fault was committed, or it faulted before it could start
+    /// (a host limit).
+    TaskFaulted { reference: &'a str, error: &'a WorkflowError },
+    /// The task stopped without an outcome in this execution: a timeout or a
+    /// competing fork's winner dropped it, the run was cancelled, or the
+    /// execution ended (its worker stopped, a commit failed). `error` says so
+    /// (status 499). A later execution may re-enter it.
+    TaskInterrupted { reference: &'a str, error: &'a WorkflowError },
     /// `try` caught `error` and runs its body again after `delay`.
-    TaskRetrying {
+    TaskRetrying { reference: &'a str, attempt: u32, delay: Duration, error: &'a WorkflowError },
+    /// The task's `then: to` asked for a unit of the jump budget: granted,
+    /// or refused (the budget is spent).
+    Jumped { reference: &'a str, to: &'a str, granted: bool },
+    /// A `wait` task's durable timer, due at `deadline_ms`.
+    Timer { reference: &'a str, deadline_ms: i64 },
+    /// A call (or process run, `run:<kind>`) is dispatched: its intent is
+    /// saved, its handler is called next. `attempt` is the enclosing `try`'s.
+    CallStarted { reference: &'a str, function: &'a str, delivery: Delivery, attempt: u32, arguments: &'a Value },
+    /// The dispatched call's answer: a result, or how it failed. An answer
+    /// that is saved (a result, an error response, proven non-execution) is
+    /// reported after its commit; an unknown outcome or a host stop, which
+    /// leave the intent pending, when it comes back.
+    CallFinished {
         reference: &'a str,
-        attempt: u32,
-        delay: Duration,
-        error: &'a WorkflowError,
+        function: &'a str,
+        delivery: Delivery,
+        result: Result<&'a Value, &'a CallFailure>,
+        annotations: &'a Annotations,
     },
+    /// A `listen` waits for an event of `types` at a new position.
+    Listening { reference: &'a str, types: &'a [String] },
+    /// The task consumed `event`: a listen's, or a child's outcome its `run:
+    /// workflow` joined.
+    EventConsumed { reference: &'a str, event: &'a Value },
+    /// `emit` handed `event` over (its envelope), committed.
+    EventEmitted { reference: &'a str, event: &'a Value },
 }
 
 pub trait Observer: Send + Sync {
@@ -234,10 +265,13 @@ impl Observer for Silent {
 
 // A timeout or a fork winner can drop a pending child without returning a
 // fault through `task`; its observer span must still close before its parent.
+// `active` from the task's (re-)entry until an exit is reported; `skipped`:
+// its `if` was false, reported as such.
 struct TaskSpan<'a> {
     observer: &'a dyn Observer,
     reference: &'a str,
     active: bool,
+    skipped: bool,
 }
 
 impl Drop for TaskSpan<'_> {
@@ -252,7 +286,7 @@ impl Drop for TaskSpan<'_> {
                     "the task was cancelled or its enclosing task stopped",
                 )
             };
-            self.observer.event(&Event::TaskFaulted { reference: self.reference, error: &error });
+            self.observer.event(&Event::TaskInterrupted { reference: self.reference, error: &error });
         }
     }
 }
@@ -783,6 +817,7 @@ async fn execute(
         return stopped(Status::Interrupted(WorkflowError::runtime("invalid saved timestamp")));
     }
     let jumps = records.values().filter(|r| matches!(r, Record::Budget { granted: true, .. })).count();
+    let loaded = records.keys().filter(|key| key.ends_with("#task")).cloned().collect();
     // `schedule` is `$run.schedule`, not part of the `$runtime` descriptor.
     let mut descriptor = runtime.clone();
     let schedule = descriptor.as_object_mut().and_then(|m| m.remove("schedule")).filter(|s| !s.is_null());
@@ -808,6 +843,8 @@ async fn execute(
         attempts: Mutex::default(),
         deadlines: Mutex::default(),
         secrets,
+        loaded,
+        exceeded_exit: Mutex::default(),
     };
     if let Some(Record::Finished { status }) = run.record("finished") {
         // A finished run that ended through its budget left a refused jump
@@ -882,10 +919,18 @@ async fn execute(
         Err(Fault::Waiting(wake_at_ms)) => Status::Waiting { wake_at_ms },
         Err(Fault::Interrupted(e)) => Status::Interrupted(e),
     };
-    if matches!(status, Status::Completed(_) | Status::Faulted(_) | Status::Cancelled)
-        && let Err(Fault::Interrupted(error)) = run.save("finished", Record::Finished { status: status.clone() }).await
-    {
-        status = Status::Interrupted(error);
+    if matches!(status, Status::Completed(_) | Status::Faulted(_) | Status::Cancelled) {
+        match run.save("finished", Record::Finished { status: status.clone() }).await {
+            Err(Fault::Interrupted(error)) => status = Status::Interrupted(error),
+            _ => {
+                // The jumping task an `on_exceeded` ended the run with has no
+                // result of its own: its exit is this commit's.
+                let exit = run.exceeded_exit.lock().unwrap_or_else(|e| e.into_inner()).take();
+                if let Some((reference, output)) = exit {
+                    run.observe(Event::TaskCompleted { reference: &reference, output: &output });
+                }
+            }
+        }
     }
     Outcome {
         status: run.secrets.status(&status),
@@ -933,11 +978,23 @@ struct Run<'a> {
     /// The declared secrets; what is persisted or reported is redacted.
     secrets: Redaction,
     deadlines: Mutex<BTreeMap<String, i64>>,
+    /// The task records an earlier execution saved: those tasks are
+    /// re-entered, which reports nothing (`Event`).
+    loaded: BTreeSet<String>,
+    /// The jumping task `on_exceeded` ended the run with, and its output,
+    /// reported once the run's end is committed.
+    exceeded_exit: Mutex<Option<(String, Value)>>,
 }
 
 impl Run<'_> {
     fn record(&self, key: &str) -> Option<Record> {
         self.records.lock().unwrap_or_else(|e| e.into_inner()).get(key).cloned()
+    }
+
+    /// Whether this execution enters the task at `reference` first: no
+    /// earlier one saved its record.
+    fn fresh(&self, reference: &str) -> bool {
+        !self.loaded.contains(&format!("{reference}#task"))
     }
 
     async fn save(&self, key: &str, record: Record) -> Result<(), Fault> {
@@ -1111,6 +1168,33 @@ impl Run<'_> {
                 let error = self.secrets.error(error);
                 observer.event(&Event::TaskRetrying { reference, attempt, delay, error: &error })
             }
+            Event::TaskInterrupted { reference, error } => {
+                let error = self.secrets.error(error);
+                observer.event(&Event::TaskInterrupted { reference, error: &error })
+            }
+            Event::CallStarted { reference, function, delivery, attempt, arguments } => {
+                let arguments = self.secrets.value(arguments);
+                observer.event(&Event::CallStarted { reference, function, delivery, attempt, arguments: &arguments })
+            }
+            Event::CallFinished { reference, function, delivery, result, annotations } => {
+                let redacted = match result {
+                    Ok(value) => Ok(self.secrets.value(value)),
+                    Err(CallFailure::NotExecuted(e)) => Err(CallFailure::NotExecuted(self.secrets.error(e))),
+                    Err(CallFailure::Response(e)) => Err(CallFailure::Response(self.secrets.error(e))),
+                    Err(CallFailure::Unknown(e)) => Err(CallFailure::Unknown(self.secrets.error(e))),
+                    Err(CallFailure::Interrupted(e)) => Err(CallFailure::Interrupted(self.secrets.error(e))),
+                };
+                let result = redacted.as_ref();
+                observer.event(&Event::CallFinished { reference, function, delivery, result, annotations })
+            }
+            Event::EventConsumed { reference, event } => {
+                let event = self.secrets.value(event);
+                observer.event(&Event::EventConsumed { reference, event: &event })
+            }
+            Event::EventEmitted { reference, event } => {
+                let event = self.secrets.value(event);
+                observer.event(&Event::EventEmitted { reference, event: &event })
+            }
             other => observer.event(&other),
         }
     }
@@ -1211,11 +1295,12 @@ impl Run<'_> {
         run
     }
 
-    /// Takes the jump the task at `reference` chose, spending one unit of
-    /// the run tree's budget under `<reference>#jump` (or restoring the
-    /// decision saved there). `Some(first)`: the budget is spent, and `first`
-    /// is the key of the run's first refusal, the one that acts on it.
-    async fn jump(&self, reference: &str) -> Result<Option<String>, Fault> {
+    /// Takes the jump to `to` the task at `reference` chose, spending one
+    /// unit of the run tree's budget under `<reference>#jump` (or restoring
+    /// the decision saved there, which reports nothing). `Some(first)`: the
+    /// budget is spent, and `first` is the key of the run's first refusal,
+    /// the one that acts on it.
+    async fn jump(&self, reference: &str, to: &str) -> Result<Option<String>, Fault> {
         if self.handler(reference, false).is_some() {
             return Err(Fault::Fatal(WorkflowError {
                 instance: Some(reference.into()),
@@ -1272,6 +1357,7 @@ impl Run<'_> {
         if decided.is_none() {
             self.jumps.fetch_add(1, Ordering::SeqCst);
         }
+        self.observe(Event::Jumped { reference, to, granted: decided.is_none() });
         Ok(decided)
     }
 
@@ -1327,7 +1413,7 @@ impl Run<'_> {
             // Answered by `exceeded` before any branch acts.
             Exceeded::Raise => Fault::Error(WorkflowError::budget("the jump budget is spent")),
             Exceeded::End => {
-                self.observe(Event::TaskCompleted { reference, output });
+                self.exit_exceeded(reference, output);
                 Fault::Exceeded(output.clone())
             }
             Exceeded::Task(handler) => {
@@ -1337,7 +1423,7 @@ impl Run<'_> {
                 self.handlers.lock().unwrap_or_else(|e| e.into_inner()).retain(|(prefix, _)| *prefix != at);
                 match result {
                     Ok((out, _)) => {
-                        self.observe(Event::TaskCompleted { reference, output });
+                        self.exit_exceeded(reference, output);
                         Fault::Exceeded(out)
                     }
                     // The handler is the run's last word: its error ends the
@@ -1350,6 +1436,12 @@ impl Run<'_> {
                 }
             }
         }
+    }
+
+    /// The jumping task completes with `output` once the run's end, which
+    /// it decided, is committed (`execute`).
+    fn exit_exceeded(&self, reference: &str, output: &Value) {
+        *self.exceeded_exit.lock().unwrap_or_else(|e| e.into_inner()) = Some((reference.to_owned(), output.clone()));
     }
 
     /// Runs `tasks` in order, following each task's flow directive.
@@ -1445,23 +1537,24 @@ impl Run<'_> {
                 _ => self.host.clock.now().timestamp_millis(),
             };
             self.save(&key, Record::Task { started_ms, result: None }).await?;
-            let mut span = TaskSpan { observer: self.host.observer.as_ref(), reference, active: false };
+            let mut span = TaskSpan { observer: self.host.observer.as_ref(), reference, active: false, skipped: false };
             let result = self.steps(task, name, reference, parent, raw, ctx, scope, started_ms, &mut span).await;
-            if let Err(Fault::Waiting(wake_at_ms)) = &result {
-                self.observe(Event::TaskSuspended { reference, wake_at_ms: *wake_at_ms });
-            }
-            if !matches!(result, Err(Fault::Cancelled | Fault::Interrupted(_))) {
-                span.active = false;
+            match &result {
+                Err(Fault::Waiting(wake_at_ms)) => {
+                    span.active = false;
+                    self.observe(Event::TaskSuspended { reference, wake_at_ms: *wake_at_ms });
+                }
+                // Reported once the run's end is committed (`exit_exceeded`).
+                Err(Fault::Exceeded(_)) => span.active = false,
+                _ => {}
             }
             let result = match result {
                 Err(Fault::Error(mut e)) => {
                     e.instance.get_or_insert_with(|| reference.into());
-                    self.observe(Event::TaskFaulted { reference, error: &e });
                     Err(Fault::Error(e))
                 }
                 Err(Fault::Fatal(mut e)) => {
                     e.instance.get_or_insert_with(|| reference.into());
-                    self.observe(Event::TaskFaulted { reference, error: &e });
                     Err(Fault::Fatal(e))
                 }
                 other => other,
@@ -1473,11 +1566,21 @@ impl Run<'_> {
                 _ => None,
             };
             if let Some(outcome) = outcome {
+                // A failed commit leaves the task interrupted (`span`).
                 self.save(
                     &key,
                     Record::Task { started_ms, result: Some(TaskResult { context: ctx.clone(), outcome }) },
                 )
                 .await?;
+                span.active = false;
+                match &result {
+                    Ok(_) if span.skipped => {}
+                    Ok((output, _)) => self.observe(Event::TaskCompleted { reference, output }),
+                    Err(Fault::Error(error) | Fault::Fatal(error)) => {
+                        self.observe(Event::TaskFaulted { reference, error })
+                    }
+                    Err(_) => {}
+                }
             }
             result
         })
@@ -1510,7 +1613,10 @@ impl Run<'_> {
             let v =
                 expr::eval(expr::bare(cond), &raw, &self.args(ctx, &null, &null, &desc, scope)).map_err(expression)?;
             if !expr::truthy(&v) {
-                self.observe(Event::TaskSkipped { reference, parent });
+                if self.fresh(reference) {
+                    self.observe(Event::TaskSkipped { reference, parent });
+                }
+                span.skipped = true;
                 return Ok((raw, Flow::Continue));
             }
         }
@@ -1530,7 +1636,9 @@ impl Run<'_> {
             self.deadlines.lock().unwrap().insert(reference.into(), started_ms.saturating_add(millis));
             DeadlineGuard { deadlines: &self.deadlines, reference }
         });
-        self.observe(Event::TaskStarted { reference, parent, kind: task.kind.name(), input: &input });
+        if self.fresh(reference) {
+            self.observe(Event::TaskStarted { reference, parent, kind: task.kind.name(), input: &input });
+        }
         span.active = true;
         let (extensions, described) = self.extensions(task, reference, &input, ctx, scope, &desc)?;
         let mut around = scope.clone();
@@ -1597,12 +1705,11 @@ impl Run<'_> {
             }
         }
         let flow = flow.or_else(|| task.then.clone()).unwrap_or(Flow::Continue);
-        if matches!(flow, Flow::Goto(_))
-            && let Some(first) = self.jump(reference).await?
+        if let Flow::Goto(to) = &flow
+            && let Some(first) = self.jump(reference, to).await?
         {
             self.exceeded(reference, &first, &out, ctx, scope).await?;
         }
-        self.observe(Event::TaskCompleted { reference, output: &out });
         Ok((out, flow))
     }
 
@@ -1780,12 +1887,16 @@ impl Run<'_> {
                         Some(w) => expr::truthy(&expr::eval(w, input, &a).map_err(expression)?),
                     };
                     if hit {
-                        self.observe(Event::SwitchCase { reference, case: name });
+                        if self.fresh(reference) {
+                            self.observe(Event::SwitchCase { reference, case: name });
+                        }
                         return Ok((input.clone(), Some(case.then.clone())));
                     }
                 }
                 let default = cases.iter().find(|(_, case)| case.when.is_none()).map(|(name, case)| {
-                    self.observe(Event::SwitchCase { reference, case: name });
+                    if self.fresh(reference) {
+                        self.observe(Event::SwitchCase { reference, case: name });
+                    }
                     case.then.clone()
                 });
                 // Without a default, the task's own `then` applies.
@@ -1800,7 +1911,7 @@ impl Run<'_> {
             }
             Kind::Wait(spec) => {
                 let d = self.duration(spec, input, &args(ctx))?;
-                self.sleep(d, &format!("{reference}#wait")).await?;
+                self.sleep(d, &format!("{reference}#wait"), Some(reference)).await?;
                 Ok((input.clone(), None))
             }
         }
@@ -1918,6 +2029,10 @@ impl Run<'_> {
                 Target::Function(_) => functions.execute(name, args, info).await,
             }
         };
+        let finished = |result: Result<&Value, &CallFailure>, annotations: &Annotations| {
+            self.observe(Event::CallFinished { reference, function: name, delivery, result, annotations })
+        };
+        self.observe(Event::CallStarted { reference, function: name, delivery, attempt, arguments: &args });
         if self.journal.is_none() {
             let result = if cooperative {
                 dispatch(args, false).await
@@ -1927,10 +2042,11 @@ impl Run<'_> {
                     r = dispatch(args, false) => r,
                 }
             };
+            let (result, annotations) = annotated(name, result, &annotator);
+            finished(result.as_ref(), &annotations);
             if self.cancel.is_cancelled() {
                 return Err(Fault::Cancelled);
             }
-            let (result, annotations) = annotated(name, result, &annotator);
             // No journal, so no record to save: the call journal still
             // learns how the call ended.
             let state = match &result {
@@ -1967,33 +2083,46 @@ impl Run<'_> {
             }
         };
         let (result, annotations) = annotated(name, result, &annotator);
-        let (state, result) = match result {
-            Ok(value) => (CallState::Done(Ok(value.clone())), Ok(value)),
-            Err(CallFailure::Response(error)) => (CallState::Done(Err(error.clone())), Err(Fault::Error(error))),
-            Err(CallFailure::NotExecuted(error)) => (CallState::NotExecuted(error.clone()), Err(Fault::Error(error))),
+        let state = match &result {
+            Ok(value) => CallState::Done(Ok(value.clone())),
+            Err(CallFailure::Response(error)) => CallState::Done(Err(error.clone())),
+            Err(CallFailure::NotExecuted(error)) => CallState::NotExecuted(error.clone()),
             Err(CallFailure::Unknown(error)) => {
+                finished(result.as_ref(), &annotations);
                 if delivery == Delivery::AtMostOnce {
                     return self.unknown_call(&key, logical, name, args, reference).await;
                 }
                 // A transient transport failure remains retryable, including after restart.
-                return Err(Fault::Error(error));
+                return Err(Fault::Error(error.clone()));
             }
             // A stop, not an answer: the pending record stays, so recovery
             // calls it again. Explicit cancellation of the run still wins,
             // and a stop is no proof that an at-most-once call did nothing.
             Err(CallFailure::Interrupted(error)) => {
+                finished(result.as_ref(), &annotations);
                 if self.cancel.is_cancelled() {
                     return Err(Fault::Cancelled);
                 }
                 if delivery == Delivery::AtMostOnce {
                     return self.unknown_call(&key, logical, name, args, reference).await;
                 }
-                return Err(Fault::Interrupted(error));
+                return Err(Fault::Interrupted(error.clone()));
             }
         };
-        let record = Record::Call { logical, function: name.into(), arguments: args, delivery, state, annotations };
+        let record = Record::Call {
+            logical,
+            function: name.into(),
+            arguments: args,
+            delivery,
+            state,
+            annotations: annotations.clone(),
+        };
         self.save(&key, record).await?;
-        result
+        finished(result.as_ref(), &annotations);
+        result.map_err(|failure| match failure {
+            CallFailure::Response(error) | CallFailure::NotExecuted(error) => Fault::Error(error),
+            CallFailure::Unknown(error) | CallFailure::Interrupted(error) => Fault::Interrupted(error),
+        })
     }
 
     /// A concurrent `for`: every iteration runs on the input and a copy of
@@ -2217,6 +2346,9 @@ impl Run<'_> {
         let mut consumed = Vec::new();
         let mut outputs = Vec::new();
         let mut subscribed = false;
+        // A re-entered listen waits first where an earlier execution did,
+        // which reported it.
+        let mut resumed = !self.fresh(reference);
         let mut i = 0;
         while !consumer.done() {
             let key = format!("{reference}#event[{i}]");
@@ -2264,6 +2396,9 @@ impl Run<'_> {
                         serde_json::from_value(redacted.clone()).map_err(|e| storage(e.into()))?;
                     wait.redacted = raw != redacted;
                     events.waiting(self.run_id, reference, &wait).await.map_err(storage)?;
+                    if !std::mem::take(&mut resumed) {
+                        self.observe(Event::Listening { reference, types: &routes });
+                    }
                     self.next_event(events, task, reference, &key, &routes, input, ctx, scope, desc, deadline).await?
                 }
             };
@@ -2325,6 +2460,7 @@ impl Run<'_> {
         };
         if self.journal.is_none() {
             if let Some(event) = events.take(self.run_id, key, routes).await.map_err(storage)? {
+                self.observe(Event::EventConsumed { reference, event: &event });
                 return Ok(event);
             }
             return Err(WorkflowError::runtime("listen requires a durable journal; cannot wait in a dry run").into());
@@ -2353,6 +2489,7 @@ impl Run<'_> {
             let notification = events.notification(self.run_id);
             if let Some(event) = events.take(self.run_id, key, routes).await.map_err(storage)? {
                 self.save(key, Record::Event { event: event.clone() }).await?;
+                self.observe(Event::EventConsumed { reference, event: &event });
                 return Ok(event);
             }
             if tokio::time::Instant::now() >= until {
@@ -2488,6 +2625,7 @@ impl Run<'_> {
         match result {
             Ok(()) => {
                 self.save(&key, pending(CallState::Done(Ok(envelope.clone())))).await?;
+                self.observe(Event::EventEmitted { reference, event: &envelope });
                 Ok(envelope)
             }
             Err(CallFailure::Response(e)) => {
@@ -2583,6 +2721,7 @@ impl Run<'_> {
                 match events.take(self.run_id, &key, &types).await.map_err(storage)? {
                     Some(event) => {
                         self.save(&key, Record::Event { event: event.clone() }).await?;
+                        self.observe(Event::EventConsumed { reference, event: &event });
                         event
                     }
                     None => return Err(Fault::Waiting(NO_DEADLINE)),
@@ -2674,8 +2813,9 @@ impl Run<'_> {
                 return Err(error.into());
             }
             let decision_key = format!("{reference}#retry-decision[{attempt}]");
-            let delay = match self.record(&decision_key) {
-                Some(Record::Retry { delay_ms }) => delay_ms.map(Duration::from_millis),
+            // A restored decision was reported by the execution that made it.
+            let (delay, decided) = match self.record(&decision_key) {
+                Some(Record::Retry { delay_ms }) => (delay_ms.map(Duration::from_millis), false),
                 Some(_) => {
                     return Err(Fault::Interrupted(WorkflowError::runtime("invalid retry record")));
                 }
@@ -2694,12 +2834,14 @@ impl Run<'_> {
                         Record::Retry { delay_ms: delay.map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX)) },
                     )
                     .await?;
-                    delay
+                    (delay, true)
                 }
             };
             if let Some(delay) = delay {
-                self.observe(Event::TaskRetrying { reference, attempt, delay, error: &error });
-                self.sleep(delay, &format!("{reference}#retry[{attempt}]")).await?;
+                if decided {
+                    self.observe(Event::TaskRetrying { reference, attempt, delay, error: &error });
+                }
+                self.sleep(delay, &format!("{reference}#retry[{attempt}]"), None).await?;
                 *ctx = snapshot.clone();
                 attempt += 1;
                 continue;
@@ -2831,8 +2973,13 @@ impl Run<'_> {
         }
     }
 
-    async fn sleep(&self, d: Duration, key: &str) -> Result<(), Fault> {
+    /// Sleeps `d` under the timer saved at `key`; a `wait` task's new timer
+    /// is reported at its `reference`.
+    async fn sleep(&self, d: Duration, key: &str, reference: Option<&str>) -> Result<(), Fault> {
         let d = self.host.limits.max_sleep.map_or(d, |max| d.min(max));
+        let deadline = || {
+            self.host.clock.now().timestamp_millis().saturating_add(i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+        };
         if self.journal.is_some() {
             let deadline_ms = match self.record(key) {
                 Some(Record::Timer { deadline_ms }) => deadline_ms,
@@ -2840,13 +2987,11 @@ impl Run<'_> {
                     return Err(Fault::Interrupted(WorkflowError::runtime("invalid timer record")));
                 }
                 None => {
-                    let deadline_ms = self
-                        .host
-                        .clock
-                        .now()
-                        .timestamp_millis()
-                        .saturating_add(i64::try_from(d.as_millis()).unwrap_or(i64::MAX));
+                    let deadline_ms = deadline();
                     self.save(key, Record::Timer { deadline_ms }).await?;
+                    if let Some(reference) = reference {
+                        self.observe(Event::Timer { reference, deadline_ms });
+                    }
                     deadline_ms
                 }
             };
@@ -2854,6 +2999,9 @@ impl Run<'_> {
                 return Err(Fault::Waiting(deadline_ms));
             }
             return Ok(());
+        }
+        if let Some(reference) = reference {
+            self.observe(Event::Timer { reference, deadline_ms: deadline() });
         }
         tokio::select! {
             _ = self.cancel.cancelled() => Err(Fault::Cancelled),
@@ -2939,6 +3087,14 @@ mod tests {
                 Event::TaskRetrying { reference, attempt, delay, .. } => {
                     format!("retry {reference} #{attempt} after {}s", delay.as_secs())
                 }
+                Event::TaskInterrupted { reference, .. } => format!("interrupt {reference}"),
+                Event::Jumped { reference, to, granted } => format!("jump {reference} {to} {granted}"),
+                Event::Timer { reference, .. } => format!("timer {reference}"),
+                Event::CallStarted { reference, function, .. } => format!("call {reference} {function}"),
+                Event::CallFinished { reference, result, .. } => format!("answer {reference} {}", result.is_ok()),
+                Event::Listening { reference, .. } => format!("listen {reference}"),
+                Event::EventConsumed { reference, .. } => format!("consume {reference}"),
+                Event::EventEmitted { reference, .. } => format!("emit {reference}"),
             };
             self.0.lock().unwrap().push(line);
         }

@@ -14,6 +14,12 @@ schedules (which a host's scheduler reads). Protocol clients (`call: http`,
 supported subset and its choices are in `src/model.rs`. A construct whose
 host seam is absent fails validation.
 
+The `Observer` hears each step as a fact this execution established (tasks
+entered and exited, switch cases, jumps, retries, timers, call dispatches and
+answers, listens, consumed and emitted events): replaying what an earlier
+execution recorded reports nothing, and an event that follows a commit is
+reported after it, at most once (`run::Event`).
+
 Recovery replays the definition, restoring completed tasks and call results.
 Protected calls preserve their logical identity across retries. At-most-once
 intent without a response produces `outcome_unknown`; it is never resent.

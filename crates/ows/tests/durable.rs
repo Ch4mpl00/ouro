@@ -3,7 +3,7 @@ use chrono::{DateTime, Utc};
 use ows::{
     durable::{CallFailure, Journal, Record, check_transition},
     model,
-    run::{self, CallInfo, Clock, Functions, Host, Limits, Silent, Status, WorkflowError},
+    run::{self, CallInfo, Clock, Event, Functions, Host, Limits, Observer, Silent, Status, WorkflowError},
 };
 use serde_json::{Value, json};
 use std::{
@@ -161,6 +161,97 @@ async fn every_checkpoint_recovers_before_and_after_commit() {
             let saves = store.saves.load(Ordering::SeqCst);
             assert_eq!(drive(&h, &time, &wf, &store).await, Status::Completed(json!({"n":3})));
             assert_eq!(store.saves.load(Ordering::SeqCst), saves);
+        }
+    }
+}
+
+/// What an observer was told, one line per event: its kind and reference
+/// (with the attempt of a retry).
+#[derive(Default)]
+struct Told(Mutex<Vec<String>>);
+impl Observer for Told {
+    fn event(&self, event: &Event<'_>) {
+        let line = match event {
+            Event::TaskStarted { reference, .. } => format!("start {reference}"),
+            Event::TaskSkipped { reference, .. } => format!("skip {reference}"),
+            Event::TaskCompleted { reference, .. } => format!("exit {reference}"),
+            Event::TaskFaulted { reference, .. } => format!("exit {reference}"),
+            Event::SwitchCase { reference, case } => format!("case {reference} {case}"),
+            Event::TaskRetrying { reference, attempt, .. } => format!("retry {reference} {attempt}"),
+            Event::Jumped { reference, .. } => format!("jump {reference}"),
+            Event::Timer { reference, .. } => format!("timer {reference}"),
+            Event::CallStarted { reference, .. } => format!("call {reference}"),
+            Event::CallFinished { reference, .. } => format!("answer {reference}"),
+            Event::EventConsumed { reference, .. } => format!("consume {reference}"),
+            Event::EventEmitted { reference, .. } => format!("emit {reference}"),
+            Event::TaskSuspended { reference, .. } => format!("suspend {reference}"),
+            Event::TaskInterrupted { reference, .. } => format!("interrupt {reference}"),
+            Event::Listening { reference, .. } => format!("listen {reference}"),
+            _ => "other".into(),
+        };
+        self.0.lock().unwrap().push(line);
+    }
+}
+
+const JUMPS: &str = r#"
+do:
+  - init: { set: { n: 0 } }
+  - step: { set: { n: '${ .n + 1 }' } }
+  - pause: { wait: PT0.001S }
+  - again: { switch: [ { more: { when: '${ .n < 3 }', then: step } }, { stop: { then: exit } } ] }
+"#;
+
+/// Facts are reported once across every resumption and at every crash
+/// boundary, before and after each commit: no task is entered, exited,
+/// retried or jumped from twice, no timer or switch case is reported
+/// twice. Every dispatch of a call is reported, and only a dispatch. Without
+/// a crash, every recorded task was entered once and every result exited.
+#[tokio::test]
+async fn facts_are_reported_once_across_resumptions_and_crashes() {
+    for body in [BODY, JUMPS] {
+        let wf = workflow(body);
+        let baseline = Store::default();
+        let time = Arc::new(Time(AtomicI64::new(1_000)));
+        let h = host(Arc::new(World::default()), time.clone());
+        drive(&h, &time, &wf, &baseline).await;
+        let count = baseline.saves.load(Ordering::SeqCst);
+        let mut cases = vec![(0, false)];
+        cases.extend((1..=count).flat_map(|n| [(n, false), (n, true)]));
+        for (fail_at, after_commit) in cases {
+            let store = Store { fail_at: AtomicUsize::new(fail_at), after_commit, ..Default::default() };
+            let world = Arc::new(World::default());
+            let told = Arc::new(Told::default());
+            let time = Arc::new(Time(AtomicI64::new(1_000)));
+            let h = Host { observer: told.clone(), ..host(world.clone(), time.clone()) };
+            assert!(matches!(drive(&h, &time, &wf, &store).await, Status::Completed(_)));
+            let told = told.0.lock().unwrap().clone();
+            let case = format!("crash {fail_at}, after={after_commit}: {told:#?}");
+            let mut seen = std::collections::BTreeSet::new();
+            for line in &told {
+                let fact = !["call ", "answer ", "suspend ", "interrupt ", "other"].iter().any(|p| line.starts_with(p));
+                assert!(!fact || seen.insert(line.clone()), "{line} twice, {case}");
+            }
+            // Each dispatch the host saw, reported once.
+            let mut dispatched: Vec<String> =
+                world.0.lock().unwrap().iter().map(|(_, reference)| format!("call {reference}")).collect();
+            let mut reported: Vec<String> = told.iter().filter(|l| l.starts_with("call ")).cloned().collect();
+            dispatched.sort();
+            reported.sort();
+            assert_eq!(dispatched, reported, "{case}");
+            if fail_at == 0 {
+                for (key, record) in store.records() {
+                    let Some(reference) = key.strip_suffix("#task") else { continue };
+                    let Record::Task { result, .. } = record else { continue };
+                    let entered = told
+                        .iter()
+                        .filter(|l| **l == format!("start {reference}") || **l == format!("skip {reference}"))
+                        .count();
+                    assert_eq!(entered, 1, "{reference} entered, {case}");
+                    if result.is_some() && !told.contains(&format!("skip {reference}")) {
+                        assert!(told.contains(&format!("exit {reference}")), "{reference} never exited, {case}");
+                    }
+                }
+            }
         }
     }
 }

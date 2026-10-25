@@ -3,12 +3,14 @@
 mod capabilities;
 pub mod control;
 mod execution;
+pub mod observer;
 mod registry;
 mod schedule;
 mod telemetry;
 mod testing;
 pub use capabilities::{EventSink, ProcessRunner, ResourceResolver, SecretResolver};
 pub use execution::{Config, InvalidDefinition, ResourceUnavailable, Runtime};
+pub use observer::{Buffered, BufferedEvents, Event, EventKind, Observer, buffered};
 pub use opentelemetry;
 #[cfg(feature = "otlp")]
 pub use opentelemetry_otlp as otlp;

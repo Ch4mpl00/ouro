@@ -164,12 +164,15 @@ impl Observer for Journal {
             }
             Event::TaskSuspended { .. } => panic!("ephemeral test host suspended"),
             Event::SwitchCase { .. } => return,
-            Event::TaskFaulted { reference, error } => {
+            // A task dropped without an outcome closes its span like a fault.
+            Event::TaskFaulted { reference, error } | Event::TaskInterrupted { reference, error } => {
                 Entry::Faulted { reference: reference.to_string(), error: (*error).clone() }
             }
             Event::TaskRetrying { reference, attempt, .. } => {
                 Entry::Retrying { reference: reference.to_string(), attempt: *attempt }
             }
+            // Calls are recorded by the host's `Functions` (`Entry::Call`).
+            _ => return,
         });
     }
 }
