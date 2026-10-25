@@ -149,22 +149,36 @@ pub fn schedule_trigger(at: Option<i64>, epoch: u64, slot: i64, mode: Mode) -> T
         at_ms: at.map(|t| t * TICK),
         types: vec![],
         state: json!({
-            "epoch": epoch, "slot": slot, "catchup": mode.catchup, "rearm": mode.rearm, "once": mode.once,
+            "epoch": epoch, "slot": slot, "catchup": mode.catchup, "rearm": mode.rearm, "once": mode.once, "onceAt": mode.once_at,
             "overlap": 0, "maxRuns": 2,
         }),
     }
 }
 /// What an activation's value chooses of the trigger: `catchup` (odd values),
-/// `after`-style `rearm` (2, 3) or a `once` one-shot (4), as the model reads it.
-#[derive(Clone, Copy, Default)]
+/// `after`-style `rearm` (2, 3) or a `once` one-shot (4), as the model reads
+/// it. A one-shot's instant is the activation's run index (`once_at`, -1:
+/// none), and its run id is the instant's in every epoch.
+#[derive(Clone, Copy)]
 pub struct Mode {
     pub catchup: i64,
     pub rearm: bool,
     pub once: bool,
+    pub once_at: i64,
+}
+impl Default for Mode {
+    fn default() -> Self {
+        Self::of(0, 0)
+    }
 }
 impl Mode {
-    pub fn of(value: i64) -> Self {
-        Self { catchup: value % 2, rearm: value == 2 || value == 3, once: value == 4 }
+    pub fn of(value: i64, r: usize) -> Self {
+        let once = value == 4;
+        Self {
+            catchup: value % 2,
+            rearm: value == 2 || value == 3,
+            once,
+            once_at: if once { i64::try_from(r).expect("a run index") } else { -1 },
+        }
     }
 }
 fn overlap_policy(policy: i64) -> anyhow::Result<Overlap> {
@@ -248,6 +262,7 @@ struct TriggerView {
     catchup: i64,
     rearm: bool,
     once: bool,
+    once_at: i64,
 }
 #[derive(Debug, PartialEq, Eq)]
 struct QueueView {
@@ -366,6 +381,8 @@ struct ModelCatalog {
     catchup: i64,
     rearm: bool,
     once: bool,
+    #[serde(rename = "onceAt")]
+    once_at: i64,
     armed: bool,
     notices: Vec<i64>,
 }
@@ -456,6 +473,7 @@ impl From<Machine> for View {
                     catchup: c.catchup,
                     rearm: c.rearm,
                     once: c.once,
+                    once_at: c.once_at,
                 }),
                 notices: c.notices,
             },
@@ -514,6 +532,7 @@ impl State<StoreDriver> for View {
                     catchup: number("catchup")?,
                     rearm: t.state["rearm"].as_bool().context("trigger rearm")?,
                     once: t.state["once"].as_bool().context("trigger once")?,
+                    once_at: number("onceAt")?,
                 })
             })
             .transpose()?;
@@ -1271,7 +1290,7 @@ impl StoreDriver {
                 // Version 1 has the schedule.
                 let mut arming = Arming::default();
                 if version == 1 {
-                    let mut t = schedule_trigger(Some(self.now + 2), defs.epoch + 1, 0, Mode::of(value));
+                    let mut t = schedule_trigger(Some(self.now + 2), defs.epoch + 1, 0, Mode::of(value, r));
                     t.state["overlap"] = json!(self.overlap);
                     t.state["maxRuns"] = json!(self.max_runs);
                     arming.triggers.insert(SCHEDULE.into(), t);
@@ -1295,6 +1314,10 @@ impl StoreDriver {
                 let catchup = t.state["catchup"].as_i64().context("catchup")?;
                 let rearm = t.state["rearm"].as_bool().context("rearm")?;
                 let once = t.state["once"].as_bool().context("once")?;
+                // A one-shot's run id is its instant's, in every epoch.
+                if once && i64::try_from(r)? != t.state["onceAt"].as_i64().context("onceAt")? {
+                    return Ok(());
+                }
                 // A one-shot's slot consumes it however it ends: it is never
                 // due again until an activation arms it.
                 let moved = |at: Option<i64>| {

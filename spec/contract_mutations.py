@@ -59,6 +59,9 @@ MUTANTS = {
  "T2": ('val epoch = c.epoch+1','val epoch = c.epoch',[op("activate",i=1)]),
  # A one-shot's slot does not consume it, or its run's end re-arms it.
  "T1/once": ('due:if (c.once or (c.rearm and not(skip) and not(refused))) -1 else s.now+2,','due:if (c.rearm and not(skip) and not(refused)) -1 else s.now+2,',[op("activate",value=4),op("tick"),op("tick"),op("fire")]),
+ # A one-shot's run id is the epoch's, not the instant's: the same instant,
+ # activated again, runs again.
+ "T1/once-id": ('and (not(c.once) or r == c.onceAt)) {','and true) {',[op("activate",value=4),op("tick"),op("tick"),op("fire"),op("activate",value=4),op("tick"),op("tick"),op("fire",r=1)]),
  "T2/once": ('else if (c.armed and c.rearm and c.due < 0','else if (c.armed and (c.rearm or c.once) and c.due < 0',[op("activate",value=4),op("tick"),op("tick"),op("fire"),op("claim"),op("finish")]),
  "T3": ('owner:w, generation:execution.generation+1, lease:s.now+4','owner:w, generation:execution.generation+1, lease:s.now+4, deadline:s.now+8',BOOT+TICKS+[op("claim")]),
  "V1": ('active:i+1,epoch:epoch','active:c.active,epoch:epoch',[op("activate",i=1)]),

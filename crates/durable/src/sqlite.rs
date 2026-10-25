@@ -29,8 +29,13 @@ impl SqliteBackend {
         connection.busy_timeout(Duration::from_secs(30))?;
         connection.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL;")?;
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // Rows without a recorded version are v0.1.0's: refused before
+        // anything is created in the file.
+        if recorded(&tx)? == 0 && has_table(&tx, "ouro_rows")? {
+            return Err(SchemaError::Legacy.into());
+        }
         tx.execute_batch("CREATE TABLE IF NOT EXISTS ouro_migrations (version INTEGER PRIMARY KEY);")?;
-        let version: i64 = tx.query_row("SELECT COALESCE(MAX(version),0) FROM ouro_migrations", [], |r| r.get(0))?;
+        let version = recorded(&tx)?;
         if version > SCHEMA {
             return Err(SchemaError::Unsupported { found: version, supported: SCHEMA }.into());
         }
@@ -54,17 +59,12 @@ impl SqliteBackend {
         let connection = Connection::open_with_flags(path, flags)?;
         connection.busy_timeout(Duration::from_secs(30))?;
         connection.execute_batch("PRAGMA query_only = ON;")?;
-        // No migrations table (or no recorded version) is an unmigrated store.
-        let present: bool = connection.query_row(
-            "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type='table' AND name='ouro_migrations')",
-            [],
-            |r| r.get(0),
-        )?;
-        let version: i64 = if present {
-            connection.query_row("SELECT COALESCE(MAX(version),0) FROM ouro_migrations", [], |r| r.get(0))?
-        } else {
-            0
-        };
+        // No migrations table (or no recorded version) is an unmigrated
+        // store, unless it holds rows: those are a v0.1.0 file's.
+        let version = recorded(&connection)?;
+        if version == 0 && has_table(&connection, "ouro_rows")? {
+            return Err(SchemaError::Legacy.into());
+        }
         SchemaError::check(version, SCHEMA)?;
         Ok(Self::with(connection, true))
     }
@@ -76,6 +76,18 @@ impl SqliteBackend {
             metrics: Arc::new(Metrics::default()),
         }
     }
+}
+
+fn has_table(connection: &Connection, name: &str) -> rusqlite::Result<bool> {
+    connection
+        .query_row("SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)", [name], |r| r.get(0))
+}
+/// The recorded schema version (`ouro_migrations`), 0 when there is none.
+fn recorded(connection: &Connection) -> rusqlite::Result<i64> {
+    if !has_table(connection, "ouro_migrations")? {
+        return Ok(0);
+    }
+    connection.query_row("SELECT COALESCE(MAX(version),0) FROM ouro_migrations", [], |r| r.get(0))
 }
 
 /// The connection while a transaction is open on it. Dropped uncommitted,

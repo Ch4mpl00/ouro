@@ -29,6 +29,7 @@ from check import IMAGE
 # `ID/variant` is a further mutant of one ID's mechanism.
 MODULES = {
     "contract_progress": dict(
+        deadlock=True,
         invariants=["E5"],
         temporal=["L1", "L2", "L3", "L4", "L5", "E5_delivery"],
         mutants={
@@ -42,6 +43,10 @@ MODULES = {
         fairness={},
     ),
     "contract_progress_tree": dict(
+        # A state where every run ended is legitimate: it stutters forever, and
+        # TLC reports it as a deadlock. The check stays on for the other two
+        # quotients, which passed with it before this one was added.
+        deadlock=False,
         invariants=["shape"],
         temporal=["L6", "L9"],
         mutants={
@@ -55,6 +60,7 @@ MODULES = {
         fairness={"wfClaim": ["L6"], "wfInternal": ["L6"], "wfNotice": ["L9"]},
     ),
     "contract_progress_trigger": dict(
+        deadlock=True,
         invariants=["L8_dormant", "L10_stable", "refusalStored", "shape"],
         temporal=["L7", "L8", "L10"],
         mutants={
@@ -89,15 +95,17 @@ MODULES = {
 }
 
 
-def tlc(path, module, prop, invariant):
+def tlc(path, module, prop, invariant, deadlock):
     (path / f"{prop}.cfg").write_text("INIT q_init\nNEXT q_step\n" + ("INVARIANT " if invariant else "PROPERTY ") + prop + "\n")
-    # A state where every run ended is legitimate: it stutters forever.
-    flags = ["-Xmx2g", "-cp"], ["tlc2.TLC", "-deadlock", "-workers", "2"]
+    # `-deadlock` turns the deadlock check off, for the quotients whose
+    # terminal states stutter (see MODULES).
+    flags = ["-Xmx2g", "-cp"], ["tlc2.TLC", *([] if deadlock else ["-deadlock"]), "-workers", "2"]
     config = ["-config", f"{prop}.cfg", "-metadir", f"states-{prop}"]
     command = ([JAVA, *flags[0], JAR, *flags[1], *config, f"{module}.tla"] if JAR else
                ["docker", "run", "--rm", "--platform", "linux/amd64", "--entrypoint", "java", "-v", f"{path}:/models", "-w", "/models", IMAGE,
                 *flags[0], "/opt/apalache/lib/apalache.jar", *flags[1], *config, f"{module}.tla"])
-    return subprocess.run(command, cwd=path, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=900).stdout
+    result = subprocess.run(command, cwd=path, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=900)
+    return result.stdout, result.returncode
 
 
 def check(module, spec, source, label, output):
@@ -114,12 +122,12 @@ def check(module, spec, source, label, output):
                             "--server-endpoint", os.environ.get("APALACHE_ENDPOINT", "localhost:8823")], stdout=f, check=True)
         properties = spec["invariants"] + spec["temporal"]
         with concurrent.futures.ThreadPoolExecutor(JOBS) as pool:
-            logs = list(pool.map(lambda prop: tlc(path, module, prop, prop in spec["invariants"]), properties))
-        for prop, log in zip(properties, logs):
+            logs = list(pool.map(lambda prop: tlc(path, module, prop, prop in spec["invariants"], spec["deadlock"]), properties))
+        for prop, (log, code) in zip(properties, logs):
             (output / f"temporal-{label}-{prop}.log").write_text(log)
             if "is violated" in log or "was violated" in log or "Temporal properties were violated" in log:
                 broken.append(prop)
-            elif "No error has been found" not in log:
+            elif code or "No error has been found" not in log:
                 raise RuntimeError(log)
             else:
                 # The summary line; progress lines group digits with a locale's separator.

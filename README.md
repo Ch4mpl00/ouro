@@ -460,7 +460,7 @@ the span the run was admitted in), the runtime clock's time and its kind:
 | `call_started`, `call_finished` | A call's dispatch (function, delivery, attempt, arguments) and answer (outcome, result or error, annotations) |
 | `listening`, `event_consumed`, `event_emitted` | A listen waits; a task consumes an event (a listen's, a joined child's outcome); `emit` hands one over |
 | `breaker_tripped` | The definition's breaker tripped, once, when the worker hands the notice on |
-| `run_held`, `run_released` | An operator froze or released a run (`Runtime::control`; actor, reason, and for a hold its note), once per request, for the run the command named |
+| `run_held`, `run_released` | An operator froze or released a run (`Runtime::control`; actor, reason, and for a hold its note), once per request, for the run the command named. The other operator commands (cancel, pause, resume, stop, respond) report no event of their own; the store has them (`Control::history`) |
 
 **Each fact once.** Replaying what an earlier execution recorded reports
 nothing: after a crash or a restart, the execution that takes the run over
@@ -495,7 +495,7 @@ other. Dry runs and replays are not reported to the host's observers.
 **Payloads.** Inputs, outputs, arguments, results and events are copied
 only when the host has an observer, and left out (`None`) when their JSON
 exceeds `Config::event_payload_bytes` (16 KiB by default; 0 leaves every
-one out). The run's secrets are redacted from every value and error. A run
+one out); an error's detail is not bounded, and goes to every observer as it is. The run's secrets are redacted from every value and error. A run
 cancelled while no execution holds it (an operator's or a parent's
 cancellation of a waiting run), a schedule slot the host refuses and a
 buffered slot the store promotes report nothing; the store has them
@@ -638,11 +638,12 @@ spending an interruption. A call already dispatched is not retracted, and a
 hold never changes an outcome: the worker keeps its lease (a held run's
 renewal extends it and still answers `Held`) until every call it dispatched
 has answered, however long that takes (the call's own timeout is the only
-bound), records the answer (the only step a held run commits) and then lets
-the run go. Released, the run goes on from that answer. A call left without
-an answer by a worker stop keeps its delivery rules (an at-least-once call is
-sent again after the release, an at-most-once one has an unknown outcome and
-never is). A held run starts no child. It stays live: it counts for overlap
+bound), records the answer (with the proof that a call did nothing, the only
+step a held run commits; a refusal before dispatch is recorded too) and then
+lets the run go. Released, the run goes on from that answer. A call left
+without an answer by a worker stop keeps its delivery rules (an at-least-once
+call is sent again after the release, an at-most-once one has an unknown
+outcome and never is). A held run starts no child. It stays live: it counts for overlap
 policies and the host ceiling, `inspect` and `list` show `held` (actor,
 reason, note, instant) on the run, and `counts` reports it as `held` instead
 of its frozen state. Holding is idempotent (a second hold keeps the first
@@ -811,12 +812,24 @@ Breaking changes (issue #24), for hosts written before it:
 - `ows::model::Schedule` gains `at` and `timezone`, and `ScheduleKind` gains
   `At`; code matching them exhaustively or building a `Schedule` must add
   them.
-- `Admitter::triggered` takes the trigger's `schedule` value (`$run.schedule`,
-  stored in the admission's `runtime`), and `ows::run::Host::runtime` carries
-  it as a `schedule` member, which is not part of `$runtime`.
+- `ows::run::Host::runtime` carries the trigger's `schedule` value
+  (`$run.schedule`, stored in the admission's `runtime`) as a `schedule`
+  member, which is not part of `$runtime`.
 - Stored rows keep their layout: a trigger's state gains `previous` and
   `done`, an admission's runtime gains `schedule`, all optional, so rows
   written earlier are read as they were (no first slot has a previous one).
+
+Breaking changes (issue #31), for hosts written before it:
+
+- A one-shot's run id is `schedule:<name>:at:<ms>` (it was
+  `schedule:<name>:at:<epoch>:<ms>`), and a reactivation with the same `at`
+  value does not run it again; a host that relied on an activation to repeat a
+  one-shot activates a version with another `at`. Runs already stored under
+  the old ids are not found by the new rule: the first activation after the
+  upgrade may run a one-shot once more.
+- `SchemaError` gains `Legacy` (a v0.1.0 SQLite file); `Runtime::start_at`
+  reports `run_admitted` to observers, and counts the run in the metrics only
+  through the built-in telemetry observer, as every other admission does.
 
 ## The DSL
 
@@ -1002,11 +1015,15 @@ is bounded by its collection and `retry` by its attempts.
   ends: a run, an overlap or ceiling skip (recorded in the trigger's state),
   a queue (the buffered slot starts later, from the queue, not the trigger)
   or a refusal. The trigger then stays as a dormant record (`done`, no due
-  time) that nothing re-arms, not even the end of its run; only a new
-  activation arms the version's instant again, in a new epoch and under a new
-  run id (`schedule:<name>:at:<epoch>:<ms>`). An instant already past at
-  activation fires at the next tick, whatever `catchup` says: nothing follows
-  a one-shot, so it can only run late or not at all.
+  time) that nothing re-arms, not even the end of its run. A one-shot fires
+  once per `at` value: its run id is the instant's
+  (`schedule:<name>:at:<ms>`), and an activation (a deploy, clearing a breaker
+  trip or a pause) arms the instant again, but a run that exists under that id
+  means it ran, so the slot is consumed (recorded as skipped, `already run`)
+  without a second run. A changed `at` is another id and runs. An instant
+  already past at its first activation fires at the next tick, whatever
+  `catchup` says: nothing follows a one-shot, so it can only run late or not
+  at all.
 
   A run started by a trigger reads `$run.schedule`: `{ kind, slot,
   previous }` (`every`, `cron`, `after`, `at` or `on`), with `slot` and
@@ -1145,17 +1162,21 @@ object is `ouro_`-prefixed (`ouro_rows`, `ouro_migrations`), and the schema
 version lives in `ouro_migrations`, as in Postgres: the file's
 `PRAGMA user_version` belongs to the host and is neither read nor set. The
 host's migrations never touch `ouro_` objects, and the engine never touches
-anything else. `open` sets `journal_mode = WAL` and `synchronous = FULL` for
-the whole file (a host that prefers other settings runs with its own and
-still gets engine durability only under these) and a 30-second busy timeout
-on its own connection. The adapter keeps one connection of its own: give the
+anything else. `open` switches the file to `journal_mode = WAL` (a property of
+the file, which stays after the adapter closes) and, on its own connection
+only, sets `synchronous = FULL` and a 30-second busy timeout: the host's
+connections keep their own settings, and engine durability holds for the
+commits made through the adapter's connection. The adapter keeps one connection of its own: give the
 host another connection per thread rather than sharing it, and set a busy
 timeout there too, since SQLite admits one writer and the engine's
 transactions begin immediately. A read-only open checks `ouro_migrations`.
 
 Breaking change (issue #27): stores written by v0.1.0 recorded their schema in
-`user_version`. They are not converted; opening one fails (its `ouro_rows`
-exists without a recorded version), so start a new file.
+`user_version`. They are not converted; opening one fails with
+`SchemaError::Legacy` (its `ouro_rows` exists without a recorded version),
+from `open` and from `open_read_only` alike, and the file is left as it is, so
+start a new file. `SchemaError` gains the variant: a host that matches it
+exhaustively adds an arm.
 
 ### Async seams
 

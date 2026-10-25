@@ -38,7 +38,7 @@ module contract {
   // `breaker`: the breaker tripped (a pause may stand on top of its trip;
   // resuming lifts the pause alone).
   type Catalog = { active: int, epoch: int, faults: int, tripped: bool, manual: bool, breaker: bool, trippedDigest: int,
-    triggerEpoch: int, due: int, slot: int, running: int, catchup: int, rearm: bool, once: bool,
+    triggerEpoch: int, due: int, slot: int, running: int, catchup: int, rearm: bool, once: bool, onceAt: int,
     armed: bool, notices: List[int], overlap: int, maxRuns: int, queued: int, queueSlot: int, queueInput: int, queueRefused: bool }
   type Durable = { stopped: bool, runs: List[Run], copies: List[Copy], catalog: Catalog,
     admissions: List[int], buffered: Set[(int, int)], fired: Set[(int, int)], skipped: Set[(int, int)], ingress: int -> int, ingressPayload: int -> int,
@@ -59,7 +59,7 @@ module contract {
   pure val emptyLocal: Local = { fence: 0, execution: 0, phase: 0, invocation: 0, stopped: false, permit: false }
   pure val initialDb: Durable = { stopped:false, runs: [emptyRun,emptyRun,emptyRun], copies: [], admissions: [0,0,0], budget: [0,0,0],
     buffered: Set(), fired: Set(), skipped: Set(), ingress: Map(), ingressPayload:Map(), catalog: { active: 1, epoch: 1,
-      faults: 0, tripped: false, manual: false, breaker: false, trippedDigest: 0, triggerEpoch: 1, due: 2, slot: 0, running: -1, catchup: 0, rearm:false, once:false,
+      faults: 0, tripped: false, manual: false, breaker: false, trippedDigest: 0, triggerEpoch: 1, due: 2, slot: 0, running: -1, catchup: 0, rearm:false, once:false, onceAt:-1,
       armed: true, notices: [], overlap:0, maxRuns:2, queued:-1, queueSlot:-1, queueInput:0, queueRefused:false } }
   pure val initial: Machine = { db: initialDb, workers: [emptyLocal,emptyLocal], now: 0,
     sends: [[0,0,0],[0,0,0],[0,0,0]], refusals: [[0,0,0],[0,0,0],[0,0,0]], observations: [], violations: Set(), faultsSeen: Set(), promoted: -1 }
@@ -325,11 +325,15 @@ module contract {
     } else if (op == "activate" and value >= 0) {
       // Version 1 has a schedule. Only an activation starts an epoch and only
       // an activation clears a trip; reported notices stay. The value picks
-      // the trigger: catchup (odd), `after` rearm (2, 3) or a one-shot (4).
+      // the trigger: catchup (odd), `after` rearm (2, 3) or a one-shot (4),
+      // whose instant is the activation's run index `r` and whose run id is
+      // the instant's (`onceAt`): another activation of the same instant
+      // meets the run it made, and a changed instant is another run.
       val epoch = c.epoch+1
-      { ...s,db:{ ...s.db,catalog:{ ...c,active:i+1,epoch:epoch,faults:0,tripped:false,manual:false,breaker:false,trippedDigest:0,catchup:value % 2,rearm:value == 2 or value == 3,once:value == 4,
+      { ...s,db:{ ...s.db,catalog:{ ...c,active:i+1,epoch:epoch,faults:0,tripped:false,manual:false,breaker:false,trippedDigest:0,catchup:value % 2,rearm:value == 2 or value == 3,once:value == 4,onceAt:if (value == 4) r else -1,
         triggerEpoch:epoch,due:if (i == 0) s.now+2 else -1,armed:i == 0,slot:0,queued:-1,queueSlot:-1 } } }
-    } else if (Set("fire","refuse").contains(op) and value >= 0 and c.due >= 0 and c.due <= s.now and c.triggerEpoch == c.epoch and not(c.tripped)) {
+    } else if (Set("fire","refuse").contains(op) and value >= 0 and c.due >= 0 and c.due <= s.now and c.triggerEpoch == c.epoch and not(c.tripped)
+      and (not(c.once) or r == c.onceAt)) {
       firePolicy(s,r,i,value,c.overlap,c.maxRuns,op == "refuse")
     } else if (op == "ingress" and s.db.ingress.keys().contains(i) and s.db.ingress.get(i) > s.now and s.db.ingressPayload.get(i) != value)
       observe(s,op,r,i,value,-1)
@@ -495,6 +499,9 @@ module contract {
         c.triggerEpoch == c.epoch and not(c.tripped) and
         // A one-shot's slot consumes it, however the slot ended.
         (not(c.once) or d.due < 0) and
+        // A one-shot's run id is its instant's, in every epoch: one instant
+        // never runs twice (M-4).
+        (not(c.once) or r == c.onceAt) and
         (if (fired) not(old.admitted) and execution.admitted and a.db.admissions.nth(r) == b.db.admissions.nth(r)+1
           else a.db.admissions == b.db.admissions)))
     // These monitors state the selected policy independently of firePolicy.

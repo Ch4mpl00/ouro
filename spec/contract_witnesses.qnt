@@ -215,10 +215,22 @@ module contract_witnesses {
   run oneShotTest = oneShot.expect(checked and m.db.admissions == [1,0,0] and m.db.fired == Set((2,0)) and
     m.db.catalog.armed and m.db.catalog.due < 0 and m.db.catalog.once and m.db.runs.nth(0).outcome == 1)
   // Its slot is consumed by a skip too: an earlier epoch's run is still live.
-  action oneShotBusy = init.then(ticks(2)).then(do("fire")).then(execute("activate",0,0,0,4,0)).then(ticks(2))
+  action oneShotBusy = init.then(ticks(2)).then(do("fire")).then(execute("activate",1,0,0,4,0)).then(ticks(2))
     .then(execute("fire",1,0,0,0,0)).then(ticks(4)).then(execute("fire",2,0,0,0,0))
   run oneShotBusyTest = oneShotBusy.expect(checked and m.db.admissions == [1,0,0] and m.db.skipped == Set((2,0)) and
     m.db.catalog.due < 0 and m.db.catalog.once)
+  // A one-shot fires once per instant (M-4). The activation's run index is
+  // the instant, and its run id is the instant's in every epoch. Activating
+  // the same instant again finds the run and consumes the slot as a skip; a
+  // changed instant is another run.
+  action oneShotReactivated = init.then(execute("activate",0,0,0,4,0)).then(ticks(2)).then(do("fire")).then(do("claim"))
+    .then(do("finish")).then(execute("activate",0,0,0,4,0)).then(ticks(2)).then(do("fire"))
+  run oneShotReactivatedTest = oneShotReactivated.expect(checked and m.db.admissions == [1,0,0] and
+    m.db.fired == Set((2,0)) and m.db.skipped == Set((3,0)) and m.db.catalog.epoch == 3 and
+    m.db.catalog.due < 0 and m.db.catalog.once and m.db.catalog.onceAt == 0)
+  action oneShotChanged = oneShotReactivated.then(execute("activate",1,0,0,4,0)).then(ticks(2)).then(execute("fire",1,0,0,0,0))
+  run oneShotChangedTest = oneShotChanged.expect(checked and m.db.admissions == [1,1,0] and
+    m.db.fired == Set((2,0),(4,0)) and m.db.catalog.due < 0 and m.db.catalog.onceAt == 1)
   // A trip refuses by content digest (V2). Version 2 has other content than
   // the tripped version 1: a pinned start of it is admitted and its fault is
   // not counted (no second notice, the count stays). Version 3 repeats
@@ -316,7 +328,7 @@ module contract_witnesses {
   // against the stores by crates/durable/tests/quint.rs.
   // The tail of the suite, a run of its own: a single chain this long exceeds
   // the evaluator's recursion limit.
-  run bridgeTail = emergencyStop.then(clearStop).then(stoppedQueue).then(resumedQueue).then(oneShot).then(oneShotBusy)
+  run bridgeTail = emergencyStop.then(clearStop).then(stoppedQueue).then(resumedQueue).then(oneShot).then(oneShotBusy).then(oneShotReactivated).then(oneShotChanged)
     .then(pinnedAdmitted).then(sameContentRefused).then(pinnedUncounted).then(heldReleased).then(heldDispatched)
     .then(heldChild).then(heldCancelled).then(heldClaimed).then(resumed).then(pauseActivated).then(resumeKeepsTrip)
     .then(pauseTrippedResumed).then(absentAdmitted).then(absentRefused).then(heldAnswered)

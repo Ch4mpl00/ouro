@@ -370,8 +370,8 @@ impl Runtime {
     /// run its built-in version for a run while the tripped one stays
     /// active. A pinned run counts toward the breaker only when its version
     /// is the active one, as every run does.
-    /// Starting an existing id returns that run if it was pinned at the same
-    /// version, and fails otherwise.
+    /// Starting an existing id returns that run if it belongs to `name` and
+    /// was admitted at `version` (pinned or not), and fails otherwise.
     pub async fn start_at(&self, id: &str, name: &str, version: u64, input: Value) -> anyhow::Result<SavedRun> {
         if let Some(saved) = self.store.get(id).await? {
             let a = &saved.admission;
@@ -380,8 +380,9 @@ impl Runtime {
             return Ok(saved);
         }
         let a = self.admitter().pinned(id, name, version, input).await?;
-        if self.store.admit(&a, self.clock.now_ms()).await? {
-            self.metrics.started(name);
+        let now = self.clock.now_ms();
+        if self.store.admit(&a, now).await? {
+            self.observers.admitted(&a, None, id, now);
         }
         self.store.get(id).await?.ok_or_else(|| anyhow::anyhow!("admitted run disappeared"))
     }
