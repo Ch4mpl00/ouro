@@ -1,3 +1,47 @@
+# Contract checking — 2026-10-25, a buffered slot keeps its place (#30)
+
+The engine now drains a definition's deferred queue (`drain_marked`) in the
+commit of every firing, `admit` and `start` of that definition, before the
+admission looks at the room. Until now a clear drained only a bounded batch of
+deferred definitions; one past the batch waited for a poll, and in between a
+later slot of the same trigger, or another start, took the room the buffered
+slot needs (the L7 finding of #28). `contract.qnt` already promotes right after
+the clear, so no contract model changed; the engine matches it. The smaller
+alternative, promoting the whole backlog in the clear's own commit, is
+unbounded; draining lazily at the admission costs one point read per admission.
+
+`contract_progress_trigger.qnt` restates the step as `settled` (used by
+`firing` and `starting`: the drain commits even when it trips the definition,
+which then changes the trigger or refuses the start). L7 no longer assumes
+that the stop is eventually cleared for good (`wfCalm`, the `calm` flag and the
+`settle` action are gone); a stop may recur forever. A poll is enabled only
+between a clear and the next stop, so it is assumed strongly fair (`sfPoll`,
+formerly `wfPoll`). The old L7 conflated slots (`queued` stays true when a
+firing promotes one slot and buffers the next in one commit); it now tells them
+apart by a parity bit `qa` that flips at every buffering, one parity at a time.
+Two mutants cover the new rule (`L7/order`: a firing that does not drain first,
+`L7/order/start`: a start that does not); both violate L7.
+
+`spec/contract_temporal.py` (native Apalache 0.62.4 server, TLC from the same
+jar on a portable JDK 21, three TLC processes of two workers; not the Docker
+stage `check.sh --only temporal`), all three quotients, all 33 variants met
+their targets; 451.7 s wall. Trigger quotient: 824,475 generated / 41,920
+distinct states, depth 22. Baseline holds every property; mutants `L7`,
+`L7/capacity`, `L7/stop`, `L7/order`, `L7/order/start` violate L7 (`L7/order`
+also L10, an effect of the quotient's parity state), `L8`, `L8/dormant`, `L10`,
+`L10/digest` as before; ablations `wfEndSched`, `wfEndOther`, `wfClear`,
+`sfPoll`, `sfFire`, `wfTick`, `wfReactivate`, `sfAdmit` each violate the
+properties that state them (`sfPoll`: L7). The witnesses (69 tests) pass.
+Simulation, symbolic and mutation stages were not rerun (`contract.qnt` and the
+other modules did not change); `contract-evidence.json` is not regenerated.
+
+The conformance suite gains `queue_order_after_clear` on every adapter: 1,002
+definitions with a buffered slot each, a stop, the first runs cancelled, a
+clear (whose batch of 1,000 skips the last two); then a later slot of one
+trigger must be buffered behind the older slot, and a manual start of the other
+definition must find the older slot promoted. Before the engine change it
+fails on memory, SQLite and Postgres (`Committed` where `Queued` is required).
+
 # Contract checking — 2026-10-25, hold and release of a run, manual pause (#29)
 
 The model gains held runs and an operator's pause (`manual`). H1: a held run

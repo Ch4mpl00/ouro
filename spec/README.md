@@ -229,8 +229,11 @@ by TLC exhaustively, with each fairness conjunct named and dropped in turn:
   refusals. Run outcomes, activations (any version and trigger kind) and
   starts are adversarial environment steps.
   - **L7** assumes that the trigger's live run and other runs eventually end,
-    that the stop is eventually cleared for good, and that due-run polls
-    continue. Not firing, activation or admissions.
+    that every stop is eventually cleared (it may recur forever) and that a
+    poll possible infinitely often happens (strong fairness). Not firing,
+    activation or admissions. Slots are told apart by a parity bit that flips
+    at every buffering, so a promotion followed by the next slot's buffering
+    is not mistaken for a slot that was never promoted.
   - **L8** assumes strong fairness of firing (interruptions and stops disable it
     repeatedly), advancing time and an eventual clear of the stop. Not run ends.
   - **L10** assumes a host that eventually activates after a trip, keeps
@@ -255,13 +258,11 @@ What the quotients are connected to, and what not:
   bounded batch at clearing, the rest at `due_as` polls) and promotion at the
   end of any run of the definition follow `drain_queues`, which `contract.qnt`
   simplifies to a promotion after every transition; the worker's notice
-  follows the heartbeat renewal in the runtime's execution loop. While a
-  buffered slot waits for its deferred drain, the engine admits a later slot of
-  the same trigger (`fire` consults the trigger's live runs and capacity, not
-  the marker) or another start into the room it needs. L7 holds under F, but a
-  buffered slot is not guaranteed to run before a later slot, and with stops
-  repeated forever it can be passed over forever, even under strong fairness of
-  polls (RESULTS.md records both counterexamples).
+  follows the heartbeat renewal in the runtime's execution loop. A firing, an
+  `admit` and a `start` drain their definition's deferred marker in their own
+  commit (`drain_marked`) before they look at the room, so a buffered slot
+  waiting for a poll is never passed over by a later slot of its trigger or by
+  another start; the quotient's `settled` is that step.
 - **Not modelled:** pause and resume, the skip/allow/replace policies (the
   contract's monitors cover them), event-triggered (`on`) schedules and ingress,
   missed slots under `catchup: none`, several triggers or buffered slots per

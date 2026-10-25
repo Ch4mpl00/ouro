@@ -821,20 +821,23 @@ under the stated fairness; the interpreter's generated budgets across crashes.
 
 Assume the runs that hold a buffered slot back eventually end (the trigger's
 live run and any run occupying the definition's capacity: L1 and L6 give this
-only for programs whose inputs arrive), the emergency stop is eventually
-cleared for good and due-run polls continue. Then the slot is eventually
+only for programs whose inputs arrive), every emergency stop is eventually
+cleared (the operator may stop again as often as it likes) and a due-run poll
+that is possible infinitely often happens. Then the slot is eventually
 promoted, or discarded by an activation or a trip. Promotion commits with the
-end that makes room for it, whichever run of the definition ends; a drain the
-stop deferred happens at clearing (a bounded batch of definitions) or at a later
-poll, and until then a later slot of the trigger or another start may take the
-room first. No
-fairness of firing, activation or admissions is assumed.
+end that makes room for it, whichever run of the definition ends. A drain the
+stop deferred happens at clearing (a bounded batch of definitions), at a later
+poll, or in the commit of the next admission to the definition (a firing, a
+start): that admission drains the definition's deferred queue first, so no
+later slot of the trigger and no other start takes the room a buffered slot
+needs ahead of it. No fairness of firing, activation or admissions is assumed.
 
 A queue position cannot be stranded. **Source:** [#19][I19]. **Fault:** a crash
 at the predecessor's terminal commit, a stop between the end and the promotion,
 an activation or trip racing promotion. **Mutant:** never promote; promote only
 at the end of the trigger's own run; drop the deferred drain when the stop is
-cleared. **Check:** `contract_progress_trigger::L7`; the overlap policy monitors
+cleared; admit a firing, or a start, without draining the deferred queue
+first. **Check:** `contract_progress_trigger::L7`; the overlap policy monitors
 of `contract.qnt`.
 
 #### L8 — A one-shot slot resolves and the trigger stays dormant [P/D, liveness]

@@ -20,14 +20,13 @@ module contract_progress_trigger {
   // one-shot's slot consumed it. gen: the activation epoch's parity (only an
   // activation changes it). sched: 0 none, 1 the trigger's live run, counted,
   // 2 one from an earlier epoch. oc/ou: other live runs, counted/uncounted.
-  // mark: a drain deferred by the emergency stop (`control_drain`). calm:
-  // the operator stopped for the last time (F: faults cease). owed: contents
+  // mark: a drain deferred by the emergency stop (`control_drain`). owed: contents
   // tripped since their last admission. broken: sticky stability monitors.
   type Trigger = {
     active: int, gen: int, tripped: bool, faults: int,
     armed: bool, kind: int, due: int, done: bool,
-    sched: int, oc: int, ou: int, queued: bool, qRefused: bool,
-    stopped: bool, mark: bool, calm: bool, owed: Set[int], broken: Set[str]
+    sched: int, oc: int, ou: int, queued: bool, qRefused: bool, qa: bool,
+    stopped: bool, mark: bool, owed: Set[int], broken: Set[str]
   }
   var s: Trigger
 
@@ -55,6 +54,20 @@ module contract_progress_trigger {
     else if (x.queued and x.sched == 0 and live(x) < maxRuns) promote(x) else x
   // `drain_pending`: a deferred drain, when the stop is cleared or polled.
   pure def deferred(x: Trigger): Trigger = drain(x)
+  // `drain_marked`: an admission (a firing, a start) drains its definition's
+  // deferred queue first, in its own commit, so a buffered slot is never
+  // passed over by the slot or the run that would take its room.
+  // The drain commits even when it trips the definition, which then refuses
+  // the admission (a changed trigger for a firing, a refusal for a start).
+  pure def settled(x: Trigger): Trigger = if (x.mark) deferred({ ...x, mark: false }) else x
+  pure def firing(x: Trigger, refused: bool): Trigger = {
+    val y = settled(x)
+    if (y.tripped or not(y.armed)) y else fireNext(y, refused)
+  }
+  pure def starting(x: Trigger, v: int): Trigger = {
+    val y = settled(x)
+    if (barred(y, v)) y else admitNext(y, v)
+  }
   // Stability monitors: within one epoch (no activation in the step) a
   // consumed one-shot stays dormant unless disarmed, and a trip stays with
   // its content refused.
@@ -87,7 +100,7 @@ module contract_progress_trigger {
     val consumed = x.kind == 2
     val after = { ...x,
       due: if (consumed or (x.kind == 1 and not(skip) and not(refused))) -1 else 0, done: consumed,
-      queued: x.queued or buffer, qRefused: if (buffer) refused else x.qRefused,
+      queued: x.queued or buffer, qRefused: if (buffer) refused else x.qRefused, qa: if (buffer) not(x.qa) else x.qa,
       sched: if (admit and not(refused)) 1 else x.sched,
       owed: if (admit and not(refused)) x.owed.exclude(Set(content(x.active))) else x.owed }
     if (admit and refused) observe(after, true, 2) else after
@@ -106,14 +119,14 @@ module contract_progress_trigger {
   action init = {
     nondet k = Set(0, 1, 2).oneOf()
     s' = { active: 1, gen: 0, tripped: false, faults: 0, armed: true, kind: k, due: 0, done: false,
-      sched: 0, oc: 0, ou: 0, queued: false, qRefused: false, stopped: false, mark: false, calm: false,
+      sched: 0, oc: 0, ou: 0, queued: false, qRefused: false, qa: false, stopped: false, mark: false,
       owed: Set(), broken: Set() }
   }
   action go(x: Trigger): bool = s' = monitor(s, x)
   // The scheduler: a due slot fires unless stopped or tripped; the host may
   // refuse its run (#15), or its admission may be interrupted (a transient
   // resource failure: the slot is kept and due again after a backoff).
-  action fire(refused: bool): bool = all { s.armed, s.due == 1, not(s.stopped), not(s.tripped), go(fireNext(s, refused)) }
+  action fire(refused: bool): bool = all { s.armed, s.due == 1, not(s.stopped), not(s.tripped), go(firing(s, refused)) }
   action fireAny = any { fire(false), fire(true) }
   action interrupt = all { s.armed, s.due == 1, not(s.stopped), not(s.tripped), go({ ...s, due: 0 }) }
   action tick = all { s.armed, s.due == 0, go({ ...s, due: 1 }) }
@@ -130,20 +143,19 @@ module contract_progress_trigger {
   action reactivate = all { s.tripped, activate }
   // Starts of other runs: at the active version, or pinned at a stored one.
   // Two representatives bound them; the runtime does not.
-  action pin(v: int): bool = all { not(s.stopped), not(barred(s, v)), s.oc + s.ou < 2, go(admitNext(s, v)) }
+  action pin(v: int): bool = all { not(s.stopped), not(barred(s, v)), s.oc + s.ou < 2, go(starting(s, v)) }
   // Any admission of one content (version 3 repeats version 1's text).
   action admitFirst = any { pin(1), pin(3) }
   action admitSecond = pin(2)
-  action halt = all { not(s.calm), not(s.stopped), go({ ...s, stopped: true }) }
+  action halt = all { not(s.stopped), go({ ...s, stopped: true }) }
   // Clearing drains a bounded batch of deferred definitions; one past the
   // batch waits for a due-run poll.
   action clear = all { s.stopped, nondet batch = Set(true, false).oneOf()
     go(if (batch and s.mark) deferred({ ...s, stopped: false, mark: false }) else { ...s, stopped: false }) }
   action poll = all { not(s.stopped), s.mark, go(deferred({ ...s, mark: false })) }
-  action settle = all { not(s.calm), go({ ...s, calm: true }) }
   action step = any {
     fireAny, interrupt, tick, endSched, endCounted, endUncounted, activate, pin(1), pin(2), pin(3),
-    halt, clear, poll, settle
+    halt, clear, poll
   }
 
   // Fairness, each conjunct named so the checker can drop it (ablation).
@@ -151,12 +163,14 @@ module contract_progress_trigger {
   // programs whose inputs arrive; an assumption here, not a consequence).
   temporal wfEndSched = endSched.weakFair(s)
   temporal wfEndOther = endCounted.weakFair(s) and endUncounted.weakFair(s)
-  // The operator eventually stops for the last time and clears the stop (F:
-  // no liveness claim holds through a permanent stop or outage).
-  temporal wfCalm = settle.weakFair(s)
+  // A stop is cleared (F: no liveness claim holds through a permanent stop or
+  // outage); the operator may stop again as often as it likes.
   temporal wfClear = clear.weakFair(s)
-  // Due-run polls keep coming while the store is not stopped.
-  temporal wfPoll = poll.weakFair(s)
+  // Due-run polls keep coming while the store is not stopped. A poll is
+  // enabled only between a clear and the next stop, so a stop toggled forever
+  // can defeat a weakly fair poll; strong fairness says a poll that is
+  // possible infinitely often happens.
+  temporal sfPoll = poll.strongFair(s)
   // The scheduler keeps polling due triggers; interruptions (and stops) may
   // disable a firing repeatedly, so it needs strong fairness (F).
   temporal sfFire = fireAny.strongFair(s)
@@ -169,7 +183,11 @@ module contract_progress_trigger {
 
   // L7: a buffered slot is eventually promoted, or discarded by an
   // activation or a trip.
-  temporal L7 = (wfEndSched and wfEndOther and wfCalm and wfClear and wfPoll).implies(s.queued.leadsTo(not(s.queued)))
+  // Slots are told apart by qa, which flips at every buffering: a firing that
+  // promotes the buffered slot and buffers the next one in one commit leaves
+  // `queued` true, yet resolves the earlier slot.
+  temporal L7 = (wfEndSched and wfEndOther and wfClear and sfPoll).implies(Set(true, false).forall(g =>
+    (s.queued and s.qa == g).leadsTo(not(s.queued and s.qa == g))))
   // L8: an armed one-shot's slot resolves and the trigger is dormant, unless
   // a trip disarmed it or an activation replaced it first.
   temporal L8 = (sfFire and wfTick and wfClear).implies(Set(0, 1).forall(g =>
