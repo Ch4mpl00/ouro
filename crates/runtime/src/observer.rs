@@ -156,8 +156,10 @@ pub enum EventKind {
     EventEmitted { event: Option<Value> },
     /// The definition's breaker tripped (the envelope names the run whose
     /// fault reached the threshold and the tripped version), reported once
-    /// by the worker whose hand-off acknowledged the notice.
-    BreakerTripped { epoch: u64, faults: u32, threshold: u32, error: WorkflowError },
+    /// by the worker whose hand-off acknowledged the notice. `digest` is the
+    /// tripped version's content digest: admissions of that content are
+    /// refused until an activation.
+    BreakerTripped { digest: String, epoch: u64, faults: u32, threshold: u32, error: WorkflowError },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -322,6 +324,7 @@ impl Observers {
             span: None,
             time_ms: now_ms,
             kind: EventKind::BreakerTripped {
+                digest: data["digest"].as_str().unwrap_or_default().to_owned(),
                 epoch: number("epoch"),
                 faults: u32::try_from(number("faults")).unwrap_or(u32::MAX),
                 threshold: u32::try_from(number("threshold")).unwrap_or(u32::MAX),
