@@ -720,7 +720,7 @@ serial bridge projecting every decision, conformance (restarts, failed commits,
 parent/child/grandchild, a race at the last unit) and the interpreter's
 generated budgets across crashes.
 
-### L. Progress obligations (5)
+### L. Progress obligations (10)
 
 These are temporal properties, not state invariants in the narrow model-checking
 sense. They accompany safety to rule out inert implementations.
@@ -793,6 +793,98 @@ Error cleanup is part of durability. **Source:** waiter failure in [DBOS][DBOS],
 **Check:** inject that error, restore storage, keep the same process alive, and
 assert a bounded test drain with another execution; then repeat across processes.
 
+L6–L10 cover the mechanisms added after v0.1.0 ([#28][I28]). Each states the
+fairness it needs and no more: dropping any one of its assumptions from the
+finite quotient produces a counterexample (spec/RESULTS.md). The workflow
+program, external events, run outcomes and the host's activation choices are
+never assumed fair.
+
+#### L6 — The jump budget ends every internal cycle [D, liveness]
+
+Under F (a runnable run is eventually taken by a compatible worker, and a worker
+holding a run eventually commits its next step), every runnable run eventually
+ends or waits for an external event, a timer or a joined child: no internal
+cycle of `then` jumps runs forever, whatever the program chooses at each step.
+The tree's jumps are bounded by B1's counter, which neither a restart nor a
+replaced owner resets; a refused jump never moves back (a catch continues past
+it, otherwise the run ends). Loops and retries are bounded by their collection
+and the host's attempt ceiling, child nesting by the host's depth ceiling; that
+only a jump moves back is the interpreter's property, not the quotient's.
+
+The budget turns an unbounded loop into a terminal outcome, not a stuck run.
+**Source:** [#8][I8], [README][README]. **Fault:** a crash between a jump's
+decision and its commit, lease takeover mid-cycle. **Mutant:** grant a jump
+without moving the counter. **Check:** `contract_progress_tree::L6` exhausted
+under the stated fairness; the interpreter's generated budgets across crashes.
+
+#### L7 — A buffered slot is promoted or discarded [P/D, liveness]
+
+Assume the runs that hold a buffered slot back eventually end (the trigger's
+live run and any run occupying the definition's capacity: L1 and L6 give this
+only for programs whose inputs arrive), the emergency stop is eventually
+cleared for good and due-run polls continue. Then the slot is eventually
+promoted, or discarded by an activation or a trip. Promotion commits with the
+end that makes room for it, whichever run of the definition ends; a drain the
+stop deferred happens at clearing (a bounded batch of definitions) or at a later
+poll, and until then a later slot of the trigger or another start may take the
+room first. No
+fairness of firing, activation or admissions is assumed.
+
+A queue position cannot be stranded. **Source:** [#19][I19]. **Fault:** a crash
+at the predecessor's terminal commit, a stop between the end and the promotion,
+an activation or trip racing promotion. **Mutant:** never promote; promote only
+at the end of the trigger's own run; drop the deferred drain when the stop is
+cleared. **Check:** `contract_progress_trigger::L7`; the overlap policy monitors
+of `contract.qnt`.
+
+#### L8 — A one-shot slot resolves and the trigger stays dormant [P/D, liveness]
+
+Under strong fairness of firing (interrupted admissions and stops may disable a
+due slot repeatedly; the scheduler keeps polling), advancing time and the stop
+eventually cleared, an armed one-shot's slot resolves (admission, skip, buffer
+or refusal) and leaves the trigger dormant, unless a trip disarmed it or an
+activation replaced it first. Dormancy is stable with no fairness at all:
+nothing but an activation makes the trigger due again (T2), no run's end
+included.
+
+A one-shot fires once per activation. **Source:** [#24][I24]. **Fault:** an
+interrupted admission, a stop at the due time, a crash at the firing commit.
+**Mutant:** a slot that does not consume the trigger; a one-shot's run that
+re-arms it at its end. **Check:** `contract_progress_trigger::L8` and
+`L8_dormant`; `oneShotTest` and the `T1/once`, `T2/once` mutants.
+
+#### L9 — A run's end reaches every owned descendant [P/D, liveness]
+
+Once a run ended (completion, fault or cancellation), every owned descendant is
+eventually terminal and no worker still executes it or any of them, even a
+descendant waiting for input that never arrives. The store's part is atomic
+(C3); what remains is the worker's: one executing a run that ended under it
+stops at its next lease renewal or fenced save, which fails because the run has
+no fence (or because storage is unavailable). The only assumption is that a
+holding worker keeps renewing; the descendants' own progress is not assumed.
+
+A cancelled subtree keeps no worker busy. **Source:** [#14][I14],
+[AGENTS][AGENTS]. **Fault:** a crash at the parent's terminal commit, a remote
+cancellation of a running child. **Mutant:** cascade only to direct children; a
+worker that keeps executing a cancelled run. **Check:**
+`contract_progress_tree::L9`; C3's monitor and conformance; handler cancellation
+tests.
+
+#### L10 — Admissions of tripped content resume only after an activation [P/D, liveness]
+
+Under a host that eventually activates after a trip and keeps starting runs of
+each content, with the stop eventually cleared, admissions of the tripped
+content digest eventually resume. Without an activation the refusal is stable,
+with no fairness: the trip stays, its digest is refused on every admission path,
+and only an activation (of any version, identical content included) ends it.
+
+Recovery from a trip is the host's explicit decision and remains available.
+**Source:** [#10][I10], [#23][I23]. **Fault:** a crash at the trip's commit, a
+repeated finish, an old epoch's completion. **Mutant:** an activation that
+leaves the trip; a trip that refuses by version number instead of content.
+**Check:** `contract_progress_trigger::L10` and `L10_stable`; V2's monitor,
+witnesses and mutants.
+
 ## 4. The fault × invariant matrix
 
 These are **predicted oracle obligations**, not measured mutant footprints. A
@@ -806,6 +898,14 @@ concurrent racers, lease expiry and storage disconnect rows. Issue #14 widened
 C3 from cancellation to every end of a parent and added no cell: the same rows
 can strand a live owned descendant at the parent's terminal commit, and a
 duplicate or stale finish is refused by the fence before it can end anything.
+L6–L10 (issue #28) add no columns either. Their predicted rows: L6 boundary
+crash, ambiguous commit, lease expiry, storage disconnect and version change;
+L7 boundary crash, ambiguous commit, concurrent racers, storage disconnect and
+version change; L8 boundary crash, ambiguous commit, concurrent racers, clock
+jump, storage disconnect and version change; L9 boundary crash, ambiguous
+commit, concurrent racers, lease expiry and storage disconnect; L10 boundary
+crash, ambiguous commit, duplicate delivery, concurrent racers and version
+change.
 
 Boundary crash B means injecting immediately before/after admission, intent,
 dispatch, external effect, response, result/checkpoint commit, event acceptance/
@@ -889,7 +989,7 @@ claims about the formulas above, with their premises made explicit:
 | E2's intent-before-dispatch ⇒ one special case of R3's dependency order | R3 also covers reads, choices, events, joins and task frontiers. |
 | L1 with F for an eligible post-error operation ⇒ L5's eventual-operation clause | L5 separately identifies reclaimable coordination and the same-process witness. Its general progress part is intentionally redundant. |
 
-Safety does not imply L1–L5: a system that accepts nothing or stops forever may
+Safety does not imply L1–L10: a system that accepts nothing or stops forever may
 preserve every safety predicate. Conversely, eventual terminal failure does not
 establish safety. A2 is atomicity/durability of transitions, not a claim that their
 business rules are correct; otherwise every safety property would be hidden inside
@@ -914,6 +1014,7 @@ separation targets because their observation dimensions differ:
 | X1 / X2 | In an otherwise isolated execution, permit one dispatch the mock rule marks / one replay read. |
 | X3 | Reuse a branch decision with no downstream effects. |
 | L2 / L3 / L4 / L5 | Respect all safety rules but strand, respectively, an expired lease, accepted copy, due slot, or local waiter. |
+| L6 / L7 / L8 / L9 / L10 | Respect all safety rules but, respectively, let a granted jump go uncounted, leave a buffered slot behind a run that made room, leave a one-shot's slot unconsumed, cascade only to direct children, or keep a trip through an activation. |
 
 These are not proofs that each target alone fails the entire 38-property set.
 Some necessarily violate umbrella clauses (for example L5 can also violate L1,
@@ -992,6 +1093,11 @@ public runtime exports already implement that rule.
 [I10]: https://github.com/Ch4mpl00/ouro/issues/10
 [I14]: https://github.com/Ch4mpl00/ouro/issues/14
 [I15]: https://github.com/Ch4mpl00/ouro/issues/15
+[I8]: https://github.com/Ch4mpl00/ouro/issues/8
+[I19]: https://github.com/Ch4mpl00/ouro/issues/19
+[I23]: https://github.com/Ch4mpl00/ouro/issues/23
+[I24]: https://github.com/Ch4mpl00/ouro/issues/24
+[I28]: https://github.com/Ch4mpl00/ouro/issues/28
 [RMR]: https://arxiv.org/html/2608.03836
 [DF]: https://www.microsoft.com/en-us/research/uploads/prod/2021/10/DF-Semantics-With-Proofs.pdf
 [DBOS]: https://www.dbos.dev/blog/how-to-test-durable-execution

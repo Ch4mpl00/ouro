@@ -32,6 +32,99 @@ checks, and the opt-in Postgres bridges (the Postgres conformance and
 scalability suites ran). `contract_progress.qnt` is unchanged, and
 `contract-evidence.json` is not regenerated (its source hashes are stale).
 
+# Contract checking — 2026-10-25, liveness of the post-v0.1.0 mechanisms (#28)
+
+Temporal stage only, on `main` 07ff233 plus this branch. `contract.qnt`,
+`contract_progress.qnt` and every other existing module are unchanged; two
+sibling quotients add L6–L10 (spec/README.md, "The progress quotients"). The
+stage ran as `APALACHE_ENDPOINT=localhost:8841 JAVA=… APALACHE_JAR=…
+spec/check.sh --only temporal`: Quint 0.33.0 compiling through a native Apalache
+0.62.4 server, TLC from the same jar on the portable JDK 21.0.8 (aarch64), three
+TLC processes at a time with two workers each. Earlier temporal timings came from
+the amd64-emulated Docker image and are not comparable.
+
+| Quotient | Properties | Generated / distinct states | Depth |
+| --- | --- | ---: | ---: |
+| `contract_progress` (unchanged) | E5 (invariant), L1–L5, E5_delivery | 1,748 / 373 | 13 |
+| `contract_progress_tree` | `shape` (B1, C3 restated), L6, L9 | 11,509 / 1,818 | 17 |
+| `contract_progress_trigger` | `L8_dormant`, `L10_stable`, `shape` (invariants), L7, L8, L10 | 1,159,897 / 57,432 | 25 |
+
+Every baseline property holds exhaustively. Each row below is one variant
+checked against every property of its own quotient; a mutant must violate its
+target, an ablation (one named fairness conjunct replaced by `true`) every
+property that states it. All 31 variants met that; the stage took **601.9 s**
+wall (`exit=0`). Seconds are per variant, all its properties, three at a time.
+
+| Variant | Violations | Seconds |
+| --- | --- | ---: |
+| baseline (`contract_progress`) | none | 4.556 |
+| E5 | E5 | 3.149 |
+| L1 | L1 | 3.06 |
+| L2 | L1, L2 | 2.935 |
+| L3 | L3 | 4.004 |
+| L4 | L4 | 3.002 |
+| L5 | L1, L2, L3, L4, L5 | 2.645 |
+| baseline (`contract_progress_tree`) | none | 2.007 |
+| L6: a granted jump does not move the counter | L6 | 1.671 |
+| L9: the end cascades to direct children only | `shape`, L9 | 1.768 |
+| L9/worker: a worker never notices its run ended | L9 | 1.759 |
+| ablation `wfClaim` | L6 | 1.761 |
+| ablation `wfInternal` | L6 | 1.512 |
+| ablation `wfNotice` | L9 | 1.755 |
+| baseline (`contract_progress_trigger`) | none | 32.591 |
+| L7: nothing promotes a buffered slot | L7 | 32.174 |
+| L7/capacity: only the trigger's own run's end promotes | L7 | 30.951 |
+| L7/stop: clearing or polling drops the deferred drain | L7 | 30.394 |
+| L8: a one-shot's slot does not consume it | L8 | 33.923 |
+| L8/dormant: a one-shot's run re-arms it at its end | `L8_dormant` | 100.885 |
+| L10: an activation leaves the trip | `L10_stable`, `shape`, L8, L10 | 11.088 |
+| L10/digest: the trip refuses by version number | `L10_stable`, `shape` | 63.923 |
+| ablation `wfEndSched` | L7 | 35.129 |
+| ablation `wfEndOther` | L7, L10 | 16.645 |
+| ablation `wfCalm` | L7 | 35.101 |
+| ablation `wfClear` | L7, L8, L10 | 10.736 |
+| ablation `wfPoll` | L7 | 37.161 |
+| ablation `sfFire` | L8 | 27.776 |
+| ablation `wfTick` | L8 | 27.951 |
+| ablation `wfReactivate` | L10 | 20.3 |
+| ablation `sfAdmit` | L10 | 19.547 |
+
+No obligation turned out false under its stated fairness. Off-target cells are
+exhaustive within each quotient; the L10 mutant's L8 violation is a consequence
+(a trip kept through an activation leaves the newly armed one-shot unable to
+fire), not a separation claim. `wfEndOther` in L10 is needed only because
+the quotient bounds other live runs at two; the runtime admits a start whatever
+else is live, so the runtime needs less than the quotient's premise states.
+
+**The deferred drain can be passed over.** The `wfCalm` ablation shows that L7
+needs the stop to be cleared for good: a stop toggled forever keeps a deferred
+drain from ever reaching a poll. With `wfPoll` strengthened to strong fairness
+and `wfCalm` still dropped, TLC (3.7 s) finds runs where, between a clear whose
+batch skipped the definition and the next poll, other admissions take the room
+the buffered slot needs, forever: once a later slot of the same trigger (the
+engine's `fire` reads the trigger's live runs and capacity, not the
+`control_drain` marker), once pinned starts. Reproduce by replacing
+`poll.weakFair(s)` with `poll.strongFair(s)` and `settle.weakFair(s)` with
+`true` in a copy and checking L7. This is not an L7 counterexample (F excludes
+an operator stopping forever), and no safety ID forbids it, but it departs from
+`contract.qnt`, whose `settle` promotes right after clearing with no batch, so
+there a buffered slot always precedes later slots. If slot order is meant to
+hold, `fire` could drain its own trigger's deferred queue before admitting; this
+branch does not change the engine.
+
+Not run for this revision: the simulation, witnesses, symbolic and mutation
+stages (no model they read changed; all Quint modules typecheck, 0.6–8.3 s each),
+and `contract-evidence.json` was not regenerated (`evidence.py` now knows L6–L10
+and which quotient states each; it needs the mutation stage's results and still
+lacks S1, which predates this branch).
+
+| Rust check (`CARGO_HOME=/private/tmp/ouro-cargo`) | Result | Time |
+| --- | --- | --- |
+| `cargo fmt --all -- --check` | Pass | 1 s |
+| `cargo clippy --workspace --all-targets -- -D warnings` | Pass | 46 s |
+| `OURO_REQUIRE_QUINT=1 cargo test --workspace --no-fail-fast` | 258 passed, 0 failed, 4 ignored (the opt-in Postgres MBT bridges and benchmarks); 21 CTK scenarios; serial and concurrent bridges on memory and SQLite | 403 s |
+| Prohibited-name scan of `crates`, `examples` | Empty | |
+
 # Contract checking — 2026-10-24, schedule overlap (#19)
 
 Quick checks only, on the combined #14/#15/#19 model. The policy and host
