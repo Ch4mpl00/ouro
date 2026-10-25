@@ -154,9 +154,11 @@ impl Observer for Spans {
                 self.tasks.lock().unwrap().insert(reference.to_string(), task);
             }
             Event::TaskCompleted { reference, .. } => self.end_task(reference, "completed", None),
-            Event::TaskFaulted { reference, error } => self.end_task(reference, "faulted", Some(error.to_string())),
+            Event::TaskFaulted { reference, error } | Event::TaskInterrupted { reference, error } => {
+                self.end_task(reference, "faulted", Some(error.to_string()))
+            }
             Event::TaskSuspended { reference, .. } => self.end_task(reference, "waiting", None),
-            Event::TaskSkipped { .. } | Event::SwitchCase { .. } | Event::TaskRetrying { .. } => {}
+            _ => {}
         }
     }
 }
