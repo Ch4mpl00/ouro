@@ -143,7 +143,7 @@ fn shipping(dispatches: Arc<Dispatches>) -> Registry {
     registry
 }
 
-/// The README's example: an unknown create is looked up, never sent again.
+/// The example in `docs/call-outcomes.md`: an unknown create is looked up, never sent again.
 const SHIP: &str = r#"do:
   - ship:
       try:
@@ -609,7 +609,7 @@ async fn a_cancelled_long_handler_is_dropped_and_its_call_keeps_its_intent() {
     }
 }
 
-/// The README's definition, as it is printed there.
+/// The definition of `docs/call-outcomes.md`, as it is printed there.
 const README: &str = r#"do:
   - ship:
       try:

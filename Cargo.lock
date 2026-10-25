@@ -2282,6 +2282,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "ouro-quickstart-example"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "ouro-runtime",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
 name = "ouro-restart-example"
 version = "0.1.0"
 dependencies = [

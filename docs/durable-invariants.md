@@ -89,7 +89,7 @@ promise survival of a process that owns the only copy.
 
 ### Sources and their limits
 
-- **[README][README], [store API][API], [runtime exports][RAPI], [OWS README][OWS],
+- **[README][README] and its reference pages in this directory, [store API][API], [runtime exports][RAPI], [OWS README][OWS],
   [repository conventions][AGENTS]** supply ouro's vocabulary and promises.
 - **[Issue #1][I1], all four comments**: [positioning][I1P], [storage and evidence][I1S],
   [scope correction][I1C], [invariant gaps][I1G]. The scope correction supersedes
