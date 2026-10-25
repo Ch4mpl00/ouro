@@ -2045,6 +2045,37 @@ async fn a_catch_naming_the_unknown_type_reconciles_an_unknown_at_most_once_outc
         assert!(matches!(&status, Status::Faulted(e) if e.type_ == CALL_UNKNOWN), "{filter}: {status:?}");
         assert_eq!((shipments.count("create"), shipments.count("lookup")), (1, 0), "{filter}");
     }
+    // A catch that names the type but does not take this error (its guard,
+    // or another property of its filter) passes it on as unknown as it came:
+    // an enclosing catch-all written for definite failures never sees it.
+    for inner in [
+        "errors: { with: { type: urn:ouro:errors:call.unknown } }\n              when: '${ false }'",
+        "errors: { with: { type: urn:ouro:errors:call.unknown } }\n              exceptWhen: '${ true }'",
+        "errors: { with: { type: urn:ouro:errors:call.unknown, status: 500 } }",
+    ] {
+        let shipments =
+            Shipments::new(|_| Err(CallFailure::answer(WorkflowError::unknown_outcome("timed out after send"))));
+        h.functions = shipments.clone();
+        let wf = workflow(&format!(
+            r#"do:
+  - outer:
+      try:
+        - ship:
+            try:
+              - create: {{ call: create }}
+            catch:
+              {inner}
+              do:
+                - lookup: {{ call: lookup, with: {{ reference: x }} }}
+      catch:
+        do:
+          - compensate: {{ set: {{ compensated: true }} }}
+"#
+        ));
+        let status = drive(&h, &time, &wf, &Store::default()).await;
+        assert!(matches!(&status, Status::Faulted(e) if e.type_ == CALL_UNKNOWN), "{inner}: {status:?}");
+        assert_eq!((shipments.count("create"), shipments.count("lookup")), (1, 0), "{inner}");
+    }
 }
 
 // A crash between the dispatch and the commit of its answer leaves the same
