@@ -780,6 +780,8 @@ async fn decided(backend: &Arc<dyn AtomicBackend>, metrics: &Metrics) -> anyhow:
     // activation admits again.
     let mut refused = a.clone();
     refused.id = "decided:refused".into();
+    // The tripped content's version: admissions are refused by content digest.
+    refused.version = v2.version;
     metrics.reset();
     assert!(s.admit(&refused, 0).await.unwrap_err().is::<ouro_durable::DefinitionTripped>());
     let counts = metrics.counts();

@@ -381,13 +381,40 @@ pub async fn run_all(factory: impl AsyncFn(&str) -> anyhow::Result<TestStore>) -
     assert_eq!(trip.run, "fault2");
     assert_eq!(s.get("fault0").await?.unwrap().admission.version, second.version);
     assert!(s.activate("workflow", 99, 0).await.is_err());
-    // A trip refuses a pinned admission too: V2 admits nothing, of any version.
+    // A trip refuses an admission by content digest: a pinned start of other
+    // content is admitted and never counted, the same content under another
+    // version number is refused.
+    assert_eq!(trip.digest, digest_of("second"));
     let mut again = pinned_at_first.clone();
     again.id = "pinned-again".into();
-    assert!(s.start(&again, 0).await.unwrap_err().is::<DefinitionTripped>());
+    let f = s.start(&again, 0).await?.expect("other content is admitted while tripped");
+    let seen = s.inspect_control("pinned-again").await?.unwrap();
+    assert!(seen.pinned && seen.snapshot.run.epoch.is_none());
+    assert_eq!(seen.digest, digest_of("first"));
+    s.finish(&f, &Status::Faulted(WorkflowError::runtime("fault")), 0, 3).await?;
+    let after = s.definitions("workflow").await?;
+    assert_eq!((after.consecutive_faults, after.tripped.as_ref()), (3, Some(&trip)), "not counted");
+    assert_eq!(s.notices(10).await?.len(), 1, "no second notice");
+    let copy = s.save_definition("workflow", "second").await?;
+    assert_eq!(copy.digest, second.digest);
+    let mut same = admission("same-content");
+    same.version = copy.version;
+    same.definition = copy.yaml.clone();
+    same.runtime = json!({ PINNED: true });
+    assert!(s.start(&same, 0).await.unwrap_err().is::<DefinitionTripped>(), "same content, other number");
+    assert!(s.get("same-content").await?.is_none());
     assert!(s.inspect_control("pinned").await?.unwrap().pinned, "the run admitted before the trip is kept");
+    let versions = s.definitions("workflow").await?.versions;
+    assert_eq!(
+        versions.values().map(|v| v.digest.clone()).collect::<Vec<_>>(),
+        [digest_of("first"), digest_of("second"), digest_of("second")]
+    );
+    report.operations += 6;
+    report
+        .witnesses
+        .insert("a trip refuses by content digest: other content is admitted uncounted, same content is not");
     report.operations += 2;
-    report.witnesses.insert("a pinned run is not the breaker's observation and a trip refuses a pinned admission");
+    report.witnesses.insert("a pinned run is not the breaker's observation");
     report.operations += 13;
     report.witnesses.insert("breaker trips without changing the active version or pinned runs");
     decisions(&factory, &mut report).await?;
@@ -687,7 +714,7 @@ pub async fn run_all(factory: impl AsyncFn(&str) -> anyhow::Result<TestStore>) -
         audit(&*s).await?;
     }
     report.witnesses.insert("finite histories drain every live listener");
-    assert_eq!(report.witnesses.len(), 28);
+    assert_eq!(report.witnesses.len(), 29);
     let t = factory("concurrent-claims").await?;
     report.cases += 1;
     t.store.admit(&admission("r"), 0).await?;
@@ -838,6 +865,7 @@ async fn definition_queries(
     assert_eq!(summary.name, "workflow");
     let never = VersionSummary {
         version: 1,
+        digest: digest_of("old"),
         activated_ms: None,
         activated_epoch: None,
         activated_by: None,
@@ -845,6 +873,7 @@ async fn definition_queries(
     };
     let released = VersionSummary {
         version: 2,
+        digest: digest_of(control_definition_yaml()),
         activated_ms: Some(5),
         activated_epoch: Some(1),
         activated_by: Some("operator".into()),
@@ -960,7 +989,10 @@ async fn definition_queries(
     assert_eq!((reactivated.epoch, reactivated.consecutive_faults), (2, 0));
     // A reactivation is the version's latest activation, unattributed here.
     let again = VersionSummary { activated_ms: Some(6), activated_epoch: Some(2), ..never.clone() };
-    assert_eq!(reactivated.versions, vec![never.clone(), VersionSummary { version: 2, ..again }]);
+    assert_eq!(
+        reactivated.versions,
+        vec![never.clone(), VersionSummary { version: 2, digest: digest_of(control_definition_yaml()), ..again }]
+    );
     assert!(reactivated.tripped.is_none());
     assert_eq!(reactivated.schedules[0].next_due_ms, Some(10));
     // A page racing activation must observe the old catalog and its triggers,
@@ -1719,6 +1751,7 @@ async fn decisions(
     let trip = Trip {
         manual: None,
         version: two.version,
+        digest: digest_of("two"),
         epoch: 2,
         faults: 2,
         threshold: 2,
@@ -1733,12 +1766,14 @@ async fn decisions(
     assert_eq!(notices.len(), 1);
     assert_eq!(notices[0].1, trip.event("w"));
     assert_eq!((notices[0].1["type"].as_str(), notices[0].1["id"].as_str()), (Some(TRIPPED), Some("tripped:2")));
-    // Tripped, no new run is admitted, by any path and of any version, with
+    // Tripped, no new run of the tripped content is admitted, by any path, with
     // a typed refusal in the admission's commit; an existing run is joined.
     let tripped = |e: anyhow::Error| e.downcast_ref::<DefinitionTripped>().map(|t| (t.name.clone(), t.epoch));
     let expected = Some(("w".to_string(), 2));
     assert_eq!(tripped(s.admit(&run_of("refused", two.version), 6).await.unwrap_err()), expected);
-    assert_eq!(tripped(s.start(&run_of("refused", one.version), 6).await.unwrap_err()), expected);
+    // Other content (version one) is admitted, uncounted; this is the digest rule.
+    assert!(s.start(&run_of("other-content", one.version), 6).await?.is_some());
+    assert_eq!(s.get("other-content").await?.unwrap().epoch, None);
     let parent = s.start(&admission("parent"), 6).await?.unwrap();
     let link = ChildLink { parent: "parent".into(), key: "child".into(), reference: "/child".into() };
     let before = s.inspect("parent").await?;

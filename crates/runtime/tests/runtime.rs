@@ -1720,7 +1720,7 @@ async fn a_run_started_at_a_version_keeps_it_without_activating_it() {
     assert_eq!(rt.get("p").await.unwrap().unwrap().outcome, Some(Status::Completed(json!({"result":"first"}))));
 }
 #[tokio::test]
-async fn a_pinned_start_is_checked_like_any_start_and_a_trip_refuses_it() {
+async fn a_pinned_start_is_checked_like_any_start_and_a_trip_refuses_only_its_content() {
     let store = Arc::new(durable::memory::memory());
     let time: Arc<dyn Clock> = Arc::new(Time::default());
     let counted = counter_registry(Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
@@ -1745,9 +1745,29 @@ async fn a_pinned_start_is_checked_like_any_start_and_a_trip_refuses_it() {
         rt.drive(id, &stop).await.unwrap();
     }
     assert!(rt.definitions("workflow").await.unwrap().tripped.is_some());
-    let e = rt.start_at("p", "workflow", good.version, json!({})).await.unwrap_err();
-    assert!(e.is::<durable::DefinitionTripped>(), "{e:#}");
-    // An activation clears the trip; the pinned start then works again.
-    rt.activate("workflow", good.version).await.unwrap();
-    rt.start_at("p", "workflow", bad.version, json!({})).await.unwrap();
+    // The tripped content is refused by any path and version number; other
+    // content runs pinned, uncounted, while the tripped version stays active.
+    let copy = rt
+        .save("workflow", &yaml("  - fail: { raise: { error: { type: 'urn:test:failure', status: 500 } } }"))
+        .await
+        .unwrap();
+    for refused in [
+        rt.start_at("c", "workflow", copy.version, json!({})).await,
+        rt.start("n", "workflow", json!({})).await.map(|_| unreachable!()),
+    ] {
+        assert!(refused.unwrap_err().is::<durable::DefinitionTripped>());
+    }
+    let before = rt.definitions("workflow").await.unwrap();
+    rt.start_at("p", "workflow", good.version, json!({})).await.unwrap();
+    assert_eq!(rt.drive("p", &stop).await.unwrap(), Some(Status::Completed(json!({"result":"ok"}))));
+    rt.start_at("p2", "workflow", good.version, json!({})).await.unwrap();
+    assert_eq!(rt.definitions("workflow").await.unwrap(), before, "a pinned run changes nothing of the trip");
+    assert_eq!(
+        before.versions[&good.version].digest,
+        rt.definitions("workflow").await.unwrap().versions[&good.version].digest
+    );
+    assert_eq!(before.versions[&bad.version].digest, before.versions[&copy.version].digest);
+    // An activation of even the identical content clears the trip.
+    rt.activate("workflow", copy.version).await.unwrap();
+    rt.start_at("q", "workflow", bad.version, json!({})).await.unwrap();
 }

@@ -198,11 +198,30 @@ module contract_witnesses {
     .then(execute("fire",1,0,0,0,0)).then(ticks(4)).then(execute("fire",2,0,0,0,0))
   run oneShotBusyTest = oneShotBusy.expect(checked and m.db.admissions == [1,0,0] and m.db.skipped == Set((2,0)) and
     m.db.catalog.due < 0 and m.db.catalog.once)
+  // A trip refuses by content digest (V2). Version 2 has other content than
+  // the tripped version 1: a pinned start of it is admitted and its fault is
+  // not counted (no second notice, the count stays). Version 3 repeats
+  // version 1's content: a pinned start of it is refused.
+  action pinnedAdmitted = breaker.then(execute("pin",2,0,1,5,0)).then(execute("claim",2,0,0,0,0))
+    .then(execute("finish",2,0,0,1,0))
+  run pinnedAdmittedTest = pinnedAdmitted.expect(checked and m.db.admissions == [1,1,1] and
+    m.db.catalog.tripped and m.db.catalog.trippedDigest == 1 and m.db.catalog.faults == 2 and m.db.catalog.notices == [1] and
+    m.db.runs.nth(2).version == 2 and m.db.runs.nth(2).epoch == 0 and m.db.runs.nth(2).outcome == 2)
+  action sameContentRefused = breaker.then(execute("pin",2,0,2,5,0))
+  run sameContentRefusedTest = sameContentRefused.expect(checked and m.db.admissions == [1,1,0] and
+    m.db.catalog.tripped and not(m.db.runs.nth(2).admitted))
+  // Untripped, a pinned run of a version other than the active one never
+  // counts, however often it fails.
+  action pinnedUncounted = init.then(execute("pin",0,0,1,3,0)).then(execute("claim",0,0,0,0,0))
+    .then(execute("finish",0,0,0,1,0)).then(execute("pin",1,0,1,4,0)).then(execute("claim",1,0,0,0,0))
+    .then(execute("finish",1,0,0,1,0))
+  run pinnedUncountedTest = pinnedUncounted.expect(checked and m.db.catalog.faults == 0 and not(m.db.catalog.tripped) and
+    m.db.admissions == [1,1,0] and m.db.runs.nth(0).epoch == 0 and m.db.runs.nth(1).outcome == 2)
   // Every history above in one trace (each starts with init), replayed
   // against the stores by crates/durable/tests/quint.rs.
   run bridgeSuite = continuation.then(unknown).then(mailbox).then(expiry).then(child).then(childFinish).then(grandchild).then(activation)
     .then(deadline).then(compatibility).then(dry).then(replay).then(schedule).then(breaker).then(rearm)
     .then(noCatchup).then(overlap).then(ingress).then(ingressExpiry).then(redispatch).then(protectedUnknown)
     .then(notExecuted).then(errorResponse).then(conflict).then(release).then(staleFence).then(admission)
-    .then(successResetsBreaker).then(noRollback).then(reactivation).then(broadcast).then(retention).then(budget).then(skipPolicy).then(allowPolicy).then(queuePolicy).then(replacePolicy).then(ceilingPolicy).then(skipCrash).then(allowCrash).then(queueCrash).then(replaceCrash).then(refused).then(oldCompletionPromotes).then(queuedRefusal).then(emergencyStop).then(clearStop).then(stoppedQueue).then(resumedQueue).then(oneShot).then(oneShotBusy)
+    .then(successResetsBreaker).then(noRollback).then(reactivation).then(broadcast).then(retention).then(budget).then(skipPolicy).then(allowPolicy).then(queuePolicy).then(replacePolicy).then(ceilingPolicy).then(skipCrash).then(allowCrash).then(queueCrash).then(replaceCrash).then(refused).then(oldCompletionPromotes).then(queuedRefusal).then(emergencyStop).then(clearStop).then(stoppedQueue).then(resumedQueue).then(oneShot).then(oneShotBusy).then(pinnedAdmitted).then(sameContentRefused).then(pinnedUncounted)
 }

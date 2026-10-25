@@ -18,6 +18,8 @@ def op(name, r=0, w=0, i=0, value=0, fault=0):
     return name,r,w,i,value,fault
 CALL = [op("intent"),op("dispatch"),op("result")]
 TICKS = [op("tick")]*4
+# A breaker trip at threshold 2: two runs fault.
+TRIP = BOOT+[op("finish",value=1),op("admit",r=1),op("claim",r=1),op("finish",r=1,value=1)]
 # Replacements affect transition mechanisms only, never the oracle formulas.
 MUTANTS = {
  "S1": ('else if (s.db.stopped and Set(', 'else if (false and Set(', [op("stop",value=1),op("admit")]),
@@ -55,6 +57,11 @@ MUTANTS = {
  "T3": ('owner:w, generation:execution.generation+1, lease:s.now+4','owner:w, generation:execution.generation+1, lease:s.now+4, deadline:s.now+8',BOOT+TICKS+[op("claim")]),
  "V1": ('active:i+1,epoch:epoch','active:c.active,epoch:epoch',[op("activate",i=1)]),
  "V2": ('val counted = execution.epoch == c.epoch','val counted = true',BOOT+[op("activate"),op("finish",value=1)]),
+ # A trip that ignores digests refuses every pinned start; or admits every one.
+ "V2/digest": ('and not(barred(c,i+1)))\n      observe(pinRun','and not(c.tripped))\n      observe(pinRun',TRIP+[op("pin",r=2,i=1,value=5)]),
+ "V2/same-content": ('and not(barred(c,i+1)))\n      observe(pinRun','and true)\n      observe(pinRun',TRIP+[op("pin",r=2,i=2,value=5)]),
+ # A pinned run of another version carries the active epoch and so counts.
+ "V2/pinned-counts": ('epoch:if (version == c.active) c.epoch else 0','epoch:c.epoch',[op("pin",i=1,value=3),op("claim"),op("finish",fault=0,value=1)]),
  "V3": ('execution.lease <= s.now and compatible(execution.app,w)','execution.lease <= s.now',[op("admit",i=1),op("claim",w=1)]),
  "O1": ('{ ...persisted.workers.nth(actor),stopped:true,phase:0,permit:false }','{ ...persisted.workers.nth(actor),stopped:false,phase:1,permit:false }',BOOT+[op("intent",fault=2),op("dispatch")]),
  "O2": ('x.outcome != 0 and s.now >= x.ended+5','true',BOOT+[op("sweep")]),

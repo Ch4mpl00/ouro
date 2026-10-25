@@ -248,7 +248,9 @@ async fn every_event_kind_is_reported_in_its_envelope() {
     );
     let tripped = events.iter().find(|e| kind(e) == "breaker_tripped").unwrap();
     assert_eq!((tripped.run_id.as_str(), tripped.definition.as_str()), ("b", "broken"));
-    assert!(matches!(&tripped.kind, EventKind::BreakerTripped { faults: 1, threshold: 1, .. }));
+    assert!(
+        matches!(&tripped.kind, EventKind::BreakerTripped { faults: 1, threshold: 1, digest, .. } if digest.len() == 64)
+    );
     // Spans: a task's events carry its span, a call's its function span,
     // the run's its drive's root.
     provider.force_flush().unwrap();

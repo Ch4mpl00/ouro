@@ -47,6 +47,12 @@ struct StoredRun {
     /// read as a run without evidence.
     version: u32,
     run: SavedRun,
+    /// The content digest the admitted version had in the catalog when the
+    /// run was admitted, copied from there and never recomputed: empty for
+    /// a version the catalog did not hold. Admissions and trips compare
+    /// stored digests only, so a later change to how digests are computed
+    /// cannot alter the meaning of rows already written.
+    digest: String,
     awaits: BTreeMap<String, i64>,
     listeners: BTreeMap<String, Vec<String>>,
     subscriptions: BTreeMap<String, Vec<String>>,
@@ -125,7 +131,8 @@ async fn run(rows: &mut dyn Transaction, id: &str) -> anyhow::Result<StoredRun> 
 /// kept a predecessor and its triggers for a breaker rollback, and a boolean
 /// trip) is refused, never read as a definition that cannot be tripped.
 /// 4: each version's latest activation (`Definitions::activations`).
-const DEFINITIONS_VERSION: u64 = 4;
+/// 5: each version's content digest, and the digest a trip refuses by.
+const DEFINITIONS_VERSION: u64 = 5;
 async fn load_definitions(rows: &mut dyn Transaction, name: &str) -> anyhow::Result<Option<Definitions>> {
     let Some(value) = rows.get("definitions", name).await? else { return Ok(None) };
     Ok(Some(decode_definitions(name, value)?))
@@ -383,8 +390,10 @@ fn claim_run(snapshot: &mut StoredRun, now: i64, owner: &str) -> anyhow::Result<
 }
 /// Admits a run once. Its admission instant and the activation epoch it
 /// belongs to (when it runs the active version) are fixed here. A tripped
-/// definition admits no new run, of any version and by any path, in the
-/// same commit that reads the trip; an existing run is still joined.
+/// definition refuses, by any path, a new run whose definition has the
+/// tripped content digest, whatever its version number, in the same commit
+/// that reads the trip; other content is admitted (a pinned start) and never
+/// counts toward the breaker. An existing run is still joined.
 async fn insert(rows: &mut dyn Transaction, admission: &Admission, now: i64) -> anyhow::Result<bool> {
     let Some(snapshot) = admitted(rows, admission, now).await? else { return Ok(false) };
     store_run(rows, &snapshot).await?;
@@ -398,7 +407,15 @@ async fn admitted(rows: &mut dyn Transaction, admission: &Admission, now: i64) -
     }
     running(rows).await?;
     let defs = load_definitions(rows, &admission.name).await?;
-    if let Some(trip) = defs.as_ref().and_then(|d| d.tripped.as_ref()) {
+    // Stored digests only (`Definition::digest`, `Trip::digest`): nothing is
+    // hashed here. A version the catalog does not hold has no digest and is
+    // never the tripped content.
+    let digest =
+        defs.as_ref().and_then(|d| d.versions.get(&admission.version)).map_or_else(String::new, |d| d.digest.clone());
+    if let Some(trip) = defs.as_ref().and_then(|d| d.tripped.as_ref())
+        && !digest.is_empty()
+        && digest == trip.digest
+    {
         return Err(trip.refusal(&admission.name).into());
     }
     let epoch = defs.filter(|d| d.active == Some(admission.version)).map(|d| d.epoch);
@@ -420,6 +437,7 @@ async fn admitted(rows: &mut dyn Transaction, admission: &Admission, now: i64) -
             annotations: Default::default(),
         },
         version: VERSION,
+        digest,
         awaits: BTreeMap::new(),
         listeners: BTreeMap::new(),
         subscriptions: BTreeMap::new(),
@@ -1252,6 +1270,7 @@ async fn breaker(
                 let trip = Trip {
                     manual: None,
                     version: run.admission.version,
+                    digest: defs.versions.get(&run.admission.version).map(|d| d.digest.clone()).unwrap_or_default(),
                     epoch: defs.epoch,
                     faults: defs.consecutive_faults,
                     threshold,
@@ -1442,6 +1461,7 @@ impl RunStore for TransactionalStore {
                     ows::model::parse_yaml(&s.run.admission.definition).map_or(host, |w| w.budget.max_jumps(host))
                 });
                 let pinned = s.run.admission.pinned();
+                let digest = s.digest.clone();
                 let trace_id = runtime["trace_id"].as_str().map(str::to_owned);
                 let span_id = runtime["span_id"].as_str().map(str::to_owned);
                 let snapshot = snapshot(rows, s).await?;
@@ -1450,6 +1470,7 @@ impl RunStore for TransactionalStore {
                 Ok(Some(control::Inspection {
                     snapshot,
                     pinned,
+                    digest,
                     calls,
                     annotations,
                     waits,
@@ -2054,7 +2075,7 @@ impl RunStore for TransactionalStore {
                     .last_key_value()
                     .map_or(Some(1), |(v, _)| v.checked_add(1))
                     .ok_or_else(|| anyhow::anyhow!("definition version overflow"))?;
-                let d = Definition { name: name.into(), version, yaml: yaml.into() };
+                let d = Definition { name: name.into(), version, yaml: yaml.into(), digest: digest_of(yaml) };
                 defs.versions.insert(version, d.clone());
                 store_definitions(rows, name, &defs).await?;
                 Ok(d)
@@ -2177,11 +2198,12 @@ async fn definition_summary(
         name: name.into(),
         versions: defs
             .versions
-            .keys()
-            .map(|&version| {
+            .iter()
+            .map(|(&version, d)| {
                 let latest = defs.activations.get(&version);
                 VersionSummary {
                     version,
+                    digest: d.digest.clone(),
                     activated_ms: latest.map(|a| a.at_ms),
                     activated_epoch: latest.map(|a| a.epoch),
                     activated_by: latest.and_then(|a| a.actor.clone()),
@@ -2374,6 +2396,7 @@ async fn control_command(
                         note: note.clone(),
                     }),
                     version,
+                    digest: defs.versions.get(&version).map(|d| d.digest.clone()).unwrap_or_default(),
                     epoch: defs.epoch,
                     faults: defs.consecutive_faults,
                     threshold: 0,

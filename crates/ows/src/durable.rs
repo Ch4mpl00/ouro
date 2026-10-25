@@ -171,7 +171,9 @@ use std::collections::BTreeMap;
 /// 9: a call record keeps the annotations its answer carried.
 /// 10: a run row keeps its calls' numeric annotation totals (`accumulate`),
 /// added in the commit that saves each answer.
-pub const VERSION: u32 = 10;
+/// 11: a run row keeps the content digest of the definition version it was
+/// admitted with (engine layout; the OWS record formats are unchanged).
+pub const VERSION: u32 = 11;
 
 /// The key of a run's `Record::Exceeded`.
 pub const EXCEEDED: &str = "exceeded";
