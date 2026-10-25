@@ -212,8 +212,8 @@ module contract_progress_trigger {
   val L8_dormant = not(s.broken.contains("L8"))
   val L10_stable = not(s.broken.contains("L10"))
   // No fairness: a refusal by a trip always names a committed trip (L-1, #31).
-  val refusalStored = not(s.broken.contains("refusal"))
+  val L7_refusal = not(s.broken.contains("refusal"))
   val shape = (s.tripped implies (not(s.armed) and not(s.queued) and s.owed.contains(content(s.active)))) and
     (s.queued implies s.armed) and (s.done implies s.kind == 2)
-  val safety = L8_dormant and L10_stable and refusalStored and shape
+  val safety = L8_dormant and L10_stable and L7_refusal and shape
 }

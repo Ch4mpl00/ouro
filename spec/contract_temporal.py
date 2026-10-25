@@ -61,7 +61,7 @@ MODULES = {
     ),
     "contract_progress_trigger": dict(
         deadlock=True,
-        invariants=["L8_dormant", "L10_stable", "refusalStored", "shape"],
+        invariants=["L8_dormant", "L10_stable", "L7_refusal", "shape"],
         temporal=["L7", "L8", "L10"],
         mutants={
             # A buffered slot that nothing promotes.
@@ -77,7 +77,7 @@ MODULES = {
             # The same for an owned child of the definition (M-2, #31).
             "L7/order/child": ("val y = settled(x)\n    if (barred(y, y.active))", "val y = x\n    if (barred(y, y.active))", "L7"),
             # A start refused by its drain's trip rolls the drain and the trip back (L-1, #31).
-            "refusalStored": ("if (barred(y, v)) y else admitNext(y, v)", "if (barred(y, v)) x else admitNext(y, v)", "refusalStored"),
+            "L7/refusal": ("if (barred(y, v)) y else admitNext(y, v)", "if (barred(y, v)) x else admitNext(y, v)", "L7_refusal"),
             # A one-shot's slot does not consume it.
             "L8": ("val consumed = x.kind == 2", "val consumed = false", "L8"),
             # A one-shot's run carries a re-arm, so its end wakes the dormant trigger.

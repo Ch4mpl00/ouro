@@ -850,7 +850,7 @@ an activation or trip racing promotion. **Mutant:** never promote; promote only
 at the end of the trigger's own run; drop the deferred drain when the stop is
 cleared; admit a firing, a start or an owned child without draining the
 deferred queue first; roll a drain's trip back with the start it refuses.
-**Check:** `contract_progress_trigger::L7` and `refusalStored`; the overlap
+**Check:** `contract_progress_trigger::L7` and `L7_refusal`; the overlap
 policy monitors of `contract.qnt`.
 
 #### L8 — A one-shot slot resolves and the trigger stays dormant [P/D, liveness]

@@ -257,7 +257,7 @@ by TLC exhaustively, with each fairness conjunct named and dropped in turn:
     two run representatives: the runtime admits a start whatever else is live.
   - **L8_dormant** and **L10_stable** are stability monitors with no fairness:
     within an epoch a consumed one-shot stays dormant unless disarmed, and a trip
-    stays with its content refused (no admission of it). **refusalStored**:
+    stays with its content refused (no admission of it). **L7_refusal**:
     a start or child refused by a trip is refused by a stored one (a drain's
     trip commits with the refusal it causes).
 
@@ -282,7 +282,7 @@ What the quotients are connected to, and what not:
   over by a later slot of its trigger or by another start; the quotient's
   `settled` is that step (`firing`, `starting`, `spawning`). A drain that trips
   the definition commits with the refusal it causes (`drained_refusal`); the
-  quotient's `refusalStored` monitor states it.
+  quotient's `L7_refusal` monitor states it.
 - **Not modelled:** pause and resume, the skip/allow/replace policies (the
   contract's monitors cover them), event-triggered (`on`) schedules and ingress,
   missed slots under `catchup: none`, several triggers or buffered slots per
