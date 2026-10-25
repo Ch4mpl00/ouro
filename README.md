@@ -60,6 +60,13 @@ non-negative numbers, summed into the `ouro.call.annotations` metric. The
 engine knows nothing about tokens or prices: a backend computes cost from
 the model and token counts, and an application may still annotate its own
 (`cost_usd`). `annotation_totals(&calls)` sums a journal's numbers per name.
+A stored run also keeps its totals on its row (`SavedRun::annotations`):
+the commit that saves a call's answer adds the answer's numbers to them,
+so a restored or replayed call, whose saved answer is never saved anew,
+never counts twice, and they survive `sweep`. They are bounded like one
+call's annotations: a name not yet present is admitted only while the
+totals keep at most 32 names and 4 KB as JSON (later new names are left
+out, in commit order); texts are ignored.
 A handler is generic over its success type (`Value` or `Output`), so one
 that never succeeds names it: `Err::<Value, _>(error)`.
 
@@ -119,7 +126,9 @@ targeted `publish` uses the mailbox too; a broadcast `publish` still reaches
 only the runs subscribed at that moment.
 
 Versions are immutable. Every activation, including reactivating the active
-version, starts a new activation epoch, and nothing else does. The breaker
+version, starts a new activation epoch, and nothing else does; its commit
+records when (the runtime's clock) and, through `activate_as`, who and why
+(Operator control, below). The breaker
 counts terminal faults (unhandled errors, timeouts, unknown outcomes) of runs
 admitted in the active version's current epoch, and the schedule slots of that
 epoch whose run the host refused to admit; cancellations and interruptions
@@ -335,6 +344,29 @@ commit together. Conflicting reuse is an error. `entry` and the paged
 also indexed by run. Operator audit and response identities are retained
 independently of execution-evidence sweeping.
 
+A console that only observes opens the store read-only:
+`sqlite::open_read_only(path)` (a read-only connection with `query_only`,
+never creating the file; deferred transactions, so it never takes the
+writer's lock), `postgres::connect_read_only(url)` (or
+`PostgresBackend::read_only_config` / `read_only_manager`; every
+transaction is `SERIALIZABLE READ ONLY`, and a role with `SELECT` on the two
+tables is enough) and, for memory, `MemoryBackend::read_only_view()`. They
+never migrate and never write: a database without the schema is refused
+with `SchemaError::Unmigrated`, another schema version with
+`SchemaError::Unsupported` (the writable open now refuses a newer one with
+the same error). Every query works: the store's own (`get`, `list`,
+`inspect`, `definitions`, `trigger`, `queued`, `notices`) and every
+`Control` query (`inspect`, `list`, `history`, `waits`, `counts`, `entry`,
+`journal`, `workers`, `definitions`, `totals`); every mutating or worker
+operation, fenced reads
+(`check_lease`, `load_records`) and `due` (which may promote deferred
+queues) included, is refused with `durable::ReadOnly` before a transaction
+opens, and a backend refuses any `put` or `delete` with it too. `Control`
+reports it as `ControlError::ReadOnly`. A read-only open does not scan
+runs: a row written under another durable state version is refused when
+it is read, as on a writable handle. `AtomicBackend::is_read_only` marks a
+third-party adapter's read-only handle.
+
 ```rust
 use ouro_runtime::control::{Control, Request, Runs, Waits};
 // store and clock are injected by the composition root.
@@ -350,6 +382,21 @@ let waits = control.waits(&Waits::default(), None, 50).await?;
 let definitions = control.definitions(None, 50).await?;
 let definition = control.definition("workflow").await?;
 ```
+
+Every `Control` method (and `Runtime::control`) fails with a typed
+`ControlError`, so a console reacts to the variant instead of a message:
+`NotFound` (the run or definition a command names), `RequestConflict` (a
+request ID reused with another command or attribution), `ResponseConflict`
+(a response's event identity reused with other content), `InvalidState`
+(resuming an automatic trip, pausing a definition without an active
+version), `Stopped`, `WaitClosed` (a wait never opened, answered, ended or
+timed out), `WaitMismatch` (the event fails the wait's matcher), `ReadOnly`,
+`InvalidInput` (a page limit, cursor, time window, request attribution or
+response identity) and `Storage`, which displays its error and keeps its
+source chain. It implements `std::error::Error`, so `?` into `anyhow` still
+works. A store raises these variants inside its `anyhow` errors;
+`ControlError::from(anyhow::Error)` recovers them (and `Stopped`,
+`ReadOnly`) for hosts that call `RunStore` directly.
 
 `cancel` and `cancel_tree` have the same owned-tree semantics: the run and
 its transitive owned descendants end in one commit; independent runs remain
@@ -379,7 +426,9 @@ clear. Events may still be accepted into mailboxes while stopped.
 
 `inspect` includes the admitted definition/version, state, lease, waits and
 mailbox copies, call journal (each call with its annotations) and the
-annotations' numeric totals for the run, children (including ended children),
+run row's annotation totals (which `list` and `history` items carry too, as
+`SavedRun::annotations`, and which remain after `sweep` removed the
+journal), children (including ended children),
 and tree jump budget. A terminal run keeps the tree's spent count at its end.
 The `trace_id`/`span_id` the run was admitted in are exposed when there was
 one (Observability). `workers` pages worker heartbeat rows, marking stale
@@ -396,13 +445,40 @@ age select indexes; residual state/combined filters can produce an empty
 page with a continuation. Follow `next` until absent. Cursors are bound to
 the query; each page is a consistent transaction, not a multi-page snapshot.
 
+`totals(definition, since_ms, before_ms)` sums the annotation totals of a
+definition's runs that ended in a window, without reading a run: each
+terminal commit (a finish, a cancellation, a cascade's descendants) adds
+the ending run's totals to its definition's bucket row for the hour it
+ended in (`TOTALS_BUCKET_MS`, one hour aligned to the Unix epoch), and a
+query reads only that definition's bucket rows in the window, rounded out
+to whole hours and at most `MAX_TOTALS_BUCKETS` (1,000) of them, or it is
+refused as `InvalidInput`. It returns the window, the count of runs it
+summed, their totals and the hourly buckets that hold any. A run without
+annotation totals writes nothing and is not counted; a run counts once, in
+the commit that ends it (an ambiguous finish cannot end it twice), at its
+end, so a live run's usage shows on its own row (`list`) until it ends.
+Buckets are bounded like a run's totals (32 names, 4 KB) and kept like
+outcomes: `sweep` does not remove them. Runs ending against the same
+definition within the hour share its bucket row, as they share its
+breaker row; writing it in the call's commit instead would make every
+annotated answer of every run of the definition contend on it.
+
 `definitions(cursor, limit)` pages `DefinitionSummary` values in binary name
 order through `RunStore::query_definitions`; `definition(name)` returns the
 same summary, or `None` for an unknown name. Neither needs a registry or raw
 backend access. A summary includes ascending version numbers, the active
 version, epoch, consecutive faults and the original trip report (including a
-manual pause's actor, reason and note). `VersionSummary::activated_ms` is
-`None`: the current catalog does not persist activation timestamps.
+manual pause's actor, reason and note). Each `VersionSummary` carries the
+version's latest activation: `activated_ms` (the runtime's clock),
+`activated_epoch` and, when the host activated it with
+`Runtime::activate_as(name, version, actor, note)`, `activated_by` and
+`activation_note`; all `None` for a version never activated. Only the
+latest activation per version is kept, in the definitions row: that row is
+read by every admission and terminal commit of the name, so an unbounded
+history there would grow their cost with every activation, while one entry
+per version stays bounded by the versions it already holds. Reactivating
+an older version replaces its entry; the epochs order activations across
+versions.
 `schedules` has one entry per kind configured by the active version (`every`,
 `cron`, `after`, `on`), with its next due time, overlap policy, catch-up policy
 and buffered slot's pinned run identity/version when present. An `on` trigger
@@ -427,6 +503,24 @@ Repeating an event's `source` + `id` returns its original reply even after the
 wait closes; changing its payload or wait is a conflict. Matching contexts
 are redacted before persistence; a response requiring secret values is
 refused rather than guessed without the host's secret resolver.
+
+Breaking changes (issue #22), for hosts and adapters written before it:
+
+- `Control` methods and `Runtime::control` return `ControlError` instead
+  of `anyhow::Error`; the engine raises typed refusals where it raised
+  messages.
+- `RunStore::activate` takes `now_ms`, and `activate_with` an
+  `Activation`; `Definitions` gains `activations`, `VersionSummary` gains
+  `activated_epoch`, `activated_by` and `activation_note`. The definitions
+  row layout is 4: rows of layout 3 are refused.
+- `SavedRun` gains `annotations`, and `Inspection::annotations` reads them
+  from the run row. The durable state version is 10: run rows written
+  under 9 are refused.
+- `RunStore` gains `totals` (a store that keeps none fails it) and
+  `AtomicBackend` gains `is_read_only` (default `false`); the conformance
+  `TestStore` gains `read_only`, the factory's read-only open.
+- The writable SQLite and Postgres opens refuse a newer schema with
+  `SchemaError::Unsupported` instead of a message.
 
 ## The DSL
 
@@ -652,6 +746,7 @@ The engine owns primary and secondary keys in `(kind, id)` order:
 | `control_wait_type:<hex type>`, `control_wait_definition:<hex name>:type:<hex type>` | same wait key | Current listens by routing type |
 | `worker` | worker ID | One worker's heartbeat row |
 | `worker_expiry` | ordered expiry + hex worker ID | Worker rows by staleness, for `sweep` |
+| `totals:<hex name>` | ordered bucket start | Annotation totals and count of the definition's runs that ended in that hour |
 
 Index entries contain the run ID and change in the same transaction as the
 run. Times use sign-adjusted, fixed-width hexadecimal; names and event types
@@ -685,15 +780,16 @@ Both initial migrations were replaced before any release or deployment. This
 layout requires a fresh database from the earlier development checkout; there
 is no conversion of that unreleased layout. Applied migrations are immutable
 from the next release onward. The SQL schema is a generic key/value table, so
-the row shapes above (and the interpreter's durable state version, now 9: a
-call record keeps its annotations) can
+the row shapes above (and the interpreter's durable state version, now 10:
+a run row keeps its calls' annotation totals) can
 change without a migration; nothing persisted before them is converted. Each
 run row records the durable state version it was written under, and a row of
 another version (including the earlier one-aggregate-per-run layout) is
 refused with an error rather than read as a run without evidence. Likewise a
-`definitions` row records its layout (3); the earlier unversioned layout, which
-kept a predecessor for a breaker rollback, is refused rather than read as a
-definition that never tripped.
+`definitions` row records its layout (4: each version's latest activation);
+the earlier unversioned layout, which kept a predecessor for a breaker
+rollback, is refused rather than read as a definition that never tripped,
+and so is layout 3, which kept no activation times.
 
 ### Async seams
 
@@ -783,12 +879,14 @@ fencing, immutable evidence, event histories, held listens, every interpreter
 checkpoint boundary, child notifications, rollback and ambiguous commits,
 corruption, concurrent claims, retention, liveness drains and a run tree's
 shared budget (restarts, failed commits, children, a race at the last unit),
-all overlap policies, queue promotion and a race at the schedule ceiling, and
+all overlap policies, queue promotion and a race at the schedule ceiling,
+read-only handles (the same query answers, every write refused), and
 operations dropped mid-transaction or mid-statement. Its interpreter cases
 keep a paused clock on a runtime of their own and reach the store through
 blocking tasks of the caller's runtime, so real I/O never advances virtual
 time. Factories supply
-an independent reopen handle, persisted-row inspection and failure injection.
+an independent reopen handle, a read-only open (`TestStore::read_only`),
+persisted-row inspection and failure injection.
 
 `cargo test -p ouro-durable --test scalability -- --nocapture` checks every
 operation's row bound with 10,000 unrelated persisted runs, a run holding

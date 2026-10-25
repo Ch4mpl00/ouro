@@ -1109,3 +1109,17 @@ Cancellation closes the same owned subtree as C3 and reaches the owner's
 function token at its next renewal (immediately through the in-process control
 path). Attributed commands commit their audit and idempotency reply atomically;
 a matched response commits its addressed event in that same transition.
+
+Addendum (2026-10-25, issue #22). Three observational additions change no
+transition of the model. A read-only handle (SQLite read-only connection,
+Postgres `READ ONLY` transactions, a memory view) never migrates and never
+writes: it serves queries and refuses every mutating or worker operation
+before a transaction opens, so it adds no history event (A2, A5). Each
+activation records its instant, epoch and the host's attribution as the
+version's latest activation in the commit that starts the epoch (V1, V2
+unchanged). A call's numeric annotations are added to its run's totals in
+the commit that saves its answer, which is the commit that completes the
+call record (E4: a completed record is never saved anew, so replay and
+recovery never count it twice), and a run's totals are added to its
+definition's hourly bucket in its terminal commit (A3: a run ends once).
+Neither row is evidence: `sweep` keeps both, as it keeps outcomes (O2).

@@ -1238,7 +1238,7 @@ fn operator(id: &str) -> ouro_runtime::control::Request {
 
 #[tokio::test]
 async fn store_only_control_lists_definition_schedules_and_suspended_slots() {
-    use ouro_runtime::control::{Control, ScheduleCatchup, ScheduleKind};
+    use ouro_runtime::control::{Control, ControlError, ScheduleCatchup, ScheduleKind};
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("definitions.sqlite");
     let clock = Arc::new(Time::default());
@@ -1252,7 +1252,9 @@ async fn store_only_control_lists_definition_schedules_and_suspended_slots() {
     let summary = control.definition("workflow").await.unwrap().unwrap();
     assert_eq!((summary.active, summary.epoch), (Some(1), 1));
     assert_eq!(summary.versions[0].version, 1);
-    assert_eq!(summary.versions[0].activated_ms, None);
+    // Activated at the runtime's clock, unattributed.
+    let first = &summary.versions[0];
+    assert_eq!((first.activated_ms, first.activated_epoch, first.activated_by.as_deref()), (Some(0), Some(1), None));
     assert_eq!(
         summary.schedules.iter().map(|s| s.kind).collect::<Vec<_>>(),
         [ScheduleKind::Every, ScheduleKind::After, ScheduleKind::On]
@@ -1279,20 +1281,57 @@ async fn store_only_control_lists_definition_schedules_and_suspended_slots() {
     assert_eq!(control.definition("workflow").await.unwrap(), Some(before_pause));
     // Reactivation replaces the schedules and discards the buffered slot.
     let replacement = rt.save("workflow", &yaml("  - ok: { set: { ok: true } }")).await.unwrap();
-    rt.activate("workflow", replacement.version).await.unwrap();
+    assert!(rt.activate_as("workflow", replacement.version, " ", None).await.is_err());
+    rt.activate_as("workflow", replacement.version, "operator", Some("drop the schedule")).await.unwrap();
     let summary = control.definition("workflow").await.unwrap().unwrap();
     assert_eq!((summary.active, summary.epoch, summary.versions.len()), (Some(2), 2, 2));
+    let second = &summary.versions[1];
+    assert_eq!((second.activated_ms, second.activated_epoch), (Some(2000), Some(2)));
+    assert_eq!(
+        (second.activated_by.as_deref(), second.activation_note.as_deref()),
+        (Some("operator"), Some("drop the schedule"))
+    );
+    assert_eq!(summary.versions[0].activated_epoch, Some(1), "the first version keeps its latest activation");
     assert!(summary.schedules.is_empty());
     let page = control.definitions(None, 1).await.unwrap();
     assert_eq!(page.items, [summary]);
     assert!(control.definitions(page.next.as_ref(), 1).await.unwrap().items.is_empty());
-    assert!(control.definitions(None, 0).await.is_err());
-    assert!(control.definitions(None, 1001).await.is_err());
+    assert!(matches!(control.definitions(None, 0).await, Err(ControlError::InvalidInput(_))));
+    assert!(matches!(control.definitions(None, 1001).await, Err(ControlError::InvalidInput(_))));
+}
+
+#[tokio::test]
+async fn read_only_control_answers_queries_and_refuses_commands() {
+    use ouro_runtime::control::{Control, ControlError, Runs, Waits};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("read-only.sqlite");
+    let clock = Arc::new(Time::default());
+    let rt = runtime(Arc::new(durable::sqlite::open(&path).unwrap()), Registry::new(), clock.clone());
+    save(&rt, &yaml("  - wait: { listen: { to: { one: { with: { type: answer } } } } }")).await;
+    rt.start("r", "workflow", json!({})).await.unwrap();
+    assert!(matches!(rt.drive("r", &CancellationToken::new()).await.unwrap(), Some(Status::Waiting { .. })));
+    let writable = Control::new(Arc::new(durable::sqlite::open(&path).unwrap()), clock.clone());
+    let control = Control::new(Arc::new(durable::sqlite::open_read_only(&path).unwrap()), clock.clone());
+    assert_eq!(control.inspect("r").await.unwrap(), writable.inspect("r").await.unwrap());
+    assert_eq!(
+        control.list(&Runs::default(), None, 10).await.unwrap(),
+        writable.list(&Runs::default(), None, 10).await.unwrap()
+    );
+    assert_eq!(control.definitions(None, 10).await.unwrap(), writable.definitions(None, 10).await.unwrap());
+    let waits = control.waits(&Waits::default(), None, 10).await.unwrap().items;
+    assert_eq!(waits.len(), 1);
+    let answer = json!({"source":"/operator","id":"1","type":"answer","data":{}});
+    let refused = control.respond(&operator("answer"), "r", &waits[0].key, answer).await;
+    assert!(matches!(refused, Err(ControlError::ReadOnly)), "{refused:?}");
+    assert!(matches!(control.cancel(&operator("cancel"), "r").await, Err(ControlError::ReadOnly)));
+    assert!(matches!(control.emergency_stop(&operator("stop"), true).await, Err(ControlError::ReadOnly)));
+    assert!(!control.stopped().await.unwrap());
+    assert!(control.journal(None, None, 10).await.unwrap().items.is_empty());
 }
 
 #[tokio::test]
 async fn store_only_control_answers_a_multi_event_listen_with_persisted_correlation() {
-    use ouro_runtime::control::{Control, Runs, Waits};
+    use ouro_runtime::control::{Control, ControlError, Runs, Waits};
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("control.sqlite");
     let clock = Arc::new(Time::default());
@@ -1319,8 +1358,16 @@ async fn store_only_control_answers_a_multi_event_listen_with_persisted_correlat
     assert!(matches!(rt.drive("r", &stop).await.unwrap(), Some(Status::Waiting { .. })));
     let wait = control.waits(&Waits::default(), None, 10).await.unwrap().items.pop().unwrap();
     assert_eq!(wait.waiting.progress.expectations["ticket"], 42);
-    assert!(control.respond(&operator("filled"), "r", &wait.key, event("filled", "first", 42)).await.is_err());
-    assert!(control.respond(&operator("wrong"), "r", &wait.key, event("wrong", "second", 43)).await.is_err());
+    let filled = control.respond(&operator("filled"), "r", &wait.key, event("filled", "first", 42)).await;
+    assert!(matches!(filled, Err(ControlError::WaitMismatch { .. })), "{filled:?}");
+    let wrong = control.respond(&operator("wrong"), "r", &wait.key, event("wrong", "second", 43)).await;
+    assert!(matches!(wrong, Err(ControlError::WaitMismatch { .. })), "{wrong:?}");
+    let reused = control.respond(&operator("first"), "r", &wait.key, event("other", "second", 42)).await;
+    assert!(matches!(reused, Err(ControlError::RequestConflict { .. })), "{reused:?}");
+    let unbounded = control.history(&Runs::default(), None, 10).await;
+    assert!(matches!(unbounded, Err(ControlError::InvalidInput(_))), "{unbounded:?}");
+    let anywhere = control.counts(&Runs::default(), false, None, 10).await;
+    assert!(matches!(anywhere, Err(ControlError::InvalidInput(_))), "{anywhere:?}");
     let answer = event("2", "second", 42);
     control.respond(&operator("second"), "r", &wait.key, answer.clone()).await.unwrap();
     assert!(matches!(rt.drive("r", &stop).await.unwrap(), Some(Status::Completed(_))));
@@ -1339,7 +1386,7 @@ async fn store_only_control_answers_a_multi_event_listen_with_persisted_correlat
 
 #[tokio::test]
 async fn control_respond_supports_wildcard_listens_and_refuses_expired_waits() {
-    use ouro_runtime::control::{Control, Waits};
+    use ouro_runtime::control::{Control, ControlError, Waits};
     let store = Arc::new(durable::memory::memory());
     let clock = Arc::new(Time::default());
     let rt = runtime(store.clone(), Registry::new(), clock.clone());
@@ -1369,7 +1416,8 @@ async fn control_respond_supports_wildcard_listens_and_refuses_expired_waits() {
         .pop()
         .unwrap();
     clock.0.store(1000, Ordering::SeqCst);
-    assert!(control.respond(&operator("late"), "expired", &wait.key, event).await.is_err());
+    let late = control.respond(&operator("late"), "expired", &wait.key, event).await;
+    assert!(matches!(late, Err(ControlError::WaitClosed { .. })), "{late:?}");
     assert!(matches!(rt.drive("expired", &stop).await.unwrap(), Some(Status::Faulted(_))));
     assert!(control.waits(&Waits::default(), None, 10).await.unwrap().items.is_empty());
 }

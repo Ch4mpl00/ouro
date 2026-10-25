@@ -51,12 +51,12 @@ fn t2_old_completion_cannot_rearm_new_epoch() {
 fn v2_old_epoch_fault_does_not_count_after_reactivation() {
     adapters(|d| {
         let version = d.block(d.store.save_definition("model", "definition")).unwrap();
-        d.block(d.store.activate("model", version.version)).unwrap();
+        d.block(d.store.activate("model", version.version, 0)).unwrap();
         let mut a = admission("old");
         a.name = "model".into();
         a.version = version.version;
         let fence = d.block(d.store.start(&a, 0)).unwrap().unwrap();
-        d.block(d.store.activate("model", version.version)).unwrap();
+        d.block(d.store.activate("model", version.version, 0)).unwrap();
         d.block(d.store.finish(&fence, &Status::Faulted(WorkflowError::runtime("fault")), 1, 3)).unwrap();
         assert_eq!(d.block(d.store.definitions("model")).unwrap().consecutive_faults, 0);
     });

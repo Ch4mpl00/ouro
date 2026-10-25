@@ -55,8 +55,8 @@ use crate::{
 };
 use opentelemetry::KeyValue;
 use ouro_durable::{
-    Admission, Arming, DefinitionTripped, Definitions, Fired, Firing, Overlap, OverlapGuard, Rearm, Refused, RunStore,
-    Trigger,
+    Activation, Admission, Arming, DefinitionTripped, Definitions, Fired, Firing, Overlap, OverlapGuard, Rearm,
+    Refused, RunStore, Trigger,
 };
 use ows::{
     events::{self, Consumer, Offer},
@@ -161,13 +161,27 @@ fn arming(name: &str, yaml: &str, epoch: u64, now: i64) -> anyhow::Result<BTreeM
 
 impl Runtime {
     /// Activates `version` of `name` in a new epoch: its triggers replace
-    /// the definition's ones in the activation's commit.
-    pub(crate) async fn activate_armed(&self, name: &str, version: u64) -> anyhow::Result<()> {
+    /// the definition's ones in the activation's commit, which records the
+    /// activation's time (this runtime's clock) and attribution.
+    pub(crate) async fn activate_armed(
+        &self,
+        name: &str,
+        version: u64,
+        actor: Option<&str>,
+        note: Option<&str>,
+    ) -> anyhow::Result<()> {
         for _ in 0..16 {
             let definitions = self.store.definitions(name).await?;
             let d = definitions.versions.get(&version).ok_or_else(|| anyhow::anyhow!("unknown definition version"))?;
-            let triggers = arming(name, &d.yaml, definitions.epoch + 1, self.clock.now_ms())?;
-            if self.store.activate_with(name, version, definitions.epoch, &Arming { triggers }).await?.is_some() {
+            let now = self.clock.now_ms();
+            let triggers = arming(name, &d.yaml, definitions.epoch + 1, now)?;
+            let activation = Activation { at_ms: now, actor: actor.map(str::to_owned), note: note.map(str::to_owned) };
+            if self
+                .store
+                .activate_with(name, version, definitions.epoch, &Arming { triggers }, &activation)
+                .await?
+                .is_some()
+            {
                 return Ok(());
             }
         }

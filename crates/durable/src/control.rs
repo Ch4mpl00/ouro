@@ -71,6 +71,97 @@ impl std::fmt::Display for Stopped {
 }
 impl std::error::Error for Stopped {}
 
+/// What an operator command or query names and the store does not hold.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Entity {
+    Run,
+    Definition,
+}
+
+/// Why a control command or query failed, typed so a console or CLI can
+/// react without matching messages. A store raises the operator variants
+/// inside its `anyhow` errors (`RunStore::control`); `ControlError::from`
+/// recovers them, together with `Stopped` and `ReadOnly`, and keeps anything
+/// else as `Storage` with its source chain.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum ControlError {
+    /// The command names a run or definition the store does not hold.
+    NotFound { entity: Entity, id: String },
+    /// The request id was already used with another command or attribution:
+    /// a retry must repeat the original exactly.
+    RequestConflict { id: String },
+    /// The response's event identity (`source` + `id`) already answered with
+    /// another payload or for another wait.
+    ResponseConflict { identity: String },
+    /// The command does not apply in the target's current state: resuming an
+    /// automatic breaker trip (only an activation clears it), pausing a
+    /// definition without an active version, resuming a pause whose
+    /// activation changed.
+    InvalidState(String),
+    /// The emergency stop refuses this operation.
+    Stopped,
+    /// The wait is not open: never opened, already answered, closed by its
+    /// run's end, or past its timeout.
+    WaitClosed { run: String, wait: String },
+    /// The response does not satisfy the wait's persisted matcher (its
+    /// filters or correlation).
+    WaitMismatch { run: String, wait: String },
+    /// The store was opened read-only.
+    ReadOnly,
+    /// A malformed request: a page limit outside 1..=`MAX_PAGE`, a cursor of
+    /// another query, an inverted or missing time window, missing request
+    /// attribution or response identity.
+    InvalidInput(String),
+    /// Anything else, typically storage; displayed as its source.
+    Storage(anyhow::Error),
+}
+impl std::fmt::Display for ControlError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotFound { entity: Entity::Run, id } => write!(f, "unknown run {id}"),
+            Self::NotFound { entity: Entity::Definition, id } => write!(f, "unknown definition {id}"),
+            Self::RequestConflict { id } => write!(f, "control request {id} was already used with other content"),
+            Self::ResponseConflict { identity } => {
+                write!(f, "response event {identity} was already used with other content")
+            }
+            Self::InvalidState(message) | Self::InvalidInput(message) => f.write_str(message),
+            Self::Stopped => std::fmt::Display::fmt(&Stopped, f),
+            Self::WaitClosed { run, wait } => write!(f, "wait {wait} of run {run} is not open"),
+            Self::WaitMismatch { run, wait } => write!(f, "the event does not match wait {wait} of run {run}"),
+            Self::ReadOnly => std::fmt::Display::fmt(&crate::ReadOnly, f),
+            Self::Storage(e) => std::fmt::Display::fmt(e, f),
+        }
+    }
+}
+impl std::error::Error for ControlError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        // Transparent: `Storage` displays its error, so the chain continues
+        // with that error's own source.
+        match self {
+            Self::Storage(e) => e.source(),
+            _ => None,
+        }
+    }
+}
+impl From<anyhow::Error> for ControlError {
+    /// Recovers a typed refusal from a store's error, wherever it was
+    /// raised; anything else stays `Storage`.
+    fn from(error: anyhow::Error) -> Self {
+        let error = match error.downcast::<ControlError>() {
+            Ok(typed) => return typed,
+            Err(error) => error,
+        };
+        if error.is::<Stopped>() {
+            Self::Stopped
+        } else if error.is::<crate::ReadOnly>() {
+            Self::ReadOnly
+        } else {
+            Self::Storage(error)
+        }
+    }
+}
+
 /// Cursors are opaque and bound to their query. Pages examine at most `limit`
 /// index entries: combined residual filters may yield an empty page with a
 /// continuation. Keep paging until `next` is absent.
@@ -100,12 +191,18 @@ pub struct DefinitionSummary {
     /// an automatic trip disarms them, leaving no next due time or queue.
     pub schedules: Vec<ScheduleSummary>,
 }
+/// A version and its latest activation, if it was ever activated: an older
+/// version activated again shows that activation (the epochs order them).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VersionSummary {
     pub version: u64,
-    /// None when the catalog did not record an activation instant. Existing
-    /// stores retain versions and epochs, but no activation timestamps.
+    /// When, by the runtime's clock.
     pub activated_ms: Option<i64>,
+    /// The activation epoch it started.
+    pub activated_epoch: Option<u64>,
+    /// Who activated it and why, when the host said (`Runtime::activate_as`).
+    pub activated_by: Option<String>,
+    pub activation_note: Option<String>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -165,9 +262,10 @@ pub struct Inspection {
     pub snapshot: RunSnapshot,
     /// The call journal, each call with its annotations.
     pub calls: Vec<CallEntry>,
-    /// The calls' numeric annotations summed per name
-    /// (`ows::durable::annotation_totals`): a run's tokens, its cost.
-    pub annotations: BTreeMap<String, serde_json::Number>,
+    /// The calls' numeric annotations summed per name: a run's tokens, its
+    /// cost. The run row's totals (`SavedRun::annotations`), so they remain
+    /// once `sweep` has removed the call journal.
+    pub annotations: ows::durable::Totals,
     pub waits: BTreeMap<String, PendingWait>,
     pub children: Vec<SavedRun>,
     pub budget_spent: u64,
@@ -214,4 +312,35 @@ pub struct WorkerStatus {
 pub struct Counts {
     pub states: BTreeMap<String, usize>,
     pub next: Option<Cursor>,
+}
+
+/// The width of a totals bucket: one hour, aligned to the Unix epoch (UTC).
+/// Part of the stored layout: a run's totals are added to its definition's
+/// bucket of the hour it ended in, in its terminal commit.
+pub const TOTALS_BUCKET_MS: i64 = 3_600_000;
+/// The most buckets one `RunStore::totals` window may cover (41 days and a
+/// bit): a query reads at most this many rows.
+pub const MAX_TOTALS_BUCKETS: usize = MAX_PAGE;
+/// One definition's annotation totals over a window (`RunStore::totals`).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DefinitionTotals {
+    pub definition: String,
+    /// The window rounded out to whole buckets, `[since_ms, before_ms)`.
+    pub since_ms: i64,
+    pub before_ms: i64,
+    /// The runs that ended in the window with annotation totals.
+    pub runs: u64,
+    /// Their totals summed per name, bounded like a run's
+    /// (`ows::durable::accumulate`).
+    pub annotations: ows::durable::Totals,
+    /// The buckets that hold any, oldest first.
+    pub buckets: Vec<TotalsBucket>,
+}
+/// The runs of one definition that ended within one bucket with annotation
+/// totals, and those totals summed.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TotalsBucket {
+    pub start_ms: i64,
+    pub runs: u64,
+    pub annotations: ows::durable::Totals,
 }

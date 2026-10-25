@@ -9,7 +9,7 @@
 //! root's count commit together without touching the root's run row.
 use crate::*;
 use ows::{
-    durable::{EXCEEDED, VERSION, check_transition},
+    durable::{CallState, EXCEEDED, VERSION, check_transition},
     run::WorkflowError,
 };
 use serde::{Deserialize, de::DeserializeOwned};
@@ -79,6 +79,17 @@ struct Pending {
     cloud: u64,
 }
 
+/// A definition's runs that ended within one bucket with annotation totals
+/// (`totals:<hex name>`, keyed by the bucket's start): their count and sums.
+#[derive(Default, Serialize, Deserialize)]
+struct Bucket {
+    runs: u64,
+    annotations: ows::durable::Totals,
+}
+fn bucket_start(ms: i64) -> i64 {
+    ms.saturating_sub(ms.rem_euclid(control::TOTALS_BUCKET_MS))
+}
+
 /// An ingress identity a trigger took, until `expires_at_ms`.
 #[derive(Serialize, Deserialize)]
 struct Tombstone {
@@ -113,7 +124,8 @@ async fn run(rows: &mut dyn Transaction, id: &str) -> anyhow::Result<StoredRun> 
 /// The layout version of a `definitions` row. The earlier layout (none: it
 /// kept a predecessor and its triggers for a breaker rollback, and a boolean
 /// trip) is refused, never read as a definition that cannot be tripped.
-const DEFINITIONS_VERSION: u64 = 3;
+/// 4: each version's latest activation (`Definitions::activations`).
+const DEFINITIONS_VERSION: u64 = 4;
 async fn load_definitions(rows: &mut dyn Transaction, name: &str) -> anyhow::Result<Option<Definitions>> {
     let Some(value) = rows.get("definitions", name).await? else { return Ok(None) };
     Ok(Some(decode_definitions(name, value)?))
@@ -405,6 +417,7 @@ async fn admitted(rows: &mut dyn Transaction, admission: &Admission, now: i64) -
             admitted_ms: now,
             epoch,
             root: None,
+            annotations: Default::default(),
         },
         version: VERSION,
         awaits: BTreeMap::new(),
@@ -1049,6 +1062,7 @@ async fn activate(
     version: u64,
     epoch: Option<u64>,
     arming: &Arming,
+    activation: &Activation,
 ) -> anyhow::Result<Option<Definitions>> {
     let mut defs = load_definitions(rows, name).await?.unwrap_or_default();
     anyhow::ensure!(defs.versions.contains_key(&version), "unknown definition version");
@@ -1061,6 +1075,8 @@ async fn activate(
     defs.epoch = defs.epoch.checked_add(1).ok_or_else(|| anyhow::anyhow!("activation epoch overflow"))?;
     defs.consecutive_faults = 0;
     defs.tripped = None;
+    let Activation { at_ms, actor, note } = activation.clone();
+    defs.activations.insert(version, Activated { epoch: defs.epoch, at_ms, actor, note });
     rows.delete("paused", name).await?;
     arm(rows, &mut defs, &arming.triggers).await?;
     store_definitions(rows, name, &defs).await?;
@@ -1134,6 +1150,8 @@ async fn terminate(rows: &mut dyn Transaction, id: &str, status: &Status, now: i
     }
     // Iterative cascade avoids stack growth on arbitrarily nested child runs.
     let mut names = std::collections::BTreeSet::from([snapshot.run.admission.name.clone()]);
+    let mut ended = BTreeMap::new();
+    tally(&mut ended, &snapshot.run);
     let mut parents = vec![id.to_string()];
     while let Some(parent) = parents.pop() {
         for mut child in indexed_runs(rows, &partition("children", &parent), "", None, usize::MAX).await? {
@@ -1151,6 +1169,7 @@ async fn terminate(rows: &mut dyn Transaction, id: &str, status: &Status, now: i
             child.listeners.clear();
             child.subscriptions.clear();
             names.insert(child.run.admission.name.clone());
+            tally(&mut ended, &child.run);
             child.waits.clear();
             parents.push(child.run.admission.id.clone());
             store_run_indexed(rows, &child, &before).await?;
@@ -1161,7 +1180,36 @@ async fn terminate(rows: &mut dyn Transaction, id: &str, status: &Status, now: i
     for name in names {
         drain_queues(rows, &name, now).await?;
     }
+    for (name, (runs, annotations)) in ended {
+        add_bucket(rows, &name, now, runs, &annotations).await?;
+    }
     Ok(())
+}
+/// Adds the totals of runs that ended now to `name`'s bucket: one row read
+/// and written, in the terminal commit. Runs ending against the same
+/// definition within the hour share it, as they share its breaker row; a
+/// run without annotation totals writes nothing.
+async fn add_bucket(
+    rows: &mut dyn Transaction,
+    name: &str,
+    now: i64,
+    runs: u64,
+    annotations: &ows::durable::Totals,
+) -> anyhow::Result<()> {
+    let (kind, k) = (partition("totals", name), time_key(bucket_start(now)));
+    let mut bucket: Bucket = get(rows, &kind, &k).await?.unwrap_or_default();
+    bucket.runs = bucket.runs.saturating_add(runs);
+    ows::durable::accumulate(&mut bucket.annotations, annotations);
+    put(rows, &kind, &k, &bucket).await
+}
+/// Notes an ending run's annotation totals under its definition.
+fn tally(ended: &mut BTreeMap<String, (u64, ows::durable::Totals)>, run: &SavedRun) {
+    if run.annotations.is_empty() {
+        return;
+    }
+    let (runs, totals) = ended.entry(run.admission.name.clone()).or_default();
+    *runs += 1;
+    ows::durable::accumulate(totals, &run.annotations);
 }
 async fn cancel_run(rows: &mut dyn Transaction, id: &str, now: i64) -> anyhow::Result<bool> {
     let Some(s) = find_run(rows, id).await? else { return Ok(false) };
@@ -1235,10 +1283,10 @@ impl RunStore for TransactionalStore {
             .await
     }
     async fn stopped(&self) -> anyhow::Result<bool> {
-        self.update(|rows| Box::pin(async move { is_stopped(rows).await })).await
+        self.read(|rows| Box::pin(async move { is_stopped(rows).await })).await
     }
     async fn control_entry(&self, id: &str) -> anyhow::Result<Option<control::Entry>> {
-        self.update(|rows| Box::pin(async move { get(rows, "control_command", id).await })).await
+        self.read(|rows| Box::pin(async move { get(rows, "control_command", id).await })).await
     }
     async fn control_history(
         &self,
@@ -1246,7 +1294,7 @@ impl RunStore for TransactionalStore {
         cursor: Option<&control::Cursor>,
         limit: usize,
     ) -> anyhow::Result<control::Page<control::Entry>> {
-        self.update(|rows| {
+        self.read(|rows| {
             Box::pin(async move {
                 let kind = run.map_or_else(|| "control_history".into(), |r| partition("control_history_run", r));
                 let (found, next) = page_rows(rows, &kind, &kind, None, None, cursor, limit).await?;
@@ -1264,14 +1312,14 @@ impl RunStore for TransactionalStore {
         cursor: Option<&control::Cursor>,
         limit: usize,
     ) -> anyhow::Result<control::Page<SavedRun>> {
-        self.update(|rows| Box::pin(async move { query_runs(rows, filter, history, cursor, limit).await })).await
+        self.read(|rows| Box::pin(async move { query_runs(rows, filter, history, cursor, limit).await })).await
     }
     async fn query_definitions(
         &self,
         cursor: Option<&control::Cursor>,
         limit: usize,
     ) -> anyhow::Result<control::Page<control::DefinitionSummary>> {
-        self.update(|rows| {
+        self.read(|rows| {
             Box::pin(async move {
                 let (found, next) = page_rows(rows, "definitions", "definitions", None, None, cursor, limit).await?;
                 let mut items = Vec::new();
@@ -1285,7 +1333,7 @@ impl RunStore for TransactionalStore {
         .await
     }
     async fn definition_control(&self, name: &str) -> anyhow::Result<Option<control::DefinitionSummary>> {
-        self.update(|rows| {
+        self.read(|rows| {
             Box::pin(async move {
                 let Some(defs) = load_definitions(rows, name).await? else { return Ok(None) };
                 Ok(Some(definition_summary(rows, name, defs).await?))
@@ -1299,7 +1347,7 @@ impl RunStore for TransactionalStore {
         cursor: Option<&control::Cursor>,
         limit: usize,
     ) -> anyhow::Result<control::Page<control::Wait>> {
-        self.update(|rows| {
+        self.read(|rows| {
             Box::pin(async move {
                 let query = serde_json::to_string(&("waits", f))?;
                 let (found, next) =
@@ -1345,7 +1393,7 @@ impl RunStore for TransactionalStore {
         cursor: Option<&control::Cursor>,
         limit: usize,
     ) -> anyhow::Result<control::Page<control::Worker>> {
-        self.update(|rows| {
+        self.read(|rows| {
             Box::pin(async move {
                 let (found, next) = page_rows(rows, "worker", "workers", None, None, cursor, limit).await?;
                 let items =
@@ -1373,7 +1421,7 @@ impl RunStore for TransactionalStore {
         .await
     }
     async fn inspect_control(&self, id: &str) -> anyhow::Result<Option<control::Inspection>> {
-        self.update(|rows| {
+        self.read(|rows| {
             Box::pin(async move {
                 let Some(s) = find_run(rows, id).await? else {
                     return Ok(None);
@@ -1397,7 +1445,7 @@ impl RunStore for TransactionalStore {
                 let span_id = runtime["span_id"].as_str().map(str::to_owned);
                 let snapshot = snapshot(rows, s).await?;
                 let calls = ows::durable::call_journal(&snapshot.records);
-                let annotations = ows::durable::annotation_totals(&calls);
+                let annotations = snapshot.run.annotations.clone();
                 Ok(Some(control::Inspection {
                     snapshot,
                     calls,
@@ -1409,6 +1457,51 @@ impl RunStore for TransactionalStore {
                     trace_id,
                     span_id,
                 }))
+            })
+        })
+        .await
+    }
+
+    // One bounded range read of the definition's bucket rows.
+    async fn totals(&self, name: &str, since: i64, before: i64) -> anyhow::Result<control::DefinitionTotals> {
+        use control::{ControlError, MAX_TOTALS_BUCKETS, TOTALS_BUCKET_MS};
+        if since > before {
+            return Err(ControlError::InvalidInput("invalid time window".into()).into());
+        }
+        let start = bucket_start(since);
+        let end = bucket_start(before.saturating_sub(1)).saturating_add(TOTALS_BUCKET_MS).max(start);
+        let buckets = usize::try_from(end.saturating_sub(start) / TOTALS_BUCKET_MS).unwrap_or(usize::MAX);
+        if buckets > MAX_TOTALS_BUCKETS {
+            return Err(ControlError::InvalidInput(format!(
+                "a totals window covers at most {MAX_TOTALS_BUCKETS} buckets of {TOTALS_BUCKET_MS} ms"
+            ))
+            .into());
+        }
+        self.read(|rows| {
+            Box::pin(async move {
+                let found = rows
+                    .scan(&partition("totals", name), &time_key(start), Some(&time_key(end)), MAX_TOTALS_BUCKETS)
+                    .await?;
+                let mut totals = control::DefinitionTotals {
+                    definition: name.into(),
+                    since_ms: start,
+                    before_ms: end,
+                    runs: 0,
+                    annotations: Default::default(),
+                    buckets: Vec::new(),
+                };
+                for ((_, k), value) in found {
+                    let bucket: Bucket = serde_json::from_value(value)?;
+                    let start_ms = i64::from_be_bytes(u64::from_str_radix(&k, 16)?.to_be_bytes()) ^ i64::MIN;
+                    totals.runs = totals.runs.saturating_add(bucket.runs);
+                    ows::durable::accumulate(&mut totals.annotations, &bucket.annotations);
+                    totals.buckets.push(control::TotalsBucket {
+                        start_ms,
+                        runs: bucket.runs,
+                        annotations: bucket.annotations,
+                    });
+                }
+                Ok(totals)
             })
         })
         .await
@@ -1497,8 +1590,11 @@ impl RunStore for TransactionalStore {
 
     // The fence check reads the run row and the save writes only the record's
     // row, in one serializable commit: an owner replaced before the commit
-    // conflicts and fails the check on retry. Only a run's first record also
-    // writes the run row, to mark evidence for `sweep`.
+    // conflicts and fails the check on retry. A run's first record also
+    // writes the run row, to mark evidence for `sweep`, and so does a call's
+    // answer with numeric annotations, which adds them to the run's totals:
+    // only the save that completes the call does, never a replay of it (a
+    // completed record is immutable, and saving it again changes nothing).
     async fn save_record(&self, f: &Fence, k: &str, r: &Record, now: i64) -> anyhow::Result<()> {
         self.update(|rows| {
             Box::pin(async move {
@@ -1512,14 +1608,25 @@ impl RunStore for TransactionalStore {
                 if matches!(r, Record::Budget { .. } | Record::Exceeded { .. }) {
                     anyhow::ensure!(old.as_ref() == Some(&value), "budget records must be committed by spend");
                 }
+                let mut completed = false;
                 if let Some(old) = &old {
-                    check_transition(&serde_json::from_value(old.clone())?, r)?;
+                    let old: Record = serde_json::from_value(old.clone())?;
+                    check_transition(&old, r)?;
+                    completed = matches!(old, Record::Call { state: CallState::Done(_), .. });
                 }
                 if old.as_ref() != Some(&value) {
                     rows.put(&kind, k, &value).await?;
                 }
-                if !s.evidence {
-                    s.evidence = true;
+                let mut changed = !s.evidence;
+                s.evidence = true;
+                if let Record::Call { state: CallState::Done(_), annotations, .. } = r
+                    && !completed
+                {
+                    let before = s.run.annotations.clone();
+                    ows::durable::accumulate(&mut s.run.annotations, ows::durable::numbers(annotations));
+                    changed |= s.run.annotations != before;
+                }
+                if changed {
                     store_run(rows, &s).await?;
                 }
                 Ok(())
@@ -1632,13 +1739,13 @@ impl RunStore for TransactionalStore {
         self.update(|rows| Box::pin(async move { publish(rows, event, target, now, &self.policy).await })).await
     }
     async fn ingested(&self, event: &Value, now: i64) -> anyhow::Result<bool> {
-        self.update(|rows| Box::pin(async move { Ok(tombstone(rows, event, now).await?.2) })).await
+        self.read(|rows| Box::pin(async move { Ok(tombstone(rows, event, now).await?.2) })).await
     }
     async fn trigger(&self, key: &str) -> anyhow::Result<Option<Trigger>> {
-        self.update(|rows| Box::pin(async move { get(rows, "trigger", key).await })).await
+        self.read(|rows| Box::pin(async move { get(rows, "trigger", key).await })).await
     }
     async fn due_triggers(&self, now: i64, limit: usize) -> anyhow::Result<Vec<(String, Trigger)>> {
-        self.update(|rows| {
+        self.read(|rows| {
             Box::pin(async move {
                 if is_stopped(rows).await? {
                     return Ok(Vec::new());
@@ -1650,7 +1757,7 @@ impl RunStore for TransactionalStore {
         .await
     }
     async fn triggers_for(&self, t: &str, limit: usize) -> anyhow::Result<Vec<(String, Trigger)>> {
-        self.update(|rows| {
+        self.read(|rows| {
             Box::pin(async move {
                 if is_stopped(rows).await? {
                     return Ok(Vec::new());
@@ -1665,7 +1772,7 @@ impl RunStore for TransactionalStore {
         .await
     }
     async fn queued(&self, key: &str) -> anyhow::Result<Option<Admission>> {
-        self.update(|rows| Box::pin(async move { Ok(queued(rows, key).await?.map(|q| q.admission)) })).await
+        self.read(|rows| Box::pin(async move { Ok(queued(rows, key).await?.map(|q| q.admission)) })).await
     }
     async fn fire(&self, firing: &Firing<'_>, now: i64) -> anyhow::Result<Fired> {
         self.update(|rows| Box::pin(async move { fire(rows, firing, now, &self.policy).await })).await
@@ -1765,7 +1872,7 @@ impl RunStore for TransactionalStore {
         .await
     }
     async fn child_outcome(&self, parent: &str, k: &str, child: &str) -> anyhow::Result<Option<Status>> {
-        self.update(|rows| {
+        self.read(|rows| {
             Box::pin(async move {
                 let s = run(rows, child).await?;
                 anyhow::ensure!(
@@ -1901,10 +2008,10 @@ impl RunStore for TransactionalStore {
         .await
     }
     async fn get(&self, id: &str) -> anyhow::Result<Option<SavedRun>> {
-        self.update(|rows| Box::pin(async move { Ok(find_run(rows, id).await?.map(|s| s.run)) })).await
+        self.read(|rows| Box::pin(async move { Ok(find_run(rows, id).await?.map(|s| s.run)) })).await
     }
     async fn list(&self, name: Option<&str>, prefix: &str) -> anyhow::Result<Vec<SavedRun>> {
-        self.update(|rows| {
+        self.read(|rows| {
             Box::pin(async move {
                 let end = prefix_end(prefix);
                 if let Some(name) = name {
@@ -1925,7 +2032,7 @@ impl RunStore for TransactionalStore {
         .await
     }
     async fn inspect(&self, id: &str) -> anyhow::Result<Option<RunSnapshot>> {
-        self.update(|rows| {
+        self.read(|rows| {
             Box::pin(async move {
                 let Some(s) = find_run(rows, id).await? else {
                     return Ok(None);
@@ -1953,10 +2060,13 @@ impl RunStore for TransactionalStore {
         })
         .await
     }
-    async fn activate(&self, name: &str, version: u64) -> anyhow::Result<()> {
-        self.update(|rows| Box::pin(async move { activate(rows, name, version, None, &Arming::default()).await }))
-            .await
-            .map(|_| ())
+    async fn activate(&self, name: &str, version: u64, now: i64) -> anyhow::Result<()> {
+        let activation = &Activation::at(now);
+        self.update(|rows| {
+            Box::pin(async move { activate(rows, name, version, None, &Arming::default(), activation).await })
+        })
+        .await
+        .map(|_| ())
     }
     async fn activate_with(
         &self,
@@ -1964,15 +2074,19 @@ impl RunStore for TransactionalStore {
         version: u64,
         epoch: u64,
         arming: &Arming,
+        activation: &Activation,
     ) -> anyhow::Result<Option<Definitions>> {
-        self.update(|rows| Box::pin(async move { activate(rows, name, version, Some(epoch), arming).await })).await
+        self.update(|rows| {
+            Box::pin(async move { activate(rows, name, version, Some(epoch), arming, activation).await })
+        })
+        .await
     }
     async fn definitions(&self, name: &str) -> anyhow::Result<Definitions> {
-        self.update(|rows| Box::pin(async move { Ok(load_definitions(rows, name).await?.unwrap_or_default()) })).await
+        self.read(|rows| Box::pin(async move { Ok(load_definitions(rows, name).await?.unwrap_or_default()) })).await
     }
     // One ordered range read of at most `limit` notice rows.
     async fn notices(&self, limit: usize) -> anyhow::Result<Vec<(String, Value)>> {
-        self.update(|rows| {
+        self.read(|rows| {
             Box::pin(async move {
                 Ok(rows.scan("notice", "", None, limit).await?.into_iter().map(|((_, k), v)| (k, v)).collect())
             })
@@ -2057,7 +2171,20 @@ async fn definition_summary(
     }
     Ok(control::DefinitionSummary {
         name: name.into(),
-        versions: defs.versions.keys().map(|&version| VersionSummary { version, activated_ms: None }).collect(),
+        versions: defs
+            .versions
+            .keys()
+            .map(|&version| {
+                let latest = defs.activations.get(&version);
+                VersionSummary {
+                    version,
+                    activated_ms: latest.map(|a| a.at_ms),
+                    activated_epoch: latest.map(|a| a.epoch),
+                    activated_by: latest.and_then(|a| a.actor.clone()),
+                    activation_note: latest.and_then(|a| a.note.clone()),
+                }
+            })
+            .collect(),
         active: defs.active,
         epoch: defs.epoch,
         consecutive_faults: defs.consecutive_faults,
@@ -2111,11 +2238,18 @@ async fn page_rows(
     cursor: Option<&control::Cursor>,
     limit: usize,
 ) -> anyhow::Result<(Rows, Option<control::Cursor>)> {
-    anyhow::ensure!((1..=control::MAX_PAGE).contains(&limit), "page limit must be 1..={}", control::MAX_PAGE);
-    anyhow::ensure!(since.zip(before).is_none_or(|(a, b)| a <= b), "invalid time window");
+    use control::ControlError;
+    if !(1..=control::MAX_PAGE).contains(&limit) {
+        return Err(ControlError::InvalidInput(format!("page limit must be 1..={}", control::MAX_PAGE)).into());
+    }
+    if since.zip(before).is_some_and(|(a, b)| a > b) {
+        return Err(ControlError::InvalidInput("invalid time window".into()).into());
+    }
     let start = match cursor {
         Some(c) => {
-            anyhow::ensure!(c.query == query, "cursor belongs to another query");
+            if c.query != query {
+                return Err(ControlError::InvalidInput("cursor belongs to another query".into()).into());
+            }
             c.after.clone()
         }
         None => since.map_or_else(String::new, time_key),
@@ -2189,16 +2323,18 @@ async fn control_command(
     now: i64,
     policy: &Policy,
 ) -> anyhow::Result<control::Reply> {
-    use control::{Command, Reply};
-    anyhow::ensure!(
-        !request.id.trim().is_empty() && !request.actor.trim().is_empty() && !request.reason.trim().is_empty(),
-        "control request requires id, actor and reason"
-    );
+    use control::{Command, ControlError, Entity, Reply};
+    if request.id.trim().is_empty() || request.actor.trim().is_empty() || request.reason.trim().is_empty() {
+        return Err(ControlError::InvalidInput("control request requires id, actor and reason".into()).into());
+    }
     let canonical = normalize_command(command);
     if let Some(entry) = get::<control::Entry>(rows, "control_command", &request.id).await? {
-        anyhow::ensure!(entry.request == *request && entry.command == canonical, "control request identity conflict");
+        if entry.request != *request || entry.command != canonical {
+            return Err(ControlError::RequestConflict { id: request.id.clone() }.into());
+        }
         return Ok(entry.reply);
     }
+    let unknown = |name: &str| ControlError::NotFound { entity: Entity::Definition, id: name.into() };
     let reply = match command {
         Command::Cancel { run: id } => {
             let changed = find_run(rows, id).await?.is_some_and(|s| s.run.ended_ms.is_none());
@@ -2220,10 +2356,12 @@ async fn control_command(
             Reply::Changed(changed)
         }
         Command::Pause { definition: name, note } => {
-            let mut defs = load_definitions(rows, name).await?.ok_or_else(|| anyhow::anyhow!("unknown definition"))?;
+            let mut defs = load_definitions(rows, name).await?.ok_or_else(|| unknown(name))?;
             let changed = defs.tripped.is_none();
             if changed {
-                let version = defs.active.ok_or_else(|| anyhow::anyhow!("definition has no active version"))?;
+                let version = defs
+                    .active
+                    .ok_or_else(|| ControlError::InvalidState(format!("definition {name} has no active version")))?;
                 suspend(rows, name, &mut defs).await?;
                 defs.tripped = Some(Trip {
                     manual: Some(control::ManualTrip {
@@ -2250,16 +2388,17 @@ async fn control_command(
             Reply::Changed(changed)
         }
         Command::Resume { definition: name } => {
-            let mut defs = load_definitions(rows, name).await?.ok_or_else(|| anyhow::anyhow!("unknown definition"))?;
-            anyhow::ensure!(
-                defs.tripped.as_ref().is_none_or(|t| t.manual.is_some()),
-                "a breaker trip requires activation"
-            );
+            let mut defs = load_definitions(rows, name).await?.ok_or_else(|| unknown(name))?;
+            if defs.tripped.as_ref().is_some_and(|t| t.manual.is_none()) {
+                return Err(ControlError::InvalidState(format!("{name}: a breaker trip requires activation")).into());
+            }
             let changed = defs.tripped.is_some();
             if changed {
                 let paused: control::Paused =
                     get(rows, "paused", name).await?.ok_or_else(|| anyhow::anyhow!("missing suspended triggers"))?;
-                anyhow::ensure!(paused.epoch == defs.epoch, "suspended activation changed");
+                if paused.epoch != defs.epoch {
+                    return Err(ControlError::InvalidState(format!("{name}: suspended activation changed")).into());
+                }
                 defs.tripped = None;
                 arm(rows, &mut defs, &paused.triggers).await?;
                 for (key, value) in &paused.queues {
@@ -2275,19 +2414,24 @@ async fn control_command(
             Reply::Changed(changed)
         }
         Command::Respond { run: id, wait: key, event } => {
-            let identity = identity(event).ok_or_else(|| anyhow::anyhow!("response requires event source and id"))?;
+            let identity = identity(event)
+                .ok_or_else(|| ControlError::InvalidInput("response requires event source and id".into()))?;
             let kind = partition("control_response", id);
             let dedup = component(&identity);
+            let closed = || ControlError::WaitClosed { run: id.clone(), wait: key.clone() };
             if let Some(entry) = get::<control::Entry>(rows, &kind, &dedup).await? {
-                anyhow::ensure!(entry.command == canonical, "response event identity conflict");
+                if entry.command != canonical {
+                    return Err(ControlError::ResponseConflict { identity: identity.replace('\u{0}', "/") }.into());
+                }
                 entry.reply
             } else {
-                let s = run(rows, id).await?;
-                let w = s.waits.get(key).ok_or_else(|| anyhow::anyhow!("wait is no longer pending"))?;
-                anyhow::ensure!(
-                    s.run.ended_ms.is_none() && w.timeout_ms.is_none_or(|at| now < at),
-                    "wait ended or timed out"
-                );
+                let s = find_run(rows, id)
+                    .await?
+                    .ok_or_else(|| ControlError::NotFound { entity: Entity::Run, id: id.clone() })?;
+                let w = s.waits.get(key).ok_or_else(closed)?;
+                if s.run.ended_ms.is_some() || w.timeout_ms.is_some_and(|at| now >= at) {
+                    return Err(closed().into());
+                }
                 let mut event = event.clone();
                 if let Value::Object(m) = &mut event {
                     m.entry("specversion").or_insert(json!("1.0"));
@@ -2296,7 +2440,12 @@ async fn control_command(
                         .to_rfc3339();
                     m.entry("time").or_insert(json!(time));
                 }
-                anyhow::ensure!(w.accepts(&event).map_err(anyhow::Error::msg)?, "event does not match wait");
+                let matched = w.accepts(&event).map_err(|e| {
+                    ControlError::InvalidState(format!("wait {key} of run {id} cannot be matched here: {e}"))
+                })?;
+                if !matched {
+                    return Err(ControlError::WaitMismatch { run: id.clone(), wait: key.clone() }.into());
+                }
                 let result = Reply::Responded(deliver(rows, &event, Some(id), now, policy).await?);
                 let sequence: u64 = get(rows, &identities_of(id), &dedup)
                     .await?

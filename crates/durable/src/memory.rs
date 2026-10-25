@@ -14,9 +14,22 @@ struct State {
 }
 #[derive(Default)]
 pub struct MemoryBackend {
-    state: Mutex<State>,
+    state: Arc<Mutex<State>>,
+    read_only: bool,
     pub faults: Arc<FaultInjector>,
     pub metrics: Arc<Metrics>,
+}
+impl MemoryBackend {
+    /// A read-only handle to the same rows, with counters of its own: it
+    /// serves queries and refuses every write (`ReadOnly`).
+    pub fn read_only_view(&self) -> Self {
+        Self {
+            state: self.state.clone(),
+            read_only: true,
+            faults: Arc::new(FaultInjector::default()),
+            metrics: Arc::new(Metrics::default()),
+        }
+    }
 }
 struct RangeRead {
     kind: String,
@@ -50,6 +63,9 @@ impl AtomicBackend for MemoryBackend {
             scans: Vec::new(),
             writes: BTreeMap::new(),
         }))
+    }
+    fn is_read_only(&self) -> bool {
+        self.read_only
     }
     async fn snapshot(&self) -> anyhow::Result<Snapshot> {
         let state = self.state.lock().unwrap();
@@ -99,11 +115,17 @@ impl Transaction for MemoryTransaction<'_> {
         Ok(rows.into_iter().take(limit).collect())
     }
     async fn put(&mut self, kind: &str, id: &str, value: &serde_json::Value) -> anyhow::Result<()> {
+        if self.backend.read_only {
+            return Err(ReadOnly.into());
+        }
         self.get(kind, id).await?;
         self.writes.insert((kind.into(), id.into()), Some(value.clone()));
         Ok(())
     }
     async fn delete(&mut self, kind: &str, id: &str) -> anyhow::Result<()> {
+        if self.backend.read_only {
+            return Err(ReadOnly.into());
+        }
         self.get(kind, id).await?;
         self.writes.insert((kind.into(), id.into()), None);
         Ok(())

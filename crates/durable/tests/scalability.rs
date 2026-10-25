@@ -1,6 +1,6 @@
 use ouro_durable::{
-    Arming, AtomicBackend, Compatibility, Conflict, Fence, Fired, Firing, IoCounts, Metrics, Overlap, OverlapGuard,
-    Policy, Rearm, Refused, RunState, RunStore, TransactionalStore, Trigger,
+    Activation, Arming, AtomicBackend, Compatibility, Conflict, Fence, Fired, Firing, IoCounts, Metrics, Overlap,
+    OverlapGuard, Policy, Rearm, Refused, RunState, RunStore, TransactionalStore, Trigger,
     conformance::{admission, event},
     memory::MemoryBackend,
     postgres::PostgresBackend,
@@ -35,6 +35,7 @@ async fn bounds(backend: Arc<dyn AtomicBackend>, metrics: Arc<Metrics>, validati
     definition_bounds(&backend, &metrics).await?;
     control_bounds(&backend, &metrics).await?;
     heartbeat_bounds(&backend, &metrics).await?;
+    totals_bounds(&backend, &metrics).await?;
     decided(&backend, &metrics).await?;
     overlap_bounds(&backend, &metrics).await?;
     let s = TransactionalStore::new(backend.clone());
@@ -42,7 +43,7 @@ async fn bounds(backend: Arc<dyn AtomicBackend>, metrics: Arc<Metrics>, validati
     a.name = "target".into();
     bounded(&metrics, "save_definition", 0, async || s.save_definition("target", "one").await).await?;
     let d = bounded(&metrics, "save_definition_existing", 0, async || s.save_definition("target", "two").await).await?;
-    bounded(&metrics, "activate", 0, async || s.activate("target", d.version).await).await?;
+    bounded(&metrics, "activate", 0, async || s.activate("target", d.version, 0).await).await?;
     assert_eq!(bounded(&metrics, "definitions", 2, async || s.definitions("target").await).await?.versions.len(), 2);
     a.version = d.version;
     let mut other = a.clone();
@@ -56,6 +57,25 @@ async fn bounds(backend: Arc<dyn AtomicBackend>, metrics: Arc<Metrics>, validati
         s.save_record(&f, "timer", &Record::Timer { deadline_ms: 42 }, 1).await
     })
     .await?;
+    // An annotated answer also rewrites its run row (the totals): one more
+    // row written in the same commit, whatever the run or store holds.
+    let chat = |state| Record::Call {
+        logical: "chat".into(),
+        function: "chat".into(),
+        arguments: json!({}),
+        delivery: ows::durable::Delivery::AtLeastOnce,
+        state,
+        annotations: BTreeMap::from([("tokens".to_string(), ows::durable::Annotation::from(7))]),
+    };
+    let answered = chat(ows::durable::CallState::Done(Ok(json!(1))));
+    s.save_record(&admitted, "chat#call", &chat(ows::durable::CallState::Pending), 1).await?;
+    bounded(&metrics, "save_record_annotated", 0, async || s.save_record(&admitted, "chat#call", &answered, 1).await)
+        .await?;
+    bounded(&metrics, "save_record_annotated_replay", 0, async || {
+        s.save_record(&admitted, "chat#call", &answered, 1).await
+    })
+    .await?;
+    assert_eq!(s.get(&other.id).await?.unwrap().annotations["tokens"], 7.into());
     // Full pending inboxes must not turn a missing eligible delivery into a
     // scan over every registration of the same event type.
     for n in 0..64 {
@@ -389,7 +409,7 @@ async fn definition_bounds(backend: &Arc<dyn AtomicBackend>, metrics: &Metrics) 
                 },
             );
         }
-        s.activate_with(&name, 1, 0, &Arming { triggers }).await?.unwrap();
+        s.activate_with(&name, 1, 0, &Arming { triggers }, &Activation::at(0)).await?.unwrap();
     }
     let a = ouro_durable::Admission { name: "catalog0000".into(), ..admission("catalog:first") };
     let b = ouro_durable::Admission { id: "catalog:buffered".into(), ..a.clone() };
@@ -476,6 +496,52 @@ async fn heartbeat_bounds(backend: &Arc<dyn AtomicBackend>, metrics: &Metrics) -
     .await?;
     assert_eq!(swept.workers, 50);
     assert_eq!(s.workers(None, 1_000).await?.items.len(), 1_000);
+    Ok(())
+}
+
+/// Hourly totals among the 10,000 seeded runs: a terminal commit of a run
+/// with annotation totals reads and writes its one bucket row, and a window
+/// reads only the definition's buckets in it, however many runs ended there
+/// or other definitions' buckets exist.
+async fn totals_bounds(backend: &Arc<dyn AtomicBackend>, metrics: &Metrics) -> anyhow::Result<()> {
+    use ouro_durable::control::TOTALS_BUCKET_MS;
+    use ows::durable::{Annotation, CallState, Delivery};
+    let s = TransactionalStore::new(backend.clone());
+    let answer = Record::Call {
+        logical: "chat".into(),
+        function: "chat".into(),
+        arguments: json!({}),
+        delivery: Delivery::AtLeastOnce,
+        state: CallState::Done(Ok(json!(1))),
+        annotations: BTreeMap::from([("tokens".to_string(), Annotation::from(3))]),
+    };
+    let end = async |name: &str, id: &str, at: i64| -> anyhow::Result<()> {
+        let mut a = admission(id);
+        a.name = name.into();
+        let f = s.start(&a, at).await?.unwrap();
+        s.save_record(&f, "chat#call", &answer, at).await?;
+        s.finish(&f, &Status::Completed(json!(0)), at, 3).await?;
+        Ok(())
+    };
+    for n in 0..48 {
+        end("totals", &format!("totals:{n}"), n * TOTALS_BUCKET_MS).await?;
+        end("totals-other", &format!("totals-other:{n}"), n * TOTALS_BUCKET_MS).await?;
+    }
+    let mut a = admission("totals:bounded");
+    a.name = "totals".into();
+    let f = s.start(&a, 0).await?.unwrap();
+    s.save_record(&f, "chat#call", &answer, 0).await?;
+    bounded(metrics, "finish_totals", 1, async || s.finish(&f, &Status::Completed(json!(0)), 0, 3).await).await?;
+    let hour = bounded(metrics, "totals_hour", 1, async || s.totals("totals", 0, TOTALS_BUCKET_MS).await).await?;
+    assert_eq!((hour.runs, &hour.annotations["tokens"]), (2, &6.into()));
+    let day = bounded(metrics, "totals_day", 24, async || s.totals("totals", 0, 24 * TOTALS_BUCKET_MS).await).await?;
+    assert_eq!((day.runs, day.buckets.len()), (25, 24));
+    assert!(
+        bounded(metrics, "totals_absent", 0, async || s.totals("absent", 0, TOTALS_BUCKET_MS).await)
+            .await?
+            .buckets
+            .is_empty()
+    );
     Ok(())
 }
 
@@ -687,14 +753,18 @@ async fn decided(backend: &Arc<dyn AtomicBackend>, metrics: &Metrics) -> anyhow:
     let arm = |keys: &[&str]| keys.iter().map(|k| ((*k).to_string(), slot(100))).collect();
     let arming = Arming { triggers: arm(&["decided#a", "decided#b"]) };
     let epoch = s.definitions("decided").await?.epoch;
-    bounded(metrics, "activate_with", 2, async || s.activate_with("decided", v1.version, epoch, &arming).await)
-        .await?
-        .unwrap();
+    bounded(metrics, "activate_with", 2, async || {
+        s.activate_with("decided", v1.version, epoch, &arming, &Activation::at(0)).await
+    })
+    .await?
+    .unwrap();
     let arming = Arming { triggers: arm(&["decided#c"]) };
     let epoch = s.definitions("decided").await?.epoch;
-    bounded(metrics, "activate_rearm", 3, async || s.activate_with("decided", v2.version, epoch, &arming).await)
-        .await?
-        .unwrap();
+    bounded(metrics, "activate_rearm", 3, async || {
+        s.activate_with("decided", v2.version, epoch, &arming, &Activation::at(0)).await
+    })
+    .await?
+    .unwrap();
     let mut faulty = a.clone();
     faulty.id = "decided:trip".into();
     faulty.version = v2.version;
@@ -715,13 +785,13 @@ async fn decided(backend: &Arc<dyn AtomicBackend>, metrics: &Metrics) -> anyhow:
     let counts = metrics.counts();
     assert!(counts.rows_read <= 32 && counts.rows_written == 0, "admit_tripped: {counts:?}");
     let epoch = s.definitions("decided").await?.epoch;
-    s.activate_with("decided", v2.version, epoch, &Arming::default()).await?.unwrap();
+    s.activate_with("decided", v2.version, epoch, &Arming::default(), &Activation::at(0)).await?.unwrap();
     // A refused trigger run: the slot moves, the run is stored ended and the
     // breaker counts it, by a constant number of rows; at the threshold the
     // same commit trips, removes the trigger and stores the notice.
     let armed = Arming { triggers: BTreeMap::from([("decided#refused".to_string(), slot(200))]) };
     let epoch = s.definitions("decided").await?.epoch;
-    s.activate_with("decided", v2.version, epoch, &armed).await?.unwrap();
+    s.activate_with("decided", v2.version, epoch, &armed, &Activation::at(0)).await?.unwrap();
     let refusal = |id: &str| Refused {
         admission: ouro_durable::Admission { id: id.into(), version: v2.version, ..a.clone() },
         error: WorkflowError::validation("invalid"),
@@ -746,7 +816,7 @@ async fn decided(backend: &Arc<dyn AtomicBackend>, metrics: &Metrics) -> anyhow:
     assert!(d.tripped.is_some_and(|t| t.run == second.admission.id) && d.triggers.is_empty());
     assert_eq!(s.get(&first.admission.id).await?.map(|r| r.state), Some(RunState::Failed));
     let epoch = d.epoch;
-    s.activate_with("decided", v2.version, epoch, &Arming::default()).await?.unwrap();
+    s.activate_with("decided", v2.version, epoch, &Arming::default(), &Activation::at(0)).await?.unwrap();
     // Version-aware claims page through their own partitions only.
     let mut versioned = a.clone();
     versioned.id = "decided:versioned".into();
@@ -768,7 +838,7 @@ async fn decided(backend: &Arc<dyn AtomicBackend>, metrics: &Metrics) -> anyhow:
 async fn workers(store: Arc<dyn RunStore>, reopen: ouro_durable::conformance::Reopen) -> anyhow::Result<()> {
     const RUNS: usize = 128;
     let d = store.save_definition("contention", "yaml").await?;
-    store.activate("contention", d.version).await?;
+    store.activate("contention", d.version, 0).await?;
     for n in 0..RUNS {
         let mut a = admission(&format!("load:{n:04}"));
         a.name = d.name.clone();
@@ -1038,7 +1108,7 @@ async fn index_atomicity(
             .unwrap();
         s.save_record(&c, "timer", &Record::Timer { deadline_ms: 42 }, 0).await?;
         let first = s.save_definition("workflow", "first").await?;
-        s.activate("workflow", first.version).await?;
+        s.activate("workflow", first.version, 0).await?;
         let second = s.save_definition("workflow", "second").await?;
         let epoch = s.definitions("workflow").await?.epoch;
         if operation == "sweep" {
@@ -1049,7 +1119,7 @@ async fn index_atomicity(
         if operation == "trip" {
             let trigger = Trigger { at_ms: Some(5), types: vec!["t".into()], state: json!(1) };
             let arming = Arming { triggers: BTreeMap::from([("armed".to_string(), trigger)]) };
-            s.activate_with("workflow", second.version, epoch, &arming).await?;
+            s.activate_with("workflow", second.version, epoch, &arming, &Activation::at(0)).await?;
             let mut a = admission("tripping");
             a.version = second.version;
             tripping = s.start(&a, 0).await?;
@@ -1077,7 +1147,7 @@ async fn index_atomicity(
                 "register" => s.register_wait(&p, &["new".into()], 0).await,
                 "unregister" => s.unregister_wait(&p, "event", &["answer".into()], 0).await,
                 "definition" => s.save_definition("workflow", "third").await.map(|_| ()),
-                "activate" => s.activate("workflow", second.version).await,
+                "activate" => s.activate("workflow", second.version, 0).await,
                 "subscribe" => s.subscribe(&p, "listen", &["answer".into()], 0).await,
                 "publish" => {
                     s.publish(&json!({"id":"1","source":"/s","type":"published"}), Some("p"), 0).await.map(|_| ())
@@ -1107,6 +1177,7 @@ async fn index_atomicity(
                                 Trigger { at_ms: Some(5), types: vec!["t".into()], state: json!(1) },
                             )]),
                         },
+                        &Activation::at(0),
                     )
                     .await
                     .map(|_| ()),
@@ -1292,7 +1363,7 @@ async fn control_bounds(backend: &Arc<dyn AtomicBackend>, metrics: &Metrics) -> 
     let mut a = admission("operator:root");
     a.name = "operator".into();
     s.save_definition("operator", "yaml").await?;
-    s.activate("operator", 1).await?;
+    s.activate("operator", 1, 0).await?;
     let f = s.start(&a, now).await?.unwrap();
     bounded(metrics, "control_check_lease", 0, async || s.check_lease(&f, now).await).await?;
     let mut child = a.clone();
@@ -1413,7 +1484,8 @@ async fn control_bounds(backend: &Arc<dyn AtomicBackend>, metrics: &Metrics) -> 
         let name = if pause { "operatorpausequeue" } else { "operatorstopqueue" };
         s.save_definition(name, "yaml").await?;
         let slot = |n| Trigger { at_ms: Some(now + n), types: vec![], state: json!(n) };
-        s.activate_with(name, 1, 0, &Arming { triggers: BTreeMap::from([(name.into(), slot(0))]) }).await?;
+        s.activate_with(name, 1, 0, &Arming { triggers: BTreeMap::from([(name.into(), slot(0))]) }, &Activation::at(0))
+            .await?;
         let mut first = a.clone();
         first.id = format!("{name}:first");
         first.name = name.into();

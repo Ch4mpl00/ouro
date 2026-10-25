@@ -11,7 +11,7 @@ use super::{
     run_id, schedule_trigger, status, worker,
 };
 use anyhow::{Context, ensure};
-use ouro_durable::{Admission, Arming, Fence, Fired, Firing, IdentityConflict, Rearm, RunStore, Trigger};
+use ouro_durable::{Activation, Admission, Arming, Fence, Fired, Firing, IdentityConflict, Rearm, RunStore, Trigger};
 use ows::durable::CallState;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -209,7 +209,7 @@ async fn race(store: &dyn RunStore, p: &Prepared, k: usize, c: &Cmd) -> (i64, Op
                     .triggers
                     .insert(SCHEDULE.into(), schedule_trigger(Some(ms / TICK + 2), p.epoch + 1, 0, catchup, rearm));
             }
-            i64::from(store.activate_with(NAME, version, p.epoch, &arming).await.unwrap().is_some())
+            i64::from(store.activate_with(NAME, version, p.epoch, &arming, &Activation::at(0)).await.unwrap().is_some())
         }
         other => panic!("no concurrent form for {other}"),
     };

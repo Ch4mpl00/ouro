@@ -7,12 +7,16 @@
 //! `current_thread` included; one is required, since statements are handed
 //! to its blocking pool.
 use crate::*;
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 use std::{path::Path, sync::Arc, time::Duration};
 use tokio::sync::{Mutex, OwnedMutexGuard};
 
+/// The schema version this build reads and migrates to (`user_version`).
+const SCHEMA: i64 = 1;
+
 pub struct SqliteBackend {
     connection: Arc<Mutex<Connection>>,
+    read_only: bool,
     pub faults: Arc<FaultInjector>,
     pub metrics: Arc<Metrics>,
 }
@@ -24,18 +28,41 @@ impl SqliteBackend {
         connection.busy_timeout(Duration::from_secs(30))?;
         connection.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL;")?;
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let version: u32 = tx.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        anyhow::ensure!(version <= 1, "unsupported SQLite schema version {version}");
+        let version: i64 = tx.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        if version > SCHEMA {
+            return Err(SchemaError::Unsupported { found: version, supported: SCHEMA }.into());
+        }
         if version == 0 {
             tx.execute_batch(include_str!("../migrations/sqlite/001_initial.sql"))?;
             tx.execute_batch("PRAGMA user_version = 1;")?;
         }
         tx.commit()?;
-        Ok(Self {
+        Ok(Self::with(connection, false))
+    }
+    /// Opens an existing database file for queries only: it is never
+    /// created or migrated and nothing is ever written. A database without
+    /// the schema, or with another version of it, is refused with a
+    /// `SchemaError`; every write is refused with `ReadOnly`, by the
+    /// backend and by SQLite itself (a read-only connection with
+    /// `query_only`). Transactions are deferred: each reads one snapshot
+    /// without taking the writer's lock, so a console never delays a
+    /// worker. Blocking, like `open`.
+    pub fn open_read_only(path: impl AsRef<Path>) -> anyhow::Result<Self> {
+        let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX | OpenFlags::SQLITE_OPEN_URI;
+        let connection = Connection::open_with_flags(path, flags)?;
+        connection.busy_timeout(Duration::from_secs(30))?;
+        connection.execute_batch("PRAGMA query_only = ON;")?;
+        let version: i64 = connection.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        SchemaError::check(version, SCHEMA)?;
+        Ok(Self::with(connection, true))
+    }
+    fn with(connection: Connection, read_only: bool) -> Self {
+        Self {
             connection: Arc::new(Mutex::new(connection)),
+            read_only,
             faults: Arc::new(FaultInjector::default()),
             metrics: Arc::new(Metrics::default()),
-        })
+        }
     }
 }
 
@@ -97,10 +124,14 @@ impl Drop for SqliteTransaction<'_> {
 }
 #[async_trait::async_trait]
 impl AtomicBackend for SqliteBackend {
+    fn is_read_only(&self) -> bool {
+        self.read_only
+    }
     async fn begin(&self) -> anyhow::Result<Box<dyn Transaction + '_>> {
         let connection = self.connection.clone().lock_owned().await;
-        let (session, ()) = blocking(Session { connection, open: false }, |s| {
-            s.connection.execute_batch("BEGIN IMMEDIATE")?;
+        let begin = if self.read_only { "BEGIN DEFERRED" } else { "BEGIN IMMEDIATE" };
+        let (session, ()) = blocking(Session { connection, open: false }, move |s| {
+            s.connection.execute_batch(begin)?;
             s.open = true;
             Ok(())
         })
@@ -159,6 +190,9 @@ impl Transaction for SqliteTransaction<'_> {
         raw.into_iter().map(|(id, v)| Ok(((kind.into(), id), serde_json::from_str(&v)?))).collect()
     }
     async fn put(&mut self, kind: &str, id: &str, value: &Value) -> anyhow::Result<()> {
+        if self.backend.read_only {
+            return Err(ReadOnly.into());
+        }
         self.backend.faults.check(CommitFault::BeforeWrite(self.writes))?;
         self.writes += 1;
         self.backend.metrics.write();
@@ -173,6 +207,9 @@ impl Transaction for SqliteTransaction<'_> {
         .await
     }
     async fn delete(&mut self, kind: &str, id: &str) -> anyhow::Result<()> {
+        if self.backend.read_only {
+            return Err(ReadOnly.into());
+        }
         self.backend.faults.check(CommitFault::BeforeWrite(self.writes))?;
         self.writes += 1;
         self.backend.metrics.write();
@@ -197,4 +234,9 @@ impl Transaction for SqliteTransaction<'_> {
 }
 pub fn open(path: impl AsRef<Path>) -> anyhow::Result<TransactionalStore> {
     Ok(TransactionalStore::new(Arc::new(SqliteBackend::open(path)?)))
+}
+/// A store over `SqliteBackend::open_read_only`: queries and `Control`
+/// queries only; every mutating operation is refused with `ReadOnly`.
+pub fn open_read_only(path: impl AsRef<Path>) -> anyhow::Result<TransactionalStore> {
+    Ok(TransactionalStore::new(Arc::new(SqliteBackend::open_read_only(path)?)))
 }

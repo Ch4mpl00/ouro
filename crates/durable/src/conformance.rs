@@ -10,6 +10,9 @@ use std::collections::BTreeSet;
 
 /// Opens another independent handle to the same database.
 pub type Reopen = Arc<dyn Fn() -> BoxFuture<'static, anyhow::Result<Arc<dyn RunStore>>> + Send + Sync>;
+/// Opens a read-only backend over the same database (`is_read_only`): the
+/// adapter's read-only constructor, which never migrates or writes.
+pub type OpenReadOnly = Arc<dyn Fn() -> BoxFuture<'static, anyhow::Result<Arc<dyn AtomicBackend>>> + Send + Sync>;
 
 /// One case's store. Every operation is awaited on the caller's runtime,
 /// whose flavour the suite does not assume; the interpreter cases run on a
@@ -21,6 +24,7 @@ pub struct TestStore {
     pub faults: Arc<FaultInjector>,
     /// Read actual adapter rows, independently of the transition engine.
     pub backend: Arc<dyn AtomicBackend>,
+    pub read_only: OpenReadOnly,
 }
 #[derive(Debug, Default)]
 pub struct Report {
@@ -346,9 +350,9 @@ pub async fn run_all(factory: impl AsyncFn(&str) -> anyhow::Result<TestStore>) -
     report.cases += 1;
     let s = &t.store;
     let first = s.save_definition("workflow", "first").await?;
-    s.activate("workflow", first.version).await?;
+    s.activate("workflow", first.version, 0).await?;
     let second = s.save_definition("workflow", "second").await?;
-    s.activate("workflow", second.version).await?;
+    s.activate("workflow", second.version, 0).await?;
     let pinned = s.get("absent").await?;
     assert!(pinned.is_none());
     for n in 0..3 {
@@ -364,7 +368,7 @@ pub async fn run_all(factory: impl AsyncFn(&str) -> anyhow::Result<TestStore>) -
     assert_eq!((trip.version, trip.epoch, trip.faults, trip.threshold), (second.version, 2, 3, 3));
     assert_eq!(trip.run, "fault2");
     assert_eq!(s.get("fault0").await?.unwrap().admission.version, second.version);
-    assert!(s.activate("workflow", 99).await.is_err());
+    assert!(s.activate("workflow", 99, 0).await.is_err());
     report.operations += 13;
     report.witnesses.insert("breaker trips without changing the active version or pinned runs");
     decisions(&factory, &mut report).await?;
@@ -436,7 +440,7 @@ pub async fn run_all(factory: impl AsyncFn(&str) -> anyhow::Result<TestStore>) -
                     )]),
                 };
                 let epoch = s.definitions("workflow").await?.epoch;
-                s.activate_with("workflow", d.version, epoch, &arming).await?;
+                s.activate_with("workflow", d.version, epoch, &arming, &Activation::at(0)).await?;
                 tripping = s.start(&admission("tripping"), 0).await?;
                 if operation == "acknowledge" {
                     s.finish(tripping.as_ref().unwrap(), &Status::Faulted(WorkflowError::runtime("fault")), 0, 1)
@@ -445,7 +449,7 @@ pub async fn run_all(factory: impl AsyncFn(&str) -> anyhow::Result<TestStore>) -
                 }
             }
             if matches!(operation, "finish" | "cancel") {
-                s.activate("workflow", d.version).await?;
+                s.activate("workflow", d.version, 0).await?;
                 let child = s
                     .start_child(
                         &f,
@@ -487,7 +491,7 @@ pub async fn run_all(factory: impl AsyncFn(&str) -> anyhow::Result<TestStore>) -
                 "release" => s.release(&f, 0).await,
                 "renew" => s.renew(&f, 1).await,
                 "definition" => s.save_definition("workflow", "next").await.map(|_| ()),
-                "activate" => s.activate("workflow", d.version).await,
+                "activate" => s.activate("workflow", d.version, 0).await,
                 "subscribe" => s.subscribe(&f, "other", &["*".into()], 0).await,
                 "publish" => s.publish(&json!({"type":"answer","source":"/t","id":"1"}), None, 0).await.map(|_| ()),
                 "trigger" => s
@@ -527,6 +531,7 @@ pub async fn run_all(factory: impl AsyncFn(&str) -> anyhow::Result<TestStore>) -
                                 Trigger { at_ms: Some(5), types: vec!["t".into()], state: json!(1) },
                             )]),
                         },
+                        &Activation::at(0),
                     )
                     .await
                     .map(|_| ()),
@@ -731,6 +736,8 @@ pub async fn run_all(factory: impl AsyncFn(&str) -> anyhow::Result<TestStore>) -
     control_overlap(&factory, &mut report).await?;
     definition_queries(&factory, &mut report).await?;
     heartbeats(&factory, &mut report).await?;
+    annotation_totals(&factory, &mut report).await?;
+    read_only(&factory, &mut report).await?;
     dropped(&factory, &mut report).await?;
     Ok(report)
 }
@@ -777,7 +784,8 @@ async fn definition_queries(
             ("custom-on".into(), slot("on", None)),
         ]),
     };
-    s.activate_with("workflow", 2, 0, &arming).await?.unwrap();
+    let release = Activation { at_ms: 5, actor: Some("operator".into()), note: Some("release 2".into()) };
+    s.activate_with("workflow", 2, 0, &arming, &release).await?.unwrap();
     let mut first = admission("first");
     first.version = 2;
     let mut buffered = first.clone();
@@ -809,10 +817,21 @@ async fn definition_queries(
     let before = t.backend.snapshot().await?;
     let summary = fresh.definition_control("workflow").await?.unwrap();
     assert_eq!(summary.name, "workflow");
-    assert_eq!(
-        summary.versions,
-        vec![VersionSummary { version: 1, activated_ms: None }, VersionSummary { version: 2, activated_ms: None },]
-    );
+    let never = VersionSummary {
+        version: 1,
+        activated_ms: None,
+        activated_epoch: None,
+        activated_by: None,
+        activation_note: None,
+    };
+    let released = VersionSummary {
+        version: 2,
+        activated_ms: Some(5),
+        activated_epoch: Some(1),
+        activated_by: Some("operator".into()),
+        activation_note: Some("release 2".into()),
+    };
+    assert_eq!(summary.versions, vec![never.clone(), released]);
     assert_eq!((summary.active, summary.epoch, summary.consecutive_faults), (Some(2), 1, 1));
     assert!(summary.tripped.is_none());
     assert_eq!(
@@ -911,9 +930,18 @@ async fn definition_queries(
     assert_eq!(tripped.tripped, fresh.definitions("workflow").await?.tripped);
     assert!(tripped.tripped.as_ref().unwrap().manual.is_none());
     assert!(tripped.schedules.iter().all(|s| s.next_due_ms.is_none() && s.queued.is_none()));
-    s.activate_with("workflow", 2, 1, &arming).await?.unwrap();
+    // Only an activation clears an automatic trip; resuming it is refused.
+    let resume = Command::Resume { definition: "workflow".into() };
+    assert!(matches!(
+        refusal(s.control(&control_request("resume-trip"), &resume, 5).await),
+        control::ControlError::InvalidState(_)
+    ));
+    s.activate_with("workflow", 2, 1, &arming, &Activation::at(6)).await?.unwrap();
     let reactivated = fresh.definition_control("workflow").await?.unwrap();
     assert_eq!((reactivated.epoch, reactivated.consecutive_faults), (2, 0));
+    // A reactivation is the version's latest activation, unattributed here.
+    let again = VersionSummary { activated_ms: Some(6), activated_epoch: Some(2), ..never.clone() };
+    assert_eq!(reactivated.versions, vec![never.clone(), VersionSummary { version: 2, ..again }]);
     assert!(reactivated.tripped.is_none());
     assert_eq!(reactivated.schedules[0].next_due_ms, Some(10));
     // A page racing activation must observe the old catalog and its triggers,
@@ -922,12 +950,16 @@ async fn definition_queries(
     s.save_definition("workflow", no_schedule).await?;
     let old = fresh.definition_control("workflow").await?.unwrap();
     let unarmed = Arming::default();
+    let at_zero = Activation::at(0);
     let (page, activated) =
-        tokio::join!(fresh.query_definitions(None, 10), s.activate_with("workflow", 3, 2, &unarmed),);
+        tokio::join!(fresh.query_definitions(None, 10), s.activate_with("workflow", 3, 2, &unarmed, &at_zero));
     activated?.unwrap();
     let new = fresh.definition_control("workflow").await?.unwrap();
     assert_eq!((new.active, new.epoch), (Some(3), 3));
     assert!(new.schedules.is_empty());
+    // Activating another version keeps the earlier one's latest activation.
+    assert_eq!(new.versions[1].activated_epoch, Some(2));
+    assert_eq!((new.versions[2].activated_epoch, new.versions[2].activated_ms), (Some(3), Some(0)));
     let observed = &page?.items[1];
     assert!(*observed == old || *observed == new);
     // Persisted layout validation is shared by point and paged catalog reads.
@@ -995,6 +1027,305 @@ async fn heartbeats(
     assert_eq!(rows().await?, (0, 0));
     report.operations += 12;
     report.witnesses.insert("one heartbeat row per worker, swept after it stays stale");
+    Ok(())
+}
+
+/// Per-run annotation totals (#22): the run row sums its calls' numeric
+/// annotations in the commit that saves each answer, a replayed save adds
+/// nothing, texts are ignored, the names are bounded like one call's, and
+/// listings, history and inspection return them, after `sweep` too.
+async fn annotation_totals(
+    factory: &impl AsyncFn(&str) -> anyhow::Result<TestStore>,
+    report: &mut Report,
+) -> anyhow::Result<()> {
+    use control::Runs;
+    use ows::durable::{Annotation, CallState, Delivery, MAX_ANNOTATIONS};
+    let t = factory("annotation-totals").await?;
+    report.cases += 1;
+    let s = &t.store;
+    let call = |state: CallState, annotations: &[(&str, Annotation)]| Record::Call {
+        logical: "call".into(),
+        function: "chat".into(),
+        arguments: json!({}),
+        delivery: Delivery::AtLeastOnce,
+        state,
+        annotations: annotations.iter().map(|(k, v)| (k.to_string(), v.clone())).collect(),
+    };
+    let usage = |tokens: u64, cost: f64| {
+        call(
+            CallState::Done(Ok(json!("ok"))),
+            &[("tokens", tokens.into()), ("cost_usd", cost.into()), ("model", "small".into())],
+        )
+    };
+    let f = s.start(&admission("r"), 0).await?.unwrap();
+    s.save_record(&f, "a#call", &call(CallState::Pending, &[]), 1).await?;
+    s.save_record(&f, "a#call", &usage(100, 0.25), 1).await?;
+    // The same answer saved again (a replay after a lost reply) adds nothing.
+    s.save_record(&f, "a#call", &usage(100, 0.25), 2).await?;
+    s.save_record(&f, "b#call", &usage(30, 0.5), 2).await?;
+    // An error answer carries annotations too.
+    let failed = call(CallState::Done(Err(WorkflowError::runtime("no"))), &[("tokens", 5.into())]);
+    s.save_record(&f, "c#call", &failed, 2).await?;
+    let expected: ows::durable::Totals = BTreeMap::from([
+        ("cost_usd".into(), serde_json::Number::from_f64(0.75).unwrap()),
+        ("tokens".into(), 135.into()),
+    ]);
+    let fresh = (t.reopen)().await?;
+    assert_eq!(fresh.get("r").await?.unwrap().annotations, expected);
+    let inspection = fresh.inspect_control("r").await?.unwrap();
+    assert_eq!(inspection.annotations, expected);
+    assert_eq!(inspection.annotations, ows::durable::annotation_totals(&inspection.calls));
+    let listed = fresh.query_runs(&Runs::default(), false, None, 10).await?;
+    assert_eq!(listed.items[0].annotations, expected);
+    s.finish(&f, &Status::Completed(json!(1)), 3, 3).await?;
+    let window = Runs { since_ms: Some(0), before_ms: Some(10), ..Runs::default() };
+    assert_eq!(fresh.query_runs(&window, true, None, 10).await?.items[0].annotations, expected);
+    // Sweeping the evidence removes the journal, not the run's totals.
+    assert!(fresh.sweep(3 + RECORDS_KEPT_MS, RECORDS_KEPT_MS).await?.records > 0);
+    let swept = fresh.inspect_control("r").await?.unwrap();
+    assert!(swept.calls.is_empty());
+    assert_eq!((swept.annotations, swept.snapshot.run.annotations), (expected.clone(), expected));
+
+    // Names beyond the bound are left out; present names keep summing.
+    let f = s.start(&admission("many"), 0).await?.unwrap();
+    for n in 0..=MAX_ANNOTATIONS {
+        let answer = call(CallState::Done(Ok(json!(n))), &[(&format!("k{n:02}"), Annotation::from(1))]);
+        s.save_record(&f, &format!("{n}#call"), &answer, 1).await?;
+    }
+    let answer = call(CallState::Done(Ok(json!(0))), &[("k00", Annotation::from(2))]);
+    s.save_record(&f, "again#call", &answer, 1).await?;
+    let totals = s.get("many").await?.unwrap().annotations;
+    assert_eq!(totals.len(), MAX_ANNOTATIONS);
+    assert!(!totals.contains_key(&format!("k{MAX_ANNOTATIONS:02}")));
+    assert_eq!(totals["k00"], 3.into());
+    // A run without annotated answers keeps none.
+    assert!(s.get("plain").await?.is_none_or(|r| r.annotations.is_empty()));
+    audit(&*fresh).await?;
+    report.operations += 16;
+    report.witnesses.insert("per-run annotation totals, counted once per answer and kept after sweep");
+
+    // Per-definition totals over a window: each run's terminal commit adds
+    // its totals to its definition's bucket of the hour it ended in.
+    use control::{ControlError, MAX_TOTALS_BUCKETS, TOTALS_BUCKET_MS};
+    let hour = TOTALS_BUCKET_MS;
+    let t = factory("definition-totals").await?;
+    report.cases += 1;
+    let s = &t.store;
+    let tokens = |n: u64| call(CallState::Done(Ok(json!(n))), &[("tokens", n.into()), ("model", "small".into())]);
+    let ended = async |id: &str, n: u64, at: i64| -> anyhow::Result<()> {
+        let f = s.start(&admission(id), at).await?.unwrap();
+        s.save_record(&f, "chat#call", &tokens(n), at).await?;
+        s.finish(&f, &Status::Completed(json!(n)), at, 3).await?;
+        Ok(())
+    };
+    ended("a", 10, 5).await?;
+    ended("b", 20, hour - 1).await?;
+    ended("c", 40, hour).await?;
+    // A run without totals writes no bucket and is not counted.
+    let plain = s.start(&admission("plain"), 6).await?.unwrap();
+    s.finish(&plain, &Status::Completed(json!(0)), 6, 3).await?;
+    // A cascade counts every ended run under its own definition.
+    let parent = s.start(&admission("p"), 7).await?.unwrap();
+    s.save_record(&parent, "chat#call", &tokens(1), 7).await?;
+    let mut other = admission("child");
+    other.name = "other".into();
+    let link = ChildLink { parent: "p".into(), key: "child".into(), reference: "child".into() };
+    let child = s.start_child(&parent, &other, &link, 7).await?.unwrap();
+    s.save_record(&child, "chat#call", &tokens(2), 7).await?;
+    assert!(s.cancel("p", 8).await?);
+    // An ambiguous terminal commit counts once: a retry finds the run ended.
+    let f = s.start(&admission("ambiguous"), 9).await?.unwrap();
+    s.save_record(&f, "chat#call", &tokens(100), 9).await?;
+    t.faults.arm(CommitFault::BeforeCommit);
+    assert!(s.finish(&f, &Status::Completed(json!(0)), 9, 3).await.is_err());
+    t.faults.arm(CommitFault::AfterCommit);
+    assert!(s.finish(&f, &Status::Completed(json!(0)), 9, 3).await.is_err());
+    t.faults.clear();
+    assert!(s.finish(&f, &Status::Completed(json!(0)), 9, 3).await.is_err());
+    let fresh = (t.reopen)().await?;
+    let window = fresh.totals("workflow", 0, 2 * hour).await?;
+    let sums = |n: u64| BTreeMap::from([("tokens".to_string(), serde_json::Number::from(n))]);
+    assert_eq!((window.since_ms, window.before_ms, window.runs), (0, 2 * hour, 5));
+    assert_eq!(window.annotations, sums(171));
+    assert_eq!(
+        window.buckets,
+        vec![
+            control::TotalsBucket { start_ms: 0, runs: 4, annotations: sums(131) },
+            control::TotalsBucket { start_ms: hour, runs: 1, annotations: sums(40) },
+        ]
+    );
+    // Windows round out to whole hours.
+    let first = fresh.totals("workflow", 1, 2).await?;
+    assert_eq!((first.since_ms, first.before_ms, first.runs), (0, hour, 4));
+    assert_eq!(fresh.totals("workflow", hour, hour + 1).await?.annotations, sums(40));
+    assert!(fresh.totals("workflow", hour, hour).await?.buckets.is_empty());
+    assert_eq!(fresh.totals("other", 0, hour).await?.annotations, sums(2));
+    let none = fresh.totals("missing", 0, hour).await?;
+    assert!(none.buckets.is_empty() && none.runs == 0 && none.annotations.is_empty());
+    let limit = i64::try_from(MAX_TOTALS_BUCKETS).unwrap() * hour;
+    assert_eq!(fresh.totals("workflow", 0, limit).await?.runs, 5);
+    for (since, before) in [(1, 0), (0, limit + 1), (i64::MIN, i64::MAX)] {
+        let refused = refusal(fresh.totals("workflow", since, before).await);
+        assert!(matches!(refused, ControlError::InvalidInput(_)), "{refused:?}");
+    }
+    // Buckets are aggregates of their own: sweeping evidence keeps them.
+    fresh.sweep(i64::MAX / 2, 0).await?;
+    assert_eq!(fresh.totals("workflow", 0, 2 * hour).await?, window);
+    audit(&*fresh).await?;
+    report.operations += 24;
+    report.witnesses.insert("per-definition hourly totals written by terminal commits, read in bounded windows");
+    Ok(())
+}
+
+/// Whether an operation failed with the read-only refusal.
+fn refused_read_only<T: std::fmt::Debug>(result: anyhow::Result<T>) -> bool {
+    result.is_err_and(|e| e.is::<ReadOnly>())
+}
+/// A read-only handle (#22) over a populated store: every query answers
+/// what the writable handle answers, every mutating operation (and every
+/// worker operation, fenced reads included) is refused with `ReadOnly`
+/// before it touches a row, and a write through the backend's own
+/// transaction is refused too. Nothing it does changes the store, and it
+/// sees what the writer commits afterwards.
+async fn read_only(
+    factory: &impl AsyncFn(&str) -> anyhow::Result<TestStore>,
+    report: &mut Report,
+) -> anyhow::Result<()> {
+    use control::{Command, Runs, Waits, Worker};
+    use ows::durable::{Annotation, CallState, Delivery};
+    let t = factory("read-only").await?;
+    report.cases += 1;
+    let s = &t.store;
+    let d = s.save_definition("workflow", control_definition_yaml()).await?;
+    let slot = Trigger { at_ms: Some(4), types: vec!["start".into()], state: json!({ "kind": "every" }) };
+    let arming = Arming { triggers: BTreeMap::from([("w#every".into(), slot.clone())]) };
+    s.activate_with("workflow", d.version, 0, &arming, &Activation::at(0)).await?;
+    let parent = s.start(&admission("p"), 0).await?.unwrap();
+    let call = Record::Call {
+        logical: "call".into(),
+        function: "f".into(),
+        arguments: json!({}),
+        delivery: Delivery::AtLeastOnce,
+        state: CallState::Done(Ok(json!(1))),
+        annotations: BTreeMap::from([("tokens".to_string(), Annotation::from(3))]),
+    };
+    s.save_record(&parent, "call#call", &call, 0).await?;
+    let link = ChildLink { parent: "p".into(), key: "c".into(), reference: "c".into() };
+    s.start_child(&parent, &admission("c"), &link, 0).await?;
+    s.register_wait(&parent, &["answer".into()], 1).await?;
+    s.describe_wait(&parent, "listen", &control_wait(), 1).await?;
+    s.deliver(&event("mail", "other", json!(1)), Some("p"), 1).await?;
+    s.finish(&parent, &Status::Waiting { wake_at_ms: 100 }, 1, 3).await?;
+    let done = s.start(&admission("done"), 2).await?.unwrap();
+    s.save_record(&done, "call#call", &call, 2).await?;
+    s.finish(&done, &Status::Completed(json!(42)), 3, 3).await?;
+    s.control(&control_request("cancel-child"), &Command::Cancel { run: "c".into() }, 4).await?;
+    let worker = Worker {
+        id: "w".into(),
+        host: None,
+        application: None,
+        started_ms: 0,
+        beat_ms: 4,
+        expires_ms: 4 + LEASE_MS,
+        held: 1,
+    };
+    s.beat(&worker).await?;
+
+    let backend = (t.read_only)().await?;
+    assert!(backend.is_read_only());
+    let r = TransactionalStore::new(backend.clone());
+    let before = t.backend.snapshot().await?;
+    macro_rules! same {
+        ($($query:ident($($arg:expr),*)),* $(,)?) => {$(
+            assert_eq!(r.$query($($arg),*).await?, s.$query($($arg),*).await?, stringify!($query));
+        )*};
+    }
+    let window = Runs { since_ms: Some(0), before_ms: Some(10), ..Runs::default() };
+    let ingress = event("ingress", "start", json!(1));
+    same!(
+        get("p"),
+        get("missing"),
+        list(None, ""),
+        list(Some("workflow"), "c"),
+        inspect("p"),
+        inspect_control("p"),
+        inspect_control("missing"),
+        query_runs(&Runs::default(), false, None, 10),
+        query_runs(&window, true, None, 10),
+        query_definitions(None, 10),
+        definition_control("workflow"),
+        pending_waits(&Waits::default(), None, 10),
+        workers(None, 10),
+        control_entry("cancel-child"),
+        control_history(None, None, 10),
+        control_history(Some("c"), None, 10),
+        stopped(),
+        definitions("workflow"),
+        trigger("w#every"),
+        due_triggers(i64::MAX, 10),
+        triggers_for("start", 10),
+        queued("w#every"),
+        child_outcome("p", "c", "c"),
+        ingested(&ingress, 4),
+        notices(10),
+        totals("workflow", 0, 10),
+        totals("missing", 0, 10),
+    );
+    assert_eq!(r.inspect_control("p").await?.unwrap().calls.len(), 1);
+    assert_eq!(r.workers(None, 10).await?.items, vec![worker.clone()]);
+    assert_eq!(r.totals("workflow", 0, 10).await?.runs, 1);
+
+    let fence = parent.clone();
+    let types = vec!["answer".to_string()];
+    let firing = Firing { key: "w#every", expected: Some(&slot), next: None, ..Firing::default() };
+    let cancel = Command::Cancel { run: "p".into() };
+    assert!(refused_read_only(r.control(&control_request("refused"), &cancel, 5).await));
+    let typed = control::ControlError::from(r.control(&control_request("refused"), &cancel, 5).await.unwrap_err());
+    assert!(matches!(typed, control::ControlError::ReadOnly), "{typed:?}");
+    assert!(refused_read_only(r.beat(&worker).await));
+    assert!(refused_read_only(r.describe_wait(&fence, "listen", &control_wait(), 5).await));
+    assert!(refused_read_only(r.admit(&admission("new"), 5).await));
+    assert!(refused_read_only(r.start(&admission("new"), 5).await));
+    assert!(refused_read_only(r.claim("p", 100).await));
+    assert!(refused_read_only(r.check_lease(&fence, 5).await));
+    assert!(refused_read_only(r.renew(&fence, 5).await));
+    assert!(refused_read_only(r.release(&fence, 5).await));
+    assert!(refused_read_only(r.load_records(&fence, 5).await));
+    assert!(refused_read_only(r.save_record(&fence, "t", &Record::Timer { deadline_ms: 1 }, 5).await));
+    assert!(refused_read_only(r.register_wait(&fence, &types, 5).await));
+    assert!(refused_read_only(r.unregister_wait(&fence, "listen", &types, 5).await));
+    assert!(refused_read_only(r.deliver(&event("new", "answer", json!(1)), Some("p"), 5).await));
+    assert!(refused_read_only(r.deliver(&event("new", "answer", json!(1)), None, 5).await));
+    assert!(refused_read_only(r.take_event(&fence, "listen#event[0]", &types, 5).await));
+    assert!(refused_read_only(r.subscribe(&fence, "listen", &types, 5).await));
+    assert!(refused_read_only(r.unsubscribe(&fence, "listen", 5).await));
+    assert!(refused_read_only(r.publish(&event("new", "answer", json!(1)), None, 5).await));
+    assert!(refused_read_only(r.fire(&firing, 5).await));
+    assert!(refused_read_only(r.finish(&fence, &Status::Cancelled, 5, 3).await));
+    let link = ChildLink { parent: "p".into(), key: "new".into(), reference: "new".into() };
+    assert!(refused_read_only(r.start_child(&fence, &admission("new"), &link, 5).await));
+    assert!(refused_read_only(r.spend(&fence, "jump", 10, 5).await));
+    assert!(refused_read_only(r.due(i64::MAX, 10).await));
+    assert!(refused_read_only(r.cancel("p", 5).await));
+    assert!(refused_read_only(r.cancel("missing", 5).await));
+    assert!(refused_read_only(r.sweep(i64::MAX, 0).await));
+    assert!(refused_read_only(r.save_definition("workflow", "yaml").await));
+    assert!(refused_read_only(r.activate("workflow", d.version, 0).await));
+    assert!(refused_read_only(r.activate_with("workflow", d.version, 1, &arming, &Activation::at(0)).await));
+    assert!(refused_read_only(r.acknowledge("notice").await));
+    // The backend refuses a write in its own transaction before sending it.
+    let mut tx = backend.begin().await?;
+    assert!(tx.get("run", "p").await?.is_some());
+    assert!(refused_read_only(tx.put("run", "p", &json!({})).await));
+    assert!(refused_read_only(tx.delete("run", "p").await));
+    tx.rollback().await;
+    assert_eq!(t.backend.snapshot().await?, before, "a read-only handle changes nothing");
+    // Each query is a fresh transaction: it sees what the writer commits.
+    assert!(s.admit(&admission("later"), 6).await?);
+    assert_eq!(r.get("later").await?, s.get("later").await?);
+    assert!(r.get("later").await?.is_some());
+    report.operations += 60;
+    report.witnesses.insert("a read-only handle answers every query and refuses every write");
     Ok(())
 }
 
@@ -1326,10 +1657,13 @@ async fn decisions(
     let arming = |triggers: &[(&str, i64)]| Arming {
         triggers: triggers.iter().map(|(k, n)| ((*k).into(), trigger(*n))).collect(),
     };
-    let d = s.activate_with("w", one.version, 0, &arming(&[("w#every", 10)])).await?.unwrap();
+    let d = s.activate_with("w", one.version, 0, &arming(&[("w#every", 10)]), &Activation::at(0)).await?.unwrap();
     assert_eq!((d.epoch, d.triggers.clone()), (1, vec!["w#every".to_string()]));
-    assert!(s.activate_with("w", two.version, 0, &arming(&[])).await?.is_none(), "a stale epoch is refused");
-    let d = s.activate_with("w", two.version, 1, &arming(&[("w#after", 20)])).await?.unwrap();
+    assert!(
+        s.activate_with("w", two.version, 0, &arming(&[]), &Activation::at(0)).await?.is_none(),
+        "a stale epoch is refused"
+    );
+    let d = s.activate_with("w", two.version, 1, &arming(&[("w#after", 20)]), &Activation::at(0)).await?.unwrap();
     assert_eq!(d.epoch, 2);
     assert!(s.trigger("w#every").await?.is_none() && s.trigger("w#after").await?.is_some(), "replaced in one commit");
     let run_of = |id: &str, version: u64| {
@@ -1405,7 +1739,7 @@ async fn decisions(
     assert_eq!(s.notices(10).await?.len(), 1, "one trip, one notice");
     // Only an activation clears it, in a new epoch, with the version the
     // host chooses (here the earlier one). The notice stays until handed on.
-    let d = s.activate_with("w", one.version, 2, &arming(&[("w#every", 40)])).await?.unwrap();
+    let d = s.activate_with("w", one.version, 2, &arming(&[("w#every", 40)]), &Activation::at(0)).await?.unwrap();
     assert!(d.tripped.is_none() && d.epoch == 3 && d.consecutive_faults == 0, "a new activation clears it");
     assert_eq!(s.trigger("w#every").await?, Some(trigger(40)));
     assert_eq!(s.notices(10).await?, notices);
@@ -1467,7 +1801,7 @@ async fn decisions(
     let v = s.save_definition("w", "yaml").await?;
     let slot = |at: i64| Trigger { at_ms: Some(at), types: vec![], state: json!({ "at": at }) };
     let arming = Arming { triggers: BTreeMap::from([("w#every".into(), slot(10))]) };
-    s.activate_with("w", v.version, 0, &arming).await?.unwrap();
+    s.activate_with("w", v.version, 0, &arming, &Activation::at(0)).await?.unwrap();
     let run_of = |id: &str| Admission { name: "w".into(), version: v.version, ..admission(id) };
     let invalid = WorkflowError::validation("invalid");
     let refused = |id: &str| Refused { admission: run_of(id), error: invalid.clone(), breaker_threshold: 2 };
@@ -1749,9 +2083,10 @@ impl RunStore for Offloaded {
         version: u64,
         epoch: u64,
         arming: &Arming,
+        activation: &Activation,
     ) -> anyhow::Result<Option<Definitions>> {
-        let (name, arming) = (name.to_owned(), arming.clone());
-        offloaded!(self, |s| s.activate_with(&name, version, epoch, &arming))
+        let (name, arming, activation) = (name.to_owned(), arming.clone(), activation.clone());
+        offloaded!(self, |s| s.activate_with(&name, version, epoch, &arming, &activation))
     }
     async fn definitions(&self, name: &str) -> anyhow::Result<Definitions> {
         let name = name.to_owned();
@@ -2176,7 +2511,7 @@ async fn overlap_policies(
         let s = &t.store;
         let d = s.save_definition("workflow", "original").await?;
         let armed = Arming { triggers: BTreeMap::from([("policy".into(), slot(1))]) };
-        s.activate_with("workflow", d.version, 0, &armed).await?;
+        s.activate_with("workflow", d.version, 0, &armed, &Activation::at(0)).await?;
         fire(&**s, Overlap::Queue, 1, 10, None).await?;
         fire(&**s, Overlap::Queue, 2, 10, None).await?;
         assert!(s.queued("policy").await?.is_some());
@@ -2190,6 +2525,7 @@ async fn overlap_policies(
                 d.version,
                 1,
                 &Arming { triggers: BTreeMap::from([("policy".into(), slot(10))]) },
+                &Activation::at(0),
             )
             .await?;
             s.cancel("slot1", 3).await?;
@@ -2244,8 +2580,14 @@ async fn overlap_policies(
         report.cases += 1;
         let s = &t.store;
         let d = s.save_definition("workflow", "original").await?;
-        s.activate_with("workflow", d.version, 0, &Arming { triggers: BTreeMap::from([("policy".into(), slot(1))]) })
-            .await?;
+        s.activate_with(
+            "workflow",
+            d.version,
+            0,
+            &Arming { triggers: BTreeMap::from([("policy".into(), slot(1))]) },
+            &Activation::at(0),
+        )
+        .await?;
         fire(&**s, policy, 1, 10, None).await?;
         let refused = Refused {
             admission: admission("slot2"),
@@ -2366,18 +2708,22 @@ pub fn control_wait() -> ows::events::PendingWait {
 fn control_request(id: &str) -> control::Request {
     control::Request { id: id.into(), actor: "operator".into(), reason: "maintenance".into() }
 }
+/// The typed refusal of a control operation that must fail.
+fn refusal<T: std::fmt::Debug>(result: anyhow::Result<T>) -> control::ControlError {
+    control::ControlError::from(result.expect_err("the control operation must be refused"))
+}
 async fn controls(
     factory: &impl AsyncFn(&str) -> anyhow::Result<TestStore>,
     report: &mut Report,
 ) -> anyhow::Result<()> {
-    use control::{Command, Reply, Runs, Waits};
+    use control::{Command, ControlError, Entity, Reply, Runs, Waits};
     let t = factory("control").await?;
     report.cases += 1;
     let s = &t.store;
     let d = s.save_definition("workflow", "yaml").await?;
     let trigger = Trigger { at_ms: Some(4), types: vec!["start".into()], state: json!({}) };
     let arming = Arming { triggers: BTreeMap::from([("schedule".into(), trigger.clone())]) };
-    s.activate_with("workflow", d.version, 0, &arming).await?;
+    s.activate_with("workflow", d.version, 0, &arming, &Activation::at(0)).await?;
     let parent = s.start(&admission("p"), 0).await?.unwrap();
     let child = s
         .start_child(
@@ -2431,9 +2777,33 @@ async fn controls(
     // A late retry must not undo the intervening resume.
     assert_eq!(remote.control(&control_request("pause"), &pause, 3).await?, Reply::Changed(true));
     assert!(s.definitions("workflow").await?.tripped.is_none());
-    assert!(s.control(&control_request("pause"), &Command::Stop { enabled: true }, 3).await.is_err());
+    assert!(matches!(
+        refusal(s.control(&control_request("pause"), &Command::Stop { enabled: true }, 3).await),
+        ControlError::RequestConflict { id } if id == "pause"
+    ));
+    let mut impostor = control_request("pause");
+    impostor.actor = "someone else".into();
+    assert!(matches!(refusal(s.control(&impostor, &pause, 3).await), ControlError::RequestConflict { .. }));
+    let blank = control::Request { reason: " ".into(), ..control_request("blank") };
+    assert!(matches!(refusal(s.control(&blank, &pause, 3).await), ControlError::InvalidInput(_)));
+    let missing = Command::Pause { definition: "missing".into(), note: String::new() };
+    assert!(matches!(
+        refusal(s.control(&control_request("missing"), &missing, 3).await),
+        ControlError::NotFound { entity: Entity::Definition, id } if id == "missing"
+    ));
+    let resume_missing = Command::Resume { definition: "missing".into() };
+    assert!(matches!(
+        refusal(s.control(&control_request("resume-missing"), &resume_missing, 3).await),
+        ControlError::NotFound { entity: Entity::Definition, .. }
+    ));
+    s.save_definition("inactive", "yaml").await?;
+    let inactive = Command::Pause { definition: "inactive".into(), note: String::new() };
+    assert!(matches!(
+        refusal(s.control(&control_request("inactive"), &inactive, 3).await),
+        ControlError::InvalidState(_)
+    ));
     s.control(&control_request("pause-again"), &pause, 3).await?;
-    s.activate_with("workflow", d.version, 1, &arming).await?;
+    s.activate_with("workflow", d.version, 1, &arming, &Activation::at(0)).await?;
     assert!(s.definitions("workflow").await?.tripped.is_none());
     assert_eq!(s.definitions("workflow").await?.epoch, 2);
 
@@ -2468,13 +2838,27 @@ async fn controls(
         e
     };
     for (id, event) in [("wrong-correlation", response(43, true)), ("wrong-filter", response(42, false))] {
-        assert!(
-            remote
-                .control(&control_request(id), &Command::Respond { run: "p".into(), wait: "listen".into(), event }, 4)
-                .await
-                .is_err()
-        );
+        let respond = Command::Respond { run: "p".into(), wait: "listen".into(), event };
+        assert!(matches!(
+            refusal(remote.control(&control_request(id), &respond, 4).await),
+            ControlError::WaitMismatch { run, wait } if run == "p" && wait == "listen"
+        ));
     }
+    let elsewhere = Command::Respond { run: "nobody".into(), wait: "listen".into(), event: response(42, true) };
+    assert!(matches!(
+        refusal(remote.control(&control_request("nobody"), &elsewhere, 4).await),
+        ControlError::NotFound { entity: Entity::Run, id } if id == "nobody"
+    ));
+    let unopened = Command::Respond { run: "p".into(), wait: "other".into(), event: response(42, true) };
+    assert!(matches!(
+        refusal(remote.control(&control_request("unopened"), &unopened, 4).await),
+        ControlError::WaitClosed { .. }
+    ));
+    let anonymous = Command::Respond { run: "p".into(), wait: "listen".into(), event: json!({"type": "answer"}) };
+    assert!(matches!(
+        refusal(remote.control(&control_request("anonymous"), &anonymous, 4).await),
+        ControlError::InvalidInput(_)
+    ));
     assert!(s.inspect("p").await?.unwrap().events.is_empty());
     let answer = Command::Respond { run: "p".into(), wait: "listen".into(), event: response(42, true) };
     let reply = remote.control(&control_request("answer"), &answer, 4).await?;
@@ -2486,7 +2870,18 @@ async fn controls(
     if let Command::Respond { event, .. } = &mut conflict {
         event["ticket"] = json!(43);
     }
-    assert!(s.control(&control_request("answer-conflict"), &conflict, 5).await.is_err());
+    assert!(matches!(
+        refusal(s.control(&control_request("answer-conflict"), &conflict, 5).await),
+        ControlError::ResponseConflict { .. }
+    ));
+    let mut late = answer.clone();
+    if let Command::Respond { event, .. } = &mut late {
+        event["id"] = json!("late-response");
+    }
+    assert!(matches!(
+        refusal(s.control(&control_request("answer-late"), &late, 5).await),
+        ControlError::WaitClosed { .. }
+    ));
     assert_eq!(s.control_history(Some("p"), None, 10).await?.items.len(), 2);
     assert_eq!(s.control_entry("answer").await?.unwrap().request.actor, "operator");
 
@@ -2553,9 +2948,15 @@ async fn controls(
     );
     assert_eq!(s.query_runs(&filter, true, None, 10).await?.items.len(), 3);
     let page = s.query_runs(&filter, false, None, 1).await?;
-    assert!(s.query_runs(&Runs::default(), false, page.next.as_ref(), 1).await.is_err());
-    assert!(s.query_runs(&filter, false, None, 0).await.is_err());
-    assert!(s.query_runs(&filter, false, None, control::MAX_PAGE + 1).await.is_err());
+    let invalid = |r| matches!(refusal(r), ControlError::InvalidInput(_));
+    assert!(invalid(s.query_runs(&Runs::default(), false, page.next.as_ref(), 1).await.map(|_| ())));
+    assert!(invalid(s.query_runs(&filter, false, None, 0).await.map(|_| ())));
+    assert!(invalid(s.query_runs(&filter, false, None, control::MAX_PAGE + 1).await.map(|_| ())));
+    let inverted = Runs { since_ms: Some(10), before_ms: Some(0), ..Runs::default() };
+    assert!(invalid(s.query_runs(&inverted, true, None, 10).await.map(|_| ())));
+    assert!(invalid(s.pending_waits(&Waits::default(), page.next.as_ref(), 10).await.map(|_| ())));
+    assert!(invalid(s.control_history(None, None, 0).await.map(|_| ())));
+    assert!(invalid(s.query_definitions(None, control::MAX_PAGE + 1).await.map(|_| ())));
     audit(&*remote).await?;
     audit_control(&t).await?;
     report.operations += 80;
@@ -2619,7 +3020,7 @@ async fn controls(
             report.cases += 1;
             let s = &t.store;
             let d = s.save_definition("workflow", "yaml").await?;
-            s.activate_with("workflow", d.version, 0, &arming).await?;
+            s.activate_with("workflow", d.version, 0, &arming, &Activation::at(0)).await?;
             let f = s.start(&admission("r"), 0).await?.unwrap();
             s.describe_wait(&f, "listen", &control_wait(), 2).await?;
             if op == "resume" {
@@ -2651,7 +3052,12 @@ async fn controls(
                 s.control(&control_request("command"), &command, 3).await.map(|_| ())
             };
             t.faults.clear();
-            assert!(result.is_err(), "control {op} at {fault:?}");
+            // An injected storage failure is no operator refusal: it stays
+            // `Storage`, displayed as the failure itself.
+            let failure = result.as_ref().expect_err("an injected fault fails the command").to_string();
+            let typed = refusal(result);
+            assert!(matches!(&typed, control::ControlError::Storage(_)), "control {op} at {fault:?}: {typed:?}");
+            assert_eq!(typed.to_string(), failure);
             let fresh = (t.reopen)().await?;
             if fault == CommitFault::AfterCommit {
                 assert_ne!(t.backend.snapshot().await?, before);
@@ -2760,8 +3166,14 @@ async fn control_overlap(
         let s = &t.store;
         let d = s.save_definition("workflow", "yaml").await?;
         let slot = |n| Trigger { at_ms: Some(n), types: vec![], state: json!(n) };
-        s.activate_with("workflow", d.version, 0, &Arming { triggers: BTreeMap::from([("q".into(), slot(0))]) })
-            .await?;
+        s.activate_with(
+            "workflow",
+            d.version,
+            0,
+            &Arming { triggers: BTreeMap::from([("q".into(), slot(0))]) },
+            &Activation::at(0),
+        )
+        .await?;
         let fire = async |n, id: &str| {
             s.fire(
                 &Firing {

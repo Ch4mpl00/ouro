@@ -271,10 +271,20 @@ impl Runtime {
     /// tripped breaker reports (`definitions`, `notify`) and the host decides
     /// which version, if any, to activate.
     pub async fn activate(&self, name: &str, version: u64) -> anyhow::Result<()> {
+        self.activated(name, version, None, None).await
+    }
+    /// `activate`, attributed: the catalog records `actor` (nonempty) and
+    /// `note` with the activation's time, and `Control::definition` shows
+    /// them as the version's latest activation.
+    pub async fn activate_as(&self, name: &str, version: u64, actor: &str, note: Option<&str>) -> anyhow::Result<()> {
+        anyhow::ensure!(!actor.trim().is_empty(), "an attributed activation needs an actor");
+        self.activated(name, version, Some(actor), note).await
+    }
+    async fn activated(&self, name: &str, version: u64, actor: Option<&str>, note: Option<&str>) -> anyhow::Result<()> {
         let definitions = self.store.definitions(name).await?;
         let d = definitions.versions.get(&version).ok_or_else(|| anyhow::anyhow!("unknown definition version"))?;
         self.validate(&d.yaml)?;
-        self.activate_armed(name, version).await
+        self.activate_armed(name, version, actor, note).await
     }
     pub(crate) fn admitter(&self) -> Admitter {
         let (registry, generation) = self.installed.get();
@@ -370,7 +380,7 @@ impl Runtime {
         &self,
         request: &ouro_durable::control::Request,
         command: &ouro_durable::control::Command,
-    ) -> anyhow::Result<ouro_durable::control::Reply> {
+    ) -> Result<ouro_durable::control::Reply, ouro_durable::control::ControlError> {
         let reply = self.store.control(request, command, self.clock.now_ms()).await?;
         if matches!(command, ouro_durable::control::Command::Cancel { .. }) {
             self.signal_cancelled().await?;

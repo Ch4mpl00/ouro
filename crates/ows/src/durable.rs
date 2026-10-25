@@ -169,7 +169,9 @@ use std::collections::BTreeMap;
 /// one buffered firing per trigger is stored separately (queue layout 1).
 /// 8: current listen matching contexts, terminal budget counts and control indexes.
 /// 9: a call record keeps the annotations its answer carried.
-pub const VERSION: u32 = 9;
+/// 10: a run row keeps its calls' numeric annotation totals (`accumulate`),
+/// added in the commit that saves each answer.
+pub const VERSION: u32 = 10;
 
 /// The key of a run's `Record::Exceeded`.
 pub const EXCEEDED: &str = "exceeded";
@@ -370,32 +372,71 @@ pub fn check_annotations(annotations: &Annotations) -> Result<(), String> {
     Ok(())
 }
 
+/// Numeric annotations summed per name.
+pub type Totals = BTreeMap<String, serde_json::Number>;
+
+/// `a + b`: integers stay integers while the sum fits; otherwise a float.
+fn add(a: &serde_json::Number, b: &serde_json::Number) -> Option<serde_json::Number> {
+    if let (Some(x), Some(y)) = (a.as_i64(), b.as_i64())
+        && let Some(sum) = x.checked_add(y)
+    {
+        return Some(sum.into());
+    }
+    if let (Some(x), Some(y)) = (a.as_u64(), b.as_u64())
+        && let Some(sum) = x.checked_add(y)
+    {
+        return Some(sum.into());
+    }
+    serde_json::Number::from_f64(a.as_f64()? + b.as_f64()?)
+}
+fn add_to(totals: &mut Totals, name: &str, n: &serde_json::Number) {
+    let sum = match totals.get(name) {
+        Some(total) => add(total, n).unwrap_or_else(|| total.clone()),
+        None => n.clone(),
+    };
+    totals.insert(name.into(), sum);
+}
+
 /// The numeric annotations of `calls`, summed per name: integers stay
 /// integers while the sum fits; otherwise it is a float.
-pub fn annotation_totals<'a>(calls: impl IntoIterator<Item = &'a CallEntry>) -> BTreeMap<String, serde_json::Number> {
-    fn add(a: &serde_json::Number, b: &serde_json::Number) -> Option<serde_json::Number> {
-        if let (Some(x), Some(y)) = (a.as_i64(), b.as_i64())
-            && let Some(sum) = x.checked_add(y)
-        {
-            return Some(sum.into());
-        }
-        if let (Some(x), Some(y)) = (a.as_u64(), b.as_u64())
-            && let Some(sum) = x.checked_add(y)
-        {
-            return Some(sum.into());
-        }
-        serde_json::Number::from_f64(a.as_f64()? + b.as_f64()?)
-    }
-    let mut totals: BTreeMap<String, serde_json::Number> = BTreeMap::new();
+pub fn annotation_totals<'a>(calls: impl IntoIterator<Item = &'a CallEntry>) -> Totals {
+    let mut totals = Totals::new();
     for (name, value) in calls.into_iter().flat_map(|c| &c.annotations) {
-        let Annotation::Number(n) = value else { continue };
-        let sum = match totals.get(name) {
-            Some(total) => add(total, n).unwrap_or_else(|| total.clone()),
-            None => n.clone(),
-        };
-        totals.insert(name.clone(), sum);
+        if let Annotation::Number(n) = value {
+            add_to(&mut totals, name, n);
+        }
     }
     totals
+}
+
+/// Adds the numeric annotations of one answer (or other `totals`) to
+/// `totals`, summed as `annotation_totals` sums; texts are ignored. Totals a
+/// store keeps stay within the annotations' own bounds: a name not yet
+/// present is admitted only while `totals` keeps at most `MAX_ANNOTATIONS`
+/// names and `MAX_ANNOTATION_BYTES` as JSON, so a later new name is left
+/// out (deterministically: the order of the commits that add them).
+/// Present names keep summing.
+pub fn accumulate<'a>(totals: &mut Totals, numbers: impl IntoIterator<Item = (&'a String, &'a serde_json::Number)>) {
+    for (name, n) in numbers {
+        if totals.contains_key(name) {
+            add_to(totals, name, n);
+            continue;
+        }
+        if totals.len() >= MAX_ANNOTATIONS {
+            continue;
+        }
+        totals.insert(name.clone(), n.clone());
+        if serde_json::to_vec(totals).map_or(usize::MAX, |b| b.len()) > MAX_ANNOTATION_BYTES {
+            totals.remove(name);
+        }
+    }
+}
+/// The numeric annotations of an answer, for `accumulate`.
+pub fn numbers(annotations: &Annotations) -> impl Iterator<Item = (&String, &serde_json::Number)> {
+    annotations.iter().filter_map(|(name, value)| match value {
+        Annotation::Number(n) => Some((name, n)),
+        Annotation::Text(_) => None,
+    })
 }
 
 /// Only pending tasks/calls may advance. Everything else is immutable.
