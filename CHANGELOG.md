@@ -6,6 +6,36 @@ store written before such a change must be recreated unless the entry says other
 
 ## Unreleased (since v0.1.0)
 
+### Issue #34: host data at admission and host-started children (design 03)
+
+New: `Runtime::start_with(id, name, input, Start { version, host })` admits a
+run with host data (`admission.runtime["host"]`, at most 16 KiB as JSON),
+which its functions read through `FunctionContext::host()` and no expression
+sees; `FunctionContext::start_child(ChildStart { .. })` starts an owned child
+the host vouches for (`hostchild:` ids, which `FunctionContext::child_id(key)`
+returns before the start); `Runtime::dry_run_with` gives a dry
+run's root host data; `Inspection::host`. Breaking changes, for hosts and
+store adapters:
+
+- `FunctionContext` gains the public fields `host` and `children`: code that
+  builds one with a struct literal adds them (`None` for both).
+- `Runtime::start_child(parent, key, id, name, input, host)` takes the
+  child's host data (`Value::Null`: none).
+- Starting a stored id is refused with the typed `durable::AdmissionMismatch`
+  when the definition, the version a pinned start names, or the host data
+  differs (absent against present included), and the shared store engine now
+  decides it in the admission's transaction for `admit` and `start`: a plain
+  `start` of a run that has host data fails, and a pinned `RunStore::admit`
+  of a stored id at another version, which joined it, is refused. Another
+  definition was an untyped error and is now this one. A child's join
+  (`RunStore::start_child`) still compares only the definition (first commit
+  wins), now with the typed error.
+- The control queries `list` and `history` (`RunStore::query_runs`) and an
+  inspection's `children` show `"<redacted>"` (`control::REDACTED`) in place
+  of a run's host data; only `inspect` of the run shows it.
+- No durable state or layout version changes: host data is an admission
+  runtime binding, which stores keep as they always did.
+
 ### Issue #31, M-6: engine extensions under `metadata.ouro`
 
 Breaking changes (issue #31, M-6), for authors of definitions, hosts and

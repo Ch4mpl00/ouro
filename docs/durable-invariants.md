@@ -449,7 +449,14 @@ For `(parent,key)`, at most one child admission and immutable reference is selec
 Owned-child admission, ownership and completion subscription commit together.
 Recovery joins that child, including if already finished; it does not resolve
 `latest` again or admit another child. Owned links are acyclic, and owned outcome
-queries must match the actual parent/key/child relation.
+queries must match the actual parent/key/child relation. Host data (part of
+`A(r)`, design 03): a child the workflow starts (`run: workflow`, the reserved
+`start_child`) is admitted without host data, whatever its parent's; a child a
+host function starts keeps exactly the host data that function gave in the
+commit that admitted it. A join of an existing child compares only its
+definition (first commit wins: a re-dispatch with other input, version or host
+data joins the stored child unchanged); a root's join compares definition,
+named version and host data (A1, `AdmissionMismatch`).
 
 A resumed parent does not restart its child. **Source:** [README][README],
 [API][API]. **Fault:** crash after child start, catalog change before retry.
@@ -1329,3 +1336,15 @@ untargeted delivery never chooses a held run (routing is checked by the
 conformance suite, not the model). In the interpreter, a `catch` naming the
 unknown-outcome type that does not take the error re-raises it as it came, and
 a saved `emit` refusal is restored on recovery as a call's is (R2).
+
+Addendum (2026-10-25, issue #34, design 03). Host data is part of a run's
+admission (`A(r)`, under its runtime bindings): given by the host at a root's
+start or by a host function starting an owned child, immutable (A1), read by
+the run's functions and never by its expressions. A conflicting admission of a
+root's id is refused with a typed `AdmissionMismatch` (another definition,
+another version a pinned start names, other host data), decided in the
+transaction that reads the stored run (D12: an explicit conflict). A child's
+join is first commit wins: only another definition is a conflict, and the stored
+admission is kept (C1). Children a workflow starts carry no host data. These
+are checked by the conformance suite on every adapter (`host_data`) and the
+runtime tests, not by the model, which treats admission content as opaque.

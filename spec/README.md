@@ -30,7 +30,7 @@ are the bridges in `crates/durable/tests/quint.rs` and `quint/concurrent.rs`.
 
 | Contract ID | Model predicate / checked scope | Adapter or interpreter evidence |
 | --- | --- | --- |
-| A1 | `contract::A1`: admission fields and occurrence counts | Serial MBT (admission projection, readmission witness); admission conformance |
+| A1 | `contract::A1`: admission fields and occurrence counts | Serial MBT (admission projection, readmission witness); admission conformance; host data (design 03: a conflicting root admission is a typed mismatch, racing starts store one) in conformance `host_data` only, the model treats admission content as opaque |
 | A2 | `A2`: abort atomicity and acknowledged evidence | Serial MBT under faults 1, 2, 8; concurrent replies; commit-fault conformance |
 | A3 | `A3`: outcome/end-time absorption | Serial MBT; terminal replay properties |
 | A4 | `A4`: representative result schema | Existing schema and corruption tests; arbitrary format evolution is not modeled |
@@ -48,7 +48,7 @@ are the bridges in `crates/durable/tests/quint.rs` and `quint/concurrent.rs`.
 | W3 | `W3`: addressed mailbox, explicit expiry with a record | Serial MBT (expiry record audited); `gaps::w3_mailbox_expiry_is_observable` |
 | W4 | `W4`: FIFO among pending matching copies | Serial MBT; delivery conformance; one type in the model |
 | W5 | `W5`: publication recipients and subscription survival | Concurrent publish/finish; existing multi-take DSL tests |
-| C1 | `C1`: acyclic owned link and one child admission | Serial MBT; native-child recovery tests |
+| C1 | `C1`: acyclic owned link and one child admission | Serial MBT; native-child recovery tests; host data of children (design 03: none for a workflow-started child, exactly the host function's for a host child, a join keeps the first commit's, also around the child commit) in conformance `host_data` and `crates/runtime/tests/host.rs`, not in the model |
 | C2 | `C2`: terminal child has notification obligation | Serial MBT audits the parent's one notification; child conformance |
 | C3 | `C3`: any end of a run (completion, fault, cancellation) closes its owned subtree, transitively, in that transition | Serial MBT (`childTest`, `childFinishTest`, `grandchildTest`; the bridge audits that no owned child outlives its parent); conformance audit and commit faults; handler cancellation tests remain separate |
 | T1 | `T1`: slot disposition (a refused slot's run included), overlap and global ingress identity | Concurrent firings and ingress; serial MBT; `t1_*` runtime regressions |

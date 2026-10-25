@@ -114,6 +114,17 @@ impl Runtime {
         mock: Arc<dyn Mock>,
         stop: &CancellationToken,
     ) -> anyhow::Result<DryRun> {
+        self.dry_run_with(yaml, input, None, mock, stop).await
+    }
+    /// `dry_run` with host data for its root (`Runtime::start_with`).
+    pub async fn dry_run_with(
+        &self,
+        yaml: &str,
+        input: Value,
+        host: Option<Value>,
+        mock: Arc<dyn Mock>,
+        stop: &CancellationToken,
+    ) -> anyhow::Result<DryRun> {
         self.validate(yaml)?;
         let store = Arc::new(ouro_durable::memory::memory());
         let clock = Arc::new(TestClock(std::sync::atomic::AtomicI64::new(self.clock.now_ms())));
@@ -130,7 +141,8 @@ impl Runtime {
         runtime.capabilities = self.capabilities.clone();
         let d = runtime.save("dry-run", yaml).await?;
         runtime.activate(&d.name, d.version).await?;
-        runtime.start("dry-run", "dry-run", input).await?;
+        let start = crate::Start { version: None, host: host.unwrap_or(Value::Null) };
+        runtime.start_with("dry-run", "dry-run", input, start).await?;
         runtime.definition_source = self.store.clone();
         // Traced with the host's tracer, unless the host removed its
         // OpenTelemetry observer; counted nowhere, and no host observer
