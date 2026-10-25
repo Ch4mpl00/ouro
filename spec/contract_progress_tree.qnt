@@ -75,7 +75,10 @@ module contract_progress_tree {
   temporal wfNotice = notice(0).weakFair(t) and notice(1).weakFair(t) and notice(2).weakFair(t)
 
   // L6: a runnable run eventually ends or waits for an external event or a
-  // timer; no internal `then` cycle runs forever.
+  // timer; no internal `then` cycle runs forever. `then` jumps are bounded by
+  // the tree's budget (`spent`, shared by forks and owned children); retries
+  // are bounded by the host's attempt ceiling, pinned per run, so this
+  // quotient abstracts retries away and has no retry action.
   temporal L6 = (wfClaim and wfInternal).implies(
     Runs.forall(r => (t.status.get(r) == 1).leadsTo(t.status.get(r) == 2 or t.status.get(r) == 3)))
   // L9: once a run ended (any outcome, cancellation included), each of its

@@ -60,7 +60,7 @@
     "contract_bounded.qnt": "73bf8d192bc6a1906da7eec55df41d77f038a2f4ae128d8a52e47a8d04b5ab90",
     "contract_concurrent.qnt": "09b4d5c932d2963a159defcdc0aa6bb6bbc0e218fdc9d76767eb03ddaaba479d",
     "contract_progress.qnt": "056253d12af27cb032ca3f30c82854be1d278c4f0a879bb50ae86a71475252fc",
-    "contract_progress_tree.qnt": "7b17185df39b36c9dd509c2852060b0e6df28a7b29cf1e94c0567fbf568d731b",
+    "contract_progress_tree.qnt": "3a77a8357561409f26430f592f083b4585310eeab5281a9d30720c8dc13fdf74",
     "contract_progress_trigger.qnt": "4b3d910407893e0ce721db3916cfa9aa6c5a3a93eedd23434adc79974e176adf",
     "contract_witnesses.qnt": "2f455ee58bded45b6d51b7840fa7c1c694ed405651471b00ce26b811f201fa70"
   },
@@ -4715,7 +4715,7 @@
         "L6"
       ],
       "states": 606,
-      "seconds": 1.216,
+      "seconds": 1.434,
       "scope": "exhaustive finite obligation quotient; other quotients' domains structurally absent",
       "cells": {
         "A1": "structurally_absent",
@@ -4784,7 +4784,7 @@
         "L9"
       ],
       "states": 2106,
-      "seconds": 1.491,
+      "seconds": 1.715,
       "scope": "exhaustive finite obligation quotient; other quotients' domains structurally absent",
       "cells": {
         "A1": "structurally_absent",
@@ -4852,7 +4852,7 @@
         "L9"
       ],
       "states": 1818,
-      "seconds": 1.475,
+      "seconds": 1.764,
       "scope": "exhaustive finite obligation quotient; other quotients' domains structurally absent",
       "cells": {
         "A1": "structurally_absent",
@@ -6658,7 +6658,7 @@
       "mutant": "baseline",
       "violations": [],
       "states": 1818,
-      "seconds": 1.562,
+      "seconds": 3.114,
       "scope": "exhaustive finite obligation quotient; other quotients' domains structurally absent"
     },
     {
@@ -6670,7 +6670,7 @@
         "L6"
       ],
       "states": 606,
-      "seconds": 1.216,
+      "seconds": 1.434,
       "scope": "exhaustive finite obligation quotient; other quotients' domains structurally absent"
     },
     {
@@ -6683,7 +6683,7 @@
         "L9"
       ],
       "states": 2106,
-      "seconds": 1.491,
+      "seconds": 1.715,
       "scope": "exhaustive finite obligation quotient; other quotients' domains structurally absent"
     },
     {
@@ -6695,7 +6695,7 @@
         "L9"
       ],
       "states": 1818,
-      "seconds": 1.475,
+      "seconds": 1.764,
       "scope": "exhaustive finite obligation quotient; other quotients' domains structurally absent"
     },
     {
@@ -6707,7 +6707,7 @@
         "L6"
       ],
       "states": 1818,
-      "seconds": 1.429,
+      "seconds": 1.88,
       "scope": "exhaustive finite obligation quotient; other quotients' domains structurally absent"
     },
     {
@@ -6719,7 +6719,7 @@
         "L6"
       ],
       "states": 1818,
-      "seconds": 1.27,
+      "seconds": 1.513,
       "scope": "exhaustive finite obligation quotient; other quotients' domains structurally absent"
     },
     {
@@ -6731,7 +6731,7 @@
         "L9"
       ],
       "states": 1818,
-      "seconds": 1.444,
+      "seconds": 1.829,
       "scope": "exhaustive finite obligation quotient; other quotients' domains structurally absent"
     },
     {
