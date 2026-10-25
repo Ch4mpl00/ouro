@@ -206,6 +206,66 @@ pub struct Definition {
     pub name: String,
     pub version: u64,
     pub yaml: String,
+    /// `digest_of(yaml)`, stored with the version when it is saved.
+    pub digest: String,
+}
+
+/// The content digest of a definition: the lowercase hex SHA-256 of its
+/// canonical form. The canonical form is the parsed YAML document written as
+/// compact JSON with every object's keys sorted (done here, so it does not
+/// depend on `serde_json`'s `preserve_order`). Whitespace, comments, quoting
+/// style and key order therefore leave the digest alone; any change of a
+/// value, a key, a list's order or a scalar's type (`1` against `"1"`)
+/// gives a new one. It identifies content, not a version number: two
+/// versions with the same content share a digest. Text that is not YAML
+/// has no document; its raw bytes are hashed under a distinct prefix, so
+/// the digest still identifies exactly that text. A tripped breaker refuses
+/// admissions by this digest.
+///
+/// It is computed once, when a version is saved, and stored with the version
+/// (`Definition::digest`); the trip and the run row copy the stored value.
+/// Nothing recomputes a digest from YAML later, so a future change to the
+/// canonical form or the parser cannot alter the digest of an existing row.
+pub fn digest_of(yaml: &str) -> String {
+    use sha2::{Digest, Sha256};
+    fn canonical(v: &Value, out: &mut String) {
+        match v {
+            Value::Array(items) => {
+                out.push('[');
+                for (i, item) in items.iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    canonical(item, out);
+                }
+                out.push(']');
+            }
+            Value::Object(map) => {
+                let mut keys: Vec<_> = map.keys().collect();
+                keys.sort_unstable();
+                out.push('{');
+                for (i, key) in keys.into_iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    out.push_str(&Value::String(key.clone()).to_string());
+                    out.push(':');
+                    canonical(&map[key], out);
+                }
+                out.push('}');
+            }
+            scalar => out.push_str(&scalar.to_string()),
+        }
+    }
+    let text = match serde_yaml_ng::from_str::<Value>(yaml) {
+        Ok(document) => {
+            let mut out = String::from("yaml:");
+            canonical(&document, &mut out);
+            out
+        }
+        Err(_) => format!("raw:{yaml}"),
+    };
+    Sha256::digest(text.as_bytes()).iter().map(|b| format!("{b:02x}")).collect()
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -273,6 +333,10 @@ pub struct Trip {
     pub manual: Option<control::ManualTrip>,
     /// The active version and the epoch the breaker tripped in.
     pub version: u64,
+    /// The content digest of that version (`digest_of`): while the trip
+    /// stands, an admission whose definition has this digest is refused, of
+    /// whatever version number; one with other content is admitted.
+    pub digest: String,
     pub epoch: u64,
     /// The consecutive faults counted, which reached `threshold`.
     pub faults: u32,
@@ -302,6 +366,7 @@ impl Trip {
             "data": {
                 "name": name,
                 "version": self.version,
+                "digest": self.digest,
                 "epoch": self.epoch,
                 "faults": self.faults,
                 "threshold": self.threshold,
@@ -806,5 +871,29 @@ impl Events for Lease {
     fn notification(&self, _: &str) -> futures::future::BoxFuture<'_, ()> {
         // Polling is also correct across independent connections and processes.
         Box::pin(tokio::time::sleep(std::time::Duration::from_millis(1)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::digest_of;
+
+    const BASE: &str = "document: {dsl: '1.0.3', namespace: n, name: w, version: '1'}\nroot: 1\ndo:\n  - a:\n      set: {x: 1, y: [1, 2]}\n";
+
+    #[test]
+    fn the_digest_ignores_formatting_and_key_order_only() {
+        let reformatted = "# a comment\ndo:\n- a:\n    set:\n      y:\n      - 1\n      - 2\n      x: 1\nroot: 1\ndocument:\n  name: \"w\"\n  namespace: 'n'\n  version: \"1\"\n  dsl: 1.0.3\n";
+        assert_eq!(digest_of(BASE), digest_of(reformatted));
+        assert_eq!(digest_of(BASE).len(), 64);
+        for changed in [
+            BASE.replace("x: 1", "x: 2"),
+            BASE.replace("[1, 2]", "[2, 1]"),
+            BASE.replace("root: 1", "root: '1'"),
+            BASE.replace("name: w", "name: v"),
+        ] {
+            assert_ne!(digest_of(BASE), digest_of(&changed), "{changed}");
+        }
+        // Text without a document is hashed as it is.
+        assert_ne!(digest_of("a: [unclosed"), digest_of("a: [unclosed "));
     }
 }

@@ -196,6 +196,8 @@ pub struct DefinitionSummary {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VersionSummary {
     pub version: u64,
+    /// The version's content digest (`digest_of`).
+    pub digest: String,
     /// When, by the runtime's clock.
     pub activated_ms: Option<i64>,
     /// The activation epoch it started.
@@ -264,6 +266,10 @@ pub struct Inspection {
     /// (`Runtime::start_at`); the version is `snapshot.run.admission.version`.
     #[serde(default)]
     pub pinned: bool,
+    /// The content digest the admitted version had in the catalog when the
+    /// run was admitted (stored with the run, not recomputed); empty when the
+    /// catalog did not hold that version. What a trip compares admissions by.
+    pub digest: String,
     /// The call journal, each call with its annotations.
     pub calls: Vec<CallEntry>,
     /// The calls' numeric annotations summed per name: a run's tokens, its

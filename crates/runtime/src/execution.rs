@@ -326,13 +326,13 @@ impl Runtime {
     /// (`Inspection::pinned`); recovery and replay use its own admitted
     /// definition, as every run's.
     ///
-    /// CHOICE: a tripped definition refuses a pinned start as it refuses
-    /// every admission (`DefinitionTripped`; durable invariant V2 admits
-    /// nothing of any version until an activation). To run its built-in
-    /// version after a trip, the host starts a definition of another name or
-    /// activates; admitting past a trip would be a change of that contract
-    /// and of its model. A pinned run counts toward the breaker only when its
-    /// version is the active one, as every run does.
+    /// While the definition is tripped, a pinned start is refused iff the
+    /// stored version's content digest (`ouro_durable::digest_of`) is the
+    /// tripped one, whatever its number (`DefinitionTripped`; durable
+    /// invariant V2). A version with other content is admitted, so a host can
+    /// run its built-in version for a run while the tripped one stays
+    /// active. A pinned run counts toward the breaker only when its version
+    /// is the active one, as every run does.
     /// Starting an existing id returns that run if it was pinned at the same
     /// version, and fails otherwise.
     pub async fn start_at(&self, id: &str, name: &str, version: u64, input: Value) -> anyhow::Result<SavedRun> {
@@ -971,7 +971,8 @@ impl Admitter {
     pub async fn active(&self, id: &str, name: &str, input: Value) -> anyhow::Result<Admission> {
         self.active_in(id, name, input, &self.root()).await
     }
-    /// A root run of the stored version `version` of `name`, tripped or not,
+    /// A root run of the stored version `version` of `name`; the store refuses it
+    /// iff the definition is tripped on that version's content,
     /// marked as pinned (`Runtime::start_at`).
     pub async fn pinned(&self, id: &str, name: &str, version: u64, input: Value) -> anyhow::Result<Admission> {
         let mut definitions = self.definitions.definitions(name).await?;
