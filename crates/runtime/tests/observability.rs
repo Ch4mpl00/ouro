@@ -530,3 +530,30 @@ async fn a_worker_beats_one_row_and_records_the_backlog() {
     assert_eq!(telemetry.points("ouro.waits.pending").last().map(|p| p.value), Some(1.0));
     assert!(telemetry.points("ouro.backlog.age")[0].value >= 0.0);
 }
+
+/// A start pinned at a stored version counts once through the observer, like
+/// every admission; without telemetry it counts nothing.
+#[tokio::test]
+async fn a_pinned_start_is_counted_by_the_telemetry_observer_only() {
+    for with_telemetry in [true, false] {
+        let telemetry = Telemetry::new();
+        let mut registry = Registry::new();
+        registry
+            .register(Function::new("noop", json!({}), json!({}), |a: Value, _: FunctionContext| async { Ok(a) }))
+            .unwrap();
+        let mut rt = telemetry.runtime(
+            Arc::new(durable::memory::memory()),
+            registry,
+            Config::default(),
+            Arc::new(Time::default()),
+        );
+        if !with_telemetry {
+            rt = rt.without_telemetry();
+        }
+        let d = rt.save("pinned", &yaml("pinned", "  - a: { call: noop }")).await.unwrap();
+        rt.activate("pinned", d.version).await.unwrap();
+        rt.start_at("p", "pinned", d.version, json!({})).await.unwrap();
+        let expected = if with_telemetry { 1.0 } else { 0.0 };
+        assert_eq!(telemetry.total("ouro.runs.started", &[("ouro.definition", "pinned")]), expected);
+    }
+}
