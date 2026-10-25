@@ -458,7 +458,7 @@ the span the run was admitted in), the runtime clock's time and its kind:
 | `call_started`, `call_finished` | A call's dispatch (function, delivery, attempt, arguments) and answer (outcome, result or error, annotations) |
 | `listening`, `event_consumed`, `event_emitted` | A listen waits; a task consumes an event (a listen's, a joined child's outcome); `emit` hands one over |
 | `breaker_tripped` | The definition's breaker tripped, once, when the worker hands the notice on |
-| `run_held`, `run_released` | An operator froze or released a run (`Runtime::control`; actor, reason, and for a hold its note), once per request, for the run the command named |
+| `run_held`, `run_released` | An operator froze or released a run (`Runtime::control`; actor, reason, and for a hold its note), once per request, for the run the command named. The other operator commands (cancel, pause, resume, stop, respond) report no event of their own; the store has them (`Control::history`) |
 
 **Each fact once.** Replaying what an earlier execution recorded reports
 nothing: after a crash or a restart, the execution that takes the run over
@@ -493,7 +493,7 @@ other. Dry runs and replays are not reported to the host's observers.
 **Payloads.** Inputs, outputs, arguments, results and events are copied
 only when the host has an observer, and left out (`None`) when their JSON
 exceeds `Config::event_payload_bytes` (16 KiB by default; 0 leaves every
-one out). The run's secrets are redacted from every value and error. A run
+one out); an error's detail is not bounded, and goes to every observer as it is. The run's secrets are redacted from every value and error. A run
 cancelled while no execution holds it (an operator's or a parent's
 cancellation of a waiting run), a schedule slot the host refuses and a
 buffered slot the store promotes report nothing; the store has them
@@ -628,7 +628,8 @@ A worker driving it stops at the next fenced step or dispatch boundary (every
 fenced operation and `check_lease` refuse with `control::Held`) or at its
 next lease renewal, within one heartbeat, and gives the lease back without
 spending an interruption. A call already dispatched is not retracted: its
-answer is still recorded (the only step a held run commits), a call still in
+answer is still recorded (with the proof that a call did nothing, the only step
+a held run commits; a refusal before dispatch is recorded too), a call still in
 flight when the renewal sees the hold gets one heartbeat to answer, and a
 call left pending keeps its delivery rules (an at-least-once call is sent
 again after the release, an at-most-once one has an unknown outcome and never
@@ -798,9 +799,9 @@ Breaking changes (issue #24), for hosts written before it:
 - `ows::model::Schedule` gains `at` and `timezone`, and `ScheduleKind` gains
   `At`; code matching them exhaustively or building a `Schedule` must add
   them.
-- `Admitter::triggered` takes the trigger's `schedule` value (`$run.schedule`,
-  stored in the admission's `runtime`), and `ows::run::Host::runtime` carries
-  it as a `schedule` member, which is not part of `$runtime`.
+- `ows::run::Host::runtime` carries the trigger's `schedule` value
+  (`$run.schedule`, stored in the admission's `runtime`) as a `schedule`
+  member, which is not part of `$runtime`.
 - Stored rows keep their layout: a trigger's state gains `previous` and
   `done`, an admission's runtime gains `schedule`, all optional, so rows
   written earlier are read as they were (no first slot has a previous one).
