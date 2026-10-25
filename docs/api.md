@@ -114,7 +114,8 @@ reserved `start_child`; `version` pins a stored version. The workflow joins
 it with `listen` on `done`, or reads its outcome with the reserved
 `child_outcome` (`id` and `key`). Its id is
 `hostchild:[<run>, <call idempotency key>, <key>]`, so a re-dispatch of the
-call joins the same child. **The first commit wins**: a join returns the child
+call joins the same child; `cx.child_id(key)` returns that id without starting
+anything, for a host that keys its own record by it before the start. **The first commit wins**: a join returns the child
 as it was admitted, whatever input, version or host data the re-dispatch
 computed (a handler may compute host data from live state); only another
 definition under the same key is refused (`ChildRefusal::Mismatch`).

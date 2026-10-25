@@ -63,6 +63,11 @@ elephant while the maintainer was away are logged in ouro-agent `docs/designs/LO
     prefix distinct from the built-in `child:` ids, stable across a re-dispatch
     of the same call (R-H3). `ChildRef.key` is the link key
     `<call logical id>/<key>`; pass it to the built-in `child_outcome`.
+  - `FunctionContext::child_id(key: &str) -> String` (added 2026-10-25, for a
+    host that writes a record keyed by the child id before starting it): a pure
+    function returning exactly the id `start_child` with that key uses in the
+    current call (same derivation, same call idempotency key), so also in a
+    re-dispatch.
   - Same ownership, cascade, budget lineage, depth limit, trip/pause/digest
     refusals as the built-in. A pinned version uses a new
     `Admitter::pinned_in(lineage)` (R-M5).
@@ -133,7 +138,8 @@ Test-first; each must fail before the change.
   `host == null` even when the parent has host data.
 - `FunctionContext::start_child`: child owned (cascade on parent end), budget
   shared, depth limit, pinned version honoured, trip refusal by digest, pause
-  refusal; replay/re-dispatch joins the same child; a re-dispatch with
+  refusal; `child_id(k)` equals the id `start_child` with key `k` returns,
+  also on a re-dispatch; replay/re-dispatch joins the same child; a re-dispatch with
   different host data joins the existing child and keeps the first host data;
   another definition name is a mismatch error; lease-lost refusal. Conformance on memory/SQLite/Postgres incl. crash points around the
   child commit.

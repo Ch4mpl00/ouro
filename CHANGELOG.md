@@ -12,7 +12,8 @@ New: `Runtime::start_with(id, name, input, Start { version, host })` admits a
 run with host data (`admission.runtime["host"]`, at most 16 KiB as JSON),
 which its functions read through `FunctionContext::host()` and no expression
 sees; `FunctionContext::start_child(ChildStart { .. })` starts an owned child
-the host vouches for (`hostchild:` ids); `Runtime::dry_run_with` gives a dry
+the host vouches for (`hostchild:` ids, which `FunctionContext::child_id(key)`
+returns before the start); `Runtime::dry_run_with` gives a dry
 run's root host data; `Inspection::host`. Breaking changes, for hosts and
 store adapters:
 

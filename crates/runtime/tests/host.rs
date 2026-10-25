@@ -430,6 +430,13 @@ async fn a_redispatched_call_joins_its_child_and_keeps_the_first_host_data() {
             let (attempt, starts) = (a.fetch_add(1, Ordering::SeqCst), s.clone());
             async move {
                 let start = |host: Value| ChildStart { host, ..vouched(&args, &cx) };
+                // The id a host can key its records by before starting the child.
+                starts.lock().unwrap().push(Ok(ChildRef {
+                    id: cx.child_id("k"),
+                    key: String::new(),
+                    done: String::new(),
+                    waiting: String::new(),
+                }));
                 if attempt == 0 {
                     // The child commits, then the call is stopped without an answer.
                     let first = cx.start_child(start(json!("a"))).await;
@@ -456,9 +463,12 @@ async fn a_redispatched_call_joins_its_child_and_keeps_the_first_host_data() {
     assert!(matches!(settle(&rt, &time, "p").await, Some(Status::Completed(_))));
     assert_eq!(attempts.load(Ordering::SeqCst), 2, "the call was dispatched again");
     let starts = starts.lock().unwrap().clone();
-    let first = starts[0].clone().unwrap();
-    assert_eq!(starts[1], Err(format!("mismatch:{:?}", AdmissionField::Name)));
-    assert_eq!(starts[2], Ok(first.clone()), "the re-dispatch joins the same child");
+    // Each attempt: `child_id("k")` first, then its starts.
+    let first = starts[1].clone().unwrap();
+    assert_eq!(starts[0].as_ref().unwrap().id, first.id, "child_id names the child start_child starts");
+    assert_eq!(starts[2].as_ref().unwrap().id, first.id, "and the same one in a re-dispatch");
+    assert_eq!(starts[3], Err(format!("mismatch:{:?}", AdmissionField::Name)));
+    assert_eq!(starts[4], Ok(first.clone()), "the re-dispatch joins the same child");
     let children = host_children(&rt).await;
     assert_eq!(children.len(), 1);
     assert_eq!(children[0].admission.host(), Some(&json!("a")), "the first host data stays");

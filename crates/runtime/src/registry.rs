@@ -76,6 +76,13 @@ pub struct FunctionContext {
     pub children: Option<Arc<dyn ChildStarter>>,
 }
 impl FunctionContext {
+    /// The run id `start_child` with `key` gives the child in this call, and
+    /// in every re-dispatch of it (it derives from the run, the call's
+    /// idempotency key and `key`): a host can key its own records by it
+    /// before it starts the child. Pure: it starts and reads nothing.
+    pub fn child_id(&self, key: &str) -> String {
+        host_child_id(&self.run_id, &self.idempotency_key, key)
+    }
     /// The call's bounded metric attributes: `ouro.definition`,
     /// `ouro.function` and `ouro.delivery`. Run ids and task paths belong
     /// on spans only: they would make a series per run.
@@ -115,6 +122,12 @@ impl FunctionContext {
             None => Err(ChildError::Refused(ChildRefusal::Unavailable)),
         }
     }
+}
+
+/// A host child's id: `hostchild:[<run>, <call idempotency key>, <key>]`,
+/// distinct from the built-in children's `child:` ids.
+pub(crate) fn host_child_id(run_id: &str, idempotency_key: &str, key: &str) -> String {
+    format!("hostchild:{}", serde_json::to_string(&(run_id, idempotency_key, key)).expect("strings serialize"))
 }
 
 /// An owned child a host function starts (`FunctionContext::start_child`).

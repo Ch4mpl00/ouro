@@ -1675,12 +1675,8 @@ impl ChildStarter for HostChildren {
             self.lineage.child(&self.admitter.limits).map_err(|e| ChildError::Refused(ChildRefusal::Depth(e)))?;
         let store = &self.lease.store;
         // Derived from the call's idempotency key, so a re-dispatch of the
-        // call (at least once) names the same child; distinct from the
-        // built-in children's `child:` ids.
-        let id = format!(
-            "hostchild:{}",
-            serde_json::to_string(&(&self.run_id, &self.idempotency_key, &child.key)).expect("strings serialize")
-        );
+        // call (at least once) names the same child (`FunctionContext::child_id`).
+        let id = crate::registry::host_child_id(&self.run_id, &self.idempotency_key, &child.key);
         let key = format!("{}/{}", self.logical, child.key);
         // The first commit wins: a re-dispatch that computed other input,
         // version or host data joins the child as it was admitted (the store
