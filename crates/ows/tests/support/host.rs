@@ -129,6 +129,10 @@ pub enum Entry {
         reference: String,
         attempt: u32,
     },
+    /// A `then: <task>` asked for the tree's jump budget.
+    Jumped {
+        granted: bool,
+    },
     /// `protected`: the call is at most once.
     Call {
         name: String,
@@ -171,6 +175,7 @@ impl Observer for Journal {
             Event::TaskRetrying { reference, attempt, .. } => {
                 Entry::Retrying { reference: reference.to_string(), attempt: *attempt }
             }
+            Event::Jumped { granted, .. } => Entry::Jumped { granted: *granted },
             // Calls are recorded by the host's `Functions` (`Entry::Call`).
             _ => return,
         });
@@ -189,6 +194,13 @@ pub fn trace(journal: &[Entry]) -> Vec<String> {
             _ => None,
         })
         .collect()
+}
+
+/// The jumps the run's tree was granted, and the ones it was refused.
+pub fn jumps(journal: &[Entry]) -> (u64, u64) {
+    let granted = journal.iter().filter(|e| matches!(e, Entry::Jumped { granted: true })).count();
+    let refused = journal.iter().filter(|e| matches!(e, Entry::Jumped { granted: false })).count();
+    (granted as u64, refused as u64)
 }
 
 /// The host calls, by name and arguments.

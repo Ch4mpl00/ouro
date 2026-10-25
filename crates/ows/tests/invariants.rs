@@ -205,6 +205,7 @@ fn well_formed(journal: &[Entry], status: &Status) -> Result<(), String> {
                     return Err(format!("#{i}: a call from {reference}, which is not open"));
                 }
             }
+            Entry::Jumped { .. } => {}
         }
     }
     if let Some((r, _)) = open.first() {

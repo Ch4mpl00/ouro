@@ -866,6 +866,30 @@ Traces are in `.results/mutation-apalache-*.itf.json`. The six-step resend trace
 uses the quotient's local-progress crash abstraction; the eight-step simulation
 trace separately demonstrates expiry/takeover in the composed model.
 
+## Properties stage — 2026-10-25 (design 02)
+
+`spec/check.sh --only properties` (`PROPERTY_RUNS=5000`, one run per binary,
+`cargo test -p ows --test <binary>`), on a shared developer machine:
+
+| Binary | Result | Seconds |
+| --- | --- | ---: |
+| `model` | pass | 351.5 |
+| `durable` | pass | 460.9 |
+| `invariants` | pass | 705.9 |
+| `metamorphic` | pass | 1165.8 |
+
+The first run of `metamorphic` failed on `a_fork_outputs_what_each_branch_outputs_alone`:
+a fork's branches share the run tree's jump budget (#8), so a fork may exhaust
+what each branch alone does not. The property now asserts the exact relation
+(the fork is granted at most the budget and refused a jump only when the
+branches' requests together exceed it; below that the fork outputs what each
+branch outputs alone). The seed is committed in
+`crates/ows/tests/metamorphic.proptest-regressions`.
+
+The L6 comment in `contract_progress_tree.qnt` changed; its temporal stage was
+rerun natively (`--module contract_progress_tree`): baseline holds, the L6 and
+L9 mutants and the three ablations are detected as before (same state counts).
+
 ## Tooling investigations
 
 The initial broad symbolic searches in an emulated Docker server lost their

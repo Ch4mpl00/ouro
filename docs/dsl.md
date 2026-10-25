@@ -62,6 +62,9 @@ is bounded by its collection and `retry` by its attempts.
   (`await: false`) starts a tree of its own. Nesting is capped separately:
   a child deeper than `Config.limits.max_depth` (default 10) is refused with
   a catchable `budget.exhausted`, which ends recursion through either kind.
+  The branches of a `fork` are part of the same run and share its budget the
+  same way: together they may spend no more than one run alone, so branches
+  that each fit the ceiling can still exhaust it between them.
 - **The ceiling is the host's.** `Config.limits.max_jumps` (default 100) is
   set only by the embedding application; each run is admitted with its budget
   pinned in its runtime bindings (the ceiling for a root, its parent's budget
