@@ -78,6 +78,16 @@ persists before execution; `start` enqueues and is idempotent by run ID.
 Every call that reaches the store is `async` (below, Async seams); a
 `current_thread` Tokio runtime is enough.
 
+`start_at(id, name, version, input)` starts a run at a stored version without
+activating it: the active version, the epoch and the schedule stay as they
+are. The same checks apply (registry, validation), the run keeps that
+version's definition for recovery and replay, and `Control::inspect` shows
+`pinned: true` beside the admitted version. A pinned run counts toward the
+breaker only if its version is the active one. A tripped definition refuses
+a pinned start like any admission (`DefinitionTripped`) until an activation.
+Starting an existing ID returns the run if it has the same version and
+fails otherwise.
+
 Every run starts with a check that each function it can call is registered:
 the functions its calls name, the process runners its `run:` tasks need
 (`run:<kind>`), and, transitively, those of the child workflows its
@@ -503,6 +513,10 @@ Repeating an event's `source` + `id` returns its original reply even after the
 wait closes; changing its payload or wait is a conflict. Matching contexts
 are redacted before persistence; a response requiring secret values is
 refused rather than guessed without the host's secret resolver.
+
+Breaking change (issue #23): `control::Inspection` gains `pinned`; a host
+that builds one by hand adds the field. The stored shape is unchanged (an
+admission's `runtime` gains an optional `pinned` binding).
 
 Breaking changes (issue #22), for hosts and adapters written before it:
 

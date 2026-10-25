@@ -260,6 +260,10 @@ pub struct Wait {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Inspection {
     pub snapshot: RunSnapshot,
+    /// The run was started at a version the host named
+    /// (`Runtime::start_at`); the version is `snapshot.run.admission.version`.
+    #[serde(default)]
+    pub pinned: bool,
     /// The call journal, each call with its annotations.
     pub calls: Vec<CallEntry>,
     /// The calls' numeric annotations summed per name: a run's tokens, its

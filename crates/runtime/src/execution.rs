@@ -319,6 +319,35 @@ impl Runtime {
         }
         self.store.get(id).await?.ok_or_else(|| anyhow::anyhow!("admitted run disappeared"))
     }
+    /// `start`, at a stored version of `name` instead of the active one,
+    /// without activating it: the active version, the activation epoch and
+    /// the schedule stay as they are. Registry checks and validation apply as
+    /// for any start, and the run records that it was pinned
+    /// (`Inspection::pinned`); recovery and replay use its own admitted
+    /// definition, as every run's.
+    ///
+    /// CHOICE: a tripped definition refuses a pinned start as it refuses
+    /// every admission (`DefinitionTripped`; durable invariant V2 admits
+    /// nothing of any version until an activation). To run its built-in
+    /// version after a trip, the host starts a definition of another name or
+    /// activates; admitting past a trip would be a change of that contract
+    /// and of its model. A pinned run counts toward the breaker only when its
+    /// version is the active one, as every run does.
+    /// Starting an existing id returns that run if it was pinned at the same
+    /// version, and fails otherwise.
+    pub async fn start_at(&self, id: &str, name: &str, version: u64, input: Value) -> anyhow::Result<SavedRun> {
+        if let Some(saved) = self.store.get(id).await? {
+            let a = &saved.admission;
+            anyhow::ensure!(a.name == name, "run belongs to another definition");
+            anyhow::ensure!(a.version == version, "run was admitted at another version");
+            return Ok(saved);
+        }
+        let a = self.admitter().pinned(id, name, version, input).await?;
+        if self.store.admit(&a, self.clock.now_ms()).await? {
+            self.metrics.started(name);
+        }
+        self.store.get(id).await?.ok_or_else(|| anyhow::anyhow!("admitted run disappeared"))
+    }
     pub async fn get(&self, id: &str) -> anyhow::Result<Option<SavedRun>> {
         self.store.get(id).await
     }
@@ -941,6 +970,18 @@ impl Admitter {
     /// A root run of `name`'s active version, unless its breaker tripped.
     pub async fn active(&self, id: &str, name: &str, input: Value) -> anyhow::Result<Admission> {
         self.active_in(id, name, input, &self.root()).await
+    }
+    /// A root run of the stored version `version` of `name`, tripped or not,
+    /// marked as pinned (`Runtime::start_at`).
+    pub async fn pinned(&self, id: &str, name: &str, version: u64, input: Value) -> anyhow::Result<Admission> {
+        let mut definitions = self.definitions.definitions(name).await?;
+        let d = definitions
+            .versions
+            .remove(&version)
+            .ok_or_else(|| anyhow::anyhow!("unknown definition version {version} of {name}"))?;
+        let mut admission = self.of(id, &d, input, &self.root()).await?;
+        admission.runtime[ouro_durable::PINNED] = json!(true);
+        Ok(admission)
     }
     fn root(&self) -> Lineage {
         Lineage { max_jumps: self.limits.max_jumps, depth: 0 }
