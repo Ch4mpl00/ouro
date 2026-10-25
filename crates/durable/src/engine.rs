@@ -1235,10 +1235,10 @@ impl RunStore for TransactionalStore {
             .await
     }
     async fn stopped(&self) -> anyhow::Result<bool> {
-        self.update(|rows| Box::pin(async move { is_stopped(rows).await })).await
+        self.read(|rows| Box::pin(async move { is_stopped(rows).await })).await
     }
     async fn control_entry(&self, id: &str) -> anyhow::Result<Option<control::Entry>> {
-        self.update(|rows| Box::pin(async move { get(rows, "control_command", id).await })).await
+        self.read(|rows| Box::pin(async move { get(rows, "control_command", id).await })).await
     }
     async fn control_history(
         &self,
@@ -1246,7 +1246,7 @@ impl RunStore for TransactionalStore {
         cursor: Option<&control::Cursor>,
         limit: usize,
     ) -> anyhow::Result<control::Page<control::Entry>> {
-        self.update(|rows| {
+        self.read(|rows| {
             Box::pin(async move {
                 let kind = run.map_or_else(|| "control_history".into(), |r| partition("control_history_run", r));
                 let (found, next) = page_rows(rows, &kind, &kind, None, None, cursor, limit).await?;
@@ -1264,14 +1264,14 @@ impl RunStore for TransactionalStore {
         cursor: Option<&control::Cursor>,
         limit: usize,
     ) -> anyhow::Result<control::Page<SavedRun>> {
-        self.update(|rows| Box::pin(async move { query_runs(rows, filter, history, cursor, limit).await })).await
+        self.read(|rows| Box::pin(async move { query_runs(rows, filter, history, cursor, limit).await })).await
     }
     async fn query_definitions(
         &self,
         cursor: Option<&control::Cursor>,
         limit: usize,
     ) -> anyhow::Result<control::Page<control::DefinitionSummary>> {
-        self.update(|rows| {
+        self.read(|rows| {
             Box::pin(async move {
                 let (found, next) = page_rows(rows, "definitions", "definitions", None, None, cursor, limit).await?;
                 let mut items = Vec::new();
@@ -1285,7 +1285,7 @@ impl RunStore for TransactionalStore {
         .await
     }
     async fn definition_control(&self, name: &str) -> anyhow::Result<Option<control::DefinitionSummary>> {
-        self.update(|rows| {
+        self.read(|rows| {
             Box::pin(async move {
                 let Some(defs) = load_definitions(rows, name).await? else { return Ok(None) };
                 Ok(Some(definition_summary(rows, name, defs).await?))
@@ -1299,7 +1299,7 @@ impl RunStore for TransactionalStore {
         cursor: Option<&control::Cursor>,
         limit: usize,
     ) -> anyhow::Result<control::Page<control::Wait>> {
-        self.update(|rows| {
+        self.read(|rows| {
             Box::pin(async move {
                 let query = serde_json::to_string(&("waits", f))?;
                 let (found, next) =
@@ -1345,7 +1345,7 @@ impl RunStore for TransactionalStore {
         cursor: Option<&control::Cursor>,
         limit: usize,
     ) -> anyhow::Result<control::Page<control::Worker>> {
-        self.update(|rows| {
+        self.read(|rows| {
             Box::pin(async move {
                 let (found, next) = page_rows(rows, "worker", "workers", None, None, cursor, limit).await?;
                 let items =
@@ -1373,7 +1373,7 @@ impl RunStore for TransactionalStore {
         .await
     }
     async fn inspect_control(&self, id: &str) -> anyhow::Result<Option<control::Inspection>> {
-        self.update(|rows| {
+        self.read(|rows| {
             Box::pin(async move {
                 let Some(s) = find_run(rows, id).await? else {
                     return Ok(None);
@@ -1632,13 +1632,13 @@ impl RunStore for TransactionalStore {
         self.update(|rows| Box::pin(async move { publish(rows, event, target, now, &self.policy).await })).await
     }
     async fn ingested(&self, event: &Value, now: i64) -> anyhow::Result<bool> {
-        self.update(|rows| Box::pin(async move { Ok(tombstone(rows, event, now).await?.2) })).await
+        self.read(|rows| Box::pin(async move { Ok(tombstone(rows, event, now).await?.2) })).await
     }
     async fn trigger(&self, key: &str) -> anyhow::Result<Option<Trigger>> {
-        self.update(|rows| Box::pin(async move { get(rows, "trigger", key).await })).await
+        self.read(|rows| Box::pin(async move { get(rows, "trigger", key).await })).await
     }
     async fn due_triggers(&self, now: i64, limit: usize) -> anyhow::Result<Vec<(String, Trigger)>> {
-        self.update(|rows| {
+        self.read(|rows| {
             Box::pin(async move {
                 if is_stopped(rows).await? {
                     return Ok(Vec::new());
@@ -1650,7 +1650,7 @@ impl RunStore for TransactionalStore {
         .await
     }
     async fn triggers_for(&self, t: &str, limit: usize) -> anyhow::Result<Vec<(String, Trigger)>> {
-        self.update(|rows| {
+        self.read(|rows| {
             Box::pin(async move {
                 if is_stopped(rows).await? {
                     return Ok(Vec::new());
@@ -1665,7 +1665,7 @@ impl RunStore for TransactionalStore {
         .await
     }
     async fn queued(&self, key: &str) -> anyhow::Result<Option<Admission>> {
-        self.update(|rows| Box::pin(async move { Ok(queued(rows, key).await?.map(|q| q.admission)) })).await
+        self.read(|rows| Box::pin(async move { Ok(queued(rows, key).await?.map(|q| q.admission)) })).await
     }
     async fn fire(&self, firing: &Firing<'_>, now: i64) -> anyhow::Result<Fired> {
         self.update(|rows| Box::pin(async move { fire(rows, firing, now, &self.policy).await })).await
@@ -1765,7 +1765,7 @@ impl RunStore for TransactionalStore {
         .await
     }
     async fn child_outcome(&self, parent: &str, k: &str, child: &str) -> anyhow::Result<Option<Status>> {
-        self.update(|rows| {
+        self.read(|rows| {
             Box::pin(async move {
                 let s = run(rows, child).await?;
                 anyhow::ensure!(
@@ -1901,10 +1901,10 @@ impl RunStore for TransactionalStore {
         .await
     }
     async fn get(&self, id: &str) -> anyhow::Result<Option<SavedRun>> {
-        self.update(|rows| Box::pin(async move { Ok(find_run(rows, id).await?.map(|s| s.run)) })).await
+        self.read(|rows| Box::pin(async move { Ok(find_run(rows, id).await?.map(|s| s.run)) })).await
     }
     async fn list(&self, name: Option<&str>, prefix: &str) -> anyhow::Result<Vec<SavedRun>> {
-        self.update(|rows| {
+        self.read(|rows| {
             Box::pin(async move {
                 let end = prefix_end(prefix);
                 if let Some(name) = name {
@@ -1925,7 +1925,7 @@ impl RunStore for TransactionalStore {
         .await
     }
     async fn inspect(&self, id: &str) -> anyhow::Result<Option<RunSnapshot>> {
-        self.update(|rows| {
+        self.read(|rows| {
             Box::pin(async move {
                 let Some(s) = find_run(rows, id).await? else {
                     return Ok(None);
@@ -1968,11 +1968,11 @@ impl RunStore for TransactionalStore {
         self.update(|rows| Box::pin(async move { activate(rows, name, version, Some(epoch), arming).await })).await
     }
     async fn definitions(&self, name: &str) -> anyhow::Result<Definitions> {
-        self.update(|rows| Box::pin(async move { Ok(load_definitions(rows, name).await?.unwrap_or_default()) })).await
+        self.read(|rows| Box::pin(async move { Ok(load_definitions(rows, name).await?.unwrap_or_default()) })).await
     }
     // One ordered range read of at most `limit` notice rows.
     async fn notices(&self, limit: usize) -> anyhow::Result<Vec<(String, Value)>> {
-        self.update(|rows| {
+        self.read(|rows| {
             Box::pin(async move {
                 Ok(rows.scan("notice", "", None, limit).await?.into_iter().map(|((_, k), v)| (k, v)).collect())
             })

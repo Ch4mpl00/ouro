@@ -10,6 +10,9 @@ use std::collections::BTreeSet;
 
 /// Opens another independent handle to the same database.
 pub type Reopen = Arc<dyn Fn() -> BoxFuture<'static, anyhow::Result<Arc<dyn RunStore>>> + Send + Sync>;
+/// Opens a read-only backend over the same database (`is_read_only`): the
+/// adapter's read-only constructor, which never migrates or writes.
+pub type OpenReadOnly = Arc<dyn Fn() -> BoxFuture<'static, anyhow::Result<Arc<dyn AtomicBackend>>> + Send + Sync>;
 
 /// One case's store. Every operation is awaited on the caller's runtime,
 /// whose flavour the suite does not assume; the interpreter cases run on a
@@ -21,6 +24,7 @@ pub struct TestStore {
     pub faults: Arc<FaultInjector>,
     /// Read actual adapter rows, independently of the transition engine.
     pub backend: Arc<dyn AtomicBackend>,
+    pub read_only: OpenReadOnly,
 }
 #[derive(Debug, Default)]
 pub struct Report {
@@ -731,6 +735,7 @@ pub async fn run_all(factory: impl AsyncFn(&str) -> anyhow::Result<TestStore>) -
     control_overlap(&factory, &mut report).await?;
     definition_queries(&factory, &mut report).await?;
     heartbeats(&factory, &mut report).await?;
+    read_only(&factory, &mut report).await?;
     dropped(&factory, &mut report).await?;
     Ok(report)
 }
@@ -1001,6 +1006,154 @@ async fn heartbeats(
     assert_eq!(rows().await?, (0, 0));
     report.operations += 12;
     report.witnesses.insert("one heartbeat row per worker, swept after it stays stale");
+    Ok(())
+}
+
+/// Whether an operation failed with the read-only refusal.
+fn refused_read_only<T: std::fmt::Debug>(result: anyhow::Result<T>) -> bool {
+    result.is_err_and(|e| e.is::<ReadOnly>())
+}
+/// A read-only handle (#22) over a populated store: every query answers
+/// what the writable handle answers, every mutating operation (and every
+/// worker operation, fenced reads included) is refused with `ReadOnly`
+/// before it touches a row, and a write through the backend's own
+/// transaction is refused too. Nothing it does changes the store, and it
+/// sees what the writer commits afterwards.
+async fn read_only(
+    factory: &impl AsyncFn(&str) -> anyhow::Result<TestStore>,
+    report: &mut Report,
+) -> anyhow::Result<()> {
+    use control::{Command, Runs, Waits, Worker};
+    use ows::durable::{Annotation, CallState, Delivery};
+    let t = factory("read-only").await?;
+    report.cases += 1;
+    let s = &t.store;
+    let d = s.save_definition("workflow", control_definition_yaml()).await?;
+    let slot = Trigger { at_ms: Some(4), types: vec!["start".into()], state: json!({ "kind": "every" }) };
+    let arming = Arming { triggers: BTreeMap::from([("w#every".into(), slot.clone())]) };
+    s.activate_with("workflow", d.version, 0, &arming).await?;
+    let parent = s.start(&admission("p"), 0).await?.unwrap();
+    let call = Record::Call {
+        logical: "call".into(),
+        function: "f".into(),
+        arguments: json!({}),
+        delivery: Delivery::AtLeastOnce,
+        state: CallState::Done(Ok(json!(1))),
+        annotations: BTreeMap::from([("tokens".to_string(), Annotation::from(3))]),
+    };
+    s.save_record(&parent, "call#call", &call, 0).await?;
+    let link = ChildLink { parent: "p".into(), key: "c".into(), reference: "c".into() };
+    s.start_child(&parent, &admission("c"), &link, 0).await?;
+    s.register_wait(&parent, &["answer".into()], 1).await?;
+    s.describe_wait(&parent, "listen", &control_wait(), 1).await?;
+    s.deliver(&event("mail", "other", json!(1)), Some("p"), 1).await?;
+    s.finish(&parent, &Status::Waiting { wake_at_ms: 100 }, 1, 3).await?;
+    let done = s.start(&admission("done"), 2).await?.unwrap();
+    s.finish(&done, &Status::Completed(json!(42)), 3, 3).await?;
+    s.control(&control_request("cancel-child"), &Command::Cancel { run: "c".into() }, 4).await?;
+    let worker = Worker {
+        id: "w".into(),
+        host: None,
+        application: None,
+        started_ms: 0,
+        beat_ms: 4,
+        expires_ms: 4 + LEASE_MS,
+        held: 1,
+    };
+    s.beat(&worker).await?;
+
+    let backend = (t.read_only)().await?;
+    assert!(backend.is_read_only());
+    let r = TransactionalStore::new(backend.clone());
+    let before = t.backend.snapshot().await?;
+    macro_rules! same {
+        ($($query:ident($($arg:expr),*)),* $(,)?) => {$(
+            assert_eq!(r.$query($($arg),*).await?, s.$query($($arg),*).await?, stringify!($query));
+        )*};
+    }
+    let window = Runs { since_ms: Some(0), before_ms: Some(10), ..Runs::default() };
+    let ingress = event("ingress", "start", json!(1));
+    same!(
+        get("p"),
+        get("missing"),
+        list(None, ""),
+        list(Some("workflow"), "c"),
+        inspect("p"),
+        inspect_control("p"),
+        inspect_control("missing"),
+        query_runs(&Runs::default(), false, None, 10),
+        query_runs(&window, true, None, 10),
+        query_definitions(None, 10),
+        definition_control("workflow"),
+        pending_waits(&Waits::default(), None, 10),
+        workers(None, 10),
+        control_entry("cancel-child"),
+        control_history(None, None, 10),
+        control_history(Some("c"), None, 10),
+        stopped(),
+        definitions("workflow"),
+        trigger("w#every"),
+        due_triggers(i64::MAX, 10),
+        triggers_for("start", 10),
+        queued("w#every"),
+        child_outcome("p", "c", "c"),
+        ingested(&ingress, 4),
+        notices(10),
+    );
+    assert_eq!(r.inspect_control("p").await?.unwrap().calls.len(), 1);
+    assert_eq!(r.workers(None, 10).await?.items, vec![worker.clone()]);
+
+    let fence = parent.clone();
+    let types = vec!["answer".to_string()];
+    let firing = Firing { key: "w#every", expected: Some(&slot), next: None, ..Firing::default() };
+    let cancel = Command::Cancel { run: "p".into() };
+    assert!(refused_read_only(r.control(&control_request("refused"), &cancel, 5).await));
+    let typed = control::ControlError::from(r.control(&control_request("refused"), &cancel, 5).await.unwrap_err());
+    assert!(matches!(typed, control::ControlError::ReadOnly), "{typed:?}");
+    assert!(refused_read_only(r.beat(&worker).await));
+    assert!(refused_read_only(r.describe_wait(&fence, "listen", &control_wait(), 5).await));
+    assert!(refused_read_only(r.admit(&admission("new"), 5).await));
+    assert!(refused_read_only(r.start(&admission("new"), 5).await));
+    assert!(refused_read_only(r.claim("p", 100).await));
+    assert!(refused_read_only(r.check_lease(&fence, 5).await));
+    assert!(refused_read_only(r.renew(&fence, 5).await));
+    assert!(refused_read_only(r.release(&fence, 5).await));
+    assert!(refused_read_only(r.load_records(&fence, 5).await));
+    assert!(refused_read_only(r.save_record(&fence, "t", &Record::Timer { deadline_ms: 1 }, 5).await));
+    assert!(refused_read_only(r.register_wait(&fence, &types, 5).await));
+    assert!(refused_read_only(r.unregister_wait(&fence, "listen", &types, 5).await));
+    assert!(refused_read_only(r.deliver(&event("new", "answer", json!(1)), Some("p"), 5).await));
+    assert!(refused_read_only(r.deliver(&event("new", "answer", json!(1)), None, 5).await));
+    assert!(refused_read_only(r.take_event(&fence, "listen#event[0]", &types, 5).await));
+    assert!(refused_read_only(r.subscribe(&fence, "listen", &types, 5).await));
+    assert!(refused_read_only(r.unsubscribe(&fence, "listen", 5).await));
+    assert!(refused_read_only(r.publish(&event("new", "answer", json!(1)), None, 5).await));
+    assert!(refused_read_only(r.fire(&firing, 5).await));
+    assert!(refused_read_only(r.finish(&fence, &Status::Cancelled, 5, 3).await));
+    let link = ChildLink { parent: "p".into(), key: "new".into(), reference: "new".into() };
+    assert!(refused_read_only(r.start_child(&fence, &admission("new"), &link, 5).await));
+    assert!(refused_read_only(r.spend(&fence, "jump", 10, 5).await));
+    assert!(refused_read_only(r.due(i64::MAX, 10).await));
+    assert!(refused_read_only(r.cancel("p", 5).await));
+    assert!(refused_read_only(r.cancel("missing", 5).await));
+    assert!(refused_read_only(r.sweep(i64::MAX, 0).await));
+    assert!(refused_read_only(r.save_definition("workflow", "yaml").await));
+    assert!(refused_read_only(r.activate("workflow", d.version).await));
+    assert!(refused_read_only(r.activate_with("workflow", d.version, 1, &arming).await));
+    assert!(refused_read_only(r.acknowledge("notice").await));
+    // The backend refuses a write in its own transaction before sending it.
+    let mut tx = backend.begin().await?;
+    assert!(tx.get("run", "p").await?.is_some());
+    assert!(refused_read_only(tx.put("run", "p", &json!({})).await));
+    assert!(refused_read_only(tx.delete("run", "p").await));
+    tx.rollback().await;
+    assert_eq!(t.backend.snapshot().await?, before, "a read-only handle changes nothing");
+    // Each query is a fresh transaction: it sees what the writer commits.
+    assert!(s.admit(&admission("later"), 6).await?);
+    assert_eq!(r.get("later").await?, s.get("later").await?);
+    assert!(r.get("later").await?.is_some());
+    report.operations += 60;
+    report.witnesses.insert("a read-only handle answers every query and refuses every write");
     Ok(())
 }
 

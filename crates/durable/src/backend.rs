@@ -122,9 +122,48 @@ impl std::fmt::Display for ReadOnly {
 }
 impl std::error::Error for ReadOnly {}
 
+/// Why a store cannot be opened without migrating it: an adapter's
+/// read-only open never creates or migrates a schema, so it refuses a
+/// database that has none yet or one this build does not read.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SchemaError {
+    /// No schema: the database was never opened writable (migrated), or it
+    /// is not an ouro store.
+    Unmigrated,
+    /// A schema version other than the one this build reads.
+    Unsupported { found: i64, supported: i64 },
+}
+impl SchemaError {
+    /// The refusal for a recorded schema `version` (0: none).
+    pub(crate) fn check(version: i64, supported: i64) -> Result<(), SchemaError> {
+        match version {
+            0 => Err(SchemaError::Unmigrated),
+            v if v == supported => Ok(()),
+            found => Err(SchemaError::Unsupported { found, supported }),
+        }
+    }
+}
+impl std::fmt::Display for SchemaError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unmigrated => f.write_str("the store has no schema; open it writable once to migrate it"),
+            Self::Unsupported { found, supported } => {
+                write!(f, "unsupported store schema version {found} (this build reads {supported})")
+            }
+        }
+    }
+}
+impl std::error::Error for SchemaError {}
+
 #[async_trait]
 pub trait AtomicBackend: Send + Sync {
     async fn begin(&self) -> anyhow::Result<Box<dyn Transaction + '_>>;
+    /// Opened read-only: every `put` and `delete` fails with `ReadOnly`
+    /// before it touches data, and `TransactionalStore` refuses its
+    /// mutating operations before opening a transaction.
+    fn is_read_only(&self) -> bool {
+        false
+    }
     /// Diagnostics only: full persisted-state audits, never used by RunStore.
     async fn snapshot(&self) -> anyhow::Result<Snapshot>;
     /// Diagnostics/corruption injection only; validates the supplied rows.
@@ -163,11 +202,24 @@ impl TransactionalStore {
         self.policy = policy;
         self
     }
+    /// Runs a mutating `operation` (`read` otherwise); a read-only backend
+    /// refuses it with `ReadOnly` before opening a transaction, whether or
+    /// not it would write.
+    pub(crate) async fn update<'c, T: Send>(
+        &'c self,
+        operation: impl for<'t> Fn(&'t mut (dyn Transaction + 'c)) -> BoxFuture<'t, anyhow::Result<T>> + Send + Sync,
+    ) -> anyhow::Result<T> {
+        if self.backend.is_read_only() {
+            return Err(ReadOnly.into());
+        }
+        self.read(operation).await
+    }
     /// Runs `operation` in a transaction and commits it, retrying definite
     /// conflicts only. The operation is called again on each attempt, so it
     /// must derive everything from what it reads. A dropped call rolls its
-    /// open transaction back (`Transaction`).
-    pub(crate) async fn update<'c, T: Send>(
+    /// open transaction back (`Transaction`). Queries run here directly, so
+    /// they serve a read-only backend too.
+    pub(crate) async fn read<'c, T: Send>(
         &'c self,
         operation: impl for<'t> Fn(&'t mut (dyn Transaction + 'c)) -> BoxFuture<'t, anyhow::Result<T>> + Send + Sync,
     ) -> anyhow::Result<T> {

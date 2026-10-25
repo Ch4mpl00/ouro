@@ -335,6 +335,29 @@ commit together. Conflicting reuse is an error. `entry` and the paged
 also indexed by run. Operator audit and response identities are retained
 independently of execution-evidence sweeping.
 
+A console that only observes opens the store read-only:
+`sqlite::open_read_only(path)` (a read-only connection with `query_only`,
+never creating the file; deferred transactions, so it never takes the
+writer's lock), `postgres::connect_read_only(url)` (or
+`PostgresBackend::read_only_config` / `read_only_manager`; every
+transaction is `SERIALIZABLE READ ONLY`, and a role with `SELECT` on the two
+tables is enough) and, for memory, `MemoryBackend::read_only_view()`. They
+never migrate and never write: a database without the schema is refused
+with `SchemaError::Unmigrated`, another schema version with
+`SchemaError::Unsupported` (the writable open now refuses a newer one with
+the same error). Every query works: the store's own (`get`, `list`,
+`inspect`, `definitions`, `trigger`, `queued`, `notices`) and every
+`Control` query (`inspect`, `list`, `history`, `waits`, `counts`, `entry`,
+`journal`, `workers`, `definitions`, `totals`); every mutating or worker
+operation, fenced reads
+(`check_lease`, `load_records`) and `due` (which may promote deferred
+queues) included, is refused with `durable::ReadOnly` before a transaction
+opens, and a backend refuses any `put` or `delete` with it too. `Control`
+reports it as `ControlError::ReadOnly`. A read-only open does not scan
+runs: a row written under another durable state version is refused when
+it is read, as on a writable handle. `AtomicBackend::is_read_only` marks a
+third-party adapter's read-only handle.
+
 ```rust
 use ouro_runtime::control::{Control, Request, Runs, Waits};
 // store and clock are injected by the composition root.
@@ -798,12 +821,14 @@ fencing, immutable evidence, event histories, held listens, every interpreter
 checkpoint boundary, child notifications, rollback and ambiguous commits,
 corruption, concurrent claims, retention, liveness drains and a run tree's
 shared budget (restarts, failed commits, children, a race at the last unit),
-all overlap policies, queue promotion and a race at the schedule ceiling, and
+all overlap policies, queue promotion and a race at the schedule ceiling,
+read-only handles (the same query answers, every write refused), and
 operations dropped mid-transaction or mid-statement. Its interpreter cases
 keep a paused clock on a runtime of their own and reach the store through
 blocking tasks of the caller's runtime, so real I/O never advances virtual
 time. Factories supply
-an independent reopen handle, persisted-row inspection and failure injection.
+an independent reopen handle, a read-only open (`TestStore::read_only`),
+persisted-row inspection and failure injection.
 
 `cargo test -p ouro-durable --test scalability -- --nocapture` checks every
 operation's row bound with 10,000 unrelated persisted runs, a run holding

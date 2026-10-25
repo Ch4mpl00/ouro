@@ -12,9 +12,12 @@ use tokio_postgres::{NoTls, error::SqlState};
 const SESSIONS: usize = 16;
 /// The longest a wait for a session, one statement or a commit may take.
 const DEADLINE: Duration = Duration::from_secs(30);
+/// The schema version this build reads and migrates to (`ouro_migrations`).
+const SCHEMA: i64 = 1;
 
 pub struct PostgresBackend {
     pool: Pool,
+    read_only: bool,
     pub faults: Arc<FaultInjector>,
     pub metrics: Arc<Metrics>,
 }
@@ -36,7 +39,30 @@ impl PostgresBackend {
     pub async fn with_manager(manager: Manager, faults: Arc<FaultInjector>) -> anyhow::Result<Self> {
         let pool = Pool::builder(manager).max_size(SESSIONS).build()?;
         bounded(migrate(&pool)).await?;
-        Ok(Self { pool, faults, metrics: Arc::new(Metrics::default()) })
+        Ok(Self { pool, read_only: false, faults, metrics: Arc::new(Metrics::default()) })
+    }
+    pub async fn connect_read_only(url: &str) -> anyhow::Result<Self> {
+        Self::read_only_config(url.parse::<tokio_postgres::Config>()?).await
+    }
+    pub async fn read_only_config(config: tokio_postgres::Config) -> anyhow::Result<Self> {
+        Self::read_only_manager(Manager::new(config, NoTls)).await
+    }
+    /// A backend for queries only: it never creates or migrates the schema
+    /// and never writes. A database without the schema, or with another
+    /// version of it, is refused with a `SchemaError`. Every transaction is
+    /// `SERIALIZABLE READ ONLY`, so the server refuses a write too; the
+    /// backend refuses each `put` and `delete` with `ReadOnly` before it is
+    /// sent. A role with `SELECT` on `ouro_rows` and `ouro_migrations` is
+    /// enough.
+    pub async fn read_only_manager(manager: Manager) -> anyhow::Result<Self> {
+        let pool = Pool::builder(manager).max_size(SESSIONS).build()?;
+        bounded(schema(&pool)).await?;
+        Ok(Self {
+            pool,
+            read_only: true,
+            faults: Arc::new(FaultInjector::default()),
+            metrics: Arc::new(Metrics::default()),
+        })
     }
     async fn session(&self) -> anyhow::Result<Object> {
         bounded(async { Ok(self.pool.get().await?) }).await
@@ -89,9 +115,17 @@ impl PostgresTransaction<'_> {
 }
 #[async_trait::async_trait]
 impl AtomicBackend for PostgresBackend {
+    fn is_read_only(&self) -> bool {
+        self.read_only
+    }
     async fn begin(&self) -> anyhow::Result<Box<dyn Transaction + '_>> {
         let tx = PostgresTransaction { session: Some(self.session().await?), backend: self, writes: 0 };
-        tx.statement(tx.session()?.batch_execute("BEGIN ISOLATION LEVEL SERIALIZABLE")).await?;
+        let begin = if self.read_only {
+            "BEGIN ISOLATION LEVEL SERIALIZABLE READ ONLY"
+        } else {
+            "BEGIN ISOLATION LEVEL SERIALIZABLE"
+        };
+        tx.statement(tx.session()?.batch_execute(begin)).await?;
         Ok(Box::new(tx))
     }
     async fn snapshot(&self) -> anyhow::Result<Snapshot> {
@@ -146,6 +180,9 @@ impl Transaction for PostgresTransaction<'_> {
             .collect()
     }
     async fn put(&mut self, kind: &str, id: &str, value: &Value) -> anyhow::Result<()> {
+        if self.backend.read_only {
+            return Err(ReadOnly.into());
+        }
         self.backend.faults.check(CommitFault::BeforeWrite(self.writes))?;
         self.writes += 1;
         self.backend.metrics.write();
@@ -165,6 +202,9 @@ impl Transaction for PostgresTransaction<'_> {
         Ok(())
     }
     async fn delete(&mut self, kind: &str, id: &str) -> anyhow::Result<()> {
+        if self.backend.read_only {
+            return Err(ReadOnly.into());
+        }
         self.backend.faults.check(CommitFault::BeforeWrite(self.writes))?;
         self.writes += 1;
         self.backend.metrics.write();
@@ -218,7 +258,9 @@ async fn migrate(pool: &Pool) -> anyhow::Result<()> {
     let tx = client.transaction().await?;
     tx.batch_execute("SELECT pg_advisory_xact_lock(716532018); CREATE TABLE IF NOT EXISTS ouro_migrations (version INTEGER PRIMARY KEY);").await?;
     let version: i32 = tx.query_one("SELECT COALESCE(MAX(version),0) FROM ouro_migrations", &[]).await?.get(0);
-    anyhow::ensure!(version <= 1, "unsupported Postgres schema version {version}");
+    if i64::from(version) > SCHEMA {
+        return Err(SchemaError::Unsupported { found: version.into(), supported: SCHEMA }.into());
+    }
     if version == 0 {
         tx.batch_execute(include_str!("../migrations/postgres/001_initial.sql")).await?;
         tx.execute("INSERT INTO ouro_migrations VALUES (1)", &[]).await?;
@@ -226,8 +268,25 @@ async fn migrate(pool: &Pool) -> anyhow::Result<()> {
     tx.commit().await?;
     Ok(())
 }
+/// The recorded schema version, read without writing: no migrations table
+/// (or no recorded version) is an unmigrated store.
+async fn schema(pool: &Pool) -> anyhow::Result<()> {
+    let client = pool.get().await?;
+    let present: bool = client.query_one("SELECT to_regclass('ouro_migrations') IS NOT NULL", &[]).await?.get(0);
+    let version: i32 = if present {
+        client.query_one("SELECT COALESCE(MAX(version),0) FROM ouro_migrations", &[]).await?.get(0)
+    } else {
+        0
+    };
+    Ok(SchemaError::check(version.into(), SCHEMA)?)
+}
 pub async fn connect(url: &str) -> anyhow::Result<TransactionalStore> {
     Ok(TransactionalStore::new(Arc::new(PostgresBackend::connect(url).await?)))
+}
+/// A store over `PostgresBackend::connect_read_only`: queries and `Control`
+/// queries only; every mutating operation is refused with `ReadOnly`.
+pub async fn connect_read_only(url: &str) -> anyhow::Result<TransactionalStore> {
+    Ok(TransactionalStore::new(Arc::new(PostgresBackend::connect_read_only(url).await?)))
 }
 async fn bounded<T>(operation: impl Future<Output = anyhow::Result<T>>) -> anyhow::Result<T> {
     tokio::time::timeout(DEADLINE, operation)

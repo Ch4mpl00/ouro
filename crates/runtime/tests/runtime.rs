@@ -1291,6 +1291,35 @@ async fn store_only_control_lists_definition_schedules_and_suspended_slots() {
 }
 
 #[tokio::test]
+async fn read_only_control_answers_queries_and_refuses_commands() {
+    use ouro_runtime::control::{Control, ControlError, Runs, Waits};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("read-only.sqlite");
+    let clock = Arc::new(Time::default());
+    let rt = runtime(Arc::new(durable::sqlite::open(&path).unwrap()), Registry::new(), clock.clone());
+    save(&rt, &yaml("  - wait: { listen: { to: { one: { with: { type: answer } } } } }")).await;
+    rt.start("r", "workflow", json!({})).await.unwrap();
+    assert!(matches!(rt.drive("r", &CancellationToken::new()).await.unwrap(), Some(Status::Waiting { .. })));
+    let writable = Control::new(Arc::new(durable::sqlite::open(&path).unwrap()), clock.clone());
+    let control = Control::new(Arc::new(durable::sqlite::open_read_only(&path).unwrap()), clock.clone());
+    assert_eq!(control.inspect("r").await.unwrap(), writable.inspect("r").await.unwrap());
+    assert_eq!(
+        control.list(&Runs::default(), None, 10).await.unwrap(),
+        writable.list(&Runs::default(), None, 10).await.unwrap()
+    );
+    assert_eq!(control.definitions(None, 10).await.unwrap(), writable.definitions(None, 10).await.unwrap());
+    let waits = control.waits(&Waits::default(), None, 10).await.unwrap().items;
+    assert_eq!(waits.len(), 1);
+    let answer = json!({"source":"/operator","id":"1","type":"answer","data":{}});
+    let refused = control.respond(&operator("answer"), "r", &waits[0].key, answer).await;
+    assert!(matches!(refused, Err(ControlError::ReadOnly)), "{refused:?}");
+    assert!(matches!(control.cancel(&operator("cancel"), "r").await, Err(ControlError::ReadOnly)));
+    assert!(matches!(control.emergency_stop(&operator("stop"), true).await, Err(ControlError::ReadOnly)));
+    assert!(!control.stopped().await.unwrap());
+    assert!(control.journal(None, None, 10).await.unwrap().items.is_empty());
+}
+
+#[tokio::test]
 async fn store_only_control_answers_a_multi_event_listen_with_persisted_correlation() {
     use ouro_runtime::control::{Control, ControlError, Runs, Waits};
     let dir = tempfile::tempdir().unwrap();
