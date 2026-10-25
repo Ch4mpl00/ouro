@@ -229,12 +229,13 @@ What the quotients are connected to, and what not:
   bounded batch at clearing, the rest at `due_as` polls) and promotion at the
   end of any run of the definition follow `drain_queues`, which `contract.qnt`
   simplifies to a promotion after every transition; the worker's notice
-  follows the heartbeat renewal in the runtime's execution loop. The engine
-  admits a newer slot while a buffered one waits for its deferred drain
-  (`fire` consults the trigger's live runs and capacity, not the marker):
-  L7 holds under F, but a buffered slot is not guaranteed to run before a later
-  slot, and with stops repeated forever it can be overtaken forever, even under
-  strong fairness of polls (RESULTS.md records that counterexample).
+  follows the heartbeat renewal in the runtime's execution loop. While a
+  buffered slot waits for its deferred drain, the engine admits a later slot of
+  the same trigger (`fire` consults the trigger's live runs and capacity, not
+  the marker) or another start into the room it needs. L7 holds under F, but a
+  buffered slot is not guaranteed to run before a later slot, and with stops
+  repeated forever it can be passed over forever, even under strong fairness of
+  polls (RESULTS.md records both counterexamples).
 - **Not modelled:** pause and resume, the skip/allow/replace policies (the
   contract's monitors cover them), event-triggered (`on`) schedules and ingress,
   missed slots under `catchup: none`, several triggers or buffered slots per

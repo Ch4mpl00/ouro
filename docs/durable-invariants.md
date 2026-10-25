@@ -823,7 +823,8 @@ cleared for good and due-run polls continue. Then the slot is eventually
 promoted, or discarded by an activation or a trip. Promotion commits with the
 end that makes room for it, whichever run of the definition ends; a drain the
 stop deferred happens at clearing (a bounded batch of definitions) or at a later
-poll, and until then a later slot of the same trigger may be admitted first. No
+poll, and until then a later slot of the trigger or another start may take the
+room first. No
 fairness of firing, activation or admissions is assumed.
 
 A queue position cannot be stranded. **Source:** [#19][I19]. **Fault:** a crash
