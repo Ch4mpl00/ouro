@@ -687,7 +687,7 @@ pub async fn run_all(factory: impl AsyncFn(&str) -> anyhow::Result<TestStore>) -
         audit(&*s).await?;
     }
     report.witnesses.insert("finite histories drain every live listener");
-    assert_eq!(report.witnesses.len(), 27);
+    assert_eq!(report.witnesses.len(), 28);
     let t = factory("concurrent-claims").await?;
     report.cases += 1;
     t.store.admit(&admission("r"), 0).await?;
