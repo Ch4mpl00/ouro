@@ -635,6 +635,9 @@ pub struct StoreDriver {
     /// The model's clock, in ticks.
     now: i64,
     sends: [[usize; CALLS]; RUNS],
+    /// Dispatches their function refused with a saved proof that it did
+    /// nothing: each licenses one more at-most-once dispatch.
+    refusals: [[usize; CALLS]; RUNS],
     /// Fence owners by worker, to name a run's current owner.
     owners: BTreeMap<String, i64>,
 }
@@ -688,6 +691,7 @@ impl StoreDriver {
             workers: Default::default(),
             now: 0,
             sends: [[0; CALLS]; RUNS],
+            refusals: [[0; CALLS]; RUNS],
             owners: BTreeMap::new(),
         })
     }
@@ -862,7 +866,7 @@ impl StoreDriver {
             2 => Some(CommitFault::AfterCommit),
             _ => None,
         };
-        let before = (self.workers.clone(), self.now, self.sends);
+        let before = (self.workers.clone(), self.now, self.sends, self.refusals);
         self.apply(op, c.r, actor, c.i, value, injected)?;
         if c.fault == 3 {
             self.apply(op, c.r, actor, c.i, c.value, None)?;
@@ -870,7 +874,7 @@ impl StoreDriver {
         self.faults.clear();
         if matches!(c.fault, 1 | 8) {
             // Nothing committed: the step's local effects are lost too.
-            (self.workers, self.now, self.sends) = before;
+            (self.workers, self.now, self.sends, self.refusals) = before;
         }
         if matches!(c.fault, 1 | 2 | 8) {
             self.coverage.lock().unwrap().rejected += 1;
@@ -915,6 +919,7 @@ impl StoreDriver {
                 "dispatch",
                 "result",
                 "notExecuted",
+                "rejected",
                 "recover",
                 "checkpoint",
                 "conflict",
@@ -1041,10 +1046,13 @@ impl StoreDriver {
                 if !x.stopped && matches!(x.phase, 1 | 4) && x.execution == r && x.invocation == i {
                     x.phase = 2;
                     self.sends[r][i] += 1;
-                    ensure!(!protected(i) || self.sends[r][i] <= 1, "an at-most-once call was sent twice");
+                    ensure!(
+                        !protected(i) || self.sends[r][i] <= self.refusals[r][i] + 1,
+                        "an at-most-once call was sent again without a refusal of its dispatch"
+                    );
                 }
             }
-            "result" | "notExecuted" => {
+            "result" | "notExecuted" | "rejected" => {
                 let Some(f) = self.fence(w, r) else { return Ok(()) };
                 let x = &self.workers[w];
                 let state = match op {
@@ -1062,11 +1070,19 @@ impl StoreDriver {
                     "notExecuted" if x.phase == 1 && x.invocation == i => {
                         CallState::NotExecuted(error("rejected", "not sent"))
                     }
+                    // The function's answer to its dispatch: it refused
+                    // before doing anything (#25).
+                    "rejected" if x.phase == 2 && x.invocation == i => {
+                        CallState::NotExecuted(error("not_executed", "refused before any effect"))
+                    }
                     _ => return Ok(()),
                 };
                 let record = call_record(i, state);
                 if self.write(fault, self.store.save_record(&f, &format!("call{i}"), &record, ms)).1 {
                     self.workers[w].phase = 0;
+                    if op == "rejected" {
+                        self.refusals[r][i] += 1;
+                    }
                 }
             }
             "recover" => {
@@ -1593,7 +1609,7 @@ pub fn with_quint(name: &str, run: impl FnOnce() -> anyhow::Result<()>) {
     assert!(result.success(), "Quint child test failed");
 }
 /// Every command of the contract model, and initialization.
-const COMMANDS: usize = 34;
+const COMMANDS: usize = 35;
 fn simulation(adapter: Adapter) -> anyhow::Result<()> {
     use quint_connect::runner::{self, RunConfig};
     let seed = std::env::var("QUINT_SEED").unwrap_or_else(|_| "20261023".into());

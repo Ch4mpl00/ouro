@@ -39,8 +39,10 @@ module contract {
     budget: List[int] }
   type Local = { fence: int, execution: int, phase: int, invocation: int, stopped: bool, permit: bool }
   type Observation = { op: str, execution: int, invocation: int, value: int, result: int }
+  // `sends` counts dispatches; `refusals` the dispatches their function
+  // answered with a saved proof that it did nothing (`rejected`, #25).
   type Machine = { db: Durable, workers: List[Local], now: int,
-    sends: List[List[int]], observations: List[Observation],
+    sends: List[List[int]], refusals: List[List[int]], observations: List[Observation],
     violations: Set[str], faultsSeen: Set[int] }
   pure val emptyRun: Run = { admitted: false, input: 0, version: 0, epoch: 0, app: 0, mode: 0,
     outcome: 0, ended: -1, deadline: -1, owner: -1, generation: 0, lease: -1,
@@ -52,18 +54,20 @@ module contract {
       faults: 0, tripped: false, trippedDigest: 0, triggerEpoch: 1, due: 2, slot: 0, running: -1, catchup: 0, rearm:false, once:false,
       armed: true, notices: [], overlap:0, maxRuns:2, queued:-1, queueSlot:-1, queueInput:0, queueRefused:false } }
   pure val initial: Machine = { db: initialDb, workers: [emptyLocal,emptyLocal], now: 0,
-    sends: [[0,0,0],[0,0,0],[0,0,0]], observations: [], violations: Set(), faultsSeen: Set() }
+    sends: [[0,0,0],[0,0,0],[0,0,0]], refusals: [[0,0,0],[0,0,0],[0,0,0]], observations: [], violations: Set(), faultsSeen: Set() }
   var m: Machine
   // The command just executed and its choices, for the model-based tests.
   type Command = { r: int, w: int, i: int, value: int, fault: int }
   var command: { tag: str, value: Command }
   // The shadow has no leases, workers, storage retries or crashes. Its step
   // relation below consumes visible labels, not the concrete post-state.
-  type Ideal = { admitted: Set[int], intents: Set[(int,int)], dispatched: Set[(int,int)],
+  // `exposed`: a dispatch no saved refusal has withdrawn, which may have had
+  // its effect; `dispatched`: ever dispatched.
+  type Ideal = { admitted: Set[int], intents: Set[(int,int)], dispatched: Set[(int,int)], exposed: Set[(int,int)],
     results: (int,int) -> int, checkpoints: Set[(int,int)], terminal: int -> int,
     inputs: int -> int, consumed: Set[(int,int)], takes: (int,int) -> int, accepted: (int,int) -> int,
     spends: (int,int) -> int, legal: bool }
-  pure val emptyIdeal: Ideal = { admitted: Set(), intents: Set(), dispatched: Set(),
+  pure val emptyIdeal: Ideal = { admitted: Set(), intents: Set(), dispatched: Set(), exposed: Set(),
     results: Map(), checkpoints: Set(), terminal: Map(), inputs:Map(), consumed: Set(), takes:Map(), accepted: Map(),
     spends: Map(), legal: true }
   var ideal: Ideal
@@ -160,7 +164,8 @@ module contract {
       Runs.filter(k => s.db.runs.nth(k).outcome == 0 and runs.nth(k).outcome == 5).fold(cancelled,(a,k) => observe(a,"finish",k,0,5,1))
   }
   // Records 0/1/2/3/4 are absent/intent/result/error response/proven not
-  // executed. Values are admitted-input + invocation, not live inputs.
+  // executed (before dispatch, or the function's refusal of its dispatch).
+  // Values are admitted-input + invocation, not live inputs.
   pure def transition(s: Machine, op: str, r: int, w: int, i: int, value: int): Machine =
     settle(act(s,op,r,w,i,value))
   pure def act(s: Machine, op: str, r: int, w: int, i: int, value: int): Machine = {
@@ -174,7 +179,7 @@ module contract {
     })
     val first = pending.fold(-1,(a,b) => if (a == -1 or b < a) b else a)
     if (op == "stop" and value >= 0) { ...s,db:{ ...s.db,stopped:value != 0 } }
-    else if (s.db.stopped and Set("admit","dry","replay","pin","claim","fire","refuse","ingress","renew","intent","dispatch","result","notExecuted","recover","checkpoint","conflict","subscribe","take","child","finish","timeout","spend","policy").contains(op)) s
+    else if (s.db.stopped and Set("admit","dry","replay","pin","claim","fire","refuse","ingress","renew","intent","dispatch","result","notExecuted","rejected","recover","checkpoint","conflict","subscribe","take","child","finish","timeout","spend","policy").contains(op)) s
     else if (Set("admit","dry","replay").contains(op) and value >= 0 and not(execution.admitted) and not(c.tripped))
       observe(admitRun(s,r,value,i,if (op == "dry") 1 else if (op == "replay") 2 else 0),"admit",r,i,value,1)
     else if (op == "pin" and value >= 0 and not(execution.admitted) and not(barred(c,i+1)))
@@ -202,6 +207,13 @@ module contract {
       // Proof, before any dispatch, that the call was not sent: it may be sent later.
       val updated = update(s,r,{ ...execution, records:execution.records.replaceAt(i,4) })
       observe({ ...updated, workers: updated.workers.replaceAt(w,{ ...local, phase:0 }) },op,r,i,execution.input+i,1)
+    } else if (op == "rejected" and authorized and local.phase == 2 and local.invocation == i) {
+      // The function's answer to this dispatch: it refused before doing
+      // anything (#25). Saved like a proof of no dispatch, it withdraws the
+      // dispatch, so a later intent may send the call again.
+      val updated = update(s,r,{ ...execution, records:execution.records.replaceAt(i,4) })
+      observe({ ...updated, workers: updated.workers.replaceAt(w,{ ...local, phase:0 }),
+        refusals:s.refusals.replaceAt(r,s.refusals.nth(r).replaceAt(i,s.refusals.nth(r).nth(i)+1)) },op,r,i,execution.input+i,1)
     } else if (op == "recover" and authorized) {
       val decision = recovery(execution.records.nth(i),execution.retained)
       // An unknown at-least-once call may be sent again, under the same key.
@@ -342,7 +354,7 @@ module contract {
     val execution = a.db.runs.nth(r)
     val c = b.db.catalog
     val d = a.db.catalog
-    val workerMutation = Set("renew","intent","result","notExecuted","checkpoint","subscribe","take","child","finish",
+    val workerMutation = Set("renew","intent","result","notExecuted","rejected","checkpoint","subscribe","take","child","finish",
       "timeout","conflict","release","spend").contains(op)
     val callsStable = Runs.forall(k => Calls.forall(j => {
       val x = b.db.runs.nth(k)
@@ -377,7 +389,11 @@ module contract {
     val error3 = flag(error2,"A5",not(workerMutation) or b.db == a.db or authority(b,r,w))
     val error4 = flag(error3,"E1",op != "dispatch" or a.observations == b.observations or
       a.observations.nth(a.observations.length()-1).value == old.input+i)
-    val error5 = flag(error4,"E2",Runs.forall(k => Calls.forall(j => not(protected(j)) or a.sends.nth(k).nth(j) <= 1)) and
+    // E2 (#25): every dispatch of an at-most-once call beyond its first is
+    // licensed by a saved refusal of an earlier one; a refusal answers a dispatch.
+    val error5 = flag(error4,"E2",Runs.forall(k => Calls.forall(j =>
+      (not(protected(j)) or a.sends.nth(k).nth(j) <= a.refusals.nth(k).nth(j) + 1) and
+      a.refusals.nth(k).nth(j) <= a.sends.nth(k).nth(j))) and
       (op != "dispatch" or a.sends == b.sends or old.records.nth(i) == 1))
     val error6 = flag(error5,"E3",op != "recover" or a.observations == b.observations or
       old.records.nth(i) != 1 or a.observations.nth(a.observations.length()-1).result == 3)
@@ -543,12 +559,14 @@ module contract {
     else if (e.op == "intent")
       { ...s,intents:s.intents.union(Set(key)),legal:s.legal and s.admitted.contains(e.execution) and not(s.intents.contains(key)) }
     else if (e.op == "dispatch")
-      { ...s,dispatched:s.dispatched.union(Set(key)),legal:s.legal and s.intents.contains(key) and
-        (not(s.dispatched.contains(key)) or not(protected(e.invocation))) and s.inputs.get(e.execution)+e.invocation == e.value }
+      { ...s,dispatched:s.dispatched.union(Set(key)),exposed:s.exposed.union(Set(key)),legal:s.legal and s.intents.contains(key) and
+        (not(s.exposed.contains(key)) or not(protected(e.invocation))) and s.inputs.get(e.execution)+e.invocation == e.value }
     else if (e.op == "notExecuted")
-      { ...s,intents:s.intents.exclude(Set(key)),legal:s.legal and s.intents.contains(key) and not(s.dispatched.contains(key)) and not(s.results.keys().contains(key)) }
+      { ...s,intents:s.intents.exclude(Set(key)),legal:s.legal and s.intents.contains(key) and not(s.exposed.contains(key)) and not(s.results.keys().contains(key)) }
+    else if (e.op == "rejected")
+      { ...s,intents:s.intents.exclude(Set(key)),exposed:s.exposed.exclude(Set(key)),legal:s.legal and s.intents.contains(key) and s.exposed.contains(key) and not(s.results.keys().contains(key)) }
     else if (e.op == "result")
-      { ...s,results:s.results.put(key,e.value),legal:s.legal and s.dispatched.contains(key) and not(s.results.keys().contains(key)) }
+      { ...s,results:s.results.put(key,e.value),legal:s.legal and s.exposed.contains(key) and not(s.results.keys().contains(key)) }
     else if (e.op == "checkpoint")
       { ...s,checkpoints:s.checkpoints.union(Set(key)),legal:s.legal and s.results.keys().contains(key) and s.results.get(key) == e.value }
     else if (e.op == "recover")
@@ -594,7 +612,7 @@ module contract {
     val atomic = (commits or persisted.db == before.db) and persisted.observations.slice(before.observations.length(),persisted.observations.length()).elems().forall(e =>
       if (e.op == "intent") persisted.db.runs.nth(e.execution).records.nth(e.invocation) >= 1
       else if (e.op == "result") Set(2,3).contains(persisted.db.runs.nth(e.execution).records.nth(e.invocation))
-      else if (e.op == "notExecuted") persisted.db.runs.nth(e.execution).records.nth(e.invocation) == 4
+      else if (e.op == "notExecuted" or e.op == "rejected") persisted.db.runs.nth(e.execution).records.nth(e.invocation) == 4
       else if (e.op == "checkpoint") persisted.db.runs.nth(e.execution).frontier.contains(e.invocation)
       else if (e.op == "spend") persisted.db.runs.nth(e.execution).spends.nth(e.invocation) == e.result
       else if (e.op == "admit") persisted.db.runs.nth(e.execution).admitted else true)
@@ -607,7 +625,7 @@ module contract {
     }
   }
   action step = {
-    nondet op = Set("admit","dry","replay","claim","renew","release","intent","dispatch","result","notExecuted","recover",
+    nondet op = Set("admit","dry","replay","claim","renew","release","intent","dispatch","result","notExecuted","rejected","recover",
       "checkpoint","conflict","subscribe","address","publish","take","expire","child","finish","timeout","cancel",
       "activate","fire","refuse","ingress","sweep","crash","tick","spend","policy","stop","pin").oneOf()
     nondet r = Runs.oneOf()
@@ -668,6 +686,7 @@ module contract {
         (not(Set(2,3).contains(x.records.nth(i))) or ideal.results.get(k) == x.values.nth(i)) and
         (x.frontier.contains(i) == ideal.checkpoints.contains(k)) and
         (m.sends.nth(r).nth(i) > 0 == ideal.dispatched.contains(k)) and
+        (not(protected(i)) or (m.sends.nth(r).nth(i) > m.refusals.nth(r).nth(i)) == ideal.exposed.contains(k)) and
         (x.spends.nth(i) != 0 == ideal.spends.keys().contains(k)) and
         (x.spends.nth(i) == 0 or ideal.spends.get(k) == x.spends.nth(i))
       })
