@@ -82,6 +82,19 @@ module contract_witnesses {
     .then(call)
   run notExecutedTest = notExecuted
     .expect(checked and m.sends.nth(0).nth(0) == 1 and m.db.runs.nth(0).records.nth(0) == 2)
+  // A function that refused its dispatch before doing anything (#25): the
+  // saved refusal withdraws the dispatch, so the at-most-once call may be
+  // sent once more; recovery reports it as proven not executed.
+  action refusal = init.then(boot).then(do("intent")).then(do("dispatch")).then(do("rejected")).then(do("recover"))
+    .then(call)
+  run refusalTest = refusal.expect(checked and m.sends.nth(0).nth(0) == 2 and m.refusals.nth(0).nth(0) == 1 and
+    m.db.runs.nth(0).records.nth(0) == 2 and m.observations.select(o => o.op == "recover").nth(0).result == 6)
+  // A refusal whose commit is lost is no proof: the dispatch stays an
+  // unknown outcome and the call is never sent again.
+  action lostRefusal = init.then(boot).then(do("intent")).then(do("dispatch")).then(execute("rejected",0,0,0,0,1))
+    .then(ticks(4)).then(do("claim")).then(do("recover"))
+  run lostRefusalTest = lostRefusal.expect(checked and m.refusals.nth(0).nth(0) == 0 and m.sends.nth(0).nth(0) == 1 and
+    m.db.runs.nth(0).records.nth(0) == 1 and m.observations.nth(m.observations.length()-1).result == 3 and m.workers.nth(0).phase == 0)
   action errorResponse = init.then(boot).then(at("intent",1)).then(at("dispatch",1))
     .then(execute("result",0,0,1,1,0)).then(at("recover",1))
   run errorResponseTest = errorResponse
@@ -285,7 +298,7 @@ module contract_witnesses {
   run bridgeSuite = continuation.then(unknown).then(mailbox).then(expiry).then(child).then(childFinish).then(grandchild).then(activation)
     .then(deadline).then(compatibility).then(dry).then(replay).then(schedule).then(breaker).then(rearm)
     .then(noCatchup).then(overlap).then(ingress).then(ingressExpiry).then(redispatch).then(protectedUnknown)
-    .then(notExecuted).then(errorResponse).then(conflict).then(release).then(staleFence).then(admission)
+    .then(notExecuted).then(refusal).then(lostRefusal).then(errorResponse).then(conflict).then(release).then(staleFence).then(admission)
     .then(successResetsBreaker).then(noRollback).then(reactivation).then(broadcast).then(retention).then(budget).then(skipPolicy).then(allowPolicy).then(queuePolicy).then(replacePolicy).then(ceilingPolicy).then(skipCrash).then(allowCrash).then(queueCrash).then(replaceCrash).then(refused).then(oldCompletionPromotes).then(queuedRefusal).then(queuedTargeted)
     .then(bridgeTail)
 }

@@ -30,8 +30,14 @@ MUTANTS = {
  "A5": ('op == "renew" and authorized', 'op == "renew"', BOOT+TICKS+[op("renew")]),
  "E1": ('observe(updated,op,r,i,execution.input+i,1)', 'observe(updated,op,r,i,execution.input+i+execution.generation,1)', BOOT+CALL[:2]),
  "E2": ('{ ...local, phase:2 }', '{ ...local, phase:1 }', BOOT+CALL[:2]+[op("dispatch")]),
+ # An at-most-once call whose outcome is unknown is dispatched again (#25).
+ "E2/unknown": ('val resend = decision == 3 and not(protected(i))', 'val resend = decision == 3', BOOT+CALL[:2]+[op("crash")]+TICKS+[op("claim"),op("recover"),op("dispatch")]),
+ # A refusal saved without a dispatch to answer licenses a second dispatch.
+ "E2/refused": ('op == "rejected" and answers and local.phase == 2', 'op == "rejected" and answers and local.phase >= 1', BOOT+[op("intent"),op("rejected")]),
  "E3": ('else if (record == 1) 3 else 0', 'else if (record == 1) 2 else 0', BOOT+[op("intent"),op("recover")]),
  "E4": ('observe(recovered,op,r,i,execution.values.nth(i),decision)', 'observe(update(recovered,r,{ ...execution,values:execution.values.replaceAt(i,99) }),op,r,i,execution.values.nth(i),decision)', BOOT+CALL+[op("recover")]),
+ # A refusal overwrites the call's saved answer.
+ "E4/refused": ('op == "rejected" and answers and local.phase == 2 and local.invocation == i', 'op == "rejected" and answers', BOOT+CALL+[op("rejected")]),
  "R1": ('continuation:frontier.fold(0,(a,k) => a + execution.values.nth(k))', 'continuation:0', [op("admit",value=1),op("claim")]+CALL+[op("checkpoint")]),
  "R2": ('val decision = recovery(execution.records.nth(i),execution.retained)', 'val decision = if (execution.records.nth(i) == 0 and w == 0) 4 else recovery(execution.records.nth(i),execution.retained)', BOOT+[op("recover")]),
  "R3": ('op == "checkpoint" and authorized and execution.records.nth(i) == 2', 'op == "checkpoint" and authorized', BOOT+[op("checkpoint")]),

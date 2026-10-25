@@ -26,10 +26,26 @@ use tokio_util::sync::CancellationToken;
 
 // ── 1. functions and the registry ──────────────────────────────────────────
 
+/// A handler's error. Its type says how far the call got
+/// (`ows::durable::CallFailure::answer`): `FunctionError::not_executed`
+/// (refused before doing anything: saved, caught like any error, safe to
+/// send again in a new attempt), `unknown_outcome` (it may have had its
+/// effect: an at-most-once call is never sent again and only a `catch`
+/// naming `CALL_UNKNOWN` handles it) and `interrupted` (stopped, no answer:
+/// the run stays recoverable). Any other error is a definite failure.
 pub type FunctionError = WorkflowError;
 
 #[derive(Clone)]
 pub struct FunctionContext {
+    /// Fires when the run is cancelled (in this process at once, from
+    /// another one at its next lease renewal), when the worker stops, and
+    /// when a renewal finds the lease lost or an emergency stop set. The
+    /// runtime then drops the handler's future
+    /// without waiting for it, so a handler that starts work outside its
+    /// future (a remote job, a spawned task) watches the token to stop it.
+    /// Nothing the handler answers afterwards is recorded: the call keeps its
+    /// intent, unknown if at most once (never sent again), pending otherwise
+    /// (sent again on recovery unless the run was cancelled).
     pub cancel: CancellationToken,
     pub run_id: String,
     pub task_path: String,

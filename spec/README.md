@@ -36,9 +36,9 @@ are the bridges in `crates/durable/tests/quint.rs` and `quint/concurrent.rs`.
 | A4 | `A4`: representative result schema | Existing schema and corruption tests; arbitrary format evolution is not modeled |
 | A5 | `A5`: authority at the mutation, ε before the lease ends | Serial MBT (fenced loads audited after every step); concurrent expired claims |
 | E1 | `E1`: invocation binding survives generation changes | Serial MBT `conflict` (identity, function, arguments, delivery); generated effect-ledger keys |
-| E2 | `E2`: at most one dispatch per **at-most-once** invocation, after its intent | Serial MBT ghost counter; generated independent effect ledger |
-| E3 | `E3`: orphan intent yields unknown | Unknown witnesses; generated uncertain-prefix check |
-| E4 | `E4`: immutable committed results and error responses | Serial MBT; generated recovery/replay properties |
+| E2 | `E2`: at most one dispatch per **at-most-once** invocation, after its intent, besides those its function refused (a saved refusal licenses one more and answers one dispatch, #25) | Serial MBT ghost counter; generated independent effect ledger; `refusalTest`, `lostRefusalTest`; mutants `E2/unknown` (an unknown outcome sent again), `E2/refused`; call-outcome conformance on every adapter |
+| E3 | `E3`: orphan intent yields unknown | Unknown witnesses, `lostRefusalTest`; generated uncertain-prefix check; a function's unknown answer and a crash between dispatch and record leave the same evidence (call-outcome conformance, interpreter crash sweeps) |
+| E4 | `E4`: immutable committed results and error responses | Serial MBT; generated recovery/replay properties; mutant `E4/refused` (a refusal overwrites a result) |
 | E5 | `contract_progress::E5`, `E5_delivery`: atomic recipient receipt/effect | Conditional fake-recipient model only; no claim of a new runtime mode |
 | R1 | `R1`: sum of committed invocation values | Serial MBT (the host computes it from durable records); generated continuation tests |
 | R2 | `R2`: deterministic invocation decision | `r2_generated_recoveries_from_one_journal_make_identical_decisions` |
@@ -100,7 +100,13 @@ deadline fixed at admission and epoch.
   response/proven not executed (0–4). Recovery reports unknown for an orphan
   intent; an at-least-once one may then be sent again under the same identity
   (worker phase 4), an at-most-once one never (`redispatchTest`,
-  `protectedUnknownTest`).
+  `protectedUnknownTest`). `rejected` is the function's answer to its dispatch
+  that it refused before doing anything (#25): it saves 4 and withdraws the
+  dispatch (the ghost `refusals`), so a later intent may send even the
+  at-most-once call once more; a refusal whose commit is lost leaves an
+  unknown outcome (`refusalTest`, `lostRefusalTest`). A function's unknown
+  answer or stop needs no command: it is the intent without an answer that a
+  crash after `dispatch` leaves.
 - **Events** (decisions 1, 2). `address` puts a copy in one run's mailbox for
   five ticks; `publish` reaches the live subscribers and never expires. A
   recipient keeps one copy per identity; another payload under it is refused
@@ -276,8 +282,8 @@ What the quotients are connected to, and what not:
 ### Serial
 
 `crates/durable/tests/quint.rs` replays Quint's random traces of `contract.qnt`
-(100 traces × 150 steps per adapter by default, all 37 commands and every fault
-switch) and the `bridgeSuite` run of `contract_witnesses.qnt` (all 62 witness
+(100 traces × 150 steps per adapter by default, all 38 commands and every fault
+switch) and the `bridgeSuite` run of `contract_witnesses.qnt` (all 65 witness
 histories in one trace). After every step it compares a projection of the store
 with the model's state. The model records each command in its `command`
 variable; the driver never sees the model's state.
@@ -296,7 +302,7 @@ ticks), with `Policy { mailbox_ms: 37_500, ingress_ms: 37_500, skew_ms: 7_500 }`
 | `admit`, `dry`, `replay` | `admit`, mode and application version in the admission's runtime bindings; none while tripped |
 | `claim` | `claim_as` with the worker's `Compatibility` |
 | `renew`, `release` | fenced `renew`, `release` |
-| `intent`, `result`, `notExecuted`, `checkpoint` | `save_record` of the call (`Pending`, `Done`, `NotExecuted`) or task |
+| `intent`, `result`, `notExecuted`, `rejected`, `checkpoint` | `save_record` of the call (`Pending`, `Done`, `NotExecuted` before and after dispatch) or task |
 | `recover` | `load_records`; an unknown at-least-once call may be sent again |
 | `conflict` | four changed bindings refused by `save_record`, then `finish` faulted |
 | `dispatch`, `crash`, `tick` | host only (ghost counter, a reopened SQLite handle, the clock) |

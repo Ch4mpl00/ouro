@@ -7,7 +7,9 @@
 // definition property): do, call, emit, for, fork, listen (one/any/all,
 // until, filters, correlation, read, foreach), raise, run (workflow natively;
 // container/script/shell through a host process runner), set, switch,
-// try/catch with retry (limit.attempt.duration included), wait;
+// try/catch with retry (limit.attempt.duration included; an unknown
+// at-most-once outcome is caught only by a filter naming its type, `run`
+// section 7), wait;
 // input/output/export transforms and schemas (inline or a host-resolved
 // `resource`); if/then/timeout; schedule (every, cron, after, on; extensions
 // in `document.metadata`: `at`, a one-shot instant; `timezone`, the IANA zone

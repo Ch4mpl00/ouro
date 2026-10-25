@@ -271,6 +271,8 @@ impl Telemetry {
                     CallOutcome::Interrupted => "Interrupted",
                 };
                 let failure = error.as_ref().map(|e| format!("{variant}({e:?})"));
+                // How far the call got, as the `ouro.calls` metric labels it.
+                call.span.context.span().set_attribute(KeyValue::new("ouro.call.outcome", outcome.label()));
                 call.span.finish(if failure.is_none() { "completed" } else { "faulted" }, failure);
                 span_ref(&call.span.context)
             }
