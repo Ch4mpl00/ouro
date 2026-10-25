@@ -504,6 +504,24 @@ wait closes; changing its payload or wait is a conflict. Matching contexts
 are redacted before persistence; a response requiring secret values is
 refused rather than guessed without the host's secret resolver.
 
+Breaking changes (issue #22), for hosts and adapters written before it:
+
+- `Control` methods and `Runtime::control` return `ControlError` instead
+  of `anyhow::Error`; the engine raises typed refusals where it raised
+  messages.
+- `RunStore::activate` takes `now_ms`, and `activate_with` an
+  `Activation`; `Definitions` gains `activations`, `VersionSummary` gains
+  `activated_epoch`, `activated_by` and `activation_note`. The definitions
+  row layout is 4: rows of layout 3 are refused.
+- `SavedRun` gains `annotations`, and `Inspection::annotations` reads them
+  from the run row. The durable state version is 10: run rows written
+  under 9 are refused.
+- `RunStore` gains `totals` (a store that keeps none fails it) and
+  `AtomicBackend` gains `is_read_only` (default `false`); the conformance
+  `TestStore` gains `read_only`, the factory's read-only open.
+- The writable SQLite and Postgres opens refuse a newer schema with
+  `SchemaError::Unsupported` instead of a message.
+
 ## The DSL
 
 The core implements the DSL's semantics; what it does not implement are
