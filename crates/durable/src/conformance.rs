@@ -2854,10 +2854,23 @@ async fn controls(
             .unwrap_err()
             .is::<DefinitionTripped>()
     );
+    // A manual pause refuses every version, pinned or not: other content is
+    // refused too (an automatic trip would admit it), until `resume`.
+    let other = s.save_definition("workflow", "other content").await?;
+    let mut elsewhere = admission("elsewhere");
+    elsewhere.version = other.version;
+    elsewhere.definition = other.yaml.clone();
+    elsewhere.runtime = json!({ PINNED: true });
+    let refused = remote.start(&elsewhere, 1).await.unwrap_err();
+    assert!(refused.downcast_ref::<DefinitionTripped>().is_some_and(|t| t.paused), "{refused}");
+    assert!(remote.admit(&elsewhere, 1).await.unwrap_err().is::<DefinitionTripped>());
+    assert!(remote.get("elsewhere").await?.is_none());
     assert_eq!(
         s.control(&control_request("resume"), &Command::Resume { definition: "workflow".into() }, 2).await?,
         Reply::Changed(true)
     );
+    assert!(s.start(&elsewhere, 2).await?.is_some(), "other content is admitted again after the resume");
+    assert!(s.cancel("elsewhere", 2).await?);
     assert_eq!(s.definitions("workflow").await?.epoch, 1);
     assert_eq!(s.trigger("schedule").await?, Some(trigger.clone()));
     // A late retry must not undo the intervening resume.
@@ -3027,12 +3040,12 @@ async fn controls(
             break;
         }
     }
-    assert_eq!(ids, BTreeSet::from(["p".into(), "c".into(), "g".into()]));
+    assert_eq!(ids, BTreeSet::from(["p".into(), "c".into(), "g".into(), "elsewhere".into()]));
     assert_eq!(
         s.query_runs(&Runs { parent: Some("p".into()), ..filter.clone() }, false, None, 10).await?.items.len(),
         1
     );
-    assert_eq!(s.query_runs(&filter, true, None, 10).await?.items.len(), 3);
+    assert_eq!(s.query_runs(&filter, true, None, 10).await?.items.len(), 4);
     let page = s.query_runs(&filter, false, None, 1).await?;
     let invalid = |r| matches!(refusal(r), ControlError::InvalidInput(_));
     assert!(invalid(s.query_runs(&Runs::default(), false, page.next.as_ref(), 1).await.map(|_| ())));

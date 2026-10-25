@@ -393,7 +393,8 @@ fn claim_run(snapshot: &mut StoredRun, now: i64, owner: &str) -> anyhow::Result<
 /// definition refuses, by any path, a new run whose definition has the
 /// tripped content digest, whatever its version number, in the same commit
 /// that reads the trip; other content is admitted (a pinned start) and never
-/// counts toward the breaker. An existing run is still joined.
+/// counts toward the breaker. A manual pause refuses every admission of the
+/// definition, whatever its content. An existing run is still joined.
 async fn insert(rows: &mut dyn Transaction, admission: &Admission, now: i64) -> anyhow::Result<bool> {
     let Some(snapshot) = admitted(rows, admission, now).await? else { return Ok(false) };
     store_run(rows, &snapshot).await?;
@@ -413,8 +414,7 @@ async fn admitted(rows: &mut dyn Transaction, admission: &Admission, now: i64) -
     let digest =
         defs.as_ref().and_then(|d| d.versions.get(&admission.version)).map_or_else(String::new, |d| d.digest.clone());
     if let Some(trip) = defs.as_ref().and_then(|d| d.tripped.as_ref())
-        && !digest.is_empty()
-        && digest == trip.digest
+        && (trip.manual.is_some() || (!digest.is_empty() && digest == trip.digest))
     {
         return Err(trip.refusal(&admission.name).into());
     }
