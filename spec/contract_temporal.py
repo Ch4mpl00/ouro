@@ -54,6 +54,30 @@ MODULES = {
         },
         fairness={"wfClaim": ["L6"], "wfInternal": ["L6"], "wfNotice": ["L9"]},
     ),
+    "contract_progress_trigger": dict(
+        invariants=["L8_dormant", "L10_stable", "shape"],
+        temporal=["L7", "L8", "L10"],
+        mutants={
+            # A buffered slot that nothing promotes.
+            "L7": ("else if (x.queued and x.sched == 0 and live(x) < maxRuns) promote(x) else x", "else x", "L7"),
+            # Only the end of the trigger's own run promotes, not room another run makes.
+            "L7/capacity": ("    drain(ended)\n", "    ended\n", "L7"),
+            # Clearing the stop or polling drops the deferred drain.
+            "L7/stop": ("pure def deferred(x: Trigger): Trigger = drain(x)", "pure def deferred(x: Trigger): Trigger = x", "L7"),
+            # A one-shot's slot does not consume it.
+            "L8": ("val consumed = x.kind == 2", "val consumed = false", "L8"),
+            # A one-shot's run carries a re-arm, so its end wakes the dormant trigger.
+            "L8/dormant": ("val rearm = x.kind == 1 and", "val rearm = x.kind != 0 and", "L8_dormant"),
+            # An activation that leaves the trip in place.
+            "L10": ("{ ...x, active: v, gen: 1 - x.gen, tripped: false,", "{ ...x, active: v, gen: 1 - x.gen, tripped: x.tripped,", "L10"),
+            # The trip refuses by version number, not by content digest.
+            "L10/digest": ("x.tripped and content(v) == content(x.active)", "x.tripped and v == x.active", "L10_stable"),
+        },
+        fairness={
+            "wfEndSched": ["L7"], "wfEndOther": ["L7", "L10"], "wfCalm": ["L7"], "wfClear": ["L7", "L8", "L10"],
+            "wfPoll": ["L7"], "sfFire": ["L8"], "wfTick": ["L8"], "wfReactivate": ["L10"], "sfAdmit": ["L10"],
+        },
+    ),
 }
 
 
