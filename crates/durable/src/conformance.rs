@@ -350,9 +350,9 @@ pub async fn run_all(factory: impl AsyncFn(&str) -> anyhow::Result<TestStore>) -
     report.cases += 1;
     let s = &t.store;
     let first = s.save_definition("workflow", "first").await?;
-    s.activate("workflow", first.version).await?;
+    s.activate("workflow", first.version, 0).await?;
     let second = s.save_definition("workflow", "second").await?;
-    s.activate("workflow", second.version).await?;
+    s.activate("workflow", second.version, 0).await?;
     let pinned = s.get("absent").await?;
     assert!(pinned.is_none());
     for n in 0..3 {
@@ -368,7 +368,7 @@ pub async fn run_all(factory: impl AsyncFn(&str) -> anyhow::Result<TestStore>) -
     assert_eq!((trip.version, trip.epoch, trip.faults, trip.threshold), (second.version, 2, 3, 3));
     assert_eq!(trip.run, "fault2");
     assert_eq!(s.get("fault0").await?.unwrap().admission.version, second.version);
-    assert!(s.activate("workflow", 99).await.is_err());
+    assert!(s.activate("workflow", 99, 0).await.is_err());
     report.operations += 13;
     report.witnesses.insert("breaker trips without changing the active version or pinned runs");
     decisions(&factory, &mut report).await?;
@@ -440,7 +440,7 @@ pub async fn run_all(factory: impl AsyncFn(&str) -> anyhow::Result<TestStore>) -
                     )]),
                 };
                 let epoch = s.definitions("workflow").await?.epoch;
-                s.activate_with("workflow", d.version, epoch, &arming).await?;
+                s.activate_with("workflow", d.version, epoch, &arming, &Activation::at(0)).await?;
                 tripping = s.start(&admission("tripping"), 0).await?;
                 if operation == "acknowledge" {
                     s.finish(tripping.as_ref().unwrap(), &Status::Faulted(WorkflowError::runtime("fault")), 0, 1)
@@ -449,7 +449,7 @@ pub async fn run_all(factory: impl AsyncFn(&str) -> anyhow::Result<TestStore>) -
                 }
             }
             if matches!(operation, "finish" | "cancel") {
-                s.activate("workflow", d.version).await?;
+                s.activate("workflow", d.version, 0).await?;
                 let child = s
                     .start_child(
                         &f,
@@ -491,7 +491,7 @@ pub async fn run_all(factory: impl AsyncFn(&str) -> anyhow::Result<TestStore>) -
                 "release" => s.release(&f, 0).await,
                 "renew" => s.renew(&f, 1).await,
                 "definition" => s.save_definition("workflow", "next").await.map(|_| ()),
-                "activate" => s.activate("workflow", d.version).await,
+                "activate" => s.activate("workflow", d.version, 0).await,
                 "subscribe" => s.subscribe(&f, "other", &["*".into()], 0).await,
                 "publish" => s.publish(&json!({"type":"answer","source":"/t","id":"1"}), None, 0).await.map(|_| ()),
                 "trigger" => s
@@ -531,6 +531,7 @@ pub async fn run_all(factory: impl AsyncFn(&str) -> anyhow::Result<TestStore>) -
                                 Trigger { at_ms: Some(5), types: vec!["t".into()], state: json!(1) },
                             )]),
                         },
+                        &Activation::at(0),
                     )
                     .await
                     .map(|_| ()),
@@ -782,7 +783,8 @@ async fn definition_queries(
             ("custom-on".into(), slot("on", None)),
         ]),
     };
-    s.activate_with("workflow", 2, 0, &arming).await?.unwrap();
+    let release = Activation { at_ms: 5, actor: Some("operator".into()), note: Some("release 2".into()) };
+    s.activate_with("workflow", 2, 0, &arming, &release).await?.unwrap();
     let mut first = admission("first");
     first.version = 2;
     let mut buffered = first.clone();
@@ -814,10 +816,21 @@ async fn definition_queries(
     let before = t.backend.snapshot().await?;
     let summary = fresh.definition_control("workflow").await?.unwrap();
     assert_eq!(summary.name, "workflow");
-    assert_eq!(
-        summary.versions,
-        vec![VersionSummary { version: 1, activated_ms: None }, VersionSummary { version: 2, activated_ms: None },]
-    );
+    let never = VersionSummary {
+        version: 1,
+        activated_ms: None,
+        activated_epoch: None,
+        activated_by: None,
+        activation_note: None,
+    };
+    let released = VersionSummary {
+        version: 2,
+        activated_ms: Some(5),
+        activated_epoch: Some(1),
+        activated_by: Some("operator".into()),
+        activation_note: Some("release 2".into()),
+    };
+    assert_eq!(summary.versions, vec![never.clone(), released]);
     assert_eq!((summary.active, summary.epoch, summary.consecutive_faults), (Some(2), 1, 1));
     assert!(summary.tripped.is_none());
     assert_eq!(
@@ -922,9 +935,12 @@ async fn definition_queries(
         refusal(s.control(&control_request("resume-trip"), &resume, 5).await),
         control::ControlError::InvalidState(_)
     ));
-    s.activate_with("workflow", 2, 1, &arming).await?.unwrap();
+    s.activate_with("workflow", 2, 1, &arming, &Activation::at(6)).await?.unwrap();
     let reactivated = fresh.definition_control("workflow").await?.unwrap();
     assert_eq!((reactivated.epoch, reactivated.consecutive_faults), (2, 0));
+    // A reactivation is the version's latest activation, unattributed here.
+    let again = VersionSummary { activated_ms: Some(6), activated_epoch: Some(2), ..never.clone() };
+    assert_eq!(reactivated.versions, vec![never.clone(), VersionSummary { version: 2, ..again }]);
     assert!(reactivated.tripped.is_none());
     assert_eq!(reactivated.schedules[0].next_due_ms, Some(10));
     // A page racing activation must observe the old catalog and its triggers,
@@ -933,12 +949,16 @@ async fn definition_queries(
     s.save_definition("workflow", no_schedule).await?;
     let old = fresh.definition_control("workflow").await?.unwrap();
     let unarmed = Arming::default();
+    let at_zero = Activation::at(0);
     let (page, activated) =
-        tokio::join!(fresh.query_definitions(None, 10), s.activate_with("workflow", 3, 2, &unarmed),);
+        tokio::join!(fresh.query_definitions(None, 10), s.activate_with("workflow", 3, 2, &unarmed, &at_zero));
     activated?.unwrap();
     let new = fresh.definition_control("workflow").await?.unwrap();
     assert_eq!((new.active, new.epoch), (Some(3), 3));
     assert!(new.schedules.is_empty());
+    // Activating another version keeps the earlier one's latest activation.
+    assert_eq!(new.versions[1].activated_epoch, Some(2));
+    assert_eq!((new.versions[2].activated_epoch, new.versions[2].activated_ms), (Some(3), Some(0)));
     let observed = &page?.items[1];
     assert!(*observed == old || *observed == new);
     // Persisted layout validation is shared by point and paged catalog reads.
@@ -1031,7 +1051,7 @@ async fn read_only(
     let d = s.save_definition("workflow", control_definition_yaml()).await?;
     let slot = Trigger { at_ms: Some(4), types: vec!["start".into()], state: json!({ "kind": "every" }) };
     let arming = Arming { triggers: BTreeMap::from([("w#every".into(), slot.clone())]) };
-    s.activate_with("workflow", d.version, 0, &arming).await?;
+    s.activate_with("workflow", d.version, 0, &arming, &Activation::at(0)).await?;
     let parent = s.start(&admission("p"), 0).await?.unwrap();
     let call = Record::Call {
         logical: "call".into(),
@@ -1138,8 +1158,8 @@ async fn read_only(
     assert!(refused_read_only(r.cancel("missing", 5).await));
     assert!(refused_read_only(r.sweep(i64::MAX, 0).await));
     assert!(refused_read_only(r.save_definition("workflow", "yaml").await));
-    assert!(refused_read_only(r.activate("workflow", d.version).await));
-    assert!(refused_read_only(r.activate_with("workflow", d.version, 1, &arming).await));
+    assert!(refused_read_only(r.activate("workflow", d.version, 0).await));
+    assert!(refused_read_only(r.activate_with("workflow", d.version, 1, &arming, &Activation::at(0)).await));
     assert!(refused_read_only(r.acknowledge("notice").await));
     // The backend refuses a write in its own transaction before sending it.
     let mut tx = backend.begin().await?;
@@ -1485,10 +1505,13 @@ async fn decisions(
     let arming = |triggers: &[(&str, i64)]| Arming {
         triggers: triggers.iter().map(|(k, n)| ((*k).into(), trigger(*n))).collect(),
     };
-    let d = s.activate_with("w", one.version, 0, &arming(&[("w#every", 10)])).await?.unwrap();
+    let d = s.activate_with("w", one.version, 0, &arming(&[("w#every", 10)]), &Activation::at(0)).await?.unwrap();
     assert_eq!((d.epoch, d.triggers.clone()), (1, vec!["w#every".to_string()]));
-    assert!(s.activate_with("w", two.version, 0, &arming(&[])).await?.is_none(), "a stale epoch is refused");
-    let d = s.activate_with("w", two.version, 1, &arming(&[("w#after", 20)])).await?.unwrap();
+    assert!(
+        s.activate_with("w", two.version, 0, &arming(&[]), &Activation::at(0)).await?.is_none(),
+        "a stale epoch is refused"
+    );
+    let d = s.activate_with("w", two.version, 1, &arming(&[("w#after", 20)]), &Activation::at(0)).await?.unwrap();
     assert_eq!(d.epoch, 2);
     assert!(s.trigger("w#every").await?.is_none() && s.trigger("w#after").await?.is_some(), "replaced in one commit");
     let run_of = |id: &str, version: u64| {
@@ -1564,7 +1587,7 @@ async fn decisions(
     assert_eq!(s.notices(10).await?.len(), 1, "one trip, one notice");
     // Only an activation clears it, in a new epoch, with the version the
     // host chooses (here the earlier one). The notice stays until handed on.
-    let d = s.activate_with("w", one.version, 2, &arming(&[("w#every", 40)])).await?.unwrap();
+    let d = s.activate_with("w", one.version, 2, &arming(&[("w#every", 40)]), &Activation::at(0)).await?.unwrap();
     assert!(d.tripped.is_none() && d.epoch == 3 && d.consecutive_faults == 0, "a new activation clears it");
     assert_eq!(s.trigger("w#every").await?, Some(trigger(40)));
     assert_eq!(s.notices(10).await?, notices);
@@ -1626,7 +1649,7 @@ async fn decisions(
     let v = s.save_definition("w", "yaml").await?;
     let slot = |at: i64| Trigger { at_ms: Some(at), types: vec![], state: json!({ "at": at }) };
     let arming = Arming { triggers: BTreeMap::from([("w#every".into(), slot(10))]) };
-    s.activate_with("w", v.version, 0, &arming).await?.unwrap();
+    s.activate_with("w", v.version, 0, &arming, &Activation::at(0)).await?.unwrap();
     let run_of = |id: &str| Admission { name: "w".into(), version: v.version, ..admission(id) };
     let invalid = WorkflowError::validation("invalid");
     let refused = |id: &str| Refused { admission: run_of(id), error: invalid.clone(), breaker_threshold: 2 };
@@ -1908,9 +1931,10 @@ impl RunStore for Offloaded {
         version: u64,
         epoch: u64,
         arming: &Arming,
+        activation: &Activation,
     ) -> anyhow::Result<Option<Definitions>> {
-        let (name, arming) = (name.to_owned(), arming.clone());
-        offloaded!(self, |s| s.activate_with(&name, version, epoch, &arming))
+        let (name, arming, activation) = (name.to_owned(), arming.clone(), activation.clone());
+        offloaded!(self, |s| s.activate_with(&name, version, epoch, &arming, &activation))
     }
     async fn definitions(&self, name: &str) -> anyhow::Result<Definitions> {
         let name = name.to_owned();
@@ -2335,7 +2359,7 @@ async fn overlap_policies(
         let s = &t.store;
         let d = s.save_definition("workflow", "original").await?;
         let armed = Arming { triggers: BTreeMap::from([("policy".into(), slot(1))]) };
-        s.activate_with("workflow", d.version, 0, &armed).await?;
+        s.activate_with("workflow", d.version, 0, &armed, &Activation::at(0)).await?;
         fire(&**s, Overlap::Queue, 1, 10, None).await?;
         fire(&**s, Overlap::Queue, 2, 10, None).await?;
         assert!(s.queued("policy").await?.is_some());
@@ -2349,6 +2373,7 @@ async fn overlap_policies(
                 d.version,
                 1,
                 &Arming { triggers: BTreeMap::from([("policy".into(), slot(10))]) },
+                &Activation::at(0),
             )
             .await?;
             s.cancel("slot1", 3).await?;
@@ -2403,8 +2428,14 @@ async fn overlap_policies(
         report.cases += 1;
         let s = &t.store;
         let d = s.save_definition("workflow", "original").await?;
-        s.activate_with("workflow", d.version, 0, &Arming { triggers: BTreeMap::from([("policy".into(), slot(1))]) })
-            .await?;
+        s.activate_with(
+            "workflow",
+            d.version,
+            0,
+            &Arming { triggers: BTreeMap::from([("policy".into(), slot(1))]) },
+            &Activation::at(0),
+        )
+        .await?;
         fire(&**s, policy, 1, 10, None).await?;
         let refused = Refused {
             admission: admission("slot2"),
@@ -2540,7 +2571,7 @@ async fn controls(
     let d = s.save_definition("workflow", "yaml").await?;
     let trigger = Trigger { at_ms: Some(4), types: vec!["start".into()], state: json!({}) };
     let arming = Arming { triggers: BTreeMap::from([("schedule".into(), trigger.clone())]) };
-    s.activate_with("workflow", d.version, 0, &arming).await?;
+    s.activate_with("workflow", d.version, 0, &arming, &Activation::at(0)).await?;
     let parent = s.start(&admission("p"), 0).await?.unwrap();
     let child = s
         .start_child(
@@ -2620,7 +2651,7 @@ async fn controls(
         ControlError::InvalidState(_)
     ));
     s.control(&control_request("pause-again"), &pause, 3).await?;
-    s.activate_with("workflow", d.version, 1, &arming).await?;
+    s.activate_with("workflow", d.version, 1, &arming, &Activation::at(0)).await?;
     assert!(s.definitions("workflow").await?.tripped.is_none());
     assert_eq!(s.definitions("workflow").await?.epoch, 2);
 
@@ -2837,7 +2868,7 @@ async fn controls(
             report.cases += 1;
             let s = &t.store;
             let d = s.save_definition("workflow", "yaml").await?;
-            s.activate_with("workflow", d.version, 0, &arming).await?;
+            s.activate_with("workflow", d.version, 0, &arming, &Activation::at(0)).await?;
             let f = s.start(&admission("r"), 0).await?.unwrap();
             s.describe_wait(&f, "listen", &control_wait(), 2).await?;
             if op == "resume" {
@@ -2983,8 +3014,14 @@ async fn control_overlap(
         let s = &t.store;
         let d = s.save_definition("workflow", "yaml").await?;
         let slot = |n| Trigger { at_ms: Some(n), types: vec![], state: json!(n) };
-        s.activate_with("workflow", d.version, 0, &Arming { triggers: BTreeMap::from([("q".into(), slot(0))]) })
-            .await?;
+        s.activate_with(
+            "workflow",
+            d.version,
+            0,
+            &Arming { triggers: BTreeMap::from([("q".into(), slot(0))]) },
+            &Activation::at(0),
+        )
+        .await?;
         let fire = async |n, id: &str| {
             s.fire(
                 &Firing {

@@ -211,6 +211,41 @@ pub struct Definitions {
     /// Trigger keys the current activation armed. Activation and tripping
     /// replace them in their own commit.
     pub triggers: Vec<String>,
+    /// The latest activation of each activated version. One entry per
+    /// version, so the row stays bounded by its versions (it is read in
+    /// every admission and terminal commit of the name): activating an older
+    /// version again replaces its entry, and the epochs order them.
+    #[serde(default)]
+    pub activations: BTreeMap<u64, Activated>,
+}
+
+/// Who activates a version and why, beside the instant (the runtime's
+/// clock): the host's attribution, when it gives one (`Runtime::activate_as`).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Activation {
+    pub at_ms: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+impl Activation {
+    /// An unattributed activation at `at_ms`.
+    pub fn at(at_ms: i64) -> Self {
+        Self { at_ms, actor: None, note: None }
+    }
+}
+
+/// A version's latest activation as the catalog keeps it: the epoch it
+/// started and its `Activation`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Activated {
+    pub epoch: u64,
+    pub at_ms: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
 }
 
 /// The CloudEvent type of a breaker trip's notice (`Trip::event`).
@@ -634,25 +669,29 @@ pub trait RunStore: Send + Sync {
     async fn list(&self, name: Option<&str>, prefix: &str) -> anyhow::Result<Vec<SavedRun>>;
     async fn inspect(&self, id: &str) -> anyhow::Result<Option<RunSnapshot>>;
     async fn save_definition(&self, name: &str, yaml: &str) -> anyhow::Result<Definition>;
-    /// Activates `version` in a new epoch with no triggers.
-    async fn activate(&self, name: &str, version: u64) -> anyhow::Result<()> {
+    /// Activates `version` in a new epoch with no triggers, unattributed,
+    /// at `now_ms`.
+    async fn activate(&self, name: &str, version: u64, now_ms: i64) -> anyhow::Result<()> {
         loop {
             let epoch = self.definitions(name).await?.epoch;
-            if self.activate_with(name, version, epoch, &Arming::default()).await?.is_some() {
+            let activation = Activation::at(now_ms);
+            if self.activate_with(name, version, epoch, &Arming::default(), &activation).await?.is_some() {
                 return Ok(());
             }
         }
     }
     /// Activates `version` in a new epoch, clears the breaker (a trip and
-    /// its count) and arms `arming`, in one commit, provided the definition is still in `epoch`
-    /// (`None` otherwise: read it again). Reactivating the active version
-    /// also starts a new epoch.
+    /// its count), arms `arming` and records `activation` as the version's
+    /// latest (`Definitions::activations`), in one commit, provided the
+    /// definition is still in `epoch` (`None` otherwise: read it again).
+    /// Reactivating the active version also starts a new epoch.
     async fn activate_with(
         &self,
         name: &str,
         version: u64,
         epoch: u64,
         arming: &Arming,
+        activation: &Activation,
     ) -> anyhow::Result<Option<Definitions>>;
     async fn definitions(&self, name: &str) -> anyhow::Result<Definitions>;
     /// Up to `limit` notices, oldest first: CloudEvents the store committed

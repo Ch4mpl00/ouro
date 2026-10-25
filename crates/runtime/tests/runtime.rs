@@ -1252,7 +1252,9 @@ async fn store_only_control_lists_definition_schedules_and_suspended_slots() {
     let summary = control.definition("workflow").await.unwrap().unwrap();
     assert_eq!((summary.active, summary.epoch), (Some(1), 1));
     assert_eq!(summary.versions[0].version, 1);
-    assert_eq!(summary.versions[0].activated_ms, None);
+    // Activated at the runtime's clock, unattributed.
+    let first = &summary.versions[0];
+    assert_eq!((first.activated_ms, first.activated_epoch, first.activated_by.as_deref()), (Some(0), Some(1), None));
     assert_eq!(
         summary.schedules.iter().map(|s| s.kind).collect::<Vec<_>>(),
         [ScheduleKind::Every, ScheduleKind::After, ScheduleKind::On]
@@ -1279,9 +1281,17 @@ async fn store_only_control_lists_definition_schedules_and_suspended_slots() {
     assert_eq!(control.definition("workflow").await.unwrap(), Some(before_pause));
     // Reactivation replaces the schedules and discards the buffered slot.
     let replacement = rt.save("workflow", &yaml("  - ok: { set: { ok: true } }")).await.unwrap();
-    rt.activate("workflow", replacement.version).await.unwrap();
+    assert!(rt.activate_as("workflow", replacement.version, " ", None).await.is_err());
+    rt.activate_as("workflow", replacement.version, "operator", Some("drop the schedule")).await.unwrap();
     let summary = control.definition("workflow").await.unwrap().unwrap();
     assert_eq!((summary.active, summary.epoch, summary.versions.len()), (Some(2), 2, 2));
+    let second = &summary.versions[1];
+    assert_eq!((second.activated_ms, second.activated_epoch), (Some(2000), Some(2)));
+    assert_eq!(
+        (second.activated_by.as_deref(), second.activation_note.as_deref()),
+        (Some("operator"), Some("drop the schedule"))
+    );
+    assert_eq!(summary.versions[0].activated_epoch, Some(1), "the first version keeps its latest activation");
     assert!(summary.schedules.is_empty());
     let page = control.definitions(None, 1).await.unwrap();
     assert_eq!(page.items, [summary]);

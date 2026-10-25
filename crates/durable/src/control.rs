@@ -191,12 +191,18 @@ pub struct DefinitionSummary {
     /// an automatic trip disarms them, leaving no next due time or queue.
     pub schedules: Vec<ScheduleSummary>,
 }
+/// A version and its latest activation, if it was ever activated: an older
+/// version activated again shows that activation (the epochs order them).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VersionSummary {
     pub version: u64,
-    /// None when the catalog did not record an activation instant. Existing
-    /// stores retain versions and epochs, but no activation timestamps.
+    /// When, by the runtime's clock.
     pub activated_ms: Option<i64>,
+    /// The activation epoch it started.
+    pub activated_epoch: Option<u64>,
+    /// Who activated it and why, when the host said (`Runtime::activate_as`).
+    pub activated_by: Option<String>,
+    pub activation_note: Option<String>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

@@ -14,8 +14,8 @@
 //! deduplication, overlap, breaker, expiry) come from the store under test.
 use anyhow::{Context, ensure};
 use ouro_durable::{
-    Admission, Arming, ChildLink, CommitFault, Compatibility, DefinitionTripped, FaultInjector, Fence, Fired, Firing,
-    IdentityConflict, Overlap, OverlapGuard, Policy, Rearm, Refused, RunSnapshot, RunState, RunStore,
+    Activation, Admission, Arming, ChildLink, CommitFault, Compatibility, DefinitionTripped, FaultInjector, Fence,
+    Fired, Firing, IdentityConflict, Overlap, OverlapGuard, Policy, Rearm, Refused, RunSnapshot, RunState, RunStore,
     TransactionalStore, Trigger, memory::MemoryBackend, sqlite::SqliteBackend,
 };
 use ows::{
@@ -665,7 +665,10 @@ impl StoreDriver {
         }
         let arming =
             Arming { triggers: BTreeMap::from([(SCHEDULE.to_string(), schedule_trigger(Some(2), 1, 0, 0, false))]) };
-        ensure!(self.block(self.store.activate_with(NAME, 1, 0, &arming))?.is_some(), "initial activation");
+        ensure!(
+            self.block(self.store.activate_with(NAME, 1, 0, &arming, &Activation::at(0)))?.is_some(),
+            "initial activation"
+        );
         let ingress = Trigger { at_ms: None, types: vec![INGRESS.into()], state: json!({}) };
         ensure!(self.block(self.store.swap_trigger(INGRESS, None, Some(&ingress), &[], None, 0))?, "ingress trigger");
         Ok(())
@@ -1162,7 +1165,8 @@ impl StoreDriver {
                     t.state["maxRuns"] = json!(self.max_runs);
                     arming.triggers.insert(SCHEDULE.into(), t);
                 }
-                let (result, _) = self.write(fault, self.store.activate_with(NAME, version, defs.epoch, &arming));
+                let (result, _) =
+                    self.write(fault, self.store.activate_with(NAME, version, defs.epoch, &arming, &Activation::at(0)));
                 if !injected {
                     ensure!(result?.is_some(), "the definition changed under a serial activation");
                 }

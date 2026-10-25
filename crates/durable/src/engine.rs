@@ -113,7 +113,8 @@ async fn run(rows: &mut dyn Transaction, id: &str) -> anyhow::Result<StoredRun> 
 /// The layout version of a `definitions` row. The earlier layout (none: it
 /// kept a predecessor and its triggers for a breaker rollback, and a boolean
 /// trip) is refused, never read as a definition that cannot be tripped.
-const DEFINITIONS_VERSION: u64 = 3;
+/// 4: each version's latest activation (`Definitions::activations`).
+const DEFINITIONS_VERSION: u64 = 4;
 async fn load_definitions(rows: &mut dyn Transaction, name: &str) -> anyhow::Result<Option<Definitions>> {
     let Some(value) = rows.get("definitions", name).await? else { return Ok(None) };
     Ok(Some(decode_definitions(name, value)?))
@@ -1049,6 +1050,7 @@ async fn activate(
     version: u64,
     epoch: Option<u64>,
     arming: &Arming,
+    activation: &Activation,
 ) -> anyhow::Result<Option<Definitions>> {
     let mut defs = load_definitions(rows, name).await?.unwrap_or_default();
     anyhow::ensure!(defs.versions.contains_key(&version), "unknown definition version");
@@ -1061,6 +1063,8 @@ async fn activate(
     defs.epoch = defs.epoch.checked_add(1).ok_or_else(|| anyhow::anyhow!("activation epoch overflow"))?;
     defs.consecutive_faults = 0;
     defs.tripped = None;
+    let Activation { at_ms, actor, note } = activation.clone();
+    defs.activations.insert(version, Activated { epoch: defs.epoch, at_ms, actor, note });
     rows.delete("paused", name).await?;
     arm(rows, &mut defs, &arming.triggers).await?;
     store_definitions(rows, name, &defs).await?;
@@ -1953,10 +1957,13 @@ impl RunStore for TransactionalStore {
         })
         .await
     }
-    async fn activate(&self, name: &str, version: u64) -> anyhow::Result<()> {
-        self.update(|rows| Box::pin(async move { activate(rows, name, version, None, &Arming::default()).await }))
-            .await
-            .map(|_| ())
+    async fn activate(&self, name: &str, version: u64, now: i64) -> anyhow::Result<()> {
+        let activation = &Activation::at(now);
+        self.update(|rows| {
+            Box::pin(async move { activate(rows, name, version, None, &Arming::default(), activation).await })
+        })
+        .await
+        .map(|_| ())
     }
     async fn activate_with(
         &self,
@@ -1964,8 +1971,12 @@ impl RunStore for TransactionalStore {
         version: u64,
         epoch: u64,
         arming: &Arming,
+        activation: &Activation,
     ) -> anyhow::Result<Option<Definitions>> {
-        self.update(|rows| Box::pin(async move { activate(rows, name, version, Some(epoch), arming).await })).await
+        self.update(|rows| {
+            Box::pin(async move { activate(rows, name, version, Some(epoch), arming, activation).await })
+        })
+        .await
     }
     async fn definitions(&self, name: &str) -> anyhow::Result<Definitions> {
         self.read(|rows| Box::pin(async move { Ok(load_definitions(rows, name).await?.unwrap_or_default()) })).await
@@ -2057,7 +2068,20 @@ async fn definition_summary(
     }
     Ok(control::DefinitionSummary {
         name: name.into(),
-        versions: defs.versions.keys().map(|&version| VersionSummary { version, activated_ms: None }).collect(),
+        versions: defs
+            .versions
+            .keys()
+            .map(|&version| {
+                let latest = defs.activations.get(&version);
+                VersionSummary {
+                    version,
+                    activated_ms: latest.map(|a| a.at_ms),
+                    activated_epoch: latest.map(|a| a.epoch),
+                    activated_by: latest.and_then(|a| a.actor.clone()),
+                    activation_note: latest.and_then(|a| a.note.clone()),
+                }
+            })
+            .collect(),
         active: defs.active,
         epoch: defs.epoch,
         consecutive_faults: defs.consecutive_faults,

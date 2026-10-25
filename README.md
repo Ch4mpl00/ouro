@@ -119,7 +119,9 @@ targeted `publish` uses the mailbox too; a broadcast `publish` still reaches
 only the runs subscribed at that moment.
 
 Versions are immutable. Every activation, including reactivating the active
-version, starts a new activation epoch, and nothing else does. The breaker
+version, starts a new activation epoch, and nothing else does; its commit
+records when (the runtime's clock) and, through `activate_as`, who and why
+(Operator control, below). The breaker
 counts terminal faults (unhandled errors, timeouts, unknown outcomes) of runs
 admitted in the active version's current epoch, and the schedule slots of that
 epoch whose run the host refused to admit; cancellations and interruptions
@@ -439,8 +441,17 @@ order through `RunStore::query_definitions`; `definition(name)` returns the
 same summary, or `None` for an unknown name. Neither needs a registry or raw
 backend access. A summary includes ascending version numbers, the active
 version, epoch, consecutive faults and the original trip report (including a
-manual pause's actor, reason and note). `VersionSummary::activated_ms` is
-`None`: the current catalog does not persist activation timestamps.
+manual pause's actor, reason and note). Each `VersionSummary` carries the
+version's latest activation: `activated_ms` (the runtime's clock),
+`activated_epoch` and, when the host activated it with
+`Runtime::activate_as(name, version, actor, note)`, `activated_by` and
+`activation_note`; all `None` for a version never activated. Only the
+latest activation per version is kept, in the definitions row: that row is
+read by every admission and terminal commit of the name, so an unbounded
+history there would grow their cost with every activation, while one entry
+per version stays bounded by the versions it already holds. Reactivating
+an older version replaces its entry; the epochs order activations across
+versions.
 `schedules` has one entry per kind configured by the active version (`every`,
 `cron`, `after`, `on`), with its next due time, overlap policy, catch-up policy
 and buffered slot's pinned run identity/version when present. An `on` trigger
@@ -729,9 +740,10 @@ change without a migration; nothing persisted before them is converted. Each
 run row records the durable state version it was written under, and a row of
 another version (including the earlier one-aggregate-per-run layout) is
 refused with an error rather than read as a run without evidence. Likewise a
-`definitions` row records its layout (3); the earlier unversioned layout, which
-kept a predecessor for a breaker rollback, is refused rather than read as a
-definition that never tripped.
+`definitions` row records its layout (4: each version's latest activation);
+the earlier unversioned layout, which kept a predecessor for a breaker
+rollback, is refused rather than read as a definition that never tripped,
+and so is layout 3, which kept no activation times.
 
 ### Async seams
 

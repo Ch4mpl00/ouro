@@ -212,7 +212,7 @@ async fn definitions_rows_of_an_earlier_layout_are_refused() {
     let backend = Arc::new(MemoryBackend::default());
     let s = TransactionalStore::new(backend.clone());
     let d = s.save_definition("workflow", "yaml").await.unwrap();
-    s.activate("workflow", d.version).await.unwrap();
+    s.activate("workflow", d.version, 0).await.unwrap();
     let key = ("definitions".to_string(), "workflow".to_string());
     let before = backend.snapshot().await.unwrap();
     let mut rows = before.rows.clone();
@@ -226,8 +226,22 @@ async fn definitions_rows_of_an_earlier_layout_are_refused() {
     assert!(backend.compare_exchange(&before, &rows).await.unwrap());
     let refused = s.definitions("workflow").await.unwrap_err().to_string();
     assert!(refused.contains("unsupported layout"), "{refused}");
-    assert!(s.activate("workflow", d.version).await.is_err() && s.save_definition("workflow", "next").await.is_err());
+    assert!(
+        s.activate("workflow", d.version, 0).await.is_err() && s.save_definition("workflow", "next").await.is_err()
+    );
     assert!(s.admit(&conformance::admission("r"), 0).await.is_err(), "admission reads the definition's epoch");
+    assert_eq!(backend.snapshot().await.unwrap(), Snapshot { rows: rows.clone() }, "a refused row is left as it is");
+    // Layout 3, without activation times, is refused as well rather than
+    // read as versions that were never activated.
+    let current = backend.snapshot().await.unwrap();
+    assert!(backend.compare_exchange(&current, &before.rows).await.unwrap());
+    let mut rows = before.rows.clone();
+    let row = rows.get_mut(&key).unwrap().as_object_mut().unwrap();
+    row.insert("version".into(), serde_json::json!(3));
+    row.remove("activations");
+    assert!(backend.compare_exchange(&before, &rows).await.unwrap());
+    let refused = s.definitions("workflow").await.unwrap_err().to_string();
+    assert!(refused.contains("unsupported layout 3"), "{refused}");
     assert_eq!(backend.snapshot().await.unwrap(), Snapshot { rows }, "a refused row is left as it is");
 }
 
