@@ -1,6 +1,6 @@
 # 04. Breaker threshold per definition
 
-Status: draft · Issue: 35 · Requested by: ouro-agent migration (its design 01, finding H3)
+Status: approved · Issue: 35 · Review: goldfish round 1 (2026-10-25), resolved below · Requested by: ouro-agent migration (its design 01, finding H3)
 
 ## Problem
 
@@ -31,26 +31,48 @@ Starting the built-in pinned doesn't help: it *is* the tripped content.
 
 ## Design
 
-- `ows::model` parses `metadata.ouro.breaker` (the `ouro` key set from design 01
-  gains `breaker`): `off` or an object with a positive integer `threshold`;
-  anything else is a validation error at `/document/metadata/ouro/breaker`.
-- The store's fault accounting (the terminal commit that counts a fault and
-  may trip) uses the active version's threshold. To avoid re-parsing YAML in
-  the hot path, the threshold is computed at `save` and stored with the version
-  in the definitions row (definitions layout +1; older rows refused); `off` is
-  stored as no threshold.
-- Queued refusals (#15/#19) that pin `breaker_threshold` today pin the policy
-  the same way.
-- `DefinitionSummary` shows each version's policy.
+Resolutions of review round 1 are marked (R-n).
+
+- **Parsing (R-M4):** `ows::model` accepts `document.metadata.ouro.breaker` —
+  the string `off` or `{ threshold: n }` with an integer `1 ≤ n ≤ 1000`; any
+  other value, or `breaker` on a task, is a validation error at its pointer;
+  `DOCUMENT_EXTENSIONS` gains `breaker`.
+- **Stored shape (R-H2, R-M5):** each stored version carries
+  `breaker: Breaker` with three states — `Inherit` (absent), `Off`,
+  `Threshold(n)` — with `#[serde(default)] = Inherit`. Old rows decode as
+  `Inherit`, which is exactly their meaning, so there is no definitions layout
+  bump.
+- **Where it is extracted (R-M1):** `Runtime::save` already parses the YAML; it
+  passes the policy to the store's `save_definition` (new parameter). A store
+  used directly with unparsable text stores `Inherit`.
+- **Host default stays (R-H1):** `Config.breaker_threshold` remains the default
+  for `Inherit`. The store calls that take `breaker_threshold: u32` today
+  (`RunStore::finish`, the refusal paths) keep taking the host default; the
+  store resolves the effective policy from the active version
+  (`Inherit → default`, `Off → never trips`, `Threshold(n) → n`) inside the same
+  commit that counts the fault. Changed signatures are listed in the CHANGELOG.
+- **Queued refusals (R-H3):** no longer pin a threshold; the policy is
+  resolved at promotion from the active version, like every other fault. The
+  `Queued` layout's `failure.breaker_threshold` field is dropped (its layout
+  version bumps; queued entries of the old layout are refused).
+- **Reporting (R-M2):** nothing new — `consecutive_faults` keeps counting under
+  `Off` and is visible in the summary; no trip, no trip event.
+- **Digest (R-M3):** the policy is part of the YAML, hence of the canonical
+  content and its digest; changing it is a new version with a new digest.
+- `DefinitionSummary` versions show `breaker`.
 
 ## Contract and model
 
-- V-rules: the trip condition becomes "consecutive faults ≥ the active
-  version's threshold, if any". Quint: `contract.qnt` already parameterises a
-  threshold; make it per version (map) with `off` = none. Witnesses: a
-  definition with `off` faults past the default and stays untripped; a
-  definition with threshold 1 trips on the first fault. Mutants: `off` still
-  trips; the default used instead of the version's threshold.
+- V2: "consecutive faults of the active version reach its effective
+  threshold" (Inherit → host default, Off → never). `contract.qnt` today
+  hard-codes the threshold 2 in the fault transitions, the V2 monitor and the
+  `quint.rs` drivers (R-H4): make the threshold a per-version map
+  (`policy: version -> int`, 0 = off) with the host default as a constant;
+  update the transitions that count faults and trip, the V2 monitor, the
+  queued-refusal clause, and the Rust bridge. Witnesses: `off` past the
+  default stays untripped; threshold 1 trips on the first fault; a queued
+  refused slot promoted under `off` doesn't trip. Mutants: `off` still trips;
+  the host default used instead of the version's threshold.
 
 ## Failure modes
 
@@ -63,14 +85,17 @@ Test-first; each must fail before the change.
 - Parse/validation of `off`, `{threshold: n}`, invalid values, unknown keys.
 - Conformance (memory/SQLite/Postgres): `off` never trips after many faults;
   `threshold: 1` trips on one; default unchanged; reactivation with a different
-  policy applies the new version's policy; queued refusal pins it.
+  policy applies the new version's policy; a queued refused slot is judged by
+  the active version's policy at promotion; an old row without `breaker`
+  decodes as `Inherit`; a scheduled definition with `off` keeps firing after
+  faults.
 - Summary shows the policy. Quint witnesses/mutants; full suite, mutation stage.
 
 ## Rollout
 
-`docs/dsl.md` (extension), `docs/control.md` (summary), `docs/durable-invariants.md`,
-`CHANGELOG.md` (definitions layout bump).
+`docs/dsl.md` (extension), `docs/control.md` (summary), `docs/api.md` (save),
+`docs/durable-invariants.md`, `CHANGELOG.md` (store signatures, `Queued` layout).
 
 ## Open questions
 
-None.
+None (review findings resolved above).

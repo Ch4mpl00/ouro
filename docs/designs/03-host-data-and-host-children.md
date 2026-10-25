@@ -1,6 +1,6 @@
 # 03. Host data at admission and host-started children
 
-Status: draft · Issue: 34 · Requested by: ouro-agent migration (its design 01, finding H2)
+Status: approved · Issue: 34 · Review: goldfish round 1 (2026-10-25), resolved below · Requested by: ouro-agent migration (its design 01, finding H2)
 
 ## Problem
 
@@ -36,41 +36,71 @@ start a child it vouches for, nor record the child's facts before it exists.
 
 ## Design
 
-- `Admission` gains `host: Value` (default `null`). Durable run-state version
-  +1; older rows refused.
-- `Runtime::start_with(id, name, input, Start { version: Option<u64>, host: Value })`
-  (`start` = defaults; `start_at` = `version: Some(v)`). Same idempotency as
-  `start`: an existing id returns the run if name, version and host data match,
-  else an error.
-- `FunctionContext::host() -> &Value`: the current run's host data.
-- `FunctionContext::start_child(ChildStart { key, name, version, input, host })
-  -> ChildRef { id, key, done, waiting }`:
-  - Owned child of the current run (same ownership, cascade, budget lineage,
-    depth limit, trip/pause/digest rules as the built-in `start_child`).
-  - Child id deterministic from (parent run, the calling task's logical
-    reference, `key`), so a re-dispatched call (at-least-once) or a replay
-    joins the same child; an existing child with different name/version/host
-    data is an error.
+Resolutions of review round 1 are marked (R-n); decisions taken by the
+elephant while the maintainer was away are logged in ouro-agent `docs/designs/LOG.md`.
+
+- **Where it lives (R-H2):** host data is stored as `admission.runtime["host"]`
+  (where `schedule`, `limits` and the pinned flag already live). No new
+  `Admission` field, no run-state version bump; `$runtime` is whitelisted, so
+  YAML never sees it. Absent = no host data. Size bound: the serialized value
+  ≤ 16 KiB, else a validation error at start (R-M7).
+- **Starting a root:** `Runtime::start_with(id, name, input, Start { version:
+  Option<u64>, host: Value })` (`start` = defaults, `start_at` = pinned). On an
+  existing id the store compares name, version and host data and returns the
+  run if equal, else a typed mismatch error — the comparison is in the shared
+  store engine (`crates/durable/src/engine.rs`), so every adapter gets it and
+  there is no race (R-H4). Plain `start` on an existing run that has host data
+  compares `host` as absent and therefore errors.
+- **Reading it:** `FunctionContext::host() -> Option<&Value>`.
+- **Starting a vouched child from a host function:**
+  `FunctionContext::start_child(ChildStart { key, name, version, input, host })
+  -> ChildRef { id, key, done, waiting }`.
+  - The capability is `FunctionContext.children: Option<Arc<dyn ChildStarter>>`
+    (R-M3): present for registered functions in live and dry runs, `None` for
+    process runners and in `Mock::response`; calling it when absent fails with
+    `not_executed`.
+  - Child id `hostchild:[<parent run>, <call idempotency key>, <key>]` — a
+    prefix distinct from the built-in `child:` ids, stable across a re-dispatch
+    of the same call (R-H3). `ChildRef.key` is the link key
+    `<call logical id>/<key>`; pass it to the built-in `child_outcome`.
+  - Same ownership, cascade, budget lineage, depth limit, trip/pause/digest
+    refusals as the built-in. A pinned version uses a new
+    `Admitter::pinned_in(lineage)` (R-M5).
   - Committed through the calling execution's fence, atomically with the
-    parent's subscriptions to `done:<id>` / `waiting:<id>`; refused when the
-    parent's lease is lost.
-  - The parent joins with `listen` on the returned event names or reads the
-    result with the built-in `child_outcome`, as today.
-- Observer: `run_admitted` for the child carries the parent id (as today);
-  host data is not copied into events or spans (it may be sensitive).
-- Control: `Inspection` shows `host` (operators may need it); `list`/`history`
-  don't.
+    parent's subscriptions; on join the store compares the full admission
+    (name, version, host) and returns a typed mismatch error (R-H4).
+  - Errors (R-M4): depth, trip, pause, mismatch → the handler gets a typed
+    refusal and should answer `not_executed` (no effect happened); lease lost
+    or storage failure → `interrupted`. Child-starting functions must be
+    registered **at-least-once** (a re-dispatch joins the same child by its
+    id); registering one at-most-once is documented as wrong (an unknown
+    outcome can't be joined).
+  - The existing public `Runtime::start_child(parent_fence, key, id, name,
+    input)` gains a `host: Value` argument (R-M5).
+- **Built-in children** (`run: workflow`, built-in `start_child`) get no host
+  data — unchanged code paths, now asserted by tests.
+- **Visibility (R-H1):** the control API redacts host data everywhere except
+  `inspect` of one run: `list`, `history` and `Inspection.children` show
+  `runtime.host` replaced by `"<redacted>"` when present. Observer events and
+  spans never carry it.
+- **Dry run and replay (R-M2):** `dry_run` takes an optional host value for
+  the root; children started by handlers in a dry run are started in its
+  private store; a mocked call runs no handler, so it starts no child. Replay
+  never runs handlers, so it never starts children.
+- **Triggers (R-M6):** scheduled and event-fired runs get no host data (non-goal);
+  a host vouches for work by starting a child from the fired run's function.
 
 ## Contract and model
 
 - The contract's child start (C-rules: owned, cascade, atomic subscriptions)
   is unchanged; a host-started child is the same transition as the built-in.
-- New invariant (ID to assign, e.g. A3): an admission's host data never
-  changes; a child started by a workflow has none. Quint: host data as an
-  opaque tag on the admission; a host start action (`hostChild`) beside the
-  built-in; monitor for immutability and for "workflow-started child has no
-  host data"; mutants: host data overwritten on re-start, workflow child
-  inherits the parent's host data.
+- Immutability is already A1 (an admission never changes). The new rule — a
+  child started by a workflow has no host data; a host-started child keeps
+  exactly what the host gave — is a clause of the child-start rules in
+  `docs/durable-invariants.md` (R-M1). It is pinned by conformance tests on
+  every adapter, not by Quint (the model treats admission content as opaque;
+  keeping Quint on durable guarantees); `spec/README.md`'s "what is checked
+  where" lists it.
 
 ## Failure modes
 
@@ -95,7 +125,9 @@ Test-first; each must fail before the change.
   refusal; replay/re-dispatch joins the same child; mismatch error; lease-lost
   refusal. Conformance on memory/SQLite/Postgres incl. crash points around the
   child commit.
-- Quint witnesses/mutants above; full suite, mutation stage.
+- Control redaction in `list`/`history`/`children`, visible in `inspect`.
+- Size bound; `start` on an existing run with host data errors.
+- Full suite.
 
 ## Rollout
 
@@ -105,4 +137,4 @@ Test-first; each must fail before the change.
 
 ## Open questions
 
-None.
+None (review findings resolved above).
