@@ -54,6 +54,7 @@ Request(op, request_id, args), Reply(request_id, value | definite_abort | ambigu
 Admit(r,A), Claim(r,f,expiry), Renew(f,expiry), Release(f), LeaseExpire(f)
 Intent(i,args,binding), Dispatch(i,a), ExternalEffect(i,key,value)
 Return(i,a,result), SaveResult(i,result), Unknown(i,reason), Restore(i,result)
+Refuse(i,a,proof)
 Checkpoint(r,frontier,state,schema_version), RecoveryDecision(r,i,decision)
 Register(w), Subscribe(s), Unsubscribe(s), Accept(e,c), Consume(c,w,k,value)
 Publish(e,recipients), RejectEvent(e,reason), ExpireEvent(c)
@@ -263,17 +264,23 @@ and bindings, not only output values.
 
 #### E2 — Protected dispatch is at most once [P, safety]
 
-For a protected write `i`, `count_H(Dispatch(i,_)) <= 1`, and every dispatch follows
-committed `Intent(i,...)`. Only the attempt that obtains fresh authorization may
-dispatch; an intent found during recovery is not fresh authorization. No runtime,
-handler wrapper or transport may automatically resend an ambiguous protected
-operation. A function error or timeout does not grant a new identity or intent.
+For a protected write `i`, `count_H(Dispatch(i,_)) <= 1 + count_H(Refuse(i,_,_))`,
+and every dispatch follows committed `Intent(i,...)`. `Refuse(i,a,proof)` is the
+committed answer of dispatch `a` that its function refused before doing anything
+(a proof of non-execution, issue #25); each answers one dispatch of `i` that had
+no other answer, so without refusals this is `count_H(Dispatch(i,_)) <= 1`. Only
+the attempt that obtains fresh authorization may dispatch; an intent found during
+recovery is not fresh authorization. No runtime, handler wrapper or transport may
+automatically resend an ambiguous protected operation. A function error, a
+timeout or a refusal whose commit was lost does not grant a new identity or
+intent.
 
 Intent protects against duplicates even when it loses a write. **Source:**
 [README][README], [AGENTS][AGENTS]. **Fault:** crash/timeout between send and save,
-duplicate workers. **Mutant:** redispatch whenever no response is recorded.
+duplicate workers. **Mutant:** redispatch whenever no response is recorded; redispatch
+an unknown outcome on recovery; count a refusal that answers no dispatch.
 **Check:** crash before intent, after intent, before/after dispatch and before/after
-result commit; count outbound attempts in a durable fake recipient.
+result or refusal commit; count outbound attempts in a durable fake recipient.
 
 #### E3 — Unknown outcomes remain epistemically honest [P, safety]
 
@@ -1233,6 +1240,28 @@ Cancellation closes the same owned subtree as C3 and reaches the owner's
 function token at its next renewal (immediately through the in-process control
 path). Attributed commands commit their audit and idempotency reply atomically;
 a matched response commits its addressed event in that same transition.
+
+Addendum (2026-10-25, issue #25). A function says how far its call got by the
+type of its error: `call.not_executed` is a proof of non-execution, `call.unknown`
+an outcome it cannot tell, `call.interrupted` a stop that is no answer; any other
+error is a definite response. One transition is new: `Refuse(i,a,proof)`, the
+committed refusal of a dispatch, saved like a proof that the call was not sent
+(record 4 in the model). It withdraws that dispatch from E2's count, so a later
+intent may send a protected call again (decision 12 of the OWS persistence
+contract: the recipient rejected it before execution). A refusal whose commit is
+lost proves nothing: the dispatch stays an intent without an answer (E3). Every
+other outcome uses existing transitions: an unknown answer and a stop keep the
+intent without an answer, the evidence a crash between dispatch and record
+leaves, so recovery decides both the same way (E3, R2) and an at-most-once call
+is never sent again (E2). The interpreter surfaces an unknown at-most-once
+outcome as `urn:ouro:errors:call.unknown` with the call's reference, which only a
+`catch` naming that type handles and which never retries the attempt. Recovery
+returns a saved refusal again instead of sending the call, as E4 restores a
+result, because the workflow may have acted on it (R1, R3); only a new DSL
+attempt sends it again. The model permits either: after a refusal an intent
+may, not must, follow. A cancelled in-flight
+call keeps its intent: the runtime drops the handler without recording what it
+would have answered (C3, E3).
 
 Addendum (2026-10-25, issue #29). An operator may hold one run and its live
 owned descendants, in one transition, and release them. A held run takes no

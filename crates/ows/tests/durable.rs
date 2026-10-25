@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use ows::{
-    durable::{CallFailure, Journal, Record, check_transition},
+    durable::{CALL_UNKNOWN, CallFailure, Journal, Record, check_transition},
     model,
     run::{self, CallInfo, Clock, Event, Functions, Host, Limits, Observer, Silent, Status, WorkflowError},
 };
@@ -23,6 +23,8 @@ struct Store {
     saves: AtomicUsize,
     fail_at: AtomicUsize,
     after_commit: bool,
+    /// The key of every save attempted, in order.
+    log: Mutex<Vec<String>>,
 }
 impl Store {
     fn records(&self) -> BTreeMap<String, Record> {
@@ -36,6 +38,7 @@ impl Journal for Store {
     }
     async fn save(&self, key: &str, record: &Record) -> anyhow::Result<()> {
         let n = self.saves.fetch_add(1, Ordering::SeqCst) + 1;
+        self.log.lock().unwrap().push(key.into());
         let fail = n == self.fail_at.load(Ordering::SeqCst);
         if fail && !self.after_commit {
             anyhow::bail!("injected crash before commit {n}");
@@ -274,7 +277,7 @@ async fn at_most_once_never_dispatches_twice_at_any_crash_boundary() {
             let result = drive(&host(world.clone(), time.clone()), &time, &wf, &store).await;
             assert!(
                 matches!(result, Status::Completed(_))
-                    || matches!(result, Status::Faulted(ref e) if e.is("outcome_unknown")),
+                    || matches!(result, Status::Faulted(ref e) if e.type_ == CALL_UNKNOWN),
                 "{result:?}"
             );
             let mut counts = BTreeMap::new();
@@ -303,7 +306,7 @@ async fn unknown_bypasses_catch_but_proven_non_dispatch_can_retry() {
         let result = drive(&host(world.clone(), time.clone()), &time, &wf, &Store::default()).await;
         let calls = world.0.lock().unwrap();
         if name == "unknown" {
-            assert!(matches!(result, Status::Faulted(ref e) if e.is("outcome_unknown")));
+            assert!(matches!(result, Status::Faulted(ref e) if e.type_ == CALL_UNKNOWN));
             assert_eq!(calls.len(), 1);
         } else {
             assert!(matches!(result, Status::Completed(_)), "{result:?}");
@@ -348,7 +351,7 @@ async fn an_interrupted_at_most_once_call_is_an_unknown_outcome() {
     let world = Arc::new(World::default());
     let time = Arc::new(Time(AtomicI64::new(1_000)));
     let result = drive(&host(world.clone(), time.clone()), &time, &wf, &Store::default()).await;
-    assert!(matches!(result, Status::Faulted(ref e) if e.is("outcome_unknown")), "{result:?}");
+    assert!(matches!(result, Status::Faulted(ref e) if e.type_ == CALL_UNKNOWN), "{result:?}");
     assert_eq!(world.0.lock().unwrap().len(), 1, "a stop does not make the call re-sendable");
 }
 
@@ -486,7 +489,7 @@ async fn a_timeout_cannot_turn_an_unknown_dispatch_into_a_catchable_retry() {
     h.functions = calls.clone();
     let store = Store::default();
     let result = drive(&h, &time, &wf, &store).await;
-    assert!(matches!(result, Status::Faulted(ref error) if error.is("outcome_unknown")));
+    assert!(matches!(result, Status::Faulted(ref error) if error.type_ == CALL_UNKNOWN));
     assert_eq!(drive(&h, &time, &wf, &store).await, result);
     assert_eq!(calls.0.load(Ordering::SeqCst), 1);
     let crashed = Store { fail_at: AtomicUsize::new(4), after_commit: true, ..Default::default() };
@@ -498,7 +501,7 @@ async fn a_timeout_cannot_turn_an_unknown_dispatch_into_a_catchable_retry() {
     // instead of letting catch turn the elapsed deadline into a retry.
     time.0.store(2_000, Ordering::SeqCst);
     assert!(matches!(drive(&h, &time, &wf, &crashed).await,
-        Status::Faulted(ref error) if error.is("outcome_unknown")));
+        Status::Faulted(ref error) if error.type_ == CALL_UNKNOWN));
     assert_eq!(calls.0.load(Ordering::SeqCst), 1);
 }
 
@@ -645,6 +648,7 @@ fn recover_generated(
                 saves: AtomicUsize::new(store.saves.load(Ordering::SeqCst)),
                 fail_at: AtomicUsize::new(store.fail_at.load(Ordering::SeqCst)),
                 after_commit: store.after_commit,
+                log: Mutex::default(),
             };
         }
         Err("recovery exceeded 512 resumptions".into())
@@ -1121,7 +1125,7 @@ async fn retried_writes_survive_a_crash_at_every_checkpoint() {
                         assert!(sent <= 1, "{case}: sent {sent}");
                         match &status {
                             Status::Completed(_) => assert_eq!(sent, 1, "{case}"),
-                            Status::Faulted(e) => assert!(e.is("outcome_unknown"), "{case}: {e:?}"),
+                            Status::Faulted(e) => assert!(e.type_ == CALL_UNKNOWN, "{case}: {e:?}"),
                             other => panic!("{case}: {other:?}"),
                         }
                     } else {
@@ -1673,7 +1677,7 @@ fn generated_faulty_histories_refine_crash_free_effect_histories() {
             };
             let (ideal, expected, _) = execute(0);
             let (actual, effects, evidence) = execute(cut);
-            let unknown = matches!(&actual,Status::Faulted(e) if e.is("outcome_unknown"));
+            let unknown = matches!(&actual,Status::Faulted(e) if e.type_ == CALL_UNKNOWN);
             if unknown {
                 prop_assert!(
                     evidence
@@ -1936,4 +1940,233 @@ async fn annotations_beyond_their_bounds_answer_with_a_validation_error() {
     big.insert("text".into(), "x".repeat(ows::durable::MAX_ANNOTATION_BYTES).into());
     assert!(ows::durable::check_annotations(&big).is_err());
     assert!(ows::durable::check_annotations(&annotations()).is_ok());
+}
+
+// Issue #25: a function says how far its call got by the type of its error.
+#[test]
+fn a_function_error_type_says_how_far_the_call_got() {
+    use ows::durable::{CALL_INTERRUPTED, CALL_NOT_EXECUTED};
+    let answer = |e: WorkflowError| CallFailure::answer(e);
+    assert!(
+        matches!(answer(WorkflowError::not_executed("refused")), CallFailure::NotExecuted(e) if e.type_ == CALL_NOT_EXECUTED)
+    );
+    assert!(
+        matches!(answer(WorkflowError::unknown_outcome("timed out")), CallFailure::Unknown(e) if e.type_ == CALL_UNKNOWN)
+    );
+    assert!(
+        matches!(answer(WorkflowError::interrupted("stopped")), CallFailure::Interrupted(e) if e.type_ == CALL_INTERRUPTED)
+    );
+    // Any other error, a timeout or a communication error included, is a
+    // definite answer: the function knows it failed.
+    for plain in
+        [WorkflowError::communication(503, "down"), WorkflowError::timeout("slow"), WorkflowError::runtime("x")]
+    {
+        assert!(matches!(answer(plain.clone()), CallFailure::Response(e) if e == plain));
+    }
+}
+
+/// A shipment service without idempotency keys: `create` is at most once,
+/// `lookup` finds what a create may have left, `check` refuses its first
+/// call before doing anything.
+struct Shipments {
+    create: fn(usize) -> Result<Value, CallFailure>,
+    calls: Mutex<Vec<String>>,
+}
+impl Shipments {
+    fn new(create: fn(usize) -> Result<Value, CallFailure>) -> Arc<Self> {
+        Arc::new(Self { create, calls: Mutex::default() })
+    }
+    fn count(&self, name: &str) -> usize {
+        self.calls.lock().unwrap().iter().filter(|n| *n == name).count()
+    }
+}
+#[async_trait]
+impl Functions for Shipments {
+    fn has(&self, _: &str) -> bool {
+        true
+    }
+    fn at_most_once(&self, name: &str, _: &Value) -> bool {
+        name == "create"
+    }
+    async fn call(&self, _: &str, _: Value, _: &CallInfo<'_>) -> Result<Value, WorkflowError> {
+        unreachable!("durable runs invoke")
+    }
+    async fn invoke(&self, name: &str, args: Value, info: &CallInfo<'_>) -> Result<Value, CallFailure> {
+        let before = self.count(name);
+        self.calls.lock().unwrap().push(name.into());
+        match name {
+            "create" => (self.create)(before),
+            "lookup" => Ok(json!({ "found": args["reference"] })),
+            "check" if before == 0 => Err(CallFailure::answer(WorkflowError::not_executed("busy, nothing sent"))),
+            _ => Ok(json!({ "checked": info.attempt })),
+        }
+    }
+}
+
+const SHIP: &str = r#"do:
+  - ship:
+      try:
+        - create: { call: create }
+      catch:
+        errors: { with: { type: urn:ouro:errors:call.unknown } }
+        as: unknown
+        retry: { limit: { attempt: { count: 3 } } }
+        do:
+          - lookup: { call: lookup, with: { reference: '${ $unknown.instance }' } }
+"#;
+
+#[tokio::test]
+async fn a_catch_naming_the_unknown_type_reconciles_an_unknown_at_most_once_outcome() {
+    let lookup = json!({ "found": "/do/0/ship/try/0/create" });
+    let shipments =
+        Shipments::new(|_| Err(CallFailure::answer(WorkflowError::unknown_outcome("timed out after send"))));
+    let time = Arc::new(Time(AtomicI64::new(1_000)));
+    let mut h = host(Arc::new(World::default()), time.clone());
+    h.functions = shipments.clone();
+    let store = Store::default();
+    let wf = workflow(SHIP);
+    assert_eq!(drive(&h, &time, &wf, &store).await, Status::Completed(lookup.clone()));
+    // Never sent again, by the retry policy or by recovery; the journal says
+    // the create may have happened.
+    assert_eq!((shipments.count("create"), shipments.count("lookup")), (1, 1));
+    let journal = ows::durable::call_journal(&store.records());
+    let create = journal.iter().find(|c| c.function == "create").unwrap();
+    assert_eq!(create.state, ows::durable::CallStatus::Unknown);
+    assert_eq!(drive(&h, &time, &wf, &store).await, Status::Completed(lookup));
+    assert_eq!(shipments.count("create"), 1);
+    // A catch-all or a status filter is written for definite failures: an
+    // unknown outcome passes it and faults the run.
+    for filter in ["", "errors: { with: { status: 409 } }"] {
+        let shipments =
+            Shipments::new(|_| Err(CallFailure::answer(WorkflowError::unknown_outcome("timed out after send"))));
+        h.functions = shipments.clone();
+        let wf = workflow(&SHIP.replace("errors: { with: { type: urn:ouro:errors:call.unknown } }", filter));
+        let status = drive(&h, &time, &wf, &Store::default()).await;
+        assert!(matches!(&status, Status::Faulted(e) if e.type_ == CALL_UNKNOWN), "{filter}: {status:?}");
+        assert_eq!((shipments.count("create"), shipments.count("lookup")), (1, 0), "{filter}");
+    }
+}
+
+// A crash between the dispatch and the commit of its answer leaves the same
+// evidence as a function that answered unknown: recovery raises the same
+// error, the same catch reconciles, and the create is never sent twice.
+#[tokio::test]
+async fn a_crash_between_dispatch_and_record_is_the_same_unknown_outcome() {
+    let lookup = json!({ "found": "/do/0/ship/try/0/create" });
+    let created = json!({ "shipment": 7 });
+    let wf = workflow(SHIP);
+    type Create = fn(usize) -> Result<Value, CallFailure>;
+    let answered: Create = |_| Ok(json!({ "shipment": 7 }));
+    let unknown: Create = |_| Err(CallFailure::answer(WorkflowError::unknown_outcome("timed out after send")));
+    for (case, create) in [("answered", answered), ("unknown", unknown)] {
+        let baseline = Store::default();
+        let time = Arc::new(Time(AtomicI64::new(1_000)));
+        let mut h = host(Arc::new(World::default()), time.clone());
+        h.functions = Shipments::new(create);
+        drive(&h, &time, &wf, &baseline).await;
+        let saves = baseline.saves.load(Ordering::SeqCst);
+        for after_commit in [false, true] {
+            for at in 1..=saves {
+                let store = Store { after_commit, ..Store::default() };
+                store.fail_at.store(at, Ordering::SeqCst);
+                let shipments = Shipments::new(create);
+                h.functions = shipments.clone();
+                let status = drive(&h, &time, &wf, &store).await;
+                let label = format!("{case}, crash at {at} (after commit: {after_commit})");
+                assert!(shipments.count("create") <= 1, "{label}");
+                let state = ows::durable::call_journal(&store.records())
+                    .into_iter()
+                    .find(|c| c.function == "create")
+                    .map(|c| c.state);
+                if status == Status::Completed(created.clone()) {
+                    assert_eq!(case, "answered", "{label}");
+                    assert_eq!(state, Some(ows::durable::CallStatus::Completed), "{label}");
+                } else {
+                    assert_eq!(status, Status::Completed(lookup.clone()), "{label}");
+                    // Reconciled only from an honest unknown: an intent
+                    // without an answer (a crash between the intent and the
+                    // dispatch loses the create, which the lookup tells).
+                    assert_eq!(state, Some(ows::durable::CallStatus::Unknown), "{label}");
+                }
+            }
+        }
+    }
+}
+
+// A function that refused before doing anything answers not executed: the
+// answer is saved, recovery returns it again instead of sending the call
+// (the workflow may already have acted on it), and only a retry, a new
+// attempt, sends it again, at most once included.
+#[tokio::test]
+async fn a_not_executed_answer_is_restored_on_recovery_and_retried_only_by_a_new_attempt() {
+    let wf = workflow(
+        r#"do:
+  - checked:
+      try:
+        - check: { call: check, metadata: { delivery: at_most_once } }
+      catch:
+        errors: { with: { type: urn:ouro:errors:call.not_executed } }
+        retry: { limit: { attempt: { count: 2 } } }
+"#,
+    );
+    let time = Arc::new(Time(AtomicI64::new(1_000)));
+    let mut h = host(Arc::new(World::default()), time.clone());
+    let shipments = Shipments::new(|_| unreachable!());
+    h.functions = shipments.clone();
+    let store = Store::default();
+    assert_eq!(drive(&h, &time, &wf, &store).await, Status::Completed(json!({ "checked": 2 })));
+    assert_eq!(shipments.count("check"), 2, "the retry sent it again");
+    let journal = ows::durable::call_journal(&store.records());
+    let states: Vec<_> = journal.iter().map(|c| (c.key.as_str(), c.state)).collect();
+    assert_eq!(
+        states,
+        [
+            ("/do/0/checked/try/0/check#call", ows::durable::CallStatus::NotExecuted),
+            ("/do/0/checked/try[2]/0/check#call", ows::durable::CallStatus::Completed),
+        ]
+    );
+    // Without a retry, the catch acts on the refusal. A crash after the
+    // refusal was saved and before the catch's own checkpoint restores it,
+    // so recovery takes the same branch and sends nothing.
+    let wf = workflow(
+        r#"do:
+  - checked:
+      try:
+        - check: { call: check }
+      catch:
+        errors: { with: { type: urn:ouro:errors:call.not_executed } }
+        do: [ { later: { set: { later: true } } } ]
+"#,
+    );
+    let baseline = Store::default();
+    let shipments = Shipments::new(|_| unreachable!());
+    h.functions = shipments.clone();
+    assert_eq!(drive(&h, &time, &wf, &baseline).await, Status::Completed(json!({ "later": true })));
+    // The call's record is saved twice: its intent, then the refusal.
+    let key = "/do/0/checked/try/0/check#call";
+    let refusal = baseline.log.lock().unwrap().iter().enumerate().filter(|(_, k)| *k == key).nth(1).unwrap().0 + 1;
+    for at in 1..=baseline.saves.load(Ordering::SeqCst) {
+        for after_commit in [false, true] {
+            let store = Store { after_commit, ..Store::default() };
+            store.fail_at.store(at, Ordering::SeqCst);
+            let shipments = Shipments::new(|_| unreachable!());
+            h.functions = shipments.clone();
+            let status = drive(&h, &time, &wf, &store).await;
+            let state = store.records().get(key).and_then(|r| match r {
+                Record::Call { state, .. } => Some(state.clone()),
+                _ => None,
+            });
+            let label = format!("crash at {at} (after commit: {after_commit})");
+            if at == refusal && !after_commit {
+                // The refusal was never saved: an at-least-once call without
+                // an answer is sent again, and this time it is answered.
+                assert_eq!(status, Status::Completed(json!({ "checked": 1 })), "{label}");
+                assert_eq!(shipments.count("check"), 2, "{label}");
+            } else {
+                assert_eq!(status, Status::Completed(json!({ "later": true })), "{label}");
+                assert!(matches!(state, Some(ows::durable::CallState::NotExecuted(_))), "{label}");
+                assert_eq!(shipments.count("check"), 1, "{label}: a saved refusal is never sent again");
+            }
+        }
+    }
 }

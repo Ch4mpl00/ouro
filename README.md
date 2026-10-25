@@ -37,7 +37,9 @@ the call's span (current while the handler runs), the function, definition,
 version and delivery, and the runtime's meter (Observability, below). Return
 JSON, an annotated `Output`, or `FunctionError` (OWS Problem Details); YAML
 `try/catch` handles ordinary function and schema errors. Both input and
-output schemas are checked.
+output schemas are checked. An error can also say that the call did nothing,
+that its outcome is unknown, or that the handler was stopped (Call outcomes,
+below).
 
 ```rust
 // A model step: its text, and its usage as annotations.
@@ -128,8 +130,8 @@ control surface.
 event (as `emit`): its record key (where its arguments and result are), the
 function, its delivery, and its state: `pending` (an at-least-once call
 without an answer, dispatched again on recovery), `completed`, `failed` (an
-error answer), `not_executed` or `unknown` (an at-most-once call that may have
-run and is never sent again). The interpreter's `Outcome::calls` carries the
+error answer), `not_executed` (refused before it did anything) or `unknown`
+(an at-most-once call that may have run and is never sent again). The interpreter's `Outcome::calls` carries the
 same journal. The engine does not decide whether a run changed the world; a
 host reads the journal to choose between rerunning a failed run, handing it
 over, or reconciling it.
@@ -241,6 +243,80 @@ journal). Replay rejects missing or changed call bindings and requires evidence
 that has not been swept. Fork scheduling and all time-dependent decisions are
 not a deterministic simulation; that is future work.
 
+## Call outcomes
+
+A handler's error is a definite failure unless its type says how far the
+call got. Three constructors build those types; a process runner and a dry
+run's mock answer the same way:
+
+| Error | Recorded as | The workflow sees | Recovery and retries |
+| --- | --- | --- | --- |
+| any other `FunctionError` | `failed` | the error, caught like any | restored; a retry sends the call again unless it is at most once |
+| `FunctionError::not_executed(detail)` (`urn:ouro:errors:call.not_executed`, 503) | `not_executed`: the call refused before doing anything | the error, caught like any | restored, not sent again; a retry (a new attempt) may send it again, an at-most-once call included |
+| `FunctionError::unknown_outcome(detail)` (`urn:ouro:errors:call.unknown`, 409) | at most once: `unknown`, the intent without an answer; at least once: `pending` | at most once: `urn:ouro:errors:call.unknown` with the call's reference, handled only by a `catch` that names that type; at least once: the error, caught like any | at most once: never sent again, by recovery or a retry; at least once: may be sent again |
+| `FunctionError::interrupted(detail)` (`urn:ouro:errors:call.interrupted`, 499) | nothing new: the intent stays | nothing: the run stops `Interrupted` (an at-most-once call is unknown instead) | the run recovers and sends an at-least-once call again |
+
+A function that did not even send its request (its own validation refused,
+its client could not connect) answers `not_executed`; one whose request went
+out and whose answer never came (a timeout, a dropped connection) answers
+`unknown_outcome`; a plain error is an answer the recipient gave. When in
+doubt, it is unknown: only a proof that nothing happened is `not_executed`.
+
+An unknown at-most-once outcome is the same record a crash between the
+dispatch and the commit of its answer leaves, so a recovered run raises the
+same error and takes the same branch. The handler's own detail reaches the
+observers and the call's span, not the workflow, since recovery after such a
+crash could not reproduce it. A catch-all `catch` or a status filter does not
+take an unknown outcome for a definite failure: the run faults with it (an
+unhandled error for the breaker) unless a `catch` names its type, and that
+`catch` never retries the attempt. For example, a carrier API that creates a
+shipment and accepts no idempotency key, so `create_shipment` is at most
+once:
+
+```rust
+Function::new("create_shipment", input, output, |args: Value, cx: FunctionContext| async move {
+    match carrier.create(&args, &cx.span).await {           // the host's client
+        Ok(shipment) => Ok(json!({ "shipment": shipment.id })),
+        Err(e) if e.not_sent() => Err(FunctionError::not_executed(e.to_string())),
+        Err(e) if e.timed_out_after_send() => Err(FunctionError::unknown_outcome(e.to_string())),
+        Err(e) => Err(FunctionError::communication(e.status(), e.to_string())),
+    }
+})
+.with_delivery(Delivery::AtMostOnce)
+```
+
+```yaml
+do:
+  - ship:
+      try:
+        - create: { call: create_shipment, with: { order: '${ .order }' } }
+      catch:
+        errors: { with: { type: urn:ouro:errors:call.unknown } }
+        as: unknown              # its instance names the create's task
+        do:
+          - find: { call: find_shipment, with: { order: '${ .order }' } }
+          - escalate:
+              if: '${ .shipment == null }'
+              call: open_ticket
+              with: { about: '${ $unknown.instance }' }
+```
+
+The workflow continues with the shipment the lookup finds, or escalates when
+there is none; the create is never sent twice (`crates/runtime/tests/outcomes.rs`
+runs this definition). A refusal is different: `try` with `errors:
+{ with: { type: urn:ouro:errors:call.not_executed } }` and a `retry` sends the
+call again, since nothing was done.
+
+**Cancellation.** `FunctionContext::cancel` fires when the run is cancelled (in
+this process at once, from another one at its next lease renewal), when the
+worker stops, and when a renewal finds the lease lost or the emergency stop
+set. The runtime does not wait for the handler: it drops the handler's future,
+even one that never looks at the token, so a handler that started work outside
+its future (a remote job, a spawned task) watches the token to stop it. What
+the handler would have answered is not recorded: the call keeps its intent,
+`unknown` if it is at most once (never sent again), `pending` otherwise (sent
+again when the run recovers on another worker, never for a cancelled run).
+
 ## Observability
 
 The runtime uses the OpenTelemetry API only. Hosts inject a tracer
@@ -257,7 +333,9 @@ span per task it enters and a `function <name>` span per call it dispatches
 (a task an earlier drive entered and this one resumes has no span in it;
 its calls hang under the root), attributed with
 `ouro.run.id`, `ouro.definition.name`, `ouro.definition.version`,
-`ouro.task.path`, `ouro.attempt` and `ouro.outcome`. A run admitted inside a
+`ouro.task.path`, `ouro.attempt` and `ouro.outcome` (and, on a function
+span, `ouro.call.outcome`: how far the call got, as `ouro.calls` labels it).
+A run admitted inside a
 span (the host's request, a parent run's call) pins that span's
 `trace_id`/`span_id` in its admission; `inspect` returns them and every
 drive's root span links to them. The call's span is
@@ -652,6 +730,27 @@ wait closes; changing its payload or wait is a conflict. Matching contexts
 are redacted before persistence; a response requiring secret values is
 refused rather than guessed without the host's secret resolver.
 
+Breaking changes (issue #25, call outcomes), for hosts and definitions
+written before it:
+
+- An unknown at-most-once outcome is `urn:ouro:errors:call.unknown`
+  (`ouro_runtime::CALL_UNKNOWN`), no longer the standard-namespace
+  `outcome_unknown`: a host that matched `error.is("outcome_unknown")`
+  compares the type. A `catch` naming that type now handles it; a catch-all
+  still does not.
+- A handler's, process runner's or mock's error of type
+  `urn:ouro:errors:call.not_executed`, `call.unknown` or `call.interrupted`
+  is that outcome, not a failed answer. `ows::run::Functions::invoke`
+  (default) and `execute` classify `call`'s errors the same way
+  (`CallFailure::answer`).
+- Recovery restores a saved not-executed answer instead of sending the call
+  again. Replay serves a recorded refusal and a call without an answer
+  instead of failing on a missing result.
+- Function spans carry `ouro.call.outcome`.
+- The durable state version is 13: run rows written under 12 are refused,
+  not converted (the record formats are unchanged; the interpretation of an
+  unknown outcome and of a refusal on recovery changed).
+
 Breaking changes (issue #29), for hosts and adapters written before it:
 
 - A manual pause now refuses every admission of the definition, pinned or
@@ -916,7 +1015,8 @@ dispatched again, with the same idempotency key. A function declares
 tighten its call with `metadata.delivery: at_most_once`, never loosen it. The
 effective delivery is bound into the invocation record and into the run's
 pinned bindings. At most once commits intent before dispatch; intent without a
-response produces `outcome_unknown`, never another dispatch. This can lose a
+response produces `urn:ouro:errors:call.unknown` (Call outcomes, above),
+never another dispatch. This can lose a
 call if the process dies before sending; neither mode promises exactly-once
 external effects. A function may use its stable idempotency key for recipient
 deduplication or reconciliation. A run without a journal (`ows::run::run`)
@@ -1013,8 +1113,9 @@ Both initial migrations were replaced before any release or deployment. This
 layout requires a fresh database from the earlier development checkout; there
 is no conversion of that unreleased layout. Applied migrations are immutable
 from the next release onward. The SQL schema is a generic key/value table, so
-the row shapes above (and the interpreter's durable state version, now 12:
-a run row may be held by an operator) can
+the row shapes above (and the interpreter's durable state version, now 13; 12:
+a run row may be held by an operator; 13: an unknown at-most-once
+outcome is catchable by its type, and recovery restores a refusal) can
 change without a migration; nothing persisted before them is converted. Each
 run row records the durable state version it was written under, and a row of
 another version (including the earlier one-aggregate-per-run layout) is

@@ -11,8 +11,8 @@
 // (flow, data, errors, retries, timers, event matching and consumption,
 // extensions) are evaluated here.
 use crate::durable::{
-    self, Annotation, Annotations, CallEntry, CallFailure, CallState, Delivery, Journal, Record, StepOutcome,
-    TaskResult,
+    self, Annotation, Annotations, CALL_INTERRUPTED, CALL_NOT_EXECUTED, CALL_UNKNOWN, CallEntry, CallFailure,
+    CallState, Delivery, Journal, Record, StepOutcome, TaskResult,
 };
 use crate::events::{self, Offer};
 use crate::expr::{self, Args};
@@ -147,14 +147,19 @@ pub trait Functions: Send + Sync {
     fn has(&self, name: &str) -> bool;
     /// Durable entry point. Adapters must honor delivery at every internal
     /// retry boundary; only proven non-execution permits an at-most-once retry.
+    /// By default an error of `call` that does not say how far the call got
+    /// (`CallFailure::answer`) is conservatively an unknown outcome.
     async fn invoke(&self, name: &str, args: Value, info: &CallInfo<'_>) -> Result<Value, CallFailure> {
-        self.call(name, args, info).await.map_err(CallFailure::Unknown)
+        self.call(name, args, info).await.map_err(|e| match CallFailure::answer(e) {
+            CallFailure::Response(e) => CallFailure::Unknown(e),
+            typed => typed,
+        })
     }
     /// Ephemeral invocation, including a host-level stop that YAML cannot
     /// catch. Ordinary adapters keep their existing catchable error contract.
     /// A workbench, for example, interrupts when required test data is absent.
     async fn execute(&self, name: &str, args: Value, info: &CallInfo<'_>) -> Result<Value, CallFailure> {
-        self.call(name, args, info).await.map_err(CallFailure::Response)
+        self.call(name, args, info).await.map_err(CallFailure::answer)
     }
     async fn call(&self, name: &str, args: Value, info: &CallInfo<'_>) -> Result<Value, WorkflowError>;
     /// Whether this invocation is at most once whatever its task says: the
@@ -552,9 +557,32 @@ impl WorkflowError {
     }
     /// A host budget ran out: the run tree's jumps, an `on_exceeded`
     /// handler's allowance, or the nesting depth of child runs. CHOICE: in
-    /// the standard namespace like `outcome_unknown`, status 508 (a loop).
+    /// the standard namespace, status 508 (a loop).
     pub fn budget(detail: impl Into<String>) -> Self {
         Self::standard("budget.exhausted", 508, "Budget Exhausted", detail)
+    }
+    /// A function's answer that it refused the call before doing anything
+    /// (`durable::CALL_NOT_EXECUTED`): its input failed the function's own
+    /// checks, a precondition did not hold, the request was never sent.
+    /// CHOICE: status 503, a request that was not processed.
+    pub fn not_executed(detail: impl Into<String>) -> Self {
+        Self::call_outcome(CALL_NOT_EXECUTED, 503, "Not Executed", detail)
+    }
+    /// A function's answer that it cannot tell whether the call had its
+    /// effect (`durable::CALL_UNKNOWN`): a request that timed out or lost
+    /// its connection after it was sent. CHOICE: status 409, as retrying an
+    /// at-most-once call would conflict with its delivery.
+    pub fn unknown_outcome(detail: impl Into<String>) -> Self {
+        Self::call_outcome(CALL_UNKNOWN, 409, "Outcome Unknown", detail)
+    }
+    /// A function's answer that it was stopped, which is no answer
+    /// (`durable::CALL_INTERRUPTED`): the run stays recoverable. CHOICE:
+    /// status 499, as the host went away before the answer.
+    pub fn interrupted(detail: impl Into<String>) -> Self {
+        Self::call_outcome(CALL_INTERRUPTED, 499, "Interrupted", detail)
+    }
+    fn call_outcome(type_: &str, status: u16, title: &str, detail: impl Into<String>) -> Self {
+        Self { type_: type_.into(), status, title: Some(title.into()), detail: Some(detail.into()), instance: None }
     }
     /// Whether this is the standard error `kind` (`"timeout"`, …).
     pub fn is(&self, kind: &str) -> bool {
@@ -1137,13 +1165,15 @@ impl Run<'_> {
         })
     }
 
+    /// An at-most-once call under `reference` may have run. The error is the
+    /// same whether its function answered `CALL_UNKNOWN` or a crash left its
+    /// intent without an answer, so recovery and replay raise what the first
+    /// execution raised (the function's own detail goes to the observer).
+    /// Fatal: only a `catch` that names its type handles it (`attempt`).
     fn unknown(&self, reference: &str) -> Fault {
-        Fault::Fatal(WorkflowError::standard(
-            "outcome_unknown",
-            409,
-            "Outcome unknown",
-            format!("{reference}: at-most-once call may have executed; automatic retry is forbidden"),
-        ))
+        Fault::Fatal(WorkflowError::unknown_outcome(format!(
+            "{reference}: at-most-once call may have executed; automatic retry is forbidden"
+        )))
     }
 
     fn observe(&self, event: Event<'_>) {
@@ -1960,7 +1990,11 @@ impl Run<'_> {
                 CallState::Pending if delivery == Delivery::AtMostOnce => {
                     return self.unknown_call(&key, logical, name, args, reference).await;
                 }
-                _ => {}
+                // An answer the workflow already acted on (a `catch` may have
+                // committed what followed it): restored like any answer. A
+                // DSL retry, a new attempt, may send the call again.
+                CallState::NotExecuted(error) => return Err(Fault::Error(error.clone())),
+                CallState::Pending => {}
             }
         } else if prior.is_some() {
             return Err(Fault::Interrupted(WorkflowError::runtime("invalid call record")));
@@ -2068,6 +2102,9 @@ impl Run<'_> {
             }
             return result.map_err(|failure| match failure {
                 CallFailure::Interrupted(error) => Fault::Interrupted(error),
+                // As in a durable run: no `catch` but one naming its type
+                // handles an unknown at-most-once outcome.
+                CallFailure::Unknown(_) if delivery == Delivery::AtMostOnce => self.unknown(reference),
                 CallFailure::Response(error) | CallFailure::NotExecuted(error) | CallFailure::Unknown(error) => {
                     Fault::Error(error)
                 }
@@ -2804,6 +2841,13 @@ impl Run<'_> {
             let error = match result {
                 Ok(next) => return Ok(ended(next)),
                 Err(Fault::Error(e)) => e,
+                // CHOICE: an unknown at-most-once outcome is no ordinary
+                // error. A catch-all written for definite failures would
+                // compensate or retry a call that may have had its effect,
+                // so only a `catch` whose `errors.with.type` names
+                // `CALL_UNKNOWN` handles it (to reconcile: look the effect up,
+                // escalate). It never retries the attempt (`blocks_retry`).
+                Err(Fault::Fatal(e)) if e.type_ == CALL_UNKNOWN && names_unknown(catch) => e,
                 Err(stop) => return Err(stop),
             };
             let mut caught = scope.clone();
@@ -3011,6 +3055,12 @@ impl Run<'_> {
 }
 
 /// `when` must hold and `exceptWhen` must not.
+/// Whether a `catch` names the unknown-outcome type in its filter, the only
+/// way it handles an unknown at-most-once outcome.
+fn names_unknown(catch: &Catch) -> bool {
+    catch.errors.as_ref().and_then(|filter| filter.get("type")).and_then(Value::as_str) == Some(CALL_UNKNOWN)
+}
+
 fn guards(when: Option<&str>, except_when: Option<&str>, input: &Value, args: &Args) -> Result<bool, Fault> {
     if let Some(w) = when
         && !expr::truthy(&expr::eval(w, input, args).map_err(expression)?)

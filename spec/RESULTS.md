@@ -1,3 +1,27 @@
+# Contract checking — 2026-10-25, call outcomes (#25)
+
+A function says how far its call got: refused before doing anything, outcome
+unknown, or stopped. Only the refusal is a new transition: `rejected`, the
+function's saved answer to a dispatch, withdraws it (ghost `refusals`, shadow
+`exposed`), so E2 bounds an at-most-once call's dispatches by one plus its
+refusals. An unknown answer and a stop are the intent without an answer that
+a crash after `dispatch` leaves, so they need no command. Merged with #28 and
+#29 (a refusal is an answer, which a hold does not refuse). Quick checks only:
+
+| Check | Scope | Result | Time |
+| --- | --- | --- | --- |
+| Typecheck | `contract`, `contract_witnesses`, `contract_bounded`, `contract_concurrent` | Pass | under 7 s each |
+| Witnesses | 71 runs, `refusalTest` and `lostRefusalTest` added to `bridgeSuite` (65 histories with `bridgeTail`) | Pass | 14 s |
+| Simulation | 2,000 × 150 steps, seed 20261023, invariant `checked` | No violation | 56 s |
+| Safety mutants | 57, with `E2/unknown` (an unknown outcome sent again on recovery), `E2/refused` and `E4/refused` | All targets detected | 391 s |
+| Fault rows, fault detection | 11 switches × 1,000 × 150 steps; 11 rows (before the merge with #29) | No violation; all detected | 330 s, 62 s |
+| Serial and concurrent MBT | memory and SQLite, 100 × 150 + `bridgeSuite` (38 commands with init), 12 rounds × 8 batches | Pass | 52 s, 91 s |
+| fmt, Clippy, `OURO_REQUIRE_QUINT=1 cargo test --workspace --no-fail-fast` | 274 Rust tests and 21 CTK scenarios; Postgres conformance (call outcomes crashed at every commit) and scalability on testcontainers | Pass | 459 s for the tests |
+| Prohibited-name scan | `crates`, `examples` | Empty | |
+
+Not run: TLC, Apalache, the temporal quotients. `contract_progress*.qnt` is
+unchanged and `contract-evidence.json` was not regenerated.
+
 # Contract checking — 2026-10-25, hold and release of a run, manual pause (#29)
 
 The model gains held runs and an operator's pause (`manual`). H1: a held run
