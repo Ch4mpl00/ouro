@@ -472,7 +472,12 @@ module contract {
       (if (c.queued < 0) buffered and d.queued == r and d.queueInput == value else skipped and d.queued == c.queued))
     val queueStable = c.queued < 0 or d.queued < 0 or
       (c.queued == d.queued and c.queueSlot == d.queueSlot and c.queueInput == d.queueInput and c.queueRefused == d.queueRefused)
-    val queueReady = not(a.db.stopped) and c.queued >= 0 and not(b.db.runs.nth(c.queued).admitted) and d.armed and not(d.tripped) and
+    // A buffered slot's run id may also be admitted directly by the operation
+    // itself (the model has three run ids): that is no promotion, and the
+    // promotion monitors below do not apply to it.
+    val admittedByOp = c.queued >= 0 and ((Set("admit","dry","replay","pin","ingress","fire","refuse").contains(op) and r == c.queued) or
+      (op == "child" and r+1 == c.queued))
+    val queueReady = not(a.db.stopped) and c.queued >= 0 and not(admittedByOp) and not(b.db.runs.nth(c.queued).admitted) and d.armed and not(d.tripped) and
       op != "activate" and not(Runs.exists(k => k != c.queued and live(a.db.runs.nth(k)) and a.db.runs.nth(k).scheduled)) and
       Runs.filter(k => k != c.queued and live(a.db.runs.nth(k))).size() < c.maxRuns
     val errorPromotion = flag(errorQueue,"OverlapQueue",queueStable and (not(queueReady) or
@@ -505,7 +510,7 @@ module contract {
     // The threshold observation trips and reports it once, stopping the
     // schedule; a tripped breaker ignores later observations; only an
     // activation clears it; notices change only at a trip.
-    val promotedRefusal = c.queued >= 0 and c.queueRefused and not(b.db.runs.nth(c.queued).admitted) and a.db.runs.nth(c.queued).admitted
+    val promotedRefusal = c.queued >= 0 and c.queueRefused and not(admittedByOp) and not(b.db.runs.nth(c.queued).admitted) and a.db.runs.nth(c.queued).admitted
     // Only runs of the active version count; a pinned run of other content
     // never does (its epoch is none), tripped or not.
     val observed = execution.epoch == c.epoch and execution.version == c.active and not(c.tripped)
