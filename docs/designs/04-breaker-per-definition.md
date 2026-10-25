@@ -1,6 +1,6 @@
 # 04. Breaker threshold per definition
 
-Status: approved · Issue: 35 · Review: goldfish round 1 (2026-10-25), resolved below · Requested by: ouro-agent migration (its design 01, finding H3)
+Status: implemented (aa0d93a, 95dbdbf) · Issue: 35 · Review: goldfish round 1 (2026-10-25), resolved below · Requested by: ouro-agent migration (its design 01, finding H3)
 
 ## Problem
 
@@ -55,6 +55,13 @@ Resolutions of review round 1 are marked (R-n).
   resolved at promotion from the active version, like every other fault. The
   `Queued` layout's `failure.breaker_threshold` field is dropped (its layout
   version bumps; queued entries of the old layout are refused).
+  *Implementation note:* the promotion needs the host default for an `Inherit`
+  version and the document gives it no other source (the engine's `Policy` has no
+  such field and `terminate`/`drain_queues` carry no threshold). The entry
+  therefore keeps the default that came with the refusal (`Refused::breaker_threshold`),
+  which is only what `Inherit` resolves to; it never decides the outcome for a
+  version with a policy of its own. The entry's shape is unchanged, so its layout
+  does not bump.
 - **Reporting (R-M2):** nothing new — `consecutive_faults` keeps counting under
   `Off` and is visible in the summary; no trip, no trip event.
 - **Digest (R-M3):** the policy is part of the YAML, hence of the canonical

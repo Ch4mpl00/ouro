@@ -133,8 +133,17 @@ admitted in the active version's current epoch, and the schedule slots of that
 epoch whose run the host refused to admit; cancellations and interruptions
 (even exhausted ones) do not count, and a success resets the count. The breaker
 reports and never rolls back: the runtime does not know which version is the
-safe one. N consecutive faults (`Config::breaker_threshold`, default 3) trip
-the definition in the commit of the Nth fault: `definitions(name).tripped`
+safe one. N consecutive faults trip the definition in the commit of the Nth
+fault, where N is the active version's own policy
+(`document.metadata.ouro.breaker`: `{ threshold: n }`, or `off`, which counts
+and never trips) and otherwise `Config::breaker_threshold` (default 3). The
+store resolves N from the active version in the commit that counts the fault,
+so the calls that carry a threshold (`RunStore::finish`, `Refused`) pass the
+host's default; `Runtime::save` reads the policy from the parsed definition
+and gives it to `RunStore::save_definition(name, yaml, breaker)` (text a host
+saves without parsing it has `Breaker::Inherit`). A refused slot buffered by
+the `queue` overlap policy is judged at promotion, by the version active then.
+`definitions(name).tripped` `definitions(name).tripped`
 holds the `Trip` (version, epoch, faults, threshold, the run and its error),
 its schedule stops, running runs finish and are no longer counted, and a
 notice is stored with the trip. No new run of the definition is admitted by

@@ -39,7 +39,7 @@ The engine owns primary and secondary keys in `(kind, id)` order:
 | `pending:<hex run ID>:<hex type>`, `published:<hex run ID>` | sequence | Pending copies of a type, and published ones, oldest first |
 | `live:<hex run ID>:<hex type>`, `live_published:<hex run ID>` | ordered expiry + sequence | The same by expiry, for waking a waiting run |
 | `expiry:<hex run ID>` | ordered expiry + sequence | Pending mailbox copies, for expiry records |
-| `definitions` | definition name | One name's immutable versions, active version, epoch, breaker count and trip, and armed trigger keys |
+| `definitions` | definition name | One name's immutable versions (each with its text, digest and breaker policy), active version, epoch, breaker count and trip, and armed trigger keys |
 | `notice` | ordered time + hex name + epoch | A CloudEvent committed for the host (a breaker trip), until acknowledged |
 | `name:<hex name>` | run ID | Listing by name and run-ID prefix |
 | `due` | ordered time + run ID | Bounded pages of eligible runs; running runs use lease expiry |

@@ -178,7 +178,9 @@ manual pause's actor, reason and note). Each `VersionSummary` carries the
 version's latest activation: `activated_ms` (the runtime's clock),
 `activated_epoch` and, when the host activated it with
 `Runtime::activate_as(name, version, actor, note)`, `activated_by` and
-`activation_note`; all `None` for a version never activated. Only the
+`activation_note`; all `None` for a version never activated. It also shows
+the version's `breaker` policy (`Inherit`, `Off` or `Threshold(n)`, from
+`document.metadata.ouro.breaker`). Only the
 latest activation per version is kept, in the definitions row: that row is
 read by every admission and terminal commit of the name, so an unbounded
 history there would grow their cost with every activation, while one entry
