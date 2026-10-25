@@ -48,7 +48,7 @@ are the bridges in `crates/durable/tests/quint.rs` and `quint/concurrent.rs`.
 | W3 | `W3`: addressed mailbox, explicit expiry with a record | Serial MBT (expiry record audited); `gaps::w3_mailbox_expiry_is_observable` |
 | W4 | `W4`: FIFO among pending matching copies | Serial MBT; delivery conformance; one type in the model |
 | W5 | `W5`: publication recipients and subscription survival | Concurrent publish/finish; existing multi-take DSL tests |
-| C1 | `C1`: acyclic owned link and one child admission | Serial MBT; native-child recovery tests; host data of children (design 03: none for a workflow-started child, exactly the host function's for a host child, a join keeps the first commit's, also around the child commit) in conformance `host_data` and `crates/runtime/tests/host.rs`, not in the model |
+| C1 | `C1`: acyclic owned link and one child admission | Serial MBT; native-child recovery tests; host data of children (design 03: none for a workflow-started child, exactly the host function's for a host child, a join keeps the first commit's, also around the child commit), the typed link conflict and per-attempt child ids (a re-dispatch joins, a DSL retry starts its own) in conformance `host_data`, `crates/runtime/tests/host.rs` and `dsl.rs`, not in the model (ids are opaque there) |
 | C2 | `C2`: terminal child has notification obligation | Serial MBT audits the parent's one notification; child conformance |
 | C3 | `C3`: any end of a run (completion, fault, cancellation) closes its owned subtree, transitively, in that transition | Serial MBT (`childTest`, `childFinishTest`, `grandchildTest`; the bridge audits that no owned child outlives its parent); conformance audit and commit faults; handler cancellation tests remain separate |
 | T1 | `T1`: slot disposition (a refused slot's run included), overlap and global ingress identity | Concurrent firings and ingress; serial MBT; `t1_*` runtime regressions |
@@ -160,7 +160,8 @@ deadline fixed at admission and epoch.
   stored version carries a policy, `policy`, 0 for `off` and n for a threshold; the host default is
   two; versions 1 and 3 share a text and so a policy; `initWith(a, b)` picks the
   policies of the initial catalog and `initAny` every pair for the random
-  traces); only runs of the
+  traces: the bridge's MBT and `check.py`'s `contract-simulation-policies`
+  start from it); only runs of the
   current epoch count; unhandled failures, timeouts, unknown endings and
   binding conflicts count, cancellations do not. It reports and never rolls
   back: the threshold observation trips the definition (no admission of the tripped content digest,
@@ -422,7 +423,8 @@ spec/check.sh
 ```
 
 This installs locked npm dependencies, typechecks all modules, runs the
-witnesses, simulates 10,000 traces × 150 steps, computes the concurrent batches,
+witnesses, simulates 10,000 traces × 150 steps (and as many again from
+`initAny`, every pair of breaker policies), computes the concurrent batches,
 runs the symbolic contract check and the TLC progress quotient, detects mutants,
 and runs formatting, Clippy, workspace tests and the restart example; with
 `TEST_DATABASE_URL`, also both Postgres bridges. `--only model`, `--only
