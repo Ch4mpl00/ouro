@@ -783,6 +783,7 @@ pub async fn run_all(factory: impl AsyncFn(&str) -> anyhow::Result<TestStore>) -
     definition_queries(&factory, &mut report).await?;
     heartbeats(&factory, &mut report).await?;
     annotation_totals(&factory, &mut report).await?;
+    call_outcomes(&factory, &mut report).await?;
     read_only(&factory, &mut report).await?;
     dropped(&factory, &mut report).await?;
     Ok(report)
@@ -2435,6 +2436,219 @@ async fn listen_case(
         usize::from(mode != 3)
     );
     Ok((saves, interrupted))
+}
+
+// How far a call got, as its function answers it (issue #25), persisted by
+// the adapter: a refusal (`NotExecuted`) is saved and a new attempt may send
+// the call again, at most once included; an unknown at-most-once outcome
+// keeps its intent without an answer, and a crash between the dispatch and
+// the commit of its answer leaves the same evidence. Every commit boundary is
+// crashed before and after, then the run is recovered on another handle.
+
+/// A shipment service: `create` (at most once) answers as its scenario
+/// says, `lookup` finds what a create may have left, `check` (at most once)
+/// refuses its first call before doing anything. Dispatches are counted
+/// across executions, as an external recipient would.
+struct Shipments {
+    unknown: bool,
+    dispatches: std::sync::Mutex<BTreeMap<String, usize>>,
+}
+impl Shipments {
+    fn count(&self, name: &str) -> usize {
+        self.dispatches.lock().unwrap().get(name).copied().unwrap_or(0)
+    }
+}
+#[async_trait::async_trait]
+impl ows::run::Functions for Shipments {
+    fn has(&self, _: &str) -> bool {
+        true
+    }
+    fn at_most_once(&self, name: &str, _: &Value) -> bool {
+        name != "lookup"
+    }
+    async fn call(&self, _: &str, _: Value, _: &ows::run::CallInfo<'_>) -> Result<Value, WorkflowError> {
+        unreachable!("durable runs invoke")
+    }
+    async fn invoke(
+        &self,
+        name: &str,
+        _: Value,
+        _: &ows::run::CallInfo<'_>,
+    ) -> Result<Value, ows::durable::CallFailure> {
+        use ows::durable::CallFailure;
+        let before = {
+            let mut dispatches = self.dispatches.lock().unwrap();
+            let n = dispatches.entry(name.into()).or_default();
+            *n += 1;
+            *n - 1
+        };
+        match name {
+            "create" if self.unknown => Err(CallFailure::answer(WorkflowError::unknown_outcome("timed out"))),
+            "create" => Ok(json!({ "shipment": 7 })),
+            "lookup" => Ok(json!({ "found": 7 })),
+            _ if before == 0 => Err(CallFailure::answer(WorkflowError::not_executed("busy, nothing done"))),
+            _ => Ok(json!({ "checked": true })),
+        }
+    }
+}
+/// The run's journal, crashing at save `fail` (from 0) before or after its
+/// commit.
+struct Crashing {
+    lease: Arc<Lease>,
+    saves: std::sync::atomic::AtomicUsize,
+    fail: usize,
+    after: bool,
+}
+#[async_trait::async_trait]
+impl Journal for Crashing {
+    async fn load(&self) -> anyhow::Result<BTreeMap<String, Record>> {
+        self.lease.load().await
+    }
+    async fn save(&self, key: &str, record: &Record) -> anyhow::Result<()> {
+        let n = self.saves.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        anyhow::ensure!(self.after || n != self.fail, "crash before commit {n}");
+        self.lease.save(key, record).await?;
+        anyhow::ensure!(!self.after || n != self.fail, "crash after commit {n}");
+        Ok(())
+    }
+}
+struct FixedTime;
+impl ows::run::Clock for FixedTime {
+    fn now(&self) -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::from_timestamp_millis(1000).unwrap()
+    }
+}
+const SHIPMENT: &str = "document: { dsl: '1.0.4', namespace: test, name: shipment, version: '1.0.0' }
+do:
+  - ship:
+      try:
+        - create: { call: create }
+      catch:
+        errors: { with: { type: urn:ouro:errors:call.unknown } }
+        do: [ { lookup: { call: lookup } } ]
+  - checked:
+      try:
+        - check: { call: check }
+      catch:
+        errors: { with: { type: urn:ouro:errors:call.not_executed } }
+        retry: { limit: { attempt: { count: 2 } } }
+";
+/// One run of `SHIPMENT`, crashing at save `fail`, then recovered on a
+/// reopened handle: the saves its first execution attempted, and whether
+/// it crashed.
+async fn shipment(t: &TestStore, unknown: bool, fail: usize, after: bool) -> anyhow::Result<(usize, bool)> {
+    use ows::{
+        durable::{CallState, CallStatus, Delivery},
+        run::{self, Host, Limits, Silent},
+    };
+    use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
+    let wf = ows::model::parse_yaml(SHIPMENT)?;
+    let shipments = Arc::new(Shipments { unknown, dispatches: Default::default() });
+    let host = Host {
+        functions: shipments.clone(),
+        observer: Arc::new(Silent),
+        clock: Arc::new(FixedTime),
+        limits: Limits::default(),
+        runtime: json!({}),
+    };
+    let token = tokio_util::sync::CancellationToken::new();
+    let lease_time = Arc::new(LeaseTime(AtomicI64::new(1000)));
+    let fence = t.store.start(&admission("r"), 1000).await?.unwrap();
+    let lease = Arc::new(Lease { store: t.store.clone(), fence, clock: lease_time.clone() });
+    let journal = Crashing { lease: lease.clone(), saves: AtomicUsize::new(0), fail, after };
+    let first = run::resume(&host, &wf, "r", json!({}), &token, &journal).await.status;
+    let saves = journal.saves.load(Ordering::SeqCst);
+    let crashed = matches!(first, Status::Interrupted(_));
+    let reopened = (t.reopen)().await?;
+    let status = if crashed {
+        let now = LEASE_MS + 1001;
+        lease_time.0.store(now, Ordering::SeqCst);
+        let fence = reopened.claim("r", now).await?.unwrap();
+        let current = Arc::new(Lease { store: reopened.clone(), fence, clock: lease_time });
+        let status = run::resume(&host, &wf, "r", json!({}), &token, &*current).await.status;
+        reopened.finish(&current.fence, &status, now, 3).await?;
+        status
+    } else {
+        t.store.finish(&lease.fence, &first, 1000, 3).await?;
+        first
+    };
+    let records = reopened.inspect("r").await?.unwrap().records;
+    // The adapter's own rows hold these call records, not only the engine's
+    // reading of them.
+    let rows = t.backend.snapshot().await?.rows;
+    for (key, record) in records.iter().filter(|(_, r)| matches!(r, Record::Call { .. })) {
+        let row = &rows[&(crate::engine::records_of("r"), key.clone())];
+        assert_eq!(&serde_json::from_value::<Record>(row.clone())?, record, "persisted row {key}");
+    }
+    let calls = ows::durable::call_journal(&records);
+    let state = |key: &str| calls.iter().find(|c| c.key == key).map(|c| c.state);
+    let case = format!("unknown answer {unknown}, crash at {fail} (after commit: {after})");
+    for call in &calls {
+        let expected = if call.function == "lookup" { Delivery::AtLeastOnce } else { Delivery::AtMostOnce };
+        assert_eq!(call.delivery, expected, "{case}: the effective delivery is persisted");
+    }
+    // At most one dispatch of the create, and its outcome stays honest: a
+    // lookup only follows an intent without an answer, which is what any
+    // reader of the persisted journal sees too.
+    assert!(shipments.count("create") <= 1, "{case}");
+    let create = state("/do/0/ship/try/0/create#call");
+    let looked_up = state("/do/0/ship/catch/do/0/lookup#call") == Some(CallStatus::Completed);
+    assert_eq!(looked_up, create == Some(CallStatus::Unknown), "{case}: {create:?}");
+    assert!(!unknown || create == Some(CallStatus::Unknown), "{case}: answered unknown");
+    // Every dispatch of the at-most-once check beyond the first is licensed
+    // by a persisted refusal of an earlier one.
+    let refusals = calls.iter().filter(|c| c.function == "check" && c.state == CallStatus::NotExecuted).count();
+    assert!(shipments.count("check") <= refusals + 1, "{case}: {calls:?}");
+    let first_check = state("/do/1/checked/try/0/check#call");
+    match &status {
+        Status::Completed(output) => {
+            assert_eq!(output, &json!({ "checked": true }), "{case}");
+            assert_eq!(first_check, Some(CallStatus::NotExecuted), "{case}");
+            assert_eq!(state("/do/1/checked/try[2]/0/check#call"), Some(CallStatus::Completed), "{case}");
+            if let Some(Record::Call { state: CallState::NotExecuted(error), .. }) =
+                records.get("/do/1/checked/try/0/check#call")
+            {
+                assert_eq!(error.type_, ows::durable::CALL_NOT_EXECUTED, "{case}: the refusal is kept as answered");
+            }
+        }
+        // A crash after a check's intent was committed and before its
+        // answer was (the refusal, or the retry's result): that check is an
+        // intent without an answer, which no catch here names.
+        Status::Faulted(error) => {
+            assert_eq!(error.type_, ows::durable::CALL_UNKNOWN, "{case}");
+            let unanswered = calls.iter().filter(|c| c.function == "check" && c.state == CallStatus::Unknown).count();
+            assert_eq!(unanswered, 1, "{case}: {calls:?}");
+            assert!(crashed, "{case}");
+        }
+        other => panic!("{case}: {other:?}"),
+    }
+    audit(&*reopened).await?;
+    Ok((saves, crashed))
+}
+async fn call_outcomes(
+    factory: &impl AsyncFn(&str) -> anyhow::Result<TestStore>,
+    report: &mut Report,
+) -> anyhow::Result<()> {
+    for unknown in [false, true] {
+        let t = factory("outcomes-baseline").await?;
+        let (saves, crashed) = shipment(&t, unknown, usize::MAX, false).await?;
+        assert!(!crashed);
+        report.cases += 1;
+        for after in [false, true] {
+            for fail in 0..saves {
+                let t = factory("outcomes-crash").await?;
+                let (_, crashed) = shipment(&t, unknown, fail, after).await?;
+                assert!(crashed, "commit {fail} was not reached");
+                report.cases += 1;
+                report.execution_crashes += 1;
+            }
+        }
+    }
+    report.witnesses.extend([
+        "a refusal is persisted and licenses one more at-most-once dispatch",
+        "an unknown outcome and a crash between dispatch and record leave the same evidence",
+    ]);
+    Ok(())
 }
 
 /// Policy decisions, ingress consumption, cancellation and admission are one
