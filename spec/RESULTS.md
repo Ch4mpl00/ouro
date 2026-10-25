@@ -1,3 +1,50 @@
+# Contract checking — 2026-10-25, review fixes (#31: H-1, M-2, M-3, M-5, L-1, L-5, L-6, L-7, L-8)
+
+The model could not see three of the findings, so it changed. **M-3**: `pause`
+no longer requires an untripped catalog; the catalog gains `breaker` (the trip
+its notice reports), a pause stands on top of a breaker's trip and `resume`
+lifts the pause alone. V2 states both and an independent clause ties
+`breaker` to a notice of the current epoch; witnesses `pauseTrippedTest` and
+`pauseTrippedResumedTest`; mutants `V2/pause-tripped` (a pause of a tripped
+definition does nothing) and `V2/pause-resume` (resuming it lifts the trip).
+`V2/resume` now drops the resume body's `tripped:c.breaker` too, since the body
+keeps a breaker's trip. **L-7**: a new command `pinAbsent` admits version 4,
+which the catalog does not hold; `barred` refuses it while tripped and V2
+states it without `barred`; witnesses `absentAdmittedTest`,
+`absentRefusedTest`; mutant `V2/absent`. **M-5**: `renew` takes the owner's
+authority alone (`answers`), so a held owner keeps its lease; H1 states that
+it changes the lease and nothing else (excused under the emergency stop, which
+the fault-3 sample found); `heldAnsweredTest` records an answer past the lease
+the run had when the hold came and restores it after the release; mutant
+`H1/renew`. All new witnesses are in `bridgeTail`, which the serial MBT replays
+on memory and SQLite (`COMMANDS` 40).
+
+`contract_progress_trigger.qnt` gains the owned child's admission
+(`spawning`, **M-2**) and the safety monitor `L7_refusal` (**L-1**: a start
+refused by a trip names a stored trip). Mutants `L7/order/child` (a child that
+does not drain first) and `L7/refusal` (the drain's trip rolled back with the
+start it refuses) are detected by L7 and `L7_refusal`. The baseline keeps 41,920
+distinct states.
+
+H-1, L-6 (interpreter `catch` and `emit` recovery), L-5 (runtime observer
+reporting) and L-8 (competing delivery, a Limits item of the model) have no
+model counterpart; their regressions are Rust tests on every adapter.
+
+| Check | Scope | Result | Time |
+| --- | --- | --- | --- |
+| Typecheck, witnesses | all modules; 78 witness runs | Pass | 23 s |
+| Simulation | 10,000 x 150 steps, seed 20261023, invariant `checked` | No violation | 251 s |
+| Safety mutants | 62 (`V2/pause-tripped`, `V2/pause-resume`, `V2/absent`, `H1/renew` added) | All targets detected | 422 s |
+| Fault rows, fault detection | 11 switches x 1,000 samples; 11 couplings | No violation; all detected | 338 s, 76 s |
+| Temporal (`contract_temporal.py`, native Apalache 0.62.4 server and TLC from the same jar on a portable JDK 21) | all three quotients, 34 variants | All met their targets | 540 s |
+| fmt, Clippy, `OURO_REQUIRE_QUINT=1 cargo test --workspace` (`check.py --only rust`) | 280 Rust tests, 21 CTK scenarios, Postgres on testcontainers, restart example | Pass | 408 s for the tests |
+| Prohibited-name scan | `crates`, `examples` | Empty | |
+
+Not conclusive: the symbolic stage (`contract_bounded`, depth 2) was started
+twice by mistake, at once on one native server, and both runs exhausted its
+4 GiB heap (about 1,050 s); it was not rerun alone, and its entry stays "not run
+in this revision". The evidence is regenerated.
+
 # Contract checking — 2026-10-25, review fixes (#31: M-1, M-4, L-2, L-3, L-4, L-9)
 
 A one-shot's run id is its instant's (`schedule:<name>:at:<ms>`), so an
