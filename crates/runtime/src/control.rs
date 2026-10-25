@@ -24,6 +24,14 @@ impl Control {
     pub async fn cancel_tree(&self, request: &Request, run: &str) -> Result<Reply, ControlError> {
         self.cancel(request, run).await
     }
+    /// Freezes the run and its live owned descendants (see `Command::Hold`).
+    pub async fn hold(&self, request: &Request, run: &str, note: &str) -> Result<Reply, ControlError> {
+        self.execute(request, &Command::Hold { run: run.into(), note: note.into() }).await
+    }
+    /// Lets a held run and its held descendants continue (`Command::Release`).
+    pub async fn release(&self, request: &Request, run: &str) -> Result<Reply, ControlError> {
+        self.execute(request, &Command::Release { run: run.into() }).await
+    }
     pub async fn pause(&self, request: &Request, definition: &str, note: &str) -> Result<Reply, ControlError> {
         self.execute(request, &Command::Pause { definition: definition.into(), note: note.into() }).await
     }
@@ -101,7 +109,9 @@ impl Control {
             if history { self.history(filter, cursor, limit).await? } else { self.list(filter, cursor, limit).await? };
         let mut states = std::collections::BTreeMap::new();
         for run in page.items {
+            // A held run is counted as held, whatever state it froze in.
             let state = match run.state {
+                _ if run.held.is_some() => "held",
                 ouro_durable::RunState::Ready => "ready",
                 ouro_durable::RunState::Running => "running",
                 ouro_durable::RunState::Waiting => "waiting",

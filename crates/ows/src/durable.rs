@@ -185,10 +185,13 @@ use std::collections::BTreeMap;
 /// added in the commit that saves each answer.
 /// 11: a run row keeps the content digest of the definition version it was
 /// admitted with (engine layout; the OWS record formats are unchanged).
-/// 12: an unknown at-most-once outcome is `CALL_UNKNOWN`, which a `catch`
+/// 12: a run row may be held by an operator (`SavedRun::held`), which keeps
+/// the run out of `due` and refuses every fenced step but the answer of a
+/// call already dispatched.
+/// 13: an unknown at-most-once outcome is `CALL_UNKNOWN`, which a `catch`
 /// naming that type handles, and recovery returns a saved not-executed
 /// answer instead of sending the call again (record formats unchanged).
-pub const VERSION: u32 = 12;
+pub const VERSION: u32 = 13;
 
 /// The key of a run's `Record::Exceeded`.
 pub const EXCEEDED: &str = "exceeded";

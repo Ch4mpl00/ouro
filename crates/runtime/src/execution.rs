@@ -7,7 +7,7 @@
 use crate::{
     FunctionContext, Output, Registry,
     capabilities::{Capabilities, EventSink, ProcessRunner, ResourceResolver, SecretResolver},
-    observer::{Observer, Observers, RunEvents},
+    observer::{EventKind, Observer, Observers, RunEvents},
     registry::{Checks, Installed, MissingFunction},
     telemetry::{Metrics, Telemetry},
     testing::{Mode, RecordedCall},
@@ -447,9 +447,29 @@ impl Runtime {
         request: &ouro_durable::control::Request,
         command: &ouro_durable::control::Command,
     ) -> Result<ouro_durable::control::Reply, ouro_durable::control::ControlError> {
-        let reply = self.store.control(request, command, self.clock.now_ms()).await?;
-        if matches!(command, ouro_durable::control::Command::Cancel { .. }) {
-            self.signal_cancelled().await?;
+        use ouro_durable::control::{Command, Reply};
+        // A retry of a committed request repeats its reply, not its event.
+        let repeated = match command {
+            Command::Hold { .. } | Command::Release { .. } => self.store.control_entry(&request.id).await?.is_some(),
+            _ => false,
+        };
+        let now = self.clock.now_ms();
+        let reply = self.store.control(request, command, now).await?;
+        match (command, &reply) {
+            (Command::Cancel { .. }, _) => self.signal_cancelled().await?,
+            (Command::Hold { run, note }, Reply::Changed(true)) if !repeated => {
+                if let Some(saved) = self.store.get(run).await? {
+                    let (actor, reason, note) = (request.actor.clone(), request.reason.clone(), note.clone());
+                    self.observers.operated(&saved, now, EventKind::RunHeld { actor, reason, note });
+                }
+            }
+            (Command::Release { run }, Reply::Changed(true)) if !repeated => {
+                if let Some(saved) = self.store.get(run).await? {
+                    let (actor, reason) = (request.actor.clone(), request.reason.clone());
+                    self.observers.operated(&saved, now, EventKind::RunReleased { actor, reason });
+                }
+            }
+            _ => {}
         }
         Ok(reply)
     }
@@ -667,6 +687,24 @@ impl Runtime {
         };
         let outcome = match ended {
             Ok(outcome) => outcome,
+            Err(Some(error)) if error.is::<ouro_durable::control::Held>() => {
+                // An operator holds the run. The lease renewal is the
+                // fast path of the hold, but a call already dispatched is
+                // not retracted: the interpreter goes on, its next fenced
+                // step refuses, and the answer of a call in flight is still
+                // recorded. It gets one heartbeat for that, well within the
+                // lease the last renewal gave it, then the run is dropped
+                // like any stopped one and the lease given back.
+                tokio::select! {
+                    biased;
+                    _ = stop.cancelled() => {}
+                    _ = tokio::time::sleep(self.config.heartbeat_interval) => {}
+                    _ = &mut run => {}
+                }
+                local_cancel.cancel();
+                drop(run);
+                return self.yield_held(&lease).await;
+            }
             Err(lost) => {
                 local_cancel.cancel();
                 // Dropping the interpreter closes in-flight spans and
@@ -695,12 +733,34 @@ impl Runtime {
         }
         match self.store.finish(&lease.fence, &outcome.status, self.clock.now_ms(), self.config.breaker_threshold).await
         {
+            Err(e) if e.is::<ouro_durable::control::Held>() => self.yield_held(&lease).await,
             Err(e) if e.is::<ouro_durable::control::Stopped>() => {
                 self.store.release(&lease.fence, self.clock.now_ms()).await?;
                 Ok(Ending::own(Status::Interrupted(WorkflowError::runtime(e.to_string()))))
             }
             result => result.map(|status| Ending { status, foreign: false, limit_exceeded: outcome.limit_exceeded }),
         }
+    }
+    /// Gives a held run's lease back: it is Ready again, still held, and
+    /// continues from its evidence when released, without spending its
+    /// interruption budget. A cancel that ended the run meanwhile is its
+    /// outcome; a lease that ended while the run settled is no loss, since
+    /// nobody can claim a held run.
+    async fn yield_held(&self, lease: &Lease) -> anyhow::Result<Ending> {
+        let id = &lease.fence.run_id;
+        if let Err(error) = self.store.release(&lease.fence, self.clock.now_ms()).await {
+            let saved = self.store.get(id).await?;
+            if let Some(status) = saved.as_ref().and_then(|r| r.outcome.clone()) {
+                return Ok(Ending { status, foreign: true, limit_exceeded: false });
+            }
+            let ours = saved.as_ref().is_some_and(|r| {
+                r.fence.as_ref() == Some(&lease.fence) && r.lease_until_ms.is_some_and(|at| at > self.clock.now_ms())
+            });
+            if ours {
+                return Err(error);
+            }
+        }
+        Ok(Ending::own(Status::Interrupted(WorkflowError::runtime(format!("run {id} is held by an operator")))))
     }
     pub async fn recover_once(&self, stop: &CancellationToken) -> anyhow::Result<usize> {
         let ids = self.store.due_as(self.clock.now_ms(), self.config.max_concurrency, &self.config.application).await?;

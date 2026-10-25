@@ -86,10 +86,11 @@ are. The same checks apply (registry, validation), the run keeps that
 version's definition for recovery and replay, and `Control::inspect` shows
 `pinned: true` beside the admitted version. A pinned run counts toward the
 breaker only if its version is the active one. While the definition is
-tripped, a pinned start is refused (`DefinitionTripped`) only if the version's
-content digest is the tripped one; a version with other content is admitted,
-so a host can run its built-in version for a run while the tripped version
-stays active.
+tripped by its breaker, a pinned start is refused (`DefinitionTripped`) only
+if the version's content digest is the tripped one; a version with other
+content is admitted, so a host can run its built-in version for a run while
+the tripped version stays active. A manual pause (below) refuses every
+admission of the definition, pinned or not, whatever its content.
 
 Every saved version has a content digest (`durable::digest_of`, shown by
 `VersionSummary::digest` and `Inspection::digest`): the SHA-256 of the
@@ -457,6 +458,7 @@ the span the run was admitted in), the runtime clock's time and its kind:
 | `call_started`, `call_finished` | A call's dispatch (function, delivery, attempt, arguments) and answer (outcome, result or error, annotations) |
 | `listening`, `event_consumed`, `event_emitted` | A listen waits; a task consumes an event (a listen's, a joined child's outcome); `emit` hands one over |
 | `breaker_tripped` | The definition's breaker tripped, once, when the worker hands the notice on |
+| `run_held`, `run_released` | An operator froze or released a run (`Runtime::control`; actor, reason, and for a hold its note), once per request, for the run the command named |
 
 **Each fact once.** Replaying what an earlier execution recorded reports
 nothing: after a crash or a restart, the execution that takes the run over
@@ -605,13 +607,40 @@ available. Cancellation cannot retract an effect already dispatched, and
 pending calls retain their declared delivery and unknown-outcome rules.
 
 `pause(request, definition, note)` makes a manual trip (`reason.type =
-"manual"`, with actor, reason and note), stops every admission path and
-suspends the current triggers and buffered admissions in that transaction. Existing runs finish.
+"manual"`, with actor, reason and note), stops every admission path, whatever
+version or content the admission names (an automatic trip refuses only the
+tripped content digest), and suspends the current triggers and buffered
+admissions in that transaction. Existing runs finish.
 `resume` clears a manual trip and restores its exact triggers, epoch and
 previous breaker count. Overdue timers follow their existing catch-up policy.
 Pausing an already tripped definition preserves its first report; an automatic
 breaker trip still requires activation. An activation clears a manual pause
 and replaces its saved triggers in a new epoch.
+
+`hold(request, run, note)` freezes one run together with its live owned
+descendants, in one transaction bounded like the cancel cascade (the
+`children` index, level by level); `release(request, run)` lets them go on.
+A held run keeps its wake-up, timers and event waits but is never returned
+by `due` and never claimed: a timer or a delivery that comes due while it is
+held fires nothing, and a release makes the work due again in the same
+commit, under the existing catch-up rules, with the run exactly as it was.
+A worker driving it stops at the next fenced step or dispatch boundary (every
+fenced operation and `check_lease` refuse with `control::Held`) or at its
+next lease renewal, within one heartbeat, and gives the lease back without
+spending an interruption. A call already dispatched is not retracted: its
+answer is still recorded (the only step a held run commits), a call still in
+flight when the renewal sees the hold gets one heartbeat to answer, and a
+call left pending keeps its delivery rules (an at-least-once call is sent
+again after the release, an at-most-once one has an unknown outcome and never
+is). A held run starts no child. It stays live: it counts for overlap
+policies and the host ceiling, `inspect` and `list` show `held` (actor,
+reason, note, instant) on the run, and `counts` reports it as `held` instead
+of its frozen state. Holding is idempotent (a second hold keeps the first
+attribution; a hold or release that changes nothing answers
+`Changed(false)`), an ended run is never held, and `cancel` works on a held
+run and ends the hold. Both commands are audited like the others, appear in
+the run's journal, and `Runtime::control` reports a change once as a
+`run_held` or `run_released` event.
 
 `emergency_stop(request, true)` sets a store-wide flag. Admissions return
 `control::Stopped`; claim and due queries return no work; firings consume no
@@ -718,9 +747,22 @@ written before it:
   again. Replay serves a recorded refusal and a call without an answer
   instead of failing on a missing result.
 - Function spans carry `ouro.call.outcome`.
-- The durable state version is 12: run rows written under 11 are refused,
+- The durable state version is 13: run rows written under 12 are refused,
   not converted (the record formats are unchanged; the interpretation of an
   unknown outcome and of a refusal on recovery changed).
+
+Breaking changes (issue #29), for hosts and adapters written before it:
+
+- A manual pause now refuses every admission of the definition, pinned or
+  not, whatever its content; the digest rule applies to automatic trips only.
+  `DefinitionTripped` gains `paused`.
+- `control::Command` gains `Hold` and `Release` (code matching it
+  exhaustively adds them), `SavedRun` gains `held` (`control::Hold`), and a
+  held run's fenced operations fail with the new `control::Held`. The run
+  state version is 12: rows of 11 are refused, not converted, so a store
+  written before this change must be recreated.
+- `counts` reports a held run as `held`; `EventKind` gains `RunHeld` and
+  `RunReleased`.
 
 Breaking change (trip by content digest): `Definition` and `Trip` gain
 `digest`, `VersionSummary` and `control::Inspection` gain `digest`, and a trip
@@ -998,7 +1040,7 @@ The engine owns primary and secondary keys in `(kind, id)` order:
 
 | Kind | ID | Purpose |
 | --- | --- | --- |
-| `run` | run ID | One run's admission, lease, waits, subscriptions and copy counters |
+| `run` | run ID | One run's admission, lease, operator hold, waits, subscriptions and copy counters |
 | `record:<hex run ID>` | record key | One journal record |
 | `event:<hex run ID>` | sequence | One accepted event copy, pending or consumed, in arrival order |
 | `event_id:<hex run ID>`, `event_type:<hex run ID>` | hex identity, hex type | The copy holding an identity; the first copy of a type |
@@ -1071,9 +1113,9 @@ Both initial migrations were replaced before any release or deployment. This
 layout requires a fresh database from the earlier development checkout; there
 is no conversion of that unreleased layout. Applied migrations are immutable
 from the next release onward. The SQL schema is a generic key/value table, so
-the row shapes above (and the interpreter's durable state version, now 12:
-an unknown at-most-once outcome is catchable by its type, and recovery
-restores a refusal) can
+the row shapes above (and the interpreter's durable state version, now 13; 12:
+a run row may be held by an operator; 13: an unknown at-most-once
+outcome is catchable by its type, and recovery restores a refusal) can
 change without a migration; nothing persisted before them is converted. Each
 run row records the durable state version it was written under, and a row of
 another version (including the earlier one-aggregate-per-run layout) is

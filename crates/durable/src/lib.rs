@@ -163,6 +163,12 @@ pub struct SavedRun {
     /// (`ows::durable::accumulate`). Kept after `sweep` removes the records.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub annotations: ows::durable::Totals,
+    /// Frozen by an operator (`control::Command::Hold`): never returned by
+    /// `due` nor claimed, whatever its wake-up, until released. The run and
+    /// its live owned descendants are held in one commit; an ended run is
+    /// never held.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub held: Option<control::Hold>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -333,9 +339,10 @@ pub struct Trip {
     pub manual: Option<control::ManualTrip>,
     /// The active version and the epoch the breaker tripped in.
     pub version: u64,
-    /// The content digest of that version (`digest_of`): while the trip
-    /// stands, an admission whose definition has this digest is refused, of
-    /// whatever version number; one with other content is admitted.
+    /// The content digest of that version (`digest_of`): while an automatic
+    /// trip stands, an admission whose definition has this digest is refused,
+    /// of whatever version number; one with other content is admitted. A
+    /// manual pause (`manual`) refuses every admission, whatever its content.
     pub digest: String,
     pub epoch: u64,
     /// The consecutive faults counted, which reached `threshold`.
@@ -349,7 +356,13 @@ pub struct Trip {
 impl Trip {
     /// The refusal of a new run of `name` while this trip stands.
     pub fn refusal(&self, name: &str) -> DefinitionTripped {
-        DefinitionTripped { name: name.into(), epoch: self.epoch, version: self.version, faults: self.faults }
+        DefinitionTripped {
+            name: name.into(),
+            epoch: self.epoch,
+            version: self.version,
+            faults: self.faults,
+            paused: self.manual.is_some(),
+        }
     }
     /// The trip as an identified CloudEvent of type `TRIPPED`: its `source`
     /// names the definition and its `id` the epoch (one trip per epoch), so a
@@ -472,6 +485,9 @@ pub struct DefinitionTripped {
     pub epoch: u64,
     pub version: u64,
     pub faults: u32,
+    /// An operator's pause, not a breaker trip: it refused this admission
+    /// whatever version the run named, and `resume` lifts it.
+    pub paused: bool,
 }
 impl DefinitionTripped {
     /// As a workflow error of type `TRIPPED_ERROR`: a `run: workflow` task
@@ -488,6 +504,13 @@ impl DefinitionTripped {
 }
 impl std::fmt::Display for DefinitionTripped {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.paused {
+            return write!(
+                f,
+                "{} is paused by an operator in epoch {}: no version is admitted until it is resumed or a version is activated",
+                self.name, self.epoch
+            );
+        }
         write!(
             f,
             "{} is tripped in epoch {}: version {} faulted {} times in a row; activate a version to resume",

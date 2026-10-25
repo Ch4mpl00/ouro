@@ -9,7 +9,9 @@ layout is modelled.
 There is **one model**: `contract.qnt` states the invocation-level contract
 under the section 8 decisions, and the same transition drives the serial and
 the concurrent model-based tests against the real stores. `contract_progress.qnt`
-is the separate finite quotient for E5 and the five progress obligations. The
+is the separate finite quotient for E5 and L1–L5; its siblings
+`contract_progress_tree.qnt` (L6, L9) and `contract_progress_trigger.qnt` (L7,
+L8, L10) cover the mechanisms added after v0.1.0 (issue #28). The
 earlier implementation-shaped `protocol.qnt` family (its modules, slices,
 witnesses, liveness quotient and mutations) was folded into the contract model
 and deleted (issue #4, item 8); what it covered and the contract model does not
@@ -21,7 +23,7 @@ simulated and its histories replayed against memory, SQLite and Postgres.
 
 ## Contract coverage
 
-`contract_progress.qnt` supplies E5 and the five temporal obligations. All 40 IDs
+The three progress quotients supply E5 and the ten temporal obligations. All 49 IDs
 have named predicates, but the scopes below matter: naming a predicate does not
 prove every clause of its English contract. "Serial MBT" and "concurrent MBT"
 are the bridges in `crates/durable/tests/quint.rs` and `quint/concurrent.rs`.
@@ -53,7 +55,7 @@ are the bridges in `crates/durable/tests/quint.rs` and `quint/concurrent.rs`.
 | T2 | `T2`: activation epoch (only an activation starts one), dormant rearm | Concurrent firing/activation; serial MBT; `gaps::t2_old_completion_cannot_rearm_new_epoch` |
 | T3 | `T3`: deadline fixed at admission | Serial MBT; `t3_admission_fixes_the_workflow_deadline` |
 | V1 | `V1`: only an activation selects the active version (no rollback); pinned admission | Serial MBT; runtime pinned-version recovery |
-| V2 | `V2`: epoch, fault classification (a refused slot's run counts), reset; a trip reports once (one notice), stops the schedule and every admission of the tripped content digest (a pinned start of other content is admitted and never counted), ignores later observations, cleared only by activation | Serial MBT; `gaps::v2_old_epoch_fault_does_not_count_after_reactivation`; `refusedTest`, `pinnedAdmittedTest`, `sameContentRefusedTest`, `pinnedUncountedTest` witnesses; mutants `V2/digest`, `V2/same-content`, `V2/pinned-counts`; refusal on every admission path in conformance (a trip then a child needs two faulted runs besides a live parent and its unadmitted child, more than the model's three, so the model's clause is not reached) |
+| V2 | `V2`: epoch, fault classification (a refused slot's run counts), reset; a trip reports once (one notice), stops the schedule and every admission of the tripped content digest (a pinned start of other content is admitted and never counted), ignores later observations, cleared only by activation; an operator's pause (`manual`) refuses every admission whatever its content, and only `resume` or an activation lifts it | Serial MBT; `gaps::v2_old_epoch_fault_does_not_count_after_reactivation`; `refusedTest`, `pinnedAdmittedTest`, `sameContentRefusedTest`, `pinnedUncountedTest`, `pauseTest`, `pausedRefusesTest`, `resumedTest`, `pauseActivatedTest`, `resumeKeepsTripTest` witnesses; mutants `V2/digest`, `V2/same-content`, `V2/pinned-counts`, `V2/manual` (a pause admits other content), `V2/resume` (resume lifts a breaker trip); refusal on every admission path in conformance (a trip then a child needs two faulted runs besides a live parent and its unadmitted child, more than the model's three, so the model's clause is not reached) |
 | V3 | `V3`: undeclared/exact-match claim and mutation guards | Serial MBT (`claim_as`, `due_as` per worker version); `gaps::v3_incompatible_worker_cannot_claim` |
 | O1 | `O1`: failed operation stops the attempt | Serial MBT fault switches; generated interrupted journals |
 | O2 | `O2`: terminal-only retention and stable identities | Serial MBT (swept evidence projected away); replay-after-sweep refusal |
@@ -63,11 +65,20 @@ are the bridges in `crates/durable/tests/quint.rs` and `quint/concurrent.rs`.
 | X3 | `X3`: no silent readmission/reopening | Terminal/admission checks |
 | S1 | `S1`: emergency stop blocks claim, firing and admission (including children and ingress); clearing preserves evidence | Stop/clear witnesses, serial MBT, `S1` guard mutant, control conformance |
 | B1 | `B1`: tree counter within the ceiling, equal to a live root's granted decisions; immutable decisions; refusal only at the ceiling | Serial MBT (`spend`, decisions projected); `budgetTest` witness; budget conformance; generated interpreter budgets |
+| H1 | `H1`: a held run takes no fenced step and no dispatch (only the answer of a call already dispatched, and the owner giving its lease back) | `heldStepsTest`, `heldDispatchTest`; mutants `H1`, `H1/dispatch`; serial MBT; control conformance (`holds`: `Held` on every fenced operation, the answer recorded) |
+| H2 | `H2`: a held run is never claimed | `heldClaimTest`, `heldClaimedTest`; mutant `H2`; serial MBT audits `due` and `due_as` without held runs; conformance audits the due indexes |
+| H3 | `H3`: a hold marks the run and its live owned descendants in one transition and changes nothing else; a release restores exactly | `heldTreeTest`, `heldChildTest`, `heldReleasedTest`; mutants `H3` (misses the subtree), `H3/release` (changes more than the flags); conformance (`holds`, the commit-fault matrix); scalability bounds |
+| H4 | `H4`: an ended run is never held (a cancel or any end clears the hold) | `heldCancelledTest`; mutant `H4`; conformance audit |
 | L1 | `contract_progress::L1`: ready work eventually completes under F | Finite drains; temporal quotient |
 | L2 | `L2`: abandoned ownership eventually claimed/completed under F | Temporal quotient |
 | L3 | `L3`: accepted event eventually consumed under F | Temporal quotient; event/recovery conformance |
 | L4 | `L4`: due slot and deadline resolve under F | Temporal quotient |
 | L5 | `L5`: failed owner's waiter becomes reclaimable | Temporal quotient only |
+| L6 | `contract_progress_tree::L6`: a runnable run ends or waits, whatever its program picks | Temporal quotient; B1 evidence; generated interpreter budgets |
+| L7 | `contract_progress_trigger::L7`: a buffered slot is promoted or discarded | Temporal quotient; `contract::OverlapQueue` promotion monitor |
+| L8 | `contract_progress_trigger::L8`, `L8_dormant`: a one-shot resolves, then stays dormant | Temporal quotient; T1/T2 one-shot clauses, `oneShotTest` |
+| L9 | `contract_progress_tree::L9`: descendants of an ended run end, and no worker keeps them | Temporal quotient; C3 monitor and conformance |
+| L10 | `contract_progress_trigger::L10`, `L10_stable`: tripped content admissible again after an activation; refused until then | Temporal quotient; V2 monitor, witnesses and mutants |
 
 Aliases `admissionImmutable`, `currentFenceOnly`, `terminalImmutable`,
 `completedNeverOverwritten`, `protectedAtMostOnce`, `eventAndRecordAtomic`,
@@ -131,7 +142,12 @@ deadline fixed at admission and epoch.
   admits it (on promotion for a buffer), and the breaker observes that fault.
   `queuedRefusalTest` checks a predecessor fault and a queued refusal tripping
   in one transition; `oldCompletionPromotesTest` checks epoch isolation while
-  promoting the new epoch's buffer.
+  promoting the new epoch's buffer. The model has three run ids, so an
+  operation may admit the very id a slot buffered; that is no promotion, and
+  the promotion monitors (V2's refusal observation, the queue promotion check)
+  leave that operation's own admission out. The fault-6 sample found it once
+  the operation set grew: the oracle counted a refusal the transition never
+  made.
 - **Time** (decision 4). The lease is four ticks; a worker acts only while
   more than ε = 1 is left; takeover only after it ends. The deadline is
   admission + 8; the owner decides a timeout.
@@ -143,6 +159,23 @@ deadline fixed at admission and epoch.
   content is admitted and its run never counts) and appends the epoch to `notices`, the trip's
   committed notice; the active version and the epoch stay. A tripped breaker
   observes nothing; only the next activation clears it.
+- **Hold** (#29). `hold` marks the run and its live owned descendants `held`
+  in one transition; `unhold` clears them (the store's `Release`; `release` is
+  the worker giving its lease back). A held run is never claimed, takes none
+  of the owner's fenced operations (renew, intent, recovery, checkpoint,
+  subscribe, take, spend, child, finish, timeout, conflict), dispatches
+  nothing (the `check_lease` boundary), and keeps everything else: its wake-up
+  and lease, which `due` ignores; events are still accepted into its mailbox.
+  `answers` (the owner's authority alone) lets the owner record the result
+  or proven non-execution of a call already dispatched and give its lease
+  back. Any end of a run, cancellation included, clears the flag. H1–H4 state
+  it.
+- **Pause** (V2). `pause` is a trip with `manual` set that reports no notice
+  and refuses every admission whatever its content (`barred`); `resume` clears
+  it, and only it, never a breaker's trip. The model pauses a definition with
+  nothing to suspend (no armed schedule, no buffered slot): suspending and
+  restoring triggers and buffers is storage behaviour, checked by the control
+  conformance suite.
 - **Compatibility** (#3). Worker `w` declares version `w + 1`; a run admitted
   with version 0 (undeclared) is compatible with both.
 - **Children, retention.** Run r's owned child is run r + 1, so run 2 can be
@@ -176,13 +209,80 @@ proved. Independent positive/negative worker skew is not enumerated, so
 real-time safety under every skew within ε is **not checked**; compatibility is
 exact matching plus undeclared, without a host-supplied `accepts` list.
 
+### The progress quotients
+
+`contract_progress.qnt` (E5, L1–L5) predates the jump budget, overlap queues,
+the child cascade, one-shot triggers and trips by content digest. Issue #28's
+obligations live in two sibling quotients, so that each state space stays small
+enough to exhaust with fairness; a product with the original would multiply
+them for no shared variable. Both are hand-written finite abstractions, checked
+by TLC exhaustively, with each fairness conjunct named and dropped in turn:
+
+- `contract_progress_tree.qnt`: one owned chain (root, child, grandchild), a
+  program of two task positions per run, the tree's counter with ceiling 2, the
+  workers holding runs. The program is adversarial at every step (forward, jump
+  back, end, wait, start its child); external events and cancellations are
+  environment steps with no fairness.
+  - **L6** assumes weak fairness of a worker taking a runnable run and of a
+    holding worker committing its next step (F). Nothing about the program.
+  - **L9** assumes only weak fairness of a holding worker's renewal, at which it
+    notices that its run ended. Not the descendants' progress, nor any event.
+- `contract_progress_trigger.qnt`: one definition with three versions (1 and 3
+  share content), a trigger of kind every/cron, `after` or one-shot under the
+  queue policy with capacity 2, its live run and up to two other runs as
+  counters (counted by the breaker or not), the breaker (threshold 2), the
+  emergency stop with the deferred drain, interrupted admissions and host
+  refusals. Run outcomes, activations (any version and trigger kind) and
+  starts are adversarial environment steps.
+  - **L7** assumes that the trigger's live run and other runs eventually end,
+    that the stop is eventually cleared for good, and that due-run polls
+    continue. Not firing, activation or admissions.
+  - **L8** assumes strong fairness of firing (interruptions and stops disable it
+    repeatedly), advancing time and an eventual clear of the stop. Not run ends.
+  - **L10** assumes a host that eventually activates after a trip, keeps
+    starting runs of each content (strong fairness) and eventually clears the
+    stop, and that other runs eventually end. The last is an artifact of the
+    two run representatives: the runtime admits a start whatever else is live.
+  - **L8_dormant** and **L10_stable** are stability monitors with no fairness:
+    within an epoch a consumed one-shot stays dormant unless disarmed, and a trip
+    stays with its content refused (no admission of it).
+
+What the quotients are connected to, and what not:
+
+- **To `contract.qnt`, by construction only.** Each transition restates one of
+  the contract's: `spend` (decision and counter in one commit, refusal at the
+  ceiling), the transitive cascade of `finish`/`cancelRun`, `firePolicy` with
+  the queue policy, `settle`'s promotion, `refuseRun`, the breaker's terminal
+  observation and trip, `activate`, the `after` re-arm and one-shot
+  consumption. No refinement mapping from the contract model to either
+  quotient, and none between them, is checked; the bridges replay only
+  `contract.qnt` against the stores.
+- **To the code, by reading it.** The deferred drain (`control_drain`, a
+  bounded batch at clearing, the rest at `due_as` polls) and promotion at the
+  end of any run of the definition follow `drain_queues`, which `contract.qnt`
+  simplifies to a promotion after every transition; the worker's notice
+  follows the heartbeat renewal in the runtime's execution loop. While a
+  buffered slot waits for its deferred drain, the engine admits a later slot of
+  the same trigger (`fire` consults the trigger's live runs and capacity, not
+  the marker) or another start into the room it needs. L7 holds under F, but a
+  buffered slot is not guaranteed to run before a later slot, and with stops
+  repeated forever it can be passed over forever, even under strong fairness of
+  polls (RESULTS.md records both counterexamples).
+- **Not modelled:** pause and resume, the skip/allow/replace policies (the
+  contract's monitors cover them), event-triggered (`on`) schedules and ingress,
+  missed slots under `catchup: none`, several triggers or buffered slots per
+  definition, run identities and retention, durations and clocks, the host's
+  task and attempt ceilings, interruption backoff budgets and the observer.
+  That only a `then` jump moves a program back is the interpreter's property,
+  which L6 takes as given.
+
 ## Model-based tests
 
 ### Serial
 
 `crates/durable/tests/quint.rs` replays Quint's random traces of `contract.qnt`
-(100 traces × 150 steps per adapter by default, all 34 commands and every fault
-switch) and the `bridgeSuite` run of `contract_witnesses.qnt` (all 56 witness
+(100 traces × 150 steps per adapter by default, all 38 commands and every fault
+switch) and the `bridgeSuite` run of `contract_witnesses.qnt` (all 65 witness
 histories in one trace). After every step it compares a projection of the store
 with the model's state. The model records each command in its `command`
 variable; the driver never sees the model's state.
@@ -217,6 +317,8 @@ ticks), with `Policy { mailbox_ms: 37_500, ingress_ms: 37_500, skew_ms: 7_500 }`
 | `fire` | `fire` with the overlap guard, capacity and `rearm`; a missed or taken slot commits a skip |
 | `refuse` | `fire` with the overlap guard and `refused` (the model's unhandled failure, threshold 2) instead of `admit`; skips as `fire` |
 | `ingress` | `ingested`, then `fire` with the ingress event on a generic trigger |
+| `hold`, `unhold` | `control` `Hold` / `Release` of run r; `dispatch` also asks the store whether the run is held (the `check_lease` boundary) |
+| `pause`, `resume` | `control` `Pause` / `Resume` of the definition, when the model's guards hold (nothing to suspend; a manual trip) |
 
 The projection keeps what both sides state: runs (admission, epoch, version,
 outcome, end, deadline, owner, generation, lease, records and values, frontier,
@@ -271,7 +373,10 @@ then executes a reachable scripted witness and records **all** sticky monitor
 violations at its end; the target property must be violated, not merely a
 nonzero CLI exit. Off-target clean cells are sampled witness observations, not
 exhaustive separations. `contract_temporal.py` exhausts each progress/recipient
-mutant against every property in that quotient.
+mutant against every property of its own quotient (the others' are structurally
+absent) and drops each named fairness assumption of L6–L10 in turn, which must
+violate every property that states it (`--module`, `--target` select one
+quotient or variant).
 
 Fault switches 1–11 correspond to every contract matrix row: boundary abort,
 lost reply, duplicate request, accept/take reordering, alternate concurrent actor,
@@ -348,7 +453,7 @@ and runtime tests:
   count each decision returns) and a grandchild's spending, which only random
   traces reach (no witness).
 
-The symbolic contract check and the TLC progress quotient need Apalache and a
+The symbolic contract check and the TLC progress quotients need Apalache and a
 JVM; whether they were run for this revision is in [RESULTS.md](RESULTS.md).
 
 ## Follow-ups
@@ -358,7 +463,7 @@ JVM; whether they were run for this revision is in [RESULTS.md](RESULTS.md).
 - Broaden the concurrent batches with storage faults and child/breaker races.
 - A production-interpreter MBT adapter for nested invocation identity and DSL
   retries, transport rejection proofs, corrupt/unsupported checkpoint formats.
-- A checked refinement relation between the model and the progress quotient,
+- A checked refinement relation between the model and the progress quotients,
   plus larger symbolic bounds. No such refinement theorem is claimed here.
 
 ## Control API quick checks (#18)

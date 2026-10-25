@@ -28,6 +28,20 @@ pub enum Command {
     Resume {
         definition: String,
     },
+    /// Freezes the run and its live owned descendants, atomically: none is
+    /// claimed or returned as due until `Release`, and a worker driving one
+    /// stops at its next fenced step or dispatch boundary and releases it.
+    /// A call already dispatched is not retracted and its answer is still
+    /// recorded. Idempotent; an ended run is left alone.
+    Hold {
+        run: String,
+        note: String,
+    },
+    /// Lets a held run and its held descendants continue from the same
+    /// place; due work the hold kept is due again in the same commit.
+    Release {
+        run: String,
+    },
     Stop {
         enabled: bool,
     },
@@ -55,6 +69,27 @@ pub struct ManualTrip {
     pub reason: String,
     pub note: String,
 }
+/// Who froze a run and why, as `RunStore::control` recorded it (`SavedRun::held`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Hold {
+    pub actor: String,
+    pub reason: String,
+    pub note: String,
+    pub at_ms: i64,
+}
+
+/// A fenced step the store refused because an operator holds the run. The
+/// worker driving it stops and releases its lease; nothing is lost, the run
+/// continues from its evidence when released.
+#[derive(Debug)]
+pub struct Held(pub String);
+impl std::fmt::Display for Held {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "run {} is held by an operator", self.0)
+    }
+}
+impl std::error::Error for Held {}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct Paused {
     pub epoch: u64,

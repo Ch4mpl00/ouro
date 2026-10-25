@@ -33,11 +33,11 @@ MUTANTS = {
  # An at-most-once call whose outcome is unknown is dispatched again (#25).
  "E2/unknown": ('val resend = decision == 3 and not(protected(i))', 'val resend = decision == 3', BOOT+CALL[:2]+[op("crash")]+TICKS+[op("claim"),op("recover"),op("dispatch")]),
  # A refusal saved without a dispatch to answer licenses a second dispatch.
- "E2/refused": ('op == "rejected" and authorized and local.phase == 2', 'op == "rejected" and authorized and local.phase >= 1', BOOT+[op("intent"),op("rejected")]),
+ "E2/refused": ('op == "rejected" and answers and local.phase == 2', 'op == "rejected" and answers and local.phase >= 1', BOOT+[op("intent"),op("rejected")]),
  "E3": ('else if (record == 1) 3 else 0', 'else if (record == 1) 2 else 0', BOOT+[op("intent"),op("recover")]),
  "E4": ('observe(recovered,op,r,i,execution.values.nth(i),decision)', 'observe(update(recovered,r,{ ...execution,values:execution.values.replaceAt(i,99) }),op,r,i,execution.values.nth(i),decision)', BOOT+CALL+[op("recover")]),
  # A refusal overwrites the call's saved answer.
- "E4/refused": ('op == "rejected" and authorized and local.phase == 2 and local.invocation == i', 'op == "rejected" and authorized', BOOT+CALL+[op("rejected")]),
+ "E4/refused": ('op == "rejected" and answers and local.phase == 2 and local.invocation == i', 'op == "rejected" and answers', BOOT+CALL+[op("rejected")]),
  "R1": ('continuation:frontier.fold(0,(a,k) => a + execution.values.nth(k))', 'continuation:0', [op("admit",value=1),op("claim")]+CALL+[op("checkpoint")]),
  "R2": ('val decision = recovery(execution.records.nth(i),execution.retained)', 'val decision = if (execution.records.nth(i) == 0 and w == 0) 4 else recovery(execution.records.nth(i),execution.retained)', BOOT+[op("recover")]),
  "R3": ('op == "checkpoint" and authorized and execution.records.nth(i) == 2', 'op == "checkpoint" and authorized', BOOT+[op("checkpoint")]),
@@ -68,6 +68,19 @@ MUTANTS = {
  "V2/same-content": ('and not(barred(c,i+1)))\n      observe(pinRun','and true)\n      observe(pinRun',TRIP+[op("pin",r=2,i=2,value=5)]),
  # A pinned run of another version carries the active epoch and so counts.
  "V2/pinned-counts": ('epoch:if (version == c.active) c.epoch else 0','epoch:c.epoch',[op("pin",i=1,value=3),op("claim"),op("finish",fault=0,value=1)]),
+ # An operator's pause admits other content like an automatic trip does, or
+ # its resume lifts a breaker's trip.
+ "V2/manual": ('and not(barred(c,i+1)))\n      observe(pinRun','and not(c.tripped and content(i+1) == c.trippedDigest))\n      observe(pinRun',[op("activate",i=1,value=0),op("pause"),op("pin",r=0,i=0,value=5)]),
+ "V2/resume": ('op == "resume" and value >= 0 and c.tripped and c.manual','op == "resume" and value >= 0 and c.tripped',TRIP+[op("resume")]),
+ # A held run takes a step, is dispatched, or is claimed; a hold misses the
+ # run's owned child, or a release changes more than the hold kept; an ended
+ # run stays held.
+ "H1": ('val authorized = answers and not(execution.held)','val authorized = answers',BOOT+[op("hold"),op("intent")]),
+ "H1/dispatch": ('and not(local.stopped) and not(execution.held) and Set(1,4)','and not(local.stopped) and Set(1,4)',BOOT+[op("intent"),op("hold"),op("dispatch")]),
+ "H2": ('live(execution) and not(execution.held) and execution.lease <= s.now','live(execution) and execution.lease <= s.now',[op("admit"),op("hold"),op("claim")]),
+ "H3": ('val closed = Set(r).union(descendants(s,r))\n      { ...s,db:{ ...s.db,runs:Runs.fold(s.db.runs,(a,k) => if (closed.contains(k)) a.replaceAt(k,{ ...a.nth(k),held:true })','val closed = Set(r)\n      { ...s,db:{ ...s.db,runs:Runs.fold(s.db.runs,(a,k) => if (closed.contains(k)) a.replaceAt(k,{ ...a.nth(k),held:true })',BOOT+[op("child"),op("hold")]),
+ "H3/release": ('a.replaceAt(k,{ ...a.nth(k),held:false })','a.replaceAt(k,{ ...a.nth(k),held:false,lease:-1 })',BOOT+[op("hold"),op("unhold")]),
+ "H4": ('notified:x.parent >= 0,held:false }) else a })','notified:x.parent >= 0 }) else a })',BOOT+[op("hold"),op("cancel")]),
  "V3": ('execution.lease <= s.now and compatible(execution.app,w)','execution.lease <= s.now',[op("admit",i=1),op("claim",w=1)]),
  "O1": ('{ ...persisted.workers.nth(actor),stopped:true,phase:0,permit:false }','{ ...persisted.workers.nth(actor),stopped:false,phase:1,permit:false }',BOOT+[op("intent",fault=2),op("dispatch")]),
  "O2": ('x.outcome != 0 and s.now >= x.ended+5','true',BOOT+[op("sweep")]),

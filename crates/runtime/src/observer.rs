@@ -160,6 +160,14 @@ pub enum EventKind {
     /// tripped version's content digest: admissions of that content are
     /// refused until an activation.
     BreakerTripped { digest: String, epoch: u64, faults: u32, threshold: u32, error: WorkflowError },
+    /// An operator froze the run (`control::Command::Hold`), reported by the
+    /// runtime that executed the command (a bare `Control` reports nothing)
+    /// once, for the run the operator named: its live owned descendants
+    /// were frozen in the same commit and show `held` in `inspect` and
+    /// `list`. The attribution is the request's.
+    RunHeld { actor: String, reason: String, note: String },
+    /// An operator let the run go on (`control::Command::Release`).
+    RunReleased { actor: String, reason: String },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -305,6 +313,25 @@ impl Observers {
             span: SpanRef::pinned(admission),
             time_ms: now_ms,
             kind: EventKind::RunAdmitted { input: self.payload(&admission.input) },
+        });
+    }
+    /// An operator's hold or release of `run`, as the command's request
+    /// attributed it.
+    pub fn operated(&self, run: &SavedRun, now_ms: i64, kind: EventKind) {
+        if self.silent() {
+            return;
+        }
+        let a = &run.admission;
+        self.dispatch(Event {
+            run_id: a.id.clone(),
+            parent_id: run.child.as_ref().map(|c| c.parent.clone()),
+            root_id: Some(run.root.clone().unwrap_or_else(|| a.id.clone())),
+            definition: a.name.clone(),
+            version: a.version,
+            task_path: None,
+            span: None,
+            time_ms: now_ms,
+            kind,
         });
     }
     /// A breaker trip's notice, handed on: its CloudEvent's report.

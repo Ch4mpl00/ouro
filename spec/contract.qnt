@@ -24,14 +24,18 @@ module contract {
     outcome: int, ended: int, deadline: int, owner: int, generation: int, lease: int,
     records: List[int], values: List[int], frontier: Set[int], continuation: int,
     subscription: bool, parent: int, notified: bool, retained: bool,
-    spends: List[int], spent: List[int], scheduled: bool
+    spends: List[int], spent: List[int], scheduled: bool,
+    // Frozen by an operator (#29): never claimed, takes no step but the answer
+    // of a call already dispatched, until released; ended runs are never held.
+    held: bool
   }
   type Copy = { id: int, recipient: int, payload: int, expires: int, disposition: int, key: int }
   // `notices`: the epochs whose trip was reported, one committed notice each.
   // `trippedDigest`: the content digest of the version that tripped (0: not
   // tripped). Versions are numbers and so are contents: version 3 repeats
   // version 1's text, so the two share a digest (`content`).
-  type Catalog = { active: int, epoch: int, faults: int, tripped: bool, trippedDigest: int,
+  // `manual`: the trip is an operator's pause, which refuses every version.
+  type Catalog = { active: int, epoch: int, faults: int, tripped: bool, manual: bool, trippedDigest: int,
     triggerEpoch: int, due: int, slot: int, running: int, catchup: int, rearm: bool, once: bool,
     armed: bool, notices: List[int], overlap: int, maxRuns: int, queued: int, queueSlot: int, queueInput: int, queueRefused: bool }
   type Durable = { stopped: bool, runs: List[Run], copies: List[Copy], catalog: Catalog,
@@ -43,18 +47,20 @@ module contract {
   // answered with a saved proof that it did nothing (`rejected`, #25).
   type Machine = { db: Durable, workers: List[Local], now: int,
     sends: List[List[int]], refusals: List[List[int]], observations: List[Observation],
-    violations: Set[str], faultsSeen: Set[int] }
+    violations: Set[str], faultsSeen: Set[int],
+    // The run id a buffered slot promoted in the latest transition (-1: none).
+    promoted: int }
   pure val emptyRun: Run = { admitted: false, input: 0, version: 0, epoch: 0, app: 0, mode: 0,
     outcome: 0, ended: -1, deadline: -1, owner: -1, generation: 0, lease: -1,
     records: [0,0,0], values: [0,0,0], frontier: Set(), continuation: 0,
-    subscription: false, parent: -1, notified: false, retained: true, spends: [0,0,0], spent: [0,0,0], scheduled: false }
+    subscription: false, parent: -1, notified: false, retained: true, spends: [0,0,0], spent: [0,0,0], scheduled: false, held: false }
   pure val emptyLocal: Local = { fence: 0, execution: 0, phase: 0, invocation: 0, stopped: false, permit: false }
   pure val initialDb: Durable = { stopped:false, runs: [emptyRun,emptyRun,emptyRun], copies: [], admissions: [0,0,0], budget: [0,0,0],
     buffered: Set(), fired: Set(), skipped: Set(), ingress: Map(), ingressPayload:Map(), catalog: { active: 1, epoch: 1,
-      faults: 0, tripped: false, trippedDigest: 0, triggerEpoch: 1, due: 2, slot: 0, running: -1, catchup: 0, rearm:false, once:false,
+      faults: 0, tripped: false, manual: false, trippedDigest: 0, triggerEpoch: 1, due: 2, slot: 0, running: -1, catchup: 0, rearm:false, once:false,
       armed: true, notices: [], overlap:0, maxRuns:2, queued:-1, queueSlot:-1, queueInput:0, queueRefused:false } }
   pure val initial: Machine = { db: initialDb, workers: [emptyLocal,emptyLocal], now: 0,
-    sends: [[0,0,0],[0,0,0],[0,0,0]], refusals: [[0,0,0],[0,0,0],[0,0,0]], observations: [], violations: Set(), faultsSeen: Set() }
+    sends: [[0,0,0],[0,0,0],[0,0,0]], refusals: [[0,0,0],[0,0,0],[0,0,0]], observations: [], violations: Set(), faultsSeen: Set(), promoted: -1 }
   var m: Machine
   // The command just executed and its choices, for the model-based tests.
   type Command = { r: int, w: int, i: int, value: int, fault: int }
@@ -72,9 +78,10 @@ module contract {
     spends: Map(), legal: true }
   var ideal: Ideal
   pure def content(version: int): int = if (version == 3) 1 else version
-  // A tripped definition refuses an admission iff its version's content is the
-  // tripped one, whatever the version number (V2).
-  pure def barred(c: Catalog, version: int): bool = c.tripped and content(version) == c.trippedDigest
+  // An automatic trip refuses an admission iff its version's content is the
+  // tripped one, whatever the version number; an operator's pause refuses
+  // every admission, whatever its content (V2).
+  pure def barred(c: Catalog, version: int): bool = c.tripped and (c.manual or content(version) == c.trippedDigest)
   pure def live(r: Run): bool = r.admitted and r.outcome == 0
   pure def compatible(app: int, worker: int): bool = app == 0 or app == worker + 1
   pure def authority(s: Machine, r: int, w: int): bool = {
@@ -108,7 +115,7 @@ module contract {
       fired:if (fresh) admitted.db.fired.union(Set((c.epoch,c.queueSlot))) else admitted.db.fired,
       catalog:{ ...c,queued:-1,queueSlot:-1,running:if (fresh) c.queued else c.running } } } else admitted
     val ended = if (fresh and c.queueRefused) refuseRun(promoted,c.queued,0) else promoted
-    { ...ended, db: { ...ended.db, budget: Runs.fold(ended.db.budget,(a,k) =>
+    { ...ended, promoted:if (fresh) c.queued else -1, db: { ...ended.db, budget: Runs.fold(ended.db.budget,(a,k) =>
       if (ended.db.runs.nth(k).outcome != 0 and ended.db.runs.nth(k).parent < 0) a.replaceAt(k,0) else a) } }
   }
   pure def update(s: Machine, r: int, execution: Run): Machine =
@@ -155,7 +162,7 @@ module contract {
       val closed = Set(r).union(descendants(s,r))
       val runs = Runs.fold(s.db.runs,(a,k) => { val x = a.nth(k)
         if (closed.contains(k) and live(x))
-          a.replaceAt(k,{ ...x,outcome:5,ended:s.now,owner:-1,lease:-1,subscription:false,notified:x.parent >= 0 }) else a })
+          a.replaceAt(k,{ ...x,outcome:5,ended:s.now,owner:-1,lease:-1,subscription:false,notified:x.parent >= 0,held:false }) else a })
       // A cancelled schedule run re-arms an `after` trigger like any other end.
       val rearmed = c.armed and c.rearm and c.due < 0 and c.running == r and execution.epoch == c.triggerEpoch
       val catalog = { ...c, due:if (rearmed) s.now+2 else c.due, running:if (c.running == r) -1 else c.running }
@@ -172,7 +179,12 @@ module contract {
     val execution = s.db.runs.nth(r)
     val local = s.workers.nth(w)
     val c = s.db.catalog
-    val authorized = authority(s,r,w)
+    // The fenced owner may act, unless an operator holds the run: a held run
+    // takes no step (H1). `answers` is the owner's authority alone: a call
+    // already dispatched is not retracted and its answer is still recorded,
+    // and the owner may always give its lease back.
+    val answers = authority(s,r,w)
+    val authorized = answers and not(execution.held)
     val pending = s.db.copies.indices().filter(k => {
       val e = s.db.copies.nth(k)
       e.recipient == r and e.disposition == 0 and e.expires > s.now
@@ -184,7 +196,7 @@ module contract {
       observe(admitRun(s,r,value,i,if (op == "dry") 1 else if (op == "replay") 2 else 0),"admit",r,i,value,1)
     else if (op == "pin" and value >= 0 and not(execution.admitted) and not(barred(c,i+1)))
       observe(pinRun(s,r,value,i+1),"admit",r,0,value,1)
-    else if (op == "claim" and live(execution) and execution.lease <= s.now and compatible(execution.app,w) and
+    else if (op == "claim" and live(execution) and not(execution.held) and execution.lease <= s.now and compatible(execution.app,w) and
       not(s.workers.elems().exists(x => x.permit))) {
       val updated = update(s,r,{ ...execution, owner:w, generation:execution.generation+1, lease:s.now+4 })
       { ...updated, workers: updated.workers.replaceAt(w,{ ...emptyLocal, execution:r, fence:execution.generation+1, permit:true }) }
@@ -194,23 +206,24 @@ module contract {
       execution.mode != 2 and not(execution.mode == 1 and mocked(i)) and s.now < execution.deadline) {
       val updated = update(s,r,{ ...execution, records:execution.records.replaceAt(i,1) })
       observe({ ...updated, workers: updated.workers.replaceAt(w,{ ...local, phase:1, invocation:i }) },op,r,i,execution.input+i,1)
-    } else if (op == "dispatch" and not(local.stopped) and Set(1,4).contains(local.phase) and local.execution == r and local.invocation == i) {
+    } else if (op == "dispatch" and not(local.stopped) and not(execution.held) and Set(1,4).contains(local.phase) and local.execution == r and local.invocation == i) {
       val updated = { ...s, workers:s.workers.replaceAt(w,{ ...local, phase:2 }),
         sends:s.sends.replaceAt(r,s.sends.nth(r).replaceAt(i,s.sends.nth(r).nth(i)+1)) }
       observe(updated,op,r,i,execution.input+i,1)
-    } else if (op == "result" and authorized and local.phase == 2 and local.invocation == i and value >= 0) {
+    } else if (op == "result" and answers and local.phase == 2 and local.invocation == i and value >= 0) {
       // Value 1: the function answered with an error, itself a result.
       val record = if (value == 1) 3 else 2
       val updated = update(s,r,{ ...execution, records:execution.records.replaceAt(i,record), values:execution.values.replaceAt(i,execution.input+i) })
       observe({ ...updated, workers: updated.workers.replaceAt(w,{ ...local, phase:0 }) },op,r,i,execution.input+i,1)
-    } else if (op == "notExecuted" and authorized and local.phase == 1 and local.invocation == i) {
+    } else if (op == "notExecuted" and answers and local.phase == 1 and local.invocation == i) {
       // Proof, before any dispatch, that the call was not sent: it may be sent later.
       val updated = update(s,r,{ ...execution, records:execution.records.replaceAt(i,4) })
       observe({ ...updated, workers: updated.workers.replaceAt(w,{ ...local, phase:0 }) },op,r,i,execution.input+i,1)
-    } else if (op == "rejected" and authorized and local.phase == 2 and local.invocation == i) {
+    } else if (op == "rejected" and answers and local.phase == 2 and local.invocation == i) {
       // The function's answer to this dispatch: it refused before doing
       // anything (#25). Saved like a proof of no dispatch, it withdraws the
-      // dispatch, so a later intent may send the call again.
+      // dispatch, so a later intent may send the call again. An answer, so
+      // a hold does not refuse it.
       val updated = update(s,r,{ ...execution, records:execution.records.replaceAt(i,4) })
       observe({ ...updated, workers: updated.workers.replaceAt(w,{ ...local, phase:0 }),
         refusals:s.refusals.replaceAt(r,s.refusals.nth(r).replaceAt(i,s.refusals.nth(r).nth(i)+1)) },op,r,i,execution.input+i,1)
@@ -284,11 +297,11 @@ module contract {
           due:if (trip) -1 else if (c.armed and c.rearm and c.due < 0 and c.running == r and execution.epoch == c.triggerEpoch) s.now+2 else c.due,
           running:if (c.running == r) -1 else c.running, notices:if (trip) c.notices.append(c.epoch) else c.notices }
       val updated = update(s,r,{ ...execution,outcome:outcome,ended:s.now,owner:-1,lease:-1,subscription:false,
-        notified:execution.parent >= 0 })
+        notified:execution.parent >= 0,held:false })
       // An owned child never outlives its parent (#14): any end of the run
       // cancels its live descendants, transitively, in this transition.
       val owned = descendants(s,r)
-      val stoppedChildren = owned.fold(updated,(a,k) => update(a,k,{ ...a.db.runs.nth(k),outcome:5,ended:s.now,owner:-1,lease:-1,subscription:false,notified:true }))
+      val stoppedChildren = owned.fold(updated,(a,k) => update(a,k,{ ...a.db.runs.nth(k),outcome:5,ended:s.now,owner:-1,lease:-1,subscription:false,notified:true,held:false }))
       val finished = observe({ ...stoppedChildren, db:{ ...stoppedChildren.db,catalog:catalog },
         workers:stoppedChildren.workers.mapped(x => if (x.execution == r or owned.contains(x.execution)) { ...x,stopped:true,permit:false } else x) },op,r,i,outcome,1)
       owned.fold(finished,(a,k) => observe(a,"finish",k,0,5,1))
@@ -301,7 +314,7 @@ module contract {
       // an activation clears a trip; reported notices stay. The value picks
       // the trigger: catchup (odd), `after` rearm (2, 3) or a one-shot (4).
       val epoch = c.epoch+1
-      { ...s,db:{ ...s.db,catalog:{ ...c,active:i+1,epoch:epoch,faults:0,tripped:false,trippedDigest:0,catchup:value % 2,rearm:value == 2 or value == 3,once:value == 4,
+      { ...s,db:{ ...s.db,catalog:{ ...c,active:i+1,epoch:epoch,faults:0,tripped:false,manual:false,trippedDigest:0,catchup:value % 2,rearm:value == 2 or value == 3,once:value == 4,
         triggerEpoch:epoch,due:if (i == 0) s.now+2 else -1,armed:i == 0,slot:0,queued:-1,queueSlot:-1 } } }
     } else if (Set("fire","refuse").contains(op) and value >= 0 and c.due >= 0 and c.due <= s.now and c.triggerEpoch == c.epoch and not(c.tripped)) {
       firePolicy(s,r,i,value,c.overlap,c.maxRuns,op == "refuse")
@@ -310,9 +323,24 @@ module contract {
     else if (op == "ingress" and value >= 0 and not(s.db.ingress.keys().contains(i) and s.db.ingress.get(i) > s.now) and not(execution.admitted) and not(c.tripped)) {
       val updated = observe(admitRun(s,r,value,0,0),"admit",r,i,value,1)
       { ...updated, db:{ ...updated.db,ingress:s.db.ingress.put(i,s.now+5),ingressPayload:s.db.ingressPayload.put(i,value) } }
+    } else if (op == "hold" and live(execution)) {
+      // The run and its live owned descendants, in one transition (H4).
+      val closed = Set(r).union(descendants(s,r))
+      { ...s,db:{ ...s.db,runs:Runs.fold(s.db.runs,(a,k) => if (closed.contains(k)) a.replaceAt(k,{ ...a.nth(k),held:true }) else a) } }
+    } else if (op == "unhold" and live(execution)) {
+      val closed = Set(r).union(descendants(s,r))
+      { ...s,db:{ ...s.db,runs:Runs.fold(s.db.runs,(a,k) => if (closed.contains(k)) a.replaceAt(k,{ ...a.nth(k),held:false }) else a) } }
+    } else if (op == "pause" and value >= 0 and not(c.tripped) and not(c.armed) and c.queued < 0) {
+      // An operator's pause is a trip that refuses every version and reports
+      // no notice. The model pauses a definition with nothing to suspend (no
+      // armed schedule, no buffered slot): suspending and restoring triggers
+      // is storage behaviour, covered by the conformance suite.
+      { ...s,db:{ ...s.db,catalog:{ ...c,tripped:true,manual:true,trippedDigest:content(c.active) } } }
+    } else if (op == "resume" and value >= 0 and c.tripped and c.manual) {
+      { ...s,db:{ ...s.db,catalog:{ ...c,tripped:false,manual:false,trippedDigest:0 } } }
     } else if (op == "sweep")
       { ...s,db:{ ...s.db,runs:s.db.runs.mapped(x => if (x.outcome != 0 and s.now >= x.ended+5) { ...x,retained:false } else x) } }
-    else if (op == "release" and authorized) {
+    else if (op == "release" and answers) {
       val updated = update(s,r,{ ...execution,owner:-1,lease:-1 })
       { ...updated,workers:updated.workers.replaceAt(w,{ ...local,stopped:true,phase:0,permit:false }) }
     }
@@ -347,6 +375,9 @@ module contract {
     if (refused and not(skip or buffer)) refuseRun(decided,r,i) else decided
   }
   pure def flag(errors: Set[str], id: str, ok: bool): Set[str] = if (ok) errors else errors.union(Set(id))
+  // The monitors' own statement of a hold's effect (the transitions spell it out).
+  pure def setHeld(runs: List[Run], tree: Set[int], v: bool): List[Run] =
+    Runs.fold(runs,(x,k) => if (tree.contains(k)) x.replaceAt(k,{ ...x.nth(k),held:v }) else x)
   // Monitors inspect before/after facts and occurrence counts, independently of
   // command success. Once observed, a violation cannot disappear after sweeping.
   pure def audit(b: Machine, a: Machine, op: str, r: int, w: int, i: int, value: int): Set[str] = {
@@ -460,7 +491,13 @@ module contract {
       (if (c.queued < 0) buffered and d.queued == r and d.queueInput == value else skipped and d.queued == c.queued))
     val queueStable = c.queued < 0 or d.queued < 0 or
       (c.queued == d.queued and c.queueSlot == d.queueSlot and c.queueInput == d.queueInput and c.queueRefused == d.queueRefused)
-    val queueReady = not(a.db.stopped) and c.queued >= 0 and not(b.db.runs.nth(c.queued).admitted) and d.armed and not(d.tripped) and
+    // A buffered slot's run id may also be admitted directly by the operation
+    // itself (the model has three run ids): that is no promotion. Excused only
+    // when the operation's own transition admits that id; an operation that
+    // targets it and is refused is checked like any other.
+    val admittedByOp = c.queued >= 0 and not(b.db.runs.nth(c.queued).admitted) and
+      a.db.runs.nth(c.queued).admitted and a.promoted != c.queued
+    val queueReady = not(a.db.stopped) and c.queued >= 0 and not(admittedByOp) and not(b.db.runs.nth(c.queued).admitted) and d.armed and not(d.tripped) and
       op != "activate" and not(Runs.exists(k => k != c.queued and live(a.db.runs.nth(k)) and a.db.runs.nth(k).scheduled)) and
       Runs.filter(k => k != c.queued and live(a.db.runs.nth(k))).size() < c.maxRuns
     val errorPromotion = flag(errorQueue,"OverlapQueue",queueStable and (not(queueReady) or
@@ -493,7 +530,7 @@ module contract {
     // The threshold observation trips and reports it once, stopping the
     // schedule; a tripped breaker ignores later observations; only an
     // activation clears it; notices change only at a trip.
-    val promotedRefusal = c.queued >= 0 and c.queueRefused and not(b.db.runs.nth(c.queued).admitted) and a.db.runs.nth(c.queued).admitted
+    val promotedRefusal = c.queued >= 0 and c.queueRefused and not(admittedByOp) and not(b.db.runs.nth(c.queued).admitted) and a.db.runs.nth(c.queued).admitted
     // Only runs of the active version count; a pinned run of other content
     // never does (its epoch is none), tripped or not.
     val observed = execution.epoch == c.epoch and execution.version == c.active and not(c.tripped)
@@ -513,11 +550,20 @@ module contract {
       else d.faults == (if (qualifying) c.faults+1 else if (execution.outcome == 1) 0 else c.faults) and
         not(d.tripped) and d.notices == c.notices
     val error23 = flag(error22,"V2",(d.faults < 2 or d.tripped) and breakerCorrect and
-      (not(c.tripped) or d.tripped or op == "activate") and
+      (not(c.tripped) or d.tripped or op == "activate" or (op == "resume" and c.manual)) and
       // While tripped, an admission happens only as a pinned start of other
-      // content, and such a start (not stopped, run free) always happens.
+      // content, and such a start (not stopped, run free) always happens. An
+      // operator's pause admits nothing at all, and only `resume` or an
+      // activation lifts it; resuming never lifts a breaker's trip.
       (not(c.tripped) or a.db.admissions == b.db.admissions or
-        (op == "pin" and a.db.admissions.nth(r) == b.db.admissions.nth(r)+1 and content(execution.version) != c.trippedDigest)) and
+        (op == "pin" and not(c.manual) and a.db.admissions.nth(r) == b.db.admissions.nth(r)+1 and content(execution.version) != c.trippedDigest)) and
+      (not(d.manual) or d.tripped) and
+      (op != "pause" or value < 0 or c.tripped or c.armed or c.queued >= 0 or (d.tripped and d.manual and
+        d.trippedDigest == content(c.active) and d.faults == c.faults and d.epoch == c.epoch)) and
+      (op != "pause" or d.manual == c.manual or (not(c.tripped) and not(c.armed))) and
+      (op != "resume" or value < 0 or c.manual or c == d) and
+      (op != "resume" or value < 0 or not(c.manual) or (not(d.tripped) and not(d.manual) and d.faults == c.faults)) and
+      (op != "activate" or c == d or not(d.manual)) and
       (op != "pin" or value < 0 or b.db.stopped or old.admitted or barred(c,i+1) or execution.admitted) and
       (op != "pin" or not(barred(c,i+1)) or a.db.admissions == b.db.admissions) and
       (d.tripped == (d.trippedDigest != 0) and (not(d.tripped) or d.trippedDigest == content(d.active))) and
@@ -546,9 +592,25 @@ module contract {
         (x.spends.nth(c) == 0 or (y.spends.nth(c) == x.spends.nth(c) and y.spent.nth(c) == x.spent.nth(c))) and
           (y.spends.nth(c) != 2 or y.spent.nth(c) == ceiling)
       })))
+    // A held run takes no step but the answer of a call already dispatched
+    // (and giving its lease back): none of the owner's fenced operations, no
+    // dispatch, and no claim changes anything while it is held (#29).
+    val steps = Set("renew","intent","recover","checkpoint","subscribe","take","child","finish","timeout","conflict","spend").contains(op)
+    val frozen = b.db.runs.nth(r).held
+    val errorH1 = flag(error30,"H1",(not(steps) or not(frozen) or b.db == a.db) and
+      (op != "dispatch" or not(frozen) or a.sends == b.sends))
+    val errorH2 = flag(errorH1,"H2",op != "claim" or not(frozen) or b.db == a.db)
+    // A hold freezes the run and its live owned descendants in one transition
+    // and changes nothing else; releasing them restores exactly what the hold
+    // kept, so due work is due again and the evidence is the same (H3).
+    val tree = Set(r).union(descendants(b,r))
+    val errorH3 = flag(errorH2,"H3",(op != "hold" or not(live(old)) or a.db == { ...b.db,runs:setHeld(b.db.runs,tree,true) }) and
+      (op != "unhold" or not(live(old)) or a.db == { ...b.db,runs:setHeld(b.db.runs,tree,false) }))
+    // An ended run is never held.
+    val errorH4 = flag(errorH3,"H4",Runs.forall(k => not(a.db.runs.nth(k).held) or live(a.db.runs.nth(k))))
     // A stop cannot grant ownership, admit or fire. Clearing it changes no
     // run identity, journal or schedule slot; resumed work uses its evidence.
-    flag(error30,"S1",not(b.db.stopped) or not(a.db.stopped) or
+    flag(errorH4,"S1",not(b.db.stopped) or not(a.db.stopped) or
       (a.db.admissions == b.db.admissions and a.db.fired == b.db.fired and
         Runs.forall(k => a.db.runs.nth(k).generation == b.db.runs.nth(k).generation)))
   }
@@ -627,7 +689,7 @@ module contract {
   action step = {
     nondet op = Set("admit","dry","replay","claim","renew","release","intent","dispatch","result","notExecuted","rejected","recover",
       "checkpoint","conflict","subscribe","address","publish","take","expire","child","finish","timeout","cancel",
-      "activate","fire","refuse","ingress","sweep","crash","tick","spend","policy","stop","pin").oneOf()
+      "activate","fire","refuse","ingress","sweep","crash","tick","spend","policy","stop","pin","hold","unhold","pause","resume").oneOf()
     nondet r = Runs.oneOf()
     nondet w = Workers.oneOf()
     nondet i = Calls.oneOf()
@@ -669,8 +731,12 @@ module contract {
   val X3 = not(m.violations.contains("X3"))
   val B1 = not(m.violations.contains("B1"))
   val S1 = not(m.violations.contains("S1"))
+  val H1 = not(m.violations.contains("H1"))
+  val H2 = not(m.violations.contains("H2"))
+  val H3 = not(m.violations.contains("H3"))
+  val H4 = not(m.violations.contains("H4"))
   val overlapPolicies = Set("OverlapSkip","OverlapAllow","OverlapQueue","OverlapReplace","OverlapCeiling").forall(p => not(m.violations.contains(p)))
-  val safety = S1 and overlapPolicies and A1 and A2 and A3 and A4 and A5 and E1 and E2 and E3 and E4 and R1 and R2 and R3 and W1 and W2 and W3 and W4 and W5 and C1 and C2 and C3 and T1 and T2 and T3 and V1 and V2 and V3 and O1 and O2 and O3 and X1 and X2 and X3 and B1
+  val safety = S1 and H1 and H2 and H3 and H4 and overlapPolicies and A1 and A2 and A3 and A4 and A5 and E1 and E2 and E3 and E4 and R1 and R2 and R3 and W1 and W2 and W3 and W4 and W5 and C1 and C2 and C3 and T1 and T2 and T3 and V1 and V2 and V3 and O1 and O2 and O3 and X1 and X2 and X3 and B1
   val compatibilityWaiting = Runs.filter(r => live(m.db.runs.nth(r)) and not(Workers.exists(w => compatible(m.db.runs.nth(r).app,w))))
   // State correspondence prevents an acknowledged label from fabricating a
   // committed fact. The event checker itself never reads the concrete state.

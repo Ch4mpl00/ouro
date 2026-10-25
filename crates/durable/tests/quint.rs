@@ -202,6 +202,8 @@ struct RunView {
     continuation: i64,
     subscription: bool,
     parent: i64,
+    /// Frozen by an operator (`Command::Hold`).
+    held: bool,
     /// Budget decisions by key: 0 none, 1 granted, 2 refused; and the tree's
     /// count after each (`Record::Budget`).
     spends: Vec<i64>,
@@ -261,6 +263,8 @@ struct CatalogView {
     epoch: i64,
     faults: i64,
     tripped: bool,
+    /// The trip is an operator's pause, which refuses every version.
+    manual: bool,
     /// The content the trip refuses (the model's `content`), 0: not tripped.
     tripped_digest: i64,
     trigger: Option<TriggerView>,
@@ -319,6 +323,7 @@ struct ModelRun {
     continuation: i64,
     subscription: bool,
     parent: i64,
+    held: bool,
     retained: bool,
     spends: Vec<i64>,
     spent: Vec<i64>,
@@ -348,6 +353,7 @@ struct ModelCatalog {
     epoch: i64,
     faults: i64,
     tripped: bool,
+    manual: bool,
     #[serde(rename = "trippedDigest")]
     tripped_digest: i64,
     #[serde(rename = "triggerEpoch")]
@@ -398,6 +404,7 @@ impl From<Machine> for View {
                     continuation: if kept { x.continuation } else { 0 },
                     subscription: x.subscription,
                     parent: x.parent,
+                    held: x.held,
                     spends: if kept { x.spends.clone() } else { vec![0; CALLS] },
                     spent: if kept { x.spent.clone() } else { vec![0; CALLS] },
                 }
@@ -434,6 +441,7 @@ impl From<Machine> for View {
                 epoch: c.epoch,
                 faults: c.faults,
                 tripped: c.tripped,
+                manual: c.manual,
                 tripped_digest: c.tripped_digest,
                 trigger: c.armed.then_some(TriggerView {
                     overlap: c.overlap,
@@ -547,6 +555,7 @@ impl State<StoreDriver> for View {
                 epoch: defs.epoch as i64,
                 faults: i64::from(defs.consecutive_faults),
                 tripped: defs.tripped.is_some(),
+                manual: defs.tripped.as_ref().is_some_and(|t| t.manual.is_some()),
                 tripped_digest: defs.tripped.as_ref().map_or(Ok(0), |t| content_of(&t.digest))?,
                 trigger,
                 notices,
@@ -768,6 +777,7 @@ impl StoreDriver {
         Ok(!self.block(self.store.stopped())?
             && self.block(self.store.get(&f.run_id))?.is_some_and(|r| {
                 r.fence.as_ref() == Some(f)
+                    && r.held.is_none()
                     && r.state == RunState::Running
                     && r.lease_until_ms.is_some_and(|t| t > self.ms() + skew)
             }))
@@ -966,7 +976,9 @@ impl StoreDriver {
             "pin" => {
                 let defs = self.block(self.store.definitions(NAME))?;
                 let version = i as u64 + 1;
-                let barred = defs.tripped.is_some_and(|t| t.digest == defs.versions[&version].digest);
+                // An automatic trip refuses its own content; a pause, every one.
+                let barred =
+                    defs.tripped.is_some_and(|t| t.manual.is_some() || t.digest == defs.versions[&version].digest);
                 if value < 0 || self.block(self.store.get(&run_id(r)))?.is_some() {
                     return Ok(());
                 }
@@ -1042,8 +1054,10 @@ impl StoreDriver {
                 }
             }
             "dispatch" => {
+                // The dispatch boundary (`check_lease`) refuses a held run.
+                let held = self.block(self.store.get(&run_id(r)))?.is_some_and(|x| x.held.is_some());
                 let x = &mut self.workers[w];
-                if !x.stopped && matches!(x.phase, 1 | 4) && x.execution == r && x.invocation == i {
+                if !x.stopped && !held && matches!(x.phase, 1 | 4) && x.execution == r && x.invocation == i {
                     x.phase = 2;
                     self.sends[r][i] += 1;
                     ensure!(
@@ -1359,6 +1373,48 @@ impl StoreDriver {
                     ensure!(result? == Fired::Committed, "a fresh ingress identity was refused");
                 }
             }
+            // An operator's hold or release of run `r` and its live subtree.
+            "hold" | "unhold" => {
+                if self.block(self.store.get(&run_id(r)))?.is_none_or(|x| x.ended_ms.is_some()) {
+                    return Ok(());
+                }
+                let request = ouro_durable::control::Request {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    actor: "model".into(),
+                    reason: "contract hold".into(),
+                };
+                let command = if op == "hold" {
+                    ouro_durable::control::Command::Hold { run: run_id(r), note: String::new() }
+                } else {
+                    ouro_durable::control::Command::Release { run: run_id(r) }
+                };
+                expect(self.write(fault, self.store.control(&request, &command, ms)).0.map(drop))?;
+            }
+            // An operator's pause refuses every version. The model pauses a
+            // definition with nothing to suspend: no armed schedule and no
+            // buffered slot (the store suspends and restores those, which the
+            // conformance suite checks).
+            "pause" | "resume" => {
+                let defs = self.block(self.store.definitions(NAME))?;
+                let manual = defs.tripped.as_ref().is_some_and(|t| t.manual.is_some());
+                let pausable = defs.tripped.is_none()
+                    && self.block(self.store.trigger(SCHEDULE))?.is_none()
+                    && self.block(self.store.queued(SCHEDULE))?.is_none();
+                if value < 0 || (op == "pause" && !pausable) || (op == "resume" && !manual) {
+                    return Ok(());
+                }
+                let request = ouro_durable::control::Request {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    actor: "model".into(),
+                    reason: "contract pause".into(),
+                };
+                let command = if op == "pause" {
+                    ouro_durable::control::Command::Pause { definition: NAME.into(), note: String::new() }
+                } else {
+                    ouro_durable::control::Command::Resume { definition: NAME.into() }
+                };
+                expect(self.write(fault, self.store.control(&request, &command, ms)).0.map(drop))?;
+            }
             "crash" => {
                 let x = &mut self.workers[w];
                 x.stopped = true;
@@ -1410,6 +1466,7 @@ impl StoreDriver {
             lease: ticks(r.lease_until_ms),
             subscription: !snapshot.subscriptions.is_empty(),
             parent: r.child.as_ref().and_then(|l| run_index(&l.parent)).map_or(-1, |p| p as i64),
+            held: r.held.is_some(),
             ..RunView::absent()
         };
         for (key, record) in &snapshot.records {
@@ -1517,6 +1574,10 @@ impl StoreDriver {
             .flatten()
             .filter_map(|s| {
                 let r = &s.run;
+                // A held run is due to nobody.
+                if r.held.is_some() {
+                    return None;
+                }
                 let eligible = match r.state {
                     RunState::Ready | RunState::Waiting => r.wake_at_ms,
                     RunState::Running => r.lease_until_ms?,
@@ -1609,7 +1670,7 @@ pub fn with_quint(name: &str, run: impl FnOnce() -> anyhow::Result<()>) {
     assert!(result.success(), "Quint child test failed");
 }
 /// Every command of the contract model, and initialization.
-const COMMANDS: usize = 35;
+const COMMANDS: usize = 39;
 fn simulation(adapter: Adapter) -> anyhow::Result<()> {
     use quint_connect::runner::{self, RunConfig};
     let seed = std::env::var("QUINT_SEED").unwrap_or_else(|_| "20261023".into());

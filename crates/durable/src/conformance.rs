@@ -54,6 +54,7 @@ async fn audit(store: &dyn RunStore) -> anyhow::Result<()> {
         if r.ended_ms.is_some() {
             assert!(s.awaits.is_empty() && s.listeners.is_empty() && s.subscriptions.is_empty());
             assert!(r.fence.is_none());
+            assert!(r.held.is_none(), "an ended run is never held");
         }
         // An owned child never outlives its parent: the parent's end, of any
         // kind, cancels it in the same commit (C3).
@@ -779,6 +780,7 @@ pub async fn run_all(factory: impl AsyncFn(&str) -> anyhow::Result<TestStore>) -
     budgets(&factory, &mut report).await?;
     overlap_policies(&factory, &mut report).await?;
     controls(&factory, &mut report).await?;
+    holds(&factory, &mut report).await?;
     control_overlap(&factory, &mut report).await?;
     definition_queries(&factory, &mut report).await?;
     heartbeats(&factory, &mut report).await?;
@@ -3068,10 +3070,23 @@ async fn controls(
             .unwrap_err()
             .is::<DefinitionTripped>()
     );
+    // A manual pause refuses every version, pinned or not: other content is
+    // refused too (an automatic trip would admit it), until `resume`.
+    let other = s.save_definition("workflow", "other content").await?;
+    let mut elsewhere = admission("elsewhere");
+    elsewhere.version = other.version;
+    elsewhere.definition = other.yaml.clone();
+    elsewhere.runtime = json!({ PINNED: true });
+    let refused = remote.start(&elsewhere, 1).await.unwrap_err();
+    assert!(refused.downcast_ref::<DefinitionTripped>().is_some_and(|t| t.paused), "{refused}");
+    assert!(remote.admit(&elsewhere, 1).await.unwrap_err().is::<DefinitionTripped>());
+    assert!(remote.get("elsewhere").await?.is_none());
     assert_eq!(
         s.control(&control_request("resume"), &Command::Resume { definition: "workflow".into() }, 2).await?,
         Reply::Changed(true)
     );
+    assert!(s.start(&elsewhere, 2).await?.is_some(), "other content is admitted again after the resume");
+    assert!(s.cancel("elsewhere", 2).await?);
     assert_eq!(s.definitions("workflow").await?.epoch, 1);
     assert_eq!(s.trigger("schedule").await?, Some(trigger.clone()));
     // A late retry must not undo the intervening resume.
@@ -3241,12 +3256,12 @@ async fn controls(
             break;
         }
     }
-    assert_eq!(ids, BTreeSet::from(["p".into(), "c".into(), "g".into()]));
+    assert_eq!(ids, BTreeSet::from(["p".into(), "c".into(), "g".into(), "elsewhere".into()]));
     assert_eq!(
         s.query_runs(&Runs { parent: Some("p".into()), ..filter.clone() }, false, None, 10).await?.items.len(),
         1
     );
-    assert_eq!(s.query_runs(&filter, true, None, 10).await?.items.len(), 3);
+    assert_eq!(s.query_runs(&filter, true, None, 10).await?.items.len(), 4);
     let page = s.query_runs(&filter, false, None, 1).await?;
     let invalid = |r| matches!(refusal(r), ControlError::InvalidInput(_));
     assert!(invalid(s.query_runs(&Runs::default(), false, page.next.as_ref(), 1).await.map(|_| ())));
@@ -3309,7 +3324,7 @@ async fn controls(
     audit(&**s).await?;
 
     // The audit row, event receipt and each command's indexes commit together.
-    for op in ["cancel", "pause", "resume", "stop", "clear", "respond", "describe"] {
+    for op in ["cancel", "pause", "resume", "stop", "clear", "hold", "release", "respond", "describe"] {
         for fault in [
             CommitFault::BeforeWrite(0),
             CommitFault::BeforeWrite(1),
@@ -3329,8 +3344,14 @@ async fn controls(
             if op == "clear" {
                 s.control(&control_request("prepare"), &stop, 2).await?;
             }
+            if op == "release" {
+                let hold = Command::Hold { run: "r".into(), note: String::new() };
+                s.control(&control_request("prepare"), &hold, 2).await?;
+            }
             let command = match op {
                 "cancel" => Command::Cancel { run: "r".into() },
+                "hold" => Command::Hold { run: "r".into(), note: "later".into() },
+                "release" => Command::Release { run: "r".into() },
                 "pause" | "resume" => {
                     if op == "pause" {
                         pause.clone()
@@ -3396,6 +3417,15 @@ async fn audit_control(t: &TestStore) -> anyhow::Result<()> {
         if kind == "run" {
             let r: SavedRun = serde_json::from_value(value["run"].clone())?;
             let id = &r.admission.id;
+            // A held run is due to nobody: no row of the due indexes names it.
+            if r.held.is_some() {
+                assert!(
+                    !rows
+                        .iter()
+                        .any(|((kind, _), v)| (kind == "due" || kind.starts_with("due_app:")) && v == &json!(id)),
+                    "held run {id} is in a due index"
+                );
+            }
             for base in ["control_run".to_string(), format!("control_run:{}", hex(&r.admission.name))] {
                 expected.insert((base, time(r.admitted_ms, id)), json!(id));
             }
@@ -3435,7 +3465,11 @@ async fn audit_control(t: &TestStore) -> anyhow::Result<()> {
             let e: control::Entry = serde_json::from_value(value.clone())?;
             let k = time(e.at_ms, &hex(&e.request.id));
             expected.insert(("control_history".into(), k.clone()), value.clone());
-            if let control::Command::Cancel { run } | control::Command::Respond { run, .. } = &e.command {
+            if let control::Command::Cancel { run }
+            | control::Command::Respond { run, .. }
+            | control::Command::Hold { run, .. }
+            | control::Command::Release { run } = &e.command
+            {
                 expected.insert((format!("control_history_run:{}", hex(run)), k), value.clone());
             }
         }
@@ -3452,6 +3486,162 @@ async fn audit_control(t: &TestStore) -> anyhow::Result<()> {
         })
         .collect();
     assert_eq!(actual, expected, "persisted control indexes disagree with primary facts");
+    Ok(())
+}
+
+/// An operator's hold on one run and its owned subtree (#29): the run is
+/// never claimed or due until released, its worker stops at the next fenced
+/// step, the answer of a call already dispatched is still recorded, and a
+/// release restores the run exactly.
+async fn holds(factory: &impl AsyncFn(&str) -> anyhow::Result<TestStore>, report: &mut Report) -> anyhow::Result<()> {
+    use control::{Command, ControlError, Entity, Reply};
+    use ows::durable::{CallState, Delivery};
+    let t = factory("hold").await?;
+    report.cases += 1;
+    let s = &t.store;
+    let remote = (t.reopen)().await?;
+    let call = |state: CallState| Record::Call {
+        logical: "call".into(),
+        function: "fetch".into(),
+        arguments: json!({}),
+        delivery: Delivery::AtLeastOnce,
+        state,
+        annotations: Default::default(),
+    };
+    let child_of = |parent: &str, id: &str| ChildLink { parent: parent.into(), key: id.into(), reference: id.into() };
+    let hold = |run: &str| Command::Hold { run: run.into(), note: "look".into() };
+    let release = |run: &str| Command::Release { run: run.into() };
+
+    // A tree p > c > g being driven, a waiting run w with a timer, and a free run.
+    let parent = s.start(&admission("p"), 0).await?.unwrap();
+    s.start_child(&parent, &admission("c"), &child_of("p", "c"), 0).await?;
+    let child = s.claim("c", LEASE_MS).await?.unwrap();
+    s.start_child(&child, &admission("g"), &child_of("c", "g"), LEASE_MS).await?;
+    s.admit(&admission("free"), 0).await?;
+    let waiter = s.start(&admission("w"), 0).await?.unwrap();
+    s.register_wait(&waiter, &["answer".into()], 1).await?;
+    s.finish(&waiter, &Status::Waiting { wake_at_ms: 50 }, 1, 3).await?;
+    let before = s.get("w").await?.unwrap();
+
+    // One transaction freezes the run and its live descendants, with the
+    // attribution; the free run and the waiter are untouched.
+    let now = 10;
+    assert_eq!(s.control(&control_request("hold-p"), &hold("p"), now).await?, Reply::Changed(true));
+    let held =
+        control::Hold { actor: "operator".into(), reason: "maintenance".into(), note: "look".into(), at_ms: now };
+    for id in ["p", "c", "g"] {
+        assert_eq!(remote.get(id).await?.unwrap().held.as_ref(), Some(&held), "{id}");
+    }
+    assert!(remote.get("free").await?.unwrap().held.is_none());
+    assert_eq!(remote.inspect_control("p").await?.unwrap().snapshot.run.held, Some(held.clone()));
+    // Idempotent: a repeat, by any request, changes nothing and keeps the first attribution.
+    assert_eq!(s.control(&control_request("hold-p"), &hold("p"), now + 1).await?, Reply::Changed(true));
+    assert_eq!(s.control(&control_request("hold-again"), &hold("p"), now + 1).await?, Reply::Changed(false));
+    assert_eq!(remote.get("c").await?.unwrap().held.as_ref(), Some(&held));
+    assert_eq!(s.control_history(Some("p"), None, 10).await?.items.len(), 2);
+    assert!(matches!(
+        refusal(s.control(&control_request("hold-none"), &hold("none"), now).await),
+        ControlError::NotFound { entity: Entity::Run, id } if id == "none"
+    ));
+    audit_control(&t).await?;
+
+    // The driving worker stops at its next fenced step; its lease is its own
+    // to give back, and the lease renewal path is one of the boundaries.
+    let is_held = |e: anyhow::Error| e.is::<control::Held>();
+    assert!(is_held(remote.check_lease(&parent, now).await.unwrap_err()));
+    assert!(is_held(remote.renew(&parent, now).await.unwrap_err()));
+    assert!(is_held(remote.save_record(&parent, "new", &call(CallState::Pending), now).await.unwrap_err()));
+    assert!(is_held(remote.spend(&parent, "jump", 10, now).await.unwrap_err()));
+    assert!(is_held(remote.register_wait(&parent, &["x".into()], now).await.unwrap_err()));
+    assert!(is_held(remote.take_event(&parent, "take", &["x".into()], now).await.unwrap_err()));
+    assert!(is_held(remote.finish(&parent, &Status::Completed(json!(1)), now, 3).await.unwrap_err()));
+    assert!(is_held(remote.start_child(&parent, &admission("late"), &child_of("p", "late"), now).await.unwrap_err()));
+    assert!(remote.get("late").await?.is_none(), "a held run starts no child");
+    assert_eq!(remote.get("p").await?.unwrap().fence, Some(parent.clone()), "refusals changed nothing");
+    remote.release(&parent, now).await?;
+    assert_eq!(s.get("p").await?.unwrap().state, RunState::Ready);
+
+    // Held runs are due to nobody, whenever their wake-up or lease ends.
+    let late = 3 * LEASE_MS;
+    let mut due = remote.due(late, 10).await?;
+    due.sort();
+    assert_eq!(due, ["free", "w"], "p, c and g are held");
+    assert!(remote.claim("p", late).await?.is_none() && remote.claim("c", late).await?.is_none());
+    assert!(remote.claim("g", late).await?.is_none());
+    assert!(is_held(remote.renew(&child, LEASE_MS + 5).await.unwrap_err()));
+    // A held run still counts: it is live and listed in its state, which
+    // `counts` reports as held.
+    assert_eq!(s.get("c").await?.unwrap().state, RunState::Running);
+    audit(&**s).await?;
+    audit_control(&t).await?;
+
+    // An event or a timer does not fire a held run; the work is kept and a
+    // release restores the run exactly, due at once.
+    assert_eq!(s.control(&control_request("hold-w"), &hold("w"), 20).await?, Reply::Changed(true));
+    assert_eq!(s.deliver(&event("answer", "answer", json!(1)), Some("w"), 21).await?, Some("w".into()));
+    assert!(!s.due(60, 10).await?.contains(&"w".to_string()));
+    assert!(s.claim("w", 60).await?.is_none());
+    assert_eq!(s.control(&control_request("release-w"), &release("w"), 61).await?, Reply::Changed(true));
+    assert_eq!(s.control(&control_request("release-w-again"), &release("w"), 62).await?, Reply::Changed(false));
+    assert!(s.due(61, 10).await?.contains(&"w".to_string()));
+    let mut after = s.get("w").await?.unwrap();
+    assert_eq!(after.wake_at_ms, 21, "the delivery woke the run; the hold kept it");
+    after.wake_at_ms = before.wake_at_ms;
+    assert_eq!(after, before, "release restores the run");
+    assert!(s.claim("w", 61).await?.is_some());
+
+    // The answer of a call already dispatched is recorded under a hold, and
+    // it is the only step that is: nothing else commits.
+    let q = s.start(&admission("q"), 0).await?.unwrap();
+    s.save_record(&q, "fetch#call", &call(CallState::Pending), 1).await?;
+    s.control(&control_request("hold-q"), &hold("q"), 2).await?;
+    assert!(is_held(s.save_record(&q, "other#call", &call(CallState::Pending), 3).await.unwrap_err()));
+    assert!(is_held(s.save_record(&q, "task", &Record::Timer { deadline_ms: 9 }, 3).await.unwrap_err()));
+    s.save_record(&q, "fetch#call", &call(CallState::Done(Ok(json!("ok")))), 3).await?;
+    assert!(matches!(
+        s.inspect("q").await?.unwrap().records.get("fetch#call"),
+        Some(Record::Call { state: CallState::Done(Ok(v)), .. }) if v == &json!("ok")
+    ));
+    assert!(is_held(s.finish(&q, &Status::Completed(json!(1)), 4, 3).await.unwrap_err()));
+    // A pending call keeps its delivery rules: released, the run resumes
+    // from the same evidence.
+    s.release(&q, 4).await?;
+    s.control(&control_request("release-q"), &release("q"), 5).await?;
+    assert!(s.claim("q", 5).await?.is_some());
+
+    // A cancel reaches a held run and its descendants, and ends the hold.
+    assert_eq!(
+        s.control(&control_request("cancel-p"), &Command::Cancel { run: "p".into() }, 70).await?,
+        Reply::Changed(true)
+    );
+    for id in ["p", "c", "g"] {
+        let r = s.get(id).await?.unwrap();
+        assert!(r.state == RunState::Cancelled && r.held.is_none(), "{id}");
+    }
+    assert_eq!(s.control(&control_request("hold-ended"), &hold("p"), 71).await?, Reply::Changed(false));
+    assert!(s.get("p").await?.unwrap().held.is_none());
+    audit(&**s).await?;
+    audit_control(&t).await?;
+
+    // Releasing the root releases the subtree it holds.
+    let t = factory("hold-release").await?;
+    report.cases += 1;
+    let s = &t.store;
+    let parent = s.start(&admission("p"), 0).await?.unwrap();
+    s.start_child(&parent, &admission("c"), &child_of("p", "c"), 0).await?;
+    s.release(&parent, 1).await?;
+    s.control(&control_request("hold"), &hold("p"), 2).await?;
+    assert_eq!(s.control(&control_request("release"), &release("p"), 3).await?, Reply::Changed(true));
+    for id in ["p", "c"] {
+        assert!(s.get(id).await?.unwrap().held.is_none(), "{id}");
+    }
+    assert!(s.claim("p", 3).await?.is_some());
+    audit_control(&t).await?;
+    report.operations += 90;
+    report
+        .witnesses
+        .insert("a hold freezes a run and its subtree, is due to nobody and refuses every step but an answer");
+    report.witnesses.insert("a release restores the held run exactly");
     Ok(())
 }
 
