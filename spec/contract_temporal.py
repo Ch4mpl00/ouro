@@ -64,6 +64,10 @@ MODULES = {
             "L7/capacity": ("    drain(ended)\n", "    ended\n", "L7"),
             # Clearing the stop or polling drops the deferred drain.
             "L7/stop": ("pure def deferred(x: Trigger): Trigger = drain(x)", "pure def deferred(x: Trigger): Trigger = x", "L7"),
+            # A firing that does not drain its definition's deferred queue first.
+            "L7/order": ("val y = settled(x)\n    if (y.tripped or not(y.armed)) y else fireNext(y, refused)", "val y = x\n    if (y.tripped or not(y.armed)) y else fireNext(y, refused)", "L7"),
+            # The same for a start of another run.
+            "L7/order/start": ("val y = settled(x)\n    if (barred(y, v))", "val y = x\n    if (barred(y, v))", "L7"),
             # A one-shot's slot does not consume it.
             "L8": ("val consumed = x.kind == 2", "val consumed = false", "L8"),
             # A one-shot's run carries a re-arm, so its end wakes the dormant trigger.
@@ -74,8 +78,8 @@ MODULES = {
             "L10/digest": ("x.tripped and content(v) == content(x.active)", "x.tripped and v == x.active", "L10_stable"),
         },
         fairness={
-            "wfEndSched": ["L7"], "wfEndOther": ["L7", "L10"], "wfCalm": ["L7"], "wfClear": ["L7", "L8", "L10"],
-            "wfPoll": ["L7"], "sfFire": ["L8"], "wfTick": ["L8"], "wfReactivate": ["L10"], "sfAdmit": ["L10"],
+            "wfEndSched": ["L7"], "wfEndOther": ["L7", "L10"], "wfClear": ["L7", "L8", "L10"],
+            "sfPoll": ["L7"], "sfFire": ["L8"], "wfTick": ["L8"], "wfReactivate": ["L10"], "sfAdmit": ["L10"],
         },
     ),
 }

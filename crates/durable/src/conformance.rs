@@ -782,6 +782,7 @@ pub async fn run_all(factory: impl AsyncFn(&str) -> anyhow::Result<TestStore>) -
     controls(&factory, &mut report).await?;
     holds(&factory, &mut report).await?;
     control_overlap(&factory, &mut report).await?;
+    queue_order_after_clear(&factory, &mut report).await?;
     definition_queries(&factory, &mut report).await?;
     heartbeats(&factory, &mut report).await?;
     annotation_totals(&factory, &mut report).await?;
@@ -3704,5 +3705,67 @@ async fn control_overlap(
         audit_control(&t).await?;
         audit(&*fresh).await?;
     }
+    Ok(())
+}
+
+/// A buffered slot keeps its place when the emergency stop is cleared: a clear
+/// drains a bounded batch of deferred definitions, and a definition past the
+/// batch must still promote its buffered slot before a later slot of its own
+/// trigger, or another start of the definition, is admitted.
+async fn queue_order_after_clear(
+    factory: &impl AsyncFn(&str) -> anyhow::Result<TestStore>,
+    report: &mut Report,
+) -> anyhow::Result<()> {
+    use control::Command;
+    let t = factory("queue-order-after-clear").await?;
+    report.cases += 1;
+    let s = &t.store;
+    let slot = |n| Trigger { at_ms: Some(n), types: vec![], state: json!(n) };
+    let named = |name: &str, id: &str| Admission { name: name.into(), ..admission(id) };
+    let fire = async |name: &str, n, id: &str| {
+        s.fire(
+            &Firing {
+                key: name,
+                expected: Some(&slot(n)),
+                next: Some(&slot(n + 1)),
+                busy: Some(&slot(n + 1)),
+                admit: &[named(name, id)],
+                overlap: Some(OverlapGuard { policy: Overlap::Queue, max_concurrent_runs: 2, ceiling: &slot(n + 1) }),
+                ..Firing::default()
+            },
+            n,
+        )
+        .await
+    };
+    // The fillers sort first and fill the batch; the two last names keep their
+    // markers after the clear.
+    let mut names: Vec<String> = (0..control::MAX_PAGE).map(|n| format!("fill{n:04}")).collect();
+    names.extend(["zlater".into(), "zstart".into()]);
+    for name in &names {
+        let d = s.save_definition(name, "yaml").await?;
+        let armed = Arming { triggers: BTreeMap::from([(name.clone(), slot(0))]) };
+        s.activate_with(name, d.version, 0, &armed, &Activation::at(0)).await?;
+        assert_eq!(fire(name, 0, &format!("{name}:first")).await?, Fired::Committed);
+        assert_eq!(fire(name, 1, &format!("{name}:buffered")).await?, Fired::Queued);
+    }
+    s.control(&control_request("stop"), &Command::Stop { enabled: true }, 2).await?;
+    for name in &names {
+        s.control(&control_request(&format!("{name}:cancel")), &Command::Cancel { run: format!("{name}:first") }, 2)
+            .await?;
+    }
+    s.control(&control_request("clear"), &Command::Stop { enabled: false }, 3).await?;
+    for name in ["zlater", "zstart"] {
+        assert!(s.get(&format!("{name}:buffered")).await?.is_none(), "the clear's batch skipped {name}");
+    }
+    // A later slot of the same trigger is buffered behind the older one.
+    assert_eq!(fire("zlater", 2, "zlater:next").await?, Fired::Queued);
+    assert!(s.get("zlater:buffered").await?.is_some_and(|r| r.ended_ms.is_none()));
+    assert!(s.get("zlater:next").await?.is_none());
+    assert_eq!(s.queued("zlater").await?, Some(named("zlater", "zlater:next")));
+    // Another start of the definition does not take the room first.
+    s.admit(&named("zstart", "zstart:manual"), 3).await?;
+    assert!(s.get("zstart:buffered").await?.is_some_and(|r| r.ended_ms.is_none()));
+    assert!(s.queued("zstart").await?.is_none());
+    audit(&**s).await?;
     Ok(())
 }
