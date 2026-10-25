@@ -1,3 +1,37 @@
+# Contract checking — 2026-10-25, hold and release of a run, manual pause (#29)
+
+The model gains held runs and an operator's pause (`manual`). H1: a held run
+takes no fenced step and no dispatch; H2: it is never claimed; H3: a hold
+marks the run and its live owned descendants in one transition and a release
+restores exactly; H4: an ended run is never held. V2 now refuses every
+admission under a pause, whatever its content, and only `resume` or an
+activation lifts it. The owner's authority alone (`answers`) still lets it
+record the answer of a call already dispatched and give its lease back. The
+model pauses a definition with nothing to suspend (no armed schedule, no
+buffered slot); suspending and restoring triggers is conformance-tested.
+
+One oracle correction, found by the fault-6 sample once the operation set
+grew (the same trace violates V2 on the unmodified model at `07ff233`): a
+buffered slot's run id can be admitted directly by an operation, which is no
+promotion; V2's refusal observation and the queue promotion check counted a
+refusal the transition never made. They now leave the operation's own
+admission of that id out. The transitions did not change.
+
+| Check | Scope | Result | Time |
+| --- | --- | --- | --- |
+| Typecheck | all five modules | Pass | |
+| Witnesses | 62 histories in `bridgeSuite`, 14 tests added (68 in all) | Pass | 20 s |
+| Simulation | 10,000 × 150 steps, seed 20261023, invariant `checked` | No violation | 235 s |
+| Safety mutants | 54 (46 existing, `V2/manual`, `V2/resume`, `H1`, `H1/dispatch`, `H2`, `H3`, `H3/release`, `H4`) | All targets detected | 426 s |
+| Fault rows | 11 switches × 1,000 × 150 steps | No violation | 328 s |
+| Fault detection | 11 rows | All detected | 72 s |
+| Serial and concurrent MBT | memory and SQLite, 100 × 150 + `bridgeSuite`, 12 rounds × 8 batches | Pass | |
+
+Not run for this revision: TLC, Apalache, the temporal quotient or symbolic
+checks, and the opt-in Postgres bridges (the Postgres conformance and
+scalability suites ran). `contract_progress.qnt` is unchanged, and
+`contract-evidence.json` is not regenerated (its source hashes are stale).
+
 # Contract checking — 2026-10-24, schedule overlap (#19)
 
 Quick checks only, on the combined #14/#15/#19 model. The policy and host

@@ -21,7 +21,7 @@ simulated and its histories replayed against memory, SQLite and Postgres.
 
 ## Contract coverage
 
-`contract_progress.qnt` supplies E5 and the five temporal obligations. All 40 IDs
+`contract_progress.qnt` supplies E5 and the five temporal obligations. All 44 IDs
 have named predicates, but the scopes below matter: naming a predicate does not
 prove every clause of its English contract. "Serial MBT" and "concurrent MBT"
 are the bridges in `crates/durable/tests/quint.rs` and `quint/concurrent.rs`.
@@ -53,7 +53,7 @@ are the bridges in `crates/durable/tests/quint.rs` and `quint/concurrent.rs`.
 | T2 | `T2`: activation epoch (only an activation starts one), dormant rearm | Concurrent firing/activation; serial MBT; `gaps::t2_old_completion_cannot_rearm_new_epoch` |
 | T3 | `T3`: deadline fixed at admission | Serial MBT; `t3_admission_fixes_the_workflow_deadline` |
 | V1 | `V1`: only an activation selects the active version (no rollback); pinned admission | Serial MBT; runtime pinned-version recovery |
-| V2 | `V2`: epoch, fault classification (a refused slot's run counts), reset; a trip reports once (one notice), stops the schedule and every admission of the tripped content digest (a pinned start of other content is admitted and never counted), ignores later observations, cleared only by activation | Serial MBT; `gaps::v2_old_epoch_fault_does_not_count_after_reactivation`; `refusedTest`, `pinnedAdmittedTest`, `sameContentRefusedTest`, `pinnedUncountedTest` witnesses; mutants `V2/digest`, `V2/same-content`, `V2/pinned-counts`; refusal on every admission path in conformance (a trip then a child needs two faulted runs besides a live parent and its unadmitted child, more than the model's three, so the model's clause is not reached) |
+| V2 | `V2`: epoch, fault classification (a refused slot's run counts), reset; a trip reports once (one notice), stops the schedule and every admission of the tripped content digest (a pinned start of other content is admitted and never counted), ignores later observations, cleared only by activation; an operator's pause (`manual`) refuses every admission whatever its content, and only `resume` or an activation lifts it | Serial MBT; `gaps::v2_old_epoch_fault_does_not_count_after_reactivation`; `refusedTest`, `pinnedAdmittedTest`, `sameContentRefusedTest`, `pinnedUncountedTest`, `pauseTest`, `pausedRefusesTest`, `resumedTest`, `pauseActivatedTest`, `resumeKeepsTripTest` witnesses; mutants `V2/digest`, `V2/same-content`, `V2/pinned-counts`, `V2/manual` (a pause admits other content), `V2/resume` (resume lifts a breaker trip); refusal on every admission path in conformance (a trip then a child needs two faulted runs besides a live parent and its unadmitted child, more than the model's three, so the model's clause is not reached) |
 | V3 | `V3`: undeclared/exact-match claim and mutation guards | Serial MBT (`claim_as`, `due_as` per worker version); `gaps::v3_incompatible_worker_cannot_claim` |
 | O1 | `O1`: failed operation stops the attempt | Serial MBT fault switches; generated interrupted journals |
 | O2 | `O2`: terminal-only retention and stable identities | Serial MBT (swept evidence projected away); replay-after-sweep refusal |
@@ -63,6 +63,10 @@ are the bridges in `crates/durable/tests/quint.rs` and `quint/concurrent.rs`.
 | X3 | `X3`: no silent readmission/reopening | Terminal/admission checks |
 | S1 | `S1`: emergency stop blocks claim, firing and admission (including children and ingress); clearing preserves evidence | Stop/clear witnesses, serial MBT, `S1` guard mutant, control conformance |
 | B1 | `B1`: tree counter within the ceiling, equal to a live root's granted decisions; immutable decisions; refusal only at the ceiling | Serial MBT (`spend`, decisions projected); `budgetTest` witness; budget conformance; generated interpreter budgets |
+| H1 | `H1`: a held run takes no fenced step and no dispatch (only the answer of a call already dispatched, and the owner giving its lease back) | `heldStepsTest`, `heldDispatchTest`; mutants `H1`, `H1/dispatch`; serial MBT; control conformance (`holds`: `Held` on every fenced operation, the answer recorded) |
+| H2 | `H2`: a held run is never claimed | `heldClaimTest`, `heldClaimedTest`; mutant `H2`; serial MBT audits `due` and `due_as` without held runs; conformance audits the due indexes |
+| H3 | `H3`: a hold marks the run and its live owned descendants in one transition and changes nothing else; a release restores exactly | `heldTreeTest`, `heldChildTest`, `heldReleasedTest`; mutants `H3` (misses the subtree), `H3/release` (changes more than the flags); conformance (`holds`, the commit-fault matrix); scalability bounds |
+| H4 | `H4`: an ended run is never held (a cancel or any end clears the hold) | `heldCancelledTest`; mutant `H4`; conformance audit |
 | L1 | `contract_progress::L1`: ready work eventually completes under F | Finite drains; temporal quotient |
 | L2 | `L2`: abandoned ownership eventually claimed/completed under F | Temporal quotient |
 | L3 | `L3`: accepted event eventually consumed under F | Temporal quotient; event/recovery conformance |
@@ -125,7 +129,12 @@ deadline fixed at admission and epoch.
   admits it (on promotion for a buffer), and the breaker observes that fault.
   `queuedRefusalTest` checks a predecessor fault and a queued refusal tripping
   in one transition; `oldCompletionPromotesTest` checks epoch isolation while
-  promoting the new epoch's buffer.
+  promoting the new epoch's buffer. The model has three run ids, so an
+  operation may admit the very id a slot buffered; that is no promotion, and
+  the promotion monitors (V2's refusal observation, the queue promotion check)
+  leave that operation's own admission out. The fault-6 sample found it once
+  the operation set grew: the oracle counted a refusal the transition never
+  made.
 - **Time** (decision 4). The lease is four ticks; a worker acts only while
   more than ε = 1 is left; takeover only after it ends. The deadline is
   admission + 8; the owner decides a timeout.
@@ -137,6 +146,23 @@ deadline fixed at admission and epoch.
   content is admitted and its run never counts) and appends the epoch to `notices`, the trip's
   committed notice; the active version and the epoch stay. A tripped breaker
   observes nothing; only the next activation clears it.
+- **Hold** (#29). `hold` marks the run and its live owned descendants `held`
+  in one transition; `unhold` clears them (the store's `Release`; `release` is
+  the worker giving its lease back). A held run is never claimed, takes none
+  of the owner's fenced operations (renew, intent, recovery, checkpoint,
+  subscribe, take, spend, child, finish, timeout, conflict), dispatches
+  nothing (the `check_lease` boundary), and keeps everything else: its wake-up
+  and lease, which `due` ignores; events are still accepted into its mailbox.
+  `answers` (the owner's authority alone) lets the owner record the result
+  or proven non-execution of a call already dispatched and give its lease
+  back. Any end of a run, cancellation included, clears the flag. H1–H4 state
+  it.
+- **Pause** (V2). `pause` is a trip with `manual` set that reports no notice
+  and refuses every admission whatever its content (`barred`); `resume` clears
+  it, and only it, never a breaker's trip. The model pauses a definition with
+  nothing to suspend (no armed schedule, no buffered slot): suspending and
+  restoring triggers and buffers is storage behaviour, checked by the control
+  conformance suite.
 - **Compatibility** (#3). Worker `w` declares version `w + 1`; a run admitted
   with version 0 (undeclared) is compatible with both.
 - **Children, retention.** Run r's owned child is run r + 1, so run 2 can be
@@ -175,8 +201,8 @@ exact matching plus undeclared, without a host-supplied `accepts` list.
 ### Serial
 
 `crates/durable/tests/quint.rs` replays Quint's random traces of `contract.qnt`
-(100 traces × 150 steps per adapter by default, all 32 commands and every fault
-switch) and the `bridgeSuite` run of `contract_witnesses.qnt` (all 49 witness
+(100 traces × 150 steps per adapter by default, all 37 commands and every fault
+switch) and the `bridgeSuite` run of `contract_witnesses.qnt` (all 62 witness
 histories in one trace). After every step it compares a projection of the store
 with the model's state. The model records each command in its `command`
 variable; the driver never sees the model's state.
@@ -211,6 +237,8 @@ ticks), with `Policy { mailbox_ms: 37_500, ingress_ms: 37_500, skew_ms: 7_500 }`
 | `fire` | `fire` with the overlap guard, capacity and `rearm`; a missed or taken slot commits a skip |
 | `refuse` | `fire` with the overlap guard and `refused` (the model's unhandled failure, threshold 2) instead of `admit`; skips as `fire` |
 | `ingress` | `ingested`, then `fire` with the ingress event on a generic trigger |
+| `hold`, `unhold` | `control` `Hold` / `Release` of run r; `dispatch` also asks the store whether the run is held (the `check_lease` boundary) |
+| `pause`, `resume` | `control` `Pause` / `Resume` of the definition, when the model's guards hold (nothing to suspend; a manual trip) |
 
 The projection keeps what both sides state: runs (admission, epoch, version,
 outcome, end, deadline, owner, generation, lease, records and values, frontier,
