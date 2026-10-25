@@ -1276,7 +1276,8 @@ Addendum (2026-10-25, issue #29). An operator may hold one run and its live
 owned descendants, in one transition, and release them. A held run takes no
 step: it is never claimed nor due (its wake-up and timers are kept, not fired),
 its owner's fenced operations and dispatches are refused, and it starts no
-child; the only things it commits are the answer of a call already dispatched
+child, and no untargeted delivery chooses it (#31: the event goes to the
+oldest waiting run not held); the only things it commits are the answer of a call already dispatched
 (the call is not retracted), the owner keeping its lease while it waits for
 that answer (amended by #31) or giving it back, mailbox acceptance of events
 and a cancellation, which ends the hold. A release

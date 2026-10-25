@@ -289,7 +289,11 @@ fn indexes(s: &StoredRun) -> Rows {
         if let Some(link) = &s.run.child {
             keys.insert(key(&partition("children", &link.parent), id), value.clone());
         }
-        for (t, at) in &s.awaits {
+        // A held run is offered no competing delivery: an untargeted event
+        // goes to the oldest waiting run that can take it now, not into a
+        // frozen mailbox. A release restores the registrations with the
+        // other index keys, in its commit; targeted events still arrive.
+        for (t, at) in s.awaits.iter().filter(|_| s.run.held.is_none()) {
             // Child waiting notifications are addressed internally. Their
             // automatic registration needs no competing-delivery index until
             // an explicit listen registers that type.

@@ -628,6 +628,9 @@ A held run keeps its wake-up, timers and event waits but is never returned
 by `due` and never claimed: a timer or a delivery that comes due while it is
 held fires nothing, and a release makes the work due again in the same
 commit, under the existing catch-up rules, with the run exactly as it was.
+It is offered no competing delivery: an untargeted `deliver` goes to the
+oldest waiting run that is not held (or to none), while an event addressed to
+the held run still enters its mailbox.
 A worker driving it stops at the next fenced step or dispatch boundary (every
 fenced operation and `check_lease` refuse with `control::Held`) or at its
 next lease renewal, within one heartbeat, and gives the lease back without

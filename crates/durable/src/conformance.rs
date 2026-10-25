@@ -3614,6 +3614,14 @@ async fn holds(factory: &impl AsyncFn(&str) -> anyhow::Result<TestStore>, report
     // An event or a timer does not fire a held run; the work is kept and a
     // release restores the run exactly, due at once.
     assert_eq!(s.control(&control_request("hold-w"), &hold("w"), 20).await?, Reply::Changed(true));
+    // A held run is not offered a competing delivery: an event the oldest
+    // waiting run would take goes to the next one that is not held, and
+    // none waits for it if only held runs do.
+    assert_eq!(s.deliver(&event("unclaimed", "answer", json!(0)), None, 20).await?, None);
+    let w2 = s.start(&admission("w2"), 20).await?.unwrap();
+    s.register_wait(&w2, &["answer".into()], 20).await?;
+    s.finish(&w2, &Status::Waiting { wake_at_ms: 500 }, 20, 3).await?;
+    assert_eq!(s.deliver(&event("competing", "answer", json!(2)), None, 20).await?, Some("w2".into()));
     assert_eq!(s.deliver(&event("answer", "answer", json!(1)), Some("w"), 21).await?, Some("w".into()));
     assert!(!s.due(60, 10).await?.contains(&"w".to_string()));
     assert!(s.claim("w", 60).await?.is_none());

@@ -452,8 +452,9 @@ the breaker, its trip and reactivation, and retention, each with a witness the
 serial bridge also replays. Not folded, and checked instead by the conformance suite and the DSL
 and runtime tests:
 
-- routing an unaddressed `deliver` to the oldest registration, `register_wait`
-  and `unregister_wait`, and several registrations of one type;
+- routing an unaddressed `deliver` to the oldest registration (a held run
+  is never chosen, #31), `register_wait` and `unregister_wait`, and several
+  registrations of one type;
 - waiting runs and their wake-ups, interruption backoff and its exhaustion;
 - the child's `waiting` notification and descendants deeper than two levels;
 - event-triggered (`on`) strategies, cron arithmetic, `accepts` lists;
