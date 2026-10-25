@@ -71,7 +71,14 @@ MUTANTS = {
  # An operator's pause admits other content like an automatic trip does, or
  # its resume lifts a breaker's trip.
  "V2/manual": ('and not(barred(c,i+1)))\n      observe(pinRun','and not(c.tripped and content(i+1) == c.trippedDigest))\n      observe(pinRun',[op("activate",i=1,value=0),op("pause"),op("pin",r=0,i=0,value=5)]),
- "V2/resume": ('op == "resume" and value >= 0 and c.tripped and c.manual','op == "resume" and value >= 0 and c.tripped',TRIP+[op("resume")]),
+ # (Resume keeps a breaker's trip in its body too since #31, so the mutant
+ # drops both: the guard and the body's `tripped:c.breaker`.)
+ "V2/resume": ('op == "resume" and value >= 0 and c.tripped and c.manual) {\n      // It lifts the pause alone: a breaker\'s trip under it stays.\n      { ...s,db:{ ...s.db,catalog:{ ...c,tripped:c.breaker,',
+               'op == "resume" and value >= 0 and c.tripped) {\n      { ...s,db:{ ...s.db,catalog:{ ...c,tripped:false,',TRIP+[op("resume")]),
+ # A pause of a definition the breaker tripped does nothing, so other content
+ # is still admitted; or resuming it lifts the breaker's trip as well (#31).
+ "V2/pause-tripped": ('op == "pause" and value >= 0 and not(c.manual)','op == "pause" and value >= 0 and not(c.tripped)',TRIP+[op("pause"),op("pin",r=2,i=1,value=5)]),
+ "V2/pause-resume": ('tripped:c.breaker,manual:false','tripped:false,manual:false',TRIP+[op("pause"),op("resume")]),
  # A held run takes a step, is dispatched, or is claimed; a hold misses the
  # run's owned child, or a release changes more than the hold kept; an ended
  # run stays held.

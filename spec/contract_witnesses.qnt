@@ -288,6 +288,15 @@ module contract_witnesses {
     m.db.catalog.active == 1)
   action resumeKeepsTrip = breaker.then(do("resume"))
   run resumeKeepsTripTest = resumeKeepsTrip.expect(checked and m.db.catalog.tripped and not(m.db.catalog.manual))
+  // A pause of a definition the breaker tripped stands beside the trip
+  // (#31): other content is refused too; resuming lifts the pause alone, and
+  // other content is admitted again while the trip waits for an activation.
+  action pauseTripped = breaker.then(do("pause")).then(execute("pin",2,0,1,5,0))
+  run pauseTrippedTest = pauseTripped.expect(checked and m.db.catalog.tripped and m.db.catalog.manual and
+    m.db.catalog.breaker and m.db.catalog.trippedDigest == 1 and m.db.admissions == [1,1,0] and m.db.catalog.notices == [1])
+  action pauseTrippedResumed = pauseTripped.then(do("resume")).then(execute("pin",2,0,1,5,0))
+  run pauseTrippedResumedTest = pauseTrippedResumed.expect(checked and m.db.catalog.tripped and not(m.db.catalog.manual) and
+    m.db.catalog.breaker and m.db.admissions == [1,1,1] and m.db.runs.nth(2).version == 2)
   // Every history above in one trace (each starts with init), replayed
   // against the stores by crates/durable/tests/quint.rs.
   // The tail of the suite, a run of its own: a single chain this long exceeds
@@ -295,6 +304,7 @@ module contract_witnesses {
   run bridgeTail = emergencyStop.then(clearStop).then(stoppedQueue).then(resumedQueue).then(oneShot).then(oneShotBusy)
     .then(pinnedAdmitted).then(sameContentRefused).then(pinnedUncounted).then(heldReleased).then(heldDispatched)
     .then(heldChild).then(heldCancelled).then(heldClaimed).then(resumed).then(pauseActivated).then(resumeKeepsTrip)
+    .then(pauseTrippedResumed)
   run bridgeSuite = continuation.then(unknown).then(mailbox).then(expiry).then(child).then(childFinish).then(grandchild).then(activation)
     .then(deadline).then(compatibility).then(dry).then(replay).then(schedule).then(breaker).then(rearm)
     .then(noCatchup).then(overlap).then(ingress).then(ingressExpiry).then(redispatch).then(protectedUnknown)

@@ -577,7 +577,9 @@ equals the tripped digest, whatever its version number: a normal start
 refused, a pinned start of a version with other content is admitted. An
 operator's pause is a trip that refuses every admission of the definition,
 whatever its content or version number; only `resume` or an activation lifts
-it, and `resume` never lifts a breaker's trip. Only
+it, and `resume` never lifts a breaker's trip. A pause may stand on top of a
+breaker's trip, which keeps its report: everything is refused until `resume`,
+which lifts the pause alone. Only
 stored digests are compared; none is recomputed at admission. Only runs of the
 active version count toward the breaker, so a pinned run of other content never
 does. An already admitted run is still joined. The active version and the epoch do not change.

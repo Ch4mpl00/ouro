@@ -34,8 +34,10 @@ module contract {
   // `trippedDigest`: the content digest of the version that tripped (0: not
   // tripped). Versions are numbers and so are contents: version 3 repeats
   // version 1's text, so the two share a digest (`content`).
-  // `manual`: the trip is an operator's pause, which refuses every version.
-  type Catalog = { active: int, epoch: int, faults: int, tripped: bool, manual: bool, trippedDigest: int,
+  // `manual`: an operator's pause stands, which refuses every version.
+  // `breaker`: the breaker tripped (a pause may stand on top of its trip;
+  // resuming lifts the pause alone).
+  type Catalog = { active: int, epoch: int, faults: int, tripped: bool, manual: bool, breaker: bool, trippedDigest: int,
     triggerEpoch: int, due: int, slot: int, running: int, catchup: int, rearm: bool, once: bool,
     armed: bool, notices: List[int], overlap: int, maxRuns: int, queued: int, queueSlot: int, queueInput: int, queueRefused: bool }
   type Durable = { stopped: bool, runs: List[Run], copies: List[Copy], catalog: Catalog,
@@ -57,7 +59,7 @@ module contract {
   pure val emptyLocal: Local = { fence: 0, execution: 0, phase: 0, invocation: 0, stopped: false, permit: false }
   pure val initialDb: Durable = { stopped:false, runs: [emptyRun,emptyRun,emptyRun], copies: [], admissions: [0,0,0], budget: [0,0,0],
     buffered: Set(), fired: Set(), skipped: Set(), ingress: Map(), ingressPayload:Map(), catalog: { active: 1, epoch: 1,
-      faults: 0, tripped: false, manual: false, trippedDigest: 0, triggerEpoch: 1, due: 2, slot: 0, running: -1, catchup: 0, rearm:false, once:false,
+      faults: 0, tripped: false, manual: false, breaker: false, trippedDigest: 0, triggerEpoch: 1, due: 2, slot: 0, running: -1, catchup: 0, rearm:false, once:false,
       armed: true, notices: [], overlap:0, maxRuns:2, queued:-1, queueSlot:-1, queueInput:0, queueRefused:false } }
   pure val initial: Machine = { db: initialDb, workers: [emptyLocal,emptyLocal], now: 0,
     sends: [[0,0,0],[0,0,0],[0,0,0]], refusals: [[0,0,0],[0,0,0],[0,0,0]], observations: [], violations: Set(), faultsSeen: Set(), promoted: -1 }
@@ -148,7 +150,7 @@ module contract {
     val faults = c.faults+1
     val trip = faults >= 2
     val ended = update(s,r,{ ...s.db.runs.nth(r), outcome:2, ended:s.now })
-    observe({ ...ended, db:{ ...ended.db, catalog:{ ...c, faults:faults, tripped:trip, trippedDigest:if (trip) content(c.active) else 0, armed:c.armed and not(trip),
+    observe({ ...ended, db:{ ...ended.db, catalog:{ ...c, faults:faults, tripped:trip, breaker:trip, trippedDigest:if (trip) content(c.active) else 0, armed:c.armed and not(trip),
       due:if (trip) -1 else c.due,queued:if (trip) -1 else c.queued,queueSlot:if (trip) -1 else c.queueSlot, notices:if (trip) c.notices.append(c.epoch) else c.notices } } },"finish",r,i,2,1)
   }
   // Decisions: 0 dispatch afresh, 2 restore the result, 3 unknown, 4 evidence
@@ -293,7 +295,7 @@ module contract {
       // its triggers go and its notice is committed with it. The host decides
       // what to activate. It does not forget the schedule's last run.
       val catalog = if (not(counted)) c
-        else { ...c, faults:faults, tripped:trip, trippedDigest:if (trip) content(c.active) else c.trippedDigest, armed:c.armed and not(trip),queued:if (trip) -1 else c.queued,queueSlot:if (trip) -1 else c.queueSlot,
+        else { ...c, faults:faults, tripped:trip, breaker:trip, trippedDigest:if (trip) content(c.active) else c.trippedDigest, armed:c.armed and not(trip),queued:if (trip) -1 else c.queued,queueSlot:if (trip) -1 else c.queueSlot,
           due:if (trip) -1 else if (c.armed and c.rearm and c.due < 0 and c.running == r and execution.epoch == c.triggerEpoch) s.now+2 else c.due,
           running:if (c.running == r) -1 else c.running, notices:if (trip) c.notices.append(c.epoch) else c.notices }
       val updated = update(s,r,{ ...execution,outcome:outcome,ended:s.now,owner:-1,lease:-1,subscription:false,
@@ -314,7 +316,7 @@ module contract {
       // an activation clears a trip; reported notices stay. The value picks
       // the trigger: catchup (odd), `after` rearm (2, 3) or a one-shot (4).
       val epoch = c.epoch+1
-      { ...s,db:{ ...s.db,catalog:{ ...c,active:i+1,epoch:epoch,faults:0,tripped:false,manual:false,trippedDigest:0,catchup:value % 2,rearm:value == 2 or value == 3,once:value == 4,
+      { ...s,db:{ ...s.db,catalog:{ ...c,active:i+1,epoch:epoch,faults:0,tripped:false,manual:false,breaker:false,trippedDigest:0,catchup:value % 2,rearm:value == 2 or value == 3,once:value == 4,
         triggerEpoch:epoch,due:if (i == 0) s.now+2 else -1,armed:i == 0,slot:0,queued:-1,queueSlot:-1 } } }
     } else if (Set("fire","refuse").contains(op) and value >= 0 and c.due >= 0 and c.due <= s.now and c.triggerEpoch == c.epoch and not(c.tripped)) {
       firePolicy(s,r,i,value,c.overlap,c.maxRuns,op == "refuse")
@@ -330,14 +332,16 @@ module contract {
     } else if (op == "unhold" and live(execution)) {
       val closed = Set(r).union(descendants(s,r))
       { ...s,db:{ ...s.db,runs:Runs.fold(s.db.runs,(a,k) => if (closed.contains(k)) a.replaceAt(k,{ ...a.nth(k),held:false }) else a) } }
-    } else if (op == "pause" and value >= 0 and not(c.tripped) and not(c.armed) and c.queued < 0) {
+    } else if (op == "pause" and value >= 0 and not(c.manual) and not(c.armed) and c.queued < 0) {
       // An operator's pause is a trip that refuses every version and reports
-      // no notice. The model pauses a definition with nothing to suspend (no
-      // armed schedule, no buffered slot): suspending and restoring triggers
-      // is storage behaviour, covered by the conformance suite.
-      { ...s,db:{ ...s.db,catalog:{ ...c,tripped:true,manual:true,trippedDigest:content(c.active) } } }
+      // no notice; on a definition the breaker tripped it stands beside the
+      // breaker's trip. The model pauses a definition with nothing to suspend
+      // (no armed schedule, no buffered slot): suspending and restoring
+      // triggers is storage behaviour, covered by the conformance suite.
+      { ...s,db:{ ...s.db,catalog:{ ...c,tripped:true,manual:true,trippedDigest:if (c.tripped) c.trippedDigest else content(c.active) } } }
     } else if (op == "resume" and value >= 0 and c.tripped and c.manual) {
-      { ...s,db:{ ...s.db,catalog:{ ...c,tripped:false,manual:false,trippedDigest:0 } } }
+      // It lifts the pause alone: a breaker's trip under it stays.
+      { ...s,db:{ ...s.db,catalog:{ ...c,tripped:c.breaker,manual:false,trippedDigest:if (c.breaker) c.trippedDigest else 0 } } }
     } else if (op == "sweep")
       { ...s,db:{ ...s.db,runs:s.db.runs.mapped(x => if (x.outcome != 0 and s.now >= x.ended+5) { ...x,retained:false } else x) } }
     else if (op == "release" and answers) {
@@ -550,7 +554,7 @@ module contract {
       else d.faults == (if (qualifying) c.faults+1 else if (execution.outcome == 1) 0 else c.faults) and
         not(d.tripped) and d.notices == c.notices
     val error23 = flag(error22,"V2",(d.faults < 2 or d.tripped) and breakerCorrect and
-      (not(c.tripped) or d.tripped or op == "activate" or (op == "resume" and c.manual)) and
+      (not(c.tripped) or d.tripped or op == "activate" or (op == "resume" and c.manual and not(c.breaker))) and
       // While tripped, an admission happens only as a pinned start of other
       // content, and such a start (not stopped, run free) always happens. An
       // operator's pause admits nothing at all, and only `resume` or an
@@ -558,11 +562,18 @@ module contract {
       (not(c.tripped) or a.db.admissions == b.db.admissions or
         (op == "pin" and not(c.manual) and a.db.admissions.nth(r) == b.db.admissions.nth(r)+1 and content(execution.version) != c.trippedDigest)) and
       (not(d.manual) or d.tripped) and
-      (op != "pause" or value < 0 or c.tripped or c.armed or c.queued >= 0 or (d.tripped and d.manual and
-        d.trippedDigest == content(c.active) and d.faults == c.faults and d.epoch == c.epoch)) and
-      (op != "pause" or d.manual == c.manual or (not(c.tripped) and not(c.armed))) and
+      // A breaker's trip is the one its notice reports, in this epoch; it
+      // stands until an activation, whatever pause comes and goes on top.
+      (not(d.breaker) or d.tripped) and d.breaker == d.notices.indices().exists(k => d.notices.nth(k) == d.epoch) and
+      // A pause, of a definition the breaker tripped or not, refuses every
+      // admission from then on and keeps the breaker's report as it was.
+      (op != "pause" or value < 0 or c.manual or c.armed or c.queued >= 0 or (d.tripped and d.manual and
+        d.trippedDigest == (if (c.tripped) c.trippedDigest else content(c.active)) and d.faults == c.faults and
+        d.epoch == c.epoch and d.breaker == c.breaker and d.notices == c.notices)) and
+      (op != "pause" or d.manual == c.manual or (not(c.manual) and not(c.armed))) and
       (op != "resume" or value < 0 or c.manual or c == d) and
-      (op != "resume" or value < 0 or not(c.manual) or (not(d.tripped) and not(d.manual) and d.faults == c.faults)) and
+      (op != "resume" or value < 0 or not(c.manual) or (not(d.manual) and d.tripped == c.breaker and
+        d.breaker == c.breaker and d.faults == c.faults and (not(c.breaker) or d.trippedDigest == c.trippedDigest))) and
       (op != "activate" or c == d or not(d.manual)) and
       (op != "pin" or value < 0 or b.db.stopped or old.admitted or barred(c,i+1) or execution.admitted) and
       (op != "pin" or not(barred(c,i+1)) or a.db.admissions == b.db.admissions) and

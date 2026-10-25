@@ -132,7 +132,9 @@ async fn run(rows: &mut dyn Transaction, id: &str) -> anyhow::Result<StoredRun> 
 /// trip) is refused, never read as a definition that cannot be tripped.
 /// 4: each version's latest activation (`Definitions::activations`).
 /// 5: each version's content digest, and the digest a trip refuses by.
-const DEFINITIONS_VERSION: u64 = 5;
+/// 6: whether the breaker tripped (`Trip::breaker`), so a pause can stand on
+/// top of a breaker's trip and `resume` lift only the pause.
+const DEFINITIONS_VERSION: u64 = 6;
 async fn load_definitions(rows: &mut dyn Transaction, name: &str) -> anyhow::Result<Option<Definitions>> {
     let Some(value) = rows.get("definitions", name).await? else { return Ok(None) };
     Ok(Some(decode_definitions(name, value)?))
@@ -1361,6 +1363,7 @@ async fn breaker(
             if defs.consecutive_faults >= threshold {
                 let trip = Trip {
                     manual: None,
+                    breaker: true,
                     version: run.admission.version,
                     digest: defs.versions.get(&run.admission.version).map(|d| d.digest.clone()).unwrap_or_default(),
                     epoch: defs.epoch,
@@ -2553,18 +2556,27 @@ async fn control_command(
         }
         Command::Pause { definition: name, note } => {
             let mut defs = load_definitions(rows, name).await?.ok_or_else(|| unknown(name))?;
-            let changed = defs.tripped.is_none();
-            if changed {
+            let manual = control::ManualTrip {
+                actor: request.actor.clone(),
+                reason: request.reason.clone(),
+                note: note.clone(),
+            };
+            let changed = defs.tripped.as_ref().is_none_or(|t| t.manual.is_none());
+            if let Some(trip) = defs.tripped.as_mut().filter(|t| t.manual.is_none()) {
+                // A breaker's trip already stopped the schedule and its
+                // buffered slot; the pause stands beside its report, so every
+                // admission is refused, other content too, until `resume`.
+                trip.manual = Some(manual);
+                suspend(rows, name, &mut defs).await?;
+                store_definitions(rows, name, &defs).await?;
+            } else if changed {
                 let version = defs
                     .active
                     .ok_or_else(|| ControlError::InvalidState(format!("definition {name} has no active version")))?;
                 suspend(rows, name, &mut defs).await?;
                 defs.tripped = Some(Trip {
-                    manual: Some(control::ManualTrip {
-                        actor: request.actor.clone(),
-                        reason: request.reason.clone(),
-                        note: note.clone(),
-                    }),
+                    manual: Some(manual),
+                    breaker: false,
                     version,
                     digest: defs.versions.get(&version).map(|d| d.digest.clone()).unwrap_or_default(),
                     epoch: defs.epoch,
@@ -2596,7 +2608,9 @@ async fn control_command(
                 if paused.epoch != defs.epoch {
                     return Err(ControlError::InvalidState(format!("{name}: suspended activation changed")).into());
                 }
-                defs.tripped = None;
+                // Only the pause is lifted: a breaker's trip under it stays,
+                // with nothing to restore (the trip disarmed the definition).
+                defs.tripped = defs.tripped.take().filter(|t| t.breaker).map(|t| Trip { manual: None, ..t });
                 arm(rows, &mut defs, &paused.triggers).await?;
                 for (key, value) in &paused.queues {
                     let q: Queued = serde_json::from_value(value.clone())?;

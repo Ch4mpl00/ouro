@@ -1754,6 +1754,7 @@ async fn decisions(
     assert_eq!((d.active, d.epoch, d.consecutive_faults), (Some(two.version), 2, 2), "no rollback, no new epoch");
     let trip = Trip {
         manual: None,
+        breaker: true,
         version: two.version,
         digest: digest_of("two"),
         epoch: 2,
@@ -1795,6 +1796,27 @@ async fn decisions(
     let d = s.definitions("w").await?;
     assert_eq!((d.consecutive_faults, d.tripped.as_ref()), (2, Some(&trip)));
     assert_eq!(s.notices(10).await?.len(), 1, "one trip, one notice");
+    // An operator's pause of the tripped definition records the pause beside
+    // the breaker's report: every admission is refused, other content too.
+    // Resuming lifts the pause alone; the trip still needs an activation.
+    let pause = control::Command::Pause { definition: "w".into(), note: "stop everything".into() };
+    assert_eq!(s.control(&control_request("pause-trip"), &pause, 6).await?, control::Reply::Changed(true));
+    let paused = s.definitions("w").await?.tripped.unwrap();
+    assert!(paused.manual.is_some(), "a pause of a tripped definition is recorded");
+    assert_eq!(Trip { manual: None, ..paused }, trip, "the breaker's report stays as it was");
+    let other = s.start(&run_of("other-paused", one.version), 6).await;
+    assert!(other.unwrap_err().downcast_ref::<DefinitionTripped>().is_some_and(|t| t.paused));
+    assert!(s.trigger("w#after").await?.is_none() && s.notices(10).await?.len() == 1, "nothing else changes");
+    assert_eq!(s.control(&control_request("pause-trip-again"), &pause, 6).await?, control::Reply::Changed(false));
+    let resume = control::Command::Resume { definition: "w".into() };
+    assert_eq!(s.control(&control_request("resume-pause"), &resume, 6).await?, control::Reply::Changed(true));
+    assert_eq!(s.definitions("w").await?.tripped.as_ref(), Some(&trip), "resuming leaves the breaker's trip");
+    let other = s.start(&run_of("other-resumed", one.version), 6).await?.unwrap();
+    s.finish(&other, &Status::Completed(json!(0)), 6, 2).await?;
+    assert!(matches!(
+        refusal(s.control(&control_request("resume-trip"), &resume, 6).await),
+        control::ControlError::InvalidState(_)
+    ));
     // Only an activation clears it, in a new epoch, with the version the
     // host chooses (here the earlier one). The notice stays until handed on.
     let d = s.activate_with("w", one.version, 2, &arming(&[("w#every", 40)]), &Activation::at(0)).await?.unwrap();

@@ -613,9 +613,11 @@ tripped content digest), and suspends the current triggers and buffered
 admissions in that transaction. Existing runs finish.
 `resume` clears a manual trip and restores its exact triggers, epoch and
 previous breaker count. Overdue timers follow their existing catch-up policy.
-Pausing an already tripped definition preserves its first report; an automatic
-breaker trip still requires activation. An activation clears a manual pause
-and replaces its saved triggers in a new epoch.
+Pausing a definition its breaker already tripped keeps the breaker's report
+(`Trip::breaker` stays set) and records the pause beside it (`Trip::manual`):
+from then on every admission is refused, other content too. `resume` lifts
+that pause alone; the breaker trip still requires activation. An activation
+clears a manual pause and replaces its saved triggers in a new epoch.
 
 `hold(request, run, note)` freezes one run together with its live owned
 descendants, in one transaction bounded like the cancel cascade (the

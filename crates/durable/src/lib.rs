@@ -334,9 +334,15 @@ pub const TRIPPED: &str = "ouro.definition.tripped";
 /// What a tripped breaker reports, in `Definitions::tripped` and as a notice.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Trip {
-    /// Present for an operator pause; `reason.type_` is `manual`.
+    /// Present while an operator's pause stands. A pause alone has
+    /// `breaker == false` and `reason.type_` `manual`; a pause of a
+    /// definition the breaker tripped keeps the breaker's report beside it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub manual: Option<control::ManualTrip>,
+    /// The breaker tripped (its threshold observation, reported once as a
+    /// notice): only an activation clears it, and `resume` lifts a pause
+    /// on top of it, never the trip itself.
+    pub breaker: bool,
     /// The active version and the epoch the breaker tripped in.
     pub version: u64,
     /// The content digest of that version (`digest_of`): while an automatic

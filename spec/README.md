@@ -55,7 +55,7 @@ are the bridges in `crates/durable/tests/quint.rs` and `quint/concurrent.rs`.
 | T2 | `T2`: activation epoch (only an activation starts one), dormant rearm | Concurrent firing/activation; serial MBT; `gaps::t2_old_completion_cannot_rearm_new_epoch` |
 | T3 | `T3`: deadline fixed at admission | Serial MBT; `t3_admission_fixes_the_workflow_deadline` |
 | V1 | `V1`: only an activation selects the active version (no rollback); pinned admission | Serial MBT; runtime pinned-version recovery |
-| V2 | `V2`: epoch, fault classification (a refused slot's run counts), reset; a trip reports once (one notice), stops the schedule and every admission of the tripped content digest (a pinned start of other content is admitted and never counted), ignores later observations, cleared only by activation; an operator's pause (`manual`) refuses every admission whatever its content, and only `resume` or an activation lifts it | Serial MBT; `gaps::v2_old_epoch_fault_does_not_count_after_reactivation`; `refusedTest`, `pinnedAdmittedTest`, `sameContentRefusedTest`, `pinnedUncountedTest`, `pauseTest`, `pausedRefusesTest`, `resumedTest`, `pauseActivatedTest`, `resumeKeepsTripTest` witnesses; mutants `V2/digest`, `V2/same-content`, `V2/pinned-counts`, `V2/manual` (a pause admits other content), `V2/resume` (resume lifts a breaker trip); refusal on every admission path in conformance (a trip then a child needs two faulted runs besides a live parent and its unadmitted child, more than the model's three, so the model's clause is not reached) |
+| V2 | `V2`: epoch, fault classification (a refused slot's run counts), reset; a trip reports once (one notice), stops the schedule and every admission of the tripped content digest (a pinned start of other content is admitted and never counted), ignores later observations, cleared only by activation; an operator's pause (`manual`) refuses every admission whatever its content, also on top of a breaker's trip (`breaker`, kept), and only `resume` or an activation lifts it | Serial MBT; `gaps::v2_old_epoch_fault_does_not_count_after_reactivation`; `refusedTest`, `pinnedAdmittedTest`, `sameContentRefusedTest`, `pinnedUncountedTest`, `pauseTest`, `pausedRefusesTest`, `resumedTest`, `pauseActivatedTest`, `resumeKeepsTripTest`, `pauseTrippedTest`, `pauseTrippedResumedTest` witnesses; mutants `V2/digest`, `V2/same-content`, `V2/pinned-counts`, `V2/manual` (a pause admits other content), `V2/resume` (resume lifts a breaker trip), `V2/pause-tripped` (a pause of a tripped definition does nothing), `V2/pause-resume` (resuming that pause lifts the trip); refusal on every admission path in conformance (a trip then a child needs two faulted runs besides a live parent and its unadmitted child, more than the model's three, so the model's clause is not reached) |
 | V3 | `V3`: undeclared/exact-match claim and mutation guards | Serial MBT (`claim_as`, `due_as` per worker version); `gaps::v3_incompatible_worker_cannot_claim` |
 | O1 | `O1`: failed operation stops the attempt | Serial MBT fault switches; generated interrupted journals |
 | O2 | `O2`: terminal-only retention and stable identities | Serial MBT (swept evidence projected away); replay-after-sweep refusal |
@@ -172,7 +172,9 @@ deadline fixed at admission and epoch.
   it.
 - **Pause** (V2). `pause` is a trip with `manual` set that reports no notice
   and refuses every admission whatever its content (`barred`); `resume` clears
-  it, and only it, never a breaker's trip. The model pauses a definition with
+  it, and only it, never a breaker's trip. A pause may stand on top of a
+  breaker's trip (`breaker`, the trip its notice reports), which `resume`
+  leaves in place (`pauseTrippedTest`, `pauseTrippedResumedTest`). The model pauses a definition with
   nothing to suspend (no armed schedule, no buffered slot): suspending and
   restoring triggers and buffers is storage behaviour, checked by the control
   conformance suite.
@@ -324,7 +326,7 @@ ticks), with `Policy { mailbox_ms: 37_500, ingress_ms: 37_500, skew_ms: 7_500 }`
 | `refuse` | `fire` with the overlap guard and `refused` (the model's unhandled failure, threshold 2) instead of `admit`; skips as `fire` |
 | `ingress` | `ingested`, then `fire` with the ingress event on a generic trigger |
 | `hold`, `unhold` | `control` `Hold` / `Release` of run r; `dispatch` also asks the store whether the run is held (the `check_lease` boundary) |
-| `pause`, `resume` | `control` `Pause` / `Resume` of the definition, when the model's guards hold (nothing to suspend; a manual trip) |
+| `pause`, `resume` | `control` `Pause` / `Resume` of the definition, when the model's guards hold (no pause yet and nothing to suspend; a pause) |
 
 The projection keeps what both sides state: runs (admission, epoch, version,
 outcome, end, deadline, owner, generation, lease, records and values, frontier,
