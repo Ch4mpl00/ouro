@@ -448,14 +448,11 @@ impl Runtime {
         request: &ouro_durable::control::Request,
         command: &ouro_durable::control::Command,
     ) -> Result<ouro_durable::control::Reply, ouro_durable::control::ControlError> {
-        use ouro_durable::control::{Command, Reply};
-        // A retry of a committed request repeats its reply, not its event.
-        let repeated = match command {
-            Command::Hold { .. } | Command::Release { .. } => self.store.control_entry(&request.id).await?.is_some(),
-            _ => false,
-        };
+        use ouro_durable::control::{Applied, Command, Reply};
+        // A retry of a committed request repeats its reply, not its event;
+        // the store tells which in the command's own commit.
         let now = self.clock.now_ms();
-        let reply = self.store.control(request, command, now).await?;
+        let Applied { reply, repeated } = self.store.apply_control(request, command, now).await?;
         match (command, &reply) {
             (Command::Cancel { .. }, _) => self.signal_cancelled().await?,
             (Command::Hold { run, note }, Reply::Changed(true)) if !repeated => {
@@ -571,6 +568,7 @@ impl Runtime {
         // any decides between started and resumed, and the interpreter
         // starts from the same read.
         let journal = Preloaded::read(journal).await;
+        let open = journal.open_calls();
         events.began(saved, journal.resumed());
         let root = events.root_context().unwrap_or_else(Context::current);
         // Before the run's next step: every function it can call is still
@@ -689,22 +687,23 @@ impl Runtime {
         let outcome = match ended {
             Ok(outcome) => outcome,
             Err(Some(error)) if error.is::<ouro_durable::control::Held>() => {
-                // An operator holds the run. The lease renewal is the
-                // fast path of the hold, but a call already dispatched is
-                // not retracted: the interpreter goes on, its next fenced
-                // step refuses, and the answer of a call in flight is still
-                // recorded. It gets one heartbeat for that, well within the
-                // lease the last renewal gave it, then the run is dropped
-                // like any stopped one and the lease given back.
-                tokio::select! {
-                    biased;
-                    _ = stop.cancelled() => {}
-                    _ = tokio::time::sleep(self.config.heartbeat_interval) => {}
-                    _ = &mut run => {}
+                // An operator holds the run. The lease renewal is the fast
+                // path of the hold, but a call already dispatched is not
+                // retracted, and a hold never changes an outcome: the worker
+                // keeps its lease (a held run's renewal still extends it)
+                // until every call this execution dispatched has its answer
+                // recorded, however long that takes (the call's own timeout
+                // is the only bound), then drops the run like any stopped
+                // one and gives the lease back. A run that ends meanwhile
+                // (its next fenced step refuses) is handled as usual below.
+                match self.settle_held(&mut run, open, &lease.fence, stop).await {
+                    Some(outcome) => outcome,
+                    None => {
+                        local_cancel.cancel();
+                        drop(run);
+                        return self.yield_held(&lease).await;
+                    }
                 }
-                local_cancel.cancel();
-                drop(run);
-                return self.yield_held(&lease).await;
             }
             Err(lost) => {
                 local_cancel.cancel();
@@ -740,6 +739,39 @@ impl Runtime {
                 Ok(Ending::own(Status::Interrupted(WorkflowError::runtime(e.to_string()))))
             }
             result => result.map(|status| Ending { status, foreign: false, limit_exceeded: outcome.limit_exceeded }),
+        }
+    }
+    /// Polls a held run until no call it dispatched is waiting for its
+    /// answer, keeping the lease meanwhile. `Some`: the run ended first (its
+    /// next fenced step refused, or the hold was released and it finished);
+    /// `None`: let it go. A worker stop, or a renewal that fails otherwise
+    /// than by the hold (the lease is lost, the emergency stop), lets it go
+    /// at once.
+    async fn settle_held<T>(
+        &self,
+        run: &mut (impl Future<Output = T> + Unpin),
+        mut open: tokio::sync::watch::Receiver<BTreeSet<String>>,
+        fence: &Fence,
+        stop: &CancellationToken,
+    ) -> Option<T> {
+        let keep = async {
+            let mut ticks = tokio::time::interval(self.config.heartbeat_interval);
+            // The first tick is now, right after the renewal that saw the hold.
+            ticks.tick().await;
+            loop {
+                ticks.tick().await;
+                match self.store.renew(fence, self.clock.now_ms()).await {
+                    Err(e) if !e.is::<ouro_durable::control::Held>() => return,
+                    _ => {}
+                }
+            }
+        };
+        tokio::select! {
+            biased;
+            _ = stop.cancelled() => None,
+            outcome = &mut *run => Some(outcome),
+            _ = open.wait_for(BTreeSet::is_empty) => None,
+            () = keep => None,
         }
     }
     /// Gives a held run's lease back: it is Ready again, still held, and
@@ -929,21 +961,29 @@ impl Ending {
 
 /// A journal whose first load returns the records read before the run
 /// started (`Preloaded::read`), so the drive and the interpreter share one
-/// read of them.
+/// read of them. It also tracks the calls this execution saved an intent for
+/// and no answer yet (`open`): what a hold waits for.
 struct Preloaded<'a> {
     journal: &'a dyn ows::durable::Journal,
     first: Mutex<Option<anyhow::Result<BTreeMap<String, ows::durable::Record>>>>,
     resumed: bool,
+    open: tokio::sync::watch::Sender<BTreeSet<String>>,
 }
 impl<'a> Preloaded<'a> {
     async fn read(journal: &'a dyn ows::durable::Journal) -> Self {
         let first = journal.load().await;
         // Unreadable records count as an earlier execution's.
         let resumed = first.as_ref().map_or(true, |records| !records.is_empty());
-        Preloaded { journal, first: Mutex::new(Some(first)), resumed }
+        Preloaded { journal, first: Mutex::new(Some(first)), resumed, open: Default::default() }
     }
     fn resumed(&self) -> bool {
         self.resumed
+    }
+    /// The keys of the calls whose intent this execution saved and whose
+    /// answer it has not: dispatched, or about to be (a dispatch the store
+    /// refuses ends the attempt instead).
+    fn open_calls(&self) -> tokio::sync::watch::Receiver<BTreeSet<String>> {
+        self.open.subscribe()
     }
 }
 #[async_trait]
@@ -956,7 +996,12 @@ impl ows::durable::Journal for Preloaded<'_> {
         }
     }
     async fn save(&self, key: &str, record: &ows::durable::Record) -> anyhow::Result<()> {
-        self.journal.save(key, record).await
+        self.journal.save(key, record).await?;
+        if let ows::durable::Record::Call { state, .. } = record {
+            let pending = matches!(state, ows::durable::CallState::Pending);
+            self.open.send_if_modified(|open| if pending { open.insert(key.into()) } else { open.remove(key) });
+        }
+        Ok(())
     }
     async fn spend(&self, key: &str, limit: u64) -> anyhow::Result<Option<ows::durable::Record>> {
         self.journal.spend(key, limit).await

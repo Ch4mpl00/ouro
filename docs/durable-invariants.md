@@ -577,7 +577,9 @@ equals the tripped digest, whatever its version number: a normal start
 refused, a pinned start of a version with other content is admitted. An
 operator's pause is a trip that refuses every admission of the definition,
 whatever its content or version number; only `resume` or an activation lifts
-it, and `resume` never lifts a breaker's trip. Only
+it, and `resume` never lifts a breaker's trip. A pause may stand on top of a
+breaker's trip, which keeps its report: everything is refused until `resume`,
+which lifts the pause alone. Only
 stored digests are compared; none is recomputed at admission. Only runs of the
 active version count toward the breaker, so a pinned run of other content never
 does. An already admitted run is still joined. The active version and the epoch do not change.
@@ -835,17 +837,21 @@ promoted, or discarded by an activation or a trip. Promotion commits with the
 end that makes room for it, whichever run of the definition ends. A drain the
 stop deferred happens at clearing (a bounded batch of definitions), at a later
 poll, or in the commit of the next admission to the definition (a firing, a
-start): that admission drains the definition's deferred queue first, so no
-later slot of the trigger and no other start takes the room a buffered slot
-needs ahead of it. No fairness of firing, activation or admissions is assumed.
+start, an owned child): that admission drains the definition's deferred queue
+first, so no later slot of the trigger and no other start takes the room a
+buffered slot needs ahead of it. A drain that trips the definition (a promoted
+refused slot reaching the threshold) commits with the refusal of the admission
+that drained it: the refusal always names a stored trip. No fairness of firing,
+activation or admissions is assumed.
 
 A queue position cannot be stranded. **Source:** [#19][I19]. **Fault:** a crash
 at the predecessor's terminal commit, a stop between the end and the promotion,
 an activation or trip racing promotion. **Mutant:** never promote; promote only
 at the end of the trigger's own run; drop the deferred drain when the stop is
-cleared; admit a firing, or a start, without draining the deferred queue
-first. **Check:** `contract_progress_trigger::L7`; the overlap policy monitors
-of `contract.qnt`.
+cleared; admit a firing, a start or an owned child without draining the
+deferred queue first; roll a drain's trip back with the start it refuses.
+**Check:** `contract_progress_trigger::L7` and `L7_refusal`; the overlap
+policy monitors of `contract.qnt`.
 
 #### L8 — A one-shot slot resolves and the trigger stays dormant [P/D, liveness]
 
@@ -1279,11 +1285,13 @@ Addendum (2026-10-25, issue #29). An operator may hold one run and its live
 owned descendants, in one transition, and release them. A held run takes no
 step: it is never claimed nor due (its wake-up and timers are kept, not fired),
 its owner's fenced operations and dispatches are refused, and it starts no
-child; the only things it commits are the owner's answer to a call (a call
-already dispatched is not retracted; the proof that a call did nothing is
-accepted whether or not it was dispatched, so a refusal before dispatch, such
-as an input validation, is committed under a hold too), the owner giving its
-lease back, mailbox acceptance of events and a cancellation, which ends the
+child, and no untargeted delivery chooses it (#31: the event goes to the
+oldest waiting run not held); the only things it commits are the owner's
+answer to a call (a call already dispatched is not retracted; the proof that a
+call did nothing is accepted whether or not it was dispatched, so a refusal
+before dispatch, such as an input validation, is committed under a hold too),
+the owner keeping its lease while it waits for that answer (amended by #31) or
+giving it back, mailbox acceptance of events and a cancellation, which ends the
 hold. A release
 restores exactly what the hold kept, so due work is due again in the same
 transition. A held run is live (overlap, the ceiling); an ended run is never
@@ -1304,3 +1312,20 @@ call record (E4: a completed record is never saved anew, so replay and
 recovery never count it twice), and a run's totals are added to its
 definition's hourly bucket in its terminal commit (A3: a run ends once).
 Neither row is evidence: `sweep` keeps both, as it keeps outcomes (O2).
+
+Addendum (2026-10-25, issue #31, core semantics). Five rules were sharpened
+after an independent review. (1) A pause may stand on top of a breaker's trip:
+it refuses every admission (V2's `manual`) and keeps the breaker's report
+(the model's `breaker`, the trip its notice reports); `resume` lifts the pause
+alone. (2) While tripped by its breaker, a definition refuses an admission of
+a version its catalog does not hold, which has no stored digest to show its
+content to be other (V2, fail closed). (3) A held run's owner keeps its lease
+while it waits for the answer of a call it dispatched (H1): a hold never turns
+an answer into an unknown outcome, and the worker lets the run go only once
+nothing it dispatched is unanswered. (4) Every admission path, an owned child
+included, drains its definition's deferred queue first (L7), and a drain that
+trips the definition commits with the refusal it causes (`L7_refusal`). (5) An
+untargeted delivery never chooses a held run (routing is checked by the
+conformance suite, not the model). In the interpreter, a `catch` naming the
+unknown-outcome type that does not take the error re-raises it as it came, and
+a saved `emit` refusal is restored on recovery as a call's is (R2).

@@ -1991,6 +1991,15 @@ impl Functions for Shipments {
     async fn call(&self, _: &str, _: Value, _: &CallInfo<'_>) -> Result<Value, WorkflowError> {
         unreachable!("durable runs invoke")
     }
+    // The first hand-over is refused before anything was sent; the next is accepted.
+    async fn emit(&self, _: &Value, _: &CallInfo<'_>) -> Result<(), CallFailure> {
+        let before = self.count("emit");
+        self.calls.lock().unwrap().push("emit".into());
+        if before == 0 {
+            return Err(CallFailure::NotExecuted(WorkflowError::not_executed("sink busy, nothing sent")));
+        }
+        Ok(())
+    }
     async fn invoke(&self, name: &str, args: Value, info: &CallInfo<'_>) -> Result<Value, CallFailure> {
         let before = self.count(name);
         self.calls.lock().unwrap().push(name.into());
@@ -2044,6 +2053,37 @@ async fn a_catch_naming_the_unknown_type_reconciles_an_unknown_at_most_once_outc
         let status = drive(&h, &time, &wf, &Store::default()).await;
         assert!(matches!(&status, Status::Faulted(e) if e.type_ == CALL_UNKNOWN), "{filter}: {status:?}");
         assert_eq!((shipments.count("create"), shipments.count("lookup")), (1, 0), "{filter}");
+    }
+    // A catch that names the type but does not take this error (its guard,
+    // or another property of its filter) passes it on as unknown as it came:
+    // an enclosing catch-all written for definite failures never sees it.
+    for inner in [
+        "errors: { with: { type: urn:ouro:errors:call.unknown } }\n              when: '${ false }'",
+        "errors: { with: { type: urn:ouro:errors:call.unknown } }\n              exceptWhen: '${ true }'",
+        "errors: { with: { type: urn:ouro:errors:call.unknown, status: 500 } }",
+    ] {
+        let shipments =
+            Shipments::new(|_| Err(CallFailure::answer(WorkflowError::unknown_outcome("timed out after send"))));
+        h.functions = shipments.clone();
+        let wf = workflow(&format!(
+            r#"do:
+  - outer:
+      try:
+        - ship:
+            try:
+              - create: {{ call: create }}
+            catch:
+              {inner}
+              do:
+                - lookup: {{ call: lookup, with: {{ reference: x }} }}
+      catch:
+        do:
+          - compensate: {{ set: {{ compensated: true }} }}
+"#
+        ));
+        let status = drive(&h, &time, &wf, &Store::default()).await;
+        assert!(matches!(&status, Status::Faulted(e) if e.type_ == CALL_UNKNOWN), "{inner}: {status:?}");
+        assert_eq!((shipments.count("create"), shipments.count("lookup")), (1, 0), "{inner}");
     }
 }
 
@@ -2166,6 +2206,52 @@ async fn a_not_executed_answer_is_restored_on_recovery_and_retried_only_by_a_new
                 assert_eq!(status, Status::Completed(json!({ "later": true })), "{label}");
                 assert!(matches!(state, Some(ows::durable::CallState::NotExecuted(_))), "{label}");
                 assert_eq!(shipments.count("check"), 1, "{label}: a saved refusal is never sent again");
+            }
+        }
+    }
+}
+
+// An `emit` follows the same rule: a saved refusal to hand the event over is
+// the answer the workflow acted on, restored on recovery, never handed over
+// again in its place.
+#[tokio::test]
+async fn a_not_executed_emit_is_restored_on_recovery() {
+    let wf = workflow(
+        r#"do:
+  - announced:
+      try:
+        - announce: { emit: { event: { with: { source: test, type: shipped } } } }
+      catch:
+        errors: { with: { type: urn:ouro:errors:call.not_executed } }
+        do: [ { later: { set: { later: true } } } ]
+"#,
+    );
+    let time = Arc::new(Time(AtomicI64::new(1_000)));
+    let mut h = host(Arc::new(World::default()), time.clone());
+    let baseline = Store::default();
+    let shipments = Shipments::new(|_| unreachable!());
+    h.functions = shipments.clone();
+    assert_eq!(drive(&h, &time, &wf, &baseline).await, Status::Completed(json!({ "later": true })));
+    assert_eq!(shipments.count("emit"), 1);
+    // The emit's record is saved twice: its envelope, then the refusal.
+    let key = "/do/0/announced/try/0/announce#call";
+    let refusal = baseline.log.lock().unwrap().iter().enumerate().filter(|(_, k)| *k == key).nth(1).unwrap().0 + 1;
+    for at in 1..=baseline.saves.load(Ordering::SeqCst) {
+        for after_commit in [false, true] {
+            let store = Store { after_commit, ..Store::default() };
+            store.fail_at.store(at, Ordering::SeqCst);
+            let shipments = Shipments::new(|_| unreachable!());
+            h.functions = shipments.clone();
+            let status = drive(&h, &time, &wf, &store).await;
+            let label = format!("crash at {at} (after commit: {after_commit})");
+            if at == refusal && !after_commit {
+                // The refusal was never saved: the envelope is handed over
+                // again, and this time it is accepted.
+                assert!(matches!(&status, Status::Completed(v) if v["type"] == "shipped"), "{label}: {status:?}");
+                assert_eq!(shipments.count("emit"), 2, "{label}");
+            } else {
+                assert_eq!(status, Status::Completed(json!({ "later": true })), "{label}");
+                assert_eq!(shipments.count("emit"), 1, "{label}: a saved refusal is never handed over again");
             }
         }
     }

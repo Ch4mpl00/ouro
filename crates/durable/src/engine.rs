@@ -132,7 +132,9 @@ async fn run(rows: &mut dyn Transaction, id: &str) -> anyhow::Result<StoredRun> 
 /// trip) is refused, never read as a definition that cannot be tripped.
 /// 4: each version's latest activation (`Definitions::activations`).
 /// 5: each version's content digest, and the digest a trip refuses by.
-const DEFINITIONS_VERSION: u64 = 5;
+/// 6: whether the breaker tripped (`Trip::breaker`), so a pause can stand on
+/// top of a breaker's trip and `resume` lift only the pause.
+const DEFINITIONS_VERSION: u64 = 6;
 async fn load_definitions(rows: &mut dyn Transaction, name: &str) -> anyhow::Result<Option<Definitions>> {
     let Some(value) = rows.get("definitions", name).await? else { return Ok(None) };
     Ok(Some(decode_definitions(name, value)?))
@@ -287,7 +289,11 @@ fn indexes(s: &StoredRun) -> Rows {
         if let Some(link) = &s.run.child {
             keys.insert(key(&partition("children", &link.parent), id), value.clone());
         }
-        for (t, at) in &s.awaits {
+        // A held run is offered no competing delivery: an untargeted event
+        // goes to the oldest waiting run that can take it now, not into a
+        // frozen mailbox. A release restores the registrations with the
+        // other index keys, in its commit; targeted events still arrive.
+        for (t, at) in s.awaits.iter().filter(|_| s.run.held.is_none()) {
             // Child waiting notifications are addressed internally. Their
             // automatic registration needs no competing-delivery index until
             // an explicit listen registers that type.
@@ -413,8 +419,8 @@ fn claim_run(snapshot: &mut StoredRun, now: i64, owner: &str) -> anyhow::Result<
 /// belongs to (when it runs the active version) are fixed here. A tripped
 /// definition refuses, by any path, a new run whose definition has the
 /// tripped content digest, whatever its version number, in the same commit
-/// that reads the trip; other content is admitted (a pinned start) and never
-/// counts toward the breaker. A manual pause refuses every admission of the
+/// that reads the trip, and a version the catalog does not hold; other
+/// content is admitted (a pinned start) and never counts toward the breaker. A manual pause refuses every admission of the
 /// definition, whatever its content. An existing run is still joined.
 async fn insert(rows: &mut dyn Transaction, admission: &Admission, now: i64) -> anyhow::Result<bool> {
     let Some(snapshot) = admitted(rows, admission, now).await? else { return Ok(false) };
@@ -429,16 +435,10 @@ async fn admitted(rows: &mut dyn Transaction, admission: &Admission, now: i64) -
     }
     running(rows).await?;
     let defs = load_definitions(rows, &admission.name).await?;
-    // Stored digests only (`Definition::digest`, `Trip::digest`): nothing is
-    // hashed here. A version the catalog does not hold has no digest and is
-    // never the tripped content.
-    let digest =
-        defs.as_ref().and_then(|d| d.versions.get(&admission.version)).map_or_else(String::new, |d| d.digest.clone());
-    if let Some(trip) = defs.as_ref().and_then(|d| d.tripped.as_ref())
-        && (trip.manual.is_some() || (!digest.is_empty() && digest == trip.digest))
-    {
-        return Err(trip.refusal(&admission.name).into());
+    if let Some(refusal) = barred(defs.as_ref(), admission) {
+        return Err(refusal.into());
     }
+    let digest = digest(defs.as_ref(), admission);
     let epoch = defs.filter(|d| d.active == Some(admission.version)).map(|d| d.epoch);
     Ok(Some(StoredRun {
         run: SavedRun {
@@ -474,6 +474,37 @@ async fn admitted(rows: &mut dyn Transaction, admission: &Admission, now: i64) -
         mailbox: None,
         evidence: false,
     }))
+}
+/// The content digest of the admitted version as the catalog stores it
+/// (`Definition::digest`): nothing is hashed here. Empty for a version the
+/// catalog does not hold.
+fn digest(defs: Option<&Definitions>, admission: &Admission) -> String {
+    defs.and_then(|d| d.versions.get(&admission.version)).map_or_else(String::new, |d| d.digest.clone())
+}
+/// The refusal a standing trip gives a new run of `admission`: a pause
+/// refuses every one; an automatic trip, the tripped content digest, compared
+/// as stored (`Trip::digest`). A version the catalog does not hold has no
+/// digest that could show its content to be other: refused (fail closed).
+fn barred(defs: Option<&Definitions>, admission: &Admission) -> Option<DefinitionTripped> {
+    let trip = defs?.tripped.as_ref()?;
+    let digest = digest(defs, admission);
+    (trip.manual.is_some() || digest.is_empty() || digest == trip.digest).then(|| trip.refusal(&admission.name))
+}
+/// After `drain_marked` drained (`drained`), the refusal the new run of
+/// `admission` now meets if the drain tripped its definition (a promoted
+/// refused slot reaching the threshold). The admission returns it inside a
+/// committed transaction (`Ok(Err(refusal))`) with nothing else written: the
+/// drain and its trip are kept, and the refusal names a stored trip.
+async fn drained_refusal(
+    rows: &mut dyn Transaction,
+    drained: bool,
+    admission: &Admission,
+) -> anyhow::Result<Option<anyhow::Error>> {
+    if !drained || find_run(rows, &admission.id).await?.is_some() {
+        return Ok(None);
+    }
+    let defs = load_definitions(rows, &admission.name).await?;
+    Ok(barred(defs.as_ref(), admission).map(Into::into))
 }
 /// A refused trigger run (`Firing::refused`): admitted under the same rules
 /// as `insert` and ended faulted in the same write, so it is never due and
@@ -918,12 +949,14 @@ async fn drain_queues(rows: &mut dyn Transaction, name: &str, now: i64) -> anyho
 /// `contract.qnt`'s `settle` promotes right after the clear, so a buffered slot
 /// always precedes later ones; this is the same order, reached lazily and in
 /// the admitting commit. One point read when nothing is deferred.
-async fn drain_marked(rows: &mut dyn Transaction, name: &str, now: i64) -> anyhow::Result<()> {
+/// Whether it drained anything (`drained_refusal`).
+async fn drain_marked(rows: &mut dyn Transaction, name: &str, now: i64) -> anyhow::Result<bool> {
     if get::<bool>(rows, "control_drain", name).await?.is_some() && !is_stopped(rows).await? {
         rows.delete("control_drain", name).await?;
         drain_queues(rows, name, now).await?;
+        return Ok(true);
     }
-    Ok(())
+    Ok(false)
 }
 
 async fn drain_pending(rows: &mut dyn Transaction, now: i64, limit: usize) -> anyhow::Result<()> {
@@ -1019,18 +1052,42 @@ async fn tombstone(
     };
     Ok((k, stored, used))
 }
-async fn fire(rows: &mut dyn Transaction, f: &Firing<'_>, now: i64, policy: &Policy) -> anyhow::Result<Fired> {
+/// `Ok(Err(refusal))`: refused by a trip its own deferred drain committed
+/// (`drained_refusal`); the drain is kept, nothing else is written.
+async fn fire(
+    rows: &mut dyn Transaction,
+    f: &Firing<'_>,
+    now: i64,
+    policy: &Policy,
+) -> anyhow::Result<anyhow::Result<Fired>> {
     if is_stopped(rows).await? {
-        return Ok(Fired::Changed);
+        return Ok(Ok(Fired::Changed));
     }
     anyhow::ensure!(f.refused.is_none() || f.admit.is_empty(), "a firing admits its runs or records a refusal");
+    let mut drained = false;
     if let Some(a) = f.admit.first().or(f.refused.map(|r| &r.admission)) {
-        drain_marked(rows, &a.name, now).await?;
+        drained = drain_marked(rows, &a.name, now).await?;
     }
     let current: Option<Trigger> = get(rows, "trigger", f.key).await?;
     if current.as_ref() != f.expected {
-        return Ok(Fired::Changed);
+        // A trip disarms the definition's triggers: a drain that tripped
+        // it lands here for any trigger it armed.
+        return Ok(Ok(Fired::Changed));
     }
+    for a in f.admit.iter().chain(f.refused.map(|r| &r.admission)) {
+        if let Some(refusal) = drained_refusal(rows, drained, a).await? {
+            return Ok(Err(refusal));
+        }
+    }
+    fire_checked(rows, f, current, now, policy).await.map(Ok)
+}
+async fn fire_checked(
+    rows: &mut dyn Transaction,
+    f: &Firing<'_>,
+    current: Option<Trigger>,
+    now: i64,
+    policy: &Policy,
+) -> anyhow::Result<Fired> {
     // Validate ingress before any policy outcome: a skipped or buffered event
     // is consumed too, and a conflicting payload must never cancel a run.
     if let Some(event) = f.ingress
@@ -1311,6 +1368,7 @@ async fn breaker(
             if defs.consecutive_faults >= threshold {
                 let trip = Trip {
                     manual: None,
+                    breaker: true,
                     version: run.admission.version,
                     digest: defs.versions.get(&run.admission.version).map(|d| d.digest.clone()).unwrap_or_default(),
                     epoch: defs.epoch,
@@ -1334,12 +1392,12 @@ async fn breaker(
 
 #[async_trait::async_trait]
 impl RunStore for TransactionalStore {
-    async fn control(
+    async fn apply_control(
         &self,
         request: &control::Request,
         command: &control::Command,
         now: i64,
-    ) -> anyhow::Result<control::Reply> {
+    ) -> anyhow::Result<control::Applied> {
         self.update(|rows| Box::pin(async move { control_command(rows, request, command, now, &self.policy).await }))
             .await
     }
@@ -1578,26 +1636,32 @@ impl RunStore for TransactionalStore {
     async fn admit(&self, a: &Admission, now: i64) -> anyhow::Result<bool> {
         self.update(|rows| {
             Box::pin(async move {
-                drain_marked(rows, &a.name, now).await?;
-                insert(rows, a, now).await
+                let drained = drain_marked(rows, &a.name, now).await?;
+                if let Some(refusal) = drained_refusal(rows, drained, a).await? {
+                    return Ok(Err(refusal));
+                }
+                insert(rows, a, now).await.map(Ok)
             })
         })
-        .await
+        .await?
     }
     async fn start(&self, a: &Admission, now: i64) -> anyhow::Result<Option<Fence>> {
         let owner = &uuid::Uuid::new_v4().to_string();
         self.update(|rows| {
             Box::pin(async move {
-                drain_marked(rows, &a.name, now).await?;
+                let drained = drain_marked(rows, &a.name, now).await?;
+                if let Some(refusal) = drained_refusal(rows, drained, a).await? {
+                    return Ok(Err(refusal));
+                }
                 let Some(mut s) = admitted(rows, a, now).await? else {
-                    return Ok(None);
+                    return Ok(Ok(None));
                 };
                 let fence = claim_run(&mut s, now, owner)?;
                 store_run(rows, &s).await?;
-                Ok(Some(fence))
+                Ok(Ok(Some(fence)))
             })
         })
-        .await
+        .await?
     }
     async fn claim_as(&self, id: &str, now: i64, worker: &Compatibility) -> anyhow::Result<Option<Fence>> {
         let owner = &uuid::Uuid::new_v4().to_string();
@@ -1622,15 +1686,22 @@ impl RunStore for TransactionalStore {
     async fn check_lease(&self, f: &Fence, now: i64) -> anyhow::Result<()> {
         self.update(|rows| Box::pin(async move { checked(rows, f, now, self.policy.skew_ms).await.map(|_| ()) })).await
     }
+    // A held run's owner keeps its lease: it may be waiting for the answer
+    // of a call it already dispatched, which the hold does not retract and
+    // whose answer it still records however long the call takes. The renewal
+    // commits and answers `Held` all the same, the worker's cue to let the
+    // run go once nothing is in flight; nobody can claim a held run anyway.
     async fn renew(&self, f: &Fence, now: i64) -> anyhow::Result<()> {
         self.update(|rows| {
             Box::pin(async move {
-                let mut s = checked(rows, f, now, self.policy.skew_ms).await?;
+                running(rows).await?;
+                let mut s = authority(rows, f, now, self.policy.skew_ms).await?;
                 s.run.lease_until_ms = Some(now.saturating_add(LEASE_MS));
-                store_run(rows, &s).await
+                store_run(rows, &s).await?;
+                Ok(not_held(&s))
             })
         })
-        .await
+        .await?
     }
     async fn release(&self, f: &Fence, now: i64) -> anyhow::Result<()> {
         self.update(|rows| {
@@ -1864,7 +1935,7 @@ impl RunStore for TransactionalStore {
         self.read(|rows| Box::pin(async move { Ok(queued(rows, key).await?.map(|q| q.admission)) })).await
     }
     async fn fire(&self, firing: &Firing<'_>, now: i64) -> anyhow::Result<Fired> {
-        self.update(|rows| Box::pin(async move { fire(rows, firing, now, &self.policy).await })).await
+        self.update(|rows| Box::pin(async move { fire(rows, firing, now, &self.policy).await })).await?
     }
     async fn finish(&self, f: &Fence, outcome: &Status, now: i64, threshold: u32) -> anyhow::Result<Status> {
         self.update(|rows| {
@@ -1932,6 +2003,12 @@ impl RunStore for TransactionalStore {
             Box::pin(async move {
                 let mut p = checked(rows, parent, now, self.policy.skew_ms).await?;
                 anyhow::ensure!(link.parent == parent.run_id && a.id != parent.run_id, "invalid child parent");
+                // An owned child takes its definition's room like any start:
+                // the deferred buffered slot goes first.
+                let drained = drain_marked(rows, &a.name, now).await?;
+                if let Some(refusal) = drained_refusal(rows, drained, a).await? {
+                    return Ok(Err(refusal));
+                }
                 for t in [format!("done:{}", a.id), format!("waiting:{}", a.id)] {
                     p.awaits.entry(t).or_insert(now);
                 }
@@ -1955,10 +2032,10 @@ impl RunStore for TransactionalStore {
                 } else if c.run.state == RunState::Waiting {
                     lifecycle(rows, &a.id, &Status::Waiting { wake_at_ms: 0 }, now).await?;
                 }
-                Ok(fence)
+                Ok(Ok(fence))
             })
         })
-        .await
+        .await?
     }
     async fn child_outcome(&self, parent: &str, k: &str, child: &str) -> anyhow::Result<Option<Status>> {
         self.read(|rows| {
@@ -2446,8 +2523,8 @@ async fn control_command(
     command: &control::Command,
     now: i64,
     policy: &Policy,
-) -> anyhow::Result<control::Reply> {
-    use control::{Command, ControlError, Entity, Reply};
+) -> anyhow::Result<control::Applied> {
+    use control::{Applied, Command, ControlError, Entity, Reply};
     if request.id.trim().is_empty() || request.actor.trim().is_empty() || request.reason.trim().is_empty() {
         return Err(ControlError::InvalidInput("control request requires id, actor and reason".into()).into());
     }
@@ -2456,7 +2533,7 @@ async fn control_command(
         if entry.request != *request || entry.command != canonical {
             return Err(ControlError::RequestConflict { id: request.id.clone() }.into());
         }
-        return Ok(entry.reply);
+        return Ok(Applied { reply: entry.reply, repeated: true });
     }
     let unknown = |name: &str| ControlError::NotFound { entity: Entity::Definition, id: name.into() };
     let reply = match command {
@@ -2491,18 +2568,27 @@ async fn control_command(
         }
         Command::Pause { definition: name, note } => {
             let mut defs = load_definitions(rows, name).await?.ok_or_else(|| unknown(name))?;
-            let changed = defs.tripped.is_none();
-            if changed {
+            let manual = control::ManualTrip {
+                actor: request.actor.clone(),
+                reason: request.reason.clone(),
+                note: note.clone(),
+            };
+            let changed = defs.tripped.as_ref().is_none_or(|t| t.manual.is_none());
+            if let Some(trip) = defs.tripped.as_mut().filter(|t| t.manual.is_none()) {
+                // A breaker's trip already stopped the schedule and its
+                // buffered slot; the pause stands beside its report, so every
+                // admission is refused, other content too, until `resume`.
+                trip.manual = Some(manual);
+                suspend(rows, name, &mut defs).await?;
+                store_definitions(rows, name, &defs).await?;
+            } else if changed {
                 let version = defs
                     .active
                     .ok_or_else(|| ControlError::InvalidState(format!("definition {name} has no active version")))?;
                 suspend(rows, name, &mut defs).await?;
                 defs.tripped = Some(Trip {
-                    manual: Some(control::ManualTrip {
-                        actor: request.actor.clone(),
-                        reason: request.reason.clone(),
-                        note: note.clone(),
-                    }),
+                    manual: Some(manual),
+                    breaker: false,
                     version,
                     digest: defs.versions.get(&version).map(|d| d.digest.clone()).unwrap_or_default(),
                     epoch: defs.epoch,
@@ -2534,7 +2620,9 @@ async fn control_command(
                 if paused.epoch != defs.epoch {
                     return Err(ControlError::InvalidState(format!("{name}: suspended activation changed")).into());
                 }
-                defs.tripped = None;
+                // Only the pause is lifted: a breaker's trip under it stays,
+                // with nothing to restore (the trip disarmed the definition).
+                defs.tripped = defs.tripped.take().filter(|t| t.breaker).map(|t| Trip { manual: None, ..t });
                 arm(rows, &mut defs, &paused.triggers).await?;
                 for (key, value) in &paused.queues {
                     let q: Queued = serde_json::from_value(value.clone())?;
@@ -2635,7 +2723,7 @@ async fn control_command(
     {
         put(rows, &partition("control_history_run", run), &k, &entry).await?;
     }
-    Ok(reply)
+    Ok(Applied { reply, repeated: false })
 }
 
 async fn snapshot(rows: &mut dyn Transaction, s: StoredRun) -> anyhow::Result<RunSnapshot> {

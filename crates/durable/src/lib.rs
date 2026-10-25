@@ -334,14 +334,21 @@ pub const TRIPPED: &str = "ouro.definition.tripped";
 /// What a tripped breaker reports, in `Definitions::tripped` and as a notice.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Trip {
-    /// Present for an operator pause; `reason.type_` is `manual`.
+    /// Present while an operator's pause stands. A pause alone has
+    /// `breaker == false` and `reason.type_` `manual`; a pause of a
+    /// definition the breaker tripped keeps the breaker's report beside it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub manual: Option<control::ManualTrip>,
+    /// The breaker tripped (its threshold observation, reported once as a
+    /// notice): only an activation clears it, and `resume` lifts a pause
+    /// on top of it, never the trip itself.
+    pub breaker: bool,
     /// The active version and the epoch the breaker tripped in.
     pub version: u64,
     /// The content digest of that version (`digest_of`): while an automatic
     /// trip stands, an admission whose definition has this digest is refused,
-    /// of whatever version number; one with other content is admitted. A
+    /// of whatever version number, and so is one of a version the catalog
+    /// does not hold; one with other content is admitted. A
     /// manual pause (`manual`) refuses every admission, whatever its content.
     pub digest: String,
     pub epoch: u64,
@@ -555,12 +562,26 @@ pub struct Swept {
 /// lease simply ends at its expiry.
 #[async_trait::async_trait]
 pub trait RunStore: Send + Sync {
+    /// Executes an attributed operator command; its effect, its audit entry
+    /// and its reply commit together. A request id already committed changes
+    /// nothing and returns the stored reply, `Applied::repeated` saying so in
+    /// that same transaction: of two concurrent submissions of one new
+    /// request, exactly one is not a repeat.
+    async fn apply_control(
+        &self,
+        request: &control::Request,
+        command: &control::Command,
+        now_ms: i64,
+    ) -> anyhow::Result<control::Applied>;
+    /// `apply_control`'s reply alone.
     async fn control(
         &self,
         request: &control::Request,
         command: &control::Command,
         now_ms: i64,
-    ) -> anyhow::Result<control::Reply>;
+    ) -> anyhow::Result<control::Reply> {
+        Ok(self.apply_control(request, command, now_ms).await?.reply)
+    }
     async fn stopped(&self) -> anyhow::Result<bool>;
     async fn control_entry(&self, id: &str) -> anyhow::Result<Option<control::Entry>>;
     async fn control_history(
@@ -640,6 +661,9 @@ pub trait RunStore: Send + Sync {
     async fn claim_as(&self, id: &str, now_ms: i64, worker: &Compatibility) -> anyhow::Result<Option<Fence>>;
     /// A dispatch boundary: current ownership and the global stop gate.
     async fn check_lease(&self, fence: &Fence, now_ms: i64) -> anyhow::Result<()>;
+    /// Extends the owner's lease. On a held run it extends it too and then
+    /// fails with `control::Held`: the owner keeps its authority to record
+    /// the answer of a call already dispatched, and learns to stop.
     async fn renew(&self, fence: &Fence, now_ms: i64) -> anyhow::Result<()>;
     async fn release(&self, fence: &Fence, now_ms: i64) -> anyhow::Result<()>;
     async fn load_records(&self, fence: &Fence, now_ms: i64) -> anyhow::Result<BTreeMap<String, Record>>;

@@ -243,6 +243,13 @@ module contract_witnesses {
   action sameContentRefused = breaker.then(execute("pin",2,0,2,5,0))
   run sameContentRefusedTest = sameContentRefused.expect(checked and m.db.admissions == [1,1,0] and
     m.db.catalog.tripped and not(m.db.runs.nth(2).admitted))
+  // A version the catalog does not hold is admitted untripped (uncounted),
+  // and refused while tripped: no stored digest shows its content to be other.
+  action absentAdmitted = init.then(execute("pinAbsent",0,0,0,5,0))
+  run absentAdmittedTest = absentAdmitted.expect(checked and m.db.admissions == [1,0,0] and
+    m.db.runs.nth(0).version == 4 and m.db.runs.nth(0).epoch == 0)
+  action absentRefused = breaker.then(execute("pinAbsent",2,0,0,5,0))
+  run absentRefusedTest = absentRefused.expect(checked and m.db.admissions == [1,1,0] and m.db.catalog.tripped)
   // Untripped, a pinned run of a version other than the active one never
   // counts, however often it fails.
   action pinnedUncounted = init.then(execute("pin",0,0,1,3,0)).then(execute("claim",0,0,0,0,0))
@@ -263,6 +270,14 @@ module contract_witnesses {
   action heldReleased = heldSteps.then(do("unhold")).then(do("claim"))
   run heldReleasedTest = heldReleased.expect(checked and not(m.db.runs.nth(0).held) and m.db.runs.nth(0).generation == 2 and
     m.db.runs.nth(0).owner == 0 and m.db.runs.nth(0).records == [2,0,0])
+  // A hold never changes an outcome (#31): the owner keeps its lease while the
+  // call it dispatched is out, past the lease it had when the hold came, and
+  // records the answer; released, recovery restores that answer.
+  action heldAnswered = init.then(boot).then(do("intent")).then(do("dispatch")).then(do("hold")).then(ticks(2))
+    .then(do("renew")).then(ticks(2)).then(do("result")).then(do("release")).then(do("unhold")).then(ticks(5))
+    .then(do("claim")).then(do("recover"))
+  run heldAnsweredTest = heldAnswered.expect(checked and not(m.db.runs.nth(0).held) and m.db.runs.nth(0).records == [2,0,0] and
+    m.observations.nth(m.observations.length()-1).result == 2 and m.sends == [[1,0,0],[0,0,0],[0,0,0]])
   // A dispatch waits for the release: the intent is saved, the world is not touched.
   action heldDispatch = init.then(boot).then(do("intent")).then(do("hold")).then(do("dispatch"))
   run heldDispatchTest = heldDispatch.expect(checked and m.sends == [[0,0,0],[0,0,0],[0,0,0]])
@@ -300,6 +315,15 @@ module contract_witnesses {
     m.db.catalog.active == 1)
   action resumeKeepsTrip = breaker.then(do("resume"))
   run resumeKeepsTripTest = resumeKeepsTrip.expect(checked and m.db.catalog.tripped and not(m.db.catalog.manual))
+  // A pause of a definition the breaker tripped stands beside the trip
+  // (#31): other content is refused too; resuming lifts the pause alone, and
+  // other content is admitted again while the trip waits for an activation.
+  action pauseTripped = breaker.then(do("pause")).then(execute("pin",2,0,1,5,0))
+  run pauseTrippedTest = pauseTripped.expect(checked and m.db.catalog.tripped and m.db.catalog.manual and
+    m.db.catalog.breaker and m.db.catalog.trippedDigest == 1 and m.db.admissions == [1,1,0] and m.db.catalog.notices == [1])
+  action pauseTrippedResumed = pauseTripped.then(do("resume")).then(execute("pin",2,0,1,5,0))
+  run pauseTrippedResumedTest = pauseTrippedResumed.expect(checked and m.db.catalog.tripped and not(m.db.catalog.manual) and
+    m.db.catalog.breaker and m.db.admissions == [1,1,1] and m.db.runs.nth(2).version == 2)
   // Every history above in one trace (each starts with init), replayed
   // against the stores by crates/durable/tests/quint.rs.
   // The tail of the suite, a run of its own: a single chain this long exceeds
@@ -307,6 +331,7 @@ module contract_witnesses {
   run bridgeTail = emergencyStop.then(clearStop).then(stoppedQueue).then(resumedQueue).then(oneShot).then(oneShotBusy).then(oneShotReactivated).then(oneShotChanged)
     .then(pinnedAdmitted).then(sameContentRefused).then(pinnedUncounted).then(heldReleased).then(heldDispatched)
     .then(heldChild).then(heldCancelled).then(heldClaimed).then(resumed).then(pauseActivated).then(resumeKeepsTrip)
+    .then(pauseTrippedResumed).then(absentAdmitted).then(absentRefused).then(heldAnswered)
   run bridgeSuite = continuation.then(unknown).then(mailbox).then(expiry).then(child).then(childFinish).then(grandchild).then(activation)
     .then(deadline).then(compatibility).then(dry).then(replay).then(schedule).then(breaker).then(rearm)
     .then(noCatchup).then(overlap).then(ingress).then(ingressExpiry).then(redispatch).then(protectedUnknown)

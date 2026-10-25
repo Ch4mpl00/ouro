@@ -278,8 +278,10 @@ struct CatalogView {
     epoch: i64,
     faults: i64,
     tripped: bool,
-    /// The trip is an operator's pause, which refuses every version.
+    /// An operator's pause stands, which refuses every version.
     manual: bool,
+    /// The breaker tripped; a pause may stand on top of its trip.
+    breaker: bool,
     /// The content the trip refuses (the model's `content`), 0: not tripped.
     tripped_digest: i64,
     trigger: Option<TriggerView>,
@@ -369,6 +371,7 @@ struct ModelCatalog {
     faults: i64,
     tripped: bool,
     manual: bool,
+    breaker: bool,
     #[serde(rename = "trippedDigest")]
     tripped_digest: i64,
     #[serde(rename = "triggerEpoch")]
@@ -459,6 +462,7 @@ impl From<Machine> for View {
                 faults: c.faults,
                 tripped: c.tripped,
                 manual: c.manual,
+                breaker: c.breaker,
                 tripped_digest: c.tripped_digest,
                 trigger: c.armed.then_some(TriggerView {
                     overlap: c.overlap,
@@ -575,6 +579,7 @@ impl State<StoreDriver> for View {
                 faults: i64::from(defs.consecutive_faults),
                 tripped: defs.tripped.is_some(),
                 manual: defs.tripped.as_ref().is_some_and(|t| t.manual.is_some()),
+                breaker: defs.tripped.as_ref().is_some_and(|t| t.breaker),
                 tripped_digest: defs.tripped.as_ref().map_or(Ok(0), |t| content_of(&t.digest))?,
                 trigger,
                 notices,
@@ -940,6 +945,7 @@ impl StoreDriver {
                 "dry",
                 "replay",
                 "pin",
+                "pinAbsent",
                 "fire",
                 "refuse",
                 "ingress",
@@ -990,14 +996,17 @@ impl StoreDriver {
                 let a = self.admission(r, value, i as i64, mode, None)?;
                 expect(self.write(fault, self.store.admit(&a, ms)).0.map(drop))?;
             }
-            // A pinned start: the stored version `i + 1`, active or not. A
-            // tripped definition refuses it iff the content is the tripped one.
-            "pin" => {
+            // A pinned start: the stored version `i + 1`, active or not, or
+            // (`pinAbsent`) version 4, which the catalog does not hold. A
+            // tripped definition refuses it iff the content is the tripped one
+            // or the catalog has no digest for it.
+            "pin" | "pinAbsent" => {
                 let defs = self.block(self.store.definitions(NAME))?;
-                let version = i as u64 + 1;
+                let version = if op == "pin" { i as u64 + 1 } else { 4 };
                 // An automatic trip refuses its own content; a pause, every one.
-                let barred =
-                    defs.tripped.is_some_and(|t| t.manual.is_some() || t.digest == defs.versions[&version].digest);
+                let barred = defs.tripped.is_some_and(|t| {
+                    t.manual.is_some() || defs.versions.get(&version).is_none_or(|d| t.digest == d.digest)
+                });
                 if value < 0 || self.block(self.store.get(&run_id(r)))?.is_some() {
                     return Ok(());
                 }
@@ -1010,7 +1019,7 @@ impl StoreDriver {
                     if barred {
                         ensure!(
                             result.err().is_some_and(|e| e.is::<DefinitionTripped>()),
-                            "a tripped definition admitted its own content"
+                            "a tripped definition admitted content it refuses"
                         );
                     } else {
                         ensure!(result?, "other content was refused while tripped");
@@ -1413,14 +1422,14 @@ impl StoreDriver {
                 };
                 expect(self.write(fault, self.store.control(&request, &command, ms)).0.map(drop))?;
             }
-            // An operator's pause refuses every version. The model pauses a
-            // definition with nothing to suspend: no armed schedule and no
-            // buffered slot (the store suspends and restores those, which the
-            // conformance suite checks).
+            // An operator's pause refuses every version, on top of a
+            // breaker's trip too. The model pauses a definition with nothing
+            // to suspend: no armed schedule and no buffered slot (the store
+            // suspends and restores those, which the conformance suite checks).
             "pause" | "resume" => {
                 let defs = self.block(self.store.definitions(NAME))?;
                 let manual = defs.tripped.as_ref().is_some_and(|t| t.manual.is_some());
-                let pausable = defs.tripped.is_none()
+                let pausable = !manual
                     && self.block(self.store.trigger(SCHEDULE))?.is_none()
                     && self.block(self.store.queued(SCHEDULE))?.is_none();
                 if value < 0 || (op == "pause" && !pausable) || (op == "resume" && !manual) {
@@ -1693,7 +1702,7 @@ pub fn with_quint(name: &str, run: impl FnOnce() -> anyhow::Result<()>) {
     assert!(result.success(), "Quint child test failed");
 }
 /// Every command of the contract model, and initialization.
-const COMMANDS: usize = 39;
+const COMMANDS: usize = 40;
 fn simulation(adapter: Adapter) -> anyhow::Result<()> {
     use quint_connect::runner::{self, RunConfig};
     let seed = std::env::var("QUINT_SEED").unwrap_or_else(|_| "20261023".into());

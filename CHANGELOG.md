@@ -8,7 +8,7 @@ store written before such a change must be recreated unless the entry says other
 
 ### Issue #31
 
-Breaking changes (issue #31), for hosts written before it:
+Breaking changes (issue #31), for hosts and adapters written before it:
 
 - A one-shot's run id is `schedule:<name>:at:<ms>` (it was
   `schedule:<name>:at:<epoch>:<ms>`), and a reactivation with the same `at`
@@ -19,6 +19,30 @@ Breaking changes (issue #31), for hosts written before it:
 - `SchemaError` gains `Legacy` (a v0.1.0 SQLite file); `Runtime::start_at`
   reports `run_admitted` to observers, and counts the run in the metrics only
   through the built-in telemetry observer, as every other admission does.
+- `Trip` gains `breaker` (the breaker's own trip; a pause alone has it
+  false). A pause of a definition the breaker tripped now records itself
+  beside the trip (`Changed(true)`, every admission refused) instead of
+  answering `Changed(false)`; `resume` lifts that pause alone. The
+  definitions row is layout 6: rows of layout 5 are refused, not converted,
+  so a store written before this change must be recreated.
+- While a definition is tripped by its breaker, an admission of a version
+  the catalog does not hold is refused (it was admitted).
+- `RunStore` gains the required `apply_control`, which answers
+  `control::Applied { reply, repeated }`; `control` is now a provided method
+  over it, so an adapter implements `apply_control` instead.
+- `RunStore::renew` of a held run extends the lease before it fails with
+  `control::Held`, and a worker that sees a hold keeps the run until every
+  call it dispatched has answered (it waited one heartbeat): a hold no longer
+  turns a slow call's answer into an unknown outcome.
+- An untargeted `deliver` no longer chooses a held run: it goes to the
+  oldest waiting run that is not held, or to none.
+- An owned child (`start_child`) drains its definition's deferred queue
+  before it takes room, and a drain that trips the definition commits with
+  the refusal it causes, on every admission path.
+- Interpreter: a `catch` naming `call.unknown` that does not take the error
+  (its `when` or `exceptWhen`, another filter property) passes it on as an
+  unknown outcome, which an enclosing catch-all does not take; recovery
+  restores a saved `emit` refusal instead of handing the envelope over again.
 
 ### Issue #29
 

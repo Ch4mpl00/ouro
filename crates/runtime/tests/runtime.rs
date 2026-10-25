@@ -1840,69 +1840,223 @@ async fn a_hold_stops_the_run_at_the_next_step_records_the_answer_in_flight_and_
     }
 }
 
+// A hold never changes a run's outcome: a worker that sees it at its lease
+// renewal keeps the lease (a held run's renewal still extends it) until the
+// call it already dispatched answers, however long that takes, records the
+// answer, and only then lets the run go. Released, the run goes on from that
+// answer; nothing is sent twice, whatever the delivery.
 #[tokio::test]
-async fn a_hold_reaches_a_busy_worker_through_its_lease_renewal_and_keeps_the_calls_delivery_rules() {
+async fn a_hold_waits_for_the_answer_of_a_call_in_flight_however_long_it_takes() {
     use ouro_runtime::control::Control;
     for delivery in [Delivery::AtLeastOnce, Delivery::AtMostOnce] {
         let store = Arc::new(durable::memory::memory());
         let clock = Arc::new(Time::default());
         let control = Arc::new(Control::new(store.clone(), clock.clone()));
-        let started = Arc::new(tokio::sync::Notify::new());
-        let calls = Arc::new(AtomicUsize::new(0));
+        let (started, answer) = (Arc::new(tokio::sync::Notify::new()), Arc::new(tokio::sync::Notify::new()));
+        let (slow, next) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
         let mut registry = Registry::new();
-        let (signal, count) = (started.clone(), calls.clone());
+        let (signal, release, count) = (started.clone(), answer.clone(), slow.clone());
         registry
             .register(
                 Function::new("slow", json!({}), json!({}), move |_: Value, _: FunctionContext| {
-                    // The first dispatch never answers; the next one does.
+                    // The first dispatch answers only when the test says so.
                     let first = count.fetch_add(1, Ordering::SeqCst) == 0;
-                    let signal = signal.clone();
+                    let (signal, release) = (signal.clone(), release.clone());
                     async move {
                         if first {
                             signal.notify_one();
-                            std::future::pending::<()>().await;
+                            release.notified().await;
                         }
-                        Ok(json!({}))
+                        Ok(json!({ "slow": true }))
                     }
                 })
                 .with_delivery(delivery),
             )
             .unwrap();
+        let count = next.clone();
+        registry
+            .register(Function::new("next", json!({}), json!({}), move |_: Value, _: FunctionContext| {
+                count.fetch_add(1, Ordering::SeqCst);
+                async { Ok(json!({})) }
+            }))
+            .unwrap();
         let rt = Runtime::new(
             store,
             Arc::new(registry),
             Config { heartbeat_interval: Duration::from_millis(20), ..Config::default() },
-            clock,
+            clock.clone(),
             tracer(),
         )
         .unwrap();
-        save(&rt, &yaml("  - slow: { call: slow }")).await;
+        save(&rt, &yaml("  - slow: { call: slow }\n  - next: { call: next }")).await;
         rt.start("r", "workflow", json!({})).await.unwrap();
         let token = CancellationToken::new();
         let operate = async {
             started.notified().await;
             control.hold(&operator("hold"), "r", "busy").await.unwrap();
+            // The call outlives many heartbeats and twice the lease it had
+            // when the hold came.
+            for _ in 0..4 {
+                tokio::time::sleep(Duration::from_millis(60)).await;
+                clock.0.fetch_add(durable::LEASE_MS / 2, Ordering::SeqCst);
+            }
+            answer.notify_one();
         };
         let (driven, ()) = tokio::join!(rt.drive("r", &token), operate);
-        // Seen at the next renewal, given one heartbeat to answer, then
-        // dropped like any stopped run and its lease given back.
         assert!(matches!(driven.unwrap(), Some(Status::Interrupted(_))), "{delivery:?}");
         let held = rt.get("r").await.unwrap().unwrap();
         assert!(held.held.is_some() && held.state == durable::RunState::Ready && held.fence.is_none());
-        let pending = if delivery == Delivery::AtLeastOnce { CallStatus::Pending } else { CallStatus::Unknown };
-        assert_eq!(rt.calls("r").await.unwrap()[0].state, pending);
-        assert_eq!(rt.get("r").await.unwrap().unwrap().interruptions, 0, "a hold spends no interruption");
+        assert_eq!(
+            rt.calls("r").await.unwrap()[0].state,
+            CallStatus::Completed,
+            "{delivery:?}: the answer was recorded"
+        );
+        assert_eq!(next.load(Ordering::SeqCst), 0, "the step after the answer waits for the release");
+        assert_eq!(held.interruptions, 0, "a hold spends no interruption");
         control.release(&operator("release"), "r").await.unwrap();
-        let outcome = rt.drive("r", &token).await.unwrap();
-        if delivery == Delivery::AtLeastOnce {
-            assert_eq!(outcome, Some(Status::Completed(json!({}))));
-            assert_eq!(calls.load(Ordering::SeqCst), 2, "the pending call is sent again, as after a stop");
-        } else {
-            assert!(matches!(outcome, Some(Status::Faulted(_))));
-            assert_eq!(calls.load(Ordering::SeqCst), 1, "an at most once call is never sent again");
-            assert_eq!(rt.calls("r").await.unwrap()[0].state, CallStatus::Unknown);
+        assert_eq!(rt.drive("r", &token).await.unwrap(), Some(Status::Completed(json!({}))), "{delivery:?}");
+        assert_eq!((slow.load(Ordering::SeqCst), next.load(Ordering::SeqCst)), (1, 1), "{delivery:?}");
+    }
+}
+
+// Waiting for a call in flight never keeps a run from the worker's shutdown:
+// a stopped worker lets it go like any run, and the call keeps its delivery
+// rules (an at-most-once call without an answer has an unknown outcome).
+#[tokio::test]
+async fn a_held_run_waiting_for_its_call_is_let_go_at_shutdown() {
+    use ouro_runtime::control::Control;
+    let store = Arc::new(durable::memory::memory());
+    let clock = Arc::new(Time::default());
+    let control = Arc::new(Control::new(store.clone(), clock.clone()));
+    let started = Arc::new(tokio::sync::Notify::new());
+    let mut registry = Registry::new();
+    let signal = started.clone();
+    registry
+        .register(
+            Function::new("slow", json!({}), json!({}), move |_: Value, _: FunctionContext| {
+                let signal = signal.clone();
+                async move {
+                    signal.notify_one();
+                    std::future::pending::<()>().await;
+                    Ok(json!({}))
+                }
+            })
+            .with_delivery(Delivery::AtMostOnce),
+        )
+        .unwrap();
+    let rt = Runtime::new(
+        store,
+        Arc::new(registry),
+        Config { heartbeat_interval: Duration::from_millis(20), ..Config::default() },
+        clock,
+        tracer(),
+    )
+    .unwrap();
+    save(&rt, &yaml("  - slow: { call: slow }")).await;
+    rt.start("r", "workflow", json!({})).await.unwrap();
+    let token = CancellationToken::new();
+    let operate = async {
+        started.notified().await;
+        control.hold(&operator("hold"), "r", "busy").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        token.cancel();
+    };
+    let (driven, ()) = tokio::join!(rt.drive("r", &token), operate);
+    assert!(matches!(driven.unwrap(), Some(Status::Interrupted(_))));
+    let held = rt.get("r").await.unwrap().unwrap();
+    assert!(held.held.is_some() && held.state == durable::RunState::Ready && held.fence.is_none());
+    assert_eq!(rt.calls("r").await.unwrap()[0].state, CallStatus::Unknown);
+}
+
+/// A memory backend whose first writing transaction after `arm` waits at its
+/// commit until `release`: the window between deciding and committing.
+#[derive(Default)]
+struct Gated {
+    inner: durable::memory::MemoryBackend,
+    armed: std::sync::atomic::AtomicBool,
+    parked: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+struct GatedTransaction<'a> {
+    inner: Box<dyn durable::Transaction + 'a>,
+    gate: &'a Gated,
+    writes: bool,
+}
+#[async_trait::async_trait]
+impl durable::AtomicBackend for Gated {
+    async fn begin(&self) -> anyhow::Result<Box<dyn durable::Transaction + '_>> {
+        Ok(Box::new(GatedTransaction { inner: self.inner.begin().await?, gate: self, writes: false }))
+    }
+    async fn snapshot(&self) -> anyhow::Result<durable::Snapshot> {
+        self.inner.snapshot().await
+    }
+}
+#[async_trait::async_trait]
+impl durable::Transaction for GatedTransaction<'_> {
+    async fn get(&mut self, kind: &str, id: &str) -> anyhow::Result<Option<Value>> {
+        self.inner.get(kind, id).await
+    }
+    async fn scan(
+        &mut self,
+        kind: &str,
+        start: &str,
+        end: Option<&str>,
+        limit: usize,
+    ) -> anyhow::Result<durable::Rows> {
+        self.inner.scan(kind, start, end, limit).await
+    }
+    async fn put(&mut self, kind: &str, id: &str, value: &Value) -> anyhow::Result<()> {
+        self.writes = true;
+        self.inner.put(kind, id, value).await
+    }
+    async fn delete(&mut self, kind: &str, id: &str) -> anyhow::Result<()> {
+        self.writes = true;
+        self.inner.delete(kind, id).await
+    }
+    async fn commit(self: Box<Self>) -> anyhow::Result<()> {
+        if self.writes && self.gate.armed.swap(false, Ordering::SeqCst) {
+            self.gate.parked.notify_one();
+            self.gate.release.notified().await;
+        }
+        self.inner.commit().await
+    }
+}
+
+// Two submissions of one new request race: the store decides which one is
+// the repeat in the command's own commit, so the event is reported once.
+#[tokio::test]
+async fn concurrent_submissions_of_one_hold_request_report_it_once() {
+    use ouro_runtime::observer::{EventKind, Observer};
+    struct Seen(Mutex<Vec<EventKind>>);
+    impl Observer for Seen {
+        fn observe(&self, event: &ouro_runtime::observer::Event) {
+            if matches!(event.kind, EventKind::RunHeld { .. }) {
+                self.0.lock().unwrap().push(event.kind.clone());
+            }
         }
     }
+    let gate = Arc::new(Gated::default());
+    let store = Arc::new(durable::TransactionalStore::new(gate.clone()));
+    let seen = Arc::new(Seen(Mutex::default()));
+    let rt = Runtime::new(store, Arc::new(Registry::new()), Config::default(), Arc::new(Time::default()), tracer())
+        .unwrap()
+        .with_observer(seen.clone());
+    save(&rt, &yaml("  - done: { set: { ok: true } }")).await;
+    rt.start("r", "workflow", json!({})).await.unwrap();
+    let hold = operator("hold");
+    let command = ouro_runtime::control::Command::Hold { run: "r".into(), note: "n".into() };
+    gate.armed.store(true, Ordering::SeqCst);
+    let first = rt.control(&hold, &command);
+    let second = async {
+        gate.parked.notified().await;
+        let reply = rt.control(&hold, &command).await;
+        gate.release.notify_one();
+        reply
+    };
+    let (first, second) = tokio::join!(first, second);
+    let changed = ouro_runtime::control::Reply::Changed(true);
+    assert_eq!((first.unwrap(), second.unwrap()), (changed.clone(), changed));
+    assert_eq!(seen.0.lock().unwrap().len(), 1, "one request, one event");
 }
 
 #[tokio::test]

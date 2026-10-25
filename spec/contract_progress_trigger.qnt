@@ -5,7 +5,7 @@
 //
 // Runs are anonymous counters: the trigger's own live run (at most one under
 // the queue policy) and up to two other runs of the definition (manual and
-// pinned starts), each either counted by the breaker (admitted in the current
+// pinned starts, owned children), each either counted by the breaker (admitted in the current
 // epoch at the active version) or not. Time is a due flag.
 module contract_progress_trigger {
   // Versions 1 and 3 share content (one digest), as in contract.qnt.
@@ -54,9 +54,9 @@ module contract_progress_trigger {
     else if (x.queued and x.sched == 0 and live(x) < maxRuns) promote(x) else x
   // `drain_pending`: a deferred drain, when the stop is cleared or polled.
   pure def deferred(x: Trigger): Trigger = drain(x)
-  // `drain_marked`: an admission (a firing, a start) drains its definition's
-  // deferred queue first, in its own commit, so a buffered slot is never
-  // passed over by the slot or the run that would take its room.
+  // `drain_marked`: an admission (a firing, a start, an owned child) drains
+  // its definition's deferred queue first, in its own commit, so a buffered
+  // slot is never passed over by the slot or the run that would take its room.
   // The drain commits even when it trips the definition, which then refuses
   // the admission (a changed trigger for a firing, a refusal for a start).
   pure def settled(x: Trigger): Trigger = if (x.mark) deferred({ ...x, mark: false }) else x
@@ -68,6 +68,16 @@ module contract_progress_trigger {
     val y = settled(x)
     if (barred(y, v)) y else admitNext(y, v)
   }
+  // An owned child of some run, admitted to this definition (its active
+  // version): `start_child` takes the definition's room like a start.
+  pure def spawning(x: Trigger): Trigger = {
+    val y = settled(x)
+    if (barred(y, y.active)) y else admitNext(y, y.active)
+  }
+  // A start refused by a trip is refused by a stored one: a refusal the
+  // drain's trip causes commits that trip with the drain, never rolls it back.
+  pure def admission(a: Trigger, v: int, b: Trigger): Trigger =
+    if (b.oc + b.ou > a.oc + a.ou or barred(b, v)) b else { ...b, broken: b.broken.union(Set("refusal")) }
   // Stability monitors: within one epoch (no activation in the step) a
   // consumed one-shot stays dormant unless disarmed, and a trip stays with
   // its content refused.
@@ -143,7 +153,8 @@ module contract_progress_trigger {
   action reactivate = all { s.tripped, activate }
   // Starts of other runs: at the active version, or pinned at a stored one.
   // Two representatives bound them; the runtime does not.
-  action pin(v: int): bool = all { not(s.stopped), not(barred(s, v)), s.oc + s.ou < 2, go(starting(s, v)) }
+  action pin(v: int): bool = all { not(s.stopped), not(barred(s, v)), s.oc + s.ou < 2, go(admission(s, v, starting(s, v))) }
+  action child = all { not(s.stopped), not(barred(s, s.active)), s.oc + s.ou < 2, go(admission(s, s.active, spawning(s))) }
   // Any admission of one content (version 3 repeats version 1's text).
   action admitFirst = any { pin(1), pin(3) }
   action admitSecond = pin(2)
@@ -154,7 +165,7 @@ module contract_progress_trigger {
     go(if (batch and s.mark) deferred({ ...s, stopped: false, mark: false }) else { ...s, stopped: false }) }
   action poll = all { not(s.stopped), s.mark, go(deferred({ ...s, mark: false })) }
   action step = any {
-    fireAny, interrupt, tick, endSched, endCounted, endUncounted, activate, pin(1), pin(2), pin(3),
+    fireAny, interrupt, tick, endSched, endCounted, endUncounted, activate, pin(1), pin(2), pin(3), child,
     halt, clear, poll
   }
 
@@ -200,7 +211,9 @@ module contract_progress_trigger {
   // (T2) and only an activation ends a trip or admits its content (V2).
   val L8_dormant = not(s.broken.contains("L8"))
   val L10_stable = not(s.broken.contains("L10"))
+  // No fairness: a refusal by a trip always names a committed trip (L-1, #31).
+  val L7_refusal = not(s.broken.contains("refusal"))
   val shape = (s.tripped implies (not(s.armed) and not(s.queued) and s.owed.contains(content(s.active)))) and
     (s.queued implies s.armed) and (s.done implies s.kind == 2)
-  val safety = L8_dormant and L10_stable and shape
+  val safety = L8_dormant and L10_stable and L7_refusal and shape
 }

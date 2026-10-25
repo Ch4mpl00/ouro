@@ -56,13 +56,13 @@
     "OverlapCeiling"
   ],
   "source_sha256": {
-    "contract.qnt": "332d8d7e400dc52d5dbd81b761112df7871268eb057eb216e5871236181a9d69",
+    "contract.qnt": "0e7fdc21760949259f56f3c36ecd9aa8f38826a6677979865ec7862b26236612",
     "contract_bounded.qnt": "73bf8d192bc6a1906da7eec55df41d77f038a2f4ae128d8a52e47a8d04b5ab90",
     "contract_concurrent.qnt": "09b4d5c932d2963a159defcdc0aa6bb6bbc0e218fdc9d76767eb03ddaaba479d",
     "contract_progress.qnt": "056253d12af27cb032ca3f30c82854be1d278c4f0a879bb50ae86a71475252fc",
     "contract_progress_tree.qnt": "7b17185df39b36c9dd509c2852060b0e6df28a7b29cf1e94c0567fbf568d731b",
-    "contract_progress_trigger.qnt": "7cf472c253257eb65b481412549f8c3f735ef92170bfca26bcc349167180713b",
-    "contract_witnesses.qnt": "90100bb60f01b6e950ff14a7855d23ee11f1836031cf09aca670324ba9474c90"
+    "contract_progress_trigger.qnt": "4b3d910407893e0ce721db3916cfa9aa6c5a3a93eedd23434adc79974e176adf",
+    "contract_witnesses.qnt": "2f455ee58bded45b6d51b7840fa7c1c694ed405651471b00ce26b811f201fa70"
   },
   "stale": [],
   "mutants": [
@@ -74,7 +74,7 @@
         "S1"
       ],
       "shadow_rejects": false,
-      "seconds": 6.638,
+      "seconds": 7.342,
       "steps": 2,
       "scope": "scripted witness; off-target clean cells are not exhaustive",
       "cells": {
@@ -145,7 +145,7 @@
         "X3"
       ],
       "shadow_rejects": true,
-      "seconds": 6.166,
+      "seconds": 6.871,
       "steps": 3,
       "scope": "scripted witness; off-target clean cells are not exhaustive",
       "cells": {
@@ -213,7 +213,7 @@
         "A2"
       ],
       "shadow_rejects": false,
-      "seconds": 6.074,
+      "seconds": 7.639,
       "steps": 1,
       "scope": "scripted witness; off-target clean cells are not exhaustive",
       "cells": {
@@ -283,7 +283,7 @@
         "X3"
       ],
       "shadow_rejects": false,
-      "seconds": 6.113,
+      "seconds": 6.774,
       "steps": 4,
       "scope": "scripted witness; off-target clean cells are not exhaustive",
       "cells": {
@@ -351,7 +351,7 @@
         "A4"
       ],
       "shadow_rejects": false,
-      "seconds": 6.285,
+      "seconds": 6.737,
       "steps": 5,
       "scope": "scripted witness; off-target clean cells are not exhaustive",
       "cells": {
@@ -419,7 +419,7 @@
         "A5"
       ],
       "shadow_rejects": false,
-      "seconds": 6.152,
+      "seconds": 6.972,
       "steps": 7,
       "scope": "scripted witness; off-target clean cells are not exhaustive",
       "cells": {
@@ -487,7 +487,7 @@
         "E1"
       ],
       "shadow_rejects": true,
-      "seconds": 6.136,
+      "seconds": 6.599,
       "steps": 4,
       "scope": "scripted witness; off-target clean cells are not exhaustive",
       "cells": {
@@ -555,7 +555,7 @@
         "E2"
       ],
       "shadow_rejects": true,
-      "seconds": 6.16,
+      "seconds": 6.71,
       "steps": 5,
       "scope": "scripted witness; off-target clean cells are not exhaustive",
       "cells": {
@@ -623,7 +623,7 @@
         "E2"
       ],
       "shadow_rejects": true,
-      "seconds": 6.166,
+      "seconds": 6.681,
       "steps": 12,
       "scope": "scripted witness; off-target clean cells are not exhaustive",
       "cells": {
@@ -691,7 +691,7 @@
         "E2"
       ],
       "shadow_rejects": true,
-      "seconds": 6.109,
+      "seconds": 6.71,
       "steps": 4,
       "scope": "scripted witness; off-target clean cells are not exhaustive",
       "cells": {
@@ -760,7 +760,7 @@
         "R2"
       ],
       "shadow_rejects": true,
-      "seconds": 6.259,
+      "seconds": 6.831,
       "steps": 4,
       "scope": "scripted witness; off-target clean cells are not exhaustive",
       "cells": {
@@ -828,7 +828,7 @@
         "E4"
       ],
       "shadow_rejects": false,
-      "seconds": 6.129,
+      "seconds": 6.727,
       "steps": 6,
       "scope": "scripted witness; off-target clean cells are not exhaustive",
       "cells": {
@@ -896,7 +896,7 @@
         "E4"
       ],
       "shadow_rejects": true,
-      "seconds": 6.037,
+      "seconds": 6.621,
       "steps": 6,
       "scope": "scripted witness; off-target clean cells are not exhaustive",
       "cells": {
@@ -964,7 +964,7 @@
         "R1"
       ],
       "shadow_rejects": false,
-      "seconds": 6.136,
+      "seconds": 6.667,
       "steps": 6,
       "scope": "scripted witness; off-target clean cells are not exhaustive",
       "cells": {
@@ -1032,7 +1032,7 @@
         "R2"
       ],
       "shadow_rejects": false,
-      "seconds": 6.089,
+      "seconds": 6.893,
       "steps": 3,
       "scope": "scripted witness; off-target clean cells are not exhaustive",
       "cells": {
@@ -1100,7 +1100,7 @@
         "R3"
       ],
       "shadow_rejects": true,
-      "seconds": 6.019,
+      "seconds": 6.677,
       "steps": 3,
       "scope": "scripted witness; off-target clean cells are not exhaustive",
       "cells": {
@@ -1168,7 +1168,7 @@
         "W1"
       ],
       "shadow_rejects": false,
-      "seconds": 6.044,
+      "seconds": 6.88,
       "steps": 4,
       "scope": "scripted witness; off-target clean cells are not exhaustive",
       "cells": {
@@ -1236,7 +1236,7 @@
         "W2"
       ],
       "shadow_rejects": true,
-      "seconds": 6.042,
+      "seconds": 6.647,
       "steps": 5,
       "scope": "scripted witness; off-target clean cells are not exhaustive",
       "cells": {
@@ -1304,7 +1304,7 @@
         "W3"
       ],
       "shadow_rejects": false,
-      "seconds": 6.073,
+      "seconds": 6.668,
       "steps": 3,
       "scope": "scripted witness; off-target clean cells are not exhaustive",
       "cells": {
@@ -1372,7 +1372,7 @@
         "W4"
       ],
       "shadow_rejects": false,
-      "seconds": 6.302,
+      "seconds": 6.64,
       "steps": 5,
       "scope": "scripted witness; off-target clean cells are not exhaustive",
       "cells": {
@@ -1440,7 +1440,7 @@
         "W5"
       ],
       "shadow_rejects": false,
-      "seconds": 6.653,
+      "seconds": 6.673,
       "steps": 4,
       "scope": "scripted witness; off-target clean cells are not exhaustive",
       "cells": {
@@ -1508,7 +1508,7 @@
         "C1"
       ],
       "shadow_rejects": false,
-      "seconds": 7.899,
+      "seconds": 6.721,
       "steps": 3,
       "scope": "scripted witness; off-target clean cells are not exhaustive",
       "cells": {
@@ -1576,7 +1576,7 @@
         "C2"
       ],
       "shadow_rejects": false,
-      "seconds": 7.239,
+      "seconds": 6.699,
       "steps": 9,
       "scope": "scripted witness; off-target clean cells are not exhaustive",
       "cells": {
@@ -1644,7 +1644,7 @@
         "C3"
       ],
       "shadow_rejects": false,
-      "seconds": 6.255,
+      "seconds": 6.588,
       "steps": 4,
       "scope": "scripted witness; off-target clean cells are not exhaustive",
       "cells": {
@@ -1712,7 +1712,7 @@
         "C3"
       ],
       "shadow_rejects": false,
-      "seconds": 6.349,
+      "seconds": 6.627,
       "steps": 4,
       "scope": "scripted witness; off-target clean cells are not exhaustive",
       "cells": {
@@ -1780,7 +1780,7 @@
         "C3"
       ],
       "shadow_rejects": false,
-      "seconds": 6.393,
+      "seconds": 6.658,
       "steps": 12,
       "scope": "scripted witness; off-target clean cells are not exhaustive",
       "cells": {
@@ -1849,7 +1849,7 @@
         "T1"
       ],
       "shadow_rejects": false,
-      "seconds": 6.324,
+      "seconds": 6.64,
       "steps": 3,
       "scope": "scripted witness; off-target clean cells are not exhaustive",
       "cells": {
@@ -1917,7 +1917,7 @@
         "T2"
       ],
       "shadow_rejects": false,
-      "seconds": 6.229,
+      "seconds": 7.108,
       "steps": 1,
       "scope": "scripted witness; off-target clean cells are not exhaustive",
       "cells": {
@@ -1985,7 +1985,7 @@
         "T1"
       ],
       "shadow_rejects": false,
-      "seconds": 6.233,
+      "seconds": 6.986,
       "steps": 4,
       "scope": "scripted witness; off-target clean cells are not exhaustive",
       "cells": {
@@ -2053,7 +2053,7 @@
         "T1"
       ],
       "shadow_rejects": false,
-      "seconds": 6.287,
+      "seconds": 6.956,
       "steps": 8,
       "scope": "scripted witness; off-target clean cells are not exhaustive",
       "cells": {
@@ -2121,7 +2121,7 @@
         "T2"
       ],
       "shadow_rejects": false,
-      "seconds": 6.259,
+      "seconds": 7.044,
       "steps": 6,
       "scope": "scripted witness; off-target clean cells are not exhaustive",
       "cells": {
@@ -2189,7 +2189,7 @@
         "T3"
       ],
       "shadow_rejects": false,
-      "seconds": 6.754,
+      "seconds": 6.803,
       "steps": 7,
       "scope": "scripted witness; off-target clean cells are not exhaustive",
       "cells": {
@@ -2257,7 +2257,7 @@
         "V1"
       ],
       "shadow_rejects": false,
-      "seconds": 7.002,
+      "seconds": 7.144,
       "steps": 1,
       "scope": "scripted witness; off-target clean cells are not exhaustive",
       "cells": {
@@ -2325,7 +2325,7 @@
         "V2"
       ],
       "shadow_rejects": false,
-      "seconds": 6.552,
+      "seconds": 7.151,
       "steps": 4,
       "scope": "scripted witness; off-target clean cells are not exhaustive",
       "cells": {
@@ -2393,7 +2393,7 @@
         "V2"
       ],
       "shadow_rejects": false,
-      "seconds": 6.79,
+      "seconds": 6.824,
       "steps": 7,
       "scope": "scripted witness; off-target clean cells are not exhaustive",
       "cells": {
@@ -2461,7 +2461,75 @@
         "V2"
       ],
       "shadow_rejects": false,
-      "seconds": 6.997,
+      "seconds": 6.756,
+      "steps": 7,
+      "scope": "scripted witness; off-target clean cells are not exhaustive",
+      "cells": {
+        "A1": "sampled_clean",
+        "A2": "sampled_clean",
+        "A3": "sampled_clean",
+        "A4": "sampled_clean",
+        "A5": "sampled_clean",
+        "E1": "sampled_clean",
+        "E2": "sampled_clean",
+        "E3": "sampled_clean",
+        "E4": "sampled_clean",
+        "E5": "structurally_absent",
+        "R1": "sampled_clean",
+        "R2": "sampled_clean",
+        "R3": "sampled_clean",
+        "W1": "sampled_clean",
+        "W2": "sampled_clean",
+        "W3": "sampled_clean",
+        "W4": "sampled_clean",
+        "W5": "sampled_clean",
+        "C1": "sampled_clean",
+        "C2": "sampled_clean",
+        "C3": "sampled_clean",
+        "T1": "sampled_clean",
+        "T2": "sampled_clean",
+        "T3": "sampled_clean",
+        "V1": "sampled_clean",
+        "V2": "violated",
+        "V3": "sampled_clean",
+        "O1": "sampled_clean",
+        "O2": "sampled_clean",
+        "O3": "sampled_clean",
+        "X1": "sampled_clean",
+        "X2": "sampled_clean",
+        "X3": "sampled_clean",
+        "B1": "sampled_clean",
+        "H1": "sampled_clean",
+        "H2": "sampled_clean",
+        "H3": "sampled_clean",
+        "H4": "sampled_clean",
+        "L1": "structurally_absent",
+        "L2": "structurally_absent",
+        "L3": "structurally_absent",
+        "L4": "structurally_absent",
+        "L5": "structurally_absent",
+        "L6": "structurally_absent",
+        "L7": "structurally_absent",
+        "L8": "structurally_absent",
+        "L9": "structurally_absent",
+        "L10": "structurally_absent",
+        "S1": "sampled_clean",
+        "OverlapSkip": "sampled_clean",
+        "OverlapAllow": "sampled_clean",
+        "OverlapQueue": "sampled_clean",
+        "OverlapReplace": "sampled_clean",
+        "OverlapCeiling": "sampled_clean"
+      }
+    },
+    {
+      "target": "V2",
+      "mutant": "V2/absent",
+      "detected": true,
+      "violations": [
+        "V2"
+      ],
+      "shadow_rejects": false,
+      "seconds": 6.82,
       "steps": 7,
       "scope": "scripted witness; off-target clean cells are not exhaustive",
       "cells": {
@@ -2529,7 +2597,7 @@
         "V2"
       ],
       "shadow_rejects": false,
-      "seconds": 6.516,
+      "seconds": 6.767,
       "steps": 3,
       "scope": "scripted witness; off-target clean cells are not exhaustive",
       "cells": {
@@ -2597,7 +2665,7 @@
         "V2"
       ],
       "shadow_rejects": false,
-      "seconds": 6.395,
+      "seconds": 6.774,
       "steps": 3,
       "scope": "scripted witness; off-target clean cells are not exhaustive",
       "cells": {
@@ -2665,8 +2733,144 @@
         "V2"
       ],
       "shadow_rejects": false,
-      "seconds": 6.253,
+      "seconds": 6.965,
       "steps": 7,
+      "scope": "scripted witness; off-target clean cells are not exhaustive",
+      "cells": {
+        "A1": "sampled_clean",
+        "A2": "sampled_clean",
+        "A3": "sampled_clean",
+        "A4": "sampled_clean",
+        "A5": "sampled_clean",
+        "E1": "sampled_clean",
+        "E2": "sampled_clean",
+        "E3": "sampled_clean",
+        "E4": "sampled_clean",
+        "E5": "structurally_absent",
+        "R1": "sampled_clean",
+        "R2": "sampled_clean",
+        "R3": "sampled_clean",
+        "W1": "sampled_clean",
+        "W2": "sampled_clean",
+        "W3": "sampled_clean",
+        "W4": "sampled_clean",
+        "W5": "sampled_clean",
+        "C1": "sampled_clean",
+        "C2": "sampled_clean",
+        "C3": "sampled_clean",
+        "T1": "sampled_clean",
+        "T2": "sampled_clean",
+        "T3": "sampled_clean",
+        "V1": "sampled_clean",
+        "V2": "violated",
+        "V3": "sampled_clean",
+        "O1": "sampled_clean",
+        "O2": "sampled_clean",
+        "O3": "sampled_clean",
+        "X1": "sampled_clean",
+        "X2": "sampled_clean",
+        "X3": "sampled_clean",
+        "B1": "sampled_clean",
+        "H1": "sampled_clean",
+        "H2": "sampled_clean",
+        "H3": "sampled_clean",
+        "H4": "sampled_clean",
+        "L1": "structurally_absent",
+        "L2": "structurally_absent",
+        "L3": "structurally_absent",
+        "L4": "structurally_absent",
+        "L5": "structurally_absent",
+        "L6": "structurally_absent",
+        "L7": "structurally_absent",
+        "L8": "structurally_absent",
+        "L9": "structurally_absent",
+        "L10": "structurally_absent",
+        "S1": "sampled_clean",
+        "OverlapSkip": "sampled_clean",
+        "OverlapAllow": "sampled_clean",
+        "OverlapQueue": "sampled_clean",
+        "OverlapReplace": "sampled_clean",
+        "OverlapCeiling": "sampled_clean"
+      }
+    },
+    {
+      "target": "V2",
+      "mutant": "V2/pause-tripped",
+      "detected": true,
+      "violations": [
+        "V2"
+      ],
+      "shadow_rejects": false,
+      "seconds": 7.08,
+      "steps": 8,
+      "scope": "scripted witness; off-target clean cells are not exhaustive",
+      "cells": {
+        "A1": "sampled_clean",
+        "A2": "sampled_clean",
+        "A3": "sampled_clean",
+        "A4": "sampled_clean",
+        "A5": "sampled_clean",
+        "E1": "sampled_clean",
+        "E2": "sampled_clean",
+        "E3": "sampled_clean",
+        "E4": "sampled_clean",
+        "E5": "structurally_absent",
+        "R1": "sampled_clean",
+        "R2": "sampled_clean",
+        "R3": "sampled_clean",
+        "W1": "sampled_clean",
+        "W2": "sampled_clean",
+        "W3": "sampled_clean",
+        "W4": "sampled_clean",
+        "W5": "sampled_clean",
+        "C1": "sampled_clean",
+        "C2": "sampled_clean",
+        "C3": "sampled_clean",
+        "T1": "sampled_clean",
+        "T2": "sampled_clean",
+        "T3": "sampled_clean",
+        "V1": "sampled_clean",
+        "V2": "violated",
+        "V3": "sampled_clean",
+        "O1": "sampled_clean",
+        "O2": "sampled_clean",
+        "O3": "sampled_clean",
+        "X1": "sampled_clean",
+        "X2": "sampled_clean",
+        "X3": "sampled_clean",
+        "B1": "sampled_clean",
+        "H1": "sampled_clean",
+        "H2": "sampled_clean",
+        "H3": "sampled_clean",
+        "H4": "sampled_clean",
+        "L1": "structurally_absent",
+        "L2": "structurally_absent",
+        "L3": "structurally_absent",
+        "L4": "structurally_absent",
+        "L5": "structurally_absent",
+        "L6": "structurally_absent",
+        "L7": "structurally_absent",
+        "L8": "structurally_absent",
+        "L9": "structurally_absent",
+        "L10": "structurally_absent",
+        "S1": "sampled_clean",
+        "OverlapSkip": "sampled_clean",
+        "OverlapAllow": "sampled_clean",
+        "OverlapQueue": "sampled_clean",
+        "OverlapReplace": "sampled_clean",
+        "OverlapCeiling": "sampled_clean"
+      }
+    },
+    {
+      "target": "V2",
+      "mutant": "V2/pause-resume",
+      "detected": true,
+      "violations": [
+        "V2"
+      ],
+      "shadow_rejects": false,
+      "seconds": 6.853,
+      "steps": 8,
       "scope": "scripted witness; off-target clean cells are not exhaustive",
       "cells": {
         "A1": "sampled_clean",
@@ -2733,7 +2937,7 @@
         "H1"
       ],
       "shadow_rejects": false,
-      "seconds": 6.541,
+      "seconds": 6.776,
       "steps": 4,
       "scope": "scripted witness; off-target clean cells are not exhaustive",
       "cells": {
@@ -2801,8 +3005,76 @@
         "H1"
       ],
       "shadow_rejects": false,
-      "seconds": 7.658,
+      "seconds": 6.77,
       "steps": 5,
+      "scope": "scripted witness; off-target clean cells are not exhaustive",
+      "cells": {
+        "A1": "sampled_clean",
+        "A2": "sampled_clean",
+        "A3": "sampled_clean",
+        "A4": "sampled_clean",
+        "A5": "sampled_clean",
+        "E1": "sampled_clean",
+        "E2": "sampled_clean",
+        "E3": "sampled_clean",
+        "E4": "sampled_clean",
+        "E5": "structurally_absent",
+        "R1": "sampled_clean",
+        "R2": "sampled_clean",
+        "R3": "sampled_clean",
+        "W1": "sampled_clean",
+        "W2": "sampled_clean",
+        "W3": "sampled_clean",
+        "W4": "sampled_clean",
+        "W5": "sampled_clean",
+        "C1": "sampled_clean",
+        "C2": "sampled_clean",
+        "C3": "sampled_clean",
+        "T1": "sampled_clean",
+        "T2": "sampled_clean",
+        "T3": "sampled_clean",
+        "V1": "sampled_clean",
+        "V2": "sampled_clean",
+        "V3": "sampled_clean",
+        "O1": "sampled_clean",
+        "O2": "sampled_clean",
+        "O3": "sampled_clean",
+        "X1": "sampled_clean",
+        "X2": "sampled_clean",
+        "X3": "sampled_clean",
+        "B1": "sampled_clean",
+        "H1": "violated",
+        "H2": "sampled_clean",
+        "H3": "sampled_clean",
+        "H4": "sampled_clean",
+        "L1": "structurally_absent",
+        "L2": "structurally_absent",
+        "L3": "structurally_absent",
+        "L4": "structurally_absent",
+        "L5": "structurally_absent",
+        "L6": "structurally_absent",
+        "L7": "structurally_absent",
+        "L8": "structurally_absent",
+        "L9": "structurally_absent",
+        "L10": "structurally_absent",
+        "S1": "sampled_clean",
+        "OverlapSkip": "sampled_clean",
+        "OverlapAllow": "sampled_clean",
+        "OverlapQueue": "sampled_clean",
+        "OverlapReplace": "sampled_clean",
+        "OverlapCeiling": "sampled_clean"
+      }
+    },
+    {
+      "target": "H1",
+      "mutant": "H1/renew",
+      "detected": true,
+      "violations": [
+        "H1"
+      ],
+      "shadow_rejects": false,
+      "seconds": 6.757,
+      "steps": 7,
       "scope": "scripted witness; off-target clean cells are not exhaustive",
       "cells": {
         "A1": "sampled_clean",
@@ -2869,7 +3141,7 @@
         "H2"
       ],
       "shadow_rejects": false,
-      "seconds": 6.722,
+      "seconds": 6.822,
       "steps": 3,
       "scope": "scripted witness; off-target clean cells are not exhaustive",
       "cells": {
@@ -2937,7 +3209,7 @@
         "H3"
       ],
       "shadow_rejects": false,
-      "seconds": 6.822,
+      "seconds": 6.821,
       "steps": 4,
       "scope": "scripted witness; off-target clean cells are not exhaustive",
       "cells": {
@@ -3005,7 +3277,7 @@
         "H3"
       ],
       "shadow_rejects": false,
-      "seconds": 7.474,
+      "seconds": 6.7,
       "steps": 4,
       "scope": "scripted witness; off-target clean cells are not exhaustive",
       "cells": {
@@ -3073,7 +3345,7 @@
         "H4"
       ],
       "shadow_rejects": false,
-      "seconds": 7.161,
+      "seconds": 6.726,
       "steps": 4,
       "scope": "scripted witness; off-target clean cells are not exhaustive",
       "cells": {
@@ -3141,7 +3413,7 @@
         "V3"
       ],
       "shadow_rejects": false,
-      "seconds": 6.277,
+      "seconds": 6.753,
       "steps": 2,
       "scope": "scripted witness; off-target clean cells are not exhaustive",
       "cells": {
@@ -3209,7 +3481,7 @@
         "O1"
       ],
       "shadow_rejects": false,
-      "seconds": 6.145,
+      "seconds": 6.732,
       "steps": 4,
       "scope": "scripted witness; off-target clean cells are not exhaustive",
       "cells": {
@@ -3277,7 +3549,7 @@
         "O2"
       ],
       "shadow_rejects": false,
-      "seconds": 6.532,
+      "seconds": 6.708,
       "steps": 3,
       "scope": "scripted witness; off-target clean cells are not exhaustive",
       "cells": {
@@ -3345,7 +3617,7 @@
         "O3"
       ],
       "shadow_rejects": false,
-      "seconds": 7.256,
+      "seconds": 6.738,
       "steps": 4,
       "scope": "scripted witness; off-target clean cells are not exhaustive",
       "cells": {
@@ -3413,7 +3685,7 @@
         "X1"
       ],
       "shadow_rejects": false,
-      "seconds": 6.942,
+      "seconds": 6.783,
       "steps": 5,
       "scope": "scripted witness; off-target clean cells are not exhaustive",
       "cells": {
@@ -3481,7 +3753,7 @@
         "X2"
       ],
       "shadow_rejects": false,
-      "seconds": 7.677,
+      "seconds": 6.93,
       "steps": 5,
       "scope": "scripted witness; off-target clean cells are not exhaustive",
       "cells": {
@@ -3553,7 +3825,7 @@
         "X3"
       ],
       "shadow_rejects": true,
-      "seconds": 6.601,
+      "seconds": 6.735,
       "steps": 4,
       "scope": "scripted witness; off-target clean cells are not exhaustive",
       "cells": {
@@ -3621,7 +3893,7 @@
         "B1"
       ],
       "shadow_rejects": true,
-      "seconds": 6.325,
+      "seconds": 6.753,
       "steps": 5,
       "scope": "scripted witness; off-target clean cells are not exhaustive",
       "cells": {
@@ -3689,7 +3961,7 @@
         "OverlapSkip"
       ],
       "shadow_rejects": false,
-      "seconds": 6.269,
+      "seconds": 6.756,
       "steps": 7,
       "scope": "scripted witness; off-target clean cells are not exhaustive",
       "cells": {
@@ -3757,7 +4029,7 @@
         "OverlapAllow"
       ],
       "shadow_rejects": false,
-      "seconds": 6.263,
+      "seconds": 6.747,
       "steps": 7,
       "scope": "scripted witness; off-target clean cells are not exhaustive",
       "cells": {
@@ -3825,7 +4097,7 @@
         "OverlapQueue"
       ],
       "shadow_rejects": false,
-      "seconds": 6.229,
+      "seconds": 6.718,
       "steps": 7,
       "scope": "scripted witness; off-target clean cells are not exhaustive",
       "cells": {
@@ -3893,7 +4165,7 @@
         "OverlapReplace"
       ],
       "shadow_rejects": false,
-      "seconds": 6.334,
+      "seconds": 6.897,
       "steps": 7,
       "scope": "scripted witness; off-target clean cells are not exhaustive",
       "cells": {
@@ -3961,7 +4233,7 @@
         "OverlapCeiling"
       ],
       "shadow_rejects": false,
-      "seconds": 8.584,
+      "seconds": 6.759,
       "steps": 7,
       "scope": "scripted witness; off-target clean cells are not exhaustive",
       "cells": {
@@ -4030,7 +4302,7 @@
         "E5"
       ],
       "states": 373,
-      "seconds": 2.825,
+      "seconds": 2.545,
       "scope": "exhaustive finite obligation quotient; other quotients' domains structurally absent",
       "cells": {
         "A1": "structurally_absent",
@@ -4098,7 +4370,7 @@
         "L1"
       ],
       "states": 253,
-      "seconds": 2.48,
+      "seconds": 2.453,
       "scope": "exhaustive finite obligation quotient; other quotients' domains structurally absent",
       "cells": {
         "A1": "structurally_absent",
@@ -4167,7 +4439,7 @@
         "L2"
       ],
       "states": 133,
-      "seconds": 2.629,
+      "seconds": 2.212,
       "scope": "exhaustive finite obligation quotient; other quotients' domains structurally absent",
       "cells": {
         "A1": "structurally_absent",
@@ -4235,7 +4507,7 @@
         "L3"
       ],
       "states": 193,
-      "seconds": 4.579,
+      "seconds": 2.101,
       "scope": "exhaustive finite obligation quotient; other quotients' domains structurally absent",
       "cells": {
         "A1": "structurally_absent",
@@ -4303,7 +4575,7 @@
         "L4"
       ],
       "states": 193,
-      "seconds": 5.744,
+      "seconds": 2.073,
       "scope": "exhaustive finite obligation quotient; other quotients' domains structurally absent",
       "cells": {
         "A1": "structurally_absent",
@@ -4375,7 +4647,7 @@
         "L5"
       ],
       "states": 13,
-      "seconds": 5.977,
+      "seconds": 1.868,
       "scope": "exhaustive finite obligation quotient; other quotients' domains structurally absent",
       "cells": {
         "A1": "structurally_absent",
@@ -4443,7 +4715,7 @@
         "L6"
       ],
       "states": 606,
-      "seconds": 2.161,
+      "seconds": 1.216,
       "scope": "exhaustive finite obligation quotient; other quotients' domains structurally absent",
       "cells": {
         "A1": "structurally_absent",
@@ -4512,7 +4784,7 @@
         "L9"
       ],
       "states": 2106,
-      "seconds": 2.734,
+      "seconds": 1.491,
       "scope": "exhaustive finite obligation quotient; other quotients' domains structurally absent",
       "cells": {
         "A1": "structurally_absent",
@@ -4580,7 +4852,7 @@
         "L9"
       ],
       "states": 1818,
-      "seconds": 1.975,
+      "seconds": 1.475,
       "scope": "exhaustive finite obligation quotient; other quotients' domains structurally absent",
       "cells": {
         "A1": "structurally_absent",
@@ -4648,7 +4920,7 @@
         "L7"
       ],
       "states": 44296,
-      "seconds": 23.013,
+      "seconds": 23.049,
       "scope": "exhaustive finite obligation quotient; other quotients' domains structurally absent",
       "cells": {
         "A1": "structurally_absent",
@@ -4716,7 +4988,7 @@
         "L7"
       ],
       "states": 37992,
-      "seconds": 22.941,
+      "seconds": 19.526,
       "scope": "exhaustive finite obligation quotient; other quotients' domains structurally absent",
       "cells": {
         "A1": "structurally_absent",
@@ -4784,7 +5056,7 @@
         "L7"
       ],
       "states": 46680,
-      "seconds": 26.403,
+      "seconds": 25.618,
       "scope": "exhaustive finite obligation quotient; other quotients' domains structurally absent",
       "cells": {
         "A1": "structurally_absent",
@@ -4853,7 +5125,7 @@
         "L10"
       ],
       "states": 43992,
-      "seconds": 39.509,
+      "seconds": 29.42,
       "scope": "exhaustive finite obligation quotient; other quotients' domains structurally absent",
       "cells": {
         "A1": "structurally_absent",
@@ -4921,7 +5193,143 @@
         "L7"
       ],
       "states": 54152,
-      "seconds": 30.589,
+      "seconds": 29.104,
+      "scope": "exhaustive finite obligation quotient; other quotients' domains structurally absent",
+      "cells": {
+        "A1": "structurally_absent",
+        "A2": "structurally_absent",
+        "A3": "structurally_absent",
+        "A4": "structurally_absent",
+        "A5": "structurally_absent",
+        "E1": "structurally_absent",
+        "E2": "structurally_absent",
+        "E3": "structurally_absent",
+        "E4": "structurally_absent",
+        "E5": "structurally_absent",
+        "R1": "structurally_absent",
+        "R2": "structurally_absent",
+        "R3": "structurally_absent",
+        "W1": "structurally_absent",
+        "W2": "structurally_absent",
+        "W3": "structurally_absent",
+        "W4": "structurally_absent",
+        "W5": "structurally_absent",
+        "C1": "structurally_absent",
+        "C2": "structurally_absent",
+        "C3": "structurally_absent",
+        "T1": "structurally_absent",
+        "T2": "structurally_absent",
+        "T3": "structurally_absent",
+        "V1": "structurally_absent",
+        "V2": "structurally_absent",
+        "V3": "structurally_absent",
+        "O1": "structurally_absent",
+        "O2": "structurally_absent",
+        "O3": "structurally_absent",
+        "X1": "structurally_absent",
+        "X2": "structurally_absent",
+        "X3": "structurally_absent",
+        "B1": "structurally_absent",
+        "H1": "structurally_absent",
+        "H2": "structurally_absent",
+        "H3": "structurally_absent",
+        "H4": "structurally_absent",
+        "L1": "structurally_absent",
+        "L2": "structurally_absent",
+        "L3": "structurally_absent",
+        "L4": "structurally_absent",
+        "L5": "structurally_absent",
+        "L6": "structurally_absent",
+        "L7": "violated",
+        "L8": "exhaustive_clean",
+        "L9": "structurally_absent",
+        "L10": "exhaustive_clean",
+        "S1": "structurally_absent",
+        "OverlapSkip": "structurally_absent",
+        "OverlapAllow": "structurally_absent",
+        "OverlapQueue": "structurally_absent",
+        "OverlapReplace": "structurally_absent",
+        "OverlapCeiling": "structurally_absent"
+      }
+    },
+    {
+      "module": "contract_progress_trigger",
+      "kind": "mutant",
+      "target": "L7",
+      "mutant": "L7/order/child",
+      "violations": [
+        "L7"
+      ],
+      "states": 51408,
+      "seconds": 28.481,
+      "scope": "exhaustive finite obligation quotient; other quotients' domains structurally absent",
+      "cells": {
+        "A1": "structurally_absent",
+        "A2": "structurally_absent",
+        "A3": "structurally_absent",
+        "A4": "structurally_absent",
+        "A5": "structurally_absent",
+        "E1": "structurally_absent",
+        "E2": "structurally_absent",
+        "E3": "structurally_absent",
+        "E4": "structurally_absent",
+        "E5": "structurally_absent",
+        "R1": "structurally_absent",
+        "R2": "structurally_absent",
+        "R3": "structurally_absent",
+        "W1": "structurally_absent",
+        "W2": "structurally_absent",
+        "W3": "structurally_absent",
+        "W4": "structurally_absent",
+        "W5": "structurally_absent",
+        "C1": "structurally_absent",
+        "C2": "structurally_absent",
+        "C3": "structurally_absent",
+        "T1": "structurally_absent",
+        "T2": "structurally_absent",
+        "T3": "structurally_absent",
+        "V1": "structurally_absent",
+        "V2": "structurally_absent",
+        "V3": "structurally_absent",
+        "O1": "structurally_absent",
+        "O2": "structurally_absent",
+        "O3": "structurally_absent",
+        "X1": "structurally_absent",
+        "X2": "structurally_absent",
+        "X3": "structurally_absent",
+        "B1": "structurally_absent",
+        "H1": "structurally_absent",
+        "H2": "structurally_absent",
+        "H3": "structurally_absent",
+        "H4": "structurally_absent",
+        "L1": "structurally_absent",
+        "L2": "structurally_absent",
+        "L3": "structurally_absent",
+        "L4": "structurally_absent",
+        "L5": "structurally_absent",
+        "L6": "structurally_absent",
+        "L7": "violated",
+        "L8": "exhaustive_clean",
+        "L9": "structurally_absent",
+        "L10": "exhaustive_clean",
+        "S1": "structurally_absent",
+        "OverlapSkip": "structurally_absent",
+        "OverlapAllow": "structurally_absent",
+        "OverlapQueue": "structurally_absent",
+        "OverlapReplace": "structurally_absent",
+        "OverlapCeiling": "structurally_absent"
+      }
+    },
+    {
+      "module": "contract_progress_trigger",
+      "kind": "mutant",
+      "target": "L7",
+      "mutant": "L7/refusal",
+      "violations": [
+        "L7_refusal"
+      ],
+      "states": 83840,
+      "seconds": 42.831,
       "scope": "exhaustive finite obligation quotient; other quotients' domains structurally absent",
       "cells": {
         "A1": "structurally_absent",
@@ -4989,7 +5397,7 @@
         "L8"
       ],
       "states": 48512,
-      "seconds": 26.5,
+      "seconds": 26.288,
       "scope": "exhaustive finite obligation quotient; other quotients' domains structurally absent",
       "cells": {
         "A1": "structurally_absent",
@@ -5057,7 +5465,7 @@
         "L8_dormant"
       ],
       "states": 85328,
-      "seconds": 45.21,
+      "seconds": 47.628,
       "scope": "exhaustive finite obligation quotient; other quotients' domains structurally absent",
       "cells": {
         "A1": "structurally_absent",
@@ -5128,7 +5536,7 @@
         "L10"
       ],
       "states": 25128,
-      "seconds": 11.544,
+      "seconds": 13.419,
       "scope": "exhaustive finite obligation quotient; other quotients' domains structurally absent",
       "cells": {
         "A1": "structurally_absent",
@@ -5197,7 +5605,7 @@
         "shape"
       ],
       "states": 85424,
-      "seconds": 45.264,
+      "seconds": 47.723,
       "scope": "exhaustive finite obligation quotient; other quotients' domains structurally absent",
       "cells": {
         "A1": "structurally_absent",
@@ -5267,7 +5675,7 @@
         "O1"
       ],
       "shadow_rejects": true,
-      "seconds": 7.148,
+      "seconds": 6.829,
       "steps": 4,
       "scope": "scripted witness; off-target clean cells are not exhaustive",
       "fault": "boundary crash",
@@ -5339,7 +5747,7 @@
         "R2"
       ],
       "shadow_rejects": true,
-      "seconds": 6.822,
+      "seconds": 6.846,
       "steps": 9,
       "scope": "scripted witness; off-target clean cells are not exhaustive",
       "fault": "ambiguous commit",
@@ -5410,7 +5818,7 @@
         "W2"
       ],
       "shadow_rejects": true,
-      "seconds": 7.038,
+      "seconds": 6.756,
       "steps": 5,
       "scope": "scripted witness; off-target clean cells are not exhaustive",
       "fault": "duplicate delivery",
@@ -5481,7 +5889,7 @@
         "W4"
       ],
       "shadow_rejects": false,
-      "seconds": 6.848,
+      "seconds": 7.065,
       "steps": 5,
       "scope": "scripted witness; off-target clean cells are not exhaustive",
       "fault": "reordering",
@@ -5552,7 +5960,7 @@
         "W1"
       ],
       "shadow_rejects": false,
-      "seconds": 7.443,
+      "seconds": 7.071,
       "steps": 4,
       "scope": "scripted witness; off-target clean cells are not exhaustive",
       "fault": "concurrent racers",
@@ -5623,7 +6031,7 @@
         "A5"
       ],
       "shadow_rejects": false,
-      "seconds": 6.462,
+      "seconds": 6.733,
       "steps": 3,
       "scope": "scripted witness; off-target clean cells are not exhaustive",
       "fault": "lease expiry",
@@ -5694,7 +6102,7 @@
         "T3"
       ],
       "shadow_rejects": false,
-      "seconds": 9.001,
+      "seconds": 7.018,
       "steps": 7,
       "scope": "scripted witness; off-target clean cells are not exhaustive",
       "fault": "clock jump",
@@ -5766,7 +6174,7 @@
         "O1"
       ],
       "shadow_rejects": true,
-      "seconds": 8.274,
+      "seconds": 6.723,
       "steps": 4,
       "scope": "scripted witness; off-target clean cells are not exhaustive",
       "fault": "storage disconnect",
@@ -5837,7 +6245,7 @@
         "A4"
       ],
       "shadow_rejects": false,
-      "seconds": 6.802,
+      "seconds": 7.05,
       "steps": 5,
       "scope": "scripted witness; off-target clean cells are not exhaustive",
       "fault": "schema-invalid data",
@@ -5908,7 +6316,7 @@
         "V2"
       ],
       "shadow_rejects": false,
-      "seconds": 7.034,
+      "seconds": 6.719,
       "steps": 3,
       "scope": "scripted witness; off-target clean cells are not exhaustive",
       "fault": "version change",
@@ -5979,7 +6387,7 @@
         "V3"
       ],
       "shadow_rejects": false,
-      "seconds": 7.26,
+      "seconds": 6.734,
       "steps": 2,
       "scope": "scripted witness; off-target clean cells are not exhaustive",
       "fault": "mixed deployment",
@@ -6049,7 +6457,7 @@
       "switch": 1,
       "samples": 1000,
       "steps": 150,
-      "seconds": 28.642,
+      "seconds": 28.782,
       "exit": 0,
       "result": "no violation",
       "scope": "sampled correct-model fault tolerance; not an oracle separation result"
@@ -6059,7 +6467,7 @@
       "switch": 2,
       "samples": 1000,
       "steps": 150,
-      "seconds": 30.248,
+      "seconds": 29.894,
       "exit": 0,
       "result": "no violation",
       "scope": "sampled correct-model fault tolerance; not an oracle separation result"
@@ -6069,7 +6477,7 @@
       "switch": 3,
       "samples": 1000,
       "steps": 150,
-      "seconds": 34.871,
+      "seconds": 37.009,
       "exit": 0,
       "result": "no violation",
       "scope": "sampled correct-model fault tolerance; not an oracle separation result"
@@ -6079,7 +6487,7 @@
       "switch": 4,
       "samples": 1000,
       "steps": 150,
-      "seconds": 30.285,
+      "seconds": 32.735,
       "exit": 0,
       "result": "no violation",
       "scope": "sampled correct-model fault tolerance; not an oracle separation result"
@@ -6089,7 +6497,7 @@
       "switch": 5,
       "samples": 1000,
       "steps": 150,
-      "seconds": 29.812,
+      "seconds": 30.171,
       "exit": 0,
       "result": "no violation",
       "scope": "sampled correct-model fault tolerance; not an oracle separation result"
@@ -6099,7 +6507,7 @@
       "switch": 6,
       "samples": 1000,
       "steps": 150,
-      "seconds": 30.839,
+      "seconds": 30.008,
       "exit": 0,
       "result": "no violation",
       "scope": "sampled correct-model fault tolerance; not an oracle separation result"
@@ -6109,7 +6517,7 @@
       "switch": 7,
       "samples": 1000,
       "steps": 150,
-      "seconds": 29.81,
+      "seconds": 30.198,
       "exit": 0,
       "result": "no violation",
       "scope": "sampled correct-model fault tolerance; not an oracle separation result"
@@ -6119,7 +6527,7 @@
       "switch": 8,
       "samples": 1000,
       "steps": 150,
-      "seconds": 30.178,
+      "seconds": 28.757,
       "exit": 0,
       "result": "no violation",
       "scope": "sampled correct-model fault tolerance; not an oracle separation result"
@@ -6129,7 +6537,7 @@
       "switch": 9,
       "samples": 1000,
       "steps": 150,
-      "seconds": 31.671,
+      "seconds": 29.402,
       "exit": 0,
       "result": "no violation",
       "scope": "sampled correct-model fault tolerance; not an oracle separation result"
@@ -6139,7 +6547,7 @@
       "switch": 10,
       "samples": 1000,
       "steps": 150,
-      "seconds": 35.271,
+      "seconds": 31.182,
       "exit": 0,
       "result": "no violation",
       "scope": "sampled correct-model fault tolerance; not an oracle separation result"
@@ -6149,7 +6557,7 @@
       "switch": 11,
       "samples": 1000,
       "steps": 150,
-      "seconds": 31.852,
+      "seconds": 30.094,
       "exit": 0,
       "result": "no violation",
       "scope": "sampled correct-model fault tolerance; not an oracle separation result"
@@ -6163,7 +6571,7 @@
       "mutant": "baseline",
       "violations": [],
       "states": 373,
-      "seconds": 3.797,
+      "seconds": 2.609,
       "scope": "exhaustive finite obligation quotient; other quotients' domains structurally absent"
     },
     {
@@ -6175,7 +6583,7 @@
         "E5"
       ],
       "states": 373,
-      "seconds": 2.825,
+      "seconds": 2.545,
       "scope": "exhaustive finite obligation quotient; other quotients' domains structurally absent"
     },
     {
@@ -6187,7 +6595,7 @@
         "L1"
       ],
       "states": 253,
-      "seconds": 2.48,
+      "seconds": 2.453,
       "scope": "exhaustive finite obligation quotient; other quotients' domains structurally absent"
     },
     {
@@ -6200,7 +6608,7 @@
         "L2"
       ],
       "states": 133,
-      "seconds": 2.629,
+      "seconds": 2.212,
       "scope": "exhaustive finite obligation quotient; other quotients' domains structurally absent"
     },
     {
@@ -6212,7 +6620,7 @@
         "L3"
       ],
       "states": 193,
-      "seconds": 4.579,
+      "seconds": 2.101,
       "scope": "exhaustive finite obligation quotient; other quotients' domains structurally absent"
     },
     {
@@ -6224,7 +6632,7 @@
         "L4"
       ],
       "states": 193,
-      "seconds": 5.744,
+      "seconds": 2.073,
       "scope": "exhaustive finite obligation quotient; other quotients' domains structurally absent"
     },
     {
@@ -6240,7 +6648,7 @@
         "L5"
       ],
       "states": 13,
-      "seconds": 5.977,
+      "seconds": 1.868,
       "scope": "exhaustive finite obligation quotient; other quotients' domains structurally absent"
     },
     {
@@ -6250,7 +6658,7 @@
       "mutant": "baseline",
       "violations": [],
       "states": 1818,
-      "seconds": 3.178,
+      "seconds": 1.562,
       "scope": "exhaustive finite obligation quotient; other quotients' domains structurally absent"
     },
     {
@@ -6262,7 +6670,7 @@
         "L6"
       ],
       "states": 606,
-      "seconds": 2.161,
+      "seconds": 1.216,
       "scope": "exhaustive finite obligation quotient; other quotients' domains structurally absent"
     },
     {
@@ -6275,7 +6683,7 @@
         "L9"
       ],
       "states": 2106,
-      "seconds": 2.734,
+      "seconds": 1.491,
       "scope": "exhaustive finite obligation quotient; other quotients' domains structurally absent"
     },
     {
@@ -6287,7 +6695,7 @@
         "L9"
       ],
       "states": 1818,
-      "seconds": 1.975,
+      "seconds": 1.475,
       "scope": "exhaustive finite obligation quotient; other quotients' domains structurally absent"
     },
     {
@@ -6299,7 +6707,7 @@
         "L6"
       ],
       "states": 1818,
-      "seconds": 1.844,
+      "seconds": 1.429,
       "scope": "exhaustive finite obligation quotient; other quotients' domains structurally absent"
     },
     {
@@ -6311,7 +6719,7 @@
         "L6"
       ],
       "states": 1818,
-      "seconds": 1.817,
+      "seconds": 1.27,
       "scope": "exhaustive finite obligation quotient; other quotients' domains structurally absent"
     },
     {
@@ -6323,7 +6731,7 @@
         "L9"
       ],
       "states": 1818,
-      "seconds": 2.251,
+      "seconds": 1.444,
       "scope": "exhaustive finite obligation quotient; other quotients' domains structurally absent"
     },
     {
@@ -6333,7 +6741,7 @@
       "mutant": "baseline",
       "violations": [],
       "states": 41920,
-      "seconds": 28.248,
+      "seconds": 23.516,
       "scope": "exhaustive finite obligation quotient; other quotients' domains structurally absent"
     },
     {
@@ -6345,7 +6753,7 @@
         "L7"
       ],
       "states": 44296,
-      "seconds": 23.013,
+      "seconds": 23.049,
       "scope": "exhaustive finite obligation quotient; other quotients' domains structurally absent"
     },
     {
@@ -6357,7 +6765,7 @@
         "L7"
       ],
       "states": 37992,
-      "seconds": 22.941,
+      "seconds": 19.526,
       "scope": "exhaustive finite obligation quotient; other quotients' domains structurally absent"
     },
     {
@@ -6369,7 +6777,7 @@
         "L7"
       ],
       "states": 46680,
-      "seconds": 26.403,
+      "seconds": 25.618,
       "scope": "exhaustive finite obligation quotient; other quotients' domains structurally absent"
     },
     {
@@ -6382,7 +6790,7 @@
         "L10"
       ],
       "states": 43992,
-      "seconds": 39.509,
+      "seconds": 29.42,
       "scope": "exhaustive finite obligation quotient; other quotients' domains structurally absent"
     },
     {
@@ -6394,7 +6802,31 @@
         "L7"
       ],
       "states": 54152,
-      "seconds": 30.589,
+      "seconds": 29.104,
+      "scope": "exhaustive finite obligation quotient; other quotients' domains structurally absent"
+    },
+    {
+      "module": "contract_progress_trigger",
+      "kind": "mutant",
+      "target": "L7",
+      "mutant": "L7/order/child",
+      "violations": [
+        "L7"
+      ],
+      "states": 51408,
+      "seconds": 28.481,
+      "scope": "exhaustive finite obligation quotient; other quotients' domains structurally absent"
+    },
+    {
+      "module": "contract_progress_trigger",
+      "kind": "mutant",
+      "target": "L7",
+      "mutant": "L7/refusal",
+      "violations": [
+        "L7_refusal"
+      ],
+      "states": 83840,
+      "seconds": 42.831,
       "scope": "exhaustive finite obligation quotient; other quotients' domains structurally absent"
     },
     {
@@ -6406,7 +6838,7 @@
         "L8"
       ],
       "states": 48512,
-      "seconds": 26.5,
+      "seconds": 26.288,
       "scope": "exhaustive finite obligation quotient; other quotients' domains structurally absent"
     },
     {
@@ -6418,7 +6850,7 @@
         "L8_dormant"
       ],
       "states": 85328,
-      "seconds": 45.21,
+      "seconds": 47.628,
       "scope": "exhaustive finite obligation quotient; other quotients' domains structurally absent"
     },
     {
@@ -6433,7 +6865,7 @@
         "L10"
       ],
       "states": 25128,
-      "seconds": 11.544,
+      "seconds": 13.419,
       "scope": "exhaustive finite obligation quotient; other quotients' domains structurally absent"
     },
     {
@@ -6446,7 +6878,7 @@
         "shape"
       ],
       "states": 85424,
-      "seconds": 45.264,
+      "seconds": 47.723,
       "scope": "exhaustive finite obligation quotient; other quotients' domains structurally absent"
     },
     {
@@ -6458,7 +6890,7 @@
         "L7"
       ],
       "states": 41920,
-      "seconds": 21.164,
+      "seconds": 24.337,
       "scope": "exhaustive finite obligation quotient; other quotients' domains structurally absent"
     },
     {
@@ -6471,7 +6903,7 @@
         "L10"
       ],
       "states": 41920,
-      "seconds": 12.334,
+      "seconds": 12.387,
       "scope": "exhaustive finite obligation quotient; other quotients' domains structurally absent"
     },
     {
@@ -6485,7 +6917,7 @@
         "L10"
       ],
       "states": 41920,
-      "seconds": 7.206,
+      "seconds": 9.824,
       "scope": "exhaustive finite obligation quotient; other quotients' domains structurally absent"
     },
     {
@@ -6497,7 +6929,7 @@
         "L7"
       ],
       "states": 41920,
-      "seconds": 24.014,
+      "seconds": 24.379,
       "scope": "exhaustive finite obligation quotient; other quotients' domains structurally absent"
     },
     {
@@ -6509,7 +6941,7 @@
         "L8"
       ],
       "states": 41920,
-      "seconds": 30.944,
+      "seconds": 24.569,
       "scope": "exhaustive finite obligation quotient; other quotients' domains structurally absent"
     },
     {
@@ -6521,7 +6953,7 @@
         "L8"
       ],
       "states": 41920,
-      "seconds": 25.24,
+      "seconds": 24.375,
       "scope": "exhaustive finite obligation quotient; other quotients' domains structurally absent"
     },
     {
@@ -6533,7 +6965,7 @@
         "L10"
       ],
       "states": 41920,
-      "seconds": 22.949,
+      "seconds": 18.517,
       "scope": "exhaustive finite obligation quotient; other quotients' domains structurally absent"
     },
     {
@@ -6545,7 +6977,7 @@
         "L10"
       ],
       "states": 41920,
-      "seconds": 20.737,
+      "seconds": 18.685,
       "scope": "exhaustive finite obligation quotient; other quotients' domains structurally absent"
     }
   ],
@@ -6561,17 +6993,17 @@
   "rust_checks": [
     {
       "check": "fmt-final",
-      "seconds": 0.516,
+      "seconds": 0.64,
       "exit": 0
     },
     {
       "check": "clippy-final",
-      "seconds": 0.517,
+      "seconds": 6.881,
       "exit": 0
     },
     {
       "check": "workspace-final",
-      "seconds": 481.745,
+      "seconds": 407.691,
       "exit": 0
     }
   ],

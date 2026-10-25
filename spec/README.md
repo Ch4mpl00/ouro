@@ -55,7 +55,7 @@ are the bridges in `crates/durable/tests/quint.rs` and `quint/concurrent.rs`.
 | T2 | `T2`: activation epoch (only an activation starts one), dormant rearm | Concurrent firing/activation; serial MBT; `gaps::t2_old_completion_cannot_rearm_new_epoch` |
 | T3 | `T3`: deadline fixed at admission | Serial MBT; `t3_admission_fixes_the_workflow_deadline` |
 | V1 | `V1`: only an activation selects the active version (no rollback); pinned admission | Serial MBT; runtime pinned-version recovery |
-| V2 | `V2`: epoch, fault classification (a refused slot's run counts), reset; a trip reports once (one notice), stops the schedule and every admission of the tripped content digest (a pinned start of other content is admitted and never counted), ignores later observations, cleared only by activation; an operator's pause (`manual`) refuses every admission whatever its content, and only `resume` or an activation lifts it | Serial MBT; `gaps::v2_old_epoch_fault_does_not_count_after_reactivation`; `refusedTest`, `pinnedAdmittedTest`, `sameContentRefusedTest`, `pinnedUncountedTest`, `pauseTest`, `pausedRefusesTest`, `resumedTest`, `pauseActivatedTest`, `resumeKeepsTripTest` witnesses; mutants `V2/digest`, `V2/same-content`, `V2/pinned-counts`, `V2/manual` (a pause admits other content), `V2/resume` (resume lifts a breaker trip); refusal on every admission path in conformance (a trip then a child needs two faulted runs besides a live parent and its unadmitted child, more than the model's three, so the model's clause is not reached) |
+| V2 | `V2`: epoch, fault classification (a refused slot's run counts), reset; a trip reports once (one notice), stops the schedule and every admission of the tripped content digest (a pinned start of other content is admitted and never counted, one of a version the catalog does not hold refused), ignores later observations, cleared only by activation; an operator's pause (`manual`) refuses every admission whatever its content, also on top of a breaker's trip (`breaker`, kept), and only `resume` or an activation lifts it | Serial MBT; `gaps::v2_old_epoch_fault_does_not_count_after_reactivation`; `refusedTest`, `pinnedAdmittedTest`, `sameContentRefusedTest`, `pinnedUncountedTest`, `pauseTest`, `pausedRefusesTest`, `resumedTest`, `pauseActivatedTest`, `resumeKeepsTripTest`, `pauseTrippedTest`, `pauseTrippedResumedTest`, `absentAdmittedTest`, `absentRefusedTest` witnesses; mutants `V2/digest`, `V2/same-content`, `V2/pinned-counts`, `V2/manual` (a pause admits other content), `V2/resume` (resume lifts a breaker trip), `V2/pause-tripped` (a pause of a tripped definition does nothing), `V2/pause-resume` (resuming that pause lifts the trip), `V2/absent` (a trip admits a version the catalog does not hold); refusal on every admission path in conformance (a trip then a child needs two faulted runs besides a live parent and its unadmitted child, more than the model's three, so the model's clause is not reached) |
 | V3 | `V3`: undeclared/exact-match claim and mutation guards | Serial MBT (`claim_as`, `due_as` per worker version); `gaps::v3_incompatible_worker_cannot_claim` |
 | O1 | `O1`: failed operation stops the attempt | Serial MBT fault switches; generated interrupted journals |
 | O2 | `O2`: terminal-only retention and stable identities | Serial MBT (swept evidence projected away); replay-after-sweep refusal |
@@ -65,7 +65,7 @@ are the bridges in `crates/durable/tests/quint.rs` and `quint/concurrent.rs`.
 | X3 | `X3`: no silent readmission/reopening | Terminal/admission checks |
 | S1 | `S1`: emergency stop blocks claim, firing and admission (including children and ingress); clearing preserves evidence | Stop/clear witnesses, serial MBT, `S1` guard mutant, control conformance |
 | B1 | `B1`: tree counter within the ceiling, equal to a live root's granted decisions; immutable decisions; refusal only at the ceiling | Serial MBT (`spend`, decisions projected); `budgetTest` witness; budget conformance; generated interpreter budgets |
-| H1 | `H1`: a held run takes no fenced step and no dispatch (only the owner's answer to a call, a result or a proof that it did nothing, which the model and the engine accept before dispatch too, and the owner giving its lease back) | `heldStepsTest`, `heldDispatchTest`; mutants `H1`, `H1/dispatch`; serial MBT; control conformance (`holds`: `Held` on every fenced operation, the answer recorded) |
+| H1 | `H1`: a held run takes no fenced step and no dispatch (only the owner's answer to a call, a result or a proof that it did nothing, which the model and the engine accept before dispatch too, and the owner keeping its lease while it waits for it or giving it back: a hold never turns an answer into an unknown outcome) | `heldStepsTest`, `heldDispatchTest`, `heldAnsweredTest`; mutants `H1`, `H1/dispatch`, `H1/renew` (the hold takes the owner's lease); serial MBT; control conformance (`holds`: `Held` on every fenced operation, the answer recorded) |
 | H2 | `H2`: a held run is never claimed | `heldClaimTest`, `heldClaimedTest`; mutant `H2`; serial MBT audits `due` and `due_as` without held runs; conformance audits the due indexes |
 | H3 | `H3`: a hold marks the run and its live owned descendants in one transition and changes nothing else; a release restores exactly | `heldTreeTest`, `heldChildTest`, `heldReleasedTest`; mutants `H3` (misses the subtree), `H3/release` (changes more than the flags); conformance (`holds`, the commit-fault matrix); scalability bounds |
 | H4 | `H4`: an ended run is never held (a cancel or any end clears the hold) | `heldCancelledTest`; mutant `H4`; conformance audit |
@@ -161,23 +161,27 @@ deadline fixed at admission and epoch.
   binding conflicts count, cancellations do not. It reports and never rolls
   back: the threshold observation trips the definition (no admission of the tripped content digest,
   children included, no schedule, the count frozen; a pinned start of other
-  content is admitted and its run never counts) and appends the epoch to `notices`, the trip's
+  content is admitted and its run never counts; `pinAbsent`, a version the
+  catalog does not hold, is refused) and appends the epoch to `notices`, the trip's
   committed notice; the active version and the epoch stay. A tripped breaker
   observes nothing; only the next activation clears it.
 - **Hold** (#29). `hold` marks the run and its live owned descendants `held`
   in one transition; `unhold` clears them (the store's `Release`; `release` is
   the worker giving its lease back). A held run is never claimed, takes none
-  of the owner's fenced operations (renew, intent, recovery, checkpoint,
+  of the owner's fenced operations (intent, recovery, checkpoint,
   subscribe, take, spend, child, finish, timeout, conflict), dispatches
   nothing (the `check_lease` boundary), and keeps everything else: its wake-up
   and lease, which `due` ignores; events are still accepted into its mailbox.
   `answers` (the owner's authority alone) lets the owner record the result
   or proven non-execution of a call (a call not yet dispatched too: a
-  refusal before dispatch is the same record) and give its lease back. Any end of a run, cancellation included, clears the flag. H1–H4 state
+  refusal before dispatch is the same record), keep its lease (`renew`, so the
+  answer is recorded however long the call takes) and give it back. Any end of a run, cancellation included, clears the flag. H1–H4 state
   it.
 - **Pause** (V2). `pause` is a trip with `manual` set that reports no notice
   and refuses every admission whatever its content (`barred`); `resume` clears
-  it, and only it, never a breaker's trip. The model pauses a definition with
+  it, and only it, never a breaker's trip. A pause may stand on top of a
+  breaker's trip (`breaker`, the trip its notice reports), which `resume`
+  leaves in place (`pauseTrippedTest`, `pauseTrippedResumedTest`). The model pauses a definition with
   nothing to suspend (no armed schedule, no buffered slot): suspending and
   restoring triggers and buffers is storage behaviour, checked by the control
   conformance suite.
@@ -237,8 +241,8 @@ by TLC exhaustively, with each fairness conjunct named and dropped in turn:
   queue policy with capacity 2, its live run and up to two other runs as
   counters (counted by the breaker or not), the breaker (threshold 2), the
   emergency stop with the deferred drain, interrupted admissions and host
-  refusals. Run outcomes, activations (any version and trigger kind) and
-  starts are adversarial environment steps.
+  refusals. Run outcomes, activations (any version and trigger kind),
+  starts and owned children are adversarial environment steps.
   - **L7** assumes that the trigger's live run and other runs eventually end,
     that every stop is eventually cleared (it may recur forever) and that a
     poll possible infinitely often happens (strong fairness). Not firing,
@@ -253,7 +257,9 @@ by TLC exhaustively, with each fairness conjunct named and dropped in turn:
     two run representatives: the runtime admits a start whatever else is live.
   - **L8_dormant** and **L10_stable** are stability monitors with no fairness:
     within an epoch a consumed one-shot stays dormant unless disarmed, and a trip
-    stays with its content refused (no admission of it).
+    stays with its content refused (no admission of it). **L7_refusal**:
+    a start or child refused by a trip is refused by a stored one (a drain's
+    trip commits with the refusal it causes).
 
 What the quotients are connected to, and what not:
 
@@ -270,10 +276,13 @@ What the quotients are connected to, and what not:
   end of any run of the definition follow `drain_queues`, which `contract.qnt`
   simplifies to a promotion after every transition; the worker's notice
   follows the heartbeat renewal in the runtime's execution loop. A firing, an
-  `admit` and a `start` drain their definition's deferred marker in their own
-  commit (`drain_marked`) before they look at the room, so a buffered slot
-  waiting for a poll is never passed over by a later slot of its trigger or by
-  another start; the quotient's `settled` is that step.
+  `admit`, a `start` and an owned child's `start_child` drain their
+  definition's deferred marker in their own commit (`drain_marked`) before
+  they look at the room, so a buffered slot waiting for a poll is never passed
+  over by a later slot of its trigger or by another start; the quotient's
+  `settled` is that step (`firing`, `starting`, `spawning`). A drain that trips
+  the definition commits with the refusal it causes (`drained_refusal`); the
+  quotient's `L7_refusal` monitor states it.
 - **Not modelled:** pause and resume, the skip/allow/replace policies (the
   contract's monitors cover them), event-triggered (`on`) schedules and ingress,
   missed slots under `catchup: none`, several triggers or buffered slots per
@@ -287,7 +296,7 @@ What the quotients are connected to, and what not:
 ### Serial
 
 `crates/durable/tests/quint.rs` replays Quint's random traces of `contract.qnt`
-(100 traces × 150 steps per adapter by default, all 38 commands and every fault
+(100 traces × 150 steps per adapter by default, all 40 commands and every fault
 switch) and the `bridgeSuite` run of `contract_witnesses.qnt` (all 65 witness
 histories in one trace). After every step it compares a projection of the store
 with the model's state. The model records each command in its `command`
@@ -319,12 +328,13 @@ ticks), with `Policy { mailbox_ms: 37_500, ingress_ms: 37_500, skew_ms: 7_500 }`
 | `finish`, `timeout`, `cancel` | `finish` (outcomes 1–5), `cancel` |
 | `activate` | `activate_with`: the version's trigger |
 | `pin` | `admit` of stored version `i + 1` marked pinned; version 3 repeats version 1's text, so a trip on one refuses the other |
+| `pinAbsent` | `admit` of version 4, which the catalog does not hold, marked pinned (refused while tripped) |
 | `policy` | Host parameters, recorded by CAS in the model trigger's metadata |
 | `fire` | `fire` with the overlap guard, capacity and `rearm`; a missed or taken slot commits a skip |
 | `refuse` | `fire` with the overlap guard and `refused` (the model's unhandled failure, threshold 2) instead of `admit`; skips as `fire` |
 | `ingress` | `ingested`, then `fire` with the ingress event on a generic trigger |
 | `hold`, `unhold` | `control` `Hold` / `Release` of run r; `dispatch` also asks the store whether the run is held (the `check_lease` boundary) |
-| `pause`, `resume` | `control` `Pause` / `Resume` of the definition, when the model's guards hold (nothing to suspend; a manual trip) |
+| `pause`, `resume` | `control` `Pause` / `Resume` of the definition, when the model's guards hold (no pause yet and nothing to suspend; a pause) |
 
 The projection keeps what both sides state: runs (admission, epoch, version,
 outcome, end, deadline, owner, generation, lease, records and values, frontier,
@@ -452,8 +462,9 @@ the breaker, its trip and reactivation, and retention, each with a witness the
 serial bridge also replays. Not folded, and checked instead by the conformance suite and the DSL
 and runtime tests:
 
-- routing an unaddressed `deliver` to the oldest registration, `register_wait`
-  and `unregister_wait`, and several registrations of one type;
+- routing an unaddressed `deliver` to the oldest registration (a held run
+  is never chosen, #31), `register_wait` and `unregister_wait`, and several
+  registrations of one type;
 - waiting runs and their wake-ups, interruption backoff and its exhaustion;
 - the child's `waiting` notification and descendants deeper than two levels;
 - event-triggered (`on`) strategies, cron arithmetic, `accepts` lists;

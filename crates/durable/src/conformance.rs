@@ -1754,6 +1754,7 @@ async fn decisions(
     assert_eq!((d.active, d.epoch, d.consecutive_faults), (Some(two.version), 2, 2), "no rollback, no new epoch");
     let trip = Trip {
         manual: None,
+        breaker: true,
         version: two.version,
         digest: digest_of("two"),
         epoch: 2,
@@ -1778,6 +1779,12 @@ async fn decisions(
     // Other content (version one) is admitted, uncounted; this is the digest rule.
     assert!(s.start(&run_of("other-content", one.version), 6).await?.is_some());
     assert_eq!(s.get("other-content").await?.unwrap().epoch, None);
+    // A version the catalog does not hold has no digest to tell its content
+    // from the tripped one: refused while tripped, on every path (fail closed).
+    let absent = two.version + 10;
+    assert_eq!(tripped(s.admit(&run_of("absent", absent), 6).await.unwrap_err()), expected);
+    assert_eq!(tripped(s.start(&run_of("absent", absent), 6).await.unwrap_err()), expected);
+    assert!(s.get("absent").await?.is_none());
     let parent = s.start(&admission("parent"), 6).await?.unwrap();
     let link = ChildLink { parent: "parent".into(), key: "child".into(), reference: "/child".into() };
     let before = s.inspect("parent").await?;
@@ -1795,6 +1802,27 @@ async fn decisions(
     let d = s.definitions("w").await?;
     assert_eq!((d.consecutive_faults, d.tripped.as_ref()), (2, Some(&trip)));
     assert_eq!(s.notices(10).await?.len(), 1, "one trip, one notice");
+    // An operator's pause of the tripped definition records the pause beside
+    // the breaker's report: every admission is refused, other content too.
+    // Resuming lifts the pause alone; the trip still needs an activation.
+    let pause = control::Command::Pause { definition: "w".into(), note: "stop everything".into() };
+    assert_eq!(s.control(&control_request("pause-trip"), &pause, 6).await?, control::Reply::Changed(true));
+    let paused = s.definitions("w").await?.tripped.unwrap();
+    assert!(paused.manual.is_some(), "a pause of a tripped definition is recorded");
+    assert_eq!(Trip { manual: None, ..paused }, trip, "the breaker's report stays as it was");
+    let other = s.start(&run_of("other-paused", one.version), 6).await;
+    assert!(other.unwrap_err().downcast_ref::<DefinitionTripped>().is_some_and(|t| t.paused));
+    assert!(s.trigger("w#after").await?.is_none() && s.notices(10).await?.len() == 1, "nothing else changes");
+    assert_eq!(s.control(&control_request("pause-trip-again"), &pause, 6).await?, control::Reply::Changed(false));
+    let resume = control::Command::Resume { definition: "w".into() };
+    assert_eq!(s.control(&control_request("resume-pause"), &resume, 6).await?, control::Reply::Changed(true));
+    assert_eq!(s.definitions("w").await?.tripped.as_ref(), Some(&trip), "resuming leaves the breaker's trip");
+    let other = s.start(&run_of("other-resumed", one.version), 6).await?.unwrap();
+    s.finish(&other, &Status::Completed(json!(0)), 6, 2).await?;
+    assert!(matches!(
+        refusal(s.control(&control_request("resume-trip"), &resume, 6).await),
+        control::ControlError::InvalidState(_)
+    ));
     // Only an activation clears it, in a new epoch, with the version the
     // host chooses (here the earlier one). The notice stays until handed on.
     let d = s.activate_with("w", one.version, 2, &arming(&[("w#every", 40)]), &Activation::at(0)).await?.unwrap();
@@ -2182,14 +2210,14 @@ impl RunStore for Offloaded {
         let name = name.to_owned();
         offloaded!(self, |s| s.definitions(&name))
     }
-    async fn control(
+    async fn apply_control(
         &self,
         request: &control::Request,
         command: &control::Command,
         now: i64,
-    ) -> anyhow::Result<control::Reply> {
+    ) -> anyhow::Result<control::Applied> {
         let (request, command) = (request.clone(), command.clone());
-        offloaded!(self, |s| s.control(&request, &command, now))
+        offloaded!(self, |s| s.apply_control(&request, &command, now))
     }
     async fn stopped(&self) -> anyhow::Result<bool> {
         offloaded!(self, |s| s.stopped())
@@ -3527,7 +3555,11 @@ async fn holds(factory: &impl AsyncFn(&str) -> anyhow::Result<TestStore>, report
     // One transaction freezes the run and its live descendants, with the
     // attribution; the free run and the waiter are untouched.
     let now = 10;
-    assert_eq!(s.control(&control_request("hold-p"), &hold("p"), now).await?, Reply::Changed(true));
+    let applied = |reply, repeated| control::Applied { reply, repeated };
+    assert_eq!(
+        s.apply_control(&control_request("hold-p"), &hold("p"), now).await?,
+        applied(Reply::Changed(true), false)
+    );
     let held =
         control::Hold { actor: "operator".into(), reason: "maintenance".into(), note: "look".into(), at_ms: now };
     for id in ["p", "c", "g"] {
@@ -3535,9 +3567,12 @@ async fn holds(factory: &impl AsyncFn(&str) -> anyhow::Result<TestStore>, report
     }
     assert!(remote.get("free").await?.unwrap().held.is_none());
     assert_eq!(remote.inspect_control("p").await?.unwrap().snapshot.run.held, Some(held.clone()));
-    // Idempotent: a repeat, by any request, changes nothing and keeps the first attribution.
-    assert_eq!(s.control(&control_request("hold-p"), &hold("p"), now + 1).await?, Reply::Changed(true));
-    assert_eq!(s.control(&control_request("hold-again"), &hold("p"), now + 1).await?, Reply::Changed(false));
+    // Idempotent: a repeat, by any request, changes nothing and keeps the
+    // first attribution; the store says which request is a repeat.
+    let repeat = s.apply_control(&control_request("hold-p"), &hold("p"), now + 1).await?;
+    assert_eq!(repeat, applied(Reply::Changed(true), true));
+    let again = s.apply_control(&control_request("hold-again"), &hold("p"), now + 1).await?;
+    assert_eq!(again, applied(Reply::Changed(false), false));
     assert_eq!(remote.get("c").await?.unwrap().held.as_ref(), Some(&held));
     assert_eq!(s.control_history(Some("p"), None, 10).await?.items.len(), 2);
     assert!(matches!(
@@ -3579,6 +3614,14 @@ async fn holds(factory: &impl AsyncFn(&str) -> anyhow::Result<TestStore>, report
     // An event or a timer does not fire a held run; the work is kept and a
     // release restores the run exactly, due at once.
     assert_eq!(s.control(&control_request("hold-w"), &hold("w"), 20).await?, Reply::Changed(true));
+    // A held run is not offered a competing delivery: an event the oldest
+    // waiting run would take goes to the next one that is not held, and
+    // none waits for it if only held runs do.
+    assert_eq!(s.deliver(&event("unclaimed", "answer", json!(0)), None, 20).await?, None);
+    let w2 = s.start(&admission("w2"), 20).await?.unwrap();
+    s.register_wait(&w2, &["answer".into()], 20).await?;
+    s.finish(&w2, &Status::Waiting { wake_at_ms: 500 }, 20, 3).await?;
+    assert_eq!(s.deliver(&event("competing", "answer", json!(2)), None, 20).await?, Some("w2".into()));
     assert_eq!(s.deliver(&event("answer", "answer", json!(1)), Some("w"), 21).await?, Some("w".into()));
     assert!(!s.due(60, 10).await?.contains(&"w".to_string()));
     assert!(s.claim("w", 60).await?.is_none());
@@ -3592,23 +3635,30 @@ async fn holds(factory: &impl AsyncFn(&str) -> anyhow::Result<TestStore>, report
     assert!(s.claim("w", 61).await?.is_some());
 
     // The answer of a call already dispatched is recorded under a hold, and
-    // it is the only step that is: nothing else commits.
+    // it is the only step that is: nothing else commits. Its owner keeps the
+    // lease while it waits for that answer, however long the call takes: a
+    // renewal still answers `Held`, and extends the lease all the same.
     let q = s.start(&admission("q"), 0).await?.unwrap();
     s.save_record(&q, "fetch#call", &call(CallState::Pending), 1).await?;
     s.control(&control_request("hold-q"), &hold("q"), 2).await?;
     assert!(is_held(s.save_record(&q, "other#call", &call(CallState::Pending), 3).await.unwrap_err()));
     assert!(is_held(s.save_record(&q, "task", &Record::Timer { deadline_ms: 9 }, 3).await.unwrap_err()));
-    s.save_record(&q, "fetch#call", &call(CallState::Done(Ok(json!("ok")))), 3).await?;
+    let kept = LEASE_MS / 2;
+    assert!(is_held(s.renew(&q, kept).await.unwrap_err()));
+    assert_eq!(s.get("q").await?.unwrap().lease_until_ms, Some(kept + LEASE_MS), "the held owner keeps its lease");
+    assert!(!s.due(kept + LEASE_MS, 10).await?.contains(&"q".to_string()), "and the run is still due to nobody");
+    let answered = LEASE_MS + 100;
+    s.save_record(&q, "fetch#call", &call(CallState::Done(Ok(json!("ok")))), answered).await?;
     assert!(matches!(
         s.inspect("q").await?.unwrap().records.get("fetch#call"),
         Some(Record::Call { state: CallState::Done(Ok(v)), .. }) if v == &json!("ok")
     ));
-    assert!(is_held(s.finish(&q, &Status::Completed(json!(1)), 4, 3).await.unwrap_err()));
+    assert!(is_held(s.finish(&q, &Status::Completed(json!(1)), answered + 1, 3).await.unwrap_err()));
     // A pending call keeps its delivery rules: released, the run resumes
     // from the same evidence.
-    s.release(&q, 4).await?;
-    s.control(&control_request("release-q"), &release("q"), 5).await?;
-    assert!(s.claim("q", 5).await?.is_some());
+    s.release(&q, answered + 1).await?;
+    s.control(&control_request("release-q"), &release("q"), answered + 2).await?;
+    assert!(s.claim("q", answered + 2).await?.is_some());
 
     // A cancel reaches a held run and its descendants, and ends the hold.
     assert_eq!(
@@ -3711,7 +3761,9 @@ async fn control_overlap(
 /// A buffered slot keeps its place when the emergency stop is cleared: a clear
 /// drains a bounded batch of deferred definitions, and a definition past the
 /// batch must still promote its buffered slot before a later slot of its own
-/// trigger, or another start of the definition, is admitted.
+/// trigger, or another start of the definition (an owned child included), is
+/// admitted. A drain that trips the definition commits with the refusal it
+/// causes, whichever admission path drained it.
 async fn queue_order_after_clear(
     factory: &impl AsyncFn(&str) -> anyhow::Result<TestStore>,
     report: &mut Report,
@@ -3737,16 +3789,41 @@ async fn queue_order_after_clear(
         )
         .await
     };
-    // The fillers sort first and fill the batch; the two last names keep their
+    // The fillers sort first and fill the batch; the last names keep their
     // markers after the clear.
     let mut names: Vec<String> = (0..control::MAX_PAGE).map(|n| format!("fill{n:04}")).collect();
-    names.extend(["zlater".into(), "zstart".into()]);
+    let late = ["zchild", "zlater", "zstart", "ztrip-admit", "ztrip-child", "ztrip-start"];
+    names.extend(late.map(String::from));
     for name in &names {
         let d = s.save_definition(name, "yaml").await?;
         let armed = Arming { triggers: BTreeMap::from([(name.clone(), slot(0))]) };
         s.activate_with(name, d.version, 0, &armed, &Activation::at(0)).await?;
+        if name.starts_with("ztrip") {
+            // One fault short of the threshold, and a buffered slot whose run
+            // the host refuses: its promotion is the fault that trips.
+            let f = s.start(&named(name, &format!("{name}:fault")), 0).await?.unwrap();
+            s.finish(&f, &Status::Faulted(WorkflowError::runtime("fault")), 0, 2).await?;
+        }
         assert_eq!(fire(name, 0, &format!("{name}:first")).await?, Fired::Committed);
-        assert_eq!(fire(name, 1, &format!("{name}:buffered")).await?, Fired::Queued);
+        if name.starts_with("ztrip") {
+            let refused = Refused {
+                admission: named(name, &format!("{name}:buffered")),
+                error: WorkflowError::runtime("cannot admit"),
+                breaker_threshold: 2,
+            };
+            let firing = Firing {
+                key: name,
+                expected: Some(&slot(1)),
+                next: Some(&slot(2)),
+                busy: Some(&slot(2)),
+                refused: Some(&refused),
+                overlap: Some(OverlapGuard { policy: Overlap::Queue, max_concurrent_runs: 2, ceiling: &slot(2) }),
+                ..Firing::default()
+            };
+            assert_eq!(s.fire(&firing, 1).await?, Fired::Queued);
+        } else {
+            assert_eq!(fire(name, 1, &format!("{name}:buffered")).await?, Fired::Queued);
+        }
     }
     s.control(&control_request("stop"), &Command::Stop { enabled: true }, 2).await?;
     for name in &names {
@@ -3754,7 +3831,7 @@ async fn queue_order_after_clear(
             .await?;
     }
     s.control(&control_request("clear"), &Command::Stop { enabled: false }, 3).await?;
-    for name in ["zlater", "zstart"] {
+    for name in late {
         assert!(s.get(&format!("{name}:buffered")).await?.is_none(), "the clear's batch skipped {name}");
     }
     // A later slot of the same trigger is buffered behind the older one.
@@ -3766,6 +3843,38 @@ async fn queue_order_after_clear(
     s.admit(&named("zstart", "zstart:manual"), 3).await?;
     assert!(s.get("zstart:buffered").await?.is_some_and(|r| r.ended_ms.is_none()));
     assert!(s.queued("zstart").await?.is_none());
+    // Nor does an owned child of the definition, started by a run of another.
+    let parent = s.start(&named("parent", "parent"), 3).await?.unwrap();
+    let link = |key: &str| ChildLink { parent: "parent".into(), key: key.into(), reference: format!("/{key}") };
+    s.start_child(&parent, &named("zchild", "zchild:owned"), &link("owned"), 3).await?.unwrap();
+    assert!(s.get("zchild:buffered").await?.is_some_and(|r| r.ended_ms.is_none()));
+    assert!(s.queued("zchild").await?.is_none());
+    // Promoting the refused slot is the definition's second fault: the trip
+    // commits with the drain, and the admission that drained it is refused
+    // by that stored trip, its own changes (a child's parent side) rolled back.
+    let tripped = |e: anyhow::Error| e.downcast_ref::<DefinitionTripped>().map(|t| t.name.clone());
+    let before = s.inspect("parent").await?;
+    for (name, refusal) in [
+        ("ztrip-admit", s.admit(&named("ztrip-admit", "ztrip-admit:manual"), 3).await.map(drop)),
+        (
+            "ztrip-child",
+            s.start_child(&parent, &named("ztrip-child", "ztrip-child:owned"), &link("trip"), 3).await.map(drop),
+        ),
+        ("ztrip-start", s.start(&named("ztrip-start", "ztrip-start:manual"), 3).await.map(drop)),
+    ] {
+        assert_eq!(refusal.map_err(tripped).unwrap_err(), Some(name.to_string()), "{name}");
+        let d = s.definitions(name).await?;
+        let trip = d.tripped.as_ref().unwrap_or_else(|| panic!("{name}: the drain's trip was rolled back"));
+        assert_eq!((trip.faults, trip.run.as_str()), (2, format!("{name}:buffered").as_str()), "{name}");
+        assert!(s.get(&format!("{name}:buffered")).await?.is_some_and(|r| r.ended_ms == Some(3)), "{name}");
+        assert!(s.get(&format!("{name}:manual")).await?.is_none(), "{name}");
+        assert!(s.queued(name).await?.is_none(), "{name}");
+    }
+    assert_eq!(s.inspect("parent").await?, before, "the parent's side of a refused child is not committed");
+    let notices = s.notices(10).await?;
+    for name in ["ztrip-admit", "ztrip-child", "ztrip-start"] {
+        assert_eq!(notices.iter().filter(|(_, n)| n["subject"] == name).count(), 1, "{name}: one trip, one notice");
+    }
     audit(&**s).await?;
     Ok(())
 }

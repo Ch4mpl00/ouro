@@ -278,6 +278,15 @@ async fn definitions_rows_of_an_earlier_layout_are_refused() {
     let refused = s.definitions("workflow").await.unwrap_err().to_string();
     assert!(refused.contains("unsupported layout 3"), "{refused}");
     assert_eq!(backend.snapshot().await.unwrap(), Snapshot { rows }, "a refused row is left as it is");
+    // Layout 5 did not say whether a trip is the breaker's, so a pause on top
+    // of one could not be told from a pause alone: refused, not guessed.
+    let current = backend.snapshot().await.unwrap();
+    assert!(backend.compare_exchange(&current, &before.rows).await.unwrap());
+    let mut rows = before.rows.clone();
+    rows.get_mut(&key).unwrap().as_object_mut().unwrap().insert("version".into(), serde_json::json!(5));
+    assert!(backend.compare_exchange(&before, &rows).await.unwrap());
+    let refused = s.definitions("workflow").await.unwrap_err().to_string();
+    assert!(refused.contains("unsupported layout 5"), "{refused}");
 }
 
 #[tokio::test]

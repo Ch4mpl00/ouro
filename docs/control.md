@@ -81,9 +81,11 @@ tripped content digest), and suspends the current triggers and buffered
 admissions in that transaction. Existing runs finish.
 `resume` clears a manual trip and restores its exact triggers, epoch and
 previous breaker count. Overdue timers follow their existing catch-up policy.
-Pausing an already tripped definition preserves its first report; an automatic
-breaker trip still requires activation. An activation clears a manual pause
-and replaces its saved triggers in a new epoch.
+Pausing a definition its breaker already tripped keeps the breaker's report
+(`Trip::breaker` stays set) and records the pause beside it (`Trip::manual`):
+from then on every admission is refused, other content too. `resume` lifts
+that pause alone; the breaker trip still requires activation. An activation
+clears a manual pause and replaces its saved triggers in a new epoch.
 
 `hold(request, run, note)` freezes one run together with its live owned
 descendants, in one transaction bounded like the cancel cascade (the
@@ -92,16 +94,22 @@ A held run keeps its wake-up, timers and event waits but is never returned
 by `due` and never claimed: a timer or a delivery that comes due while it is
 held fires nothing, and a release makes the work due again in the same
 commit, under the existing catch-up rules, with the run exactly as it was.
+It is offered no competing delivery: an untargeted `deliver` goes to the
+oldest waiting run that is not held (or to none), while an event addressed to
+the held run still enters its mailbox.
 A worker driving it stops at the next fenced step or dispatch boundary (every
 fenced operation and `check_lease` refuse with `control::Held`) or at its
 next lease renewal, within one heartbeat, and gives the lease back without
-spending an interruption. A call already dispatched is not retracted: its
-answer is still recorded (with the proof that a call did nothing, the only step
-a held run commits; a refusal before dispatch is recorded too), a call still in
-flight when the renewal sees the hold gets one heartbeat to answer, and a
-call left pending keeps its delivery rules (an at-least-once call is sent
-again after the release, an at-most-once one has an unknown outcome and never
-is). A held run starts no child. It stays live: it counts for overlap
+spending an interruption. A call already dispatched is not retracted, and a
+hold never changes an outcome: the worker keeps its lease (a held run's
+renewal extends it and still answers `Held`) until every call it dispatched
+has answered, however long that takes (the call's own timeout is the only
+bound), records the answer (with the proof that a call did nothing, the only
+step a held run commits; a refusal before dispatch is recorded too) and then
+lets the run go. Released, the run goes on from that answer. A call left
+without an answer by a worker stop keeps its delivery rules (an at-least-once
+call is sent again after the release, an at-most-once one has an unknown
+outcome and never is). A held run starts no child. It stays live: it counts for overlap
 policies and the host ceiling, `inspect` and `list` show `held` (actor,
 reason, note, instant) on the run, and `counts` reports it as `held` instead
 of its frozen state. Holding is idempotent (a second hold keeps the first
@@ -109,7 +117,10 @@ attribution; a hold or release that changes nothing answers
 `Changed(false)`), an ended run is never held, and `cancel` works on a held
 run and ends the hold. Both commands are audited like the others, appear in
 the run's journal, and `Runtime::control` reports a change once as a
-`run_held` or `run_released` event.
+`run_held` or `run_released` event: the store says whether a request repeats
+one already committed (`RunStore::apply_control`, `control::Applied`) in the
+command's own commit, so two concurrent submissions of one request report it
+once.
 
 `emergency_stop(request, true)` sets a store-wide flag. Admissions return
 `control::Stopped`; claim and due queries return no work; firings consume no

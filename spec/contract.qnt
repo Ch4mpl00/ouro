@@ -34,8 +34,10 @@ module contract {
   // `trippedDigest`: the content digest of the version that tripped (0: not
   // tripped). Versions are numbers and so are contents: version 3 repeats
   // version 1's text, so the two share a digest (`content`).
-  // `manual`: the trip is an operator's pause, which refuses every version.
-  type Catalog = { active: int, epoch: int, faults: int, tripped: bool, manual: bool, trippedDigest: int,
+  // `manual`: an operator's pause stands, which refuses every version.
+  // `breaker`: the breaker tripped (a pause may stand on top of its trip;
+  // resuming lifts the pause alone).
+  type Catalog = { active: int, epoch: int, faults: int, tripped: bool, manual: bool, breaker: bool, trippedDigest: int,
     triggerEpoch: int, due: int, slot: int, running: int, catchup: int, rearm: bool, once: bool, onceAt: int,
     armed: bool, notices: List[int], overlap: int, maxRuns: int, queued: int, queueSlot: int, queueInput: int, queueRefused: bool }
   type Durable = { stopped: bool, runs: List[Run], copies: List[Copy], catalog: Catalog,
@@ -57,7 +59,7 @@ module contract {
   pure val emptyLocal: Local = { fence: 0, execution: 0, phase: 0, invocation: 0, stopped: false, permit: false }
   pure val initialDb: Durable = { stopped:false, runs: [emptyRun,emptyRun,emptyRun], copies: [], admissions: [0,0,0], budget: [0,0,0],
     buffered: Set(), fired: Set(), skipped: Set(), ingress: Map(), ingressPayload:Map(), catalog: { active: 1, epoch: 1,
-      faults: 0, tripped: false, manual: false, trippedDigest: 0, triggerEpoch: 1, due: 2, slot: 0, running: -1, catchup: 0, rearm:false, once:false, onceAt:-1,
+      faults: 0, tripped: false, manual: false, breaker: false, trippedDigest: 0, triggerEpoch: 1, due: 2, slot: 0, running: -1, catchup: 0, rearm:false, once:false, onceAt:-1,
       armed: true, notices: [], overlap:0, maxRuns:2, queued:-1, queueSlot:-1, queueInput:0, queueRefused:false } }
   pure val initial: Machine = { db: initialDb, workers: [emptyLocal,emptyLocal], now: 0,
     sends: [[0,0,0],[0,0,0],[0,0,0]], refusals: [[0,0,0],[0,0,0],[0,0,0]], observations: [], violations: Set(), faultsSeen: Set(), promoted: -1 }
@@ -78,10 +80,16 @@ module contract {
     spends: Map(), legal: true }
   var ideal: Ideal
   pure def content(version: int): int = if (version == 3) 1 else version
+  // The catalog holds versions 1-3; `pinAbsent` admits version 4, which it
+  // does not hold and so has no stored digest.
+  pure val absent = 4
+  pure def stored(version: int): bool = version >= 1 and version <= 3
   // An automatic trip refuses an admission iff its version's content is the
-  // tripped one, whatever the version number; an operator's pause refuses
-  // every admission, whatever its content (V2).
-  pure def barred(c: Catalog, version: int): bool = c.tripped and (c.manual or content(version) == c.trippedDigest)
+  // tripped one, whatever the version number, or the catalog does not hold
+  // the version (no digest shows its content to be other: fail closed); an
+  // operator's pause refuses every admission, whatever its content (V2).
+  pure def barred(c: Catalog, version: int): bool =
+    c.tripped and (c.manual or not(stored(version)) or content(version) == c.trippedDigest)
   pure def live(r: Run): bool = r.admitted and r.outcome == 0
   pure def compatible(app: int, worker: int): bool = app == 0 or app == worker + 1
   pure def authority(s: Machine, r: int, w: int): bool = {
@@ -148,7 +156,7 @@ module contract {
     val faults = c.faults+1
     val trip = faults >= 2
     val ended = update(s,r,{ ...s.db.runs.nth(r), outcome:2, ended:s.now })
-    observe({ ...ended, db:{ ...ended.db, catalog:{ ...c, faults:faults, tripped:trip, trippedDigest:if (trip) content(c.active) else 0, armed:c.armed and not(trip),
+    observe({ ...ended, db:{ ...ended.db, catalog:{ ...c, faults:faults, tripped:trip, breaker:trip, trippedDigest:if (trip) content(c.active) else 0, armed:c.armed and not(trip),
       due:if (trip) -1 else c.due,queued:if (trip) -1 else c.queued,queueSlot:if (trip) -1 else c.queueSlot, notices:if (trip) c.notices.append(c.epoch) else c.notices } } },"finish",r,i,2,1)
   }
   // Decisions: 0 dispatch afresh, 2 restore the result, 3 unknown, 4 evidence
@@ -182,7 +190,8 @@ module contract {
     // The fenced owner may act, unless an operator holds the run: a held run
     // takes no step (H1). `answers` is the owner's authority alone: a call
     // already dispatched is not retracted and its answer is still recorded,
-    // and the owner may always give its lease back.
+    // however long it takes (the owner keeps renewing its lease), and the
+    // owner may always give its lease back.
     val answers = authority(s,r,w)
     val authorized = answers and not(execution.held)
     val pending = s.db.copies.indices().filter(k => {
@@ -191,16 +200,20 @@ module contract {
     })
     val first = pending.fold(-1,(a,b) => if (a == -1 or b < a) b else a)
     if (op == "stop" and value >= 0) { ...s,db:{ ...s.db,stopped:value != 0 } }
-    else if (s.db.stopped and Set("admit","dry","replay","pin","claim","fire","refuse","ingress","renew","intent","dispatch","result","notExecuted","rejected","recover","checkpoint","conflict","subscribe","take","child","finish","timeout","spend","policy").contains(op)) s
+    else if (s.db.stopped and Set("admit","dry","replay","pin","pinAbsent","claim","fire","refuse","ingress","renew","intent","dispatch","result","notExecuted","rejected","recover","checkpoint","conflict","subscribe","take","child","finish","timeout","spend","policy").contains(op)) s
     else if (Set("admit","dry","replay").contains(op) and value >= 0 and not(execution.admitted) and not(c.tripped))
       observe(admitRun(s,r,value,i,if (op == "dry") 1 else if (op == "replay") 2 else 0),"admit",r,i,value,1)
     else if (op == "pin" and value >= 0 and not(execution.admitted) and not(barred(c,i+1)))
       observe(pinRun(s,r,value,i+1),"admit",r,0,value,1)
+    // A pinned admission of a version the catalog does not hold, possible
+    // through the store API (the runtime admits only catalog versions).
+    else if (op == "pinAbsent" and value >= 0 and not(execution.admitted) and not(barred(c,absent)))
+      observe(pinRun(s,r,value,absent),"admit",r,0,value,1)
     else if (op == "claim" and live(execution) and not(execution.held) and execution.lease <= s.now and compatible(execution.app,w) and
       not(s.workers.elems().exists(x => x.permit))) {
       val updated = update(s,r,{ ...execution, owner:w, generation:execution.generation+1, lease:s.now+4 })
       { ...updated, workers: updated.workers.replaceAt(w,{ ...emptyLocal, execution:r, fence:execution.generation+1, permit:true }) }
-    } else if (op == "renew" and authorized)
+    } else if (op == "renew" and answers)
       update(s,r,{ ...execution, lease:s.now+4 })
     else if (op == "intent" and authorized and Set(0,4).contains(execution.records.nth(i)) and
       execution.mode != 2 and not(execution.mode == 1 and mocked(i)) and s.now < execution.deadline) {
@@ -293,7 +306,7 @@ module contract {
       // its triggers go and its notice is committed with it. The host decides
       // what to activate. It does not forget the schedule's last run.
       val catalog = if (not(counted)) c
-        else { ...c, faults:faults, tripped:trip, trippedDigest:if (trip) content(c.active) else c.trippedDigest, armed:c.armed and not(trip),queued:if (trip) -1 else c.queued,queueSlot:if (trip) -1 else c.queueSlot,
+        else { ...c, faults:faults, tripped:trip, breaker:trip, trippedDigest:if (trip) content(c.active) else c.trippedDigest, armed:c.armed and not(trip),queued:if (trip) -1 else c.queued,queueSlot:if (trip) -1 else c.queueSlot,
           due:if (trip) -1 else if (c.armed and c.rearm and c.due < 0 and c.running == r and execution.epoch == c.triggerEpoch) s.now+2 else c.due,
           running:if (c.running == r) -1 else c.running, notices:if (trip) c.notices.append(c.epoch) else c.notices }
       val updated = update(s,r,{ ...execution,outcome:outcome,ended:s.now,owner:-1,lease:-1,subscription:false,
@@ -317,7 +330,7 @@ module contract {
       // the instant's (`onceAt`): another activation of the same instant
       // meets the run it made, and a changed instant is another run.
       val epoch = c.epoch+1
-      { ...s,db:{ ...s.db,catalog:{ ...c,active:i+1,epoch:epoch,faults:0,tripped:false,manual:false,trippedDigest:0,catchup:value % 2,rearm:value == 2 or value == 3,once:value == 4,onceAt:if (value == 4) r else -1,
+      { ...s,db:{ ...s.db,catalog:{ ...c,active:i+1,epoch:epoch,faults:0,tripped:false,manual:false,breaker:false,trippedDigest:0,catchup:value % 2,rearm:value == 2 or value == 3,once:value == 4,onceAt:if (value == 4) r else -1,
         triggerEpoch:epoch,due:if (i == 0) s.now+2 else -1,armed:i == 0,slot:0,queued:-1,queueSlot:-1 } } }
     } else if (Set("fire","refuse").contains(op) and value >= 0 and c.due >= 0 and c.due <= s.now and c.triggerEpoch == c.epoch and not(c.tripped)
       and (not(c.once) or r == c.onceAt)) {
@@ -334,14 +347,16 @@ module contract {
     } else if (op == "unhold" and live(execution)) {
       val closed = Set(r).union(descendants(s,r))
       { ...s,db:{ ...s.db,runs:Runs.fold(s.db.runs,(a,k) => if (closed.contains(k)) a.replaceAt(k,{ ...a.nth(k),held:false }) else a) } }
-    } else if (op == "pause" and value >= 0 and not(c.tripped) and not(c.armed) and c.queued < 0) {
+    } else if (op == "pause" and value >= 0 and not(c.manual) and not(c.armed) and c.queued < 0) {
       // An operator's pause is a trip that refuses every version and reports
-      // no notice. The model pauses a definition with nothing to suspend (no
-      // armed schedule, no buffered slot): suspending and restoring triggers
-      // is storage behaviour, covered by the conformance suite.
-      { ...s,db:{ ...s.db,catalog:{ ...c,tripped:true,manual:true,trippedDigest:content(c.active) } } }
+      // no notice; on a definition the breaker tripped it stands beside the
+      // breaker's trip. The model pauses a definition with nothing to suspend
+      // (no armed schedule, no buffered slot): suspending and restoring
+      // triggers is storage behaviour, covered by the conformance suite.
+      { ...s,db:{ ...s.db,catalog:{ ...c,tripped:true,manual:true,trippedDigest:if (c.tripped) c.trippedDigest else content(c.active) } } }
     } else if (op == "resume" and value >= 0 and c.tripped and c.manual) {
-      { ...s,db:{ ...s.db,catalog:{ ...c,tripped:false,manual:false,trippedDigest:0 } } }
+      // It lifts the pause alone: a breaker's trip under it stays.
+      { ...s,db:{ ...s.db,catalog:{ ...c,tripped:c.breaker,manual:false,trippedDigest:if (c.breaker) c.trippedDigest else 0 } } }
     } else if (op == "sweep")
       { ...s,db:{ ...s.db,runs:s.db.runs.mapped(x => if (x.outcome != 0 and s.now >= x.ended+5) { ...x,retained:false } else x) } }
     else if (op == "release" and answers) {
@@ -557,7 +572,7 @@ module contract {
       else d.faults == (if (qualifying) c.faults+1 else if (execution.outcome == 1) 0 else c.faults) and
         not(d.tripped) and d.notices == c.notices
     val error23 = flag(error22,"V2",(d.faults < 2 or d.tripped) and breakerCorrect and
-      (not(c.tripped) or d.tripped or op == "activate" or (op == "resume" and c.manual)) and
+      (not(c.tripped) or d.tripped or op == "activate" or (op == "resume" and c.manual and not(c.breaker))) and
       // While tripped, an admission happens only as a pinned start of other
       // content, and such a start (not stopped, run free) always happens. An
       // operator's pause admits nothing at all, and only `resume` or an
@@ -565,14 +580,24 @@ module contract {
       (not(c.tripped) or a.db.admissions == b.db.admissions or
         (op == "pin" and not(c.manual) and a.db.admissions.nth(r) == b.db.admissions.nth(r)+1 and content(execution.version) != c.trippedDigest)) and
       (not(d.manual) or d.tripped) and
-      (op != "pause" or value < 0 or c.tripped or c.armed or c.queued >= 0 or (d.tripped and d.manual and
-        d.trippedDigest == content(c.active) and d.faults == c.faults and d.epoch == c.epoch)) and
-      (op != "pause" or d.manual == c.manual or (not(c.tripped) and not(c.armed))) and
+      // A breaker's trip is the one its notice reports, in this epoch; it
+      // stands until an activation, whatever pause comes and goes on top.
+      (not(d.breaker) or d.tripped) and d.breaker == d.notices.indices().exists(k => d.notices.nth(k) == d.epoch) and
+      // A pause, of a definition the breaker tripped or not, refuses every
+      // admission from then on and keeps the breaker's report as it was.
+      (op != "pause" or value < 0 or c.manual or c.armed or c.queued >= 0 or (d.tripped and d.manual and
+        d.trippedDigest == (if (c.tripped) c.trippedDigest else content(c.active)) and d.faults == c.faults and
+        d.epoch == c.epoch and d.breaker == c.breaker and d.notices == c.notices)) and
+      (op != "pause" or d.manual == c.manual or (not(c.manual) and not(c.armed))) and
       (op != "resume" or value < 0 or c.manual or c == d) and
-      (op != "resume" or value < 0 or not(c.manual) or (not(d.tripped) and not(d.manual) and d.faults == c.faults)) and
+      (op != "resume" or value < 0 or not(c.manual) or (not(d.manual) and d.tripped == c.breaker and
+        d.breaker == c.breaker and d.faults == c.faults and (not(c.breaker) or d.trippedDigest == c.trippedDigest))) and
       (op != "activate" or c == d or not(d.manual)) and
       (op != "pin" or value < 0 or b.db.stopped or old.admitted or barred(c,i+1) or execution.admitted) and
       (op != "pin" or not(barred(c,i+1)) or a.db.admissions == b.db.admissions) and
+      // A version the catalog does not hold is admitted only untripped.
+      (op != "pinAbsent" or value < 0 or b.db.stopped or old.admitted or c.tripped or execution.admitted) and
+      (op != "pinAbsent" or not(c.tripped) or a.db.admissions == b.db.admissions) and
       (d.tripped == (d.trippedDigest != 0) and (not(d.tripped) or d.trippedDigest == content(d.active))) and
       (op != "activate" or c == d or (d.faults == 0 and not(d.tripped))))
     val error24 = flag(error23,"V3",(op != "claim" or b.db == a.db or compatible(old.app,w)) and
@@ -600,12 +625,18 @@ module contract {
           (y.spends.nth(c) != 2 or y.spent.nth(c) == ceiling)
       })))
     // A held run takes no step but the answer of a call already dispatched
-    // (and giving its lease back): none of the owner's fenced operations, no
-    // dispatch, and no claim changes anything while it is held (#29).
-    val steps = Set("renew","intent","recover","checkpoint","subscribe","take","child","finish","timeout","conflict","spend").contains(op)
+    // (and giving its lease back or keeping it): none of the owner's other
+    // fenced operations, no dispatch, and no claim changes anything while it
+    // is held (#29).
+    val steps = Set("intent","recover","checkpoint","subscribe","take","child","finish","timeout","conflict","spend").contains(op)
     val frozen = b.db.runs.nth(r).held
+    // The owner of a held run keeps its lease, and nothing else, so the
+    // answer of a call it dispatched is recorded however long the call takes:
+    // a hold never turns an answer into an unknown outcome (#31).
     val errorH1 = flag(error30,"H1",(not(steps) or not(frozen) or b.db == a.db) and
-      (op != "dispatch" or not(frozen) or a.sends == b.sends))
+      (op != "dispatch" or not(frozen) or a.sends == b.sends) and
+      (op != "renew" or not(frozen) or b.db.stopped or not(authority(b,r,w)) or
+        a.db == { ...b.db,runs:b.db.runs.replaceAt(r,{ ...old,lease:b.now+4 }) }))
     val errorH2 = flag(errorH1,"H2",op != "claim" or not(frozen) or b.db == a.db)
     // A hold freezes the run and its live owned descendants in one transition
     // and changes nothing else; releasing them restores exactly what the hold
@@ -696,7 +727,7 @@ module contract {
   action step = {
     nondet op = Set("admit","dry","replay","claim","renew","release","intent","dispatch","result","notExecuted","rejected","recover",
       "checkpoint","conflict","subscribe","address","publish","take","expire","child","finish","timeout","cancel",
-      "activate","fire","refuse","ingress","sweep","crash","tick","spend","policy","stop","pin","hold","unhold","pause","resume").oneOf()
+      "activate","fire","refuse","ingress","sweep","crash","tick","spend","policy","stop","pin","pinAbsent","hold","unhold","pause","resume").oneOf()
     nondet r = Runs.oneOf()
     nondet w = Workers.oneOf()
     nondet i = Calls.oneOf()

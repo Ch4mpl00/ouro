@@ -25,9 +25,9 @@ MUTANTS = {
  "S1": ('else if (s.db.stopped and Set(', 'else if (false and Set(', [op("stop",value=1),op("admit")]),
  "A1": ('Set("admit","dry","replay").contains(op) and value >= 0 and not(execution.admitted)', 'Set("admit","dry","replay").contains(op) and value >= 0', BOOT+[op("admit",value=1)]),
  "A2": ('val persisted = if (commits) proposed else before', 'val persisted = if (commits) { ...proposed,db:before.db } else before', [op("admit")]),
- "A3": ('else if (op == "renew" and authorized)', 'else if (op == "renew" and execution.outcome != 0) update(s,r,{ ...execution,outcome:1 })\n    else if (op == "renew" and authorized)', BOOT+[op("finish",value=1),op("renew")]),
+ "A3": ('else if (op == "renew" and answers)', 'else if (op == "renew" and execution.outcome != 0) update(s,r,{ ...execution,outcome:1 })\n    else if (op == "renew" and answers)', BOOT+[op("finish",value=1),op("renew")]),
  "A4": ('values:execution.values.replaceAt(i,execution.input+i)', 'values:execution.values.replaceAt(i,-1)', BOOT+CALL),
- "A5": ('op == "renew" and authorized', 'op == "renew"', BOOT+TICKS+[op("renew")]),
+ "A5": ('op == "renew" and answers', 'op == "renew"', BOOT+TICKS+[op("renew")]),
  "E1": ('observe(updated,op,r,i,execution.input+i,1)', 'observe(updated,op,r,i,execution.input+i+execution.generation,1)', BOOT+CALL[:2]),
  "E2": ('{ ...local, phase:2 }', '{ ...local, phase:1 }', BOOT+CALL[:2]+[op("dispatch")]),
  # An at-most-once call whose outcome is unknown is dispatched again (#25).
@@ -70,16 +70,28 @@ MUTANTS = {
  "V2/digest": ('and not(barred(c,i+1)))\n      observe(pinRun','and not(c.tripped))\n      observe(pinRun',TRIP+[op("pin",r=2,i=1,value=5)]),
  "V2/same-content": ('and not(barred(c,i+1)))\n      observe(pinRun','and true)\n      observe(pinRun',TRIP+[op("pin",r=2,i=2,value=5)]),
  # A pinned run of another version carries the active epoch and so counts.
+ # A trip that admits a version the catalog does not hold (no digest, #31).
+ "V2/absent": ('c.tripped and (c.manual or not(stored(version)) or','c.tripped and (c.manual or',TRIP+[op("pinAbsent",r=2,value=5)]),
  "V2/pinned-counts": ('epoch:if (version == c.active) c.epoch else 0','epoch:c.epoch',[op("pin",i=1,value=3),op("claim"),op("finish",fault=0,value=1)]),
  # An operator's pause admits other content like an automatic trip does, or
  # its resume lifts a breaker's trip.
  "V2/manual": ('and not(barred(c,i+1)))\n      observe(pinRun','and not(c.tripped and content(i+1) == c.trippedDigest))\n      observe(pinRun',[op("activate",i=1,value=0),op("pause"),op("pin",r=0,i=0,value=5)]),
- "V2/resume": ('op == "resume" and value >= 0 and c.tripped and c.manual','op == "resume" and value >= 0 and c.tripped',TRIP+[op("resume")]),
+ # (Resume keeps a breaker's trip in its body too since #31, so the mutant
+ # drops both: the guard and the body's `tripped:c.breaker`.)
+ "V2/resume": ('op == "resume" and value >= 0 and c.tripped and c.manual) {\n      // It lifts the pause alone: a breaker\'s trip under it stays.\n      { ...s,db:{ ...s.db,catalog:{ ...c,tripped:c.breaker,',
+               'op == "resume" and value >= 0 and c.tripped) {\n      { ...s,db:{ ...s.db,catalog:{ ...c,tripped:false,',TRIP+[op("resume")]),
+ # A pause of a definition the breaker tripped does nothing, so other content
+ # is still admitted; or resuming it lifts the breaker's trip as well (#31).
+ "V2/pause-tripped": ('op == "pause" and value >= 0 and not(c.manual)','op == "pause" and value >= 0 and not(c.tripped)',TRIP+[op("pause"),op("pin",r=2,i=1,value=5)]),
+ "V2/pause-resume": ('tripped:c.breaker,manual:false','tripped:false,manual:false',TRIP+[op("pause"),op("resume")]),
  # A held run takes a step, is dispatched, or is claimed; a hold misses the
  # run's owned child, or a release changes more than the hold kept; an ended
  # run stays held.
  "H1": ('val authorized = answers and not(execution.held)','val authorized = answers',BOOT+[op("hold"),op("intent")]),
  "H1/dispatch": ('and not(local.stopped) and not(execution.held) and Set(1,4)','and not(local.stopped) and Set(1,4)',BOOT+[op("intent"),op("hold"),op("dispatch")]),
+ # A held run's owner loses its lease to the hold, so a call in flight past
+ # it ends with an unknown outcome (#31).
+ "H1/renew": ('op == "renew" and answers', 'op == "renew" and authorized',BOOT+[op("intent"),op("dispatch"),op("hold"),op("tick"),op("renew")]),
  "H2": ('live(execution) and not(execution.held) and execution.lease <= s.now','live(execution) and execution.lease <= s.now',[op("admit"),op("hold"),op("claim")]),
  "H3": ('val closed = Set(r).union(descendants(s,r))\n      { ...s,db:{ ...s.db,runs:Runs.fold(s.db.runs,(a,k) => if (closed.contains(k)) a.replaceAt(k,{ ...a.nth(k),held:true })','val closed = Set(r)\n      { ...s,db:{ ...s.db,runs:Runs.fold(s.db.runs,(a,k) => if (closed.contains(k)) a.replaceAt(k,{ ...a.nth(k),held:true })',BOOT+[op("child"),op("hold")]),
  "H3/release": ('a.replaceAt(k,{ ...a.nth(k),held:false })','a.replaceAt(k,{ ...a.nth(k),held:false,lease:-1 })',BOOT+[op("hold"),op("unhold")]),
