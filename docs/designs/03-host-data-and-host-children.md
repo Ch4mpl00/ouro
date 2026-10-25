@@ -157,3 +157,24 @@ changes; no state version bump and no `Admission` field, per R-H2),
 ## Open questions
 
 None (review findings resolved above).
+
+## Amendment after the pre-tag drift review (2026-10-26)
+
+Decided by the elephant (logged in ouro-agent `docs/designs/LOG.md`):
+
+- **Child ids are per attempt and fixed-size.** Both host-started and built-in
+  child ids are derived from (parent run id, the call's per-attempt reference,
+  key) and hashed: `hostchild:<32 hex>` and `child:<32 hex>` (SHA-256 of the
+  canonical tuple, truncated). A crash re-dispatch of the same attempt joins
+  the same child; a DSL `retry` attempt starts its own child (a retry re-runs
+  the work). This fixes the retry fault (drift H-1: the same id with a
+  different link was refused untyped and retried until "gave up after 10
+  interruptions") and the id growth with nesting (drift H-2). Durable
+  run-state version +1.
+- A remaining link conflict is the typed `AdmissionMismatch`, never
+  `Interrupted`.
+- The 16 KiB host-data check runs after the join lookup, so a re-dispatch
+  joins even if its recomputed host data is larger.
+- `FunctionContext::child_id(key)` follows the new derivation.
+- `dry_run_with(…, host: Option<Value>, …)` is the dry-run entry with host
+  data (`dry_run` delegates to it).
