@@ -1,5 +1,5 @@
 use ouro_runtime::{
-    CallStatus, Config, Function, FunctionContext, MissingFunction, Mock, Registry, Runtime,
+    CALL_UNKNOWN, CallStatus, Config, Function, FunctionContext, MissingFunction, Mock, Registry, Runtime,
     durable::{self, Clock, RunStore},
     ows::{
         durable::{CallState, Delivery, Record},
@@ -230,7 +230,7 @@ async fn shutdown_releases_the_lease_and_unknown_writes_never_dispatch_again() {
     assert_eq!((calls[0].key.as_str(), calls[0].function.as_str()), ("/do/0/write#call", "write"));
     assert_eq!((calls[0].delivery, calls[0].state), (Delivery::AtMostOnce, CallStatus::Unknown));
     let result = rt.drive("r", &CancellationToken::new()).await.unwrap();
-    assert!(matches!(result,Some(Status::Faulted(e)) if e.is("outcome_unknown")));
+    assert!(matches!(result,Some(Status::Faulted(e)) if e.type_ == CALL_UNKNOWN));
     assert_eq!(writes.load(Ordering::SeqCst), 1);
 }
 #[tokio::test]
@@ -393,7 +393,7 @@ async fn delivery_is_declared_per_function() {
             assert_eq!(sent[0], sent[1], "re-dispatched once more, under the same idempotency key");
         } else {
             let outcome = rt.drive(name, &CancellationToken::new()).await.unwrap();
-            assert!(matches!(outcome, Some(Status::Faulted(e)) if e.is("outcome_unknown")), "{name}");
+            assert!(matches!(outcome, Some(Status::Faulted(e)) if e.type_ == CALL_UNKNOWN), "{name}");
             assert_eq!(keys.lock().unwrap().len(), before + 1, "{name}: never sent again");
         }
         let delivery = rt.records(name).await.unwrap().values().find_map(|r| match r {

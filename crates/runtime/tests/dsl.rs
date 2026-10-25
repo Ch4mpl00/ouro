@@ -4,8 +4,8 @@
 // schedules. Durability cases restart the runtime on the same SQLite file.
 use async_trait::async_trait;
 use ouro_runtime::{
-    Config, Delivery, EventSink, Function, FunctionContext, FunctionError, ProcessRunner, Registry, ResourceResolver,
-    Runtime, SecretResolver,
+    CALL_UNKNOWN, Config, Delivery, EventSink, Function, FunctionContext, FunctionError, ProcessRunner, Registry,
+    ResourceResolver, Runtime, SecretResolver,
     durable::{self, AtomicBackend, Clock, RunStore},
     mock,
     ows::{
@@ -1120,7 +1120,7 @@ async fn crashes_at_every_commit_never_repeat_a_child_an_event_or_a_write() {
                     assert_eq!(writes.len(), 3, "{label}");
                     assert_eq!((consumed, children), (2, 1), "{label}");
                 }
-                Some(Status::Faulted(e)) if e.is("outcome_unknown") => {}
+                Some(Status::Faulted(e)) if e.type_ == CALL_UNKNOWN => {}
                 _ => panic!("{label}"),
             }
             let mut unique = writes.clone();

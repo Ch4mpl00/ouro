@@ -22,8 +22,12 @@ reported after it, at most once (`run::Event`).
 
 Recovery replays the definition, restoring completed tasks and call results.
 Protected calls preserve their logical identity across retries. At-most-once
-intent without a response produces `outcome_unknown`; it is never resent.
-See the invariants in `src/durable.rs` for the complete persistence contract.
+intent without a response produces `urn:ouro:errors:call.unknown`; it is
+never resent, and only a `catch` that names that type handles it. A host
+says how far a call got by the type of its error (`CallFailure::answer`:
+`call.not_executed`, `call.unknown`, `call.interrupted`; any other error is
+a definite answer). See the invariants in `src/durable.rs` for the complete
+persistence contract.
 
 Tests include the official conformance kit (`tests/ctk`, run with
 cucumber), the reference model, differential properties, invariants,

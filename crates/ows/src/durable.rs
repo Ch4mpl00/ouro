@@ -94,6 +94,18 @@
 //!     For the same reason an interrupted at-most-once call (`CallFailure::Interrupted`)
 //!     is unknown; an interrupted at-least-once call keeps its pending record
 //!     and is called again on recovery.
+//!     A function says how far its call got by the type of its error
+//!     (`CallFailure::answer`): `CALL_NOT_EXECUTED` is proof of no execution
+//!     (decision 12), `CALL_UNKNOWN` an outcome it cannot tell, and
+//!     `CALL_INTERRUPTED` a stop; any other error is a definite answer. An
+//!     unknown at-most-once outcome keeps the intent without an answer, the
+//!     same record a crash after dispatch leaves, so recovery decides it the
+//!     same way and the workflow sees the same error either way:
+//!     `CALL_UNKNOWN` with the call's reference, which only a `catch` that
+//!     names that type handles (decision 13: it never retries the attempt).
+//!     A not-executed answer is saved, and recovery returns it again: the
+//!     workflow already acted on it. Only a new attempt (a DSL retry) may
+//!     send the call again, at most once included.
 //!
 //! ## Waiting and completion
 //!
@@ -173,7 +185,10 @@ use std::collections::BTreeMap;
 /// added in the commit that saves each answer.
 /// 11: a run row keeps the content digest of the definition version it was
 /// admitted with (engine layout; the OWS record formats are unchanged).
-pub const VERSION: u32 = 11;
+/// 12: an unknown at-most-once outcome is `CALL_UNKNOWN`, which a `catch`
+/// naming that type handles, and recovery returns a saved not-executed
+/// answer instead of sending the call again (record formats unchanged).
+pub const VERSION: u32 = 12;
 
 /// The key of a run's `Record::Exceeded`.
 pub const EXCEEDED: &str = "exceeded";
@@ -186,12 +201,32 @@ pub enum Delivery {
     AtMostOnce,
 }
 
+/// The error type of a function's answer that proves the call did nothing
+/// (it refused before any effect): saved as `CallState::NotExecuted`, safe to
+/// send again in a new attempt, and caught like any error.
+pub const CALL_NOT_EXECUTED: &str = "urn:ouro:errors:call.not_executed";
+/// The error type of an answer that cannot tell whether the call had its
+/// effect (a request that timed out after it was sent). An at-most-once call
+/// keeps its intent without an answer and is never sent again; the workflow
+/// sees this type with the call's reference, and only a `catch` that names
+/// it handles it. An at-least-once call stays pending, may be sent again,
+/// and its error is an ordinary one.
+pub const CALL_UNKNOWN: &str = "urn:ouro:errors:call.unknown";
+/// The error type of an answer that is a stop, not an answer
+/// (`CallFailure::Interrupted`): nothing is saved and the run stays
+/// recoverable.
+pub const CALL_INTERRUPTED: &str = "urn:ouro:errors:call.interrupted";
+
 /// The host must classify failures conservatively: an ordinary transport
 /// error is Unknown, not proof that dispatch never happened.
 #[derive(Debug)]
 pub enum CallFailure {
+    /// Proof that the call had no effect: it was not sent, or its recipient
+    /// refused it before doing anything.
     NotExecuted(WorkflowError),
+    /// A definite answer: the function's error.
     Response(WorkflowError),
+    /// The call may or may not have had its effect.
     Unknown(WorkflowError),
     /// A stop of the host (its process or the call's owner going away), not
     /// an answer: nothing is saved for the call, the run ends `Interrupted`
@@ -199,6 +234,25 @@ pub enum CallFailure {
     /// of its own (a model turn). Explicit cancellation of the run still
     /// ends it `Cancelled`, and an at-most-once call's outcome is unknown.
     Interrupted(WorkflowError),
+}
+
+impl CallFailure {
+    /// A function's error answer, by its type: `CALL_NOT_EXECUTED`,
+    /// `CALL_UNKNOWN` and `CALL_INTERRUPTED` say how far the call got; any
+    /// other error is a definite answer (`Response`).
+    pub fn answer(error: WorkflowError) -> Self {
+        match error.type_.as_str() {
+            CALL_NOT_EXECUTED => Self::NotExecuted(error),
+            CALL_UNKNOWN => Self::Unknown(error),
+            CALL_INTERRUPTED => Self::Interrupted(error),
+            _ => Self::Response(error),
+        }
+    }
+    pub fn error(&self) -> &WorkflowError {
+        match self {
+            Self::NotExecuted(e) | Self::Response(e) | Self::Unknown(e) | Self::Interrupted(e) => e,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -499,10 +553,12 @@ pub enum CallStatus {
     Completed,
     /// The function answered with an error.
     Failed,
-    /// Proven not executed (`CallFailure::NotExecuted`).
+    /// Proven not executed (`CallFailure::NotExecuted`): refused before
+    /// dispatch, or answered `CALL_NOT_EXECUTED` by its function. No effect.
     NotExecuted,
     /// An at-most-once call whose intent has no answer: it may have run and
-    /// is never dispatched again.
+    /// is never dispatched again. Its function answered `CALL_UNKNOWN` or
+    /// was stopped, or the process stopped before its answer was saved.
     Unknown,
 }
 
