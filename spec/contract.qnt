@@ -29,7 +29,7 @@ module contract {
   type Copy = { id: int, recipient: int, payload: int, expires: int, disposition: int, key: int }
   // `notices`: the epochs whose trip was reported, one committed notice each.
   type Catalog = { active: int, epoch: int, faults: int, tripped: bool,
-    triggerEpoch: int, due: int, slot: int, running: int, catchup: int, rearm: bool,
+    triggerEpoch: int, due: int, slot: int, running: int, catchup: int, rearm: bool, once: bool,
     armed: bool, notices: List[int], overlap: int, maxRuns: int, queued: int, queueSlot: int, queueInput: int, queueRefused: bool }
   type Durable = { stopped: bool, runs: List[Run], copies: List[Copy], catalog: Catalog,
     admissions: List[int], buffered: Set[(int, int)], fired: Set[(int, int)], skipped: Set[(int, int)], ingress: int -> int, ingressPayload: int -> int,
@@ -46,7 +46,7 @@ module contract {
   pure val emptyLocal: Local = { fence: 0, execution: 0, phase: 0, invocation: 0, stopped: false, permit: false }
   pure val initialDb: Durable = { stopped:false, runs: [emptyRun,emptyRun,emptyRun], copies: [], admissions: [0,0,0], budget: [0,0,0],
     buffered: Set(), fired: Set(), skipped: Set(), ingress: Map(), ingressPayload:Map(), catalog: { active: 1, epoch: 1,
-      faults: 0, tripped: false, triggerEpoch: 1, due: 2, slot: 0, running: -1, catchup: 0, rearm:false,
+      faults: 0, tripped: false, triggerEpoch: 1, due: 2, slot: 0, running: -1, catchup: 0, rearm:false, once:false,
       armed: true, notices: [], overlap:0, maxRuns:2, queued:-1, queueSlot:-1, queueInput:0, queueRefused:false } }
   pure val initial: Machine = { db: initialDb, workers: [emptyLocal,emptyLocal], now: 0,
     sends: [[0,0,0],[0,0,0],[0,0,0]], observations: [], violations: Set(), faultsSeen: Set() }
@@ -267,9 +267,10 @@ module contract {
       { ...s,db:{ ...s.db,catalog:{ ...c,overlap:value % 4,maxRuns:i+1 } } }
     } else if (op == "activate" and value >= 0) {
       // Version 1 has a schedule. Only an activation starts an epoch and only
-      // an activation clears a trip; reported notices stay.
+      // an activation clears a trip; reported notices stay. The value picks
+      // the trigger: catchup (odd), `after` rearm (2, 3) or a one-shot (4).
       val epoch = c.epoch+1
-      { ...s,db:{ ...s.db,catalog:{ ...c,active:i+1,epoch:epoch,faults:0,tripped:false,catchup:value % 2,rearm:value >= 2,
+      { ...s,db:{ ...s.db,catalog:{ ...c,active:i+1,epoch:epoch,faults:0,tripped:false,catchup:value % 2,rearm:value == 2 or value == 3,once:value == 4,
         triggerEpoch:epoch,due:if (i == 0) s.now+2 else -1,armed:i == 0,slot:0,queued:-1,queueSlot:-1 } } }
     } else if (Set("fire","refuse").contains(op) and value >= 0 and c.due >= 0 and c.due <= s.now and c.triggerEpoch == c.epoch and not(c.tripped)) {
       firePolicy(s,r,i,value,c.overlap,c.maxRuns,op == "refuse")
@@ -308,7 +309,7 @@ module contract {
       fired:if (skip or buffer) s.db.fired else s.db.fired.union(Set(slot)),
       buffered:if (buffer) s.db.buffered.union(Set(slot)) else s.db.buffered,
       skipped:if (skip) s.db.skipped.union(Set(slot)) else s.db.skipped,
-      catalog:{ ...replaced.db.catalog,slot:c.slot+1,due:if (c.rearm and not(skip) and not(refused)) -1 else s.now+2,
+      catalog:{ ...replaced.db.catalog,slot:c.slot+1,due:if (c.once or (c.rearm and not(skip) and not(refused))) -1 else s.now+2,
         running:if (skip or buffer) replaced.db.catalog.running else r,
         queued:if (buffer) r else c.queued,queueSlot:if (buffer) c.slot else c.queueSlot,
         queueInput:if (buffer) value else c.queueInput,queueRefused:if (buffer) refused else c.queueRefused } } }
@@ -411,6 +412,8 @@ module contract {
     val error19 = flag(error18,"T1",not(slotChanged) or
       ((if (fired) 1 else 0) + (if (skipped) 1 else 0) + (if (buffered) 1 else 0) == 1 and
         c.triggerEpoch == c.epoch and not(c.tripped) and
+        // A one-shot's slot consumes it, however the slot ended.
+        (not(c.once) or d.due < 0) and
         (if (fired) not(old.admitted) and execution.admitted and a.db.admissions.nth(r) == b.db.admissions.nth(r)+1
           else a.db.admissions == b.db.admissions)))
     // These monitors state the selected policy independently of firePolicy.
@@ -438,6 +441,8 @@ module contract {
     // Nothing but an activation starts an epoch.
     val error20 = flag(errorCapacity,"T2",d.triggerEpoch == d.epoch and (op == "activate" or d.epoch == c.epoch) and
       (not(rearmDue) or d.epoch != c.epoch or d.tripped or d.due == b.now+2) and
+      // Nothing but an activation makes a dormant one-shot due again.
+      (op == "activate" or not(c.once and c.due < 0) or d.due < 0) and
       (op != "activate" or c == d or (d.epoch == c.epoch+1 and d.due == (if (i == 0) b.now+2 else -1))))
     val error21 = flag(error20,"T3",Runs.forall(k => {
       val x = b.db.runs.nth(k)

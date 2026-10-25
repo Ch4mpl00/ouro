@@ -7,7 +7,7 @@
 //! respects real time (no command placed before one that ended before it
 //! began) must match every reply and a fresh projection of the store.
 use super::{
-    Adapter, CALLS, Command, INGRESS, NAME, SCHEDULE, StoreDriver, TICK, View, call_record, event, ingress_event,
+    Adapter, CALLS, Command, INGRESS, Mode, NAME, SCHEDULE, StoreDriver, TICK, View, call_record, event, ingress_event,
     run_id, schedule_trigger, status, worker,
 };
 use anyhow::{Context, ensure};
@@ -160,13 +160,15 @@ async fn race(store: &dyn RunStore, p: &Prepared, k: usize, c: &Cmd) -> (i64, Op
             let Some(t) = p.schedule.as_ref().filter(|t| t.at_ms.is_some_and(|at| at <= ms)) else { return (0, None) };
             let slot = t.state["slot"].as_i64().unwrap();
             let rearm = t.state["rearm"].as_bool().unwrap();
+            let once = t.state["once"].as_bool().unwrap();
             let at = |at: Option<i64>| {
                 let mut next = t.clone();
                 next.at_ms = at.map(|at| at * TICK);
                 next.state["slot"] = json!(slot + 1);
                 next
             };
-            let (next, busy) = (at(if rearm { None } else { Some(ms / TICK + 2) }), at(Some(ms / TICK + 2)));
+            let (next, busy) =
+                (at(if rearm || once { None } else { Some(ms / TICK + 2) }), at((!once).then_some(ms / TICK + 2)));
             let again = Rearm { trigger: SCHEDULE.into(), delay_ms: 2 * TICK };
             let firing = Firing {
                 key: SCHEDULE,
@@ -202,12 +204,11 @@ async fn race(store: &dyn RunStore, p: &Prepared, k: usize, c: &Cmd) -> (i64, Op
         }
         "activate" => {
             let version = c.i as u64 + 1;
-            let (catchup, rearm) = (c.value % 2, c.value >= 2);
             let mut arming = Arming::default();
             if version == 1 {
                 arming
                     .triggers
-                    .insert(SCHEDULE.into(), schedule_trigger(Some(ms / TICK + 2), p.epoch + 1, 0, catchup, rearm));
+                    .insert(SCHEDULE.into(), schedule_trigger(Some(ms / TICK + 2), p.epoch + 1, 0, Mode::of(c.value)));
             }
             i64::from(store.activate_with(NAME, version, p.epoch, &arming, &Activation::at(0)).await.unwrap().is_some())
         }
