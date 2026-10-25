@@ -116,8 +116,8 @@ the current code (state which assertion fails in the report).
 
 ## Rollout
 
-- README: every mention of the extensions, and a "Breaking changes (issue #31,
-  M-6)" entry: old → new paths, the state/layout bump, the conformance-suite
+- README and `docs/*.md`: every mention of the extensions, and a "Breaking changes
+  (issue #31, M-6)" entry in `CHANGELOG.md`: old → new paths, the state/layout bump, the conformance-suite
   strings.
 - Doc comments: grep `metadata.` across `crates/` (at least `ows/src/model.rs`,
   `ows/src/durable.rs`, `ows/src/run.rs`, `runtime/src/execution.rs`,

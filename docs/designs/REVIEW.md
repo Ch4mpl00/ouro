@@ -5,7 +5,7 @@ document, this repository and this rubric. That is the point — you are not
 biased by the conversation that produced it. Do not edit anything. Write your
 findings to the file you were given.
 
-Read `AGENTS.md`, `README.md`, `docs/durable-invariants.md` and `spec/README.md`
+Read `AGENTS.md`, `README.md`, the reference pages in `docs/`, `docs/durable-invariants.md` and `spec/README.md`
 as needed, and the code the document touches. Then go through four lenses.
 
 1. **Zoom out.** Is this the simplest design that solves the stated problem?
