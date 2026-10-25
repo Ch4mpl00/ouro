@@ -173,7 +173,10 @@ use std::collections::BTreeMap;
 /// added in the commit that saves each answer.
 /// 11: a run row keeps the content digest of the definition version it was
 /// admitted with (engine layout; the OWS record formats are unchanged).
-pub const VERSION: u32 = 11;
+/// 12: a run row may be held by an operator (`SavedRun::held`), which keeps
+/// the run out of `due` and refuses every fenced step but the answer of a
+/// call already dispatched.
+pub const VERSION: u32 = 12;
 
 /// The key of a run's `Record::Exceeded`.
 pub const EXCEEDED: &str = "exceeded";

@@ -1420,6 +1420,22 @@ async fn control_bounds(backend: &Arc<dyn AtomicBackend>, metrics: &Metrics) -> 
         s.control(&req("resume"), &Command::Resume { definition: "operator".into() }, now).await
     })
     .await?;
+    // A hold touches the rows of its subtree (the cancel cascade's reach) and
+    // nothing else: the run row and its due keys, once each.
+    let hold = Command::Hold { run: a.id.clone(), note: "bounds".into() };
+    bounded(metrics, "control_hold_tree", 3, async || s.control(&req("hold"), &hold, now).await).await?;
+    bounded(metrics, "control_hold_retry", 0, async || s.control(&req("hold"), &hold, now).await).await?;
+    bounded(metrics, "control_hold_again", 3, async || s.control(&req("hold-again"), &hold, now).await).await?;
+    bounded(metrics, "control_held_step", 0, async || {
+        anyhow::ensure!(s.check_lease(&f, now).await.unwrap_err().is::<ouro_durable::control::Held>());
+        Ok(())
+    })
+    .await?;
+    bounded(metrics, "control_held_claim", 0, async || s.claim(&a.id, i64::MAX).await).await?;
+    let release = Command::Release { run: a.id.clone() };
+    bounded(metrics, "control_release_tree", 3, async || s.control(&req("release"), &release, now).await).await?;
+    bounded(metrics, "control_release_again", 3, async || s.control(&req("release-again"), &release, now).await)
+        .await?;
     bounded(metrics, "control_stop", 0, async || s.control(&req("stop"), &Command::Stop { enabled: true }, now).await)
         .await?;
     assert!(bounded(metrics, "control_stopped", 0, async || s.stopped().await).await?);

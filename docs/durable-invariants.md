@@ -567,7 +567,10 @@ of a new run of that definition, by any path, is refused in its own commit
 with a typed, non-retryable error iff the admitted version's stored digest
 equals the tripped digest, whatever its version number: a normal start
 (active, hence tripped content) and a pinned start of an identical copy are
-refused, a pinned start of a version with other content is admitted. Only
+refused, a pinned start of a version with other content is admitted. An
+operator's pause is a trip that refuses every admission of the definition,
+whatever its content or version number; only `resume` or an activation lifts
+it, and `resume` never lifts a breaker's trip. Only
 stored digests are compared; none is recomputed at admission. Only runs of the
 active version count toward the breaker, so a pinned run of other content never
 does. An already admitted run is still joined. The active version and the epoch do not change.
@@ -1230,6 +1233,19 @@ Cancellation closes the same owned subtree as C3 and reaches the owner's
 function token at its next renewal (immediately through the in-process control
 path). Attributed commands commit their audit and idempotency reply atomically;
 a matched response commits its addressed event in that same transition.
+
+Addendum (2026-10-25, issue #29). An operator may hold one run and its live
+owned descendants, in one transition, and release them. A held run takes no
+step: it is never claimed nor due (its wake-up and timers are kept, not fired),
+its owner's fenced operations and dispatches are refused, and it starts no
+child; the only things it commits are the answer of a call already dispatched
+(the call is not retracted), the owner giving its lease back, mailbox
+acceptance of events and a cancellation, which ends the hold. A release
+restores exactly what the hold kept, so due work is due again in the same
+transition. A held run is live (overlap, the ceiling); an ended run is never
+held. The model states this as H1 (no step, no dispatch), H2 (no claim), H3
+(a hold or release changes the held flags of the tree and nothing else) and H4
+(ended runs are not held); the manual pause is V2's `manual` flag.
 
 Addendum (2026-10-25, issue #22). Three observational additions change no
 transition of the model. A read-only handle (SQLite read-only connection,
