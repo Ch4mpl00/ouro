@@ -423,16 +423,43 @@ fn claim_run(snapshot: &mut StoredRun, now: i64, owner: &str) -> anyhow::Result<
 /// tripped content digest, whatever its version number, in the same commit
 /// that reads the trip, and a version the catalog does not hold; other
 /// content is admitted (a pinned start) and never counts toward the breaker. A manual pause refuses every admission of the
-/// definition, whatever its content. An existing run is still joined.
+/// definition, whatever its content. An existing run is still joined, as a
+/// root (`Join::Root`).
 async fn insert(rows: &mut dyn Transaction, admission: &Admission, now: i64) -> anyhow::Result<bool> {
-    let Some(snapshot) = admitted(rows, admission, now).await? else { return Ok(false) };
+    let Some(snapshot) = admitted(rows, admission, now, Join::Root).await? else { return Ok(false) };
     store_run(rows, &snapshot).await?;
     Ok(true)
 }
+/// How an admission of a stored run id joins it (design 03); otherwise
+/// `AdmissionMismatch`, in the transaction that read the stored run, so of
+/// racing different admissions one is stored and the others are refused.
+#[derive(Clone, Copy)]
+enum Join {
+    /// The same definition, the version a pinned start names and the same
+    /// host data (`Admission::joins`): a root's id is the host's, so another
+    /// admission under it is a mistake.
+    Root,
+    /// The same definition only: the first commit wins. A child's id is
+    /// derived from its parent's invocation, and a re-dispatch of that
+    /// invocation may compute other input or host data (from a clock, from
+    /// files); refusing it would fault the parent and cancel the child.
+    Child,
+}
 /// The row a new run starts with, not stored yet; `None`: already admitted.
-async fn admitted(rows: &mut dyn Transaction, admission: &Admission, now: i64) -> anyhow::Result<Option<StoredRun>> {
+async fn admitted(
+    rows: &mut dyn Transaction,
+    admission: &Admission,
+    now: i64,
+    join: Join,
+) -> anyhow::Result<Option<StoredRun>> {
     if let Some(existing) = find_run(rows, &admission.id).await? {
-        anyhow::ensure!(existing.run.admission.name == admission.name, "run already belongs to another definition");
+        let stored = &existing.run.admission;
+        match join {
+            Join::Root => {
+                stored.joins(&admission.name, admission.pinned().then_some(admission.version), admission.host())
+            }
+            Join::Child => stored.joins(&admission.name, None, stored.host()),
+        }?;
         return Ok(None);
     }
     running(rows).await?;
@@ -513,7 +540,7 @@ async fn drained_refusal(
 /// never claimed. Its fault feeds the breaker as a terminal one would. A
 /// run already stored under its id is joined: nothing is counted again.
 async fn refuse(rows: &mut dyn Transaction, refused: &Refused, now: i64) -> anyhow::Result<()> {
-    let Some(mut snapshot) = admitted(rows, &refused.admission, now).await? else { return Ok(()) };
+    let Some(mut snapshot) = admitted(rows, &refused.admission, now, Join::Root).await? else { return Ok(()) };
     let status = Status::Faulted(refused.error.clone());
     snapshot.run.state = RunState::Failed;
     snapshot.run.outcome = Some(status);
@@ -1556,13 +1583,14 @@ impl RunStore for TransactionalStore {
                 let children = indexed_runs(rows, &partition("control_parent", id), "", None, usize::MAX)
                     .await?
                     .into_iter()
-                    .map(|s| s.run)
+                    .map(|s| control::redacted(s.run))
                     .collect();
                 let runtime = &s.run.admission.runtime;
                 let budget_limit = runtime["limits"]["max_jumps"].as_u64().map(|host| {
                     ows::model::parse_yaml(&s.run.admission.definition).map_or(host, |w| w.budget.max_jumps(host))
                 });
                 let pinned = s.run.admission.pinned();
+                let host = s.run.admission.host().cloned();
                 let digest = s.digest.clone();
                 let trace_id = runtime["trace_id"].as_str().map(str::to_owned);
                 let span_id = runtime["span_id"].as_str().map(str::to_owned);
@@ -1573,7 +1601,7 @@ impl RunStore for TransactionalStore {
                     snapshot,
                     pinned,
                     digest,
-                    host: None,
+                    host,
                     calls,
                     annotations,
                     waits,
@@ -1656,7 +1684,7 @@ impl RunStore for TransactionalStore {
                 if let Some(refusal) = drained_refusal(rows, drained, a).await? {
                     return Ok(Err(refusal));
                 }
-                let Some(mut s) = admitted(rows, a, now).await? else {
+                let Some(mut s) = admitted(rows, a, now, Join::Root).await? else {
                     return Ok(Ok(None));
                 };
                 let fence = claim_run(&mut s, now, owner)?;
@@ -2017,7 +2045,7 @@ impl RunStore for TransactionalStore {
                 }
                 p.listeners.insert(format!("child:{}", a.id), vec![format!("done:{}", a.id)]);
                 store_run(rows, &p).await?;
-                let fresh = admitted(rows, a, now).await?;
+                let fresh = admitted(rows, a, now, Join::Child).await?;
                 let inserted = fresh.is_some();
                 let mut c = match fresh {
                     Some(c) => c,
@@ -2457,7 +2485,7 @@ async fn query_runs(
             && f.state.as_ref().is_none_or(|state| *state == r.state)
             && f.parent.as_ref().is_none_or(|p| r.child.as_ref().is_some_and(|c| c.parent == *p))
         {
-            items.push(r);
+            items.push(control::redacted(r));
         }
     }
     Ok(control::Page { items, next })

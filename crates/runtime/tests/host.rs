@@ -230,7 +230,7 @@ async fn host_data_is_bounded_at_start() {
     assert!(rt.get("large").await.unwrap().is_none(), "nothing is stored");
     // A host child with too much host data is refused before anything happens.
     let Some(Status::Faulted(e)) = rt.drive("fits", &CancellationToken::new()).await.unwrap() else { panic!() };
-    assert!(e.is("call.not_executed"), "{e:?}");
+    assert_eq!(e.type_, ouro_runtime::CALL_NOT_EXECUTED, "{e:?}");
     assert_eq!(*starts.lock().unwrap(), [Err("host-data".to_owned())]);
     assert!(host_children(&rt).await.is_empty());
 }

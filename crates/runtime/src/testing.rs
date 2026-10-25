@@ -121,7 +121,7 @@ impl Runtime {
         &self,
         yaml: &str,
         input: Value,
-        _host: Option<Value>,
+        host: Option<Value>,
         mock: Arc<dyn Mock>,
         stop: &CancellationToken,
     ) -> anyhow::Result<DryRun> {
@@ -141,7 +141,8 @@ impl Runtime {
         runtime.capabilities = self.capabilities.clone();
         let d = runtime.save("dry-run", yaml).await?;
         runtime.activate(&d.name, d.version).await?;
-        runtime.start("dry-run", "dry-run", input).await?;
+        let start = crate::Start { version: None, host: host.unwrap_or(Value::Null) };
+        runtime.start_with("dry-run", "dry-run", input, start).await?;
         runtime.definition_source = self.store.clone();
         // Traced with the host's tracer, unless the host removed its
         // OpenTelemetry observer; counted nowhere, and no host observer

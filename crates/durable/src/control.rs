@@ -11,6 +11,14 @@ pub const MAX_PAGE: usize = 1_000;
 /// host data (`Admission::host`): pages of `list` and `history`, and an
 /// inspection's `children`. Only `inspect` of the run itself returns it.
 pub const REDACTED: &str = "<redacted>";
+/// `run` as those queries show it: its host data, when it has any, replaced
+/// by `REDACTED`.
+pub fn redacted(mut run: SavedRun) -> SavedRun {
+    if run.admission.host().is_some() {
+        run.admission.runtime[crate::HOST] = Value::String(REDACTED.into());
+    }
+    run
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Request {

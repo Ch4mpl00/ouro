@@ -95,6 +95,22 @@ impl Admission {
     pub fn host(&self) -> Option<&Value> {
         self.runtime.get(HOST).filter(|host| !host.is_null())
     }
+    /// Whether a root start of `name` (at `version`, when the start names
+    /// one) with `host` joins this stored run: the same definition, the same
+    /// version if named, and the same host data, absent against present
+    /// included. Input is not compared (a start retry identifies the run).
+    pub fn joins(&self, name: &str, version: Option<u64>, host: Option<&Value>) -> Result<(), AdmissionMismatch> {
+        let field = if self.name != name {
+            AdmissionField::Name
+        } else if version.is_some_and(|v| v != self.version) {
+            AdmissionField::Version
+        } else if self.host() != host {
+            AdmissionField::Host
+        } else {
+            return Ok(());
+        };
+        Err(AdmissionMismatch { id: self.id.clone(), field })
+    }
 }
 
 /// What an admission of an existing run id disagreed on (`AdmissionMismatch`).
@@ -693,7 +709,10 @@ pub trait RunStore: Send + Sync {
     }
     /// Admits a run once (`false`: already admitted). A new run of a tripped
     /// definition is refused with `DefinitionTripped`; so are `start`,
-    /// `start_child` and a firing's admissions.
+    /// `start_child` and a firing's admissions. An admission of a stored id
+    /// joins it only with the same definition, the same version when it is
+    /// pinned, and the same host data (`Admission::joins`); otherwise it is
+    /// refused with `AdmissionMismatch`, in this transaction, as by `start`.
     async fn admit(&self, admission: &Admission, now_ms: i64) -> anyhow::Result<bool>;
     async fn start(&self, admission: &Admission, now_ms: i64) -> anyhow::Result<Option<Fence>>;
     /// A claim by an undeclared worker, which resumes every run.
@@ -812,7 +831,9 @@ pub trait RunStore: Send + Sync {
         breaker_threshold: u32,
     ) -> anyhow::Result<Status>;
     /// Parent ownership, child admission, and completion subscriptions commit
-    /// together. Replaying a link joins the original immutable child.
+    /// together. Replaying a link joins the original immutable child: the
+    /// first commit wins, so a join compares only the definition name
+    /// (`AdmissionMismatch` otherwise), never input, version or host data.
     async fn start_child(
         &self,
         parent: &Fence,
