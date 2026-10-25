@@ -79,7 +79,8 @@ impl SqliteBackend {
 }
 
 fn has_table(connection: &Connection, name: &str) -> rusqlite::Result<bool> {
-    connection.query_row("SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)", [name], |r| r.get(0))
+    connection
+        .query_row("SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)", [name], |r| r.get(0))
 }
 /// The recorded schema version (`ouro_migrations`), 0 when there is none.
 fn recorded(connection: &Connection) -> rusqlite::Result<i64> {

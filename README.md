@@ -806,6 +806,18 @@ Breaking changes (issue #24), for hosts written before it:
   `done`, an admission's runtime gains `schedule`, all optional, so rows
   written earlier are read as they were (no first slot has a previous one).
 
+Breaking changes (issue #31), for hosts written before it:
+
+- A one-shot's run id is `schedule:<name>:at:<ms>` (it was
+  `schedule:<name>:at:<epoch>:<ms>`), and a reactivation with the same `at`
+  value does not run it again; a host that relied on an activation to repeat a
+  one-shot activates a version with another `at`. Runs already stored under
+  the old ids are not found by the new rule: the first activation after the
+  upgrade may run a one-shot once more.
+- `SchemaError` gains `Legacy` (a v0.1.0 SQLite file); `Runtime::start_at`
+  reports `run_admitted` to observers, and counts the run in the metrics only
+  through the built-in telemetry observer, as every other admission does.
+
 ## The DSL
 
 The core implements the DSL's semantics; what it does not implement are

@@ -314,10 +314,7 @@ async fn sqlite_read_only_open_never_creates_or_migrates() {
     let legacy = dir.path().join("legacy.sqlite");
     rusqlite::Connection::open(&legacy)
         .unwrap()
-        .execute_batch(&format!(
-            "{} PRAGMA user_version = 1;",
-            include_str!("../migrations/sqlite/001_initial.sql")
-        ))
+        .execute_batch(&format!("{} PRAGMA user_version = 1;", include_str!("../migrations/sqlite/001_initial.sql")))
         .unwrap();
     assert_eq!(schema(SqliteBackend::open_read_only(&legacy).err().unwrap()), SchemaError::Legacy);
     assert_eq!(schema(SqliteBackend::open(&legacy).err().unwrap()), SchemaError::Legacy);

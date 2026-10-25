@@ -210,9 +210,10 @@ async fn race(store: &dyn RunStore, p: &Prepared, k: usize, c: &Cmd) -> (i64, Op
             let version = c.i as u64 + 1;
             let mut arming = Arming::default();
             if version == 1 {
-                arming
-                    .triggers
-                    .insert(SCHEDULE.into(), schedule_trigger(Some(ms / TICK + 2), p.epoch + 1, 0, Mode::of(c.value, c.r)));
+                arming.triggers.insert(
+                    SCHEDULE.into(),
+                    schedule_trigger(Some(ms / TICK + 2), p.epoch + 1, 0, Mode::of(c.value, c.r)),
+                );
             }
             i64::from(store.activate_with(NAME, version, p.epoch, &arming, &Activation::at(0)).await.unwrap().is_some())
         }

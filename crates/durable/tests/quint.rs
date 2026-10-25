@@ -173,7 +173,12 @@ impl Default for Mode {
 impl Mode {
     pub fn of(value: i64, r: usize) -> Self {
         let once = value == 4;
-        Self { catchup: value % 2, rearm: value == 2 || value == 3, once, once_at: if once { i64::try_from(r).expect("a run index") } else { -1 } }
+        Self {
+            catchup: value % 2,
+            rearm: value == 2 || value == 3,
+            once,
+            once_at: if once { i64::try_from(r).expect("a run index") } else { -1 },
+        }
     }
 }
 fn overlap_policy(policy: i64) -> anyhow::Result<Overlap> {

@@ -43,6 +43,9 @@ MODULES = {
         fairness={},
     ),
     "contract_progress_tree": dict(
+        # A state where every run ended is legitimate: it stutters forever, and
+        # TLC reports it as a deadlock. The check stays on for the other two
+        # quotients, which passed with it before this one was added.
         deadlock=False,
         invariants=["shape"],
         temporal=["L6", "L9"],
@@ -57,10 +60,7 @@ MODULES = {
         fairness={"wfClaim": ["L6"], "wfInternal": ["L6"], "wfNotice": ["L9"]},
     ),
     "contract_progress_trigger": dict(
-        # A state where every run ended and nothing is armed is legitimate:
-        # it stutters forever, so TLC's deadlock check is off for this
-        # quotient (and the tree's) only. `contract_progress` keeps it on.
-        deadlock=False,
+        deadlock=True,
         invariants=["L8_dormant", "L10_stable", "shape"],
         temporal=["L7", "L8", "L10"],
         mutants={

@@ -390,7 +390,12 @@ lease expiry, bounded clock jump, storage disconnect, invalid value, intervening
 activation and alternate application version. `contract_faults.py` interleaves
 each switch with fault-free steps. `contract_fault_detection.py` couples each row
 to an explicit broken mechanism and records the observed bad-consequence
-footprint. `evidence.py` publishes the matrices in `contract-evidence.json`.
+footprint. `evidence.py` publishes the matrices in `contract-evidence.json`; on
+a checkout without `.results` it republishes the committed sections and sets
+`stale` when a model source changed since they ran (`test_evidence.py`).
+`test_temporal.py` pins the temporal stage's own rules: TLC's deadlock check
+stays on for every quotient but the run tree's (whose terminal states stutter)
+and a clean result needs exit code 0.
 
 ## Running
 
