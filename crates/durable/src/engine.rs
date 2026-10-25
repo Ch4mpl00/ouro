@@ -911,6 +911,21 @@ async fn drain_queues(rows: &mut dyn Transaction, name: &str, now: i64) -> anyho
     Ok(())
 }
 
+/// Drains a definition's deferred queue before anything else is admitted to
+/// it. A clear drains a bounded batch of markers, so a definition past the
+/// batch keeps its marker; without this a later slot of the same trigger, or
+/// another start that takes the room, would pass the buffered slot over.
+/// `contract.qnt`'s `settle` promotes right after the clear, so a buffered slot
+/// always precedes later ones; this is the same order, reached lazily and in
+/// the admitting commit. One point read when nothing is deferred.
+async fn drain_marked(rows: &mut dyn Transaction, name: &str, now: i64) -> anyhow::Result<()> {
+    if get::<bool>(rows, "control_drain", name).await?.is_some() && !is_stopped(rows).await? {
+        rows.delete("control_drain", name).await?;
+        drain_queues(rows, name, now).await?;
+    }
+    Ok(())
+}
+
 async fn drain_pending(rows: &mut dyn Transaction, now: i64, limit: usize) -> anyhow::Result<()> {
     for ((_, name), _) in rows.scan("control_drain", "", None, limit).await? {
         rows.delete("control_drain", &name).await?;
@@ -1009,6 +1024,9 @@ async fn fire(rows: &mut dyn Transaction, f: &Firing<'_>, now: i64, policy: &Pol
         return Ok(Fired::Changed);
     }
     anyhow::ensure!(f.refused.is_none() || f.admit.is_empty(), "a firing admits its runs or records a refusal");
+    if let Some(a) = f.admit.first().or(f.refused.map(|r| &r.admission)) {
+        drain_marked(rows, &a.name, now).await?;
+    }
     let current: Option<Trigger> = get(rows, "trigger", f.key).await?;
     if current.as_ref() != f.expected {
         return Ok(Fired::Changed);
@@ -1558,12 +1576,19 @@ impl RunStore for TransactionalStore {
         self.policy
     }
     async fn admit(&self, a: &Admission, now: i64) -> anyhow::Result<bool> {
-        self.update(|rows| Box::pin(async move { insert(rows, a, now).await })).await
+        self.update(|rows| {
+            Box::pin(async move {
+                drain_marked(rows, &a.name, now).await?;
+                insert(rows, a, now).await
+            })
+        })
+        .await
     }
     async fn start(&self, a: &Admission, now: i64) -> anyhow::Result<Option<Fence>> {
         let owner = &uuid::Uuid::new_v4().to_string();
         self.update(|rows| {
             Box::pin(async move {
+                drain_marked(rows, &a.name, now).await?;
                 let Some(mut s) = admitted(rows, a, now).await? else {
                     return Ok(None);
                 };
