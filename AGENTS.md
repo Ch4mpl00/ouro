@@ -43,6 +43,14 @@ obvious statements.
 - Changing a reference-model rule or regression fixture to make a failing
   implementation pass. Fix the implementation or discuss the rule change.
 
+## Design documents
+
+Non-trivial changes start as a design document in `docs/designs/` (process,
+template and the reviewer rubric there): one long-context session writes it,
+reviewers with no prior context check it, executors implement strictly by it.
+Every caught bug is pinned by a test that fails before the fix, and by the
+Quint model when it is a contract rule.
+
 ## Working here
 
 Do not run build or development-server scripts; assume the dev preview exists.
