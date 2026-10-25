@@ -50,7 +50,7 @@ fn t2_old_completion_cannot_rearm_new_epoch() {
 #[test]
 fn v2_old_epoch_fault_does_not_count_after_reactivation() {
     adapters(|d| {
-        let version = d.block(d.store.save_definition("model", "definition")).unwrap();
+        let version = d.block(d.store.save_definition("model", "definition", ouro_durable::Breaker::Inherit)).unwrap();
         d.block(d.store.activate("model", version.version, 0)).unwrap();
         let mut a = admission("old");
         a.name = "model".into();

@@ -263,6 +263,8 @@ pub struct VersionSummary {
     /// Who activated it and why, when the host said (`Runtime::activate_as`).
     pub activated_by: Option<String>,
     pub activation_note: Option<String>,
+    /// The version's breaker policy (`document.metadata.ouro.breaker`).
+    pub breaker: crate::Breaker,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

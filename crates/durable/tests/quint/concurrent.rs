@@ -234,7 +234,7 @@ fn linearizable<F: PartialEq>(orders: &[(&[usize], &[i64], F)], history: &[Compl
 
 fn run(adapter: Adapter, batch: &Batch, round: usize) -> anyhow::Result<()> {
     let mut driver = StoreDriver::model(adapter)?;
-    driver.initialize()?;
+    driver.initialize([super::DEFAULT_THRESHOLD; 2])?;
     for c in &batch.setup {
         driver.execute(&Command { op: c.op.clone(), r: c.r, w: c.w, i: c.i, value: c.value, fault: 0 })?;
     }

@@ -14,9 +14,9 @@
 //! deduplication, overlap, breaker, expiry) come from the store under test.
 use anyhow::{Context, ensure};
 use ouro_durable::{
-    Activation, Admission, Arming, ChildLink, CommitFault, Compatibility, DefinitionTripped, FaultInjector, Fence,
-    Fired, Firing, IdentityConflict, Overlap, OverlapGuard, Policy, Rearm, Refused, RunSnapshot, RunState, RunStore,
-    TransactionalStore, Trigger, memory::MemoryBackend, sqlite::SqliteBackend,
+    Activation, Admission, Arming, Breaker, ChildLink, CommitFault, Compatibility, DefinitionTripped, FaultInjector,
+    Fence, Fired, Firing, IdentityConflict, Overlap, OverlapGuard, Policy, Rearm, Refused, RunSnapshot, RunState,
+    RunStore, TransactionalStore, Trigger, memory::MemoryBackend, sqlite::SqliteBackend,
 };
 use ows::{
     durable::{CallState, Delivery, Record, StepOutcome, TaskResult},
@@ -69,6 +69,25 @@ fn run_index(id: &str) -> Option<usize> {
 /// share a digest.
 fn content(version: u64) -> u64 {
     if version == 3 { 1 } else { version }
+}
+/// The host's default breaker threshold (the model's `defaultThreshold`): what
+/// the bridge passes to every `finish` and refusal.
+pub const DEFAULT_THRESHOLD: i64 = 2;
+/// The stored policy of a model policy number: 0 is `off`, the default is a
+/// version that names none (`Inherit`), any other number a threshold.
+fn breaker_of(policy: i64) -> Breaker {
+    match policy {
+        0 => Breaker::Off,
+        DEFAULT_THRESHOLD => Breaker::Inherit,
+        n => Breaker::Threshold(u32::try_from(n).expect("a model policy is a small number")),
+    }
+}
+fn policy_of(breaker: Breaker) -> i64 {
+    match breaker {
+        Breaker::Off => 0,
+        Breaker::Inherit => DEFAULT_THRESHOLD,
+        Breaker::Threshold(n) => i64::from(n),
+    }
 }
 /// The text of a model version.
 fn definition_text(version: u64) -> String {
@@ -284,6 +303,8 @@ struct CatalogView {
     breaker: bool,
     /// The content the trip refuses (the model's `content`), 0: not tripped.
     tripped_digest: i64,
+    /// Each stored version's breaker policy: 0 off, n a threshold.
+    policy: Vec<i64>,
     trigger: Option<TriggerView>,
     /// The epochs whose trip has a notice, oldest first.
     notices: Vec<i64>,
@@ -374,6 +395,7 @@ struct ModelCatalog {
     breaker: bool,
     #[serde(rename = "trippedDigest")]
     tripped_digest: i64,
+    policy: Vec<i64>,
     #[serde(rename = "triggerEpoch")]
     trigger_epoch: i64,
     due: i64,
@@ -464,6 +486,7 @@ impl From<Machine> for View {
                 manual: c.manual,
                 breaker: c.breaker,
                 tripped_digest: c.tripped_digest,
+                policy: c.policy,
                 trigger: c.armed.then_some(TriggerView {
                     overlap: c.overlap,
                     max_runs: c.max_runs,
@@ -581,6 +604,7 @@ impl State<StoreDriver> for View {
                 manual: defs.tripped.as_ref().is_some_and(|t| t.manual.is_some()),
                 breaker: defs.tripped.as_ref().is_some_and(|t| t.breaker),
                 tripped_digest: defs.tripped.as_ref().map_or(Ok(0), |t| content_of(&t.digest))?,
+                policy: defs.versions.values().map(|d| policy_of(d.breaker)).collect(),
                 trigger,
                 notices,
             },
@@ -742,9 +766,12 @@ impl StoreDriver {
     /// The model's initial catalog: versions 1–3 saved, version 1 (the one
     /// with a schedule) active in epoch 1, its trigger due at tick 2, and the
     /// generic trigger that takes ingress events.
-    pub fn initialize(&mut self) -> anyhow::Result<()> {
+    /// `policy` is the breaker policy of version 1 (and 3, which repeats its
+    /// text) and of version 2, as the model's `initWith` chose them.
+    pub fn initialize(&mut self, policy: [i64; 2]) -> anyhow::Result<()> {
         for v in 1..=3 {
-            self.block(self.store.save_definition(NAME, &definition_text(v)))?;
+            let breaker = breaker_of(policy[usize::from(content(v) == 2)]);
+            self.block(self.store.save_definition(NAME, &definition_text(v), breaker))?;
         }
         let arming = Arming {
             triggers: BTreeMap::from([(SCHEDULE.to_string(), schedule_trigger(Some(2), 1, 0, Mode::default()))]),
@@ -846,16 +873,18 @@ impl Driver for StoreDriver {
     }
     fn step(&mut self, step: &Step) -> anyhow::Result<()> {
         *self.coverage.lock().unwrap().actions.entry(step.action_taken.clone()).or_default() += 1;
-        if step.action_taken == "init" {
-            let coverage = self.coverage.clone();
-            *self = Self::model(self.adapter)?;
-            self.coverage = coverage;
-            return self.initialize();
-        }
         macro_rules! pick {
             ($name:literal, $ty:ty) => {
                 <$ty>::deserialize(step.nondet_picks.get($name).context(concat!("missing choice ", $name))?.clone())?
             };
+        }
+        if step.action_taken == "init" {
+            let coverage = self.coverage.clone();
+            *self = Self::model(self.adapter)?;
+            self.coverage = coverage;
+            // The model chose the versions' policies; they travel in the
+            // command's `i` (versions 1 and 3) and `value` (version 2).
+            return self.initialize([pick!("i", i64), pick!("value", i64)]);
         }
         let command = Command {
             op: step.action_taken.clone(),
@@ -1715,7 +1744,7 @@ fn simulation(adapter: Adapter) -> anyhow::Result<()> {
             gen_config: RunConfig {
                 spec: spec_path("contract.qnt").to_string_lossy().into_owned(),
                 main: None,
-                init: None,
+                init: Some("initAny".into()),
                 step: None,
                 max_samples: Some(std::env::var("QUINT_SAMPLES").ok().map(|v| v.parse()).transpose()?.unwrap_or(100)),
                 max_steps: Some(150),

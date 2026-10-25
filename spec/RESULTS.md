@@ -910,3 +910,12 @@ still reloads real store snapshots.
 The Docker startup helper initially checked TCP acceptance, which can precede
 gRPC readiness and trigger Quint's fallback downloader. It now waits for the
 server's ready message; the default Docker/TLC path was rerun successfully.
+
+## Evidence for the per-definition breaker policy
+
+`contract.qnt` changed with the breaker policy, so the mutants, fault
+tolerance, fault detection and temporal stages were rerun natively (portable
+JDK, Apalache 0.62.4 server, TLC) and `contract-evidence.json` regenerated.
+No violation of a baseline and no undetected mutant: contract-mutants 445.8 s,
+contract-faults 340.7 s, contract-fault-detection 80.2 s, contract-temporal
+535.6 s. `test_evidence.py` and `test_temporal.py` pass.

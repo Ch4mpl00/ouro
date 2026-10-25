@@ -905,6 +905,9 @@ struct Queued {
     admission: Admission,
     rearm: Option<Rearm>,
     max_concurrent_runs: usize,
+    /// A refused slot's fault and the host default threshold that came with
+    /// it. The default is only what `Inherit` resolves to at promotion; the
+    /// active version's own policy is read then (`breaker`), never pinned here.
     failure: Option<(WorkflowError, u32)>,
 }
 async fn queued(rows: &mut dyn Transaction, k: &str) -> anyhow::Result<Option<Queued>> {
@@ -1374,12 +1377,19 @@ fn notice_key(name: &str, trip: &Trip) -> String {
 /// while the breaker has not tripped. A trip reports, and nothing else: the
 /// active version and the epoch stay, the triggers go, and the notice is
 /// stored in this commit, so a trip is never committed unreported.
+///
+/// The threshold is the active version's own policy (`Definition::breaker`,
+/// part of its text and digest), resolved here, in the commit that counts the
+/// fault: `Inherit` takes `default`, the host's threshold the caller passes;
+/// `Off` counts and never trips. Resolving it at the observation, not at
+/// admission or when a slot is buffered, makes every path (a terminal fault, a
+/// refused slot, a queued refusal at promotion) judge by the same version.
 async fn breaker(
     rows: &mut dyn Transaction,
     run: &SavedRun,
     fault: Option<&WorkflowError>,
     success: bool,
-    threshold: u32,
+    default: u32,
     now: i64,
 ) -> anyhow::Result<()> {
     let name = &run.admission.name;
@@ -1393,8 +1403,10 @@ async fn breaker(
         None if success && defs.consecutive_faults > 0 => defs.consecutive_faults = 0,
         Some(reason) => {
             defs.consecutive_faults = defs.consecutive_faults.saturating_add(1);
-            let threshold = threshold.max(1);
-            if defs.consecutive_faults >= threshold {
+            let policy = defs.versions.get(&run.admission.version).map_or(Breaker::Inherit, |d| d.breaker);
+            if let Some(threshold) = policy.effective(default)
+                && defs.consecutive_faults >= threshold
+            {
                 let trip = Trip {
                     manual: None,
                     breaker: true,
@@ -2240,7 +2252,7 @@ impl RunStore for TransactionalStore {
         .await
     }
 
-    async fn save_definition(&self, name: &str, yaml: &str) -> anyhow::Result<Definition> {
+    async fn save_definition(&self, name: &str, yaml: &str, breaker: Breaker) -> anyhow::Result<Definition> {
         self.update(|rows| {
             Box::pin(async move {
                 let mut defs = load_definitions(rows, name).await?.unwrap_or_default();
@@ -2249,7 +2261,7 @@ impl RunStore for TransactionalStore {
                     .last_key_value()
                     .map_or(Some(1), |(v, _)| v.checked_add(1))
                     .ok_or_else(|| anyhow::anyhow!("definition version overflow"))?;
-                let d = Definition { name: name.into(), version, yaml: yaml.into(), digest: digest_of(yaml) };
+                let d = Definition { name: name.into(), version, yaml: yaml.into(), digest: digest_of(yaml), breaker };
                 defs.versions.insert(version, d.clone());
                 store_definitions(rows, name, &defs).await?;
                 Ok(d)
@@ -2382,6 +2394,7 @@ async fn definition_summary(
                     activated_epoch: latest.map(|a| a.epoch),
                     activated_by: latest.and_then(|a| a.actor.clone()),
                     activation_note: latest.and_then(|a| a.note.clone()),
+                    breaker: d.breaker,
                 }
             })
             .collect(),

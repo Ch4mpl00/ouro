@@ -37,7 +37,10 @@ module contract {
   // `manual`: an operator's pause stands, which refuses every version.
   // `breaker`: the breaker tripped (a pause may stand on top of its trip;
   // resuming lifts the pause alone).
-  type Catalog = { active: int, epoch: int, faults: int, tripped: bool, manual: bool, breaker: bool, trippedDigest: int,
+  // `policy`: each stored version's breaker policy (design 04), indexed by
+  // version - 1: 0 is `off`, n >= 1 trips at n consecutive faults. A policy is
+  // part of the text, so versions of the same content share it (`content`).
+  type Catalog = { active: int, epoch: int, faults: int, tripped: bool, manual: bool, breaker: bool, trippedDigest: int, policy: List[int],
     triggerEpoch: int, due: int, slot: int, running: int, catchup: int, rearm: bool, once: bool, onceAt: int,
     armed: bool, notices: List[int], overlap: int, maxRuns: int, queued: int, queueSlot: int, queueInput: int, queueRefused: bool }
   type Durable = { stopped: bool, runs: List[Run], copies: List[Copy], catalog: Catalog,
@@ -59,7 +62,7 @@ module contract {
   pure val emptyLocal: Local = { fence: 0, execution: 0, phase: 0, invocation: 0, stopped: false, permit: false }
   pure val initialDb: Durable = { stopped:false, runs: [emptyRun,emptyRun,emptyRun], copies: [], admissions: [0,0,0], budget: [0,0,0],
     buffered: Set(), fired: Set(), skipped: Set(), ingress: Map(), ingressPayload:Map(), catalog: { active: 1, epoch: 1,
-      faults: 0, tripped: false, manual: false, breaker: false, trippedDigest: 0, triggerEpoch: 1, due: 2, slot: 0, running: -1, catchup: 0, rearm:false, once:false, onceAt:-1,
+      faults: 0, tripped: false, manual: false, breaker: false, trippedDigest: 0, policy: [defaultThreshold,defaultThreshold,defaultThreshold], triggerEpoch: 1, due: 2, slot: 0, running: -1, catchup: 0, rearm:false, once:false, onceAt:-1,
       armed: true, notices: [], overlap:0, maxRuns:2, queued:-1, queueSlot:-1, queueInput:0, queueRefused:false } }
   pure val initial: Machine = { db: initialDb, workers: [emptyLocal,emptyLocal], now: 0,
     sends: [[0,0,0],[0,0,0],[0,0,0]], refusals: [[0,0,0],[0,0,0],[0,0,0]], observations: [], violations: Set(), faultsSeen: Set(), promoted: -1 }
@@ -80,6 +83,13 @@ module contract {
     spends: Map(), legal: true }
   var ideal: Ideal
   pure def content(version: int): int = if (version == 3) 1 else version
+  // The host's default threshold: what a version without a policy (`Inherit`)
+  // trips at. Versions 1 and 3 share a text, hence a policy.
+  pure val defaultThreshold = 2
+  pure def threshold(c: Catalog): int = c.policy.nth(c.active-1)
+  // Whether `faults` consecutive faults trip the active version: its own
+  // threshold, never for `off` (0).
+  pure def trips(c: Catalog, faults: int): bool = threshold(c) > 0 and faults >= threshold(c)
   // The catalog holds versions 1-3; `pinAbsent` admits version 4, which it
   // does not hold and so has no stored digest.
   pure val absent = 4
@@ -154,7 +164,7 @@ module contract {
   pure def refuseRun(s: Machine, r: int, i: int): Machine = {
     val c = s.db.catalog
     val faults = c.faults+1
-    val trip = faults >= 2
+    val trip = trips(c,faults)
     val ended = update(s,r,{ ...s.db.runs.nth(r), outcome:2, ended:s.now })
     observe({ ...ended, db:{ ...ended.db, catalog:{ ...c, faults:faults, tripped:trip, breaker:trip, trippedDigest:if (trip) content(c.active) else 0, armed:c.armed and not(trip),
       due:if (trip) -1 else c.due,queued:if (trip) -1 else c.queued,queueSlot:if (trip) -1 else c.queueSlot, notices:if (trip) c.notices.append(c.epoch) else c.notices } } },"finish",r,i,2,1)
@@ -301,7 +311,7 @@ module contract {
       val faults = if (outcome == 1) 0 else if (outcome >= 2 and outcome <= 4) c.faults+1 else c.faults
       // A tripped breaker observes nothing until the next activation.
       val counted = execution.epoch == c.epoch and not(c.tripped)
-      val trip = counted and faults >= 2
+      val trip = counted and trips(c,faults)
       // A trip only reports: the active version, the epoch and the count stay,
       // its triggers go and its notice is committed with it. The host decides
       // what to activate. It does not forget the schedule's last run.
@@ -560,18 +570,18 @@ module contract {
       (if (qualifying) c.faults+1 else if (execution.outcome == 1) 0 else c.faults) else c.faults
     val breakerCorrect = if (promotedRefusal) {
       val faults = primaryFaults+1
-      d.faults == faults and d.tripped == (faults >= 2) and d.armed == (c.armed and faults < 2) and
-        d.notices == (if (faults >= 2) c.notices.append(c.epoch) else c.notices)
+      d.faults == faults and d.tripped == trips(c,faults) and d.armed == (c.armed and not(trips(c,faults))) and
+        d.notices == (if (trips(c,faults)) c.notices.append(c.epoch) else c.notices)
     } else if (not(terminalObservation)) d.notices == c.notices
       else if (not(observed))
         (if (c.queued >= 0 and d.queued < 0 and a.db.admissions != b.db.admissions)
           d == { ...c,queued:-1,queueSlot:-1,running:c.queued } else c == d)
 
-      else if (qualifying and c.faults == 1) d.faults == 2 and d.tripped and d.due == -1 and not(d.armed) and
+      else if (qualifying and trips(c,c.faults+1)) d.faults == c.faults+1 and d.tripped and d.due == -1 and not(d.armed) and
         d.notices == c.notices.append(c.epoch)
       else d.faults == (if (qualifying) c.faults+1 else if (execution.outcome == 1) 0 else c.faults) and
         not(d.tripped) and d.notices == c.notices
-    val error23 = flag(error22,"V2",(d.faults < 2 or d.tripped) and breakerCorrect and
+    val error23 = flag(error22,"V2",(not(trips(c,d.faults)) or d.tripped or op == "activate") and d.policy == c.policy and breakerCorrect and
       (not(c.tripped) or d.tripped or op == "activate" or (op == "resume" and c.manual and not(c.breaker))) and
       // While tripped, an admission happens only as a pinned start of other
       // content, and such a start (not stopped, run free) always happens. An
@@ -687,7 +697,20 @@ module contract {
     } else s
   }
   pure val noCommand: Command = { r: 0, w: 0, i: 0, value: 0, fault: 0 }
-  action init = all { m' = initial, ideal' = emptyIdeal, command' = { tag: "init", value: noCommand } }
+  // The initial machine, its stored versions carrying breaker policies `a`
+  // (versions 1 and 3, one text) and `b` (version 2). The bridge reads them
+  // from the command's `i` and `value`, since it saves the versions itself.
+  pure def initialWith(a: int, b: int): Machine =
+    { ...initial, db: { ...initialDb, catalog: { ...initialDb.catalog, policy: [a,b,a] } } }
+  action initWith(a: int, b: int): bool =
+    all { m' = initialWith(a,b), ideal' = emptyIdeal, command' = { tag: "init", value: { r: 0, w: 0, i: a, value: b, fault: 0 } } }
+  action init = initWith(defaultThreshold,defaultThreshold)
+  // Every pair of policies: off, one, the default and a higher threshold.
+  action initAny = {
+    nondet a = Set(0,1,2,3).oneOf()
+    nondet b = Set(0,1,2,3).oneOf()
+    initWith(a,b)
+  }
   // Fault: 0 none; 1 boundary crash; 2 ambiguous commit; 3 duplicate delivery;
   // 4 reordering; 5 racers; 6 expiry; 7 bounded clock jump; 8 disconnect;
   // 9 invalid data; 10 activation; 11 mixed deployment. Concurrent operations

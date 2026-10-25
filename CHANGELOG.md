@@ -6,6 +6,32 @@ store written before such a change must be recreated unless the entry says other
 
 ## Unreleased (since v0.1.0)
 
+### Design 04: breaker threshold per definition
+
+A definition may set its own breaker policy in `document.metadata.ouro.breaker`
+(`off`, or `{ threshold: n }` with `1 <= n <= 1000`); absent, the host's
+`Config::breaker_threshold` applies as before. Under `off` faults are counted
+(`consecutive_faults`) and never trip. Breaking changes, for hosts and store
+adapters:
+
+- `RunStore::save_definition` takes the version's policy: `save_definition(name,
+  yaml, breaker: Breaker)`. `Runtime::save` reads it from the parsed
+  definition; a host that saves text it did not parse passes
+  `Breaker::Inherit`.
+- `Definition` and `control::VersionSummary` gain `breaker: Breaker`
+  (`Inherit`, `Off`, `Threshold(n)`); `ows::model::Workflow` gains `breaker`.
+  The stored shape is additive: a version row without the key reads as
+  `Inherit`, which is exactly what it meant, so no layout version changes and
+  existing stores are read as they are.
+- The threshold arguments of `RunStore::finish` and `Refused::breaker_threshold`
+  are the host's default, used only for versions with no policy of their own;
+  the store resolves the effective threshold from the active version in the
+  commit that counts the fault, and a queued refused slot is judged at
+  promotion by the version active then. `Trip::threshold` is the effective
+  one.
+- The public conformance suite counts four more witnesses; `spec/contract.qnt`
+  models the policy per version (`policy`, `initWith`).
+
 ### Issue #34: host data at admission and host-started children (design 03)
 
 New: `Runtime::start_with(id, name, input, Start { version, host })` admits a

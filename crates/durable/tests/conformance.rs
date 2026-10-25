@@ -247,7 +247,7 @@ async fn definitions_rows_of_an_earlier_layout_are_refused() {
     use ouro_durable::RunStore;
     let backend = Arc::new(MemoryBackend::default());
     let s = TransactionalStore::new(backend.clone());
-    let d = s.save_definition("workflow", "yaml").await.unwrap();
+    let d = s.save_definition("workflow", "yaml", ouro_durable::Breaker::Inherit).await.unwrap();
     s.activate("workflow", d.version, 0).await.unwrap();
     let key = ("definitions".to_string(), "workflow".to_string());
     let before = backend.snapshot().await.unwrap();
@@ -263,7 +263,8 @@ async fn definitions_rows_of_an_earlier_layout_are_refused() {
     let refused = s.definitions("workflow").await.unwrap_err().to_string();
     assert!(refused.contains("unsupported layout"), "{refused}");
     assert!(
-        s.activate("workflow", d.version, 0).await.is_err() && s.save_definition("workflow", "next").await.is_err()
+        s.activate("workflow", d.version, 0).await.is_err()
+            && s.save_definition("workflow", "next", ouro_durable::Breaker::Inherit).await.is_err()
     );
     assert!(s.admit(&conformance::admission("r"), 0).await.is_err(), "admission reads the definition's epoch");
     assert_eq!(backend.snapshot().await.unwrap(), Snapshot { rows: rows.clone() }, "a refused row is left as it is");
@@ -297,6 +298,33 @@ async fn definitions_rows_of_an_earlier_layout_are_refused() {
     assert!(backend.compare_exchange(&before, &rows).await.unwrap());
     let refused = s.definitions("workflow").await.unwrap_err().to_string();
     assert!(refused.contains("unsupported layout 6"), "{refused}");
+}
+
+#[tokio::test]
+async fn a_stored_version_without_a_breaker_policy_is_inherit() {
+    use ouro_durable::{Breaker, RunStore};
+    let backend = Arc::new(MemoryBackend::default());
+    let s = TransactionalStore::new(backend.clone());
+    s.save_definition("workflow", "plain", ouro_durable::Breaker::Inherit).await.unwrap();
+    s.save_definition("workflow", "off", Breaker::Off).await.unwrap();
+    s.save_definition("workflow", "three", Breaker::Threshold(3)).await.unwrap();
+    // The stored shape: `Inherit` is the absence of a policy, so rows saved
+    // before policies existed are byte-for-byte rows of `Inherit` versions.
+    let key = ("definitions".to_string(), "workflow".to_string());
+    let rows = backend.snapshot().await.unwrap().rows;
+    let versions = &rows[&key]["versions"];
+    assert!(versions["1"].get("breaker").is_none(), "{versions}");
+    assert_eq!(versions["2"]["breaker"], serde_json::json!("off"));
+    assert_eq!(versions["3"]["breaker"], serde_json::json!({ "threshold": 3 }));
+    // An old row, written without the key, reads as `Inherit`, with no layout bump.
+    let before = backend.snapshot().await.unwrap();
+    let mut rows = before.rows.clone();
+    for v in ["1", "2", "3"] {
+        rows.get_mut(&key).unwrap()["versions"][v].as_object_mut().unwrap().remove("breaker");
+    }
+    assert!(backend.compare_exchange(&before, &rows).await.unwrap());
+    let versions = s.definitions("workflow").await.unwrap().versions;
+    assert!(versions.values().all(|d| d.breaker == Breaker::Inherit));
 }
 
 #[tokio::test]

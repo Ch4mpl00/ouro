@@ -324,6 +324,45 @@ module contract_witnesses {
   action pauseTrippedResumed = pauseTripped.then(do("resume")).then(execute("pin",2,0,1,5,0))
   run pauseTrippedResumedTest = pauseTrippedResumed.expect(checked and m.db.catalog.tripped and not(m.db.catalog.manual) and
     m.db.catalog.breaker and m.db.admissions == [1,1,1] and m.db.runs.nth(2).version == 2)
+  // A version's own breaker policy (design 04): `off` counts faults past the
+  // default of two and never trips, a threshold of one trips on the first
+  // fault, a threshold above the default holds out until it is reached, and
+  // activating another version applies that version's policy.
+  action fault(r: int): bool = execute("admit",r,0,0,0,0).then(execute("claim",r,0,0,0,0)).then(execute("finish",r,0,0,1,0))
+  action offPolicy = initWith(0,2).then(boot).then(execute("finish",0,0,0,1,0)).then(fault(1)).then(fault(2))
+  run offPolicyTest = offPolicy.expect(checked and not(m.db.catalog.tripped) and m.db.catalog.faults == 3 and
+    m.db.catalog.notices == [] and m.db.catalog.armed and not(m.db.catalog.breaker))
+  action oneFault = initWith(1,2).then(boot).then(execute("finish",0,0,0,1,0))
+  run oneFaultTest = oneFault.expect(checked and m.db.catalog.tripped and m.db.catalog.faults == 1 and
+    m.db.catalog.notices == [1] and not(m.db.catalog.armed))
+  action highThreshold = initWith(3,2).then(boot).then(execute("finish",0,0,0,1,0)).then(fault(1))
+  run highThresholdTest = highThreshold.expect(checked and not(m.db.catalog.tripped) and m.db.catalog.faults == 2 and
+    m.db.catalog.notices == [])
+  action highThresholdTrips = highThreshold.then(fault(2))
+  run highThresholdTripsTest = highThresholdTrips.expect(checked and m.db.catalog.tripped and m.db.catalog.faults == 3 and
+    m.db.catalog.notices == [1])
+  action policyActivated = initWith(0,1).then(execute("activate",0,0,1,0,0)).then(boot).then(execute("finish",0,0,0,1,0))
+  run policyActivatedTest = policyActivated.expect(checked and m.db.catalog.tripped and m.db.catalog.active == 2 and
+    m.db.catalog.epoch == 2 and m.db.catalog.faults == 1 and m.db.catalog.trippedDigest == 2)
+  action offReactivated = policyActivated.then(execute("activate",0,0,0,0,0)).then(fault(1)).then(fault(2))
+  run offReactivatedTest = offReactivated.expect(checked and not(m.db.catalog.tripped) and m.db.catalog.active == 1 and
+    m.db.catalog.epoch == 3 and m.db.catalog.faults == 2)
+  // A queued refused slot is promoted, and its fault counted, under the
+  // active version's policy: `off` never trips on it; a threshold of three
+  // holds out against the default of two.
+  action queuedRefusalWith(a: int): bool = initWith(a,2).then(execute("policy",0,0,1,2,0)).then(ticks(2)).then(do("fire"))
+    .then(ticks(2)).then(execute("refuse",1,0,0,7,0)).then(do("crash")).then(do("claim"))
+    .then(execute("finish",0,0,0,1,0))
+  run queuedRefusalOffTest = queuedRefusalWith(0).expect(checked and m.db.admissions == [1,1,0] and
+    m.db.runs.nth(1).outcome == 2 and not(m.db.catalog.tripped) and m.db.catalog.faults == 2 and
+    m.db.catalog.notices == [] and m.db.catalog.queued == -1)
+  run queuedRefusalHighTest = queuedRefusalWith(3).expect(checked and m.db.admissions == [1,1,0] and
+    m.db.runs.nth(1).outcome == 2 and not(m.db.catalog.tripped) and m.db.catalog.faults == 2 and
+    m.db.catalog.notices == [] and m.db.catalog.queued == -1)
+  run queuedRefusalOneTest = queuedRefusalWith(1).expect(checked and m.db.catalog.tripped and m.db.catalog.faults == 1 and
+    m.db.catalog.notices == [1])
+  action bridgePolicies = offPolicy.then(oneFault).then(highThresholdTrips).then(offReactivated).then(queuedRefusalWith(0))
+    .then(queuedRefusalWith(3)).then(queuedRefusalWith(1))
   // Every history above in one trace (each starts with init), replayed
   // against the stores by crates/durable/tests/quint.rs.
   // The tail of the suite, a run of its own: a single chain this long exceeds
@@ -337,5 +376,5 @@ module contract_witnesses {
     .then(noCatchup).then(overlap).then(ingress).then(ingressExpiry).then(redispatch).then(protectedUnknown)
     .then(notExecuted).then(refusal).then(lostRefusal).then(errorResponse).then(conflict).then(release).then(staleFence).then(admission)
     .then(successResetsBreaker).then(noRollback).then(reactivation).then(broadcast).then(retention).then(budget).then(skipPolicy).then(allowPolicy).then(queuePolicy).then(replacePolicy).then(ceilingPolicy).then(skipCrash).then(allowCrash).then(queueCrash).then(replaceCrash).then(refused).then(oldCompletionPromotes).then(queuedRefusal).then(queuedTargeted)
-    .then(bridgeTail)
+    .then(bridgeTail).then(bridgePolicies)
 }

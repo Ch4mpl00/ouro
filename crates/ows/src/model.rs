@@ -48,8 +48,38 @@ pub struct Workflow {
     /// `document.metadata.ouro.limits`: a tighter jump budget, and what happens
     /// when it runs out.
     pub budget: Budget,
+    /// `document.metadata.ouro.breaker`: this definition's own breaker policy.
+    pub breaker: Breaker,
     /// The definition as parsed, exposed as `$workflow.definition`.
     pub definition: Value,
+}
+
+/// `document.metadata.ouro.breaker` (an extension): how many consecutive
+/// faults of the active version trip the definition. `Inherit` (absent) takes
+/// the host's default threshold; `Off` counts faults and never trips. The
+/// policy is part of the definition's text, hence of its digest.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Breaker {
+    #[default]
+    Inherit,
+    Off,
+    Threshold(u32),
+}
+
+impl Breaker {
+    /// The highest `threshold` a definition may name.
+    pub const MAX_THRESHOLD: u32 = 1000;
+
+    /// The number of consecutive faults that trips under this policy, given
+    /// the host's `default`: `None` never trips.
+    pub fn effective(self, default: u32) -> Option<u32> {
+        match self {
+            Breaker::Inherit => Some(default.max(1)),
+            Breaker::Off => None,
+            Breaker::Threshold(n) => Some(n.max(1)),
+        }
+    }
 }
 
 /// `document.metadata.ouro.limits` (an extension: the OWS document admits no other
@@ -500,7 +530,7 @@ fn problem(at: &str, message: impl Into<String>) -> Problem {
 
 /// The keys of `document.metadata.ouro` and of a task's `metadata.ouro`: the
 /// engine's extensions, the only members of `metadata` it reads.
-const DOCUMENT_EXTENSIONS: &[&str] = &["limits", "at", "timezone", "catchup", "overlap"];
+const DOCUMENT_EXTENSIONS: &[&str] = &["limits", "at", "timezone", "catchup", "overlap", "breaker"];
 const TASK_EXTENSIONS: &[&str] = &["delivery", "concurrency", "hold"];
 const COMMON: &[&str] = &["if", "input", "output", "export", "timeout", "then", "metadata"];
 
@@ -690,6 +720,10 @@ impl Parser {
             Some(l) => self.budget(l),
             None => Budget::default(),
         };
+        let breaker = match metadata("breaker") {
+            Some(b) => self.breaker(b),
+            None => Breaker::Inherit,
+        };
         Some(Workflow {
             document: document?,
             input,
@@ -699,8 +733,41 @@ impl Parser {
             timeout,
             schedule,
             budget,
+            breaker,
             definition: v.clone(),
         })
+    }
+
+    /// `breaker: off` or `breaker: { threshold: n }`, `1 <= n <= MAX_THRESHOLD`.
+    fn breaker(&mut self, v: &Value) -> Breaker {
+        const AT: &str = "/document/metadata/ouro/breaker";
+        if v.as_str() == Some("off") {
+            return Breaker::Off;
+        }
+        let Some(m) = v.as_object() else {
+            self.fail(AT, "expected `off` or `{ threshold: <n> }`");
+            return Breaker::Inherit;
+        };
+        self.only(m, AT, &["threshold"]);
+        match m.get("threshold") {
+            Some(n) => {
+                let n =
+                    n.as_u64().and_then(|n| u32::try_from(n).ok()).filter(|n| (1..=Breaker::MAX_THRESHOLD).contains(n));
+                if n.is_none() {
+                    self.fail(
+                        &format!("{AT}/threshold"),
+                        format!("expected an integer from 1 to {}", Breaker::MAX_THRESHOLD),
+                    );
+                }
+                n.map_or(Breaker::Inherit, Breaker::Threshold)
+            }
+            None => {
+                if m.is_empty() {
+                    self.fail(AT, "expected `off` or `{ threshold: <n> }`");
+                }
+                Breaker::Inherit
+            }
+        }
     }
 
     fn budget(&mut self, v: &Value) -> Budget {

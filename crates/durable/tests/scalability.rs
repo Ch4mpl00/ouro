@@ -41,8 +41,14 @@ async fn bounds(backend: Arc<dyn AtomicBackend>, metrics: Arc<Metrics>, validati
     let s = TransactionalStore::new(backend.clone());
     let mut a = admission("target:r");
     a.name = "target".into();
-    bounded(&metrics, "save_definition", 0, async || s.save_definition("target", "one").await).await?;
-    let d = bounded(&metrics, "save_definition_existing", 0, async || s.save_definition("target", "two").await).await?;
+    bounded(&metrics, "save_definition", 0, async || {
+        s.save_definition("target", "one", ouro_durable::Breaker::Inherit).await
+    })
+    .await?;
+    let d = bounded(&metrics, "save_definition_existing", 0, async || {
+        s.save_definition("target", "two", ouro_durable::Breaker::Inherit).await
+    })
+    .await?;
     bounded(&metrics, "activate", 0, async || s.activate("target", d.version, 0).await).await?;
     assert_eq!(bounded(&metrics, "definitions", 2, async || s.definitions("target").await).await?.versions.len(), 2);
     a.version = d.version;
@@ -397,7 +403,7 @@ async fn definition_bounds(backend: &Arc<dyn AtomicBackend>, metrics: &Metrics) 
     let s = TransactionalStore::new(backend.clone());
     for n in 0..1_000 {
         let name = format!("catalog{n:04}");
-        s.save_definition(&name, control_definition_yaml()).await?;
+        s.save_definition(&name, control_definition_yaml(), ouro_durable::Breaker::Inherit).await?;
         let mut triggers = BTreeMap::new();
         for kind in ["every", "cron", "after", "on"] {
             triggers.insert(
@@ -748,8 +754,8 @@ async fn decided(backend: &Arc<dyn AtomicBackend>, metrics: &Metrics) -> anyhow:
     assert_eq!(busy, Fired::Busy(first.id.clone()));
     // Activation epochs: arm, re-arm, trip (removing the trigger and storing
     // the notice in the terminal commit), then hand the notice on.
-    let v1 = s.save_definition("decided", "one").await?;
-    let v2 = s.save_definition("decided", "two").await?;
+    let v1 = s.save_definition("decided", "one", ouro_durable::Breaker::Inherit).await?;
+    let v2 = s.save_definition("decided", "two", ouro_durable::Breaker::Inherit).await?;
     let arm = |keys: &[&str]| keys.iter().map(|k| ((*k).to_string(), slot(100))).collect();
     let arming = Arming { triggers: arm(&["decided#a", "decided#b"]) };
     let epoch = s.definitions("decided").await?.epoch;
@@ -839,7 +845,7 @@ async fn decided(backend: &Arc<dyn AtomicBackend>, metrics: &Metrics) -> anyhow:
 
 async fn workers(store: Arc<dyn RunStore>, reopen: ouro_durable::conformance::Reopen) -> anyhow::Result<()> {
     const RUNS: usize = 128;
-    let d = store.save_definition("contention", "yaml").await?;
+    let d = store.save_definition("contention", "yaml", ouro_durable::Breaker::Inherit).await?;
     store.activate("contention", d.version, 0).await?;
     for n in 0..RUNS {
         let mut a = admission(&format!("load:{n:04}"));
@@ -1109,9 +1115,9 @@ async fn index_atomicity(
             .await?
             .unwrap();
         s.save_record(&c, "timer", &Record::Timer { deadline_ms: 42 }, 0).await?;
-        let first = s.save_definition("workflow", "first").await?;
+        let first = s.save_definition("workflow", "first", ouro_durable::Breaker::Inherit).await?;
         s.activate("workflow", first.version, 0).await?;
-        let second = s.save_definition("workflow", "second").await?;
+        let second = s.save_definition("workflow", "second", ouro_durable::Breaker::Inherit).await?;
         let epoch = s.definitions("workflow").await?.epoch;
         if operation == "sweep" {
             s.finish(&p, &Status::Completed(json!(42)), 0, 3).await?;
@@ -1148,7 +1154,9 @@ async fn index_atomicity(
                 "record" => s.save_record(&p, "timer", &Record::Timer { deadline_ms: 42 }, 0).await,
                 "register" => s.register_wait(&p, &["new".into()], 0).await,
                 "unregister" => s.unregister_wait(&p, "event", &["answer".into()], 0).await,
-                "definition" => s.save_definition("workflow", "third").await.map(|_| ()),
+                "definition" => {
+                    s.save_definition("workflow", "third", ouro_durable::Breaker::Inherit).await.map(|_| ())
+                }
                 "activate" => s.activate("workflow", second.version, 0).await,
                 "subscribe" => s.subscribe(&p, "listen", &["answer".into()], 0).await,
                 "publish" => {
@@ -1364,7 +1372,7 @@ async fn control_bounds(backend: &Arc<dyn AtomicBackend>, metrics: &Metrics) -> 
     let now = 2_000_000;
     let mut a = admission("operator:root");
     a.name = "operator".into();
-    s.save_definition("operator", "yaml").await?;
+    s.save_definition("operator", "yaml", ouro_durable::Breaker::Inherit).await?;
     s.activate("operator", 1, 0).await?;
     let f = s.start(&a, now).await?.unwrap();
     bounded(metrics, "control_check_lease", 0, async || s.check_lease(&f, now).await).await?;
@@ -1500,7 +1508,7 @@ async fn control_bounds(backend: &Arc<dyn AtomicBackend>, metrics: &Metrics) -> 
     s.finish(&f, &Status::Completed(json!(42)), now, 3).await?;
     for pause in [false, true] {
         let name = if pause { "operatorpausequeue" } else { "operatorstopqueue" };
-        s.save_definition(name, "yaml").await?;
+        s.save_definition(name, "yaml", ouro_durable::Breaker::Inherit).await?;
         let slot = |n| Trigger { at_ms: Some(now + n), types: vec![], state: json!(n) };
         s.activate_with(name, 1, 0, &Arming { triggers: BTreeMap::from([(name.into(), slot(0))]) }, &Activation::at(0))
             .await?;

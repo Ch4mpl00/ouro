@@ -16,13 +16,38 @@ does not validate on an older engine).
 
 | Where | Keys |
 | --- | --- |
-| `document.metadata.ouro` | `limits`, `at`, `timezone`, `catchup`, `overlap` |
+| `document.metadata.ouro` | `limits`, `at`, `timezone`, `catchup`, `overlap`, `breaker` |
 | a call task's `metadata.ouro` | `delivery`: `at_least_once` or `at_most_once` (tighten only) |
 | a `for` task's `metadata.ouro` | `concurrency`: a positive integer, not with `while` |
 | a `listen` task's `metadata.ouro` | `hold`: a literal ISO 8601 duration |
 
 A known key on another kind of task is a validation error at its
 `…/metadata/ouro/<key>` pointer.
+
+## The breaker policy (an ouro extension)
+
+The runtime trips a definition after `Config::breaker_threshold` (default 3)
+consecutive faults of its active version. A definition may set its own policy
+in `document.metadata.ouro.breaker`, for a host's infrastructure definitions
+that must not stop for a transient outage:
+
+```yaml
+document:
+  metadata:
+    ouro:
+      breaker: off                   # count faults, never trip
+      # breaker: { threshold: 10 }   # trip after 10 consecutive faults (1 to 1000)
+```
+
+Absent, the host's default applies. `off` still counts and reports faults
+(`consecutive_faults`, metrics, observers) but never trips, so the definition
+is admitted however often it faults; an operator can still `pause` it. Any
+other value is a validation error at `/document/metadata/ouro/breaker`, and
+the key is not allowed on a task. The policy is part of the definition's text,
+hence of its digest: changing it is a new version, and the policy in force is
+the one of the active version of the epoch (activating another version applies
+its own). There are no time windows, probing or automatic resets; an
+activation stays the only way to clear a trip.
 
 ## The jump budget (an ouro extension)
 

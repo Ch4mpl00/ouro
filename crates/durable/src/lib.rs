@@ -16,7 +16,7 @@ pub use backend::{
     AtomicBackend, CommitFault, Conflict, FaultInjector, IoCounts, Key, Metrics, ReadOnly, Rows, SchemaError, Snapshot,
     Transaction, TransactionalStore,
 };
-pub use ows::model::Overlap;
+pub use ows::model::{Breaker, Overlap};
 use ows::{
     durable::{Journal, Record},
     run::{Events, Status, WorkflowError},
@@ -275,6 +275,14 @@ pub struct Definition {
     pub yaml: String,
     /// `digest_of(yaml)`, stored with the version when it is saved.
     pub digest: String,
+    /// The breaker policy the definition's text declares
+    /// (`document.metadata.ouro.breaker`), extracted when it is saved. Rows
+    /// saved before the policy existed have none, which is `Inherit`.
+    #[serde(default, skip_serializing_if = "is_inherit")]
+    pub breaker: Breaker,
+}
+fn is_inherit(b: &Breaker) -> bool {
+    *b == Breaker::Inherit
 }
 
 /// The content digest of a definition: the lowercase hex SHA-256 of its
@@ -514,7 +522,8 @@ pub struct Refused {
     pub admission: Admission,
     /// Why it was refused: the run's terminal fault.
     pub error: WorkflowError,
-    /// The breaker threshold the fault counts against, as for `finish`.
+    /// The host's default breaker threshold, as for `finish`: the active
+    /// version's own policy (`Definition::breaker`) takes precedence.
     pub breaker_threshold: u32,
 }
 
@@ -819,7 +828,9 @@ pub trait RunStore: Send + Sync {
     /// epoch feed its breaker in the same commit: a fault (an unhandled
     /// error, a timeout, an unknown outcome) counts, a success resets the
     /// count; cancellation and running out of interruptions do not count.
-    /// At `breaker_threshold` it trips: the definition records the `Trip`,
+    /// At the active version's effective threshold (`Definition::breaker`:
+    /// `Inherit` takes `breaker_threshold`, the host's default; `Off` counts
+    /// and never trips) it trips: the definition records the `Trip`,
     /// its triggers are removed and a `TRIPPED` notice is stored, in that
     /// commit. A tripped breaker observes nothing more until an activation.
     /// It never changes the active version or the epoch.
@@ -867,7 +878,10 @@ pub trait RunStore: Send + Sync {
     async fn get(&self, id: &str) -> anyhow::Result<Option<SavedRun>>;
     async fn list(&self, name: Option<&str>, prefix: &str) -> anyhow::Result<Vec<SavedRun>>;
     async fn inspect(&self, id: &str) -> anyhow::Result<Option<RunSnapshot>>;
-    async fn save_definition(&self, name: &str, yaml: &str) -> anyhow::Result<Definition>;
+    /// Stores `yaml` as the next version of `name`, with the `breaker` policy
+    /// its text declares (the host reads it from the parsed document; text
+    /// the host did not parse has `Breaker::Inherit`).
+    async fn save_definition(&self, name: &str, yaml: &str, breaker: Breaker) -> anyhow::Result<Definition>;
     /// Activates `version` in a new epoch with no triggers, unattributed,
     /// at `now_ms`.
     async fn activate(&self, name: &str, version: u64, now_ms: i64) -> anyhow::Result<()> {

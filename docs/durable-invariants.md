@@ -573,7 +573,12 @@ run contributes at most once. Fault increments the consecutive-fault count;
 success resets it. On reaching threshold `N`, the trip is atomic with the threshold
 observation: the definition records its report (version, epoch, count, threshold,
 the run and its error), stops firing its schedule, and commits one notice for the
-host. Each stored version has a content digest, fixed when it is saved (a
+host. The threshold `N` is a property of the version that faults, the active one:
+its own policy, which is part of its text (`document.metadata.ouro.breaker`:
+`{ threshold: n }` or `off`), or the host's default when it has none. It is
+resolved in the commit that counts the fault, for a terminal fault, a refused
+slot and a queued refusal at its promotion alike. Under `off` faults are still
+counted but never trip: no trip, no notice, the schedule stays armed. Each stored version has a content digest, fixed when it is saved (a
 SHA-256 of the canonical parsed document: formatting, comments and key order
 do not change it, any semantic change does); the trip records the digest of
 the version that tripped, which is the active one. From then on an admission
