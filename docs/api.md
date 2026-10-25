@@ -76,8 +76,10 @@ parsed document in canonical form (compact JSON, keys sorted), so whitespace,
 comments, quoting and key order do not change it and any change of value does.
 It is computed once, when the version is saved, and stored; admissions and
 trips compare stored digests only.
-Starting an existing ID returns the run if it has the same version and
-fails otherwise.
+`start_at` of an existing ID returns the run if it was admitted with the same
+definition and that version and has no host data, and fails otherwise with
+`durable::AdmissionMismatch` (see host data below: a pinned start names no host
+data, so a run that has some is refused).
 
 ### Host data
 

@@ -83,11 +83,12 @@ it with a single write.
 ## Features
 
 - Registered functions with schemas, at-most-once delivery and annotated output: [API](docs/api.md).
+- Host data: facts the host vouches for (tenant, user, permissions), stored with a run, read by its functions, never set or seen by the workflow, also for children a function starts: [API](docs/api.md#host-data).
 - Explicit call outcomes (not executed, unknown, interrupted) instead of guessed retries: [call outcomes](docs/call-outcomes.md).
 - Leases, recovery, schedules, event waits, child runs and breakers on one transactional store contract: [API](docs/api.md).
 - OpenTelemetry spans and metrics, and typed events for your own observers: [observability](docs/observability.md).
 - Operator control: pause, hold, cancel, respond, inspect, with an audited history: [control](docs/control.md).
-- The DSL subset, extensions (jump budget, schedules, overlap policies) and where it is silent: [DSL](docs/dsl.md).
+- The DSL subset, extensions (jump budget, schedules, overlap policies, a breaker policy per definition) and where it is silent: [DSL](docs/dsl.md).
 - SQLite (default, WAL, `synchronous = FULL`), Postgres and memory adapters, async throughout: [storage](docs/storage.md).
 - Dry runs and replay without side effects: [API](docs/api.md).
 
