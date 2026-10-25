@@ -5,7 +5,7 @@
 //! and resources. A process stop releases work; explicit cancellation is a
 //! terminal storage transaction. Lease loss always stops forward progress.
 use crate::{
-    FunctionContext, Output, Registry,
+    ChildError, ChildRef, ChildRefusal, ChildStart, ChildStarter, FunctionContext, HostDataTooLarge, Output, Registry,
     capabilities::{Capabilities, EventSink, ProcessRunner, ResourceResolver, SecretResolver},
     observer::{EventKind, Observer, Observers, RunEvents},
     registry::{Checks, Installed, MissingFunction},
@@ -16,8 +16,8 @@ use async_trait::async_trait;
 use futures::{StreamExt, future::BoxFuture, stream::FuturesUnordered};
 use opentelemetry::{Context, global::BoxedTracer, trace::FutureExt};
 use ouro_durable::{
-    Admission, ChildLink, Clock, Compatibility, Definition, DefinitionTripped, Fence, Lease, RunStore, SavedRun, Swept,
-    SystemClock,
+    Admission, AdmissionMismatch, ChildLink, Clock, Compatibility, Definition, DefinitionTripped, Fence, Lease,
+    RunStore, SavedRun, Swept, SystemClock,
 };
 use ows::{
     durable::{Annotations, CallEntry, CallFailure, CallStatus, Delivery},
@@ -342,19 +342,44 @@ impl Runtime {
     pub(crate) async fn admission(&self, id: &str, name: &str, input: Value) -> anyhow::Result<Admission> {
         self.admitter().active(id, name, input).await
     }
-    /// Persist a run before any execution. `drive` executes it immediately;
-    /// `worker` also picks it up, including after the embedding process restarts.
-    pub async fn start(&self, id: &str, name: &str, input: Value) -> anyhow::Result<SavedRun> {
+    /// `start` with the options of `Start`: a stored version to run instead
+    /// of the active one (`start_at`), and the run's host data. Host data is
+    /// stored with the admission (`durable::HOST`), immutable, read by the
+    /// run's functions (`FunctionContext::host`), never by its expressions,
+    /// and shown only by `Control::inspect` of the run; larger than
+    /// `durable::MAX_HOST_BYTES` it is refused (`HostDataTooLarge`).
+    ///
+    /// Starting an existing id returns that run if it was admitted with the
+    /// same definition, the same version when `start.version` names one, and
+    /// the same host data (absent against present included); otherwise the
+    /// typed `durable::AdmissionMismatch`. The store compares in the
+    /// transaction that reads the run, so of concurrent different starts one
+    /// is stored and the others are refused.
+    pub async fn start_with(&self, id: &str, name: &str, input: Value, start: Start) -> anyhow::Result<SavedRun> {
+        let host = host_data(start.host)?;
         if let Some(saved) = self.store.get(id).await? {
-            anyhow::ensure!(saved.admission.name == name, "run belongs to another definition");
+            saved.admission.joins(name, start.version, host.as_ref())?;
             return Ok(saved);
         }
-        let a = self.admission(id, name, input).await?;
+        let mut a = match start.version {
+            Some(version) => self.admitter().pinned(id, name, version, input).await?,
+            None => self.admission(id, name, input).await?,
+        };
+        if let Some(host) = host {
+            a.runtime[ouro_durable::HOST] = host;
+        }
         let now = self.clock.now_ms();
         if self.store.admit(&a, now).await? {
             self.observers.admitted(&a, None, id, now);
         }
         self.store.get(id).await?.ok_or_else(|| anyhow::anyhow!("admitted run disappeared"))
+    }
+    /// Persist a run before any execution. `drive` executes it immediately;
+    /// `worker` also picks it up, including after the embedding process restarts.
+    /// It has no host data (`start_with`): an existing run with host data is
+    /// refused.
+    pub async fn start(&self, id: &str, name: &str, input: Value) -> anyhow::Result<SavedRun> {
+        self.start_with(id, name, input, Start::default()).await
     }
     /// `start`, at a stored version of `name` instead of the active one,
     /// without activating it: the active version, the activation epoch and
@@ -373,18 +398,7 @@ impl Runtime {
     /// Starting an existing id returns that run if it belongs to `name` and
     /// was admitted at `version` (pinned or not), and fails otherwise.
     pub async fn start_at(&self, id: &str, name: &str, version: u64, input: Value) -> anyhow::Result<SavedRun> {
-        if let Some(saved) = self.store.get(id).await? {
-            let a = &saved.admission;
-            anyhow::ensure!(a.name == name, "run belongs to another definition");
-            anyhow::ensure!(a.version == version, "run was admitted at another version");
-            return Ok(saved);
-        }
-        let a = self.admitter().pinned(id, name, version, input).await?;
-        let now = self.clock.now_ms();
-        if self.store.admit(&a, now).await? {
-            self.observers.admitted(&a, None, id, now);
-        }
-        self.store.get(id).await?.ok_or_else(|| anyhow::anyhow!("admitted run disappeared"))
+        self.start_with(id, name, input, Start { version: Some(version), host: Value::Null }).await
     }
     pub async fn get(&self, id: &str) -> anyhow::Result<Option<SavedRun>> {
         self.store.get(id).await
@@ -486,17 +500,25 @@ impl Runtime {
         id: &str,
         name: &str,
         input: Value,
+        host: Value,
     ) -> anyhow::Result<SavedRun> {
+        let host = host_data(host)?;
         let owner = self.store.get(&parent.run_id).await?.ok_or_else(|| anyhow::anyhow!("unknown parent run"))?;
+        // A child's first commit wins (design 03): a join returns the child as
+        // it was admitted; only another definition is refused.
         let a = if let Some(saved) = self.store.get(id).await? {
-            anyhow::ensure!(saved.admission.name == name, "child definition changed");
+            saved.admission.joins(name, None, saved.admission.host())?;
             saved.admission
         } else {
             let declared = model::parse_yaml(&owner.admission.definition)?.budget;
             let lineage = Lineage::of(&owner.admission, &self.config.limits);
             let lineage = Lineage { max_jumps: declared.max_jumps(lineage.max_jumps), ..lineage };
             let child = lineage.child(&self.config.limits).map_err(|e| anyhow::anyhow!("{e}"))?;
-            self.admitter().active_in(id, name, input, &child).await?
+            let mut a = self.admitter().active_in(id, name, input, &child).await?;
+            if let Some(host) = host {
+                a.runtime[ouro_durable::HOST] = host;
+            }
+            a
         };
         let link = ChildLink { parent: parent.run_id.clone(), key: key.into(), reference: key.into() };
         let now = self.clock.now_ms();
@@ -638,6 +660,7 @@ impl Runtime {
                 function_permits: self.function_permits.clone(),
                 lineage,
                 mode: mode.clone(),
+                host: saved.admission.host().cloned().map(Arc::new),
             }),
             observer: events.clone(),
             clock: Arc::new(InterpreterClock(self.clock.clone())),
@@ -1010,6 +1033,43 @@ impl ows::durable::Journal for Preloaded<'_> {
 
 // ── 2. admission ───────────────────────────────────────────────────────────
 
+/// How `Runtime::start_with` admits a run. The default is `start`'s: the
+/// active version, no host data.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Start {
+    /// A stored version to run instead of the active one (`start_at`).
+    pub version: Option<u64>,
+    /// The run's host data (`null`: none), at most `durable::MAX_HOST_BYTES`
+    /// as JSON: stored with its admission, immutable, read by its functions
+    /// (`FunctionContext::host`) and never by its expressions.
+    pub host: Value,
+}
+
+/// Host data as admitted: `None` for `null`; refused past `MAX_HOST_BYTES`
+/// as JSON, before anything is stored.
+fn host_data(host: Value) -> Result<Option<Value>, HostDataTooLarge> {
+    if host.is_null() {
+        return Ok(None);
+    }
+    let bytes = serde_json::to_vec(&host).map_or(usize::MAX, |json| json.len());
+    if bytes > ouro_durable::MAX_HOST_BYTES {
+        return Err(HostDataTooLarge { bytes });
+    }
+    Ok(Some(host))
+}
+
+/// A definition, or a stored version of it, that a start names and the
+/// catalog cannot run: no active version, or no such version. Deterministic,
+/// so a host child refused with it did nothing (`ChildRefusal::Inadmissible`).
+#[derive(Debug)]
+pub(crate) struct UnknownDefinition(String);
+impl std::fmt::Display for UnknownDefinition {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+impl std::error::Error for UnknownDefinition {}
+
 /// Builds admissions: the definition version, its input, and the bindings
 /// (function schemas and delivery, external schemas) the run keeps.
 #[derive(Clone)]
@@ -1175,12 +1235,22 @@ impl Admitter {
     /// iff the definition is tripped on that version's content,
     /// marked as pinned (`Runtime::start_at`).
     pub async fn pinned(&self, id: &str, name: &str, version: u64, input: Value) -> anyhow::Result<Admission> {
+        self.pinned_in(id, name, version, input, &self.root()).await
+    }
+    /// `pinned` at a place in a run tree (a host function's child).
+    pub async fn pinned_in(
+        &self,
+        id: &str,
+        name: &str,
+        version: u64,
+        input: Value,
+        lineage: &Lineage,
+    ) -> anyhow::Result<Admission> {
         let mut definitions = self.definitions.definitions(name).await?;
-        let d = definitions
-            .versions
-            .remove(&version)
-            .ok_or_else(|| anyhow::anyhow!("unknown definition version {version} of {name}"))?;
-        let mut admission = self.of(id, &d, input, &self.root()).await?;
+        let d = definitions.versions.remove(&version).ok_or_else(|| {
+            anyhow::Error::new(UnknownDefinition(format!("unknown definition version {version} of {name}")))
+        })?;
+        let mut admission = self.of(id, &d, input, lineage).await?;
         admission.runtime[ouro_durable::PINNED] = json!(true);
         Ok(admission)
     }
@@ -1200,7 +1270,7 @@ impl Admitter {
         definitions
             .active
             .and_then(|v| definitions.versions.remove(&v))
-            .ok_or_else(|| anyhow::anyhow!("no active definition for {name}"))
+            .ok_or_else(|| anyhow::Error::new(UnknownDefinition(format!("no active definition for {name}"))))
     }
     /// A run of `d`: checked (`MissingFunction`), validated
     /// (`InvalidDefinition`) and bound.
@@ -1368,6 +1438,8 @@ pub(crate) struct ExecutionFunctions {
     /// owned children inherit.
     pub lineage: Lineage,
     pub mode: Mode,
+    /// The run's host data, which every call's context carries.
+    pub host: Option<Arc<Value>>,
 }
 impl ExecutionFunctions {
     /// A function call or, with `process`, a process run: replayed, mocked
@@ -1392,12 +1464,28 @@ impl ExecutionFunctions {
         // interpreter reported its dispatch.
         let span = self.events.call_context(info.reference).unwrap_or_else(Context::current);
         let (definition, version) = &self.definition;
+        let idempotency_key = serde_json::to_string(&(info.run_id, info.logical)).expect("string tuple serializes");
+        // A registered function's handler may start host children; a process
+        // runner may not, and replay dispatches nothing.
+        let children: Option<Arc<dyn ChildStarter>> = match (&self.mode, process) {
+            (Mode::Live | Mode::Dry { .. }, None) => Some(Arc::new(HostChildren {
+                lease: self.lease.clone(),
+                admitter: self.admitter.clone(),
+                events: self.events.clone(),
+                lineage: self.lineage,
+                run_id: info.run_id.into(),
+                idempotency_key: idempotency_key.clone(),
+                logical: info.logical.into(),
+                reference: info.reference.into(),
+            })),
+            _ => None,
+        };
         let context = FunctionContext {
             cancel: info.cancel.clone(),
             run_id: info.run_id.into(),
             task_path: info.reference.into(),
             attempt: info.attempt,
-            idempotency_key: serde_json::to_string(&(info.run_id, info.logical)).expect("string tuple serializes"),
+            idempotency_key,
             span,
             input: info.input.clone(),
             function: name.into(),
@@ -1405,6 +1493,8 @@ impl ExecutionFunctions {
             version: *version,
             delivery: info.delivery,
             meter: self.metrics.meter.clone(),
+            host: self.host.clone(),
+            children,
         };
         let result = async {
             if let Mode::Replay { .. } = &self.mode {
@@ -1443,7 +1533,8 @@ impl ExecutionFunctions {
                 // The dry run's guarantee: a call the host's rule marks is
                 // answered here and never reaches its handler or runner.
                 Mode::Dry { mock, mocked } if mock.mocks(name, &args) => {
-                    let output = mock.response(name, &args, &context);
+                    // A mocked call runs no handler, so it starts no child.
+                    let output = mock.response(name, &args, &FunctionContext { children: None, ..context.clone() });
                     mocked.lock().unwrap().push(RecordedCall {
                         task_path: info.reference.into(),
                         logical: info.logical.into(),
@@ -1563,6 +1654,77 @@ impl std::fmt::Display for Refused {
     }
 }
 impl std::error::Error for Refused {}
+
+/// `FunctionContext::start_child` for one call of a registered function:
+/// an owned child of the run the call serves, which the host vouches for.
+struct HostChildren {
+    lease: Arc<Lease>,
+    admitter: Admitter,
+    events: Arc<RunEvents>,
+    lineage: Lineage,
+    run_id: String,
+    idempotency_key: String,
+    logical: String,
+    reference: String,
+}
+#[async_trait]
+impl ChildStarter for HostChildren {
+    async fn start_child(&self, child: ChildStart) -> Result<ChildRef, ChildError> {
+        let host = host_data(child.host).map_err(|e| ChildError::Refused(ChildRefusal::HostData(e)))?;
+        let lineage =
+            self.lineage.child(&self.admitter.limits).map_err(|e| ChildError::Refused(ChildRefusal::Depth(e)))?;
+        let store = &self.lease.store;
+        // Derived from the call's idempotency key, so a re-dispatch of the
+        // call (at least once) names the same child (`FunctionContext::child_id`).
+        let id = crate::registry::host_child_id(&self.run_id, &self.idempotency_key, &child.key);
+        let key = format!("{}/{}", self.logical, child.key);
+        // The first commit wins: a re-dispatch that computed other input,
+        // version or host data joins the child as it was admitted (the store
+        // applies the same rule in the child's commit, `start_child`).
+        let a = match store.get(&id).await.map_err(ChildError::Interrupted)? {
+            Some(saved) => {
+                saved
+                    .admission
+                    .joins(&child.name, None, saved.admission.host())
+                    .map_err(|m| ChildError::Refused(ChildRefusal::Mismatch(m)))?;
+                saved.admission
+            }
+            None => {
+                let admitted = match child.version {
+                    Some(version) => self.admitter.pinned_in(&id, &child.name, version, child.input, &lineage).await,
+                    None => self.admitter.active_in(&id, &child.name, child.input, &lineage).await,
+                };
+                let mut a = admitted.map_err(child_error)?;
+                if let Some(host) = host {
+                    a.runtime[ouro_durable::HOST] = host;
+                }
+                a
+            }
+        };
+        let now = self.lease.clock.now_ms();
+        let link = ChildLink { parent: self.run_id.clone(), key: key.clone(), reference: self.reference.clone() };
+        if let Some(fence) = store.start_child(&self.lease.fence, &a, &link, now).await.map_err(child_error)? {
+            self.events.observers().admitted(&a, Some(&self.run_id), self.events.root(), now);
+            store.release(&fence, now).await.map_err(ChildError::Interrupted)?;
+        }
+        Ok(ChildRef { done: format!("done:{id}"), waiting: format!("waiting:{id}"), id, key })
+    }
+}
+/// A deterministic refusal (nothing was admitted) or, for anything else (a
+/// lost lease, a hold, the emergency stop, storage, a schema resolver that
+/// failed now), an interruption.
+fn child_error(e: anyhow::Error) -> ChildError {
+    if let Some(tripped) = e.downcast_ref::<DefinitionTripped>() {
+        return ChildError::Refused(ChildRefusal::Tripped(tripped.clone()));
+    }
+    if let Some(mismatch) = e.downcast_ref::<AdmissionMismatch>() {
+        return ChildError::Refused(ChildRefusal::Mismatch(mismatch.clone()));
+    }
+    if e.is::<MissingFunction>() || e.is::<InvalidDefinition>() || e.is::<UnknownDefinition>() {
+        return ChildError::Refused(ChildRefusal::Inadmissible(e));
+    }
+    ChildError::Interrupted(e)
+}
 
 /// Replay's journal: a recorded budget decision is saved again as it was
 /// (a granted one with no limit, a refused one with none left), so the
