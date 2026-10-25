@@ -114,6 +114,17 @@ impl Runtime {
         mock: Arc<dyn Mock>,
         stop: &CancellationToken,
     ) -> anyhow::Result<DryRun> {
+        self.dry_run_with(yaml, input, None, mock, stop).await
+    }
+    /// `dry_run` with host data for its root (`Runtime::start_with`).
+    pub async fn dry_run_with(
+        &self,
+        yaml: &str,
+        input: Value,
+        _host: Option<Value>,
+        mock: Arc<dyn Mock>,
+        stop: &CancellationToken,
+    ) -> anyhow::Result<DryRun> {
         self.validate(yaml)?;
         let store = Arc::new(ouro_durable::memory::memory());
         let clock = Arc::new(TestClock(std::sync::atomic::AtomicI64::new(self.clock.now_ms())));

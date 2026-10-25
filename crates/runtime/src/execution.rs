@@ -342,6 +342,13 @@ impl Runtime {
     pub(crate) async fn admission(&self, id: &str, name: &str, input: Value) -> anyhow::Result<Admission> {
         self.admitter().active(id, name, input).await
     }
+    /// `start` with the options of `Start`: a pinned version, host data.
+    pub async fn start_with(&self, id: &str, name: &str, input: Value, start: Start) -> anyhow::Result<SavedRun> {
+        match start.version {
+            Some(version) => self.start_at(id, name, version, input).await,
+            None => self.start(id, name, input).await,
+        }
+    }
     /// Persist a run before any execution. `drive` executes it immediately;
     /// `worker` also picks it up, including after the embedding process restarts.
     pub async fn start(&self, id: &str, name: &str, input: Value) -> anyhow::Result<SavedRun> {
@@ -486,6 +493,7 @@ impl Runtime {
         id: &str,
         name: &str,
         input: Value,
+        _host: Value,
     ) -> anyhow::Result<SavedRun> {
         let owner = self.store.get(&parent.run_id).await?.ok_or_else(|| anyhow::anyhow!("unknown parent run"))?;
         let a = if let Some(saved) = self.store.get(id).await? {
@@ -1010,6 +1018,18 @@ impl ows::durable::Journal for Preloaded<'_> {
 
 // ── 2. admission ───────────────────────────────────────────────────────────
 
+/// How `Runtime::start_with` admits a run. The default is `start`'s: the
+/// active version, no host data.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Start {
+    /// A stored version to run instead of the active one (`start_at`).
+    pub version: Option<u64>,
+    /// The run's host data (`null`: none), at most `durable::MAX_HOST_BYTES`
+    /// as JSON: stored with its admission, immutable, read by its functions
+    /// (`FunctionContext::host`) and never by its expressions.
+    pub host: Value,
+}
+
 /// Builds admissions: the definition version, its input, and the bindings
 /// (function schemas and delivery, external schemas) the run keeps.
 #[derive(Clone)]
@@ -1405,6 +1425,8 @@ impl ExecutionFunctions {
             version: *version,
             delivery: info.delivery,
             meter: self.metrics.meter.clone(),
+            host: None,
+            children: None,
         };
         let result = async {
             if let Mode::Replay { .. } = &self.mode {

@@ -789,7 +789,183 @@ pub async fn run_all(factory: impl AsyncFn(&str) -> anyhow::Result<TestStore>) -
     call_outcomes(&factory, &mut report).await?;
     read_only(&factory, &mut report).await?;
     dropped(&factory, &mut report).await?;
+    host_data(&factory, &mut report).await?;
     Ok(report)
+}
+
+/// Host data (`Admission::host`, design 03) on every adapter: a start of an
+/// existing id joins only an equal admission (the definition, the version a
+/// pinned start names, the host data) and refuses another with a typed
+/// `AdmissionMismatch` that writes nothing, in the transaction that reads the
+/// stored run, so racing starts store one. A child join is first commit wins:
+/// only the definition name is compared, the stored admission stays, also
+/// around the child's commit. Control pages redact host data; `inspect` of the
+/// run shows it.
+async fn host_data(
+    factory: &impl AsyncFn(&str) -> anyhow::Result<TestStore>,
+    report: &mut Report,
+) -> anyhow::Result<()> {
+    fn hosted(id: &str, host: Value) -> Admission {
+        let mut a = admission(id);
+        a.runtime[HOST] = host;
+        a
+    }
+    fn mismatch<T: std::fmt::Debug>(result: anyhow::Result<T>) -> Option<AdmissionField> {
+        result.unwrap_err().downcast_ref::<AdmissionMismatch>().map(|m| m.field)
+    }
+    let t = factory("host-data").await?;
+    report.cases += 1;
+    let s = &t.store;
+    let tenant = json!({ "tenant": "a" });
+    assert!(s.admit(&hosted("r", tenant.clone()), 0).await?);
+    assert!(!s.admit(&hosted("r", tenant.clone()), 1).await?, "an equal admission joins");
+    let before = t.backend.snapshot().await?;
+    assert_eq!(mismatch(s.admit(&hosted("r", json!({ "tenant": "b" })), 1).await), Some(AdmissionField::Host));
+    assert_eq!(mismatch(s.admit(&admission("r"), 1).await), Some(AdmissionField::Host));
+    assert_eq!(mismatch(s.start(&admission("r"), 1).await), Some(AdmissionField::Host));
+    let mut other = hosted("r", tenant.clone());
+    other.name = "other".into();
+    assert_eq!(mismatch(s.admit(&other, 1).await), Some(AdmissionField::Name));
+    let mut pinned = hosted("r", tenant.clone());
+    pinned.version = 2;
+    pinned.runtime[PINNED] = json!(true);
+    assert_eq!(mismatch(s.start(&pinned, 1).await), Some(AdmissionField::Version));
+    assert_eq!(t.backend.snapshot().await?, before, "a refused admission writes nothing");
+    // An unpinned start names no version (it follows the active one): it joins.
+    let mut moved = hosted("r", tenant.clone());
+    moved.version = 2;
+    assert!(s.start(&moved, 1).await?.is_none());
+    // `null` is no host data.
+    assert!(s.admit(&admission("plain"), 1).await?);
+    assert!(!s.admit(&hosted("plain", Value::Null), 1).await?);
+    assert_eq!(mismatch(s.admit(&hosted("plain", tenant.clone()), 1).await), Some(AdmissionField::Host));
+    assert_eq!(s.get("r").await?.unwrap().admission, hosted("r", tenant.clone()));
+
+    // A child: the first commit wins. A join with other host data or input
+    // (a re-dispatch that recomputed them) returns the stored child; only
+    // another definition is refused.
+    let p = s.start(&admission("p"), 1).await?.unwrap();
+    let link = ChildLink { parent: "p".into(), key: "/spawn/k".into(), reference: "/spawn".into() };
+    let child = hosted("hostchild:k", json!({ "user": "u" }));
+    let c = s.start_child(&p, &child, &link, 1).await?.unwrap();
+    s.release(&c, 1).await?;
+    assert!(s.start_child(&p, &child, &link, 2).await?.is_none(), "an equal child joins");
+    let mut recomputed = hosted("hostchild:k", json!({ "user": "v" }));
+    recomputed.input = json!({ "n": 2 });
+    assert!(s.start_child(&p, &recomputed, &link, 2).await?.is_none(), "other host data joins");
+    assert!(s.start_child(&p, &admission("hostchild:k"), &link, 2).await?.is_none(), "so does none");
+    let before = t.backend.snapshot().await?;
+    let mut renamed = child.clone();
+    renamed.name = "other".into();
+    assert_eq!(mismatch(s.start_child(&p, &renamed, &link, 2).await), Some(AdmissionField::Name));
+    assert_eq!(t.backend.snapshot().await?, before, "a refused child writes nothing");
+    assert_eq!(s.list(None, "hostchild:").await?.len(), 1);
+    assert_eq!(s.get("hostchild:k").await?.unwrap().admission, child);
+
+    // Control pages and an inspection's children redact host data.
+    let shown = |run: &SavedRun| run.admission.runtime.get(HOST).cloned();
+    let page = s.query_runs(&control::Runs::default(), false, None, 100).await?;
+    assert_eq!(page.items.len(), 4);
+    for run in &page.items {
+        match run.admission.id.as_str() {
+            "p" | "plain" => assert_eq!(shown(run), None),
+            _ => assert_eq!(shown(run), Some(json!(control::REDACTED)), "{}", run.admission.id),
+        }
+    }
+    let inspection = s.inspect_control("p").await?.unwrap();
+    assert_eq!((inspection.host.as_ref(), inspection.children.len()), (None, 1));
+    assert_eq!(shown(&inspection.children[0]), Some(json!(control::REDACTED)));
+    let inspection = s.inspect_control("hostchild:k").await?.unwrap();
+    assert_eq!(inspection.host, Some(json!({ "user": "u" })));
+    assert_eq!(inspection.snapshot.run.admission, child);
+    s.finish(&p, &Status::Completed(json!(0)), 3, 3).await?;
+    let window = control::Runs { since_ms: Some(0), before_ms: Some(i64::MAX), ..control::Runs::default() };
+    let ended = s.query_runs(&window, true, None, 100).await?;
+    assert_eq!(ended.items.len(), 2, "the parent and its cancelled child");
+    assert_eq!(ended.items.iter().filter(|r| shown(r) == Some(json!(control::REDACTED))).count(), 1);
+    assert_eq!(s.get("hostchild:k").await?.unwrap().admission, child, "the stored run is not redacted");
+    audit(&**s).await?;
+    report.operations += 24;
+
+    // Racing starts of one id with two host data: one is stored, the starts
+    // with the same host data join it and the others are refused.
+    let t = factory("host-data-race").await?;
+    report.cases += 1;
+    let barrier = Arc::new(tokio::sync::Barrier::new(6));
+    let racers: Vec<_> = (0..6)
+        .map(|i| {
+            let (reopen, barrier) = (t.reopen.clone(), barrier.clone());
+            tokio::spawn(async move {
+                let store = reopen().await?;
+                barrier.wait().await;
+                anyhow::Ok((i % 2, store.admit(&hosted("raced", json!(i % 2)), 0).await))
+            })
+        })
+        .collect();
+    let mut outcomes = Vec::new();
+    for racer in racers {
+        outcomes.push(racer.await.expect("start racer panicked")?);
+    }
+    let stored = t.store.get("raced").await?.unwrap().admission;
+    let winner = stored.host().and_then(Value::as_i64).unwrap();
+    for (host, outcome) in outcomes {
+        match outcome {
+            Ok(_) => assert_eq!(host, winner, "a start with other host data joined"),
+            Err(e) => {
+                assert_eq!(e.downcast_ref::<AdmissionMismatch>().map(|m| m.field), Some(AdmissionField::Host));
+                assert_ne!(host, winner);
+            }
+        }
+    }
+    assert_eq!(stored, hosted("raced", json!(winner)));
+    report.operations += 6;
+
+    // A crash around the child's commit: the retry (a re-dispatched call,
+    // with recomputed host data) starts the child if nothing committed and
+    // joins it, as first admitted, if the commit did.
+    for point in [
+        CommitFault::BeforeWrite(0),
+        CommitFault::BeforeWrite(1),
+        CommitFault::BeforeWrite(2),
+        CommitFault::BeforeWrite(3),
+        CommitFault::BeforeCommit,
+        CommitFault::AfterCommit,
+    ] {
+        let t = factory("host-child-crash").await?;
+        report.cases += 1;
+        let s = &t.store;
+        let p = s.start(&admission("p"), 0).await?.unwrap();
+        let before = t.backend.snapshot().await?;
+        t.faults.arm(point);
+        let result = s.start_child(&p, &child, &link, 0).await;
+        t.faults.clear();
+        let after = t.backend.snapshot().await?;
+        let reopened = (t.reopen)().await?;
+        if point == CommitFault::AfterCommit {
+            assert!(result.is_err());
+            assert_ne!(before, after);
+            report.crash_points += 1;
+            assert!(reopened.start_child(&p, &recomputed, &link, 1).await?.is_none(), "the retry joins");
+        } else {
+            if result.is_err() {
+                assert_eq!(before, after, "partial child commit at {point:?}");
+                report.crash_points += 1;
+            }
+            let retried = reopened.start_child(&p, &recomputed, &link, 1).await?;
+            assert_eq!(retried.is_some(), result.is_err(), "the retry starts only an uncommitted child");
+        }
+        assert_eq!(mismatch(reopened.start_child(&p, &renamed, &link, 1).await), Some(AdmissionField::Name));
+        // The first commit's host data stays.
+        let first = if result.is_ok() || point == CommitFault::AfterCommit { &child } else { &recomputed };
+        let children = reopened.list(None, "hostchild:").await?;
+        assert_eq!(children.len(), 1);
+        assert_eq!(&children[0].admission, first);
+        assert!(reopened.inspect("p").await?.unwrap().awaits.contains_key("done:hostchild:k"));
+        audit(&*reopened).await?;
+        report.operations += 3;
+    }
+    report.witnesses.insert("host data: roots join an equal admission, a child's first commit wins");
+    Ok(())
 }
 
 /// A combined schedule exercises each kind without a runtime or registry.

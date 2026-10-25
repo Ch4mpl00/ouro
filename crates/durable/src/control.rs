@@ -7,6 +7,10 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 
 pub const MAX_PAGE: usize = 1_000;
+/// What the control queries that return many runs show in place of a run's
+/// host data (`Admission::host`): pages of `list` and `history`, and an
+/// inspection's `children`. Only `inspect` of the run itself returns it.
+pub const REDACTED: &str = "<redacted>";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Request {
@@ -318,6 +322,11 @@ pub struct Inspection {
     /// catalog did not hold that version. What a trip compares admissions by.
     #[serde(default)]
     pub digest: String,
+    /// The host data the run was admitted with (`Admission::host`), also in
+    /// `snapshot.run.admission.runtime`. Only `inspect` of the run itself shows
+    /// it: `list`, `history` and `children` carry `REDACTED` in its place.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<Value>,
     /// The call journal, each call with its annotations.
     pub calls: Vec<CallEntry>,
     /// The calls' numeric annotations summed per name: a run's tokens, its

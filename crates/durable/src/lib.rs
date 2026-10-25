@@ -41,6 +41,14 @@ pub const APPLICATION_VERSION: &str = "application_version";
 /// The admission's runtime binding (`true`) of a run the host started at a
 /// named version instead of the active one (`Admission::pinned`).
 pub const PINNED: &str = "pinned";
+/// The admission's runtime binding that holds the host data of a run
+/// (`Admission::host`): facts the host vouches for (a tenant, a user, a
+/// preset), given at admission, immutable, read by the run's functions and
+/// never by its expressions (`$runtime` is a whitelist that omits it). Absent
+/// (or `null`): the run has none.
+pub const HOST: &str = "host";
+/// The largest host data a run may be admitted with, as JSON bytes.
+pub const MAX_HOST_BYTES: usize = 16 * 1024;
 
 /// A store's time policy. Every time-related guarantee holds under clock
 /// skew between workers of at most `skew_ms`: an owner stops acting `skew_ms`
@@ -83,7 +91,44 @@ impl Admission {
     pub fn application_version(&self) -> Option<&str> {
         self.runtime.get(APPLICATION_VERSION).and_then(Value::as_str)
     }
+    /// The host data the run was admitted with (`HOST`); `None`: it has none.
+    pub fn host(&self) -> Option<&Value> {
+        self.runtime.get(HOST).filter(|host| !host.is_null())
+    }
 }
+
+/// What an admission of an existing run id disagreed on (`AdmissionMismatch`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AdmissionField {
+    /// The definition name.
+    Name,
+    /// The version a pinned start named.
+    Version,
+    /// The host data, compared as given (absent against present included).
+    Host,
+}
+
+/// An admission of a run id that is already stored with another admission:
+/// another definition, another version a pinned start named, or other host
+/// data. Returned by the store in the transaction that reads the stored run,
+/// so of two concurrent different admissions one is stored and the other
+/// gets this; nothing is written. A start of an equal admission joins the run.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AdmissionMismatch {
+    pub id: String,
+    pub field: AdmissionField,
+}
+impl std::fmt::Display for AdmissionMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let field = match self.field {
+            AdmissionField::Name => "definition",
+            AdmissionField::Version => "version",
+            AdmissionField::Host => "host data",
+        };
+        write!(f, "run {} was already admitted with another {field}", self.id)
+    }
+}
+impl std::error::Error for AdmissionMismatch {}
 
 /// The application versions a worker resumes. A run admitted without a
 /// declared version is compatible with every worker, and an undeclared worker

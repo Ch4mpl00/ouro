@@ -1573,6 +1573,7 @@ impl RunStore for TransactionalStore {
                     snapshot,
                     pinned,
                     digest,
+                    host: None,
                     calls,
                     annotations,
                     waits,
