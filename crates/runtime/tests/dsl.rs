@@ -1234,18 +1234,32 @@ async fn a_dsl_retry_starts_a_reserved_child_per_attempt_and_recovery_joins_it()
 
 #[tokio::test]
 async fn child_ids_have_a_fixed_length_at_the_depth_limit() {
-    let f = fixture();
+    // Room for every run of the chain in one pass: a waiting parent of a
+    // waiting child stays due (its child's `waiting:` notice is never taken),
+    // and with the default four slots such parents can take every slot of
+    // a pass ahead of the one run that can progress, depending on id order.
+    let config = Config { max_concurrency: 16, ..Config::default() };
+    let depth = config.limits.max_depth;
+    let registry = registry(Arc::default(), Arc::default());
+    let rt = Runtime::new(
+        Arc::new(durable::memory::memory()),
+        Arc::new(registry),
+        config,
+        Arc::new(Time::default()),
+        tracer(),
+    )
+    .unwrap();
     // Each level runs a child of its own definition until the depth limit
     // refuses one.
     let nest = "do:
   - deeper:
       try: [ { sub: { run: { workflow: { namespace: test, name: nest, version: latest } } } } ]
       catch: { do: [ { bottom: { set: { bottom: true } } } ] }";
-    save(&f.rt, "nest", &doc("nest", nest)).await;
-    f.rt.start("r", "nest", json!({})).await.unwrap();
-    assert!(matches!(settle(&f.rt, "r").await, Some(Status::Completed(_))));
-    let depth = Config::default().limits.max_depth;
-    let children = f.rt.list(Some("nest"), "child:").await.unwrap();
+    save(&rt, "nest", &doc("nest", nest)).await;
+    rt.start("r", "nest", json!({})).await.unwrap();
+    let status = settle(&rt, "r").await;
+    assert!(matches!(status, Some(Status::Completed(_))), "{status:?}");
+    let children = rt.list(Some("nest"), "child:").await.unwrap();
     assert_eq!(children.len(), depth as usize, "one child per level");
     for child in &children {
         assert!(hashed(&child.admission.id, "child:"), "{} bytes", child.admission.id.len());

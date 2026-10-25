@@ -105,10 +105,11 @@ Both initial migrations were replaced before any release or deployment. This
 layout requires a fresh database from the earlier development checkout; there
 is no conversion of that unreleased layout. Applied migrations are immutable
 from the next release onward. The SQL schema is a generic key/value table, so
-the row shapes above (and the interpreter's durable state version, now 14; 12:
+the row shapes above (and the interpreter's durable state version, now 15; 12:
 a run row may be held by an operator; 13: an unknown at-most-once
 outcome is catchable by its type, and recovery restores a refusal; 14: the
-engine's extensions are read from `metadata.ouro`) can
+engine's extensions are read from `metadata.ouro`; 15: child ids are hashed
+per attempt) can
 change without a migration; nothing persisted before them is converted. Each
 run row records the durable state version it was written under, and a row of
 another version (including the earlier one-aggregate-per-run layout) is

@@ -129,8 +129,8 @@ pub enum AdmissionField {
 }
 
 /// An admission of a run id that is already stored with another admission:
-/// another definition, another version a pinned start named, or other host
-/// data. Returned by the store in the transaction that reads the stored run,
+/// another definition, another version a pinned start named, other host
+/// data, or (a child start) another parent link. Returned by the store in the transaction that reads the stored run,
 /// so of two concurrent different admissions one is stored and the other
 /// gets this; nothing is written. A start of an equal admission joins the run.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -850,6 +850,9 @@ pub trait RunStore: Send + Sync {
     /// together. Replaying a link joins the original immutable child: the
     /// first commit wins, so a join compares only the definition name
     /// (`AdmissionMismatch` otherwise), never input, version or host data.
+    /// An id held by a run that is not the child of `link` (another key or
+    /// reference, another parent, a root run) is `AdmissionMismatch` with
+    /// `AdmissionField::Link`, and nothing is written.
     async fn start_child(
         &self,
         parent: &Fence,

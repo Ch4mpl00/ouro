@@ -61,7 +61,8 @@ elephant while the maintainer was away are logged in ouro-agent `docs/designs/LO
     `not_executed`.
   - Child id `hostchild:[<parent run>, <call idempotency key>, <key>]` — a
     prefix distinct from the built-in `child:` ids, stable across a re-dispatch
-    of the same call (R-H3). `ChildRef.key` is the link key
+    of the same call (R-H3). *Superseded by the amendment below: hashed, per
+    attempt.* `ChildRef.key` is the link key
     `<call logical id>/<key>`; pass it to the built-in `child_outcome`.
   - `FunctionContext::child_id(key: &str) -> String` (added 2026-10-25, for a
     host that writes a record keyed by the child id before starting it): a pure
@@ -98,7 +99,7 @@ elephant while the maintainer was away are logged in ouro-agent `docs/designs/LO
   `runtime.host` replaced by `"<redacted>"` when present. Observer events and
   spans never carry it.
 - **Dry run and replay (R-M2):** `dry_run` takes an optional host value for
-  the root; children started by handlers in a dry run are started in its
+  the root (implemented as `dry_run_with`, see the amendment); children started by handlers in a dry run are started in its
   private store; a mocked call runs no handler, so it starts no child. Replay
   never runs handlers, so it never starts children.
 - **Triggers (R-M6):** scheduled and event-fired runs get no host data (non-goal);
@@ -178,3 +179,8 @@ Decided by the elephant (logged in ouro-agent `docs/designs/LOG.md`):
 - `FunctionContext::child_id(key)` follows the new derivation.
 - `dry_run_with(…, host: Option<Value>, …)` is the dry-run entry with host
   data (`dry_run` delegates to it).
+- Implementation notes: `child:` ids of `[run, reference]`,
+  `hostchild:` ids of `[run, reference, key]` (SHA-256 of the compact JSON
+  array, first 128 bits in lowercase hex), durable state version 15, and
+  `AdmissionField::Link` for a link conflict (the id held by a run that is not
+  the parent's child under that key, a root included).

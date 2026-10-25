@@ -502,10 +502,10 @@ impl Runtime {
         input: Value,
         host: Value,
     ) -> anyhow::Result<SavedRun> {
-        let host = host_data(host)?;
         let owner = self.store.get(&parent.run_id).await?.ok_or_else(|| anyhow::anyhow!("unknown parent run"))?;
         // A child's first commit wins (design 03): a join returns the child as
-        // it was admitted; only another definition is refused.
+        // it was admitted, its host data unbounded; only another definition,
+        // or the id held under another link, is refused.
         let a = if let Some(saved) = self.store.get(id).await? {
             saved.admission.joins(name, None, saved.admission.host())?;
             saved.admission
@@ -514,6 +514,7 @@ impl Runtime {
             let lineage = Lineage::of(&owner.admission, &self.config.limits);
             let lineage = Lineage { max_jumps: declared.max_jumps(lineage.max_jumps), ..lineage };
             let child = lineage.child(&self.config.limits).map_err(|e| anyhow::anyhow!("{e}"))?;
+            let host = host_data(host)?;
             let mut a = self.admitter().active_in(id, name, input, &child).await?;
             if let Some(host) = host {
                 a.runtime[ouro_durable::HOST] = host;
@@ -1474,7 +1475,6 @@ impl ExecutionFunctions {
                 events: self.events.clone(),
                 lineage: self.lineage,
                 run_id: info.run_id.into(),
-                idempotency_key: idempotency_key.clone(),
                 logical: info.logical.into(),
                 reference: info.reference.into(),
             })),
@@ -1626,10 +1626,12 @@ impl ExecutionFunctions {
             return Ok(serde_json::to_value(store.child_outcome(info.run_id, key, id).await?)?);
         }
         let name = args["name"].as_str().ok_or_else(|| anyhow::anyhow!("start_child requires name"))?;
-        let id = child_id(info.run_id, info.logical);
+        // The raw reference: a DSL retry attempt starts its own child, a
+        // re-dispatch of this attempt joins the one it started.
+        let id = crate::registry::child_id(info.run_id, info.reference);
         // Replay joins the pinned child even if its active definition changed.
         let a = if let Some(saved) = store.get(&id).await? {
-            anyhow::ensure!(saved.admission.name == name, "child definition changed");
+            saved.admission.joins(name, None, saved.admission.host()).map_err(mismatch)?;
             saved.admission
         } else {
             let lineage = self.lineage.child(&self.admitter.limits).map_err(Refused)?;
@@ -1637,7 +1639,11 @@ impl ExecutionFunctions {
         };
         let now = self.lease.clock.now_ms();
         let link = ChildLink { parent: info.run_id.into(), key: info.logical.into(), reference: info.reference.into() };
-        if let Some(fence) = store.start_child(&self.lease.fence, &a, &link, now).await? {
+        let started = store.start_child(&self.lease.fence, &a, &link, now).await;
+        if let Some(fence) = started.map_err(|e| match e.downcast::<AdmissionMismatch>() {
+            Ok(m) => mismatch(m),
+            Err(e) => e,
+        })? {
             self.events.observers().admitted(&a, Some(info.run_id), self.events.root(), now);
             store.release(&fence, now).await?;
         }
@@ -1654,6 +1660,11 @@ impl std::fmt::Display for Refused {
     }
 }
 impl std::error::Error for Refused {}
+/// A child id held by a run of another definition or under another link: a
+/// definite refusal (nothing was admitted), never an interruption to retry.
+fn mismatch(m: AdmissionMismatch) -> anyhow::Error {
+    Refused(WorkflowError::not_executed(m.to_string())).into()
+}
 
 /// `FunctionContext::start_child` for one call of a registered function:
 /// an owned child of the run the call serves, which the host vouches for.
@@ -1663,20 +1674,19 @@ struct HostChildren {
     events: Arc<RunEvents>,
     lineage: Lineage,
     run_id: String,
-    idempotency_key: String,
     logical: String,
     reference: String,
 }
 #[async_trait]
 impl ChildStarter for HostChildren {
     async fn start_child(&self, child: ChildStart) -> Result<ChildRef, ChildError> {
-        let host = host_data(child.host).map_err(|e| ChildError::Refused(ChildRefusal::HostData(e)))?;
         let lineage =
             self.lineage.child(&self.admitter.limits).map_err(|e| ChildError::Refused(ChildRefusal::Depth(e)))?;
         let store = &self.lease.store;
-        // Derived from the call's idempotency key, so a re-dispatch of the
-        // call (at least once) names the same child (`FunctionContext::child_id`).
-        let id = crate::registry::host_child_id(&self.run_id, &self.idempotency_key, &child.key);
+        // Derived from the call's per-attempt reference, so a re-dispatch of
+        // the call (at least once) in the same attempt names the same child
+        // and a retry attempt its own (`FunctionContext::child_id`).
+        let id = crate::registry::host_child_id(&self.run_id, &self.reference, &child.key);
         let key = format!("{}/{}", self.logical, child.key);
         // The first commit wins: a re-dispatch that computed other input,
         // version or host data joins the child as it was admitted (the store
@@ -1690,6 +1700,9 @@ impl ChildStarter for HostChildren {
                 saved.admission
             }
             None => {
+                // Bounded only for a child it admits: a re-dispatch whose
+                // recomputed host data grew joins the child it started.
+                let host = host_data(child.host).map_err(|e| ChildError::Refused(ChildRefusal::HostData(e)))?;
                 let admitted = match child.version {
                     Some(version) => self.admitter.pinned_in(&id, &child.name, version, child.input, &lineage).await,
                     None => self.admitter.active_in(&id, &child.name, child.input, &lineage).await,
@@ -1759,10 +1772,6 @@ impl ows::durable::Journal for ReplayJournal {
     }
 }
 
-/// A child's run id: its parent and the invocation that started it.
-fn child_id(run_id: &str, key: &str) -> String {
-    format!("child:{}", serde_json::to_string(&(run_id, key)).expect("string tuple serializes"))
-}
 #[async_trait]
 impl run::Events for ExecutionFunctions {
     async fn waiting(&self, id: &str, key: &str, wait: &ows::events::PendingWait) -> anyhow::Result<()> {
@@ -1809,12 +1818,15 @@ impl run::Children for ExecutionFunctions {
         let interrupted = |e: anyhow::Error| CallFailure::Interrupted(WorkflowError::runtime(e.to_string()));
         // A tripped definition admits no child: a definite, typed answer the
         // parent may catch, never a retry. Other storage errors interrupt.
-        let refused = |e: anyhow::Error| match e.downcast_ref::<DefinitionTripped>() {
-            Some(tripped) => CallFailure::NotExecuted(tripped.error()),
-            None => interrupted(e),
-        };
+        let refused =
+            |e: anyhow::Error| match (e.downcast_ref::<DefinitionTripped>(), e.downcast_ref::<AdmissionMismatch>()) {
+                (Some(tripped), _) => CallFailure::NotExecuted(tripped.error()),
+                (None, Some(m)) => CallFailure::NotExecuted(WorkflowError::not_executed(m.to_string())),
+                (None, None) => interrupted(e),
+            };
         let store = &self.lease.store;
-        let id = child_id(run_id, key);
+        // `key` is the task's raw reference: a DSL retry starts a new child.
+        let id = crate::registry::child_id(run_id, key);
         let done = format!("done:{id}");
         // A started child keeps the version it was admitted with.
         let a = match store.get(&id).await.map_err(interrupted)? {

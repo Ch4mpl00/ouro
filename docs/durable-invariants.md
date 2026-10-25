@@ -448,7 +448,11 @@ Fanout atomicity and sink coupling are explicit choices in section 6.
 For `(parent,key)`, at most one child admission and immutable reference is selected.
 Owned-child admission, ownership and completion subscription commit together.
 Recovery joins that child, including if already finished; it does not resolve
-`latest` again or admit another child. Owned links are acyclic, and owned outcome
+`latest` again or admit another child. A child's id is derived from its parent
+and the per-attempt reference that started it (design 03, amendment), so a
+re-dispatch of the same attempt joins it and a DSL retry attempt, a new
+invocation, starts its own; an id held by a run that is not the parent's child
+under that link is refused with a typed `AdmissionMismatch`. Owned links are acyclic, and owned outcome
 queries must match the actual parent/key/child relation. Host data (part of
 `A(r)`, design 03): a child the workflow starts (`run: workflow`, the reserved
 `start_child`) is admitted without host data, whatever its parent's; a child a

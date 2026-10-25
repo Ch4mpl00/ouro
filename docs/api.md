@@ -112,13 +112,20 @@ together with the parent's subscriptions to the child's end, under the same
 ownership, cascade, budget, nesting depth and trip/pause rules as the
 reserved `start_child`; `version` pins a stored version. The workflow joins
 it with `listen` on `done`, or reads its outcome with the reserved
-`child_outcome` (`id` and `key`). Its id is
-`hostchild:[<run>, <call idempotency key>, <key>]`, so a re-dispatch of the
-call joins the same child; `cx.child_id(key)` returns that id without starting
-anything, for a host that keys its own record by it before the start. **The first commit wins**: a join returns the child
+`child_outcome` (`id` and `key`). Its id is `hostchild:` and 32 lowercase
+hex digits: the first 128 bits of the SHA-256 of the JSON array
+`[<run>, <call reference>, <key>]`, where the call reference is the raw,
+per-attempt one (`FunctionContext::task_path`). A re-dispatch of the call in
+the same attempt (after a crash or an interruption) therefore joins the same
+child, while a DSL `retry` attempt, which re-runs the work, starts its own;
+`cx.child_id(key)` returns that id without starting anything, for a host that
+keys its own record by it before the start. The id has the same length at any
+nesting depth. **The first commit wins**: a join returns the child
 as it was admitted, whatever input, version or host data the re-dispatch
-computed (a handler may compute host data from live state); only another
-definition under the same key is refused (`ChildRefusal::Mismatch`).
+computed (a handler may compute host data from live state; the 16 KiB bound
+applies only to a child it admits); only another definition under the same
+key, or the id held by a run that is not this call's child under this key
+(`AdmissionField::Link`), is refused (`ChildRefusal::Mismatch`).
 
 A refusal (`ChildError::Refused`: nesting depth, a tripped or paused
 definition, a mismatch, too much host data, a definition that cannot be
@@ -277,6 +284,13 @@ key, id, name, input, host)`, whose host data is the child's) and as a reserved
 workflow function, for a parent that starts a child, keeps working and
 joins it later: it returns `id`, `key`, `done` and `waiting` event types; a
 parent joins with `listen`, or reads the owned result with `child_outcome`.
+A child a workflow starts (the reserved `start_child`, `run: workflow`) has
+the id `child:` and 32 lowercase hex digits, from the SHA-256 of the JSON
+array `[<run>, <call or task reference>]`: like a host child, the same
+attempt joins it and a DSL `retry` attempt starts its own. An id held by a run
+that is not the parent's child under that key is refused with the typed
+`durable::AdmissionMismatch` (`AdmissionField::Link`), never retried as an
+interruption.
 An owned child never outlives its parent: when the parent ends (completes,
 faults or is cancelled), its live owned descendants are cancelled in the same
 commit, so a parent that finishes without joining stops its child.

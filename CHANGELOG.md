@@ -6,6 +6,34 @@ store written before such a change must be recreated unless the entry says other
 
 ## Unreleased (since v0.1.0)
 
+### Child ids per attempt, fixed-size (design 03 amendment)
+
+A DSL `retry` around a call that started a child (a host function's
+`FunctionContext::start_child`, the reserved `start_child`) re-sent the start
+under the same id with another link, was refused untyped and faulted the run
+after ten interruptions; child ids also grew with every nesting level. Breaking
+changes, for hosts and store adapters:
+
+- Child ids are `child:<32 hex>` (`run: workflow`, the reserved `start_child`)
+  and `hostchild:<32 hex>` (a host function's child): the first 128 bits of the
+  SHA-256 of the JSON array of the parent run id, the per-attempt reference
+  that started it and, for a host child, its key. A re-dispatch of the same
+  attempt joins its child; a DSL retry attempt starts its own.
+  `FunctionContext::child_id(key)` follows (it reads `task_path`, no longer
+  `idempotency_key`). The ids have the same length at every depth.
+- `durable::AdmissionField` gains `Link`: a child start whose id is held by a
+  run that is not the parent's child under that link (another key or attempt,
+  another parent, a root run) is refused with `AdmissionMismatch` by every
+  store (`RunStore::start_child`), which a host function sees as
+  `ChildRefusal::Mismatch` and a workflow as a not-executed answer, never as
+  an interruption. Code matching `AdmissionField` exhaustively adds the arm.
+- A child join is no longer refused for host data past the 16 KiB bound (the
+  bound applies to a child it admits), in `FunctionContext::start_child` and
+  `Runtime::start_child`.
+- The durable state version is 15: run rows of 14 are refused, not converted
+  (a run of 14 resumed now would derive other child ids and start its children
+  again), so a store written before this change must be recreated.
+
 ### Design 04: breaker threshold per definition
 
 A definition may set its own breaker policy in `document.metadata.ouro.breaker`

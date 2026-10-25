@@ -9,6 +9,7 @@ use ouro_runtime::{
     ows::run::Status,
 };
 use serde_json::{Value, json};
+use sha2::Digest;
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicI64, AtomicUsize, Ordering},
@@ -278,7 +279,7 @@ async fn a_host_function_starts_an_owned_child_it_vouches_for() {
     let k = keys.clone();
     registry
         .register(spawner(starts.clone(), move |args, cx| {
-            k.lock().unwrap().push(cx.idempotency_key.clone());
+            k.lock().unwrap().push(cx.task_path.clone());
             vouched(args, cx)
         }))
         .unwrap();
@@ -295,8 +296,11 @@ async fn a_host_function_starts_an_owned_child_it_vouches_for() {
     rt.start_with("p", "parent", json!({}), Start { version: None, host: host.clone() }).await.unwrap();
     assert!(matches!(settle(&rt, &time, "p").await, Some(Status::Completed(_))));
 
-    let key = keys.lock().unwrap()[0].clone();
-    let id = format!("hostchild:{}", serde_json::to_string(&("p", &key, "k")).unwrap());
+    // The documented derivation: the first 128 bits of the SHA-256 of the
+    // JSON array [run, call reference, key], in lowercase hex.
+    let reference = keys.lock().unwrap()[0].clone();
+    let digest = sha2::Sha256::digest(serde_json::to_string(&["p", reference.as_str(), "k"]).unwrap().as_bytes());
+    let id = format!("hostchild:{}", digest[..16].iter().map(|b| format!("{b:02x}")).collect::<String>());
     let started = starts.lock().unwrap()[0].clone().unwrap();
     assert_eq!(started.id, id);
     assert_eq!(started.key, "/do/0/spawn/k");
@@ -619,7 +623,11 @@ async fn a_dsl_retry_starts_a_host_child_per_attempt_and_a_redispatch_joins_it()
     }
     let children = host_children(&rt).await;
     assert_eq!(children.len(), 2, "one child per attempt");
-    assert!(children.iter().all(|c| matches!(c.outcome, Some(Status::Completed(_)))));
+    // Both owned by the parent under the call's logical key, each linked to
+    // the attempt that started it.
+    let links: Vec<_> = children.iter().map(|c| c.child.clone().unwrap()).collect();
+    assert!(links.iter().all(|l| l.parent == "p" && l.key == starts[0].key), "{links:?}");
+    assert_ne!(links[0].reference, links[1].reference);
 }
 
 #[tokio::test]
@@ -642,7 +650,11 @@ async fn host_child_ids_have_a_fixed_length_at_the_depth_limit() {
             }
         }))
         .unwrap();
-    let config = Config::default();
+    // Room for every run of the chain in one pass: a waiting parent of a
+    // waiting child stays due (its child's `waiting:` notice is never taken),
+    // and with the default four slots such parents can take every slot of a
+    // pass ahead of the one run that can progress, depending on id order.
+    let config = Config { max_concurrency: 16, ..Config::default() };
     let depth = config.limits.max_depth;
     assert_eq!(depth, 10, "the default nesting depth");
     let rt = runtime(Arc::new(durable::memory::memory()), registry, config, time.clone());
@@ -658,7 +670,8 @@ async fn host_child_ids_have_a_fixed_length_at_the_depth_limit() {
         do: [ { bottom: { set: { bottom: true } } } ]";
     save(&rt, "nest", &doc("nest", nest)).await;
     rt.start("r", "nest", json!({})).await.unwrap();
-    assert!(matches!(settle(&rt, &time, "r").await, Some(Status::Completed(_))));
+    let status = settle(&rt, &time, "r").await;
+    assert!(matches!(status, Some(Status::Completed(_))), "{status:?}");
     let starts = starts.lock().unwrap().clone();
     assert_eq!(starts.len(), depth as usize + 1);
     assert_eq!(starts.last(), Some(&Err("depth".to_owned())));
