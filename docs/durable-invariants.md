@@ -1154,7 +1154,7 @@ Decision 5 and the epoch rule of decision 3 were revised on 2026-10-24
    never fires.
    Activating a version without `schedule` removes its triggers in that
    transaction; runs already started finish. Missed slots: `catchup: latest`
-   (default, one late run) or `none`. `document.metadata.overlap` selects the
+   (default, one late run) or `none`. `document.metadata.ouro.overlap` selects the
    policy for unfinished runs of the same trigger, including waiting runs and
    runs of earlier epochs: `skip` (default) records a skip, `allow` admits the
    slot concurrently, `queue` durably buffers one slot until the trigger has
@@ -1226,7 +1226,7 @@ Decision 5 and the epoch rule of decision 3 were revised on 2026-10-24
    the same idempotency key. A function that must not be repeated (sending a
    message, charging a card) declares `delivery: at_most_once` when it is
    registered; a call in YAML may tighten its function's delivery
-   (`metadata.delivery: at_most_once`) but never loosen it. "Protected call" in
+   (`metadata.ouro.delivery: at_most_once`) but never loosen it. "Protected call" in
    this document means a call whose effective delivery is at-most-once, and E2
    applies to exactly those. The engine has no read/write classification
    (2026-10-24, issue #13): a dry run's host passes a mock rule (X1), and a

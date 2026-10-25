@@ -5,6 +5,25 @@ protocol clients, processes, authentication and catalogs, which are host
 functions or packs. `src/model.rs` in `ows` lists the supported subset and
 the choices made where the specification is silent (`CHOICE` comments).
 
+## Engine extensions live under `metadata.ouro`
+
+The engine reads its extensions only from an `ouro` object inside `metadata`;
+every other `metadata` key belongs to the host and is never read, validated
+or rejected. `ouro` must be an object (absent or `{}`: no extensions), and a
+key it does not know is a validation error that lists the known ones, so a
+typo never falls back to a default (and a document using a newer extension
+does not validate on an older engine).
+
+| Where | Keys |
+| --- | --- |
+| `document.metadata.ouro` | `limits`, `at`, `timezone`, `catchup`, `overlap` |
+| a call task's `metadata.ouro` | `delivery`: `at_least_once` or `at_most_once` (tighten only) |
+| a `for` task's `metadata.ouro` | `concurrency`: a positive integer, not with `while` |
+| a `listen` task's `metadata.ouro` | `hold`: a literal ISO 8601 duration |
+
+A known key on another kind of task is a validation error at its
+`…/metadata/ouro/<key>` pointer.
+
 ## The jump budget (an ouro extension)
 
 OWS puts no limit on `then:` jumps, so a `switch` that jumps back can loop
@@ -22,19 +41,21 @@ is bounded by its collection and `retry` by its attempts.
   set only by the embedding application; each run is admitted with its budget
   pinned in its runtime bindings (the ceiling for a root, its parent's budget
   for an owned child).
-- **A definition may only tighten it**, in `document.metadata.limits` (the
-  OWS document admits no other property; `metadata` is free-form):
+- **A definition may only tighten it**, in `document.metadata.ouro.limits` (the
+  OWS document admits no other property; `metadata` is free-form, see
+  [Extensions](#engine-extensions-live-under-metadataouro)):
 
   ```yaml
   document:
     metadata:
-      limits:
-        max_jumps: 30            # above the host's ceiling: rejected at validation
-        on_exceeded:             # optional
-          call: report_stuck     # a task (typically a call); the run ends with its output
-          with: { state: '${ . }' }
-        # on_exceeded: end       # end now, with the jumping task's output
-        # omitted: the jumping task raises budget.exhausted (catchable)
+      ouro:
+        limits:
+          max_jumps: 30            # above the host's ceiling: rejected at validation
+          on_exceeded:             # optional
+            call: report_stuck     # a task (typically a call); the run ends with its output
+            with: { state: '${ . }' }
+          # on_exceeded: end       # end now, with the jumping task's output
+          # omitted: the jumping task raises budget.exhausted (catchable)
   ```
 
   The error is `https://open-workflow-specification.org/spec/1.0.0/errors/budget.exhausted`
@@ -96,18 +117,19 @@ is bounded by its collection and `retry` by its attempts.
   fires. The `worker` fires due slots on each tick (`fire_due`, a range
   read of the due index); the trigger moves to its next slot in the commit
   that admits the slot's run, whose id derives from the slot, so concurrent
-  workers start each once. A missed slot under `document.metadata.catchup:
+  workers start each once. A missed slot under `document.metadata.ouro.catchup:
   none` is skipped (the default `latest` runs it once, late). Overlap is
-  selected in `document.metadata.overlap`, for unfinished runs of the same
+  selected in `document.metadata.ouro.overlap`, for unfinished runs of the same
   trigger, waiting runs and earlier epochs included:
 
   ```yaml
   document:
     metadata:
-      overlap: skip    # default: skip with a record
-      # allow         # admit each slot concurrently
-      # queue         # buffer one slot durably; skip later ones
-      # replace       # cancel unfinished runs and their owned children
+      ouro:
+        overlap: skip    # default: skip with a record
+        # allow         # admit each slot concurrently
+        # queue         # buffer one slot durably; skip later ones
+        # replace       # cancel unfinished runs and their owned children
   ```
 
   A slot whose run the host refuses to admit (a `MissingFunction` or an
@@ -150,14 +172,15 @@ is bounded by its collection and `retry` by its attempts.
   `Policy::ingress_ms`, default seven days): one event starts at most one
   run.
 
-  Three extensions of a schedule live in `document.metadata`, because the
+  Three extensions of a schedule live in `document.metadata.ouro`, because the
   official `schedule` object admits no other property:
 
   ```yaml
   document:
     metadata:
-      timezone: Europe/Berlin          # cron on this IANA zone's wall clock; default UTC
-      at: '2030-01-31T09:00:00+01:00'  # a one-shot, instead of a `schedule`
+      ouro:
+        timezone: Europe/Berlin          # cron on this IANA zone's wall clock; default UTC
+        at: '2030-01-31T09:00:00+01:00'  # a one-shot, instead of a `schedule`
   ```
 
   `timezone` applies to `cron` only (the compiled-in tz database of
