@@ -1816,8 +1816,10 @@ impl run::Children for ExecutionFunctions {
         owned: bool,
     ) -> Result<Child, CallFailure> {
         let interrupted = |e: anyhow::Error| CallFailure::Interrupted(WorkflowError::runtime(e.to_string()));
-        // A tripped definition admits no child: a definite, typed answer the
-        // parent may catch, never a retry. Other storage errors interrupt.
+        // A tripped definition admits no child, and an id held by a run of
+        // another definition or under another link is no child of this task:
+        // definite, typed answers the parent may catch, never a retry. Other
+        // storage errors interrupt.
         let refused =
             |e: anyhow::Error| match (e.downcast_ref::<DefinitionTripped>(), e.downcast_ref::<AdmissionMismatch>()) {
                 (Some(tripped), _) => CallFailure::NotExecuted(tripped.error()),
