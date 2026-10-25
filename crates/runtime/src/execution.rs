@@ -182,7 +182,7 @@ impl Runtime {
         )?
         .with_meter(opentelemetry::global::meter("ouro-runtime")))
     }
-    /// Records the runtime's metrics (`ouro.*`, see the README) with this
+    /// Records the runtime's metrics (`ouro.*`, see `docs/observability.md`) with this
     /// meter; without one, none are recorded. The host owns the meter
     /// provider, its exporter and its shutdown. Function handlers get the
     /// same meter in `FunctionContext::meter`.

@@ -24,7 +24,7 @@ caught bug is pinned by a test that fails before the fix (and by the Quint model
 when it is a contract rule) always applies.
 
 The document is the source of truth for intent; code comments keep the "why"
-next to the code it constrains; `README.md` describes what exists.
+next to the code it constrains; `README.md` and the reference pages in `docs/` describe what exists.
 
 ## Template
 
@@ -59,7 +59,7 @@ Each behaviour → the test that pins it (unit, conformance on all adapters,
 model bridge, temporal). Bugs this fixes → tests that fail before the fix.
 
 ## Rollout
-Breaking changes (README section), state/layout version bumps, docs to update.
+Breaking changes (a `CHANGELOG.md` entry), state/layout version bumps, docs to update.
 
 ## Open questions
 For the maintainer; empty when approved.
