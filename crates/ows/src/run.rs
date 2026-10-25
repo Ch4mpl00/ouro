@@ -2587,7 +2587,8 @@ impl Run<'_> {
     /// Publishes the event through the host, recorded like a write call
     /// delivered at least once: the envelope (its generated `id` and `time`
     /// included) is saved before it is handed over, and recovery hands over
-    /// that same envelope again, which receivers deduplicate by `id`. A
+    /// that same envelope again, which receivers deduplicate by `id`; a
+    /// saved refusal (not executed) is restored instead, as a call's is. A
     /// retry attempt reuses an earlier attempt's emitted event. The output
     /// is the envelope.
     async fn emit(
@@ -2604,6 +2605,11 @@ impl Run<'_> {
         let envelope = match &prior {
             Some(Record::Call { function, state: CallState::Done(result), .. }) if function == EMIT => {
                 return result.clone().map_err(Fault::Error);
+            }
+            // A saved refusal is an answer the workflow already acted on,
+            // restored like a call's (only a new attempt hands it over again).
+            Some(Record::Call { function, state: CallState::NotExecuted(error), .. }) if function == EMIT => {
+                return Err(Fault::Error(error.clone()));
             }
             Some(Record::Call { function, arguments, .. }) if function == EMIT => arguments.clone(),
             Some(_) => return Err(Fault::Interrupted(WorkflowError::runtime("invalid emit record"))),
