@@ -232,6 +232,10 @@ async fn annotations_reach_the_journal_the_span_and_the_metrics_and_survive_a_re
     assert_eq!(inspection.annotations["gen_ai.usage.input_tokens"], serde_json::Number::from(3660));
     assert_eq!(inspection.annotations["cost_usd"].as_f64(), Some(0.008));
     assert!(!inspection.annotations.contains_key("gen_ai.request.model"));
+    // The run row keeps the same totals, so a listing needs no inspection;
+    // the restart's restored first call was not counted again.
+    let listed = control.list(&ouro_runtime::control::Runs::default(), None, 10).await.unwrap();
+    assert_eq!(listed.items[0].annotations, inspection.annotations);
     // A replay takes results and annotations from the journal: no call.
     let replay = rt.replay("r", &CancellationToken::new()).await.unwrap();
     assert!(matches!(replay.status, Status::Completed(_)));

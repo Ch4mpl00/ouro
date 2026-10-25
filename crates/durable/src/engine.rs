@@ -9,7 +9,7 @@
 //! root's count commit together without touching the root's run row.
 use crate::*;
 use ows::{
-    durable::{EXCEEDED, VERSION, check_transition},
+    durable::{CallState, EXCEEDED, VERSION, check_transition},
     run::WorkflowError,
 };
 use serde::{Deserialize, de::DeserializeOwned};
@@ -406,6 +406,7 @@ async fn admitted(rows: &mut dyn Transaction, admission: &Admission, now: i64) -
             admitted_ms: now,
             epoch,
             root: None,
+            annotations: Default::default(),
         },
         version: VERSION,
         awaits: BTreeMap::new(),
@@ -1401,7 +1402,7 @@ impl RunStore for TransactionalStore {
                 let span_id = runtime["span_id"].as_str().map(str::to_owned);
                 let snapshot = snapshot(rows, s).await?;
                 let calls = ows::durable::call_journal(&snapshot.records);
-                let annotations = ows::durable::annotation_totals(&calls);
+                let annotations = snapshot.run.annotations.clone();
                 Ok(Some(control::Inspection {
                     snapshot,
                     calls,
@@ -1501,8 +1502,11 @@ impl RunStore for TransactionalStore {
 
     // The fence check reads the run row and the save writes only the record's
     // row, in one serializable commit: an owner replaced before the commit
-    // conflicts and fails the check on retry. Only a run's first record also
-    // writes the run row, to mark evidence for `sweep`.
+    // conflicts and fails the check on retry. A run's first record also
+    // writes the run row, to mark evidence for `sweep`, and so does a call's
+    // answer with numeric annotations, which adds them to the run's totals:
+    // only the save that completes the call does, never a replay of it (a
+    // completed record is immutable, and saving it again changes nothing).
     async fn save_record(&self, f: &Fence, k: &str, r: &Record, now: i64) -> anyhow::Result<()> {
         self.update(|rows| {
             Box::pin(async move {
@@ -1516,14 +1520,25 @@ impl RunStore for TransactionalStore {
                 if matches!(r, Record::Budget { .. } | Record::Exceeded { .. }) {
                     anyhow::ensure!(old.as_ref() == Some(&value), "budget records must be committed by spend");
                 }
+                let mut completed = false;
                 if let Some(old) = &old {
-                    check_transition(&serde_json::from_value(old.clone())?, r)?;
+                    let old: Record = serde_json::from_value(old.clone())?;
+                    check_transition(&old, r)?;
+                    completed = matches!(old, Record::Call { state: CallState::Done(_), .. });
                 }
                 if old.as_ref() != Some(&value) {
                     rows.put(&kind, k, &value).await?;
                 }
-                if !s.evidence {
-                    s.evidence = true;
+                let mut changed = !s.evidence;
+                s.evidence = true;
+                if let Record::Call { state: CallState::Done(_), annotations, .. } = r
+                    && !completed
+                {
+                    let before = s.run.annotations.clone();
+                    ows::durable::accumulate(&mut s.run.annotations, ows::durable::numbers(annotations));
+                    changed |= s.run.annotations != before;
+                }
+                if changed {
                     store_run(rows, &s).await?;
                 }
                 Ok(())

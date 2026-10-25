@@ -60,6 +60,13 @@ non-negative numbers, summed into the `ouro.call.annotations` metric. The
 engine knows nothing about tokens or prices: a backend computes cost from
 the model and token counts, and an application may still annotate its own
 (`cost_usd`). `annotation_totals(&calls)` sums a journal's numbers per name.
+A stored run also keeps its totals on its row (`SavedRun::annotations`):
+the commit that saves a call's answer adds the answer's numbers to them,
+so a restored or replayed call, whose saved answer is never saved anew,
+never counts twice, and they survive `sweep`. They are bounded like one
+call's annotations: a name not yet present is admitted only while the
+totals keep at most 32 names and 4 KB as JSON (later new names are left
+out, in commit order); texts are ignored.
 A handler is generic over its success type (`Value` or `Output`), so one
 that never succeeds names it: `Err::<Value, _>(error)`.
 
@@ -419,7 +426,9 @@ clear. Events may still be accepted into mailboxes while stopped.
 
 `inspect` includes the admitted definition/version, state, lease, waits and
 mailbox copies, call journal (each call with its annotations) and the
-annotations' numeric totals for the run, children (including ended children),
+run row's annotation totals (which `list` and `history` items carry too, as
+`SavedRun::annotations`, and which remain after `sweep` removed the
+journal), children (including ended children),
 and tree jump budget. A terminal run keeps the tree's spent count at its end.
 The `trace_id`/`span_id` the run was admitted in are exposed when there was
 one (Observability). `workers` pages worker heartbeat rows, marking stale
@@ -734,8 +743,8 @@ Both initial migrations were replaced before any release or deployment. This
 layout requires a fresh database from the earlier development checkout; there
 is no conversion of that unreleased layout. Applied migrations are immutable
 from the next release onward. The SQL schema is a generic key/value table, so
-the row shapes above (and the interpreter's durable state version, now 9: a
-call record keeps its annotations) can
+the row shapes above (and the interpreter's durable state version, now 10:
+a run row keeps its calls' annotation totals) can
 change without a migration; nothing persisted before them is converted. Each
 run row records the durable state version it was written under, and a row of
 another version (including the earlier one-aggregate-per-run layout) is

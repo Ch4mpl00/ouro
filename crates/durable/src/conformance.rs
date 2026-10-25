@@ -736,6 +736,7 @@ pub async fn run_all(factory: impl AsyncFn(&str) -> anyhow::Result<TestStore>) -
     control_overlap(&factory, &mut report).await?;
     definition_queries(&factory, &mut report).await?;
     heartbeats(&factory, &mut report).await?;
+    annotation_totals(&factory, &mut report).await?;
     read_only(&factory, &mut report).await?;
     dropped(&factory, &mut report).await?;
     Ok(report)
@@ -1026,6 +1027,82 @@ async fn heartbeats(
     assert_eq!(rows().await?, (0, 0));
     report.operations += 12;
     report.witnesses.insert("one heartbeat row per worker, swept after it stays stale");
+    Ok(())
+}
+
+/// Per-run annotation totals (#22): the run row sums its calls' numeric
+/// annotations in the commit that saves each answer, a replayed save adds
+/// nothing, texts are ignored, the names are bounded like one call's, and
+/// listings, history and inspection return them, after `sweep` too.
+async fn annotation_totals(
+    factory: &impl AsyncFn(&str) -> anyhow::Result<TestStore>,
+    report: &mut Report,
+) -> anyhow::Result<()> {
+    use control::Runs;
+    use ows::durable::{Annotation, CallState, Delivery, MAX_ANNOTATIONS};
+    let t = factory("annotation-totals").await?;
+    report.cases += 1;
+    let s = &t.store;
+    let call = |state: CallState, annotations: &[(&str, Annotation)]| Record::Call {
+        logical: "call".into(),
+        function: "chat".into(),
+        arguments: json!({}),
+        delivery: Delivery::AtLeastOnce,
+        state,
+        annotations: annotations.iter().map(|(k, v)| (k.to_string(), v.clone())).collect(),
+    };
+    let usage = |tokens: u64, cost: f64| {
+        call(
+            CallState::Done(Ok(json!("ok"))),
+            &[("tokens", tokens.into()), ("cost_usd", cost.into()), ("model", "small".into())],
+        )
+    };
+    let f = s.start(&admission("r"), 0).await?.unwrap();
+    s.save_record(&f, "a#call", &call(CallState::Pending, &[]), 1).await?;
+    s.save_record(&f, "a#call", &usage(100, 0.25), 1).await?;
+    // The same answer saved again (a replay after a lost reply) adds nothing.
+    s.save_record(&f, "a#call", &usage(100, 0.25), 2).await?;
+    s.save_record(&f, "b#call", &usage(30, 0.5), 2).await?;
+    // An error answer carries annotations too.
+    let failed = call(CallState::Done(Err(WorkflowError::runtime("no"))), &[("tokens", 5.into())]);
+    s.save_record(&f, "c#call", &failed, 2).await?;
+    let expected: ows::durable::Totals = BTreeMap::from([
+        ("cost_usd".into(), serde_json::Number::from_f64(0.75).unwrap()),
+        ("tokens".into(), 135.into()),
+    ]);
+    let fresh = (t.reopen)().await?;
+    assert_eq!(fresh.get("r").await?.unwrap().annotations, expected);
+    let inspection = fresh.inspect_control("r").await?.unwrap();
+    assert_eq!(inspection.annotations, expected);
+    assert_eq!(inspection.annotations, ows::durable::annotation_totals(&inspection.calls));
+    let listed = fresh.query_runs(&Runs::default(), false, None, 10).await?;
+    assert_eq!(listed.items[0].annotations, expected);
+    s.finish(&f, &Status::Completed(json!(1)), 3, 3).await?;
+    let window = Runs { since_ms: Some(0), before_ms: Some(10), ..Runs::default() };
+    assert_eq!(fresh.query_runs(&window, true, None, 10).await?.items[0].annotations, expected);
+    // Sweeping the evidence removes the journal, not the run's totals.
+    assert!(fresh.sweep(3 + RECORDS_KEPT_MS, RECORDS_KEPT_MS).await?.records > 0);
+    let swept = fresh.inspect_control("r").await?.unwrap();
+    assert!(swept.calls.is_empty());
+    assert_eq!((swept.annotations, swept.snapshot.run.annotations), (expected.clone(), expected));
+
+    // Names beyond the bound are left out; present names keep summing.
+    let f = s.start(&admission("many"), 0).await?.unwrap();
+    for n in 0..=MAX_ANNOTATIONS {
+        let answer = call(CallState::Done(Ok(json!(n))), &[(&format!("k{n:02}"), Annotation::from(1))]);
+        s.save_record(&f, &format!("{n}#call"), &answer, 1).await?;
+    }
+    let answer = call(CallState::Done(Ok(json!(0))), &[("k00", Annotation::from(2))]);
+    s.save_record(&f, "again#call", &answer, 1).await?;
+    let totals = s.get("many").await?.unwrap().annotations;
+    assert_eq!(totals.len(), MAX_ANNOTATIONS);
+    assert!(!totals.contains_key(&format!("k{MAX_ANNOTATIONS:02}")));
+    assert_eq!(totals["k00"], 3.into());
+    // A run without annotated answers keeps none.
+    assert!(s.get("plain").await?.is_none_or(|r| r.annotations.is_empty()));
+    audit(&*fresh).await?;
+    report.operations += 16;
+    report.witnesses.insert("per-run annotation totals, counted once per answer and kept after sweep");
     Ok(())
 }
 

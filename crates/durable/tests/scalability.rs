@@ -56,6 +56,25 @@ async fn bounds(backend: Arc<dyn AtomicBackend>, metrics: Arc<Metrics>, validati
         s.save_record(&f, "timer", &Record::Timer { deadline_ms: 42 }, 1).await
     })
     .await?;
+    // An annotated answer also rewrites its run row (the totals): one more
+    // row written in the same commit, whatever the run or store holds.
+    let chat = |state| Record::Call {
+        logical: "chat".into(),
+        function: "chat".into(),
+        arguments: json!({}),
+        delivery: ows::durable::Delivery::AtLeastOnce,
+        state,
+        annotations: BTreeMap::from([("tokens".to_string(), ows::durable::Annotation::from(7))]),
+    };
+    let answered = chat(ows::durable::CallState::Done(Ok(json!(1))));
+    s.save_record(&admitted, "chat#call", &chat(ows::durable::CallState::Pending), 1).await?;
+    bounded(&metrics, "save_record_annotated", 0, async || s.save_record(&admitted, "chat#call", &answered, 1).await)
+        .await?;
+    bounded(&metrics, "save_record_annotated_replay", 0, async || {
+        s.save_record(&admitted, "chat#call", &answered, 1).await
+    })
+    .await?;
+    assert_eq!(s.get(&other.id).await?.unwrap().annotations["tokens"], 7.into());
     // Full pending inboxes must not turn a missing eligible delivery into a
     // scan over every registration of the same event type.
     for n in 0..64 {
