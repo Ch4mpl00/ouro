@@ -217,6 +217,56 @@ module contract_witnesses {
     .then(execute("finish",1,0,0,1,0))
   run pinnedUncountedTest = pinnedUncounted.expect(checked and m.db.catalog.faults == 0 and not(m.db.catalog.tripped) and
     m.db.admissions == [1,1,0] and m.db.runs.nth(0).epoch == 0 and m.db.runs.nth(1).outcome == 2)
+  // A held run (#29) takes no step: its fenced operations and checkpoints are
+  // refused, it is not claimed, and nothing dispatches. The answer of a call
+  // already dispatched is still recorded, and the owner may give its lease
+  // back. Released, the same run is claimed and goes on from its evidence.
+  action heldSteps = init.then(boot).then(do("intent")).then(do("dispatch")).then(do("hold")).then(do("renew"))
+    .then(at("intent",1)).then(do("result")).then(do("checkpoint")).then(execute("finish",0,0,0,1,0))
+    .then(do("release")).then(ticks(5)).then(do("claim"))
+  run heldStepsTest = heldSteps.expect(checked and m.db.runs.nth(0).held and m.db.runs.nth(0).records == [2,0,0] and
+    m.db.runs.nth(0).frontier == Set() and m.db.runs.nth(0).outcome == 0 and m.db.runs.nth(0).generation == 1 and
+    m.db.runs.nth(0).owner == -1)
+  action heldReleased = heldSteps.then(do("unhold")).then(do("claim"))
+  run heldReleasedTest = heldReleased.expect(checked and not(m.db.runs.nth(0).held) and m.db.runs.nth(0).generation == 2 and
+    m.db.runs.nth(0).owner == 0 and m.db.runs.nth(0).records == [2,0,0])
+  // A dispatch waits for the release: the intent is saved, the world is not touched.
+  action heldDispatch = init.then(boot).then(do("intent")).then(do("hold")).then(do("dispatch"))
+  run heldDispatchTest = heldDispatch.expect(checked and m.sends == [[0,0,0],[0,0,0],[0,0,0]])
+  action heldDispatched = heldDispatch.then(do("unhold")).then(do("dispatch"))
+  run heldDispatchedTest = heldDispatched.expect(checked and m.sends == [[1,0,0],[0,0,0],[0,0,0]] and not(m.db.runs.nth(0).held))
+  // A hold covers the run and its owned descendants; releasing a child alone
+  // leaves its parent held; a cancel ends the tree and the hold with it.
+  action heldTree = init.then(boot).then(do("child")).then(ticks(4)).then(execute("claim",1,1,0,0,0))
+    .then(execute("child",1,1,0,0,0)).then(execute("release",1,1,0,0,0)).then(do("claim")).then(do("hold"))
+  run heldTreeTest = heldTree.expect(checked and Set(0,1,2).forall(r => m.db.runs.nth(r).held))
+  action heldChild = heldTree.then(execute("unhold",1,0,0,0,0))
+  run heldChildTest = heldChild.expect(checked and m.db.runs.nth(0).held and not(m.db.runs.nth(1).held) and
+    not(m.db.runs.nth(2).held))
+  action heldCancelled = heldTree.then(do("cancel"))
+  run heldCancelledTest = heldCancelled.expect(checked and Set(0,1,2).forall(r => not(m.db.runs.nth(r).held) and
+    m.db.runs.nth(r).outcome == 5))
+  // A held run is not claimed, whatever its lease; the release makes it claimable at once.
+  action heldClaim = init.then(do("admit")).then(do("hold")).then(do("claim"))
+  run heldClaimTest = heldClaim.expect(checked and m.db.runs.nth(0).held and m.db.runs.nth(0).generation == 0)
+  action heldClaimed = heldClaim.then(do("unhold")).then(do("claim"))
+  run heldClaimedTest = heldClaimed.expect(checked and not(m.db.runs.nth(0).held) and m.db.runs.nth(0).generation == 1)
+  // An operator's pause (V2) refuses every version, the tripped content and
+  // other content alike, pinned or not, until it is resumed or a version is
+  // activated; a breaker's trip admits other content, and `resume` leaves it.
+  action pause = init.then(execute("activate",0,0,1,0,0)).then(do("pause"))
+  run pauseTest = pause.expect(checked and m.db.catalog.tripped and m.db.catalog.manual and m.db.catalog.trippedDigest == 2 and
+    m.db.catalog.notices == [] and m.db.catalog.active == 2)
+  action pausedRefuses = pause.then(execute("pin",0,0,0,5,0)).then(execute("pin",1,0,1,5,0)).then(execute("admit",2,0,0,5,0))
+  run pausedRefusesTest = pausedRefuses.expect(checked and m.db.admissions == [0,0,0])
+  action resumed = pausedRefuses.then(do("resume")).then(execute("pin",0,0,0,5,0))
+  run resumedTest = resumed.expect(checked and not(m.db.catalog.tripped) and not(m.db.catalog.manual) and
+    m.db.admissions == [1,0,0] and m.db.runs.nth(0).version == 1)
+  action pauseActivated = pause.then(execute("activate",0,0,0,0,0))
+  run pauseActivatedTest = pauseActivated.expect(checked and not(m.db.catalog.tripped) and not(m.db.catalog.manual) and
+    m.db.catalog.active == 1)
+  action resumeKeepsTrip = breaker.then(do("resume"))
+  run resumeKeepsTripTest = resumeKeepsTrip.expect(checked and m.db.catalog.tripped and not(m.db.catalog.manual))
   // Every history above in one trace (each starts with init), replayed
   // against the stores by crates/durable/tests/quint.rs.
   run bridgeSuite = continuation.then(unknown).then(mailbox).then(expiry).then(child).then(childFinish).then(grandchild).then(activation)
@@ -224,4 +274,6 @@ module contract_witnesses {
     .then(noCatchup).then(overlap).then(ingress).then(ingressExpiry).then(redispatch).then(protectedUnknown)
     .then(notExecuted).then(errorResponse).then(conflict).then(release).then(staleFence).then(admission)
     .then(successResetsBreaker).then(noRollback).then(reactivation).then(broadcast).then(retention).then(budget).then(skipPolicy).then(allowPolicy).then(queuePolicy).then(replacePolicy).then(ceilingPolicy).then(skipCrash).then(allowCrash).then(queueCrash).then(replaceCrash).then(refused).then(oldCompletionPromotes).then(queuedRefusal).then(emergencyStop).then(clearStop).then(stoppedQueue).then(resumedQueue).then(oneShot).then(oneShotBusy).then(pinnedAdmitted).then(sameContentRefused).then(pinnedUncounted)
+    .then(heldReleased).then(heldDispatched).then(heldChild).then(heldCancelled).then(heldClaimed).then(resumed)
+    .then(pauseActivated).then(resumeKeepsTrip)
 }

@@ -27,7 +27,7 @@ def main():
         old,new,_=MUTANTS[target]
         if target=="A4":
             source=(ROOT/"contract.qnt").read_text()
-            start=source.index('op == "result" and authorized')
+            start=source.index('op == "result" and answers')
             end=source.index('      observe(',start)
             old=source[start:end]
             new=old.replace(' and value >= 0','').replace('values:execution.values.replaceAt(i,execution.input+i)','values:execution.values.replaceAt(i,value)')

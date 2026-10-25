@@ -62,6 +62,19 @@ MUTANTS = {
  "V2/same-content": ('and not(barred(c,i+1)))\n      observe(pinRun','and true)\n      observe(pinRun',TRIP+[op("pin",r=2,i=2,value=5)]),
  # A pinned run of another version carries the active epoch and so counts.
  "V2/pinned-counts": ('epoch:if (version == c.active) c.epoch else 0','epoch:c.epoch',[op("pin",i=1,value=3),op("claim"),op("finish",fault=0,value=1)]),
+ # An operator's pause admits other content like an automatic trip does, or
+ # its resume lifts a breaker's trip.
+ "V2/manual": ('and not(barred(c,i+1)))\n      observe(pinRun','and not(c.tripped and content(i+1) == c.trippedDigest))\n      observe(pinRun',[op("activate",i=1,value=0),op("pause"),op("pin",r=0,i=0,value=5)]),
+ "V2/resume": ('op == "resume" and value >= 0 and c.tripped and c.manual','op == "resume" and value >= 0 and c.tripped',TRIP+[op("resume")]),
+ # A held run takes a step, is dispatched, or is claimed; a hold misses the
+ # run's owned child, or a release changes more than the hold kept; an ended
+ # run stays held.
+ "H1": ('val authorized = answers and not(execution.held)','val authorized = answers',BOOT+[op("hold"),op("intent")]),
+ "H1/dispatch": ('and not(local.stopped) and not(execution.held) and Set(1,4)','and not(local.stopped) and Set(1,4)',BOOT+[op("intent"),op("hold"),op("dispatch")]),
+ "H2": ('live(execution) and not(execution.held) and execution.lease <= s.now','live(execution) and execution.lease <= s.now',[op("admit"),op("hold"),op("claim")]),
+ "H3": ('val closed = Set(r).union(descendants(s,r))\n      { ...s,db:{ ...s.db,runs:Runs.fold(s.db.runs,(a,k) => if (closed.contains(k)) a.replaceAt(k,{ ...a.nth(k),held:true })','val closed = Set(r)\n      { ...s,db:{ ...s.db,runs:Runs.fold(s.db.runs,(a,k) => if (closed.contains(k)) a.replaceAt(k,{ ...a.nth(k),held:true })',BOOT+[op("child"),op("hold")]),
+ "H3/release": ('a.replaceAt(k,{ ...a.nth(k),held:false })','a.replaceAt(k,{ ...a.nth(k),held:false,lease:-1 })',BOOT+[op("hold"),op("unhold")]),
+ "H4": ('notified:x.parent >= 0,held:false }) else a })','notified:x.parent >= 0 }) else a })',BOOT+[op("hold"),op("cancel")]),
  "V3": ('execution.lease <= s.now and compatible(execution.app,w)','execution.lease <= s.now',[op("admit",i=1),op("claim",w=1)]),
  "O1": ('{ ...persisted.workers.nth(actor),stopped:true,phase:0,permit:false }','{ ...persisted.workers.nth(actor),stopped:false,phase:1,permit:false }',BOOT+[op("intent",fault=2),op("dispatch")]),
  "O2": ('x.outcome != 0 and s.now >= x.ended+5','true',BOOT+[op("sweep")]),
