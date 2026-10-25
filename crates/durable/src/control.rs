@@ -313,3 +313,34 @@ pub struct Counts {
     pub states: BTreeMap<String, usize>,
     pub next: Option<Cursor>,
 }
+
+/// The width of a totals bucket: one hour, aligned to the Unix epoch (UTC).
+/// Part of the stored layout: a run's totals are added to its definition's
+/// bucket of the hour it ended in, in its terminal commit.
+pub const TOTALS_BUCKET_MS: i64 = 3_600_000;
+/// The most buckets one `RunStore::totals` window may cover (41 days and a
+/// bit): a query reads at most this many rows.
+pub const MAX_TOTALS_BUCKETS: usize = MAX_PAGE;
+/// One definition's annotation totals over a window (`RunStore::totals`).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DefinitionTotals {
+    pub definition: String,
+    /// The window rounded out to whole buckets, `[since_ms, before_ms)`.
+    pub since_ms: i64,
+    pub before_ms: i64,
+    /// The runs that ended in the window with annotation totals.
+    pub runs: u64,
+    /// Their totals summed per name, bounded like a run's
+    /// (`ows::durable::accumulate`).
+    pub annotations: ows::durable::Totals,
+    /// The buckets that hold any, oldest first.
+    pub buckets: Vec<TotalsBucket>,
+}
+/// The runs of one definition that ended within one bucket with annotation
+/// totals, and those totals summed.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TotalsBucket {
+    pub start_ms: i64,
+    pub runs: u64,
+    pub annotations: ows::durable::Totals,
+}

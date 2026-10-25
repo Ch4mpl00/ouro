@@ -236,6 +236,9 @@ async fn annotations_reach_the_journal_the_span_and_the_metrics_and_survive_a_re
     // the restart's restored first call was not counted again.
     let listed = control.list(&ouro_runtime::control::Runs::default(), None, 10).await.unwrap();
     assert_eq!(listed.items[0].annotations, inspection.annotations);
+    // The definition's hourly totals: the run ended at 1 s, in the first hour.
+    let totals = control.totals("chat", 0, ouro_runtime::control::TOTALS_BUCKET_MS).await.unwrap();
+    assert_eq!((totals.runs, &totals.annotations), (1, &inspection.annotations));
     // A replay takes results and annotations from the journal: no call.
     let replay = rt.replay("r", &CancellationToken::new()).await.unwrap();
     assert!(matches!(replay.status, Status::Completed(_)));

@@ -35,6 +35,7 @@ async fn bounds(backend: Arc<dyn AtomicBackend>, metrics: Arc<Metrics>, validati
     definition_bounds(&backend, &metrics).await?;
     control_bounds(&backend, &metrics).await?;
     heartbeat_bounds(&backend, &metrics).await?;
+    totals_bounds(&backend, &metrics).await?;
     decided(&backend, &metrics).await?;
     overlap_bounds(&backend, &metrics).await?;
     let s = TransactionalStore::new(backend.clone());
@@ -495,6 +496,52 @@ async fn heartbeat_bounds(backend: &Arc<dyn AtomicBackend>, metrics: &Metrics) -
     .await?;
     assert_eq!(swept.workers, 50);
     assert_eq!(s.workers(None, 1_000).await?.items.len(), 1_000);
+    Ok(())
+}
+
+/// Hourly totals among the 10,000 seeded runs: a terminal commit of a run
+/// with annotation totals reads and writes its one bucket row, and a window
+/// reads only the definition's buckets in it, however many runs ended there
+/// or other definitions' buckets exist.
+async fn totals_bounds(backend: &Arc<dyn AtomicBackend>, metrics: &Metrics) -> anyhow::Result<()> {
+    use ouro_durable::control::TOTALS_BUCKET_MS;
+    use ows::durable::{Annotation, CallState, Delivery};
+    let s = TransactionalStore::new(backend.clone());
+    let answer = Record::Call {
+        logical: "chat".into(),
+        function: "chat".into(),
+        arguments: json!({}),
+        delivery: Delivery::AtLeastOnce,
+        state: CallState::Done(Ok(json!(1))),
+        annotations: BTreeMap::from([("tokens".to_string(), Annotation::from(3))]),
+    };
+    let end = async |name: &str, id: &str, at: i64| -> anyhow::Result<()> {
+        let mut a = admission(id);
+        a.name = name.into();
+        let f = s.start(&a, at).await?.unwrap();
+        s.save_record(&f, "chat#call", &answer, at).await?;
+        s.finish(&f, &Status::Completed(json!(0)), at, 3).await?;
+        Ok(())
+    };
+    for n in 0..48 {
+        end("totals", &format!("totals:{n}"), n * TOTALS_BUCKET_MS).await?;
+        end("totals-other", &format!("totals-other:{n}"), n * TOTALS_BUCKET_MS).await?;
+    }
+    let mut a = admission("totals:bounded");
+    a.name = "totals".into();
+    let f = s.start(&a, 0).await?.unwrap();
+    s.save_record(&f, "chat#call", &answer, 0).await?;
+    bounded(metrics, "finish_totals", 1, async || s.finish(&f, &Status::Completed(json!(0)), 0, 3).await).await?;
+    let hour = bounded(metrics, "totals_hour", 1, async || s.totals("totals", 0, TOTALS_BUCKET_MS).await).await?;
+    assert_eq!((hour.runs, &hour.annotations["tokens"]), (2, &6.into()));
+    let day = bounded(metrics, "totals_day", 24, async || s.totals("totals", 0, 24 * TOTALS_BUCKET_MS).await).await?;
+    assert_eq!((day.runs, day.buckets.len()), (25, 24));
+    assert!(
+        bounded(metrics, "totals_absent", 0, async || s.totals("absent", 0, TOTALS_BUCKET_MS).await)
+            .await?
+            .buckets
+            .is_empty()
+    );
     Ok(())
 }
 

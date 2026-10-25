@@ -445,6 +445,24 @@ age select indexes; residual state/combined filters can produce an empty
 page with a continuation. Follow `next` until absent. Cursors are bound to
 the query; each page is a consistent transaction, not a multi-page snapshot.
 
+`totals(definition, since_ms, before_ms)` sums the annotation totals of a
+definition's runs that ended in a window, without reading a run: each
+terminal commit (a finish, a cancellation, a cascade's descendants) adds
+the ending run's totals to its definition's bucket row for the hour it
+ended in (`TOTALS_BUCKET_MS`, one hour aligned to the Unix epoch), and a
+query reads only that definition's bucket rows in the window, rounded out
+to whole hours and at most `MAX_TOTALS_BUCKETS` (1,000) of them, or it is
+refused as `InvalidInput`. It returns the window, the count of runs it
+summed, their totals and the hourly buckets that hold any. A run without
+annotation totals writes nothing and is not counted; a run counts once, in
+the commit that ends it (an ambiguous finish cannot end it twice), at its
+end, so a live run's usage shows on its own row (`list`) until it ends.
+Buckets are bounded like a run's totals (32 names, 4 KB) and kept like
+outcomes: `sweep` does not remove them. Runs ending against the same
+definition within the hour share its bucket row, as they share its
+breaker row; writing it in the call's commit instead would make every
+annotated answer of every run of the definition contend on it.
+
 `definitions(cursor, limit)` pages `DefinitionSummary` values in binary name
 order through `RunStore::query_definitions`; `definition(name)` returns the
 same summary, or `None` for an unknown name. Neither needs a registry or raw
@@ -710,6 +728,7 @@ The engine owns primary and secondary keys in `(kind, id)` order:
 | `control_wait_type:<hex type>`, `control_wait_definition:<hex name>:type:<hex type>` | same wait key | Current listens by routing type |
 | `worker` | worker ID | One worker's heartbeat row |
 | `worker_expiry` | ordered expiry + hex worker ID | Worker rows by staleness, for `sweep` |
+| `totals:<hex name>` | ordered bucket start | Annotation totals and count of the definition's runs that ended in that hour |
 
 Index entries contain the run ID and change in the same transaction as the
 run. Times use sign-adjusted, fixed-width hexadecimal; names and event types

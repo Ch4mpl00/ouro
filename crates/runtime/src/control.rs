@@ -113,6 +113,19 @@ impl Control {
         }
         Ok(Counts { states, next: page.next })
     }
+    /// `definition`'s annotation totals of the runs that ended in
+    /// `[since_ms, before_ms)`, rounded out to whole hours
+    /// (`TOTALS_BUCKET_MS`), at most `MAX_TOTALS_BUCKETS` of them: the sums
+    /// and the hourly buckets that hold any. One bounded read of aggregate
+    /// rows each run's terminal commit wrote; no run is scanned.
+    pub async fn totals(
+        &self,
+        definition: &str,
+        since_ms: i64,
+        before_ms: i64,
+    ) -> Result<DefinitionTotals, ControlError> {
+        self.store.totals(definition, since_ms, before_ms).await.map_err(ControlError::from)
+    }
     /// A page of worker heartbeat rows in id order, each marked stale when
     /// its worker did not beat before its expiry (by this control's clock).
     pub async fn workers(&self, cursor: Option<&Cursor>, limit: usize) -> Result<Page<WorkerStatus>, ControlError> {

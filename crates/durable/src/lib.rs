@@ -496,6 +496,13 @@ pub trait RunStore: Send + Sync {
         limit: usize,
     ) -> anyhow::Result<control::Page<control::Wait>>;
     async fn inspect_control(&self, id: &str) -> anyhow::Result<Option<control::Inspection>>;
+    /// `name`'s annotation totals of the runs that ended in `[since_ms,
+    /// before_ms)`, rounded out to whole buckets (`control::TOTALS_BUCKET_MS`)
+    /// and covering at most `control::MAX_TOTALS_BUCKETS`: one range read of
+    /// the definition's bucket rows, never of its runs.
+    async fn totals(&self, _name: &str, _since_ms: i64, _before_ms: i64) -> anyhow::Result<control::DefinitionTotals> {
+        anyhow::bail!("this store does not keep annotation totals")
+    }
     /// Upserts a worker's liveness row in one commit: the row and its
     /// expiry index entry, nothing else. A beat older than the stored one
     /// changes nothing.

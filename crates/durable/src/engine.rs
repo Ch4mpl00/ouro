@@ -79,6 +79,17 @@ struct Pending {
     cloud: u64,
 }
 
+/// A definition's runs that ended within one bucket with annotation totals
+/// (`totals:<hex name>`, keyed by the bucket's start): their count and sums.
+#[derive(Default, Serialize, Deserialize)]
+struct Bucket {
+    runs: u64,
+    annotations: ows::durable::Totals,
+}
+fn bucket_start(ms: i64) -> i64 {
+    ms.saturating_sub(ms.rem_euclid(control::TOTALS_BUCKET_MS))
+}
+
 /// An ingress identity a trigger took, until `expires_at_ms`.
 #[derive(Serialize, Deserialize)]
 struct Tombstone {
@@ -1139,6 +1150,8 @@ async fn terminate(rows: &mut dyn Transaction, id: &str, status: &Status, now: i
     }
     // Iterative cascade avoids stack growth on arbitrarily nested child runs.
     let mut names = std::collections::BTreeSet::from([snapshot.run.admission.name.clone()]);
+    let mut ended = BTreeMap::new();
+    tally(&mut ended, &snapshot.run);
     let mut parents = vec![id.to_string()];
     while let Some(parent) = parents.pop() {
         for mut child in indexed_runs(rows, &partition("children", &parent), "", None, usize::MAX).await? {
@@ -1156,6 +1169,7 @@ async fn terminate(rows: &mut dyn Transaction, id: &str, status: &Status, now: i
             child.listeners.clear();
             child.subscriptions.clear();
             names.insert(child.run.admission.name.clone());
+            tally(&mut ended, &child.run);
             child.waits.clear();
             parents.push(child.run.admission.id.clone());
             store_run_indexed(rows, &child, &before).await?;
@@ -1166,7 +1180,36 @@ async fn terminate(rows: &mut dyn Transaction, id: &str, status: &Status, now: i
     for name in names {
         drain_queues(rows, &name, now).await?;
     }
+    for (name, (runs, annotations)) in ended {
+        add_bucket(rows, &name, now, runs, &annotations).await?;
+    }
     Ok(())
+}
+/// Adds the totals of runs that ended now to `name`'s bucket: one row read
+/// and written, in the terminal commit. Runs ending against the same
+/// definition within the hour share it, as they share its breaker row; a
+/// run without annotation totals writes nothing.
+async fn add_bucket(
+    rows: &mut dyn Transaction,
+    name: &str,
+    now: i64,
+    runs: u64,
+    annotations: &ows::durable::Totals,
+) -> anyhow::Result<()> {
+    let (kind, k) = (partition("totals", name), time_key(bucket_start(now)));
+    let mut bucket: Bucket = get(rows, &kind, &k).await?.unwrap_or_default();
+    bucket.runs = bucket.runs.saturating_add(runs);
+    ows::durable::accumulate(&mut bucket.annotations, annotations);
+    put(rows, &kind, &k, &bucket).await
+}
+/// Notes an ending run's annotation totals under its definition.
+fn tally(ended: &mut BTreeMap<String, (u64, ows::durable::Totals)>, run: &SavedRun) {
+    if run.annotations.is_empty() {
+        return;
+    }
+    let (runs, totals) = ended.entry(run.admission.name.clone()).or_default();
+    *runs += 1;
+    ows::durable::accumulate(totals, &run.annotations);
 }
 async fn cancel_run(rows: &mut dyn Transaction, id: &str, now: i64) -> anyhow::Result<bool> {
     let Some(s) = find_run(rows, id).await? else { return Ok(false) };
@@ -1414,6 +1457,51 @@ impl RunStore for TransactionalStore {
                     trace_id,
                     span_id,
                 }))
+            })
+        })
+        .await
+    }
+
+    // One bounded range read of the definition's bucket rows.
+    async fn totals(&self, name: &str, since: i64, before: i64) -> anyhow::Result<control::DefinitionTotals> {
+        use control::{ControlError, MAX_TOTALS_BUCKETS, TOTALS_BUCKET_MS};
+        if since > before {
+            return Err(ControlError::InvalidInput("invalid time window".into()).into());
+        }
+        let start = bucket_start(since);
+        let end = bucket_start(before.saturating_sub(1)).saturating_add(TOTALS_BUCKET_MS).max(start);
+        let buckets = usize::try_from(end.saturating_sub(start) / TOTALS_BUCKET_MS).unwrap_or(usize::MAX);
+        if buckets > MAX_TOTALS_BUCKETS {
+            return Err(ControlError::InvalidInput(format!(
+                "a totals window covers at most {MAX_TOTALS_BUCKETS} buckets of {TOTALS_BUCKET_MS} ms"
+            ))
+            .into());
+        }
+        self.read(|rows| {
+            Box::pin(async move {
+                let found = rows
+                    .scan(&partition("totals", name), &time_key(start), Some(&time_key(end)), MAX_TOTALS_BUCKETS)
+                    .await?;
+                let mut totals = control::DefinitionTotals {
+                    definition: name.into(),
+                    since_ms: start,
+                    before_ms: end,
+                    runs: 0,
+                    annotations: Default::default(),
+                    buckets: Vec::new(),
+                };
+                for ((_, k), value) in found {
+                    let bucket: Bucket = serde_json::from_value(value)?;
+                    let start_ms = i64::from_be_bytes(u64::from_str_radix(&k, 16)?.to_be_bytes()) ^ i64::MIN;
+                    totals.runs = totals.runs.saturating_add(bucket.runs);
+                    ows::durable::accumulate(&mut totals.annotations, &bucket.annotations);
+                    totals.buckets.push(control::TotalsBucket {
+                        start_ms,
+                        runs: bucket.runs,
+                        annotations: bucket.annotations,
+                    });
+                }
+                Ok(totals)
             })
         })
         .await

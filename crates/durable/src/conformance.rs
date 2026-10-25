@@ -1103,6 +1103,77 @@ async fn annotation_totals(
     audit(&*fresh).await?;
     report.operations += 16;
     report.witnesses.insert("per-run annotation totals, counted once per answer and kept after sweep");
+
+    // Per-definition totals over a window: each run's terminal commit adds
+    // its totals to its definition's bucket of the hour it ended in.
+    use control::{ControlError, MAX_TOTALS_BUCKETS, TOTALS_BUCKET_MS};
+    let hour = TOTALS_BUCKET_MS;
+    let t = factory("definition-totals").await?;
+    report.cases += 1;
+    let s = &t.store;
+    let tokens = |n: u64| call(CallState::Done(Ok(json!(n))), &[("tokens", n.into()), ("model", "small".into())]);
+    let ended = async |id: &str, n: u64, at: i64| -> anyhow::Result<()> {
+        let f = s.start(&admission(id), at).await?.unwrap();
+        s.save_record(&f, "chat#call", &tokens(n), at).await?;
+        s.finish(&f, &Status::Completed(json!(n)), at, 3).await?;
+        Ok(())
+    };
+    ended("a", 10, 5).await?;
+    ended("b", 20, hour - 1).await?;
+    ended("c", 40, hour).await?;
+    // A run without totals writes no bucket and is not counted.
+    let plain = s.start(&admission("plain"), 6).await?.unwrap();
+    s.finish(&plain, &Status::Completed(json!(0)), 6, 3).await?;
+    // A cascade counts every ended run under its own definition.
+    let parent = s.start(&admission("p"), 7).await?.unwrap();
+    s.save_record(&parent, "chat#call", &tokens(1), 7).await?;
+    let mut other = admission("child");
+    other.name = "other".into();
+    let link = ChildLink { parent: "p".into(), key: "child".into(), reference: "child".into() };
+    let child = s.start_child(&parent, &other, &link, 7).await?.unwrap();
+    s.save_record(&child, "chat#call", &tokens(2), 7).await?;
+    assert!(s.cancel("p", 8).await?);
+    // An ambiguous terminal commit counts once: a retry finds the run ended.
+    let f = s.start(&admission("ambiguous"), 9).await?.unwrap();
+    s.save_record(&f, "chat#call", &tokens(100), 9).await?;
+    t.faults.arm(CommitFault::BeforeCommit);
+    assert!(s.finish(&f, &Status::Completed(json!(0)), 9, 3).await.is_err());
+    t.faults.arm(CommitFault::AfterCommit);
+    assert!(s.finish(&f, &Status::Completed(json!(0)), 9, 3).await.is_err());
+    t.faults.clear();
+    assert!(s.finish(&f, &Status::Completed(json!(0)), 9, 3).await.is_err());
+    let fresh = (t.reopen)().await?;
+    let window = fresh.totals("workflow", 0, 2 * hour).await?;
+    let sums = |n: u64| BTreeMap::from([("tokens".to_string(), serde_json::Number::from(n))]);
+    assert_eq!((window.since_ms, window.before_ms, window.runs), (0, 2 * hour, 5));
+    assert_eq!(window.annotations, sums(171));
+    assert_eq!(
+        window.buckets,
+        vec![
+            control::TotalsBucket { start_ms: 0, runs: 4, annotations: sums(131) },
+            control::TotalsBucket { start_ms: hour, runs: 1, annotations: sums(40) },
+        ]
+    );
+    // Windows round out to whole hours.
+    let first = fresh.totals("workflow", 1, 2).await?;
+    assert_eq!((first.since_ms, first.before_ms, first.runs), (0, hour, 4));
+    assert_eq!(fresh.totals("workflow", hour, hour + 1).await?.annotations, sums(40));
+    assert!(fresh.totals("workflow", hour, hour).await?.buckets.is_empty());
+    assert_eq!(fresh.totals("other", 0, hour).await?.annotations, sums(2));
+    let none = fresh.totals("missing", 0, hour).await?;
+    assert!(none.buckets.is_empty() && none.runs == 0 && none.annotations.is_empty());
+    let limit = i64::try_from(MAX_TOTALS_BUCKETS).unwrap() * hour;
+    assert_eq!(fresh.totals("workflow", 0, limit).await?.runs, 5);
+    for (since, before) in [(1, 0), (0, limit + 1), (i64::MIN, i64::MAX)] {
+        let refused = refusal(fresh.totals("workflow", since, before).await);
+        assert!(matches!(refused, ControlError::InvalidInput(_)), "{refused:?}");
+    }
+    // Buckets are aggregates of their own: sweeping evidence keeps them.
+    fresh.sweep(i64::MAX / 2, 0).await?;
+    assert_eq!(fresh.totals("workflow", 0, 2 * hour).await?, window);
+    audit(&*fresh).await?;
+    report.operations += 24;
+    report.witnesses.insert("per-definition hourly totals written by terminal commits, read in bounded windows");
     Ok(())
 }
 
@@ -1146,6 +1217,7 @@ async fn read_only(
     s.deliver(&event("mail", "other", json!(1)), Some("p"), 1).await?;
     s.finish(&parent, &Status::Waiting { wake_at_ms: 100 }, 1, 3).await?;
     let done = s.start(&admission("done"), 2).await?.unwrap();
+    s.save_record(&done, "call#call", &call, 2).await?;
     s.finish(&done, &Status::Completed(json!(42)), 3, 3).await?;
     s.control(&control_request("cancel-child"), &Command::Cancel { run: "c".into() }, 4).await?;
     let worker = Worker {
@@ -1196,9 +1268,12 @@ async fn read_only(
         child_outcome("p", "c", "c"),
         ingested(&ingress, 4),
         notices(10),
+        totals("workflow", 0, 10),
+        totals("missing", 0, 10),
     );
     assert_eq!(r.inspect_control("p").await?.unwrap().calls.len(), 1);
     assert_eq!(r.workers(None, 10).await?.items, vec![worker.clone()]);
+    assert_eq!(r.totals("workflow", 0, 10).await?.runs, 1);
 
     let fence = parent.clone();
     let types = vec!["answer".to_string()];
