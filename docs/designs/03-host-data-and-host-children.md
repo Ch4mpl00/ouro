@@ -1,6 +1,6 @@
 # 03. Host data at admission and host-started children
 
-Status: approved · Issue: 34 · Review: goldfish round 1 (2026-10-25), resolved below · Requested by: ouro-agent migration (its design 01, finding H2)
+Status: implemented (67b906a, b29475b) · Issue: 34 · Review: goldfish round 1 (2026-10-25), resolved below · Requested by: ouro-agent migration (its design 01, finding H2)
 
 ## Problem
 
@@ -150,8 +150,9 @@ Test-first; each must fail before the change.
 ## Rollout
 
 `docs/api.md` (host data, `start_with`, `FunctionContext::host/start_child`),
-`docs/control.md` (`Inspection.host`), `CHANGELOG.md` (state version bump,
-`Admission` field), `docs/durable-invariants.md`.
+`docs/control.md` (`Inspection.host`), `CHANGELOG.md` (the breaking API
+changes; no state version bump and no `Admission` field, per R-H2),
+`docs/durable-invariants.md`.
 
 ## Open questions
 
