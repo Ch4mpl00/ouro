@@ -3,7 +3,7 @@
 
 use ows::{
     durable::Delivery,
-    model::{self, Catchup, Kind, Overlap, Workflow},
+    model::{self, Breaker, Catchup, Kind, Overlap, Workflow},
 };
 
 fn document(metadata: &str, schedule: &str) -> Result<Workflow, String> {
@@ -127,4 +127,47 @@ fn a_known_key_on_the_wrong_task_kind_says_where_it_belongs() {
     assert!(e.contains("/do/0/x/metadata/ouro/hold") && e.contains("hold belongs on a listen task"), "{e}");
     let e = task("{ call: echo, metadata: { ouro: { concurrency: 2 } } }").unwrap_err();
     assert!(e.contains("/do/0/x/metadata/ouro/concurrency") && e.contains("concurrency belongs on a for task"), "{e}");
+}
+
+#[test]
+fn the_breaker_policy_is_off_or_a_threshold() {
+    let parse = |value: &str| document(&format!("{{ ouro: {{ breaker: {value} }} }}"), "").map(|w| w.breaker);
+    assert_eq!(document("{}", "").unwrap().breaker, Breaker::Inherit, "absent: the host's default");
+    assert_eq!(document("{ ouro: {} }", "").unwrap().breaker, Breaker::Inherit);
+    assert_eq!(parse("off"), Ok(Breaker::Off));
+    assert_eq!(parse("{ threshold: 1 }"), Ok(Breaker::Threshold(1)));
+    assert_eq!(parse("{ threshold: 7 }"), Ok(Breaker::Threshold(7)));
+    assert_eq!(parse("{ threshold: 1000 }"), Ok(Breaker::Threshold(1000)));
+    // Any other value is a validation error at the policy's pointer.
+    for bad in [
+        "0",
+        "3",
+        "true",
+        "null",
+        "on",
+        "OFF",
+        "[ 1 ]",
+        "{}",
+        "{ threshold: 0 }",
+        "{ threshold: 1001 }",
+        "{ threshold: -1 }",
+        "{ threshold: 1.5 }",
+        "{ threshold: '3' }",
+        "{ threshold: off }",
+        "{ threshold: 2, window: 5 }",
+        "{ limit: 2 }",
+    ] {
+        let e = parse(bad).unwrap_err();
+        assert!(e.contains("/document/metadata/ouro/breaker"), "{bad}: {e}");
+    }
+    let e = parse("{ threshold: 0 }").unwrap_err();
+    assert!(e.contains("/document/metadata/ouro/breaker/threshold"), "{e}");
+    // Host keys of the same name are not read.
+    assert_eq!(document("{ breaker: off }", "").unwrap().breaker, Breaker::Inherit);
+}
+
+#[test]
+fn the_breaker_policy_belongs_to_the_document() {
+    let e = task("{ call: echo, metadata: { ouro: { breaker: off } } }").unwrap_err();
+    assert!(e.contains("/do/0/x/metadata/ouro/breaker") && e.contains("unknown property"), "{e}");
 }

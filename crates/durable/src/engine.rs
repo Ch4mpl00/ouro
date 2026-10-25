@@ -2211,7 +2211,7 @@ impl RunStore for TransactionalStore {
         .await
     }
 
-    async fn save_definition(&self, name: &str, yaml: &str) -> anyhow::Result<Definition> {
+    async fn save_definition(&self, name: &str, yaml: &str, breaker: Breaker) -> anyhow::Result<Definition> {
         self.update(|rows| {
             Box::pin(async move {
                 let mut defs = load_definitions(rows, name).await?.unwrap_or_default();
@@ -2220,7 +2220,7 @@ impl RunStore for TransactionalStore {
                     .last_key_value()
                     .map_or(Some(1), |(v, _)| v.checked_add(1))
                     .ok_or_else(|| anyhow::anyhow!("definition version overflow"))?;
-                let d = Definition { name: name.into(), version, yaml: yaml.into(), digest: digest_of(yaml) };
+                let d = Definition { name: name.into(), version, yaml: yaml.into(), digest: digest_of(yaml), breaker };
                 defs.versions.insert(version, d.clone());
                 store_definitions(rows, name, &defs).await?;
                 Ok(d)
@@ -2353,6 +2353,7 @@ async fn definition_summary(
                     activated_epoch: latest.map(|a| a.epoch),
                     activated_by: latest.and_then(|a| a.actor.clone()),
                     activation_note: latest.and_then(|a| a.note.clone()),
+                    breaker: d.breaker,
                 }
             })
             .collect(),

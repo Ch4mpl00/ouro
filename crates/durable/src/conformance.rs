@@ -350,9 +350,9 @@ pub async fn run_all(factory: impl AsyncFn(&str) -> anyhow::Result<TestStore>) -
     let t = factory("definitions").await?;
     report.cases += 1;
     let s = &t.store;
-    let first = s.save_definition("workflow", "first").await?;
+    let first = s.save_definition("workflow", "first", Breaker::Inherit).await?;
     s.activate("workflow", first.version, 0).await?;
-    let second = s.save_definition("workflow", "second").await?;
+    let second = s.save_definition("workflow", "second", Breaker::Inherit).await?;
     s.activate("workflow", second.version, 0).await?;
     let pinned = s.get("absent").await?;
     assert!(pinned.is_none());
@@ -396,7 +396,7 @@ pub async fn run_all(factory: impl AsyncFn(&str) -> anyhow::Result<TestStore>) -
     let after = s.definitions("workflow").await?;
     assert_eq!((after.consecutive_faults, after.tripped.as_ref()), (3, Some(&trip)), "not counted");
     assert_eq!(s.notices(10).await?.len(), 1, "no second notice");
-    let copy = s.save_definition("workflow", "second").await?;
+    let copy = s.save_definition("workflow", "second", Breaker::Inherit).await?;
     assert_eq!(copy.digest, second.digest);
     let mut same = admission("same-content");
     same.version = copy.version;
@@ -419,6 +419,7 @@ pub async fn run_all(factory: impl AsyncFn(&str) -> anyhow::Result<TestStore>) -
     report.operations += 13;
     report.witnesses.insert("breaker trips without changing the active version or pinned runs");
     decisions(&factory, &mut report).await?;
+    breaker_policies(&factory, &mut report).await?;
 
     // Inject before each of the first row writes, before commit, and after commit.
     // Child start touches both parent and child. Terminal finish may also
@@ -473,7 +474,7 @@ pub async fn run_all(factory: impl AsyncFn(&str) -> anyhow::Result<TestStore>) -
             if operation == "expire" {
                 s.deliver(&event("expiring", "answer", json!(1)), Some("p"), 0).await?;
             }
-            let d = s.save_definition("workflow", "yaml").await?;
+            let d = s.save_definition("workflow", "yaml", Breaker::Inherit).await?;
             let mut tripping = None;
             let mut notice = None;
             if matches!(operation, "trip" | "refuse" | "acknowledge") {
@@ -537,7 +538,7 @@ pub async fn run_all(factory: impl AsyncFn(&str) -> anyhow::Result<TestStore>) -
                 "sweep" => s.sweep(1, 0).await.map(|_| ()),
                 "release" => s.release(&f, 0).await,
                 "renew" => s.renew(&f, 1).await,
-                "definition" => s.save_definition("workflow", "next").await.map(|_| ()),
+                "definition" => s.save_definition("workflow", "next", Breaker::Inherit).await.map(|_| ()),
                 "activate" => s.activate("workflow", d.version, 0).await,
                 "subscribe" => s.subscribe(&f, "other", &["*".into()], 0).await,
                 "publish" => s.publish(&json!({"type":"answer","source":"/t","id":"1"}), None, 0).await.map(|_| ()),
@@ -815,10 +816,10 @@ async fn definition_queries(
     assert!(s.query_definitions(None, 1).await?.items.is_empty());
     assert!(s.definition_control("missing").await?.is_none());
     // Unactivated versions need no parsing; summaries never return their YAML.
-    s.save_definition("workflow", "old").await?;
-    s.save_definition("workflow", control_definition_yaml()).await?;
+    s.save_definition("workflow", "old", Breaker::Inherit).await?;
+    s.save_definition("workflow", control_definition_yaml(), Breaker::Inherit).await?;
     for name in ["z", "a:#", "é"] {
-        s.save_definition(name, "unactivated").await?;
+        s.save_definition(name, "unactivated", Breaker::Inherit).await?;
     }
     let slot = |kind: &str, at_ms| Trigger {
         at_ms,
@@ -874,6 +875,7 @@ async fn definition_queries(
         activated_epoch: None,
         activated_by: None,
         activation_note: None,
+        breaker: Breaker::Inherit,
     };
     let released = VersionSummary {
         version: 2,
@@ -882,6 +884,7 @@ async fn definition_queries(
         activated_epoch: Some(1),
         activated_by: Some("operator".into()),
         activation_note: Some("release 2".into()),
+        breaker: Breaker::Inherit,
     };
     assert_eq!(summary.versions, vec![never.clone(), released]);
     assert_eq!((summary.active, summary.epoch, summary.consecutive_faults), (Some(2), 1, 1));
@@ -1002,7 +1005,7 @@ async fn definition_queries(
     // A page racing activation must observe the old catalog and its triggers,
     // or the new catalog and its triggers, never a mixture of the two.
     let no_schedule = "document: { dsl: '1.0.4', namespace: test, name: workflow, version: '1.0.0' }\ndo:\n  - ok: { set: { ok: true } }\n";
-    s.save_definition("workflow", no_schedule).await?;
+    s.save_definition("workflow", no_schedule, Breaker::Inherit).await?;
     let old = fresh.definition_control("workflow").await?.unwrap();
     let unarmed = Arming::default();
     let at_zero = Activation::at(0);
@@ -1251,7 +1254,7 @@ async fn read_only(
     let t = factory("read-only").await?;
     report.cases += 1;
     let s = &t.store;
-    let d = s.save_definition("workflow", control_definition_yaml()).await?;
+    let d = s.save_definition("workflow", control_definition_yaml(), Breaker::Inherit).await?;
     let slot = Trigger { at_ms: Some(4), types: vec!["start".into()], state: json!({ "kind": "every" }) };
     let arming = Arming { triggers: BTreeMap::from([("w#every".into(), slot.clone())]) };
     s.activate_with("workflow", d.version, 0, &arming, &Activation::at(0)).await?;
@@ -1364,7 +1367,7 @@ async fn read_only(
     assert!(refused_read_only(r.cancel("p", 5).await));
     assert!(refused_read_only(r.cancel("missing", 5).await));
     assert!(refused_read_only(r.sweep(i64::MAX, 0).await));
-    assert!(refused_read_only(r.save_definition("workflow", "yaml").await));
+    assert!(refused_read_only(r.save_definition("workflow", "yaml", Breaker::Inherit).await));
     assert!(refused_read_only(r.activate("workflow", d.version, 0).await));
     assert!(refused_read_only(r.activate_with("workflow", d.version, 1, &arming, &Activation::at(0)).await));
     assert!(refused_read_only(r.acknowledge("notice").await));
@@ -1581,6 +1584,176 @@ async fn budgets(factory: &impl AsyncFn(&str) -> anyhow::Result<TestStore>, repo
     Ok(())
 }
 
+/// A definition's own breaker policy (design 04): the effective threshold is
+/// that of the active version (`Inherit` takes the host default the call
+/// passes, `Off` counts and never trips), resolved in the commit that counts
+/// the fault, for terminal faults and for a queued refusal at promotion alike.
+async fn breaker_policies(
+    factory: &impl AsyncFn(&str) -> anyhow::Result<TestStore>,
+    report: &mut Report,
+) -> anyhow::Result<()> {
+    fn run_of(id: &str, version: u64) -> Admission {
+        let mut a = admission(id);
+        a.name = "w".into();
+        a.version = version;
+        a
+    }
+    /// A run of `version` that ends faulted, counted against `default`.
+    async fn faulted(s: &dyn RunStore, id: &str, version: u64, default: u32) -> anyhow::Result<()> {
+        let f = s.start(&run_of(id, version), 0).await?.unwrap();
+        s.finish(&f, &Status::Faulted(WorkflowError::runtime(id)), 0, default).await?;
+        Ok(())
+    }
+    let every = |n: i64| Trigger { at_ms: Some(n), types: vec![], state: json!({ "n": n }) };
+    let arming = |n: i64| Arming { triggers: BTreeMap::from([("w#every".to_string(), every(n))]) };
+
+    // `Off`: faults are counted past any threshold, never trip, never report,
+    // and the schedule stays armed; the definition is still admitted.
+    let t = factory("breaker-off").await?;
+    report.cases += 1;
+    let s = &t.store;
+    let off = s.save_definition("w", "off", Breaker::Off).await?;
+    assert_eq!(off.breaker, Breaker::Off);
+    s.activate_with("w", off.version, 0, &arming(10), &Activation::at(0)).await?;
+    for n in 0..12 {
+        faulted(&**s, &format!("off{n}"), off.version, 1).await?;
+    }
+    let d = s.definitions("w").await?;
+    assert_eq!((d.consecutive_faults, d.tripped.is_none(), d.epoch), (12, true, 1), "counted, never tripped");
+    assert!(s.notices(10).await?.is_empty(), "no trip, no notice");
+    assert_eq!(s.trigger("w#every").await?, Some(every(10)), "the schedule stays armed");
+    assert!(s.start(&run_of("still-admitted", off.version), 0).await?.is_some());
+    let f = s.start(&run_of("success", off.version), 0).await?.unwrap();
+    s.finish(&f, &Status::Completed(json!(0)), 0, 1).await?;
+    assert_eq!(s.definitions("w").await?.consecutive_faults, 0, "a success still resets the count");
+    assert_eq!(s.definitions("w").await?.versions[&off.version].breaker, Breaker::Off);
+    audit(&**s).await?;
+    report.operations += 18;
+    report.witnesses.insert("a definition with the breaker off counts faults and never trips");
+
+    // `Threshold(n)` replaces the host default, below it and above it.
+    let t = factory("breaker-threshold").await?;
+    report.cases += 1;
+    let s = &t.store;
+    let one = s.save_definition("w", "one", Breaker::Threshold(1)).await?;
+    s.activate_with("w", one.version, 0, &arming(10), &Activation::at(0)).await?;
+    faulted(&**s, "one", one.version, 5).await?;
+    let trip = s.definitions("w").await?.tripped.expect("one fault trips a threshold of one, whatever the default");
+    assert_eq!((trip.faults, trip.threshold, trip.breaker), (1, 1, true));
+    assert_eq!(s.notices(10).await?.len(), 1);
+    assert!(s.trigger("w#every").await?.is_none());
+    let four = s.save_definition("w", "four", Breaker::Threshold(4)).await?;
+    s.activate_with("w", four.version, 1, &arming(20), &Activation::at(0)).await?;
+    for n in 0..3 {
+        faulted(&**s, &format!("four{n}"), four.version, 2).await?;
+    }
+    assert!(s.definitions("w").await?.tripped.is_none(), "three faults do not reach four, past the default of two");
+    faulted(&**s, "four3", four.version, 2).await?;
+    let trip = s.definitions("w").await?.tripped.expect("the fourth trips");
+    assert_eq!((trip.faults, trip.threshold, trip.version), (4, 4, four.version));
+    // The default is unchanged for a definition without a policy.
+    let plain = s.save_definition("w", "plain", Breaker::Inherit).await?;
+    s.activate_with("w", plain.version, 2, &arming(30), &Activation::at(0)).await?;
+    faulted(&**s, "plain0", plain.version, 2).await?;
+    assert!(s.definitions("w").await?.tripped.is_none());
+    faulted(&**s, "plain1", plain.version, 2).await?;
+    assert_eq!(s.definitions("w").await?.tripped.expect("the host default").threshold, 2);
+    audit(&**s).await?;
+    report.operations += 20;
+    report.witnesses.insert("a definition threshold replaces the host default and a missing one keeps it");
+
+    // Reactivation applies the activated version's policy, in its new epoch.
+    let t = factory("breaker-reactivation").await?;
+    report.cases += 1;
+    let s = &t.store;
+    let a = s.save_definition("w", "a", Breaker::Off).await?;
+    let b = s.save_definition("w", "b", Breaker::Threshold(2)).await?;
+    s.activate_with("w", a.version, 0, &arming(10), &Activation::at(0)).await?;
+    for n in 0..4 {
+        faulted(&**s, &format!("a{n}"), a.version, 3).await?;
+    }
+    s.activate_with("w", b.version, 1, &arming(20), &Activation::at(0)).await?;
+    assert_eq!(s.definitions("w").await?.consecutive_faults, 0, "a new epoch counts afresh");
+    faulted(&**s, "b0", b.version, 3).await?;
+    assert!(s.definitions("w").await?.tripped.is_none());
+    faulted(&**s, "b1", b.version, 3).await?;
+    assert_eq!(s.definitions("w").await?.tripped.expect("the new version's threshold").threshold, 2);
+    s.activate_with("w", a.version, 2, &arming(30), &Activation::at(0)).await?;
+    for n in 0..4 {
+        faulted(&**s, &format!("again{n}"), a.version, 3).await?;
+    }
+    let d = s.definitions("w").await?;
+    assert_eq!((d.consecutive_faults, d.tripped.is_none()), (4, true), "the older version's own policy again");
+    audit(&**s).await?;
+    report.operations += 16;
+    report.witnesses.insert("reactivation applies the activated version's breaker policy");
+
+    // A queued refused slot is judged at promotion by the active version's
+    // policy, not by the threshold of the call that buffered it: three
+    // against a default of one does not trip; off never trips; the default
+    // one trips on the promoted refusal's own fault.
+    for (policy, default, trips) in [
+        (Breaker::Threshold(3), 1, false),
+        (Breaker::Off, 1, false),
+        (Breaker::Inherit, 2, true),
+        (Breaker::Threshold(2), 5, true),
+    ] {
+        let t = factory("breaker-queued-refusal").await?;
+        report.cases += 1;
+        let s = &t.store;
+        let d = s.save_definition("workflow", "original", policy).await?;
+        let slot = |n: i64| Trigger { at_ms: Some(n), types: vec!["tick".into()], state: json!(n) };
+        s.activate_with(
+            "workflow",
+            d.version,
+            0,
+            &Arming { triggers: BTreeMap::from([("policy".into(), slot(1))]) },
+            &Activation::at(0),
+        )
+        .await?;
+        let first = [admission("slot1")];
+        let (one, two, three) = (slot(1), slot(2), slot(3));
+        let guard = |ceiling| OverlapGuard { policy: Overlap::Queue, max_concurrent_runs: 10, ceiling };
+        let fired = Firing {
+            key: "policy",
+            expected: Some(&one),
+            next: Some(&two),
+            admit: &first,
+            busy: Some(&two),
+            overlap: Some(guard(&two)),
+            ..Firing::default()
+        };
+        assert_eq!(s.fire(&fired, 1).await?, Fired::Committed);
+        let refused = Refused {
+            admission: admission("slot2"),
+            error: WorkflowError::runtime("pinned refusal"),
+            breaker_threshold: default,
+        };
+        let buffered = Firing {
+            key: "policy",
+            expected: Some(&two),
+            next: Some(&three),
+            busy: Some(&three),
+            refused: Some(&refused),
+            overlap: Some(guard(&three)),
+            ..Firing::default()
+        };
+        assert_eq!(s.fire(&buffered, 2).await?, Fired::Queued);
+        let f = s.claim("slot1", 2).await?.unwrap();
+        s.finish(&f, &Status::Faulted(WorkflowError::runtime("first fault")), 3, default).await?;
+        let d = s.definitions("workflow").await?;
+        assert_eq!(d.consecutive_faults, 2, "{policy:?}: the promoted refusal is counted too");
+        assert_eq!(d.tripped.is_some(), trips, "{policy:?} against a default of {default}");
+        assert_eq!(s.notices(10).await?.len(), usize::from(trips));
+        assert_eq!(s.get("slot2").await?.unwrap().outcome, Some(Status::Faulted(refused.error)));
+        assert!(s.queued("policy").await?.is_none());
+        audit(&**s).await?;
+        report.operations += 6;
+    }
+    report.witnesses.insert("a queued refused slot is judged at promotion by the active version's breaker policy");
+    Ok(())
+}
+
 /// The settled decisions of `docs/durable-invariants.md` §8 and issue #3:
 /// event identity, the mailbox, ingress tombstones, activation epochs and the
 /// breaker, exclusive firing, the clock skew bound and compatibility.
@@ -1706,8 +1879,8 @@ async fn decisions(
     let t = factory("epochs").await?;
     report.cases += 1;
     let s = &t.store;
-    let one = s.save_definition("w", "one").await?;
-    let two = s.save_definition("w", "two").await?;
+    let one = s.save_definition("w", "one", Breaker::Inherit).await?;
+    let two = s.save_definition("w", "two", Breaker::Inherit).await?;
     let trigger = |n: i64| Trigger { at_ms: Some(n), types: vec![], state: json!({ "n": n }) };
     let arming = |triggers: &[(&str, i64)]| Arming {
         triggers: triggers.iter().map(|(k, n)| ((*k).into(), trigger(*n))).collect(),
@@ -1884,7 +2057,7 @@ async fn decisions(
     let t = factory("refused").await?;
     report.cases += 1;
     let s = &t.store;
-    let v = s.save_definition("w", "yaml").await?;
+    let v = s.save_definition("w", "yaml", Breaker::Inherit).await?;
     let slot = |at: i64| Trigger { at_ms: Some(at), types: vec![], state: json!({ "at": at }) };
     let arming = Arming { triggers: BTreeMap::from([("w#every".into(), slot(10))]) };
     s.activate_with("w", v.version, 0, &arming, &Activation::at(0)).await?.unwrap();
@@ -2191,9 +2364,9 @@ impl RunStore for Offloaded {
         let id = id.to_owned();
         offloaded!(self, |s| s.inspect(&id))
     }
-    async fn save_definition(&self, name: &str, yaml: &str) -> anyhow::Result<Definition> {
+    async fn save_definition(&self, name: &str, yaml: &str, breaker: Breaker) -> anyhow::Result<Definition> {
         let (name, yaml) = (name.to_owned(), yaml.to_owned());
-        offloaded!(self, |s| s.save_definition(&name, &yaml))
+        offloaded!(self, |s| s.save_definition(&name, &yaml, breaker))
     }
     async fn activate_with(
         &self,
@@ -2840,7 +3013,7 @@ async fn overlap_policies(
         let t = factory("overlap-epoch").await?;
         report.cases += 1;
         let s = &t.store;
-        let d = s.save_definition("workflow", "original").await?;
+        let d = s.save_definition("workflow", "original", Breaker::Inherit).await?;
         let armed = Arming { triggers: BTreeMap::from([("policy".into(), slot(1))]) };
         s.activate_with("workflow", d.version, 0, &armed, &Activation::at(0)).await?;
         fire(&**s, Overlap::Queue, 1, 10, None).await?;
@@ -2910,7 +3083,7 @@ async fn overlap_policies(
         let t = factory("overlap-refused").await?;
         report.cases += 1;
         let s = &t.store;
-        let d = s.save_definition("workflow", "original").await?;
+        let d = s.save_definition("workflow", "original", Breaker::Inherit).await?;
         s.activate_with(
             "workflow",
             d.version,
@@ -3051,7 +3224,7 @@ async fn controls(
     let t = factory("control").await?;
     report.cases += 1;
     let s = &t.store;
-    let d = s.save_definition("workflow", "yaml").await?;
+    let d = s.save_definition("workflow", "yaml", Breaker::Inherit).await?;
     let trigger = Trigger { at_ms: Some(4), types: vec!["start".into()], state: json!({}) };
     let arming = Arming { triggers: BTreeMap::from([("schedule".into(), trigger.clone())]) };
     s.activate_with("workflow", d.version, 0, &arming, &Activation::at(0)).await?;
@@ -3101,7 +3274,7 @@ async fn controls(
     );
     // A manual pause refuses every version, pinned or not: other content is
     // refused too (an automatic trip would admit it), until `resume`.
-    let other = s.save_definition("workflow", "other content").await?;
+    let other = s.save_definition("workflow", "other content", Breaker::Inherit).await?;
     let mut elsewhere = admission("elsewhere");
     elsewhere.version = other.version;
     elsewhere.definition = other.yaml.clone();
@@ -3140,7 +3313,7 @@ async fn controls(
         refusal(s.control(&control_request("resume-missing"), &resume_missing, 3).await),
         ControlError::NotFound { entity: Entity::Definition, .. }
     ));
-    s.save_definition("inactive", "yaml").await?;
+    s.save_definition("inactive", "yaml", Breaker::Inherit).await?;
     let inactive = Command::Pause { definition: "inactive".into(), note: String::new() };
     assert!(matches!(
         refusal(s.control(&control_request("inactive"), &inactive, 3).await),
@@ -3363,7 +3536,7 @@ async fn controls(
             let t = factory("control-fault").await?;
             report.cases += 1;
             let s = &t.store;
-            let d = s.save_definition("workflow", "yaml").await?;
+            let d = s.save_definition("workflow", "yaml", Breaker::Inherit).await?;
             s.activate_with("workflow", d.version, 0, &arming, &Activation::at(0)).await?;
             let f = s.start(&admission("r"), 0).await?.unwrap();
             s.describe_wait(&f, "listen", &control_wait(), 2).await?;
@@ -3705,7 +3878,7 @@ async fn control_overlap(
         let t = factory("control-overlap").await?;
         report.cases += 1;
         let s = &t.store;
-        let d = s.save_definition("workflow", "yaml").await?;
+        let d = s.save_definition("workflow", "yaml", Breaker::Inherit).await?;
         let slot = |n| Trigger { at_ms: Some(n), types: vec![], state: json!(n) };
         s.activate_with(
             "workflow",
@@ -3795,7 +3968,7 @@ async fn queue_order_after_clear(
     let late = ["zchild", "zlater", "zstart", "ztrip-admit", "ztrip-child", "ztrip-start"];
     names.extend(late.map(String::from));
     for name in &names {
-        let d = s.save_definition(name, "yaml").await?;
+        let d = s.save_definition(name, "yaml", Breaker::Inherit).await?;
         let armed = Arming { triggers: BTreeMap::from([(name.clone(), slot(0))]) };
         s.activate_with(name, d.version, 0, &armed, &Activation::at(0)).await?;
         if name.starts_with("ztrip") {

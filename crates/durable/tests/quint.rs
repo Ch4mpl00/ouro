@@ -744,7 +744,7 @@ impl StoreDriver {
     /// generic trigger that takes ingress events.
     pub fn initialize(&mut self) -> anyhow::Result<()> {
         for v in 1..=3 {
-            self.block(self.store.save_definition(NAME, &definition_text(v)))?;
+            self.block(self.store.save_definition(NAME, &definition_text(v), ouro_durable::Breaker::Inherit))?;
         }
         let arming = Arming {
             triggers: BTreeMap::from([(SCHEDULE.to_string(), schedule_trigger(Some(2), 1, 0, Mode::default()))]),

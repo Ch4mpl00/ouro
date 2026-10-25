@@ -297,8 +297,8 @@ impl Runtime {
         self.admitter().validate(yaml)
     }
     pub async fn save(&self, name: &str, yaml: &str) -> anyhow::Result<Definition> {
-        self.validate(yaml)?;
-        self.store.save_definition(name, yaml).await
+        let workflow = self.validate(yaml)?;
+        self.store.save_definition(name, yaml, workflow.breaker).await
     }
     /// Activates a saved version in a new activation epoch, clearing a
     /// tripped breaker; its schedule's triggers replace the definition's

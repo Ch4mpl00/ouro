@@ -2122,3 +2122,140 @@ async fn a_hold_and_a_release_are_reported_once_and_the_pause_of_a_definition_re
     control.resume(&operator("resume"), "workflow").await.unwrap();
     rt.start_at("p", "workflow", other.version, json!({})).await.unwrap();
 }
+
+// ── a definition's own breaker policy (design 04) ──────────────────────────
+
+/// `yaml` with `document.metadata.ouro.breaker: policy`.
+fn with_breaker(body: &str, policy: &str) -> String {
+    yaml(body).replace("version: '1.0.0'", &format!("version: '1.0.0', metadata: {{ ouro: {{ breaker: {policy} }} }}"))
+}
+const FAILS: &str = "  - fail: { raise: { error: { type: 'urn:test:failure', status: 500 } } }";
+
+#[tokio::test]
+async fn a_definition_with_the_breaker_off_counts_faults_and_never_trips() {
+    let store = Arc::new(durable::memory::memory());
+    let rt = runtime(store.clone(), Registry::new(), Arc::new(Time::default()));
+    let d = rt.save("workflow", &with_breaker(FAILS, "off")).await.unwrap();
+    assert_eq!(d.breaker, durable::Breaker::Off);
+    rt.activate("workflow", d.version).await.unwrap();
+    let stop = CancellationToken::new();
+    for n in 0..8 {
+        let id = format!("f{n}");
+        rt.start(&id, "workflow", json!({})).await.expect("an `off` definition is always admitted");
+        assert!(matches!(rt.drive(&id, &stop).await.unwrap(), Some(Status::Faulted(_))));
+    }
+    let d = rt.definitions("workflow").await.unwrap();
+    assert_eq!(d.consecutive_faults, 8, "faults are still counted, past the host's threshold of 3");
+    assert!(d.tripped.is_none());
+    assert!(store.notices(10).await.unwrap().is_empty(), "no trip, no notice");
+}
+
+#[tokio::test]
+async fn a_definition_threshold_replaces_the_hosts_default() {
+    let rt = runtime(Arc::new(durable::memory::memory()), Registry::new(), Arc::new(Time::default()));
+    let one = rt.save("workflow", &with_breaker(FAILS, "{ threshold: 1 }")).await.unwrap();
+    assert_eq!(one.breaker, durable::Breaker::Threshold(1));
+    rt.activate("workflow", one.version).await.unwrap();
+    let stop = CancellationToken::new();
+    rt.start("first", "workflow", json!({})).await.unwrap();
+    assert!(matches!(rt.drive("first", &stop).await.unwrap(), Some(Status::Faulted(_))));
+    let trip = rt.definitions("workflow").await.unwrap().tripped.expect("tripped by the first fault");
+    assert_eq!((trip.faults, trip.threshold), (1, 1));
+    // A higher threshold than the host's: three faults do not trip.
+    let five = rt.save("workflow", &with_breaker(FAILS, "{ threshold: 5 }")).await.unwrap();
+    rt.activate("workflow", five.version).await.unwrap();
+    for n in 0..4 {
+        let id = format!("g{n}");
+        rt.start(&id, "workflow", json!({})).await.unwrap();
+        assert!(matches!(rt.drive(&id, &stop).await.unwrap(), Some(Status::Faulted(_))));
+    }
+    assert!(rt.definitions("workflow").await.unwrap().tripped.is_none());
+    rt.start("g4", "workflow", json!({})).await.unwrap();
+    rt.drive("g4", &stop).await.unwrap();
+    assert_eq!(rt.definitions("workflow").await.unwrap().tripped.unwrap().threshold, 5);
+}
+
+#[tokio::test]
+async fn reactivating_another_version_applies_that_versions_policy() {
+    let rt = runtime(Arc::new(durable::memory::memory()), Registry::new(), Arc::new(Time::default()));
+    let off = rt.save("workflow", &with_breaker(FAILS, "off")).await.unwrap();
+    let inherit = rt.save("workflow", &yaml(FAILS)).await.unwrap();
+    let stop = CancellationToken::new();
+    let faults = async |from: &str, n: usize, rt: &Runtime| {
+        for i in 0..n {
+            let id = format!("{from}{i}");
+            rt.start(&id, "workflow", json!({})).await.unwrap();
+            rt.drive(&id, &stop).await.unwrap();
+        }
+    };
+    rt.activate("workflow", off.version).await.unwrap();
+    faults("a", 4, &rt).await;
+    assert!(rt.definitions("workflow").await.unwrap().tripped.is_none());
+    rt.activate("workflow", inherit.version).await.unwrap();
+    faults("b", 3, &rt).await;
+    let trip = rt.definitions("workflow").await.unwrap().tripped.expect("the host's default applies");
+    assert_eq!((trip.version, trip.threshold), (inherit.version, 3));
+    rt.activate("workflow", off.version).await.unwrap();
+    faults("c", 4, &rt).await;
+    let d = rt.definitions("workflow").await.unwrap();
+    assert!(d.tripped.is_none() && d.consecutive_faults == 4, "back to `off`: a new epoch, never tripped");
+}
+
+#[tokio::test]
+async fn the_policy_is_part_of_the_digest_and_shown_in_the_summary() {
+    use ouro_runtime::control::Control;
+    let store = Arc::new(durable::memory::memory());
+    let rt = runtime(store.clone(), Registry::new(), Arc::new(Time::default()));
+    let plain = rt.save("workflow", &yaml(FAILS)).await.unwrap();
+    let off = rt.save("workflow", &with_breaker(FAILS, "off")).await.unwrap();
+    let two = rt.save("workflow", &with_breaker(FAILS, "{ threshold: 2 }")).await.unwrap();
+    assert!(plain.digest != off.digest && off.digest != two.digest && plain.digest != two.digest);
+    let control = Control::new(store, Arc::new(Time::default()));
+    let summary = control.definition("workflow").await.unwrap().unwrap();
+    let policies: Vec<_> = summary.versions.iter().map(|v| v.breaker).collect();
+    assert_eq!(policies, [durable::Breaker::Inherit, durable::Breaker::Off, durable::Breaker::Threshold(2)]);
+}
+
+#[tokio::test]
+async fn an_invalid_policy_is_not_saved() {
+    let rt = runtime(Arc::new(durable::memory::memory()), Registry::new(), Arc::new(Time::default()));
+    for bad in ["0", "{ threshold: 0 }", "{ threshold: 1001 }", "sometimes"] {
+        let e = rt.save("workflow", &with_breaker(FAILS, bad)).await.unwrap_err().to_string();
+        assert!(e.contains("/document/metadata/ouro/breaker"), "{bad}: {e}");
+    }
+    assert!(rt.definitions("workflow").await.unwrap().versions.is_empty());
+}
+
+#[tokio::test]
+async fn a_scheduled_definition_with_the_breaker_off_keeps_firing_after_faults() {
+    let time = Arc::new(Time::default());
+    let config = Config { poll_interval: Duration::from_millis(5), ..Config::default() };
+    let rt =
+        Runtime::new(Arc::new(durable::memory::memory()), Arc::new(Registry::new()), config, time.clone(), tracer())
+            .unwrap();
+    let every = async |name: &str, policy: &str| {
+        let text = with_breaker(FAILS, policy)
+            .replace("name: workflow", &format!("name: {name}"))
+            .replace("\ndo:", "\nschedule: { every: PT1S }\ndo:");
+        let d = rt.save(name, &text).await.unwrap();
+        rt.activate(name, d.version).await.unwrap();
+    };
+    every("forever", "off").await;
+    every("default", "{ threshold: 3 }").await;
+    let stop = CancellationToken::new();
+    let drive = async {
+        for second in 1..=10 {
+            time.0.store(second * 1000, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(40)).await;
+        }
+        stop.cancel();
+    };
+    let (result, ()) = tokio::join!(rt.worker(stop.clone()), drive);
+    result.unwrap();
+    let forever = rt.definitions("forever").await.unwrap();
+    assert!(forever.tripped.is_none(), "{forever:?}");
+    assert!(forever.consecutive_faults >= 5, "it kept firing past the default threshold: {forever:?}");
+    assert!(!rt.triggers("forever").await.unwrap().is_empty(), "its schedule is still armed");
+    let tripped = rt.definitions("default").await.unwrap();
+    assert!(tripped.tripped.is_some() && rt.triggers("default").await.unwrap().is_empty(), "the control case trips");
+}

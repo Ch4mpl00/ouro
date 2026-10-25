@@ -48,8 +48,38 @@ pub struct Workflow {
     /// `document.metadata.ouro.limits`: a tighter jump budget, and what happens
     /// when it runs out.
     pub budget: Budget,
+    /// `document.metadata.ouro.breaker`: this definition's own breaker policy.
+    pub breaker: Breaker,
     /// The definition as parsed, exposed as `$workflow.definition`.
     pub definition: Value,
+}
+
+/// `document.metadata.ouro.breaker` (an extension): how many consecutive
+/// faults of the active version trip the definition. `Inherit` (absent) takes
+/// the host's default threshold; `Off` counts faults and never trips. The
+/// policy is part of the definition's text, hence of its digest.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Breaker {
+    #[default]
+    Inherit,
+    Off,
+    Threshold(u32),
+}
+
+impl Breaker {
+    /// The highest `threshold` a definition may name.
+    pub const MAX_THRESHOLD: u32 = 1000;
+
+    /// The number of consecutive faults that trips under this policy, given
+    /// the host's `default`: `None` never trips.
+    pub fn effective(self, default: u32) -> Option<u32> {
+        match self {
+            Breaker::Inherit => Some(default.max(1)),
+            Breaker::Off => None,
+            Breaker::Threshold(n) => Some(n.max(1)),
+        }
+    }
 }
 
 /// `document.metadata.ouro.limits` (an extension: the OWS document admits no other
@@ -699,6 +729,7 @@ impl Parser {
             timeout,
             schedule,
             budget,
+            breaker: Breaker::default(),
             definition: v.clone(),
         })
     }
