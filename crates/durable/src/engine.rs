@@ -2128,6 +2128,7 @@ async fn definition_summary(
             (ScheduleKind::Every, schedule.every.is_some()),
             (ScheduleKind::Cron, schedule.cron.is_some()),
             (ScheduleKind::After, schedule.after.is_some()),
+            (ScheduleKind::At, schedule.at.is_some()),
             (ScheduleKind::On, schedule.on.is_some()),
         ] {
             if configured {
@@ -2157,6 +2158,7 @@ async fn definition_summary(
                 Some("every") => ScheduleKind::Every,
                 Some("cron") => ScheduleKind::Cron,
                 Some("after") => ScheduleKind::After,
+                Some("at") => ScheduleKind::At,
                 Some("on") => ScheduleKind::On,
                 _ => continue,
             };

@@ -388,7 +388,9 @@ pub struct Host {
     pub observer: Arc<dyn Observer>,
     pub clock: Arc<dyn Clock>,
     pub limits: Limits,
-    /// `$runtime`: `{ name, version, metadata }`.
+    /// `$runtime`: `{ name, version, metadata }`. A `schedule` member, when
+    /// present, is not part of `$runtime`: it is `$run.schedule`, what a
+    /// scheduler's trigger tells the run it started (`{ kind, slot, previous }`).
     pub runtime: Value,
 }
 
@@ -781,6 +783,9 @@ async fn execute(
         return stopped(Status::Interrupted(WorkflowError::runtime("invalid saved timestamp")));
     }
     let jumps = records.values().filter(|r| matches!(r, Record::Budget { granted: true, .. })).count();
+    // `schedule` is `$run.schedule`, not part of the `$runtime` descriptor.
+    let mut descriptor = runtime.clone();
+    let schedule = descriptor.as_object_mut().and_then(|m| m.remove("schedule")).filter(|s| !s.is_null());
     let run = Run {
         host,
         wf,
@@ -796,7 +801,8 @@ async fn execute(
         calls: Mutex::new(calls.iter().map(|c| (c.key.clone(), c.clone())).collect()),
         protected: AtomicUsize::new(0),
         workflow: json!({ "id": run_id, "definition": wf.definition, "input": input, "startedAt": datetime(DateTime::from_timestamp_millis(started_ms).expect("stored timestamp")) }),
-        runtime: runtime.clone(),
+        runtime: descriptor,
+        schedule,
         journal,
         records: Mutex::new(records),
         attempts: Mutex::default(),
@@ -918,6 +924,8 @@ struct Run<'a> {
     /// `$workflow`.
     workflow: Value,
     runtime: Value,
+    /// `$run.schedule`, when a trigger started the run.
+    schedule: Option<Value>,
     journal: Option<&'a dyn Journal>,
     records: Mutex<BTreeMap<String, Record>>,
     /// Attempt prefixes of the `try`s running now: `<task>/try[k]` → `<task>/try`.
@@ -1195,7 +1203,12 @@ impl Run<'_> {
 
     /// `$run` with the given visit counts.
     fn run_argument(&self, visits: Value) -> Value {
-        json!({ "jumps": self.jumps.load(Ordering::SeqCst), "maxJumps": self.max_jumps, "visits": visits })
+        let mut run =
+            json!({ "jumps": self.jumps.load(Ordering::SeqCst), "maxJumps": self.max_jumps, "visits": visits });
+        if let Some(schedule) = &self.schedule {
+            run["schedule"] = schedule.clone();
+        }
+        run
     }
 
     /// Takes the jump the task at `reference` chose, spending one unit of

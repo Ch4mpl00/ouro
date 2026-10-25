@@ -668,7 +668,7 @@ pub async fn run_all(factory: impl AsyncFn(&str) -> anyhow::Result<TestStore>) -
         audit(&*s).await?;
     }
     report.witnesses.insert("finite histories drain every live listener");
-    assert_eq!(report.witnesses.len(), 26);
+    assert_eq!(report.witnesses.len(), 27);
     let t = factory("concurrent-claims").await?;
     report.cases += 1;
     t.store.admit(&admission("r"), 0).await?;
@@ -1916,6 +1916,38 @@ async fn decisions(
     assert_eq!(s.trigger("after").await?, Some(dormant(2)), "a replaced trigger is not re-armed");
     report.operations += 8;
     report.witnesses.insert("an old epoch's completion cannot rearm its replacement");
+
+    // A one-shot trigger: its only firing admits the run, with what the
+    // trigger told it, and leaves the trigger dormant, with no rearm. Neither
+    // the run's end nor a reopen makes it due again.
+    let t = factory("one-shot").await?;
+    report.cases += 1;
+    let s = &t.store;
+    let armed = Trigger { at_ms: Some(10), types: vec![], state: json!({ "kind": "at", "epoch": 1 }) };
+    let done = Trigger {
+        at_ms: None,
+        types: vec![],
+        state: json!({ "kind": "at", "epoch": 1, "done": true, "previous": 10 }),
+    };
+    let mut shot = admission("shot");
+    shot.runtime = json!({ "schedule": { "kind": "at", "slot": 10, "previous": null } });
+    assert!(s.swap_trigger("once", None, Some(&armed), &[], None, 0).await?);
+    assert_eq!(s.due_triggers(9, 10).await?, vec![]);
+    assert_eq!(s.due_triggers(10, 10).await?, vec![("once".to_string(), armed.clone())]);
+    let firing =
+        Firing { key: "once", expected: Some(&armed), next: Some(&done), admit: &[shot.clone()], ..Firing::default() };
+    assert_eq!(s.fire(&firing, 10).await?, Fired::Committed);
+    assert_eq!(s.fire(&firing, 10).await?, Fired::Changed, "the slot is consumed once");
+    assert_eq!(s.get("shot").await?.unwrap().admission, shot, "the run keeps what its trigger told it");
+    let f = s.claim("shot", 11).await?.unwrap();
+    s.finish(&f, &Status::Completed(json!(0)), 12, 3).await?;
+    let reopened = (t.reopen)().await?;
+    assert_eq!(reopened.trigger("once").await?, Some(done));
+    assert!(reopened.due_triggers(i64::MAX, 10).await?.is_empty());
+    assert_eq!(reopened.get("shot").await?.unwrap().admission, shot);
+    audit(&*reopened).await?;
+    report.operations += 8;
+    report.witnesses.insert("a one-shot trigger fires once and stays dormant");
     Ok(())
 }
 

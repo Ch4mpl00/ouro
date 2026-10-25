@@ -9,12 +9,13 @@
 // container/script/shell through a host process runner), set, switch,
 // try/catch with retry (limit.attempt.duration included), wait;
 // input/output/export transforms and schemas (inline or a host-resolved
-// `resource`); if/then/timeout; schedule (every, cron, after, on; missed
-// slots per `document.metadata.catchup`: `latest` | `none`; overlap per
-// `document.metadata.overlap`: `skip` | `allow` | `queue` | `replace`);
+// `resource`); if/then/timeout; schedule (every, cron, after, on; extensions
+// in `document.metadata`: `at`, a one-shot instant; `timezone`, the IANA zone
+// of `cron`; `catchup` for missed slots: `latest` | `none`; `overlap`:
+// `skip` | `allow` | `queue` | `replace`);
 // use.functions/errors/retries/timeouts/extensions/secrets; evaluate (jq,
 // strict). Runtime arguments: $context, $input, $output, $task, $workflow,
-// $runtime, $run (an extension: jump and visit counts), and $secrets in
+// $runtime, $run (an extension: jump and visit counts, the trigger's slot), and $secrets in
 // `input.from` only. The jump budget's tightening and its `on_exceeded`
 // handling live in `document.metadata.limits` (an extension).
 //
@@ -133,6 +134,14 @@ pub struct Schedule {
     pub after: Option<Duration>,
     pub on: Option<Strategy>,
     pub read: Read,
+    /// `document.metadata.at` (an extension): the instant of a one-shot
+    /// schedule, in epoch milliseconds. It is a schedule of its own: the
+    /// official `schedule` object has no such property, so it never combines
+    /// with `every`, `cron`, `after` or `on`.
+    pub at: Option<i64>,
+    /// `document.metadata.timezone` (an extension): the IANA zone `cron` is
+    /// evaluated in. `None`: UTC.
+    pub timezone: Option<chrono_tz::Tz>,
     /// `document.metadata.catchup` (an extension): what becomes of `every`
     /// and `cron` slots missed while no scheduler ran.
     pub catchup: Catchup,
@@ -595,7 +604,42 @@ impl Parser {
         let timeout = m.get("timeout").and_then(|t| self.timeout(t, "/timeout"));
         let mut schedule = m.get("schedule").and_then(|s| self.schedule(s));
         // CHOICE: the OWS `schedule` object admits no extra property, so the
-        // missed-slot policy is the document's metadata.
+        // extensions of a schedule (its time zone, a one-shot instant, the
+        // missed-slot and overlap policies) are the document's metadata.
+        let metadata = |key: &str| m.get("document").and_then(|d| d.get("metadata")).and_then(|d| d.get(key));
+        match (metadata("at"), schedule.as_mut()) {
+            (None, _) => {}
+            (Some(at), None) => {
+                let at = self.instant(at, "/document/metadata/at");
+                if m.contains_key("schedule") {
+                    // The schedule object failed on its own; nothing to add.
+                } else if let Some(at) = at {
+                    schedule = Some(Schedule {
+                        every: None,
+                        cron: None,
+                        after: None,
+                        on: None,
+                        read: Read::Data,
+                        at: Some(at),
+                        timezone: None,
+                        catchup: Catchup::Latest,
+                        overlap: Overlap::Skip,
+                    });
+                }
+            }
+            (Some(_), Some(_)) => self.fail(
+                "/document/metadata/at",
+                "a one-shot `at` is a schedule of its own: remove `schedule` (every, cron, after, on)",
+            ),
+        }
+        match (metadata("timezone"), schedule.as_mut()) {
+            (None, _) => {}
+            (Some(zone), Some(s)) if s.cron.is_some() => match zone.as_str().map(str::parse::<chrono_tz::Tz>) {
+                Some(Ok(zone)) => s.timezone = Some(zone),
+                _ => self.fail("/document/metadata/timezone", "expected an IANA time zone name, e.g. Europe/Berlin"),
+            },
+            (Some(_), _) => self.fail("/document/metadata/timezone", "timezone applies only with a `cron` schedule"),
+        }
         match m.get("document").and_then(|d| d.get("metadata")).and_then(|d| d.get("catchup")) {
             None => {}
             Some(c) => match (c.as_str(), schedule.as_mut()) {
@@ -911,6 +955,15 @@ impl Parser {
         Some(Kind::Listen(Box::new(Listen { to, read, foreach })))
     }
 
+    /// An RFC 3339 timestamp with an offset, as epoch milliseconds.
+    fn instant(&mut self, v: &Value, at: &str) -> Option<i64> {
+        let parsed = v.as_str().and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok());
+        if parsed.is_none() {
+            self.fail(at, "expected an RFC 3339 timestamp with an offset, e.g. 2030-01-31T09:00:00Z");
+        }
+        parsed.map(|t| t.timestamp_millis())
+    }
+
     fn read(&mut self, v: Option<&Value>, at: &str) -> Read {
         match v.map(|v| v.as_str()) {
             None | Some(Some("data")) => Read::Data,
@@ -1113,7 +1166,17 @@ impl Parser {
         if every.is_none() && after.is_none() && cron.is_none() && on.is_none() {
             self.fail(at, "a schedule needs every, cron, after or on");
         }
-        Some(Schedule { every, cron, after, on, read, catchup: Catchup::Latest, overlap: Overlap::Skip })
+        Some(Schedule {
+            every,
+            cron,
+            after,
+            on,
+            read,
+            at: None,
+            timezone: None,
+            catchup: Catchup::Latest,
+            overlap: Overlap::Skip,
+        })
     }
 
     fn for_task(&mut self, m: &Map<String, Value>, at: &str) -> Option<Kind> {
@@ -1590,7 +1653,10 @@ pub const BASE_VARS: &[&str] = &["context", "input", "output", "task", "workflow
 
 /// `$run` (an extension): `{ jumps, maxJumps, visits }`, the jumps this run
 /// took to a named task, its budget, and how often each task of the
-/// enclosing lists was entered. Reserved: no loop or catch variable takes it.
+/// enclosing lists was entered; and, for a run a schedule's trigger started,
+/// `schedule: { kind, slot, previous }` (datetimes like `$workflow.startedAt`;
+/// `previous` is `null` for the first). Reserved: no loop or catch variable
+/// takes it.
 pub const RUN: &str = "run";
 
 /// The argument holding the declared secrets. CHOICE: the DSL's argument
@@ -2594,6 +2660,44 @@ do:
             assert!(
                 parse_yaml(&yaml(policy, schedule)).unwrap_err().to_string().contains("/document/metadata/overlap")
             );
+        }
+    }
+
+    #[test]
+    fn timezone_and_one_shot_are_schedule_metadata() {
+        let yaml = |metadata: &str, schedule: &str| {
+            format!(
+                "document: {{ dsl: '1.0.4', namespace: t, name: w, version: '1.0.0', metadata: {{ {metadata} }} }}\n{schedule}\ndo: [ {{ a: {{ set: {{ ok: true }} }} }} ]"
+            )
+        };
+        let cron = "schedule: { cron: '0 9 * * *' }";
+        let s = parse_yaml(&yaml("timezone: Europe/Berlin", cron)).unwrap().schedule.unwrap();
+        assert_eq!(s.timezone, Some(chrono_tz::Tz::Europe__Berlin));
+        assert_eq!(parse_yaml(&yaml("", cron)).unwrap().schedule.unwrap().timezone, None);
+        for (metadata, schedule, at) in [
+            ("timezone: Mars/Olympus", cron, "/document/metadata/timezone"),
+            ("timezone: 42", cron, "/document/metadata/timezone"),
+            ("timezone: Europe/Berlin", "schedule: { every: PT1M }", "/document/metadata/timezone"),
+            ("timezone: Europe/Berlin", "", "/document/metadata/timezone"),
+        ] {
+            let e = parse_yaml(&yaml(metadata, schedule)).unwrap_err().to_string();
+            assert!(e.contains(at), "{metadata} {schedule}: {e}");
+        }
+        // `at` is a schedule of its own, with the shared policies.
+        let s = parse_yaml(&yaml("at: '2030-01-31T09:00:00+02:00', catchup: none, overlap: queue", "")).unwrap();
+        let s = s.schedule.unwrap();
+        assert_eq!(s.at, Some(1_896_073_200_000));
+        assert_eq!((s.every, s.cron, s.after, s.on.is_some()), (None, None, None, false));
+        assert_eq!((s.catchup, s.overlap), (Catchup::None, Overlap::Queue));
+        for (metadata, schedule) in [
+            ("at: '2030-01-31T09:00:00Z'", "schedule: { every: PT1M }"),
+            ("at: '2030-01-31 09:00'", ""),
+            ("at: '2030-01-31T09:00:00'", ""),
+            ("at: 1900000000", ""),
+            ("at: '2030-01-31T09:00:00Z', timezone: Europe/Berlin", ""),
+        ] {
+            let e = parse_yaml(&yaml(metadata, schedule)).unwrap_err().to_string();
+            assert!(e.contains("/document/metadata/"), "{metadata} {schedule}: {e}");
         }
     }
 
