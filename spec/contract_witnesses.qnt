@@ -187,11 +187,22 @@ module contract_witnesses {
   action resumedQueue = stoppedQueue.then(do("stop"))
   run resumedQueueTest = resumedQueue.expect(checked and not(m.db.stopped) and m.db.catalog.queued == -1
     and m.db.admissions == [1,1,0] and m.db.runs.nth(1).input == 7)
+  // A one-shot (activation value 4) fires once. Neither its run's end nor a
+  // later tick makes it due again; only an activation arms it.
+  action oneShot = init.then(execute("activate",0,0,0,4,0)).then(ticks(2)).then(do("fire")).then(do("claim"))
+    .then(do("finish")).then(ticks(4)).then(execute("fire",1,0,0,0,0))
+  run oneShotTest = oneShot.expect(checked and m.db.admissions == [1,0,0] and m.db.fired == Set((2,0)) and
+    m.db.catalog.armed and m.db.catalog.due < 0 and m.db.catalog.once and m.db.runs.nth(0).outcome == 1)
+  // Its slot is consumed by a skip too: an earlier epoch's run is still live.
+  action oneShotBusy = init.then(ticks(2)).then(do("fire")).then(execute("activate",0,0,0,4,0)).then(ticks(2))
+    .then(execute("fire",1,0,0,0,0)).then(ticks(4)).then(execute("fire",2,0,0,0,0))
+  run oneShotBusyTest = oneShotBusy.expect(checked and m.db.admissions == [1,0,0] and m.db.skipped == Set((2,0)) and
+    m.db.catalog.due < 0 and m.db.catalog.once)
   // Every history above in one trace (each starts with init), replayed
   // against the stores by crates/durable/tests/quint.rs.
   run bridgeSuite = continuation.then(unknown).then(mailbox).then(expiry).then(child).then(childFinish).then(grandchild).then(activation)
     .then(deadline).then(compatibility).then(dry).then(replay).then(schedule).then(breaker).then(rearm)
     .then(noCatchup).then(overlap).then(ingress).then(ingressExpiry).then(redispatch).then(protectedUnknown)
     .then(notExecuted).then(errorResponse).then(conflict).then(release).then(staleFence).then(admission)
-    .then(successResetsBreaker).then(noRollback).then(reactivation).then(broadcast).then(retention).then(budget).then(skipPolicy).then(allowPolicy).then(queuePolicy).then(replacePolicy).then(ceilingPolicy).then(skipCrash).then(allowCrash).then(queueCrash).then(replaceCrash).then(refused).then(oldCompletionPromotes).then(queuedRefusal).then(emergencyStop).then(clearStop).then(stoppedQueue).then(resumedQueue)
+    .then(successResetsBreaker).then(noRollback).then(reactivation).then(broadcast).then(retention).then(budget).then(skipPolicy).then(allowPolicy).then(queuePolicy).then(replacePolicy).then(ceilingPolicy).then(skipCrash).then(allowCrash).then(queueCrash).then(replaceCrash).then(refused).then(oldCompletionPromotes).then(queuedRefusal).then(emergencyStop).then(clearStop).then(stoppedQueue).then(resumedQueue).then(oneShot).then(oneShotBusy)
 }

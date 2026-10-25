@@ -567,11 +567,13 @@ impl Runtime {
             observer: spans.clone(),
             clock: Arc::new(InterpreterClock(self.clock.clone())),
             limits,
-            // `$runtime`: the descriptor the DSL defines, without the pins.
+            // `$runtime`: the descriptor the DSL defines, without the pins;
+            // its `schedule` member is `$run.schedule` (`ows::run::Host`).
             runtime: json!({
                 "name": runtime["name"],
                 "version": runtime["version"],
                 "metadata": runtime.get("metadata").cloned().unwrap_or_else(|| json!({})),
+                "schedule": runtime.get("schedule").cloned().unwrap_or(Value::Null),
             }),
         };
         // The workflow's deadline counts from admission, whichever process
@@ -1052,21 +1054,29 @@ impl Admitter {
     /// definition), the `Refused` the trigger records with its slot instead.
     /// A tripped definition, no active version and storage errors remain
     /// errors.
+    ///
+    /// `schedule` is what the trigger tells the run (`$run.schedule`:
+    /// `{ kind, slot, previous }`), kept in the admission's runtime like its
+    /// bindings, so a recovered or replayed run sees the same one.
     pub async fn triggered(
         &self,
         id: &str,
         name: &str,
         input: Value,
+        schedule: Value,
     ) -> anyhow::Result<Result<Admission, ouro_durable::Refused>> {
         let d = self.current(name).await?;
         match self.of(id, &d, input.clone(), &self.root()).await {
-            Ok(admission) => Ok(Ok(admission)),
+            Ok(mut admission) => {
+                admission.runtime["schedule"] = schedule;
+                Ok(Ok(admission))
+            }
             Err(e) => match refusal(&e) {
-                Some(error) => Ok(Err(ouro_durable::Refused {
-                    admission: self.admission(id, &d, input, &self.root(), None).await,
-                    error,
-                    breaker_threshold: self.breaker_threshold,
-                })),
+                Some(error) => {
+                    let mut admission = self.admission(id, &d, input, &self.root(), None).await;
+                    admission.runtime["schedule"] = schedule;
+                    Ok(Err(ouro_durable::Refused { admission, error, breaker_threshold: self.breaker_threshold }))
+                }
                 None => Err(e),
             },
         }
