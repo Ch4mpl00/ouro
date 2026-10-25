@@ -6,6 +6,30 @@ store written before such a change must be recreated unless the entry says other
 
 ## Unreleased (since v0.1.0)
 
+### Issue #31, M-6: engine extensions under `metadata.ouro`
+
+Breaking changes (issue #31, M-6), for authors of definitions, hosts and
+store adapters:
+
+- Every engine extension moves under an `ouro` object, at both levels:
+  `document.metadata.{limits, at, timezone, catchup, overlap}` become
+  `document.metadata.ouro.{…}`, and a task's `metadata.{delivery,
+  concurrency, hold}` become `metadata.ouro.{…}`. Everything else in
+  `metadata` is the host's and is never read. The old flat keys are not
+  detected: a definition still written that way silently loses those settings,
+  including the tightenings `delivery: at_most_once` and `limits`.
+- An unknown key inside `ouro` is a validation error listing the known keys
+  (a typo no longer falls back to a default); `ouro` that is not an object is
+  `expected an object`. Error pointers move under `/ouro/`, e.g.
+  `/document/metadata/ouro/overlap` and `/do/0/x/metadata/ouro/delivery`.
+- The durable state version is 14 and the `definitions` row layout is 7: rows
+  of 13 and 6 are refused, not converted, so a store written before this
+  change must be recreated.
+- The public conformance suite (`ouro_durable::conformance`) uses the nested
+  form in its definitions (`metadata: { ouro: { overlap: queue, catchup: none } }`
+  and a listen task's `metadata: { ouro: { hold: … } }`); a store implementor
+  needs no change beyond the new versions.
+
 ### Issue #31
 
 Breaking changes (issue #31), for hosts and adapters written before it:

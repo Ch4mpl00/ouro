@@ -163,7 +163,7 @@ pub trait Functions: Send + Sync {
     }
     async fn call(&self, name: &str, args: Value, info: &CallInfo<'_>) -> Result<Value, WorkflowError>;
     /// Whether this invocation is at most once whatever its task says: the
-    /// function's declared delivery. A task's `metadata.delivery` can only
+    /// function's declared delivery. A task's `metadata.ouro.delivery` can only
     /// tighten it.
     fn at_most_once(&self, _name: &str, _args: &Value) -> bool {
         false
@@ -497,7 +497,7 @@ pub fn validate(wf: &Workflow, functions: &dyn Functions) -> Result<(), Invalid>
 pub fn validate_limits(wf: &Workflow, limits: &Limits) -> Result<(), Invalid> {
     match wf.budget.max_jumps {
         Some(n) if n > limits.max_jumps => Err(Invalid(vec![Problem {
-            at: "/document/metadata/limits/max_jumps".into(),
+            at: "/document/metadata/ouro/limits/max_jumps".into(),
             message: format!("{n} is above this host's ceiling of {} jumps", limits.max_jumps),
         }])),
         _ => Ok(()),
@@ -3520,7 +3520,7 @@ do:
 
     fn limited(on_exceeded: &str, max: u64) -> String {
         format!(
-            "document: {{ dsl: '1.0.4', namespace: test, name: w, version: '0.1.0', metadata: {{ limits: {{ max_jumps: {max}{on_exceeded} }} }} }}\n{LOOP}"
+            "document: {{ dsl: '1.0.4', namespace: test, name: w, version: '0.1.0', metadata: {{ ouro: {{ limits: {{ max_jumps: {max}{on_exceeded} }} }} }} }}\n{LOOP}"
         )
     }
 
@@ -3548,7 +3548,7 @@ do:
     #[tokio::test]
     async fn a_retry_around_a_refused_jump_ends_at_the_attempt_ceiling() {
         let s = setup(Fake::default());
-        let doc = "document: { dsl: '1.0.4', namespace: test, name: w, version: '0.1.0', metadata: { limits: { max_jumps: 3 } } }\ndo:\n  - guard:\n      try:\n        - step: { set: { n: '${ .n + 1 }' } }\n        - again: { switch: [ { done: { when: '${ .n < 0 }', then: exit } }, { more: { then: step } } ] }\n      catch: { retry: {}, do: [ { h: { set: { r: gave_up } } } ] }\n";
+        let doc = "document: { dsl: '1.0.4', namespace: test, name: w, version: '0.1.0', metadata: { ouro: { limits: { max_jumps: 3 } } } }\ndo:\n  - guard:\n      try:\n        - step: { set: { n: '${ .n + 1 }' } }\n        - again: { switch: [ { done: { when: '${ .n < 0 }', then: exit } }, { more: { then: step } } ] }\n      catch: { retry: {}, do: [ { h: { set: { r: gave_up } } } ] }\n";
         let o = exec(&s, doc, json!({"n": 0})).await;
         assert_eq!(completed(&o)["r"], "gave_up");
         // The ceiling counts the first attempt: each later one is refused at once.
@@ -3609,7 +3609,7 @@ do:
         assert!(validate_limits(&wf, &Limits::default()).is_ok());
         let wf = model::parse_yaml(&limited("", 101)).unwrap();
         let e = validate_limits(&wf, &Limits::default()).unwrap_err().to_string();
-        assert!(e.contains("/document/metadata/limits/max_jumps") && e.contains("ceiling of 100"), "{e}");
+        assert!(e.contains("/document/metadata/ouro/limits/max_jumps") && e.contains("ceiling of 100"), "{e}");
     }
 
     #[tokio::test]

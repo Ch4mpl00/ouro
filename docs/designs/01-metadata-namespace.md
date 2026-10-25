@@ -1,6 +1,6 @@
 # 01. Engine extensions live under `metadata.ouro`
 
-Status: approved · Issue: #31 (M-6) · Review: goldfish round 1 (2026-10-25), findings resolved below
+Status: implemented (8ba3842) · Issue: #31 (M-6) · Review: goldfish round 1 (2026-10-25), findings resolved below
 
 ## Problem
 

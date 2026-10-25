@@ -794,7 +794,7 @@ pub async fn run_all(factory: impl AsyncFn(&str) -> anyhow::Result<TestStore>) -
 
 /// A combined schedule exercises each kind without a runtime or registry.
 pub fn control_definition_yaml() -> &'static str {
-    "document: { dsl: '1.0.4', namespace: test, name: workflow, version: '1.0.0', metadata: { overlap: queue, catchup: none } }
+    "document: { dsl: '1.0.4', namespace: test, name: workflow, version: '1.0.0', metadata: { ouro: { overlap: queue, catchup: none } } }
 schedule:
   every: PT1S
   cron: '0 * * * * *'
@@ -2372,7 +2372,7 @@ async fn listen_case(
     });
     let timeout = if mode == 3 { 5 } else { 50 };
     let definition = format!(
-        "document: {{ dsl: '1.0.4', namespace: test, name: listen, version: '1.0.0' }}\ndo:\n - attempt:\n     try:\n       - listen:\n           listen: {{ to: {{ one: {{ with: {{ type: answer }} }} }}, read: envelope }}\n           metadata: {{ hold: PT0.010S }}\n           timeout: {{ after: PT0.{timeout:03}S }}\n     catch:\n       errors: {{ with: {{ status: 408 }} }}\n       do: [ {{ expired: {{ set: {{ expired: true }} }} }} ]\n"
+        "document: {{ dsl: '1.0.4', namespace: test, name: listen, version: '1.0.0' }}\ndo:\n - attempt:\n     try:\n       - listen:\n           listen: {{ to: {{ one: {{ with: {{ type: answer }} }} }}, read: envelope }}\n           metadata: {{ ouro: {{ hold: PT0.010S }} }}\n           timeout: {{ after: PT0.{timeout:03}S }}\n     catch:\n       errors: {{ with: {{ status: 408 }} }}\n       do: [ {{ expired: {{ set: {{ expired: true }} }} }} ]\n"
     );
     let wf = ows::model::parse_yaml(&definition)?;
     let host = Host {

@@ -25,7 +25,7 @@
 //! A slot's run id is derived from the slot (`schedule:<name>:every:<ms>`,
 //! `…:cron:<ms>`, `…:at:<ms>`, `…:after:<epoch>:<n>`, `…:on:<digest of the events>`) and
 //! the trigger moves to the next slot in the commit that admits it, so
-//! several processes start each run once. `document.metadata.overlap` chooses
+//! several processes start each run once. `document.metadata.ouro.overlap` chooses
 //! skip, allow, queue (one durable slot) or replace (normal cancellation)
 //! over the trigger's unfinished runs. The store decides it and the host's
 //! definition ceiling in the firing's commit. A missed slot under

@@ -47,7 +47,7 @@ pub struct Config {
     /// Host ceilings no definition can lift, among them the jump budget of a
     /// run tree (`max_jumps`, default 100) and how deep child runs nest
     /// (`max_depth`, default 10). Only the host sets them; a definition may
-    /// only tighten the budget (`document.metadata.limits`).
+    /// only tighten the budget (`document.metadata.ouro.limits`).
     pub limits: Limits,
     /// `$runtime.metadata`: implementation-specific facts the host exposes
     /// to every expression (a tenant, feature flags).
@@ -1780,7 +1780,7 @@ impl Functions for ExecutionFunctions {
     }
     fn at_most_once(&self, name: &str, _: &Value) -> bool {
         // The declared delivery; the interpreter applies a task's
-        // `metadata.delivery` on top, which can only tighten it.
+        // `metadata.ouro.delivery` on top, which can only tighten it.
         let delivery = match name.strip_prefix(&Process::function("")) {
             Some(kind) => self.admitter.capabilities.processes.as_ref().map(|p| p.delivery(kind)),
             None => self.registry.get(name).map(|f| f.function.delivery),

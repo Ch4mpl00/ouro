@@ -219,8 +219,9 @@ async fn run_rows_of_another_state_version_are_refused() {
     s.start(&conformance::admission("r"), 0).await.unwrap();
     let key = ("run".to_string(), "r".to_string());
     // 3 and earlier: one aggregate per run; 4 and 5: call records with an
-    // effect; 9: no annotation totals on the run row.
-    for version in [None, Some(3), Some(4), Some(5), Some(6), Some(9)] {
+    // effect; 9: no annotation totals on the run row; 13: the engine's
+    // extensions read from the flat `metadata` keys, not `metadata.ouro`.
+    for version in [None, Some(3), Some(4), Some(5), Some(6), Some(9), Some(13)] {
         let before = backend.snapshot().await.unwrap();
         let mut rows = before.rows.clone();
         let run = rows.get_mut(&key).unwrap().as_object_mut().unwrap();
@@ -287,6 +288,15 @@ async fn definitions_rows_of_an_earlier_layout_are_refused() {
     assert!(backend.compare_exchange(&before, &rows).await.unwrap());
     let refused = s.definitions("workflow").await.unwrap_err().to_string();
     assert!(refused.contains("unsupported layout 5"), "{refused}");
+    // Layout 6 stored definitions whose engine extensions were the flat
+    // `metadata` keys; read now, they would silently lose their settings.
+    let current = backend.snapshot().await.unwrap();
+    assert!(backend.compare_exchange(&current, &before.rows).await.unwrap());
+    let mut rows = before.rows.clone();
+    rows.get_mut(&key).unwrap().as_object_mut().unwrap().insert("version".into(), serde_json::json!(6));
+    assert!(backend.compare_exchange(&before, &rows).await.unwrap());
+    let refused = s.definitions("workflow").await.unwrap_err().to_string();
+    assert!(refused.contains("unsupported layout 6"), "{refused}");
 }
 
 #[tokio::test]

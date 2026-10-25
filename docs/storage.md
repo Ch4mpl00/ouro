@@ -4,7 +4,7 @@ Completed calls and tasks restore their saved results on resume. Delivery is
 declared per function. Every call is at least once by default: a call whose outcome is unknown after a crash may be
 dispatched again, with the same idempotency key. A function declares
 `Delivery::AtMostOnce` at registration (a process runner per kind); a task may
-tighten its call with `metadata.delivery: at_most_once`, never loosen it. The
+tighten its call with `metadata.ouro.delivery: at_most_once`, never loosen it. The
 effective delivery is bound into the invocation record and into the run's
 pinned bindings. At most once commits intent before dispatch; intent without a
 response produces `urn:ouro:errors:call.unknown` ([Call outcomes](call-outcomes.md)),
@@ -105,14 +105,16 @@ Both initial migrations were replaced before any release or deployment. This
 layout requires a fresh database from the earlier development checkout; there
 is no conversion of that unreleased layout. Applied migrations are immutable
 from the next release onward. The SQL schema is a generic key/value table, so
-the row shapes above (and the interpreter's durable state version, now 13; 12:
+the row shapes above (and the interpreter's durable state version, now 14; 12:
 a run row may be held by an operator; 13: an unknown at-most-once
-outcome is catchable by its type, and recovery restores a refusal) can
+outcome is catchable by its type, and recovery restores a refusal; 14: the
+engine's extensions are read from `metadata.ouro`) can
 change without a migration; nothing persisted before them is converted. Each
 run row records the durable state version it was written under, and a row of
 another version (including the earlier one-aggregate-per-run layout) is
 refused with an error rather than read as a run without evidence. Likewise a
-`definitions` row records its layout (4: each version's latest activation);
+`definitions` row records its layout (4: each version's latest activation;
+7: the stored YAML keeps the engine's extensions under `metadata.ouro`);
 the earlier unversioned layout, which kept a predecessor for a breaker
 rollback, is refused rather than read as a definition that never tripped,
 and so is layout 3, which kept no activation times.

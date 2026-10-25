@@ -582,7 +582,7 @@ async fn every_cron_and_after_start_each_slot_once() {
 fn scheduled(name: &str, schedule: &str, meta: &str, body: &str) -> String {
     let schedule = if schedule.is_empty() { String::new() } else { format!("schedule: {{ {schedule} }}\n") };
     doc(name, &format!("{schedule}do: [ {{ a: {body} }} ]"))
-        .replace("version: '1.0.0' }", &format!("version: '1.0.0', metadata: {{ {meta} }} }}"))
+        .replace("version: '1.0.0' }", &format!("version: '1.0.0', metadata: {{ ouro: {{ {meta} }} }} }}"))
 }
 
 #[tokio::test]
@@ -770,7 +770,7 @@ async fn schedule_on_starts_a_run_per_match() {
         &doc(
             "alarm",
             "schedule: { on: { one: { with: { type: heartbeat.low, data: '${ .bpm < 50 }' } } } }\ndo: [ { a: { set: { patient: '${ .[0].patient }' } } } ]",
-        ).replace("version: '1.0.0' }", "version: '1.0.0', metadata: { overlap: allow } }"),
+        ).replace("version: '1.0.0' }", "version: '1.0.0', metadata: { ouro: { overlap: allow } } }"),
     ).await;
     let mut started = Vec::new();
     for (id, bpm, patient) in [("1", 40, "ann"), ("2", 70, "bob"), ("3", 45, "cid"), ("1", 40, "ann")] {
@@ -947,7 +947,8 @@ async fn children_of_a_tripped_definition_are_refused_with_a_typed_error() {
 async fn catchup_none_skips_missed_slots_with_a_record() {
     let f = fixture();
     let body = "schedule: { every: PT1M }\ndo: [ { a: { set: { ok: true } } } ]";
-    let yaml = doc("strict", body).replace("version: '1.0.0' }", "version: '1.0.0', metadata: { catchup: none } }");
+    let yaml =
+        doc("strict", body).replace("version: '1.0.0' }", "version: '1.0.0', metadata: { ouro: { catchup: none } } }");
     save(&f.rt, "strict", &yaml).await;
     f.time.set(60_000);
     assert_eq!(f.rt.fire_due().await.unwrap(), vec!["schedule:strict:every:60000".to_string()]);
@@ -961,7 +962,7 @@ async fn catchup_none_skips_missed_slots_with_a_record() {
     f.time.set(660_000);
     assert_eq!(f.rt.fire_due().await.unwrap(), vec!["schedule:strict:every:660000".to_string()]);
     let bad = doc("bad", "do: [ { a: { set: { ok: true } } } ]")
-        .replace("version: '1.0.0' }", "version: '1.0.0', metadata: { catchup: none } }");
+        .replace("version: '1.0.0' }", "version: '1.0.0', metadata: { ouro: { catchup: none } } }");
     assert!(f.rt.save("bad", &bad).await.unwrap_err().to_string().contains("catchup"));
 }
 
@@ -1307,7 +1308,7 @@ const BUDGETED: &str = r#"do:
 
 fn budgeted() -> String {
     format!(
-        "document: {{ dsl: '1.0.4', namespace: test, name: loop, version: '1.0.0', metadata: {{ limits: {{ max_jumps: 3, on_exceeded: end }} }} }}\n{BUDGETED}\n"
+        "document: {{ dsl: '1.0.4', namespace: test, name: loop, version: '1.0.0', metadata: {{ ouro: {{ limits: {{ max_jumps: 3, on_exceeded: end }} }} }} }}\n{BUDGETED}\n"
     )
 }
 
@@ -1469,7 +1470,7 @@ async fn definitions_only_tighten_the_budget_and_cannot_loop_without_a_way_out()
     let f = fixture();
     let limited = |n: u64| {
         format!(
-            "document: {{ dsl: '1.0.4', namespace: test, name: l, version: '1.0.0', metadata: {{ limits: {{ max_jumps: {n} }} }} }}\n{BUDGETED}\n"
+            "document: {{ dsl: '1.0.4', namespace: test, name: l, version: '1.0.0', metadata: {{ ouro: {{ limits: {{ max_jumps: {n} }} }} }} }}\n{BUDGETED}\n"
         )
     };
     assert!(f.rt.validate(&limited(100)).is_ok());
@@ -1581,7 +1582,7 @@ const RACING: &str = r#"document:
   namespace: test
   name: race
   version: '1.0.0'
-  metadata: { limits: { max_jumps: 3, on_exceeded: { call: report, with: { by: '${ .b }' } } } }
+  metadata: { ouro: { limits: { max_jumps: 3, on_exceeded: { call: report, with: { by: '${ .b }' } } } } }
 do:
   - both:
       fork:
@@ -1713,7 +1714,10 @@ async fn schedule_overlap_policies_apply_to_time_and_event_slots() {
                 _ => "on: { one: { with: { type: tick } } }",
             };
             let yaml = doc("overlap", &format!("schedule: {{ {schedule} }}\ndo: [ {{ pause: {{ wait: PT1H }} }} ]"))
-                .replace("version: '1.0.0' }", &format!("version: '1.0.0', metadata: {{ overlap: {policy} }} }}"));
+                .replace(
+                    "version: '1.0.0' }",
+                    &format!("version: '1.0.0', metadata: {{ ouro: {{ overlap: {policy} }} }} }}"),
+                );
             save(&f.rt, "overlap", &yaml).await;
             let fire = async |n: i64| {
                 f.time.set(n * 60_000);
@@ -1777,7 +1781,7 @@ async fn schedule_allow_stops_at_the_host_ceiling_across_trigger_kinds() {
         "bounded",
         "schedule: { every: PT1M, on: { one: { with: { type: tick } } } }\ndo: [ { pause: { wait: PT1H } } ]",
     )
-    .replace("version: '1.0.0' }", "version: '1.0.0', metadata: { overlap: allow } }");
+    .replace("version: '1.0.0' }", "version: '1.0.0', metadata: { ouro: { overlap: allow } } }");
     save(&f.rt, "bounded", &yaml).await;
     for n in 1..=10 {
         f.time.set(n * 60_000);
@@ -1798,8 +1802,10 @@ async fn schedule_allow_stops_at_the_host_ceiling_across_trigger_kinds() {
 async fn after_overlap_and_ceiling_rearm_without_stranding_the_trigger() {
     for policy in ["skip", "allow", "queue", "replace"] {
         let f = fixture();
-        let yaml = doc("after-overlap", "schedule: { after: PT1M }\ndo: [ { pause: { wait: PT1H } } ]")
-            .replace("version: '1.0.0' }", &format!("version: '1.0.0', metadata: {{ overlap: {policy} }} }}"));
+        let yaml = doc("after-overlap", "schedule: { after: PT1M }\ndo: [ { pause: { wait: PT1H } } ]").replace(
+            "version: '1.0.0' }",
+            &format!("version: '1.0.0', metadata: {{ ouro: {{ overlap: {policy} }} }} }}"),
+        );
         save(&f.rt, "after-overlap", &yaml).await;
         let first = f.rt.fire_due().await.unwrap().pop().unwrap();
         settle(&f.rt, &first).await;
@@ -1866,7 +1872,7 @@ async fn replacing_a_slot_signals_its_running_handler() {
     )
     .unwrap();
     let yaml = doc("replace-handler", "schedule: { every: PT1M }\ndo: [ { block: { call: block } } ]")
-        .replace("version: '1.0.0' }", "version: '1.0.0', metadata: { overlap: replace } }");
+        .replace("version: '1.0.0' }", "version: '1.0.0', metadata: { ouro: { overlap: replace } } }");
     save(&rt, "replace-handler", &yaml).await;
     time.set(60_000);
     let first = rt.fire_due().await.unwrap().pop().unwrap();
@@ -1895,7 +1901,7 @@ async fn schedule_ceiling_is_supplied_by_the_host() {
         Runtime::new(Arc::new(durable::memory::memory()), Arc::new(Registry::new()), config, time.clone(), tracer())
             .unwrap();
     let yaml = doc("host-ceiling", "schedule: { every: PT1M }\ndo: [ { pause: { wait: PT1H } } ]")
-        .replace("version: '1.0.0' }", "version: '1.0.0', metadata: { overlap: allow } }");
+        .replace("version: '1.0.0' }", "version: '1.0.0', metadata: { ouro: { overlap: allow } } }");
     save(&rt, "host-ceiling", &yaml).await;
     time.set(60_000);
     assert_eq!(rt.fire_due().await.unwrap().len(), 1);
@@ -1922,7 +1928,7 @@ async fn refused_slots_follow_the_selected_overlap_policy() {
             "refused-overlap",
             "schedule: { every: PT1M }\ndo: [ { pause: { wait: PT1H } }, { write: { call: write } } ]",
         )
-        .replace("version: '1.0.0' }", &format!("version: '1.0.0', metadata: {{ overlap: {policy} }} }}"));
+        .replace("version: '1.0.0' }", &format!("version: '1.0.0', metadata: {{ ouro: {{ overlap: {policy} }} }} }}"));
         save(&f.rt, "refused-overlap", &yaml).await;
         f.time.set(60_000);
         let first = f.rt.fire_due().await.unwrap().pop().unwrap();
@@ -1960,7 +1966,7 @@ async fn a_held_run_keeps_its_timer_counts_as_live_and_resumes_on_release() {
         |id: &str| ouro_runtime::control::Request { id: id.into(), actor: "operator".into(), reason: "review".into() };
     let yaml =
         doc("held", "schedule: { every: PT1M }\ndo: [ { pause: { wait: PT1M } }, { done: { set: { ok: true } } } ]")
-            .replace("version: '1.0.0' }", "version: '1.0.0', metadata: { overlap: skip } }");
+            .replace("version: '1.0.0' }", "version: '1.0.0', metadata: { ouro: { overlap: skip } } }");
     save(&f.rt, "held", &yaml).await;
     f.time.set(60_000);
     let first = f.rt.fire_due().await.unwrap().pop().unwrap();
