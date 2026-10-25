@@ -28,7 +28,10 @@ module contract {
   }
   type Copy = { id: int, recipient: int, payload: int, expires: int, disposition: int, key: int }
   // `notices`: the epochs whose trip was reported, one committed notice each.
-  type Catalog = { active: int, epoch: int, faults: int, tripped: bool,
+  // `trippedDigest`: the content digest of the version that tripped (0: not
+  // tripped). Versions are numbers and so are contents: version 3 repeats
+  // version 1's text, so the two share a digest (`content`).
+  type Catalog = { active: int, epoch: int, faults: int, tripped: bool, trippedDigest: int,
     triggerEpoch: int, due: int, slot: int, running: int, catchup: int, rearm: bool, once: bool,
     armed: bool, notices: List[int], overlap: int, maxRuns: int, queued: int, queueSlot: int, queueInput: int, queueRefused: bool }
   type Durable = { stopped: bool, runs: List[Run], copies: List[Copy], catalog: Catalog,
@@ -46,7 +49,7 @@ module contract {
   pure val emptyLocal: Local = { fence: 0, execution: 0, phase: 0, invocation: 0, stopped: false, permit: false }
   pure val initialDb: Durable = { stopped:false, runs: [emptyRun,emptyRun,emptyRun], copies: [], admissions: [0,0,0], budget: [0,0,0],
     buffered: Set(), fired: Set(), skipped: Set(), ingress: Map(), ingressPayload:Map(), catalog: { active: 1, epoch: 1,
-      faults: 0, tripped: false, triggerEpoch: 1, due: 2, slot: 0, running: -1, catchup: 0, rearm:false, once:false,
+      faults: 0, tripped: false, trippedDigest: 0, triggerEpoch: 1, due: 2, slot: 0, running: -1, catchup: 0, rearm:false, once:false,
       armed: true, notices: [], overlap:0, maxRuns:2, queued:-1, queueSlot:-1, queueInput:0, queueRefused:false } }
   pure val initial: Machine = { db: initialDb, workers: [emptyLocal,emptyLocal], now: 0,
     sends: [[0,0,0],[0,0,0],[0,0,0]], observations: [], violations: Set(), faultsSeen: Set() }
@@ -64,6 +67,10 @@ module contract {
     results: Map(), checkpoints: Set(), terminal: Map(), inputs:Map(), consumed: Set(), takes:Map(), accepted: Map(),
     spends: Map(), legal: true }
   var ideal: Ideal
+  pure def content(version: int): int = if (version == 3) 1 else version
+  // A tripped definition refuses an admission iff its version's content is the
+  // tripped one, whatever the version number (V2).
+  pure def barred(c: Catalog, version: int): bool = c.tripped and content(version) == c.trippedDigest
   pure def live(r: Run): bool = r.admitted and r.outcome == 0
   pure def compatible(app: int, worker: int): bool = app == 0 or app == worker + 1
   pure def authority(s: Machine, r: int, w: int): bool = {
@@ -111,6 +118,16 @@ module contract {
     val updated = update(s,r,execution)
     { ...updated, db: { ...updated.db, admissions: updated.db.admissions.replaceAt(r,updated.db.admissions.nth(r)+1) } }
   }
+  // A run admitted at stored version `version` (a pinned start): it counts
+  // toward the breaker only when that version is the active one, which is
+  // the epoch it carries (0: none, as no epoch is 0).
+  pure def pinRun(s: Machine, r: int, input: int, version: int): Machine = {
+    val c = s.db.catalog
+    val execution = { ...emptyRun, admitted:true, input:input, version:version,
+      epoch:if (version == c.active) c.epoch else 0, deadline:s.now + 8 }
+    val updated = update(s,r,execution)
+    { ...updated, db: { ...updated.db, admissions: updated.db.admissions.replaceAt(r,updated.db.admissions.nth(r)+1) } }
+  }
   // A fired slot's run `r` (admitted in the current epoch, untripped) ends at
   // its admission with an unhandled failure: one fault for the breaker, which
   // at the threshold trips and reports as `finish` does. With no run to wait
@@ -120,7 +137,7 @@ module contract {
     val faults = c.faults+1
     val trip = faults >= 2
     val ended = update(s,r,{ ...s.db.runs.nth(r), outcome:2, ended:s.now })
-    observe({ ...ended, db:{ ...ended.db, catalog:{ ...c, faults:faults, tripped:trip, armed:c.armed and not(trip),
+    observe({ ...ended, db:{ ...ended.db, catalog:{ ...c, faults:faults, tripped:trip, trippedDigest:if (trip) content(c.active) else 0, armed:c.armed and not(trip),
       due:if (trip) -1 else c.due,queued:if (trip) -1 else c.queued,queueSlot:if (trip) -1 else c.queueSlot, notices:if (trip) c.notices.append(c.epoch) else c.notices } } },"finish",r,i,2,1)
   }
   // Decisions: 0 dispatch afresh, 2 restore the result, 3 unknown, 4 evidence
@@ -157,9 +174,11 @@ module contract {
     })
     val first = pending.fold(-1,(a,b) => if (a == -1 or b < a) b else a)
     if (op == "stop" and value >= 0) { ...s,db:{ ...s.db,stopped:value != 0 } }
-    else if (s.db.stopped and Set("admit","dry","replay","claim","fire","refuse","ingress","renew","intent","dispatch","result","notExecuted","recover","checkpoint","conflict","subscribe","take","child","finish","timeout","spend","policy").contains(op)) s
+    else if (s.db.stopped and Set("admit","dry","replay","pin","claim","fire","refuse","ingress","renew","intent","dispatch","result","notExecuted","recover","checkpoint","conflict","subscribe","take","child","finish","timeout","spend","policy").contains(op)) s
     else if (Set("admit","dry","replay").contains(op) and value >= 0 and not(execution.admitted) and not(c.tripped))
       observe(admitRun(s,r,value,i,if (op == "dry") 1 else if (op == "replay") 2 else 0),"admit",r,i,value,1)
+    else if (op == "pin" and value >= 0 and not(execution.admitted) and not(barred(c,i+1)))
+      observe(pinRun(s,r,value,i+1),"admit",r,0,value,1)
     else if (op == "claim" and live(execution) and execution.lease <= s.now and compatible(execution.app,w) and
       not(s.workers.elems().exists(x => x.permit))) {
       val updated = update(s,r,{ ...execution, owner:w, generation:execution.generation+1, lease:s.now+4 })
@@ -249,7 +268,7 @@ module contract {
       // its triggers go and its notice is committed with it. The host decides
       // what to activate. It does not forget the schedule's last run.
       val catalog = if (not(counted)) c
-        else { ...c, faults:faults, tripped:trip, armed:c.armed and not(trip),queued:if (trip) -1 else c.queued,queueSlot:if (trip) -1 else c.queueSlot,
+        else { ...c, faults:faults, tripped:trip, trippedDigest:if (trip) content(c.active) else c.trippedDigest, armed:c.armed and not(trip),queued:if (trip) -1 else c.queued,queueSlot:if (trip) -1 else c.queueSlot,
           due:if (trip) -1 else if (c.armed and c.rearm and c.due < 0 and c.running == r and execution.epoch == c.triggerEpoch) s.now+2 else c.due,
           running:if (c.running == r) -1 else c.running, notices:if (trip) c.notices.append(c.epoch) else c.notices }
       val updated = update(s,r,{ ...execution,outcome:outcome,ended:s.now,owner:-1,lease:-1,subscription:false,
@@ -270,7 +289,7 @@ module contract {
       // an activation clears a trip; reported notices stay. The value picks
       // the trigger: catchup (odd), `after` rearm (2, 3) or a one-shot (4).
       val epoch = c.epoch+1
-      { ...s,db:{ ...s.db,catalog:{ ...c,active:i+1,epoch:epoch,faults:0,tripped:false,catchup:value % 2,rearm:value == 2 or value == 3,once:value == 4,
+      { ...s,db:{ ...s.db,catalog:{ ...c,active:i+1,epoch:epoch,faults:0,tripped:false,trippedDigest:0,catchup:value % 2,rearm:value == 2 or value == 3,once:value == 4,
         triggerEpoch:epoch,due:if (i == 0) s.now+2 else -1,armed:i == 0,slot:0,queued:-1,queueSlot:-1 } } }
     } else if (Set("fire","refuse").contains(op) and value >= 0 and c.due >= 0 and c.due <= s.now and c.triggerEpoch == c.epoch and not(c.tripped)) {
       firePolicy(s,r,i,value,c.overlap,c.maxRuns,op == "refuse")
@@ -459,14 +478,17 @@ module contract {
     // schedule; a tripped breaker ignores later observations; only an
     // activation clears it; notices change only at a trip.
     val promotedRefusal = c.queued >= 0 and c.queueRefused and not(b.db.runs.nth(c.queued).admitted) and a.db.runs.nth(c.queued).admitted
-    val primaryFaults = if (terminalObservation and execution.epoch == c.epoch and not(c.tripped))
+    // Only runs of the active version count; a pinned run of other content
+    // never does (its epoch is none), tripped or not.
+    val observed = execution.epoch == c.epoch and execution.version == c.active and not(c.tripped)
+    val primaryFaults = if (terminalObservation and observed)
       (if (qualifying) c.faults+1 else if (execution.outcome == 1) 0 else c.faults) else c.faults
     val breakerCorrect = if (promotedRefusal) {
       val faults = primaryFaults+1
       d.faults == faults and d.tripped == (faults >= 2) and d.armed == (c.armed and faults < 2) and
         d.notices == (if (faults >= 2) c.notices.append(c.epoch) else c.notices)
     } else if (not(terminalObservation)) d.notices == c.notices
-      else if (execution.epoch != c.epoch or c.tripped)
+      else if (not(observed))
         (if (c.queued >= 0 and d.queued < 0 and a.db.admissions != b.db.admissions)
           d == { ...c,queued:-1,queueSlot:-1,running:c.queued } else c == d)
 
@@ -476,7 +498,13 @@ module contract {
         not(d.tripped) and d.notices == c.notices
     val error23 = flag(error22,"V2",(d.faults < 2 or d.tripped) and breakerCorrect and
       (not(c.tripped) or d.tripped or op == "activate") and
-      (not(c.tripped) or a.db.admissions == b.db.admissions) and
+      // While tripped, an admission happens only as a pinned start of other
+      // content, and such a start (not stopped, run free) always happens.
+      (not(c.tripped) or a.db.admissions == b.db.admissions or
+        (op == "pin" and a.db.admissions.nth(r) == b.db.admissions.nth(r)+1 and content(execution.version) != c.trippedDigest)) and
+      (op != "pin" or value < 0 or b.db.stopped or old.admitted or barred(c,i+1) or execution.admitted) and
+      (op != "pin" or not(barred(c,i+1)) or a.db.admissions == b.db.admissions) and
+      (d.tripped == (d.trippedDigest != 0) and (not(d.tripped) or d.trippedDigest == content(d.active))) and
       (op != "activate" or c == d or (d.faults == 0 and not(d.tripped))))
     val error24 = flag(error23,"V3",(op != "claim" or b.db == a.db or compatible(old.app,w)) and
       (not(workerMutation) or b.db == a.db or compatible(old.app,w)))
@@ -559,8 +587,10 @@ module contract {
     val stopped = if (Set(1,2,8).contains(fault))
       { ...persisted,workers:persisted.workers.replaceAt(actor,{ ...persisted.workers.nth(actor),stopped:true,phase:0,permit:false }) }
       else persisted
-    val errorsFirst = audit(before,if (commits) first else before,if (commits) operation else "abort",r,actor,i,value)
-    val errors = if (fault == 3 and commits) audit({ ...first,violations:errorsFirst },persisted,operation,r,actor,i,value) else errorsFirst
+    // The monitors see the value the transition got (invalid data: none).
+    val seen = if (fault == 9) -1 else value
+    val errorsFirst = audit(before,if (commits) first else before,if (commits) operation else "abort",r,actor,i,seen)
+    val errors = if (fault == 3 and commits) audit({ ...first,violations:errorsFirst },persisted,operation,r,actor,i,seen) else errorsFirst
     val atomic = (commits or persisted.db == before.db) and persisted.observations.slice(before.observations.length(),persisted.observations.length()).elems().forall(e =>
       if (e.op == "intent") persisted.db.runs.nth(e.execution).records.nth(e.invocation) >= 1
       else if (e.op == "result") Set(2,3).contains(persisted.db.runs.nth(e.execution).records.nth(e.invocation))
@@ -579,7 +609,7 @@ module contract {
   action step = {
     nondet op = Set("admit","dry","replay","claim","renew","release","intent","dispatch","result","notExecuted","recover",
       "checkpoint","conflict","subscribe","address","publish","take","expire","child","finish","timeout","cancel",
-      "activate","fire","refuse","ingress","sweep","crash","tick","spend","policy","stop").oneOf()
+      "activate","fire","refuse","ingress","sweep","crash","tick","spend","policy","stop","pin").oneOf()
     nondet r = Runs.oneOf()
     nondet w = Workers.oneOf()
     nondet i = Calls.oneOf()

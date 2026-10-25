@@ -65,6 +65,22 @@ pub fn run_id(r: usize) -> String {
 fn run_index(id: &str) -> Option<usize> {
     id.strip_prefix('r')?.parse().ok().filter(|r| *r < RUNS)
 }
+/// The model's `content`: version 3 repeats version 1's text, so the two
+/// share a digest.
+fn content(version: u64) -> u64 {
+    if version == 3 { 1 } else { version }
+}
+/// The text of a model version.
+fn definition_text(version: u64) -> String {
+    format!("definition{}", content(version))
+}
+/// The model's content number of a stored digest.
+fn content_of(digest: &str) -> anyhow::Result<i64> {
+    (1..=2)
+        .find(|n| ouro_durable::digest_of(&format!("definition{n}")) == digest)
+        .map(i64::from)
+        .with_context(|| format!("a digest of no model version: {digest}"))
+}
 /// Worker `w` declares application version `w + 1`.
 pub fn worker(w: usize) -> Compatibility {
     Compatibility { version: Some((w + 1).to_string()), accepts: vec![] }
@@ -245,6 +261,8 @@ struct CatalogView {
     epoch: i64,
     faults: i64,
     tripped: bool,
+    /// The content the trip refuses (the model's `content`), 0: not tripped.
+    tripped_digest: i64,
     trigger: Option<TriggerView>,
     /// The epochs whose trip has a notice, oldest first.
     notices: Vec<i64>,
@@ -330,6 +348,8 @@ struct ModelCatalog {
     epoch: i64,
     faults: i64,
     tripped: bool,
+    #[serde(rename = "trippedDigest")]
+    tripped_digest: i64,
     #[serde(rename = "triggerEpoch")]
     trigger_epoch: i64,
     due: i64,
@@ -414,6 +434,7 @@ impl From<Machine> for View {
                 epoch: c.epoch,
                 faults: c.faults,
                 tripped: c.tripped,
+                tripped_digest: c.tripped_digest,
                 trigger: c.armed.then_some(TriggerView {
                     overlap: c.overlap,
                     max_runs: c.max_runs,
@@ -490,6 +511,10 @@ impl State<StoreDriver> for View {
                 (Some(t.version), t.epoch, t.faults) == (defs.active, defs.epoch, defs.consecutive_faults),
                 "the trip disagrees with its definition: {t:?}"
             );
+            ensure!(
+                defs.versions.get(&t.version).is_some_and(|d| d.digest == t.digest),
+                "the trip's digest is not its version's: {t:?}"
+            );
         }
         let notices = d
             .block(store.notices(64))?
@@ -522,6 +547,7 @@ impl State<StoreDriver> for View {
                 epoch: defs.epoch as i64,
                 faults: i64::from(defs.consecutive_faults),
                 tripped: defs.tripped.is_some(),
+                tripped_digest: defs.tripped.as_ref().map_or(Ok(0), |t| content_of(&t.digest))?,
                 trigger,
                 notices,
             },
@@ -681,7 +707,7 @@ impl StoreDriver {
     /// generic trigger that takes ingress events.
     pub fn initialize(&mut self) -> anyhow::Result<()> {
         for v in 1..=3 {
-            self.block(self.store.save_definition(NAME, &format!("definition{v}")))?;
+            self.block(self.store.save_definition(NAME, &definition_text(v)))?;
         }
         let arming = Arming {
             triggers: BTreeMap::from([(SCHEDULE.to_string(), schedule_trigger(Some(2), 1, 0, Mode::default()))]),
@@ -721,7 +747,7 @@ impl StoreDriver {
             id: run_id(r),
             name: NAME.into(),
             version,
-            definition: format!("definition{version}"),
+            definition: definition_text(version),
             input: json!(input),
             runtime,
         })
@@ -880,6 +906,7 @@ impl StoreDriver {
                 "admit",
                 "dry",
                 "replay",
+                "pin",
                 "fire",
                 "refuse",
                 "ingress",
@@ -928,6 +955,31 @@ impl StoreDriver {
                 };
                 let a = self.admission(r, value, i as i64, mode, None)?;
                 expect(self.write(fault, self.store.admit(&a, ms)).0.map(drop))?;
+            }
+            // A pinned start: the stored version `i + 1`, active or not. A
+            // tripped definition refuses it iff the content is the tripped one.
+            "pin" => {
+                let defs = self.block(self.store.definitions(NAME))?;
+                let version = i as u64 + 1;
+                let barred = defs.tripped.is_some_and(|t| t.digest == defs.versions[&version].digest);
+                if value < 0 || self.block(self.store.get(&run_id(r)))?.is_some() {
+                    return Ok(());
+                }
+                let mut a = self.admission(r, value, 0, 0, None)?;
+                a.version = version;
+                a.definition = definition_text(version);
+                a.runtime[ouro_durable::PINNED] = json!(true);
+                let (result, _) = self.write(fault, self.store.admit(&a, ms));
+                if !injected {
+                    if barred {
+                        ensure!(
+                            result.err().is_some_and(|e| e.is::<DefinitionTripped>()),
+                            "a tripped definition admitted its own content"
+                        );
+                    } else {
+                        ensure!(result?, "other content was refused while tripped");
+                    }
+                }
             }
             "claim" => {
                 if self.workers.iter().any(|x| x.permit) {
@@ -1323,7 +1375,7 @@ impl StoreDriver {
     fn run_view(&self, snapshot: &RunSnapshot) -> anyhow::Result<(RunView, Option<(i64, i64)>)> {
         let r = &snapshot.run;
         ensure!(r.admission.name == NAME, "definition name changed");
-        ensure!(r.admission.definition == format!("definition{}", r.admission.version), "definition changed");
+        ensure!(r.admission.definition == definition_text(r.admission.version), "definition changed");
         ensure!(r.admission.runtime["bindings"] == json!("fixed"), "bindings changed");
         ensure!(r.fence.is_some() == (r.state == RunState::Running), "fence/state mismatch");
         ensure!(r.outcome.is_some() == r.ended_ms.is_some(), "terminal outcome without its end");
@@ -1541,7 +1593,7 @@ pub fn with_quint(name: &str, run: impl FnOnce() -> anyhow::Result<()>) {
     assert!(result.success(), "Quint child test failed");
 }
 /// Every command of the contract model, and initialization.
-const COMMANDS: usize = 33;
+const COMMANDS: usize = 34;
 fn simulation(adapter: Adapter) -> anyhow::Result<()> {
     use quint_connect::runner::{self, RunConfig};
     let seed = std::env::var("QUINT_SEED").unwrap_or_else(|_| "20261023".into());
