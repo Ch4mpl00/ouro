@@ -83,8 +83,18 @@ activating it: the active version, the epoch and the schedule stay as they
 are. The same checks apply (registry, validation), the run keeps that
 version's definition for recovery and replay, and `Control::inspect` shows
 `pinned: true` beside the admitted version. A pinned run counts toward the
-breaker only if its version is the active one. A tripped definition refuses
-a pinned start like any admission (`DefinitionTripped`) until an activation.
+breaker only if its version is the active one. While the definition is
+tripped, a pinned start is refused (`DefinitionTripped`) only if the version's
+content digest is the tripped one; a version with other content is admitted,
+so a host can run its built-in version for a run while the tripped version
+stays active.
+
+Every saved version has a content digest (`durable::digest_of`, shown by
+`VersionSummary::digest` and `Inspection::digest`): the SHA-256 of the
+parsed document in canonical form (compact JSON, keys sorted), so whitespace,
+comments, quoting and key order do not change it and any change of value does.
+It is computed once, when the version is saved, and stored; admissions and
+trips compare stored digests only.
 Starting an existing ID returns the run if it has the same version and
 fails otherwise.
 
@@ -149,7 +159,9 @@ the definition in the commit of the Nth fault: `definitions(name).tripped`
 holds the `Trip` (version, epoch, faults, threshold, the run and its error),
 its schedule stops, running runs finish and are no longer counted, and a
 notice is stored with the trip. No new run of the definition is admitted by
-any path, of any version: the store refuses it in the admission's commit with
+any path whose version has the tripped content digest (the active version's, and
+any other version saved with the same content): the store refuses it in the
+admission's commit with
 `durable::DefinitionTripped` (naming the definition and the trip's epoch).
 `start` returns it; a `run: workflow` child, owned or not, fails its task with
 the workflow error of type `urn:ouro:errors:definition.tripped`
@@ -513,6 +525,13 @@ Repeating an event's `source` + `id` returns its original reply even after the
 wait closes; changing its payload or wait is a conflict. Matching contexts
 are redacted before persistence; a response requiring secret values is
 refused rather than guessed without the host's secret resolver.
+
+Breaking change (trip by content digest): `Definition` and `Trip` gain
+`digest`, `VersionSummary` and `control::Inspection` gain `digest`, and a trip
+no longer refuses a pinned start of a version with other content (issue #23's
+open question). The definitions row is layout 5 and the run state version 11:
+rows of the earlier layouts are refused, not converted, so a store written
+before this change must be recreated.
 
 Breaking change (issue #23): `control::Inspection` gains `pinned`; a host
 that builds one by hand adds the field. The stored shape is unchanged (an

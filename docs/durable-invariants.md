@@ -559,9 +559,20 @@ run contributes at most once. Fault increments the consecutive-fault count;
 success resets it. On reaching threshold `N`, the trip is atomic with the threshold
 observation: the definition records its report (version, epoch, count, threshold,
 the run and its error), stops firing its schedule, and commits one notice for the
-host. From then on every admission of a new run of that definition, by any path
-and of any version, is refused in its own commit with a typed, non-retryable
-error; an already admitted run is still joined. The active version and the epoch do not change. A tripped
+host. Each stored version has a content digest, fixed when it is saved (a
+SHA-256 of the canonical parsed document: formatting, comments and key order
+do not change it, any semantic change does); the trip records the digest of
+the version that tripped, which is the active one. From then on an admission
+of a new run of that definition, by any path, is refused in its own commit
+with a typed, non-retryable error iff the admitted version's stored digest
+equals the tripped digest, whatever its version number: a normal start
+(active, hence tripped content) and a pinned start of an identical copy are
+refused, a pinned start of a version with other content is admitted. Only
+stored digests are compared; none is recomputed at admission. Only runs of the
+active version count toward the breaker, so a pinned run of other content never
+does. An already admitted run is still joined. The active version and the epoch do not change.
+Activation, even of identical content, is the host's explicit decision and
+clears the trip. A tripped
 breaker observes nothing more; only an activation clears it, in a new epoch.
 Completions outside the current epoch cannot alter it. A schedule's run the host
 refused to admit is observed in its firing's transition (decision 3). Classification is decision 5.

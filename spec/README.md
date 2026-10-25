@@ -53,7 +53,7 @@ are the bridges in `crates/durable/tests/quint.rs` and `quint/concurrent.rs`.
 | T2 | `T2`: activation epoch (only an activation starts one), dormant rearm | Concurrent firing/activation; serial MBT; `gaps::t2_old_completion_cannot_rearm_new_epoch` |
 | T3 | `T3`: deadline fixed at admission | Serial MBT; `t3_admission_fixes_the_workflow_deadline` |
 | V1 | `V1`: only an activation selects the active version (no rollback); pinned admission | Serial MBT; runtime pinned-version recovery |
-| V2 | `V2`: epoch, fault classification (a refused slot's run counts), reset; a trip reports once (one notice), stops the schedule and every admission, ignores later observations, cleared only by activation | Serial MBT; `gaps::v2_old_epoch_fault_does_not_count_after_reactivation`; `refusedTest` witness; refusal on every admission path in conformance (a trip then a child needs two faulted runs besides a live parent and its unadmitted child, more than the model's three, so the model's clause is not reached) |
+| V2 | `V2`: epoch, fault classification (a refused slot's run counts), reset; a trip reports once (one notice), stops the schedule and every admission of the tripped content digest (a pinned start of other content is admitted and never counted), ignores later observations, cleared only by activation | Serial MBT; `gaps::v2_old_epoch_fault_does_not_count_after_reactivation`; `refusedTest`, `pinnedAdmittedTest`, `sameContentRefusedTest`, `pinnedUncountedTest` witnesses; mutants `V2/digest`, `V2/same-content`, `V2/pinned-counts`; refusal on every admission path in conformance (a trip then a child needs two faulted runs besides a live parent and its unadmitted child, more than the model's three, so the model's clause is not reached) |
 | V3 | `V3`: undeclared/exact-match claim and mutation guards | Serial MBT (`claim_as`, `due_as` per worker version); `gaps::v3_incompatible_worker_cannot_claim` |
 | O1 | `O1`: failed operation stops the attempt | Serial MBT fault switches; generated interrupted journals |
 | O2 | `O2`: terminal-only retention and stable identities | Serial MBT (swept evidence projected away); replay-after-sweep refusal |
@@ -132,8 +132,9 @@ deadline fixed at admission and epoch.
 - **Breaker** (decision 5, revised by #10). Threshold two; only runs of the
   current epoch count; unhandled failures, timeouts, unknown endings and
   binding conflicts count, cancellations do not. It reports and never rolls
-  back: the threshold observation trips the definition (no admissions,
-  children included, no schedule, the count frozen) and appends the epoch to `notices`, the trip's
+  back: the threshold observation trips the definition (no admission of the tripped content digest,
+  children included, no schedule, the count frozen; a pinned start of other
+  content is admitted and its run never counts) and appends the epoch to `notices`, the trip's
   committed notice; the active version and the epoch stay. A tripped breaker
   observes nothing; only the next activation clears it.
 - **Compatibility** (#3). Worker `w` declares version `w + 1`; a run admitted
@@ -205,6 +206,7 @@ ticks), with `Policy { mailbox_ms: 37_500, ingress_ms: 37_500, skew_ms: 7_500 }`
 | `child` | `start_child` of run r + 1 under run r; the child's lease is left to expire |
 | `finish`, `timeout`, `cancel` | `finish` (outcomes 1–5), `cancel` |
 | `activate` | `activate_with`: the version's trigger |
+| `pin` | `admit` of stored version `i + 1` marked pinned; version 3 repeats version 1's text, so a trip on one refuses the other |
 | `policy` | Host parameters, recorded by CAS in the model trigger's metadata |
 | `fire` | `fire` with the overlap guard, capacity and `rearm`; a missed or taken slot commits a skip |
 | `refuse` | `fire` with the overlap guard and `refused` (the model's unhandled failure, threshold 2) instead of `admit`; skips as `fire` |
