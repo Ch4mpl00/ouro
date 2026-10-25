@@ -1312,3 +1312,20 @@ call record (E4: a completed record is never saved anew, so replay and
 recovery never count it twice), and a run's totals are added to its
 definition's hourly bucket in its terminal commit (A3: a run ends once).
 Neither row is evidence: `sweep` keeps both, as it keeps outcomes (O2).
+
+Addendum (2026-10-25, issue #31, core semantics). Five rules were sharpened
+after an independent review. (1) A pause may stand on top of a breaker's trip:
+it refuses every admission (V2's `manual`) and keeps the breaker's report
+(the model's `breaker`, the trip its notice reports); `resume` lifts the pause
+alone. (2) While tripped by its breaker, a definition refuses an admission of
+a version its catalog does not hold, which has no stored digest to show its
+content to be other (V2, fail closed). (3) A held run's owner keeps its lease
+while it waits for the answer of a call it dispatched (H1): a hold never turns
+an answer into an unknown outcome, and the worker lets the run go only once
+nothing it dispatched is unanswered. (4) Every admission path, an owned child
+included, drains its definition's deferred queue first (L7), and a drain that
+trips the definition commits with the refusal it causes (`L7_refusal`). (5) An
+untargeted delivery never chooses a held run (routing is checked by the
+conformance suite, not the model). In the interpreter, a `catch` naming the
+unknown-outcome type that does not take the error re-raises it as it came, and
+a saved `emit` refusal is restored on recovery as a call's is (R2).
