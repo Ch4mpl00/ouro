@@ -6558,9 +6558,23 @@
   "contract_bounded_4": {
     "result": "not run in this revision"
   },
-  "rust_checks": {
-    "result": "not run in this revision"
-  },
+  "rust_checks": [
+    {
+      "check": "fmt-final",
+      "seconds": 0.516,
+      "exit": 0
+    },
+    {
+      "check": "clippy-final",
+      "seconds": 0.517,
+      "exit": 0
+    },
+    {
+      "check": "workspace-final",
+      "seconds": 481.745,
+      "exit": 0
+    }
+  ],
   "limits": [
     "Safety-mutant clean cells are single scripted witnesses, not exhaustive independence proofs.",
     "Temporal clean cells exhaust only the finite obligation quotient; absent domains are not checked.",

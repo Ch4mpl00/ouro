@@ -1,3 +1,37 @@
+# Contract checking — 2026-10-25, review fixes (#31: M-1, M-4, L-2, L-3, L-4, L-9)
+
+A one-shot's run id is its instant's (`schedule:<name>:at:<ms>`), so an
+activation that arms the same `at` again meets the run it made: the slot is
+consumed as a skip, and a changed `at` runs. `contract.qnt` states it: the
+activation's run index is the instant (`onceAt`), a firing of a one-shot is
+that run only (guard, and T1 checks it independently), and the witnesses
+`oneShotReactivatedTest` and `oneShotChangedTest` (in `bridgeTail`, so the
+stores replay them) pin the two halves. The `T1/once-id` mutant (the run id of
+the epoch, not the instant) is detected by T1. The value domain and the
+concurrent table are unchanged; the serial and concurrent MBT carry `onceAt` in
+the trigger's state.
+
+| Check | Scope | Result | Time |
+| --- | --- | --- | --- |
+| Typecheck, witnesses | all modules; witnesses with the two new ones | Pass | 6 s each, 21 s |
+| Simulation | 2,000 x 150 steps, seed 20261023, invariant `checked` | No violation | 55 s |
+| Safety mutants | 58 (`T1/once-id` added) | All targets detected | 894 s (with fault rows and fault detection) |
+| Temporal (`contract_temporal.py`, native Apalache 0.62.4 server and TLC from the same jar on a portable JDK 21, three TLC processes) | all three quotients, 32 variants (baselines, mutants, ablations) | All met their targets | 508 s of TLC |
+| Serial and concurrent MBT | memory and SQLite | Pass | 91 s |
+| fmt, Clippy, `OURO_REQUIRE_QUINT=1 cargo test --workspace` (`check.py --only rust`) | 277 Rust tests, Postgres on testcontainers, restart example | Pass | 482 s for the tests |
+| Prohibited-name scan | `crates`, `examples` | Empty | |
+
+L-2: the deadlock check is back on for `contract_progress` and
+`contract_progress_trigger`, whose baselines pass with it (373 and 41,920
+distinct states); only `contract_progress_tree` turns it off, because a state
+where every run ended stutters and TLC reports it as a deadlock. A clean result
+needs exit code 0 again. L-9: `evidence.py` republishes the committed sections
+when `.results` is absent and marks them `stale` when a model source changed;
+the evidence is regenerated (54 IDs, with `S1` and the overlap monitors, which
+the old list missed). Not run: the symbolic stage (`contract_bounded`, deeper
+bounds) and the Docker-emulated Apalache image; their entries stay "not run in
+this revision".
+
 # Contract checking — 2026-10-25, a buffered slot keeps its place (#30)
 
 The engine now drains a definition's deferred queue (`drain_marked`) in the
