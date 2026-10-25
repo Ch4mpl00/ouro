@@ -152,11 +152,13 @@ fn p6_jumps_stay_within_the_budget() {
             let o = model::run(&p, input.clone(), &l);
             prop_assert!(o.jumps <= budget, "{} jumps over a budget of {budget}", o.jumps);
             // With the budget lifted, the same run jumps further only if the
-            // budget refused a jump, which raised the budget's error.
+            // budget refused a jump, which raised the budget's error. A `try`
+            // may catch that error and run its handler (a catch-all takes
+            // it), so the budgeted run's trace can be longer: only the jumps
+            // and the refusal itself are pinned.
             let free = model::run(&p, input, &model::Limits { max_jumps: u64::MAX, ..model_limits() });
             if free.jumps > budget && free.tasks_run <= l.max_tasks {
                 prop_assert_eq!(o.jumps, budget);
-                prop_assert!(o.trace.len() <= free.trace.len());
             }
             if let Err(e) = &o.result
                 && exhausted(e)
