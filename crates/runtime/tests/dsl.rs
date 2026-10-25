@@ -578,6 +578,162 @@ async fn every_cron_and_after_start_each_slot_once() {
     assert!(!f.rt.fire_due().await.unwrap().iter().any(|id| id.starts_with("schedule:every:")));
 }
 
+/// A schedule document: `schedule` and the document metadata `meta`.
+fn scheduled(name: &str, schedule: &str, meta: &str, body: &str) -> String {
+    let schedule = if schedule.is_empty() { String::new() } else { format!("schedule: {{ {schedule} }}\n") };
+    doc(name, &format!("{schedule}do: [ {{ a: {body} }} ]"))
+        .replace("version: '1.0.0' }", &format!("version: '1.0.0', metadata: {{ {meta} }} }}"))
+}
+
+#[tokio::test]
+async fn a_cron_schedule_runs_on_the_wall_clock_of_its_time_zone() {
+    let f = fixture();
+    let body = "{ set: { ok: true } }";
+    save(&f.rt, "utc", &scheduled("utc", "cron: '0 9 * * *'", "", body)).await;
+    save(&f.rt, "berlin", &scheduled("berlin", "cron: '0 9 * * *'", "timezone: Europe/Berlin", body)).await;
+    save(&f.rt, "tokyo", &scheduled("tokyo", "cron: '0 9 * * *'", "timezone: Asia/Tokyo", body)).await;
+    // Activated at the epoch (1970-01-01T00:00Z): 09:00 UTC, 09:00 CET (08:00Z)
+    // and 09:00 JST (the day before, 00:00Z, already past: the next is the 2nd).
+    let due = |name: &str| {
+        let f = &f;
+        let name = name.to_owned();
+        async move { f.rt.triggers(&name).await.unwrap().pop().unwrap().1.at_ms.unwrap() }
+    };
+    assert_eq!(due("utc").await, 9 * 3_600_000);
+    assert_eq!(due("berlin").await, 8 * 3_600_000);
+    assert_eq!(due("tokyo").await, 24 * 3_600_000);
+    f.time.set(8 * 3_600_000);
+    assert_eq!(f.rt.fire_due().await.unwrap(), vec!["schedule:berlin:cron:28800000".to_string()]);
+}
+
+#[tokio::test]
+async fn a_one_shot_runs_once_at_its_instant_and_is_then_done() {
+    let f = fixture();
+    let body = "{ set: { ok: true } }";
+    save(&f.rt, "once", &scheduled("once", "", "at: '1970-01-01T00:01:00Z'", body)).await;
+    let (key, trigger) = f.rt.triggers("once").await.unwrap().pop().unwrap();
+    assert_eq!((key.as_str(), trigger.at_ms), ("once#at", Some(60_000)));
+    f.time.set(59_999);
+    assert!(f.rt.fire_due().await.unwrap().is_empty());
+    f.time.set(60_000);
+    assert_eq!(f.rt.fire_due().await.unwrap(), vec!["schedule:once:at:1:60000".to_string()]);
+    assert_eq!(completed(settle(&f.rt, "schedule:once:at:1:60000").await), json!({"ok": true}));
+    // Done: nothing is due again, however late, or from another scheduler.
+    for t in [60_001, 3_600_000, 86_400_000 * 365] {
+        f.time.set(t);
+        assert!(f.rt.fire_due().await.unwrap().is_empty());
+    }
+    let (_, trigger) = f.rt.triggers("once").await.unwrap().pop().unwrap();
+    assert_eq!((trigger.at_ms, &trigger.state["done"]), (None, &json!(true)));
+    assert_eq!(f.rt.list(Some("once"), "").await.unwrap().len(), 1);
+    // A new activation arms the version's instant again, in a new epoch.
+    save(&f.rt, "once", &scheduled("once", "", "at: '1970-01-01T00:01:00Z'", body)).await;
+    assert_eq!(f.rt.fire_due().await.unwrap(), vec!["schedule:once:at:2:60000".to_string()]);
+}
+
+#[tokio::test]
+async fn a_one_shot_in_the_past_runs_late_even_without_catchup() {
+    let f = fixture();
+    f.time.set(1_000_000);
+    save(&f.rt, "late", &scheduled("late", "", "at: '1970-01-01T00:01:00Z', catchup: none", "{ set: { ok: true } }"))
+        .await;
+    assert_eq!(f.rt.fire_due().await.unwrap(), vec!["schedule:late:at:1:60000".to_string()]);
+}
+
+#[tokio::test]
+async fn a_one_shot_is_consumed_by_a_skip_and_a_queue() {
+    let waiting = "{ wait: PT1H }";
+    // A live run of the previous activation's one-shot holds this trigger's
+    // overlap membership; the new activation's slot meets it.
+    let live = async |name: &str, meta: &str| {
+        let f = fixture();
+        save(&f.rt, name, &scheduled(name, "", "at: '1970-01-01T00:01:00Z'", waiting)).await;
+        f.time.set(60_000);
+        let first = f.rt.fire_due().await.unwrap().pop().unwrap();
+        assert!(matches!(f.rt.drive(&first, &CancellationToken::new()).await.unwrap(), Some(Status::Waiting { .. })));
+        save(&f.rt, name, &scheduled(name, "", &format!("at: '1970-01-01T00:02:00Z', {meta}"), waiting)).await;
+        f.time.set(120_000);
+        assert!(f.rt.fire_due().await.unwrap().is_empty());
+        f
+    };
+    let f = live("skipped", "overlap: skip").await;
+    let (_, trigger) = f.rt.triggers("skipped").await.unwrap().pop().unwrap();
+    assert_eq!((trigger.at_ms, &trigger.state["done"]), (None, &json!(true)));
+    assert_eq!(trigger.state["skipped"], json!([{ "slot": 120_000, "reason": "overlap" }]));
+    f.time.set(3_600_000 * 24);
+    assert!(f.rt.fire_due().await.unwrap().is_empty(), "a skipped one-shot is not retried");
+    // Queued behind the live run, the slot waits for it, in the queue and
+    // not in the trigger, which is done.
+    let f = live("queued", "overlap: queue").await;
+    assert_eq!(f.rt.queued("queued").await.unwrap().len(), 1);
+    let (_, trigger) = f.rt.triggers("queued").await.unwrap().pop().unwrap();
+    assert_eq!((trigger.at_ms, &trigger.state["done"]), (None, &json!(true)));
+    f.time.set(3_600_000 * 24);
+    assert!(f.rt.fire_due().await.unwrap().is_empty());
+    assert_eq!(f.rt.queued("queued").await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn the_run_sees_its_slot_and_the_previous_one() {
+    let f = fixture();
+    let show = "{ set: { kind: '${ $run.schedule.kind }', slot: '${ $run.schedule.slot.iso8601 }', previous: '${ $run.schedule.previous.iso8601 }', ms: '${ $run.schedule.slot.epoch.milliseconds }' } }";
+    save(&f.rt, "every", &scheduled("every", "every: PT1M", "", show)).await;
+    f.time.set(60_000);
+    let first = f.rt.fire_due().await.unwrap().pop().unwrap();
+    assert_eq!(
+        completed(settle(&f.rt, &first).await),
+        json!({"kind": "every", "slot": "1970-01-01T00:01:00.000Z", "previous": null, "ms": 60_000})
+    );
+    // Down until 10 minutes: the late run is for the missed slot, not for
+    // now, and its previous is the last slot a run was started for.
+    f.time.set(600_000);
+    let late = f.rt.fire_due().await.unwrap().pop().unwrap();
+    assert_eq!(
+        completed(settle(&f.rt, &late).await),
+        json!({"kind": "every", "slot": "1970-01-01T00:02:00.000Z", "previous": "1970-01-01T00:01:00.000Z", "ms": 120_000})
+    );
+    // A run that was not started by a trigger has none.
+    save(&f.rt, "plain", &doc("plain", "do: [ { a: { set: { none: '${ $run.schedule == null }' } } } ]")).await;
+    f.rt.start("p", "plain", json!({})).await.unwrap();
+    assert_eq!(completed(settle(&f.rt, "p").await), json!({"none": true}));
+}
+
+#[tokio::test]
+async fn a_skipped_slot_is_not_the_next_runs_previous() {
+    let f = fixture();
+    save(&f.rt, "every", &scheduled("every", "every: PT1M", "", "{ wait: PT90S }")).await;
+    f.time.set(60_000);
+    let first = f.rt.fire_due().await.unwrap().pop().unwrap();
+    assert!(matches!(f.rt.drive(&first, &CancellationToken::new()).await.unwrap(), Some(Status::Waiting { .. })));
+    f.time.set(120_000);
+    assert!(f.rt.fire_due().await.unwrap().is_empty(), "the 120 s slot overlaps the first run");
+    f.time.set(180_000);
+    let _ = settle(&f.rt, &first).await;
+    let third = f.rt.fire_due().await.unwrap().pop().unwrap();
+    let run = f.rt.get(&third).await.unwrap().unwrap();
+    assert_eq!(run.admission.runtime["schedule"]["slot"]["epoch"]["milliseconds"], 180_000);
+    assert_eq!(run.admission.runtime["schedule"]["previous"]["epoch"]["milliseconds"], 60_000);
+}
+
+#[tokio::test]
+async fn event_and_after_triggers_tell_the_run_their_slot() {
+    let f = fixture();
+    let show = "{ set: { kind: '${ $run.schedule.kind }', slot: '${ $run.schedule.slot.epoch.milliseconds }', previous: '${ $run.schedule.previous.epoch.milliseconds }' } }";
+    save(&f.rt, "after", &scheduled("after", "after: PT10S", "", show)).await;
+    let first = f.rt.fire_due().await.unwrap().pop().unwrap();
+    assert_eq!(completed(settle(&f.rt, &first).await), json!({"kind": "after", "slot": 0, "previous": null}));
+    f.time.set(10_000);
+    let second = f.rt.fire_due().await.unwrap().pop().unwrap();
+    assert_eq!(completed(settle(&f.rt, &second).await), json!({"kind": "after", "slot": 10_000, "previous": 0}));
+    save(&f.rt, "on", &scheduled("on", "on: { one: { with: { type: tick } } }", "overlap: allow", show)).await;
+    f.time.set(50_000);
+    let first = f.rt.publish(event("1", "tick", json!({}))).await.unwrap().pop().unwrap();
+    assert_eq!(completed(settle(&f.rt, &first).await), json!({"kind": "on", "slot": 50_000, "previous": null}));
+    f.time.set(70_000);
+    let second = f.rt.publish(event("2", "tick", json!({}))).await.unwrap().pop().unwrap();
+    assert_eq!(completed(settle(&f.rt, &second).await), json!({"kind": "on", "slot": 70_000, "previous": 50_000}));
+}
+
 #[tokio::test]
 async fn schedule_on_starts_a_run_per_match() {
     let f = fixture();

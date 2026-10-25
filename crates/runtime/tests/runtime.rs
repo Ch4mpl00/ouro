@@ -1237,6 +1237,26 @@ fn operator(id: &str) -> ouro_runtime::control::Request {
 }
 
 #[tokio::test]
+async fn control_lists_a_one_shot_with_its_instant_until_it_fires() {
+    use ouro_runtime::control::{Control, ScheduleKind};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("definitions.sqlite");
+    let clock = Arc::new(Time::default());
+    let rt = runtime(Arc::new(durable::sqlite::open(&path).unwrap()), Registry::new(), clock.clone());
+    let definition = yaml("  - done: { set: { ok: true } }")
+        .replace("version: '1.0.0'", "version: '1.0.0', metadata: { at: '1970-01-01T00:00:05Z' }");
+    save(&rt, &definition).await;
+    let control = Control::new(Arc::new(durable::sqlite::open(&path).unwrap()), clock.clone());
+    let due = |summary: ouro_runtime::control::DefinitionSummary| {
+        summary.schedules.iter().map(|s| (s.kind, s.next_due_ms)).collect::<Vec<_>>()
+    };
+    assert_eq!(due(control.definition("workflow").await.unwrap().unwrap()), [(ScheduleKind::At, Some(5000))]);
+    clock.0.store(5000, Ordering::SeqCst);
+    assert_eq!(rt.fire_due().await.unwrap(), ["schedule:workflow:at:1:5000"]);
+    assert_eq!(due(control.definition("workflow").await.unwrap().unwrap()), [(ScheduleKind::At, None)]);
+}
+
+#[tokio::test]
 async fn store_only_control_lists_definition_schedules_and_suspended_slots() {
     use ouro_runtime::control::{Control, ControlError, ScheduleCatchup, ScheduleKind};
     let dir = tempfile::tempdir().unwrap();

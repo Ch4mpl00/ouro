@@ -210,6 +210,7 @@ pub enum ScheduleKind {
     Every,
     Cron,
     After,
+    At,
     On,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
