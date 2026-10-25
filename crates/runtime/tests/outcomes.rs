@@ -608,3 +608,68 @@ async fn a_cancelled_long_handler_is_dropped_and_its_call_keeps_its_intent() {
         }
     }
 }
+
+/// The README's definition, as it is printed there.
+const README: &str = r#"do:
+  - ship:
+      try:
+        - create: { call: create_shipment, with: { order: '${ .order }' } }
+      catch:
+        errors: { with: { type: urn:ouro:errors:call.unknown } }
+        as: unknown              # its instance names the create's task
+        do:
+          - find: { call: find_shipment, with: { order: '${ .order }' } }
+          - escalate:
+              if: '${ .shipment == null }'
+              call: open_ticket
+              with: { about: '${ $unknown.instance }' }"#;
+
+#[tokio::test]
+async fn the_readme_reconciliation_finds_the_shipment_or_escalates() {
+    let dispatches = Arc::new(Dispatches::default());
+    let mut registry = Registry::new();
+    let d = dispatches.clone();
+    registry
+        .register(
+            Function::new("create_shipment", json!({}), json!({}), move |_: Value, _: FunctionContext| {
+                d.count("create_shipment");
+                async { Err::<Value, _>(FunctionError::unknown_outcome("no answer after sending")) }
+            })
+            .with_delivery(Delivery::AtMostOnce),
+        )
+        .unwrap();
+    let d = dispatches.clone();
+    registry
+        .register(Function::new("find_shipment", json!({}), json!({}), move |args: Value, _: FunctionContext| {
+            d.count("find_shipment");
+            // The carrier did create order 1's shipment; order 2's never arrived.
+            let shipment = if args["order"] == 1 { json!("S-1") } else { Value::Null };
+            async move { Ok(json!({ "shipment": shipment })) }
+        }))
+        .unwrap();
+    let d = dispatches.clone();
+    registry
+        .register(Function::new("open_ticket", json!({}), json!({}), move |args: Value, _: FunctionContext| {
+            d.count("open_ticket");
+            async move { Ok(json!({ "ticket": args["about"] })) }
+        }))
+        .unwrap();
+    let rt = Runtime::new(
+        Arc::new(durable::memory::memory()),
+        Arc::new(registry),
+        Config::default(),
+        Arc::new(Time::default()),
+        noop(),
+    )
+    .unwrap();
+    save(&rt, "ship", README).await;
+    for (order, expected) in [(1, json!({ "shipment": "S-1" })), (2, json!({ "ticket": "/do/0/ship/try/0/create" }))] {
+        let id = format!("order-{order}");
+        rt.start(&id, "ship", json!({ "order": order })).await.unwrap();
+        assert_eq!(rt.drive(&id, &CancellationToken::new()).await.unwrap(), Some(Status::Completed(expected)));
+    }
+    assert_eq!(
+        (dispatches.of("create_shipment"), dispatches.of("find_shipment"), dispatches.of("open_ticket")),
+        (2, 2, 1)
+    );
+}
