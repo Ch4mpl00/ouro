@@ -1136,17 +1136,21 @@ object is `ouro_`-prefixed (`ouro_rows`, `ouro_migrations`), and the schema
 version lives in `ouro_migrations`, as in Postgres: the file's
 `PRAGMA user_version` belongs to the host and is neither read nor set. The
 host's migrations never touch `ouro_` objects, and the engine never touches
-anything else. `open` sets `journal_mode = WAL` and `synchronous = FULL` for
-the whole file (a host that prefers other settings runs with its own and
-still gets engine durability only under these) and a 30-second busy timeout
-on its own connection. The adapter keeps one connection of its own: give the
+anything else. `open` switches the file to `journal_mode = WAL` (a property of
+the file, which stays after the adapter closes) and, on its own connection
+only, sets `synchronous = FULL` and a 30-second busy timeout: the host's
+connections keep their own settings, and engine durability holds for the
+commits made through the adapter's connection. The adapter keeps one connection of its own: give the
 host another connection per thread rather than sharing it, and set a busy
 timeout there too, since SQLite admits one writer and the engine's
 transactions begin immediately. A read-only open checks `ouro_migrations`.
 
 Breaking change (issue #27): stores written by v0.1.0 recorded their schema in
-`user_version`. They are not converted; opening one fails (its `ouro_rows`
-exists without a recorded version), so start a new file.
+`user_version`. They are not converted; opening one fails with
+`SchemaError::Legacy` (its `ouro_rows` exists without a recorded version),
+from `open` and from `open_read_only` alike, and the file is left as it is, so
+start a new file. `SchemaError` gains the variant: a host that matches it
+exhaustively adds an arm.
 
 ### Async seams
 
