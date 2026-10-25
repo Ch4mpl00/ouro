@@ -67,6 +67,8 @@ MUTANTS = {
  "V2/digest": ('and not(barred(c,i+1)))\n      observe(pinRun','and not(c.tripped))\n      observe(pinRun',TRIP+[op("pin",r=2,i=1,value=5)]),
  "V2/same-content": ('and not(barred(c,i+1)))\n      observe(pinRun','and true)\n      observe(pinRun',TRIP+[op("pin",r=2,i=2,value=5)]),
  # A pinned run of another version carries the active epoch and so counts.
+ # A trip that admits a version the catalog does not hold (no digest, #31).
+ "V2/absent": ('c.tripped and (c.manual or not(stored(version)) or','c.tripped and (c.manual or',TRIP+[op("pinAbsent",r=2,value=5)]),
  "V2/pinned-counts": ('epoch:if (version == c.active) c.epoch else 0','epoch:c.epoch',[op("pin",i=1,value=3),op("claim"),op("finish",fault=0,value=1)]),
  # An operator's pause admits other content like an automatic trip does, or
  # its resume lifts a breaker's trip.

@@ -926,6 +926,7 @@ impl StoreDriver {
                 "dry",
                 "replay",
                 "pin",
+                "pinAbsent",
                 "fire",
                 "refuse",
                 "ingress",
@@ -976,14 +977,17 @@ impl StoreDriver {
                 let a = self.admission(r, value, i as i64, mode, None)?;
                 expect(self.write(fault, self.store.admit(&a, ms)).0.map(drop))?;
             }
-            // A pinned start: the stored version `i + 1`, active or not. A
-            // tripped definition refuses it iff the content is the tripped one.
-            "pin" => {
+            // A pinned start: the stored version `i + 1`, active or not, or
+            // (`pinAbsent`) version 4, which the catalog does not hold. A
+            // tripped definition refuses it iff the content is the tripped one
+            // or the catalog has no digest for it.
+            "pin" | "pinAbsent" => {
                 let defs = self.block(self.store.definitions(NAME))?;
-                let version = i as u64 + 1;
+                let version = if op == "pin" { i as u64 + 1 } else { 4 };
                 // An automatic trip refuses its own content; a pause, every one.
-                let barred =
-                    defs.tripped.is_some_and(|t| t.manual.is_some() || t.digest == defs.versions[&version].digest);
+                let barred = defs.tripped.is_some_and(|t| {
+                    t.manual.is_some() || defs.versions.get(&version).is_none_or(|d| t.digest == d.digest)
+                });
                 if value < 0 || self.block(self.store.get(&run_id(r)))?.is_some() {
                     return Ok(());
                 }
@@ -996,7 +1000,7 @@ impl StoreDriver {
                     if barred {
                         ensure!(
                             result.err().is_some_and(|e| e.is::<DefinitionTripped>()),
-                            "a tripped definition admitted its own content"
+                            "a tripped definition admitted content it refuses"
                         );
                     } else {
                         ensure!(result?, "other content was refused while tripped");
@@ -1675,7 +1679,7 @@ pub fn with_quint(name: &str, run: impl FnOnce() -> anyhow::Result<()>) {
     assert!(result.success(), "Quint child test failed");
 }
 /// Every command of the contract model, and initialization.
-const COMMANDS: usize = 39;
+const COMMANDS: usize = 40;
 fn simulation(adapter: Adapter) -> anyhow::Result<()> {
     use quint_connect::runner::{self, RunConfig};
     let seed = std::env::var("QUINT_SEED").unwrap_or_else(|_| "20261023".into());

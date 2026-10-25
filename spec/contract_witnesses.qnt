@@ -231,6 +231,13 @@ module contract_witnesses {
   action sameContentRefused = breaker.then(execute("pin",2,0,2,5,0))
   run sameContentRefusedTest = sameContentRefused.expect(checked and m.db.admissions == [1,1,0] and
     m.db.catalog.tripped and not(m.db.runs.nth(2).admitted))
+  // A version the catalog does not hold is admitted untripped (uncounted),
+  // and refused while tripped: no stored digest shows its content to be other.
+  action absentAdmitted = init.then(execute("pinAbsent",0,0,0,5,0))
+  run absentAdmittedTest = absentAdmitted.expect(checked and m.db.admissions == [1,0,0] and
+    m.db.runs.nth(0).version == 4 and m.db.runs.nth(0).epoch == 0)
+  action absentRefused = breaker.then(execute("pinAbsent",2,0,0,5,0))
+  run absentRefusedTest = absentRefused.expect(checked and m.db.admissions == [1,1,0] and m.db.catalog.tripped)
   // Untripped, a pinned run of a version other than the active one never
   // counts, however often it fails.
   action pinnedUncounted = init.then(execute("pin",0,0,1,3,0)).then(execute("claim",0,0,0,0,0))
@@ -304,7 +311,7 @@ module contract_witnesses {
   run bridgeTail = emergencyStop.then(clearStop).then(stoppedQueue).then(resumedQueue).then(oneShot).then(oneShotBusy)
     .then(pinnedAdmitted).then(sameContentRefused).then(pinnedUncounted).then(heldReleased).then(heldDispatched)
     .then(heldChild).then(heldCancelled).then(heldClaimed).then(resumed).then(pauseActivated).then(resumeKeepsTrip)
-    .then(pauseTrippedResumed)
+    .then(pauseTrippedResumed).then(absentAdmitted).then(absentRefused)
   run bridgeSuite = continuation.then(unknown).then(mailbox).then(expiry).then(child).then(childFinish).then(grandchild).then(activation)
     .then(deadline).then(compatibility).then(dry).then(replay).then(schedule).then(breaker).then(rearm)
     .then(noCatchup).then(overlap).then(ingress).then(ingressExpiry).then(redispatch).then(protectedUnknown)

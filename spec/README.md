@@ -55,7 +55,7 @@ are the bridges in `crates/durable/tests/quint.rs` and `quint/concurrent.rs`.
 | T2 | `T2`: activation epoch (only an activation starts one), dormant rearm | Concurrent firing/activation; serial MBT; `gaps::t2_old_completion_cannot_rearm_new_epoch` |
 | T3 | `T3`: deadline fixed at admission | Serial MBT; `t3_admission_fixes_the_workflow_deadline` |
 | V1 | `V1`: only an activation selects the active version (no rollback); pinned admission | Serial MBT; runtime pinned-version recovery |
-| V2 | `V2`: epoch, fault classification (a refused slot's run counts), reset; a trip reports once (one notice), stops the schedule and every admission of the tripped content digest (a pinned start of other content is admitted and never counted), ignores later observations, cleared only by activation; an operator's pause (`manual`) refuses every admission whatever its content, also on top of a breaker's trip (`breaker`, kept), and only `resume` or an activation lifts it | Serial MBT; `gaps::v2_old_epoch_fault_does_not_count_after_reactivation`; `refusedTest`, `pinnedAdmittedTest`, `sameContentRefusedTest`, `pinnedUncountedTest`, `pauseTest`, `pausedRefusesTest`, `resumedTest`, `pauseActivatedTest`, `resumeKeepsTripTest`, `pauseTrippedTest`, `pauseTrippedResumedTest` witnesses; mutants `V2/digest`, `V2/same-content`, `V2/pinned-counts`, `V2/manual` (a pause admits other content), `V2/resume` (resume lifts a breaker trip), `V2/pause-tripped` (a pause of a tripped definition does nothing), `V2/pause-resume` (resuming that pause lifts the trip); refusal on every admission path in conformance (a trip then a child needs two faulted runs besides a live parent and its unadmitted child, more than the model's three, so the model's clause is not reached) |
+| V2 | `V2`: epoch, fault classification (a refused slot's run counts), reset; a trip reports once (one notice), stops the schedule and every admission of the tripped content digest (a pinned start of other content is admitted and never counted, one of a version the catalog does not hold refused), ignores later observations, cleared only by activation; an operator's pause (`manual`) refuses every admission whatever its content, also on top of a breaker's trip (`breaker`, kept), and only `resume` or an activation lifts it | Serial MBT; `gaps::v2_old_epoch_fault_does_not_count_after_reactivation`; `refusedTest`, `pinnedAdmittedTest`, `sameContentRefusedTest`, `pinnedUncountedTest`, `pauseTest`, `pausedRefusesTest`, `resumedTest`, `pauseActivatedTest`, `resumeKeepsTripTest`, `pauseTrippedTest`, `pauseTrippedResumedTest`, `absentAdmittedTest`, `absentRefusedTest` witnesses; mutants `V2/digest`, `V2/same-content`, `V2/pinned-counts`, `V2/manual` (a pause admits other content), `V2/resume` (resume lifts a breaker trip), `V2/pause-tripped` (a pause of a tripped definition does nothing), `V2/pause-resume` (resuming that pause lifts the trip), `V2/absent` (a trip admits a version the catalog does not hold); refusal on every admission path in conformance (a trip then a child needs two faulted runs besides a live parent and its unadmitted child, more than the model's three, so the model's clause is not reached) |
 | V3 | `V3`: undeclared/exact-match claim and mutation guards | Serial MBT (`claim_as`, `due_as` per worker version); `gaps::v3_incompatible_worker_cannot_claim` |
 | O1 | `O1`: failed operation stops the attempt | Serial MBT fault switches; generated interrupted journals |
 | O2 | `O2`: terminal-only retention and stable identities | Serial MBT (swept evidence projected away); replay-after-sweep refusal |
@@ -156,7 +156,8 @@ deadline fixed at admission and epoch.
   binding conflicts count, cancellations do not. It reports and never rolls
   back: the threshold observation trips the definition (no admission of the tripped content digest,
   children included, no schedule, the count frozen; a pinned start of other
-  content is admitted and its run never counts) and appends the epoch to `notices`, the trip's
+  content is admitted and its run never counts; `pinAbsent`, a version the
+  catalog does not hold, is refused) and appends the epoch to `notices`, the trip's
   committed notice; the active version and the epoch stay. A tripped breaker
   observes nothing; only the next activation clears it.
 - **Hold** (#29). `hold` marks the run and its live owned descendants `held`
@@ -289,7 +290,7 @@ What the quotients are connected to, and what not:
 ### Serial
 
 `crates/durable/tests/quint.rs` replays Quint's random traces of `contract.qnt`
-(100 traces × 150 steps per adapter by default, all 38 commands and every fault
+(100 traces × 150 steps per adapter by default, all 40 commands and every fault
 switch) and the `bridgeSuite` run of `contract_witnesses.qnt` (all 65 witness
 histories in one trace). After every step it compares a projection of the store
 with the model's state. The model records each command in its `command`
@@ -321,6 +322,7 @@ ticks), with `Policy { mailbox_ms: 37_500, ingress_ms: 37_500, skew_ms: 7_500 }`
 | `finish`, `timeout`, `cancel` | `finish` (outcomes 1–5), `cancel` |
 | `activate` | `activate_with`: the version's trigger |
 | `pin` | `admit` of stored version `i + 1` marked pinned; version 3 repeats version 1's text, so a trip on one refuses the other |
+| `pinAbsent` | `admit` of version 4, which the catalog does not hold, marked pinned (refused while tripped) |
 | `policy` | Host parameters, recorded by CAS in the model trigger's metadata |
 | `fire` | `fire` with the overlap guard, capacity and `rearm`; a missed or taken slot commits a skip |
 | `refuse` | `fire` with the overlap guard and `refused` (the model's unhandled failure, threshold 2) instead of `admit`; skips as `fire` |

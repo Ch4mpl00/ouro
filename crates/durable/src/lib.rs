@@ -347,7 +347,8 @@ pub struct Trip {
     pub version: u64,
     /// The content digest of that version (`digest_of`): while an automatic
     /// trip stands, an admission whose definition has this digest is refused,
-    /// of whatever version number; one with other content is admitted. A
+    /// of whatever version number, and so is one of a version the catalog
+    /// does not hold; one with other content is admitted. A
     /// manual pause (`manual`) refuses every admission, whatever its content.
     pub digest: String,
     pub epoch: u64,

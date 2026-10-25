@@ -415,8 +415,8 @@ fn claim_run(snapshot: &mut StoredRun, now: i64, owner: &str) -> anyhow::Result<
 /// belongs to (when it runs the active version) are fixed here. A tripped
 /// definition refuses, by any path, a new run whose definition has the
 /// tripped content digest, whatever its version number, in the same commit
-/// that reads the trip; other content is admitted (a pinned start) and never
-/// counts toward the breaker. A manual pause refuses every admission of the
+/// that reads the trip, and a version the catalog does not hold; other
+/// content is admitted (a pinned start) and never counts toward the breaker. A manual pause refuses every admission of the
 /// definition, whatever its content. An existing run is still joined.
 async fn insert(rows: &mut dyn Transaction, admission: &Admission, now: i64) -> anyhow::Result<bool> {
     let Some(snapshot) = admitted(rows, admission, now).await? else { return Ok(false) };
@@ -479,11 +479,12 @@ fn digest(defs: Option<&Definitions>, admission: &Admission) -> String {
 }
 /// The refusal a standing trip gives a new run of `admission`: a pause
 /// refuses every one; an automatic trip, the tripped content digest, compared
-/// as stored (`Trip::digest`).
+/// as stored (`Trip::digest`). A version the catalog does not hold has no
+/// digest that could show its content to be other: refused (fail closed).
 fn barred(defs: Option<&Definitions>, admission: &Admission) -> Option<DefinitionTripped> {
     let trip = defs?.tripped.as_ref()?;
     let digest = digest(defs, admission);
-    (trip.manual.is_some() || (!digest.is_empty() && digest == trip.digest)).then(|| trip.refusal(&admission.name))
+    (trip.manual.is_some() || digest.is_empty() || digest == trip.digest).then(|| trip.refusal(&admission.name))
 }
 /// After `drain_marked` drained (`drained`), the refusal the new run of
 /// `admission` now meets if the drain tripped its definition (a promoted

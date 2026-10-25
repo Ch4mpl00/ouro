@@ -89,7 +89,9 @@ breaker only if its version is the active one. While the definition is
 tripped by its breaker, a pinned start is refused (`DefinitionTripped`) only
 if the version's content digest is the tripped one; a version with other
 content is admitted, so a host can run its built-in version for a run while
-the tripped version stays active. A manual pause (below) refuses every
+the tripped version stays active. An admission of a version the catalog does
+not hold (possible through `RunStore` directly) is refused while tripped:
+without a stored digest its content cannot be shown to differ. A manual pause (below) refuses every
 admission of the definition, pinned or not, whatever its content.
 
 Every saved version has a content digest (`durable::digest_of`, shown by

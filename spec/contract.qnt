@@ -80,10 +80,16 @@ module contract {
     spends: Map(), legal: true }
   var ideal: Ideal
   pure def content(version: int): int = if (version == 3) 1 else version
+  // The catalog holds versions 1-3; `pinAbsent` admits version 4, which it
+  // does not hold and so has no stored digest.
+  pure val absent = 4
+  pure def stored(version: int): bool = version >= 1 and version <= 3
   // An automatic trip refuses an admission iff its version's content is the
-  // tripped one, whatever the version number; an operator's pause refuses
-  // every admission, whatever its content (V2).
-  pure def barred(c: Catalog, version: int): bool = c.tripped and (c.manual or content(version) == c.trippedDigest)
+  // tripped one, whatever the version number, or the catalog does not hold
+  // the version (no digest shows its content to be other: fail closed); an
+  // operator's pause refuses every admission, whatever its content (V2).
+  pure def barred(c: Catalog, version: int): bool =
+    c.tripped and (c.manual or not(stored(version)) or content(version) == c.trippedDigest)
   pure def live(r: Run): bool = r.admitted and r.outcome == 0
   pure def compatible(app: int, worker: int): bool = app == 0 or app == worker + 1
   pure def authority(s: Machine, r: int, w: int): bool = {
@@ -193,11 +199,15 @@ module contract {
     })
     val first = pending.fold(-1,(a,b) => if (a == -1 or b < a) b else a)
     if (op == "stop" and value >= 0) { ...s,db:{ ...s.db,stopped:value != 0 } }
-    else if (s.db.stopped and Set("admit","dry","replay","pin","claim","fire","refuse","ingress","renew","intent","dispatch","result","notExecuted","rejected","recover","checkpoint","conflict","subscribe","take","child","finish","timeout","spend","policy").contains(op)) s
+    else if (s.db.stopped and Set("admit","dry","replay","pin","pinAbsent","claim","fire","refuse","ingress","renew","intent","dispatch","result","notExecuted","rejected","recover","checkpoint","conflict","subscribe","take","child","finish","timeout","spend","policy").contains(op)) s
     else if (Set("admit","dry","replay").contains(op) and value >= 0 and not(execution.admitted) and not(c.tripped))
       observe(admitRun(s,r,value,i,if (op == "dry") 1 else if (op == "replay") 2 else 0),"admit",r,i,value,1)
     else if (op == "pin" and value >= 0 and not(execution.admitted) and not(barred(c,i+1)))
       observe(pinRun(s,r,value,i+1),"admit",r,0,value,1)
+    // A pinned admission of a version the catalog does not hold, possible
+    // through the store API (the runtime admits only catalog versions).
+    else if (op == "pinAbsent" and value >= 0 and not(execution.admitted) and not(barred(c,absent)))
+      observe(pinRun(s,r,value,absent),"admit",r,0,value,1)
     else if (op == "claim" and live(execution) and not(execution.held) and execution.lease <= s.now and compatible(execution.app,w) and
       not(s.workers.elems().exists(x => x.permit))) {
       val updated = update(s,r,{ ...execution, owner:w, generation:execution.generation+1, lease:s.now+4 })
@@ -577,6 +587,9 @@ module contract {
       (op != "activate" or c == d or not(d.manual)) and
       (op != "pin" or value < 0 or b.db.stopped or old.admitted or barred(c,i+1) or execution.admitted) and
       (op != "pin" or not(barred(c,i+1)) or a.db.admissions == b.db.admissions) and
+      // A version the catalog does not hold is admitted only untripped.
+      (op != "pinAbsent" or value < 0 or b.db.stopped or old.admitted or c.tripped or execution.admitted) and
+      (op != "pinAbsent" or not(c.tripped) or a.db.admissions == b.db.admissions) and
       (d.tripped == (d.trippedDigest != 0) and (not(d.tripped) or d.trippedDigest == content(d.active))) and
       (op != "activate" or c == d or (d.faults == 0 and not(d.tripped))))
     val error24 = flag(error23,"V3",(op != "claim" or b.db == a.db or compatible(old.app,w)) and
@@ -700,7 +713,7 @@ module contract {
   action step = {
     nondet op = Set("admit","dry","replay","claim","renew","release","intent","dispatch","result","notExecuted","rejected","recover",
       "checkpoint","conflict","subscribe","address","publish","take","expire","child","finish","timeout","cancel",
-      "activate","fire","refuse","ingress","sweep","crash","tick","spend","policy","stop","pin","hold","unhold","pause","resume").oneOf()
+      "activate","fire","refuse","ingress","sweep","crash","tick","spend","policy","stop","pin","pinAbsent","hold","unhold","pause","resume").oneOf()
     nondet r = Runs.oneOf()
     nondet w = Workers.oneOf()
     nondet i = Calls.oneOf()

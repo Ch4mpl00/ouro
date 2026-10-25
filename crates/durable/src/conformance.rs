@@ -1779,6 +1779,12 @@ async fn decisions(
     // Other content (version one) is admitted, uncounted; this is the digest rule.
     assert!(s.start(&run_of("other-content", one.version), 6).await?.is_some());
     assert_eq!(s.get("other-content").await?.unwrap().epoch, None);
+    // A version the catalog does not hold has no digest to tell its content
+    // from the tripped one: refused while tripped, on every path (fail closed).
+    let absent = two.version + 10;
+    assert_eq!(tripped(s.admit(&run_of("absent", absent), 6).await.unwrap_err()), expected);
+    assert_eq!(tripped(s.start(&run_of("absent", absent), 6).await.unwrap_err()), expected);
+    assert!(s.get("absent").await?.is_none());
     let parent = s.start(&admission("parent"), 6).await?.unwrap();
     let link = ChildLink { parent: "parent".into(), key: "child".into(), reference: "/child".into() };
     let before = s.inspect("parent").await?;
