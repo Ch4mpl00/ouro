@@ -220,8 +220,9 @@ async fn run_rows_of_another_state_version_are_refused() {
     let key = ("run".to_string(), "r".to_string());
     // 3 and earlier: one aggregate per run; 4 and 5: call records with an
     // effect; 9: no annotation totals on the run row; 13: the engine's
-    // extensions read from the flat `metadata` keys, not `metadata.ouro`.
-    for version in [None, Some(3), Some(4), Some(5), Some(6), Some(9), Some(13)] {
+    // extensions read from the flat `metadata` keys, not `metadata.ouro`;
+    // 14: child ids derived from the logical invocation, not hashed per attempt.
+    for version in [None, Some(3), Some(4), Some(5), Some(6), Some(9), Some(13), Some(14)] {
         let before = backend.snapshot().await.unwrap();
         let mut rows = before.rows.clone();
         let run = rows.get_mut(&key).unwrap().as_object_mut().unwrap();

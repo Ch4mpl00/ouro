@@ -122,6 +122,10 @@ pub enum AdmissionField {
     Version,
     /// The host data, compared as given (absent against present included).
     Host,
+    /// The owner of a child start: the id is held by a run that is not the
+    /// child of this parent under this link (another key, another
+    /// invocation, or a root run).
+    Link,
 }
 
 /// An admission of a run id that is already stored with another admission:
@@ -140,6 +144,7 @@ impl std::fmt::Display for AdmissionMismatch {
             AdmissionField::Name => "definition",
             AdmissionField::Version => "version",
             AdmissionField::Host => "host data",
+            AdmissionField::Link => "parent link",
         };
         write!(f, "run {} was already admitted with another {field}", self.id)
     }

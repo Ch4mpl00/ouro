@@ -1162,6 +1162,96 @@ async fn crashes_at_every_commit_never_repeat_a_child_an_event_or_a_write() {
     assert!(completed * 4 > commits * 2 * 3, "{completed} of {} crash points completed", commits * 2);
 }
 
+/// A retried `try` around the reserved `start_child`: the first attempt
+/// fails after its child started, the second succeeds.
+const RETRIED_START: &str = r#"do:
+  - attempt:
+      try:
+        - start: { call: start_child, with: { name: child, input: {} } }
+        - fail: { if: '${ $task.reference | contains("/try[") | not }', raise: { error: { type: 'urn:t:first', status: 500 } } }
+      catch:
+        retry: { limit: { attempt: { count: 2 } } }
+  - done: { set: { ok: true } }"#;
+
+/// `RETRIED_START` to its end with a crash at commit `fail_at`: its status,
+/// its children's ids and the commits it took.
+async fn retried_start_crash(fail_at: usize, after: bool) -> (Option<Status>, Vec<String>, usize) {
+    let backend = Arc::new(Crashing {
+        inner: durable::memory::MemoryBackend::default(),
+        commits: AtomicUsize::new(0),
+        fail_at,
+        after,
+    });
+    let store = Arc::new(durable::TransactionalStore::new(backend.clone()));
+    let f = fixture_on(store.clone(), Arc::default(), Arc::default(), Arc::default());
+    let setup = async |rt: &Runtime| -> anyhow::Result<()> {
+        for (name, body) in [("child", "do: [ { r: { set: { answer: 42 } } } ]"), ("parent", RETRIED_START)] {
+            let d = rt.save(name, &doc(name, body)).await?;
+            rt.activate(name, d.version).await?;
+        }
+        rt.start("p", "parent", json!({})).await?;
+        Ok(())
+    };
+    while setup(&f.rt).await.is_err() {}
+    for step in 1..200 {
+        if let Some(status) = store.get("p").await.ok().flatten().and_then(|r| r.outcome) {
+            let children = loop {
+                if let Ok(runs) = store.list(Some("child"), "").await {
+                    break runs.into_iter().map(|r| r.admission.id).collect();
+                }
+            };
+            return (Some(status), children, backend.commits.load(Ordering::SeqCst));
+        }
+        let _ = f.rt.recover_once(&CancellationToken::new()).await;
+        f.time.set(step * (durable::LEASE_MS + 600_001));
+    }
+    (None, Vec::new(), 0)
+}
+
+fn hashed(id: &str, prefix: &str) -> bool {
+    id.strip_prefix(prefix)
+        .is_some_and(|h| h.len() == 32 && h.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()))
+}
+
+#[tokio::test]
+async fn a_dsl_retry_starts_a_reserved_child_per_attempt_and_recovery_joins_it() {
+    let (status, children, commits) = retried_start_crash(usize::MAX, false).await;
+    let expected = Status::Completed(json!({ "ok": true }));
+    assert_eq!(status.as_ref(), Some(&expected));
+    assert_eq!(children.len(), 2, "one child per attempt: {children:?}");
+    assert!(children.iter().all(|id| hashed(id, "child:")), "{children:?}");
+    // A crash anywhere: recovery re-dispatches the same attempt's start,
+    // which joins its child; no attempt starts two.
+    for after in [false, true] {
+        for fail_at in 1..=commits {
+            let (status, children, _) = retried_start_crash(fail_at, after).await;
+            let label = format!("crash at commit {fail_at}, after={after}: {status:?} {children:?}");
+            assert_eq!(status.as_ref(), Some(&expected), "{label}");
+            assert_eq!(children.len(), 2, "{label}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn child_ids_have_a_fixed_length_at_the_depth_limit() {
+    let f = fixture();
+    // Each level runs a child of its own definition until the depth limit
+    // refuses one.
+    let nest = "do:
+  - deeper:
+      try: [ { sub: { run: { workflow: { namespace: test, name: nest, version: latest } } } } ]
+      catch: { do: [ { bottom: { set: { bottom: true } } } ] }";
+    save(&f.rt, "nest", &doc("nest", nest)).await;
+    f.rt.start("r", "nest", json!({})).await.unwrap();
+    assert!(matches!(settle(&f.rt, "r").await, Some(Status::Completed(_))));
+    let depth = Config::default().limits.max_depth;
+    let children = f.rt.list(Some("nest"), "child:").await.unwrap();
+    assert_eq!(children.len(), depth as usize, "one child per level");
+    for child in &children {
+        assert!(hashed(&child.admission.id, "child:"), "{} bytes", child.admission.id.len());
+    }
+}
+
 // ── runtime expression arguments, dry runs, event-triggered `all` ──────────
 
 #[tokio::test]

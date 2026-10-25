@@ -450,6 +450,10 @@ async fn a_redispatched_call_joins_its_child_and_keeps_the_first_host_data() {
                 starts.lock().unwrap().push(other.map_err(|e| kind(&e)));
                 let joined = cx.start_child(start(json!("b"))).await;
                 starts.lock().unwrap().push(joined.as_ref().map(Clone::clone).map_err(kind));
+                // The size bound applies to a child it admits: a re-dispatch
+                // whose recomputed host data grew past it still joins.
+                let large = cx.start_child(start(json!("x".repeat(durable::MAX_HOST_BYTES)))).await;
+                starts.lock().unwrap().push(large.map_err(|e| kind(&e)));
                 Ok(serde_json::to_value(joined?).unwrap())
             }
         }))
@@ -469,6 +473,7 @@ async fn a_redispatched_call_joins_its_child_and_keeps_the_first_host_data() {
     assert_eq!(starts[2].as_ref().unwrap().id, first.id, "and the same one in a re-dispatch");
     assert_eq!(starts[3], Err(format!("mismatch:{:?}", AdmissionField::Name)));
     assert_eq!(starts[4], Ok(first.clone()), "the re-dispatch joins the same child");
+    assert_eq!(starts[5], Ok(first.clone()), "larger host data on a join is not refused");
     let children = host_children(&rt).await;
     assert_eq!(children.len(), 1);
     assert_eq!(children[0].admission.host(), Some(&json!("a")), "the first host data stays");
@@ -532,6 +537,178 @@ async fn the_host_api_start_child_takes_host_data() {
     assert_eq!(mismatch(other), Some(AdmissionField::Name));
     let none = rt.start_child(&fence, "n", "n", "child", json!({}), Value::Null).await.unwrap();
     assert!(none.admission.host().is_none());
+    // The size bound applies to a child it admits; a join is not refused.
+    let large = json!("x".repeat(durable::MAX_HOST_BYTES));
+    let joined = rt.start_child(&fence, "k", "c", "child", json!({}), large.clone()).await.unwrap();
+    assert_eq!(joined.admission, c.admission);
+    let refused = rt.start_child(&fence, "big", "big", "child", json!({}), large).await.unwrap_err();
+    assert!(refused.downcast_ref::<HostDataTooLarge>().is_some(), "{refused}");
+    // An id held under another link (another key, or a root run of the same
+    // definition) is a typed mismatch, not a failure to retry.
+    let other = rt.start_child(&fence, "other", "c", "child", json!({}), Value::Null).await.unwrap_err();
+    assert_eq!(mismatch(other), Some(AdmissionField::Link));
+    rt.start("root", "child", json!({})).await.unwrap();
+    let root = rt.start_child(&fence, "r", "root", "child", json!({}), Value::Null).await.unwrap_err();
+    assert_eq!(mismatch(root), Some(AdmissionField::Link));
+}
+
+/// Fails its first attempt: the call answers an error unless it runs in a
+/// retry attempt (its task path names `try[n]`).
+fn flaky() -> Function {
+    Function::new("flaky", json!({}), json!({}), |_: Value, cx: FunctionContext| async move {
+        match cx.task_path.contains("/try[") {
+            true => Ok(json!({})),
+            false => Err(FunctionError::communication(500, "the first attempt fails")),
+        }
+    })
+}
+const HOST_CHILD_ID: usize = "hostchild:".len() + 32;
+fn hashed(id: &str, prefix: &str) -> bool {
+    id.strip_prefix(prefix)
+        .is_some_and(|h| h.len() == 32 && h.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()))
+}
+
+#[tokio::test]
+async fn a_dsl_retry_starts_a_host_child_per_attempt_and_a_redispatch_joins_it() {
+    let time = Arc::new(Time::default());
+    let starts = Starts::default();
+    let ids = Arc::new(Mutex::new(Vec::new()));
+    let dispatches = Arc::new(AtomicUsize::new(0));
+    let mut registry = Registry::new();
+    registry.register(whoami(Seen::default())).unwrap();
+    registry.register(flaky()).unwrap();
+    let (s, i, d) = (starts.clone(), ids.clone(), dispatches.clone());
+    registry
+        .register(Function::new("spawn", json!({}), json!({}), move |args: Value, cx: FunctionContext| {
+            let (starts, ids, dispatch) = (s.clone(), i.clone(), d.fetch_add(1, Ordering::SeqCst));
+            async move {
+                ids.lock().unwrap().push(cx.child_id("k"));
+                let result = cx.start_child(vouched(&args, &cx)).await;
+                starts.lock().unwrap().push(result.as_ref().map(Clone::clone).map_err(kind));
+                if dispatch == 0 {
+                    // The child committed, the answer is lost: the call is
+                    // dispatched again in the same attempt.
+                    return Err(FunctionError::interrupted("the host is shutting down"));
+                }
+                Ok(serde_json::to_value(result?).unwrap())
+            }
+        }))
+        .unwrap();
+    let rt = runtime(Arc::new(durable::memory::memory()), registry, Config::default(), time.clone());
+    save(&rt, "child", &doc("child", CHILD)).await;
+    let parent = "do:
+  - attempt:
+      try:
+        - spawn: { call: spawn, with: { name: child } }
+        - fail: { call: flaky }
+      catch:
+        retry: { limit: { attempt: { count: 2 } } }";
+    save(&rt, "parent", &doc("parent", parent)).await;
+    rt.start("p", "parent", json!({})).await.unwrap();
+    let status = settle(&rt, &time, "p").await;
+    assert!(matches!(status, Some(Status::Completed(_))), "{status:?}");
+    assert_eq!(dispatches.load(Ordering::SeqCst), 3, "two dispatches of the first attempt, one of the second");
+    let starts: Vec<_> = starts.lock().unwrap().iter().map(|s| s.clone().unwrap()).collect();
+    assert_eq!(starts[0], starts[1], "a re-dispatch of the same attempt joins its child");
+    assert_ne!(starts[1].id, starts[2].id, "a retry attempt starts its own child");
+    assert_eq!(starts[0].key, starts[2].key, "under the call's logical key");
+    let ids = ids.lock().unwrap().clone();
+    assert_eq!(ids, starts.iter().map(|s| s.id.clone()).collect::<Vec<_>>(), "child_id follows the attempt");
+    for started in &starts {
+        assert!(hashed(&started.id, "hostchild:"), "{}", started.id);
+    }
+    let children = host_children(&rt).await;
+    assert_eq!(children.len(), 2, "one child per attempt");
+    assert!(children.iter().all(|c| matches!(c.outcome, Some(Status::Completed(_)))));
+}
+
+#[tokio::test]
+async fn host_child_ids_have_a_fixed_length_at_the_depth_limit() {
+    let time = Arc::new(Time::default());
+    let starts = Starts::default();
+    let mut registry = Registry::new();
+    let s = starts.clone();
+    registry
+        .register(Function::new("spawn", json!({}), json!({}), move |args: Value, cx: FunctionContext| {
+            let starts = s.clone();
+            async move {
+                // Refuses instead of storing an id that grew with the nesting.
+                if cx.child_id("k").len() != HOST_CHILD_ID {
+                    return Err(FunctionError::not_executed(format!("an id of {} bytes", cx.child_id("k").len())));
+                }
+                let result = cx.start_child(vouched(&args, &cx)).await;
+                starts.lock().unwrap().push(result.as_ref().map(Clone::clone).map_err(kind));
+                Ok(serde_json::to_value(result?).unwrap())
+            }
+        }))
+        .unwrap();
+    let config = Config::default();
+    let depth = config.limits.max_depth;
+    assert_eq!(depth, 10, "the default nesting depth");
+    let rt = runtime(Arc::new(durable::memory::memory()), registry, config, time.clone());
+    // Each level starts a child of its own definition and joins it, until
+    // the depth limit refuses one.
+    let nest = "do:
+  - deeper:
+      try:
+        - spawn: { call: spawn, with: { name: nest }, export: { as: '${ . }' } }
+        - join: { listen: { to: { one: { with: { type: '${ $context.done }' } } } } }
+      catch:
+        errors: { with: { type: urn:ouro:errors:call.not_executed } }
+        do: [ { bottom: { set: { bottom: true } } } ]";
+    save(&rt, "nest", &doc("nest", nest)).await;
+    rt.start("r", "nest", json!({})).await.unwrap();
+    assert!(matches!(settle(&rt, &time, "r").await, Some(Status::Completed(_))));
+    let starts = starts.lock().unwrap().clone();
+    assert_eq!(starts.len(), depth as usize + 1);
+    assert_eq!(starts.last(), Some(&Err("depth".to_owned())));
+    let children = host_children(&rt).await;
+    assert_eq!(children.len(), depth as usize, "one child per level");
+    for child in &children {
+        assert!(hashed(&child.admission.id, "hostchild:"), "{}", child.admission.id);
+    }
+    let deepest = children.iter().map(|c| c.admission.runtime["limits"]["depth"].as_u64()).max();
+    assert_eq!(deepest, Some(Some(u64::from(depth))));
+}
+
+#[tokio::test]
+async fn an_id_held_under_another_link_is_a_typed_refusal() {
+    let time = Arc::new(Time::default());
+    let starts = Starts::default();
+    let store: Arc<dyn RunStore> = Arc::new(durable::memory::memory());
+    let mut registry = Registry::new();
+    registry.register(whoami(Seen::default())).unwrap();
+    let (s, taken) = (starts.clone(), store.clone());
+    registry
+        .register(Function::new("spawn", json!({}), json!({}), move |args: Value, cx: FunctionContext| {
+            let (starts, store) = (s.clone(), taken.clone());
+            async move {
+                // A run of the same definition already holds the child's id,
+                // with no link to this call.
+                let mut squatter = store.get("template").await.unwrap().unwrap().admission;
+                squatter.id = cx.child_id("k");
+                store.admit(&squatter, 0).await.unwrap();
+                let result = cx.start_child(vouched(&args, &cx)).await;
+                starts.lock().unwrap().push(result.as_ref().map(Clone::clone).map_err(kind));
+                Ok(serde_json::to_value(result?).unwrap())
+            }
+        }))
+        .unwrap();
+    let rt = runtime(store.clone(), registry, Config::default(), time.clone());
+    save(&rt, "child", &doc("child", CHILD)).await;
+    rt.start("template", "child", json!({})).await.unwrap();
+    let parent = "do:
+  - attempt:
+      try:
+        - spawn: { call: spawn, with: { name: child } }
+      catch:
+        errors: { with: { type: urn:ouro:errors:call.not_executed } }
+        do: [ { refused: { set: { refused: true } } } ]";
+    save(&rt, "parent", &doc("parent", parent)).await;
+    rt.start("p", "parent", json!({})).await.unwrap();
+    let status = settle(&rt, &time, "p").await;
+    assert_eq!(status, Some(Status::Completed(json!({ "refused": true }))));
+    assert_eq!(*starts.lock().unwrap(), [Err(format!("mismatch:{:?}", AdmissionField::Link))], "never an interruption");
 }
 
 #[tokio::test]
