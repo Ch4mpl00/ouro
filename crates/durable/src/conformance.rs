@@ -911,6 +911,12 @@ async fn definition_queries(
     assert_eq!(tripped.tripped, fresh.definitions("workflow").await?.tripped);
     assert!(tripped.tripped.as_ref().unwrap().manual.is_none());
     assert!(tripped.schedules.iter().all(|s| s.next_due_ms.is_none() && s.queued.is_none()));
+    // Only an activation clears an automatic trip; resuming it is refused.
+    let resume = Command::Resume { definition: "workflow".into() };
+    assert!(matches!(
+        refusal(s.control(&control_request("resume-trip"), &resume, 5).await),
+        control::ControlError::InvalidState(_)
+    ));
     s.activate_with("workflow", 2, 1, &arming).await?.unwrap();
     let reactivated = fresh.definition_control("workflow").await?.unwrap();
     assert_eq!((reactivated.epoch, reactivated.consecutive_faults), (2, 0));
@@ -2366,11 +2372,15 @@ pub fn control_wait() -> ows::events::PendingWait {
 fn control_request(id: &str) -> control::Request {
     control::Request { id: id.into(), actor: "operator".into(), reason: "maintenance".into() }
 }
+/// The typed refusal of a control operation that must fail.
+fn refusal<T: std::fmt::Debug>(result: anyhow::Result<T>) -> control::ControlError {
+    control::ControlError::from(result.expect_err("the control operation must be refused"))
+}
 async fn controls(
     factory: &impl AsyncFn(&str) -> anyhow::Result<TestStore>,
     report: &mut Report,
 ) -> anyhow::Result<()> {
-    use control::{Command, Reply, Runs, Waits};
+    use control::{Command, ControlError, Entity, Reply, Runs, Waits};
     let t = factory("control").await?;
     report.cases += 1;
     let s = &t.store;
@@ -2431,7 +2441,31 @@ async fn controls(
     // A late retry must not undo the intervening resume.
     assert_eq!(remote.control(&control_request("pause"), &pause, 3).await?, Reply::Changed(true));
     assert!(s.definitions("workflow").await?.tripped.is_none());
-    assert!(s.control(&control_request("pause"), &Command::Stop { enabled: true }, 3).await.is_err());
+    assert!(matches!(
+        refusal(s.control(&control_request("pause"), &Command::Stop { enabled: true }, 3).await),
+        ControlError::RequestConflict { id } if id == "pause"
+    ));
+    let mut impostor = control_request("pause");
+    impostor.actor = "someone else".into();
+    assert!(matches!(refusal(s.control(&impostor, &pause, 3).await), ControlError::RequestConflict { .. }));
+    let blank = control::Request { reason: " ".into(), ..control_request("blank") };
+    assert!(matches!(refusal(s.control(&blank, &pause, 3).await), ControlError::InvalidInput(_)));
+    let missing = Command::Pause { definition: "missing".into(), note: String::new() };
+    assert!(matches!(
+        refusal(s.control(&control_request("missing"), &missing, 3).await),
+        ControlError::NotFound { entity: Entity::Definition, id } if id == "missing"
+    ));
+    let resume_missing = Command::Resume { definition: "missing".into() };
+    assert!(matches!(
+        refusal(s.control(&control_request("resume-missing"), &resume_missing, 3).await),
+        ControlError::NotFound { entity: Entity::Definition, .. }
+    ));
+    s.save_definition("inactive", "yaml").await?;
+    let inactive = Command::Pause { definition: "inactive".into(), note: String::new() };
+    assert!(matches!(
+        refusal(s.control(&control_request("inactive"), &inactive, 3).await),
+        ControlError::InvalidState(_)
+    ));
     s.control(&control_request("pause-again"), &pause, 3).await?;
     s.activate_with("workflow", d.version, 1, &arming).await?;
     assert!(s.definitions("workflow").await?.tripped.is_none());
@@ -2468,13 +2502,27 @@ async fn controls(
         e
     };
     for (id, event) in [("wrong-correlation", response(43, true)), ("wrong-filter", response(42, false))] {
-        assert!(
-            remote
-                .control(&control_request(id), &Command::Respond { run: "p".into(), wait: "listen".into(), event }, 4)
-                .await
-                .is_err()
-        );
+        let respond = Command::Respond { run: "p".into(), wait: "listen".into(), event };
+        assert!(matches!(
+            refusal(remote.control(&control_request(id), &respond, 4).await),
+            ControlError::WaitMismatch { run, wait } if run == "p" && wait == "listen"
+        ));
     }
+    let elsewhere = Command::Respond { run: "nobody".into(), wait: "listen".into(), event: response(42, true) };
+    assert!(matches!(
+        refusal(remote.control(&control_request("nobody"), &elsewhere, 4).await),
+        ControlError::NotFound { entity: Entity::Run, id } if id == "nobody"
+    ));
+    let unopened = Command::Respond { run: "p".into(), wait: "other".into(), event: response(42, true) };
+    assert!(matches!(
+        refusal(remote.control(&control_request("unopened"), &unopened, 4).await),
+        ControlError::WaitClosed { .. }
+    ));
+    let anonymous = Command::Respond { run: "p".into(), wait: "listen".into(), event: json!({"type": "answer"}) };
+    assert!(matches!(
+        refusal(remote.control(&control_request("anonymous"), &anonymous, 4).await),
+        ControlError::InvalidInput(_)
+    ));
     assert!(s.inspect("p").await?.unwrap().events.is_empty());
     let answer = Command::Respond { run: "p".into(), wait: "listen".into(), event: response(42, true) };
     let reply = remote.control(&control_request("answer"), &answer, 4).await?;
@@ -2486,7 +2534,18 @@ async fn controls(
     if let Command::Respond { event, .. } = &mut conflict {
         event["ticket"] = json!(43);
     }
-    assert!(s.control(&control_request("answer-conflict"), &conflict, 5).await.is_err());
+    assert!(matches!(
+        refusal(s.control(&control_request("answer-conflict"), &conflict, 5).await),
+        ControlError::ResponseConflict { .. }
+    ));
+    let mut late = answer.clone();
+    if let Command::Respond { event, .. } = &mut late {
+        event["id"] = json!("late-response");
+    }
+    assert!(matches!(
+        refusal(s.control(&control_request("answer-late"), &late, 5).await),
+        ControlError::WaitClosed { .. }
+    ));
     assert_eq!(s.control_history(Some("p"), None, 10).await?.items.len(), 2);
     assert_eq!(s.control_entry("answer").await?.unwrap().request.actor, "operator");
 
@@ -2553,9 +2612,15 @@ async fn controls(
     );
     assert_eq!(s.query_runs(&filter, true, None, 10).await?.items.len(), 3);
     let page = s.query_runs(&filter, false, None, 1).await?;
-    assert!(s.query_runs(&Runs::default(), false, page.next.as_ref(), 1).await.is_err());
-    assert!(s.query_runs(&filter, false, None, 0).await.is_err());
-    assert!(s.query_runs(&filter, false, None, control::MAX_PAGE + 1).await.is_err());
+    let invalid = |r| matches!(refusal(r), ControlError::InvalidInput(_));
+    assert!(invalid(s.query_runs(&Runs::default(), false, page.next.as_ref(), 1).await.map(|_| ())));
+    assert!(invalid(s.query_runs(&filter, false, None, 0).await.map(|_| ())));
+    assert!(invalid(s.query_runs(&filter, false, None, control::MAX_PAGE + 1).await.map(|_| ())));
+    let inverted = Runs { since_ms: Some(10), before_ms: Some(0), ..Runs::default() };
+    assert!(invalid(s.query_runs(&inverted, true, None, 10).await.map(|_| ())));
+    assert!(invalid(s.pending_waits(&Waits::default(), page.next.as_ref(), 10).await.map(|_| ())));
+    assert!(invalid(s.control_history(None, None, 0).await.map(|_| ())));
+    assert!(invalid(s.query_definitions(None, control::MAX_PAGE + 1).await.map(|_| ())));
     audit(&*remote).await?;
     audit_control(&t).await?;
     report.operations += 80;
@@ -2651,7 +2716,12 @@ async fn controls(
                 s.control(&control_request("command"), &command, 3).await.map(|_| ())
             };
             t.faults.clear();
-            assert!(result.is_err(), "control {op} at {fault:?}");
+            // An injected storage failure is no operator refusal: it stays
+            // `Storage`, displayed as the failure itself.
+            let failure = result.as_ref().expect_err("an injected fault fails the command").to_string();
+            let typed = refusal(result);
+            assert!(matches!(&typed, control::ControlError::Storage(_)), "control {op} at {fault:?}: {typed:?}");
+            assert_eq!(typed.to_string(), failure);
             let fresh = (t.reopen)().await?;
             if fault == CommitFault::AfterCommit {
                 assert_ne!(t.backend.snapshot().await?, before);

@@ -112,6 +112,16 @@ impl std::fmt::Display for Conflict {
 }
 impl std::error::Error for Conflict {}
 
+/// A write through a store opened read-only, refused before it touches data.
+#[derive(Debug)]
+pub struct ReadOnly;
+impl std::fmt::Display for ReadOnly {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the store was opened read-only")
+    }
+}
+impl std::error::Error for ReadOnly {}
+
 #[async_trait]
 pub trait AtomicBackend: Send + Sync {
     async fn begin(&self) -> anyhow::Result<Box<dyn Transaction + '_>>;

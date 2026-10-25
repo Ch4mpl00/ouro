@@ -1,5 +1,8 @@
 //! Operator access using only a store and a clock, in a console or separate
 //! process. The embedding host supplies authorization, request IDs and actors.
+//! Every method fails with a typed `ControlError` (not found, conflicting
+//! request or response identity, invalid state or input, closed or
+//! mismatching wait, stopped, read-only), or `Storage` with its source chain.
 pub use ouro_durable::control::*;
 use ouro_durable::{Clock, RunStore, SavedRun};
 use std::sync::Arc;
@@ -12,26 +15,26 @@ impl Control {
     pub fn new(store: Arc<dyn RunStore>, clock: Arc<dyn Clock>) -> Self {
         Self { store, clock }
     }
-    pub async fn execute(&self, request: &Request, command: &Command) -> anyhow::Result<Reply> {
-        self.store.control(request, command, self.clock.now_ms()).await
+    pub async fn execute(&self, request: &Request, command: &Command) -> Result<Reply, ControlError> {
+        self.store.control(request, command, self.clock.now_ms()).await.map_err(ControlError::from)
     }
-    pub async fn cancel(&self, request: &Request, run: &str) -> anyhow::Result<Reply> {
+    pub async fn cancel(&self, request: &Request, run: &str) -> Result<Reply, ControlError> {
         self.execute(request, &Command::Cancel { run: run.into() }).await
     }
-    pub async fn cancel_tree(&self, request: &Request, run: &str) -> anyhow::Result<Reply> {
+    pub async fn cancel_tree(&self, request: &Request, run: &str) -> Result<Reply, ControlError> {
         self.cancel(request, run).await
     }
-    pub async fn pause(&self, request: &Request, definition: &str, note: &str) -> anyhow::Result<Reply> {
+    pub async fn pause(&self, request: &Request, definition: &str, note: &str) -> Result<Reply, ControlError> {
         self.execute(request, &Command::Pause { definition: definition.into(), note: note.into() }).await
     }
-    pub async fn resume(&self, request: &Request, definition: &str) -> anyhow::Result<Reply> {
+    pub async fn resume(&self, request: &Request, definition: &str) -> Result<Reply, ControlError> {
         self.execute(request, &Command::Resume { definition: definition.into() }).await
     }
-    pub async fn emergency_stop(&self, request: &Request, enabled: bool) -> anyhow::Result<Reply> {
+    pub async fn emergency_stop(&self, request: &Request, enabled: bool) -> Result<Reply, ControlError> {
         self.execute(request, &Command::Stop { enabled }).await
     }
-    pub async fn stopped(&self) -> anyhow::Result<bool> {
-        self.store.stopped().await
+    pub async fn stopped(&self) -> Result<bool, ControlError> {
+        self.store.stopped().await.map_err(ControlError::from)
     }
     pub async fn respond(
         &self,
@@ -39,37 +42,50 @@ impl Control {
         run: &str,
         wait: &str,
         event: serde_json::Value,
-    ) -> anyhow::Result<Reply> {
+    ) -> Result<Reply, ControlError> {
         self.execute(request, &Command::Respond { run: run.into(), wait: wait.into(), event }).await
     }
-    pub async fn inspect(&self, run: &str) -> anyhow::Result<Option<Inspection>> {
-        self.store.inspect_control(run).await
+    pub async fn inspect(&self, run: &str) -> Result<Option<Inspection>, ControlError> {
+        self.store.inspect_control(run).await.map_err(ControlError::from)
     }
-    pub async fn list(&self, filter: &Runs, cursor: Option<&Cursor>, limit: usize) -> anyhow::Result<Page<SavedRun>> {
-        self.store.query_runs(filter, false, cursor, limit).await
+    pub async fn list(
+        &self,
+        filter: &Runs,
+        cursor: Option<&Cursor>,
+        limit: usize,
+    ) -> Result<Page<SavedRun>, ControlError> {
+        self.store.query_runs(filter, false, cursor, limit).await.map_err(ControlError::from)
     }
     pub async fn history(
         &self,
         filter: &Runs,
         cursor: Option<&Cursor>,
         limit: usize,
-    ) -> anyhow::Result<Page<SavedRun>> {
-        anyhow::ensure!(
-            filter.since_ms.is_some() && filter.before_ms.is_some(),
-            "history requires a bounded time window"
-        );
-        self.store.query_runs(filter, true, cursor, limit).await
+    ) -> Result<Page<SavedRun>, ControlError> {
+        if filter.since_ms.is_none() || filter.before_ms.is_none() {
+            return Err(ControlError::InvalidInput("history requires a bounded time window".into()));
+        }
+        self.store.query_runs(filter, true, cursor, limit).await.map_err(ControlError::from)
     }
     /// Definition metadata in binary name order. Each bounded page observes
     /// catalog, breaker, schedules and queued slots in one transaction.
-    pub async fn definitions(&self, cursor: Option<&Cursor>, limit: usize) -> anyhow::Result<Page<DefinitionSummary>> {
-        self.store.query_definitions(cursor, limit).await
+    pub async fn definitions(
+        &self,
+        cursor: Option<&Cursor>,
+        limit: usize,
+    ) -> Result<Page<DefinitionSummary>, ControlError> {
+        self.store.query_definitions(cursor, limit).await.map_err(ControlError::from)
     }
-    pub async fn definition(&self, name: &str) -> anyhow::Result<Option<DefinitionSummary>> {
-        self.store.definition_control(name).await
+    pub async fn definition(&self, name: &str) -> Result<Option<DefinitionSummary>, ControlError> {
+        self.store.definition_control(name).await.map_err(ControlError::from)
     }
-    pub async fn waits(&self, filter: &Waits, cursor: Option<&Cursor>, limit: usize) -> anyhow::Result<Page<Wait>> {
-        self.store.pending_waits(filter, cursor, limit).await
+    pub async fn waits(
+        &self,
+        filter: &Waits,
+        cursor: Option<&Cursor>,
+        limit: usize,
+    ) -> Result<Page<Wait>, ControlError> {
+        self.store.pending_waits(filter, cursor, limit).await.map_err(ControlError::from)
     }
     pub async fn counts(
         &self,
@@ -77,8 +93,10 @@ impl Control {
         history: bool,
         cursor: Option<&Cursor>,
         limit: usize,
-    ) -> anyhow::Result<Counts> {
-        anyhow::ensure!(filter.definition.is_some(), "counts require a definition");
+    ) -> Result<Counts, ControlError> {
+        if filter.definition.is_none() {
+            return Err(ControlError::InvalidInput("counts require a definition".into()));
+        }
         let page =
             if history { self.history(filter, cursor, limit).await? } else { self.list(filter, cursor, limit).await? };
         let mut states = std::collections::BTreeMap::new();
@@ -97,22 +115,22 @@ impl Control {
     }
     /// A page of worker heartbeat rows in id order, each marked stale when
     /// its worker did not beat before its expiry (by this control's clock).
-    pub async fn workers(&self, cursor: Option<&Cursor>, limit: usize) -> anyhow::Result<Page<WorkerStatus>> {
+    pub async fn workers(&self, cursor: Option<&Cursor>, limit: usize) -> Result<Page<WorkerStatus>, ControlError> {
         let page = self.store.workers(cursor, limit).await?;
         let now = self.clock.now_ms();
         let items =
             page.items.into_iter().map(|worker| WorkerStatus { stale: worker.expires_ms <= now, worker }).collect();
         Ok(Page { items, next: page.next })
     }
-    pub async fn entry(&self, id: &str) -> anyhow::Result<Option<Entry>> {
-        self.store.control_entry(id).await
+    pub async fn entry(&self, id: &str) -> Result<Option<Entry>, ControlError> {
+        self.store.control_entry(id).await.map_err(ControlError::from)
     }
     pub async fn journal(
         &self,
         run: Option<&str>,
         cursor: Option<&Cursor>,
         limit: usize,
-    ) -> anyhow::Result<Page<Entry>> {
-        self.store.control_history(run, cursor, limit).await
+    ) -> Result<Page<Entry>, ControlError> {
+        self.store.control_history(run, cursor, limit).await.map_err(ControlError::from)
     }
 }

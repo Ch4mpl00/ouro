@@ -370,7 +370,7 @@ impl Runtime {
         &self,
         request: &ouro_durable::control::Request,
         command: &ouro_durable::control::Command,
-    ) -> anyhow::Result<ouro_durable::control::Reply> {
+    ) -> Result<ouro_durable::control::Reply, ouro_durable::control::ControlError> {
         let reply = self.store.control(request, command, self.clock.now_ms()).await?;
         if matches!(command, ouro_durable::control::Command::Cancel { .. }) {
             self.signal_cancelled().await?;

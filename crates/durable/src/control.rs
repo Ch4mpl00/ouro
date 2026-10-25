@@ -71,6 +71,97 @@ impl std::fmt::Display for Stopped {
 }
 impl std::error::Error for Stopped {}
 
+/// What an operator command or query names and the store does not hold.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Entity {
+    Run,
+    Definition,
+}
+
+/// Why a control command or query failed, typed so a console or CLI can
+/// react without matching messages. A store raises the operator variants
+/// inside its `anyhow` errors (`RunStore::control`); `ControlError::from`
+/// recovers them, together with `Stopped` and `ReadOnly`, and keeps anything
+/// else as `Storage` with its source chain.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum ControlError {
+    /// The command names a run or definition the store does not hold.
+    NotFound { entity: Entity, id: String },
+    /// The request id was already used with another command or attribution:
+    /// a retry must repeat the original exactly.
+    RequestConflict { id: String },
+    /// The response's event identity (`source` + `id`) already answered with
+    /// another payload or for another wait.
+    ResponseConflict { identity: String },
+    /// The command does not apply in the target's current state: resuming an
+    /// automatic breaker trip (only an activation clears it), pausing a
+    /// definition without an active version, resuming a pause whose
+    /// activation changed.
+    InvalidState(String),
+    /// The emergency stop refuses this operation.
+    Stopped,
+    /// The wait is not open: never opened, already answered, closed by its
+    /// run's end, or past its timeout.
+    WaitClosed { run: String, wait: String },
+    /// The response does not satisfy the wait's persisted matcher (its
+    /// filters or correlation).
+    WaitMismatch { run: String, wait: String },
+    /// The store was opened read-only.
+    ReadOnly,
+    /// A malformed request: a page limit outside 1..=`MAX_PAGE`, a cursor of
+    /// another query, an inverted or missing time window, missing request
+    /// attribution or response identity.
+    InvalidInput(String),
+    /// Anything else, typically storage; displayed as its source.
+    Storage(anyhow::Error),
+}
+impl std::fmt::Display for ControlError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotFound { entity: Entity::Run, id } => write!(f, "unknown run {id}"),
+            Self::NotFound { entity: Entity::Definition, id } => write!(f, "unknown definition {id}"),
+            Self::RequestConflict { id } => write!(f, "control request {id} was already used with other content"),
+            Self::ResponseConflict { identity } => {
+                write!(f, "response event {identity} was already used with other content")
+            }
+            Self::InvalidState(message) | Self::InvalidInput(message) => f.write_str(message),
+            Self::Stopped => std::fmt::Display::fmt(&Stopped, f),
+            Self::WaitClosed { run, wait } => write!(f, "wait {wait} of run {run} is not open"),
+            Self::WaitMismatch { run, wait } => write!(f, "the event does not match wait {wait} of run {run}"),
+            Self::ReadOnly => std::fmt::Display::fmt(&crate::ReadOnly, f),
+            Self::Storage(e) => std::fmt::Display::fmt(e, f),
+        }
+    }
+}
+impl std::error::Error for ControlError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        // Transparent: `Storage` displays its error, so the chain continues
+        // with that error's own source.
+        match self {
+            Self::Storage(e) => e.source(),
+            _ => None,
+        }
+    }
+}
+impl From<anyhow::Error> for ControlError {
+    /// Recovers a typed refusal from a store's error, wherever it was
+    /// raised; anything else stays `Storage`.
+    fn from(error: anyhow::Error) -> Self {
+        let error = match error.downcast::<ControlError>() {
+            Ok(typed) => return typed,
+            Err(error) => error,
+        };
+        if error.is::<Stopped>() {
+            Self::Stopped
+        } else if error.is::<crate::ReadOnly>() {
+            Self::ReadOnly
+        } else {
+            Self::Storage(error)
+        }
+    }
+}
+
 /// Cursors are opaque and bound to their query. Pages examine at most `limit`
 /// index entries: combined residual filters may yield an empty page with a
 /// continuation. Keep paging until `next` is absent.

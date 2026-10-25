@@ -13,7 +13,7 @@ pub mod postgres;
 pub mod sqlite;
 
 pub use backend::{
-    AtomicBackend, CommitFault, Conflict, FaultInjector, IoCounts, Key, Metrics, Rows, Snapshot, Transaction,
+    AtomicBackend, CommitFault, Conflict, FaultInjector, IoCounts, Key, Metrics, ReadOnly, Rows, Snapshot, Transaction,
     TransactionalStore,
 };
 pub use ows::model::Overlap;

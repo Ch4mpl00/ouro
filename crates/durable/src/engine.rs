@@ -2111,11 +2111,18 @@ async fn page_rows(
     cursor: Option<&control::Cursor>,
     limit: usize,
 ) -> anyhow::Result<(Rows, Option<control::Cursor>)> {
-    anyhow::ensure!((1..=control::MAX_PAGE).contains(&limit), "page limit must be 1..={}", control::MAX_PAGE);
-    anyhow::ensure!(since.zip(before).is_none_or(|(a, b)| a <= b), "invalid time window");
+    use control::ControlError;
+    if !(1..=control::MAX_PAGE).contains(&limit) {
+        return Err(ControlError::InvalidInput(format!("page limit must be 1..={}", control::MAX_PAGE)).into());
+    }
+    if since.zip(before).is_some_and(|(a, b)| a > b) {
+        return Err(ControlError::InvalidInput("invalid time window".into()).into());
+    }
     let start = match cursor {
         Some(c) => {
-            anyhow::ensure!(c.query == query, "cursor belongs to another query");
+            if c.query != query {
+                return Err(ControlError::InvalidInput("cursor belongs to another query".into()).into());
+            }
             c.after.clone()
         }
         None => since.map_or_else(String::new, time_key),
@@ -2189,16 +2196,18 @@ async fn control_command(
     now: i64,
     policy: &Policy,
 ) -> anyhow::Result<control::Reply> {
-    use control::{Command, Reply};
-    anyhow::ensure!(
-        !request.id.trim().is_empty() && !request.actor.trim().is_empty() && !request.reason.trim().is_empty(),
-        "control request requires id, actor and reason"
-    );
+    use control::{Command, ControlError, Entity, Reply};
+    if request.id.trim().is_empty() || request.actor.trim().is_empty() || request.reason.trim().is_empty() {
+        return Err(ControlError::InvalidInput("control request requires id, actor and reason".into()).into());
+    }
     let canonical = normalize_command(command);
     if let Some(entry) = get::<control::Entry>(rows, "control_command", &request.id).await? {
-        anyhow::ensure!(entry.request == *request && entry.command == canonical, "control request identity conflict");
+        if entry.request != *request || entry.command != canonical {
+            return Err(ControlError::RequestConflict { id: request.id.clone() }.into());
+        }
         return Ok(entry.reply);
     }
+    let unknown = |name: &str| ControlError::NotFound { entity: Entity::Definition, id: name.into() };
     let reply = match command {
         Command::Cancel { run: id } => {
             let changed = find_run(rows, id).await?.is_some_and(|s| s.run.ended_ms.is_none());
@@ -2220,10 +2229,12 @@ async fn control_command(
             Reply::Changed(changed)
         }
         Command::Pause { definition: name, note } => {
-            let mut defs = load_definitions(rows, name).await?.ok_or_else(|| anyhow::anyhow!("unknown definition"))?;
+            let mut defs = load_definitions(rows, name).await?.ok_or_else(|| unknown(name))?;
             let changed = defs.tripped.is_none();
             if changed {
-                let version = defs.active.ok_or_else(|| anyhow::anyhow!("definition has no active version"))?;
+                let version = defs
+                    .active
+                    .ok_or_else(|| ControlError::InvalidState(format!("definition {name} has no active version")))?;
                 suspend(rows, name, &mut defs).await?;
                 defs.tripped = Some(Trip {
                     manual: Some(control::ManualTrip {
@@ -2250,16 +2261,17 @@ async fn control_command(
             Reply::Changed(changed)
         }
         Command::Resume { definition: name } => {
-            let mut defs = load_definitions(rows, name).await?.ok_or_else(|| anyhow::anyhow!("unknown definition"))?;
-            anyhow::ensure!(
-                defs.tripped.as_ref().is_none_or(|t| t.manual.is_some()),
-                "a breaker trip requires activation"
-            );
+            let mut defs = load_definitions(rows, name).await?.ok_or_else(|| unknown(name))?;
+            if defs.tripped.as_ref().is_some_and(|t| t.manual.is_none()) {
+                return Err(ControlError::InvalidState(format!("{name}: a breaker trip requires activation")).into());
+            }
             let changed = defs.tripped.is_some();
             if changed {
                 let paused: control::Paused =
                     get(rows, "paused", name).await?.ok_or_else(|| anyhow::anyhow!("missing suspended triggers"))?;
-                anyhow::ensure!(paused.epoch == defs.epoch, "suspended activation changed");
+                if paused.epoch != defs.epoch {
+                    return Err(ControlError::InvalidState(format!("{name}: suspended activation changed")).into());
+                }
                 defs.tripped = None;
                 arm(rows, &mut defs, &paused.triggers).await?;
                 for (key, value) in &paused.queues {
@@ -2275,19 +2287,24 @@ async fn control_command(
             Reply::Changed(changed)
         }
         Command::Respond { run: id, wait: key, event } => {
-            let identity = identity(event).ok_or_else(|| anyhow::anyhow!("response requires event source and id"))?;
+            let identity = identity(event)
+                .ok_or_else(|| ControlError::InvalidInput("response requires event source and id".into()))?;
             let kind = partition("control_response", id);
             let dedup = component(&identity);
+            let closed = || ControlError::WaitClosed { run: id.clone(), wait: key.clone() };
             if let Some(entry) = get::<control::Entry>(rows, &kind, &dedup).await? {
-                anyhow::ensure!(entry.command == canonical, "response event identity conflict");
+                if entry.command != canonical {
+                    return Err(ControlError::ResponseConflict { identity: identity.replace('\u{0}', "/") }.into());
+                }
                 entry.reply
             } else {
-                let s = run(rows, id).await?;
-                let w = s.waits.get(key).ok_or_else(|| anyhow::anyhow!("wait is no longer pending"))?;
-                anyhow::ensure!(
-                    s.run.ended_ms.is_none() && w.timeout_ms.is_none_or(|at| now < at),
-                    "wait ended or timed out"
-                );
+                let s = find_run(rows, id)
+                    .await?
+                    .ok_or_else(|| ControlError::NotFound { entity: Entity::Run, id: id.clone() })?;
+                let w = s.waits.get(key).ok_or_else(closed)?;
+                if s.run.ended_ms.is_some() || w.timeout_ms.is_some_and(|at| now >= at) {
+                    return Err(closed().into());
+                }
                 let mut event = event.clone();
                 if let Value::Object(m) = &mut event {
                     m.entry("specversion").or_insert(json!("1.0"));
@@ -2296,7 +2313,12 @@ async fn control_command(
                         .to_rfc3339();
                     m.entry("time").or_insert(json!(time));
                 }
-                anyhow::ensure!(w.accepts(&event).map_err(anyhow::Error::msg)?, "event does not match wait");
+                let matched = w.accepts(&event).map_err(|e| {
+                    ControlError::InvalidState(format!("wait {key} of run {id} cannot be matched here: {e}"))
+                })?;
+                if !matched {
+                    return Err(ControlError::WaitMismatch { run: id.clone(), wait: key.clone() }.into());
+                }
                 let result = Reply::Responded(deliver(rows, &event, Some(id), now, policy).await?);
                 let sequence: u64 = get(rows, &identities_of(id), &dedup)
                     .await?

@@ -351,6 +351,21 @@ let definitions = control.definitions(None, 50).await?;
 let definition = control.definition("workflow").await?;
 ```
 
+Every `Control` method (and `Runtime::control`) fails with a typed
+`ControlError`, so a console reacts to the variant instead of a message:
+`NotFound` (the run or definition a command names), `RequestConflict` (a
+request ID reused with another command or attribution), `ResponseConflict`
+(a response's event identity reused with other content), `InvalidState`
+(resuming an automatic trip, pausing a definition without an active
+version), `Stopped`, `WaitClosed` (a wait never opened, answered, ended or
+timed out), `WaitMismatch` (the event fails the wait's matcher), `ReadOnly`,
+`InvalidInput` (a page limit, cursor, time window, request attribution or
+response identity) and `Storage`, which displays its error and keeps its
+source chain. It implements `std::error::Error`, so `?` into `anyhow` still
+works. A store raises these variants inside its `anyhow` errors;
+`ControlError::from(anyhow::Error)` recovers them (and `Stopped`,
+`ReadOnly`) for hosts that call `RunStore` directly.
+
 `cancel` and `cancel_tree` have the same owned-tree semantics: the run and
 its transitive owned descendants end in one commit; independent runs remain
 independent. A lease holder discovers a remote cancel at its next renewal
