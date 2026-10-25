@@ -114,8 +114,9 @@ def check(module, spec, source, label, output):
             elif "No error has been found" not in log:
                 raise RuntimeError(log)
             else:
-                found = re.search(r"([\d ]+) distinct states found, 0 states left on queue", log)
-                states = int(found.group(1).replace(" ", "")) if found else states
+                # The summary line; progress lines group digits with a locale's separator.
+                found = re.findall(r"^\d+ states generated, (\d+) distinct states found, 0 states left on queue", log, re.M)
+                states = int(found[-1]) if found else states
     return broken, states, round(time.monotonic() - started, 3)
 
 
