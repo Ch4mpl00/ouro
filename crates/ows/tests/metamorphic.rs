@@ -14,7 +14,7 @@ mod support;
 use proptest::prelude::*;
 use proptest::test_runner::{TestCaseError, TestRunner};
 use serde_json::{Value, json};
-use support::host::{Entry, Observed, Options, Ran, calls, execute, hit_limit, observed, pretty};
+use support::host::{Entry, Observed, Options, Ran, calls, execute, hit_limit, jumps, observed, pretty};
 use support::program::{
     Body, Catch, Cond, Data, Ext, Flow, Items, Num, Profile, Program, Task, Template, definition, each_task, fix,
     input, list_at, lists, program, task,
@@ -288,6 +288,29 @@ fn a_fork_outputs_what_each_branch_outputs_alone() {
             .map(|b| execute(&Program { tasks: vec![b.clone()], ..forked.clone() }, input.clone(), &Options::default()))
             .collect();
         if hit_limit(&fork.outcome) || alone.iter().any(|r| hit_limit(&r.outcome)) {
+            return Ok(());
+        }
+        // The branches of a fork share the run tree's jump budget (#8), so
+        // together they may exhaust what each alone does not. The relation
+        // holds exactly while the branches' jump requests fit the budget;
+        // beyond it the fork may fault with `budget.exhausted`. The budget
+        // still binds: it grants no more than its ceiling, and refuses a
+        // jump only when the branches' requests together exceed it.
+        let budget = Options::default().limits.max_jumps;
+        let requests: u64 = alone
+            .iter()
+            .map(|r| {
+                let (granted, refused) = jumps(&r.journal);
+                granted + refused
+            })
+            .sum();
+        let (granted, refused) = jumps(&fork.journal);
+        prop_assert!(granted <= budget, "the fork was granted {granted} jumps of {budget}");
+        prop_assert!(
+            refused == 0 || requests > budget,
+            "the fork was refused a jump the branches' {requests} requests fit in {budget}"
+        );
+        if requests > budget {
             return Ok(());
         }
         let results: Vec<Observed> = alone.iter().map(|r| observed(&r.outcome)).collect();

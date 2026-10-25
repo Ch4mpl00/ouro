@@ -423,7 +423,8 @@ runs the symbolic contract check and the TLC progress quotient, detects mutants,
 and runs formatting, Clippy, workspace tests and the restart example; with
 `TEST_DATABASE_URL`, also both Postgres bridges. `--only model`, `--only
 simulation`, `--only symbolic`, `--only temporal`, `--only mutations` and
-`--only rust` reproduce one stage; logs, commands and timings are kept in the
+`--only rust` reproduce one stage (`--only properties` is separate, see
+[What is checked where](#what-is-checked-where)); logs, commands and timings are kept in the
 ignored `spec/.results/`. The script owns and stops only its own Docker server.
 For a running native Apalache server:
 
@@ -453,6 +454,25 @@ CARGO_HOME=/private/tmp/ouro-cargo OURO_REQUIRE_QUINT=1 cargo test -p ouro-durab
 TEST_DATABASE_URL=postgresql://postgres:local-test-password@localhost/postgres \
   CARGO_HOME=/private/tmp/ouro-cargo cargo test -p ouro-durable --test quint postgres -- --ignored --nocapture
 ```
+
+## What is checked where
+
+Not every rule belongs in Quint. The model states durable guarantees; the
+interpreter's own policies are pinned elsewhere.
+
+| Rule | Where it is checked |
+| --- | --- |
+| Durable rules (admission, fencing, evidence, events, holds, triggers, versions) | The contract model, its mutants, the serial and concurrent MBT and the conformance suite on every adapter |
+| Progress (L1-L10) | The finite temporal quotients, under named fairness |
+| Interpreter error handling (`try`/`catch` selection, `call.unknown` not caught by a non-matching filter, a retry never re-dispatching an attempt that `blocks_retry`, a catch-all taking `budget.exhausted`) | The Rust reference model (`crates/ows/tests/model`), the property tests and the regression tests for H-1, #32 and `blocks_retry`. Quint does not model `try`, handler selection, error types or retry policy; E2's no-re-dispatch of an at-most-once call is modelled (mutant `E2/unknown`) |
+
+`spec/check.sh --only properties` runs every `ows` test binary that reads
+`PROPERTY_RUNS` (`model`, `durable`, `invariants`, `metamorphic`) at
+`PROPERTY_RUNS=5000`, one logged run per binary with its time and exit status in
+`spec/.results/`. It is opt-in and runs before every release tag, not per change
+(it takes minutes). A failure leaves proptest's seed in the
+`.proptest-regressions` file beside the test; the fix commits that seed with
+the test that pins the bug. Timings: [RESULTS.md](RESULTS.md).
 
 ## Limits
 

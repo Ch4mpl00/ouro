@@ -10,12 +10,14 @@ import time
 ROOT = pathlib.Path(__file__).resolve().parent
 REPO = ROOT.parent
 IMAGE = "ghcr.io/apalache-mc/apalache@sha256:cea4c97e15c085ab42424502c406a642c585f947f935a3131c167b1b00c480c8"
+# The ows test binaries that read PROPERTY_RUNS (crates/ows/tests/support/host.rs).
+PROPERTY_BINARIES = ["model", "durable", "invariants", "metamorphic"]
 QUINT = str(ROOT / "node_modules/.bin/quint")
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--only", choices=["model", "rust", "simulation", "symbolic", "temporal", "mutations"])
+    parser.add_argument("--only", choices=["model", "rust", "simulation", "symbolic", "temporal", "mutations", "properties"])
     parser.add_argument("--samples", type=int, default=10000)
     args = parser.parse_args()
     if args.samples < 1:
@@ -38,7 +40,18 @@ def main():
             raise SystemExit(result.returncode)
 
     def selected(stage):
+        if stage == "properties":  # opt-in, per release: minutes of proptest
+            return args.only == stage
         return args.only is None or args.only == stage or (args.only == "model" and stage != "rust")
+
+    if selected("properties"):
+        # Every test binary that reads PROPERTY_RUNS (grep it for the list),
+        # at depth; a failure leaves proptest's seed in the .proptest-regressions
+        # file beside the test, which the fix commits.
+        os.environ["PROPERTY_RUNS"] = "5000"
+        os.environ.setdefault("OURO_REQUIRE_QUINT", "1")
+        for binary in PROPERTY_BINARIES:
+            run(f"properties-{binary}", ["cargo", "test", "-p", "ows", "--test", binary])
 
     if selected("simulation"):
         for source in sorted(ROOT.glob("*.qnt")):

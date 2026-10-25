@@ -823,9 +823,13 @@ ends or waits for an external event, a timer or a joined child: no internal
 cycle of `then` jumps runs forever, whatever the program chooses at each step.
 The tree's jumps are bounded by B1's counter, which neither a restart nor a
 replaced owner resets; a refused jump never moves back (a catch continues past
-it, otherwise the run ends). Loops and retries are bounded by their collection
-and the host's attempt ceiling, child nesting by the host's depth ceiling; that
-only a jump moves back is the interpreter's property, not the quotient's.
+it, otherwise the run ends). Retries are bounded by the host's attempt ceiling,
+`min(retry.attempts, Limits.max_attempts)` (default 10), pinned in the run's
+`execution` record so a restart cannot reset it; a zero-delay retry is not a
+timer wait but it is bounded. Loops are bounded by their collection, child
+nesting by the host's depth ceiling; that only a jump moves back is the
+interpreter's property, not the quotient's. The quotient abstracts retries
+away: it has no retry action.
 
 The budget turns an unbounded loop into a terminal outcome, not a stuck run.
 **Source:** [#8][I8], [README][README]. **Fault:** a crash between a jump's
