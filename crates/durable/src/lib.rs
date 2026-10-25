@@ -163,6 +163,12 @@ pub struct SavedRun {
     /// (`ows::durable::accumulate`). Kept after `sweep` removes the records.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub annotations: ows::durable::Totals,
+    /// Frozen by an operator (`control::Command::Hold`): never returned by
+    /// `due` nor claimed, whatever its wake-up, until released. The run and
+    /// its live owned descendants are held in one commit; an ended run is
+    /// never held.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub held: Option<control::Hold>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

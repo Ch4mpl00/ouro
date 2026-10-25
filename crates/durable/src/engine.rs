@@ -268,7 +268,15 @@ fn indexes(s: &StoredRun) -> Rows {
         if let Some(trigger) = &s.trigger {
             keys.insert(key(&partition("trigger_live", trigger), id), value.clone());
         }
-        let due = if s.run.state == RunState::Running { s.run.lease_until_ms } else { Some(s.run.wake_at_ms) };
+        // A held run keeps its wake-up (and lease) but is due to nobody:
+        // the index is rebuilt from the row when it is released.
+        let due = if s.run.held.is_some() {
+            None
+        } else if s.run.state == RunState::Running {
+            s.run.lease_until_ms
+        } else {
+            Some(s.run.wake_at_ms)
+        };
         if let Some(due) = due {
             keys.insert(key("due", &timed(due, id)), value.clone());
             // Per application version (empty: undeclared), so a declared
@@ -358,11 +366,24 @@ async fn running(rows: &mut dyn Transaction) -> anyhow::Result<()> {
     }
     Ok(())
 }
+/// Every fenced step: no emergency stop, current ownership, and no operator
+/// hold. A hold refuses with `control::Held`, the worker's cue to release.
 async fn checked(rows: &mut dyn Transaction, fence: &Fence, now: i64, skew: i64) -> anyhow::Result<StoredRun> {
     running(rows).await?;
-    authority(rows, fence, now, skew).await
+    let s = authority(rows, fence, now, skew).await?;
+    not_held(&s)?;
+    Ok(s)
+}
+fn not_held(s: &StoredRun) -> anyhow::Result<()> {
+    if s.run.held.is_some() {
+        return Err(control::Held(s.run.admission.id.clone()).into());
+    }
+    Ok(())
 }
 fn claimable(r: &SavedRun, now: i64) -> bool {
+    if r.held.is_some() {
+        return false;
+    }
     match r.state {
         RunState::Ready | RunState::Waiting => r.wake_at_ms <= now,
         // Takeover only after the lease has ended.
@@ -435,6 +456,7 @@ async fn admitted(rows: &mut dyn Transaction, admission: &Admission, now: i64) -
             epoch,
             root: None,
             annotations: Default::default(),
+            held: None,
         },
         version: VERSION,
         digest,
@@ -1145,6 +1167,7 @@ async fn terminate(rows: &mut dyn Transaction, id: &str, status: &Status, now: i
     snapshot.run.ended_ms = Some(now);
     snapshot.run.fence = None;
     snapshot.run.lease_until_ms = None;
+    snapshot.run.held = None;
     snapshot.awaits.clear();
     snapshot.addressed_waits.clear();
     snapshot.listeners.clear();
@@ -1182,6 +1205,7 @@ async fn terminate(rows: &mut dyn Transaction, id: &str, status: &Status, now: i
             child.run.ended_ms = Some(now);
             child.run.fence = None;
             child.run.lease_until_ms = None;
+            child.run.held = None;
             child.awaits.clear();
             child.addressed_waits.clear();
             child.listeners.clear();
@@ -1621,9 +1645,26 @@ impl RunStore for TransactionalStore {
     async fn save_record(&self, f: &Fence, k: &str, r: &Record, now: i64) -> anyhow::Result<()> {
         self.update(|rows| {
             Box::pin(async move {
-                let mut s = checked(rows, f, now, self.policy.skew_ms).await?;
+                running(rows).await?;
+                let mut s = authority(rows, f, now, self.policy.skew_ms).await?;
                 let kind = records_of(&f.run_id);
                 let old = rows.get(&kind, k).await?;
+                // A hold refuses every step but the answer of a call already
+                // dispatched: its intent is saved and the world may have
+                // changed, so the answer is recorded, never lost.
+                if s.run.held.is_some() {
+                    let intent = old.as_ref().map(|o| serde_json::from_value::<Record>(o.clone())).transpose()?;
+                    let answer = matches!(
+                        (&intent, r),
+                        (
+                            Some(Record::Call { state: CallState::Pending, .. }),
+                            Record::Call { state: CallState::Done(_) | CallState::NotExecuted(_), .. }
+                        )
+                    );
+                    if !answer {
+                        not_held(&s)?;
+                    }
+                }
                 let value = serde_json::to_value(r)?;
                 if matches!(r, Record::Event { .. } | Record::Expired { .. }) {
                     anyhow::ensure!(old.as_ref() == Some(&value), "event records must be committed by take_event");
@@ -2316,6 +2357,38 @@ async fn query_runs(
     }
     Ok(control::Page { items, next })
 }
+/// Holds (`Some`) or releases (`None`) a live run and its live owned
+/// descendants in this transaction: the cancel cascade's reach, found the
+/// same way (the `children` index, level by level, bounded by the subtree),
+/// each row rewritten once with its indexes. A run already in the wanted
+/// state is left alone, so the answer is whether anything changed. An ended
+/// run has nothing to freeze.
+async fn set_hold(rows: &mut dyn Transaction, id: &str, hold: Option<control::Hold>) -> anyhow::Result<bool> {
+    use control::{ControlError, Entity};
+    let root =
+        find_run(rows, id).await?.ok_or_else(|| ControlError::NotFound { entity: Entity::Run, id: id.into() })?;
+    if root.run.ended_ms.is_some() {
+        return Ok(false);
+    }
+    let mut tree = vec![root];
+    let mut next = 0;
+    while next < tree.len() {
+        let parent = tree[next].run.admission.id.clone();
+        next += 1;
+        tree.extend(indexed_runs(rows, &partition("children", &parent), "", None, usize::MAX).await?);
+    }
+    let mut changed = false;
+    for mut s in tree {
+        if s.run.held.is_some() == hold.is_some() {
+            continue;
+        }
+        let before = indexes(&s);
+        s.run.held = hold.clone();
+        store_run_indexed(rows, &s, &before).await?;
+        changed = true;
+    }
+    Ok(changed)
+}
 async fn suspend(rows: &mut dyn Transaction, name: &str, defs: &mut Definitions) -> anyhow::Result<()> {
     let mut triggers = BTreeMap::new();
     let mut queues = BTreeMap::new();
@@ -2369,6 +2442,16 @@ async fn control_command(
             }
             Reply::Changed(changed)
         }
+        Command::Hold { run: id, note } => {
+            let hold = control::Hold {
+                actor: request.actor.clone(),
+                reason: request.reason.clone(),
+                note: note.clone(),
+                at_ms: now,
+            };
+            Reply::Changed(set_hold(rows, id, Some(hold)).await?)
+        }
+        Command::Release { run: id } => Reply::Changed(set_hold(rows, id, None).await?),
         Command::Stop { enabled } => {
             let changed = is_stopped(rows).await? != *enabled;
             if changed {
@@ -2520,7 +2603,11 @@ async fn control_command(
     put(rows, "control_command", &request.id, &entry).await?;
     let k = timed(now, &component(&request.id));
     put(rows, "control_history", &k, &entry).await?;
-    if let Command::Cancel { run } | Command::Respond { run, .. } = command {
+    if let Command::Cancel { run }
+    | Command::Respond { run, .. }
+    | Command::Hold { run, .. }
+    | Command::Release { run } = command
+    {
         put(rows, &partition("control_history_run", run), &k, &entry).await?;
     }
     Ok(reply)
