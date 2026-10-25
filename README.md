@@ -14,7 +14,7 @@ crates/
   ows/             DSL parser, validation, interpreter, schema and reference tests
   durable/         RunStore, lease Journal, storage adapters, conformance suite
     migrations/    versioned SQLite and Postgres SQL
-  runtime/         functions, versions, run driver, dry runs, replay, OpenTelemetry
+  runtime/         functions, versions, run driver, observers, dry runs, replay, OpenTelemetry
 examples/
   restart/         kill a worker, recover its run, verify one write
 ```
@@ -244,12 +244,17 @@ not a deterministic simulation; that is future work.
 
 The runtime uses the OpenTelemetry API only. Hosts inject a tracer
 (`Runtime::new`) and a meter (`Runtime::with_meter`; without one no metric is
-recorded) and configure export, flush and shutdown themselves.
+recorded) and configure export, flush and shutdown themselves. The spans and
+the run metrics below are made by the built-in OpenTelemetry observer from
+the runtime's events (Observers, below); `Runtime::without_telemetry` removes
+it.
 `--features otlp` exposes the optional OTLP exporter crate (traces and
 metrics); merely enabling it opens no connection.
 
 **Spans.** Each drive of a run opens `workflow <name>`, with a `task <path>`
-span per task and a `function <name>` span per call, attributed with
+span per task it enters and a `function <name>` span per call it dispatches
+(a task an earlier drive entered and this one resumes has no span in it;
+its calls hang under the root), attributed with
 `ouro.run.id`, `ouro.definition.name`, `ouro.definition.version`,
 `ouro.task.path`, `ouro.attempt` and `ouro.outcome`. A run admitted inside a
 span (the host's request, a parent run's call) pins that span's
@@ -352,6 +357,98 @@ Breaking changes (issue #20), for hosts and adapters written before it:
 - `RunStore` gains `beat` and `workers` (a store that keeps no heartbeats
   fails them, and with them `worker`).
 - A taken-over run's `wake_at_ms` is its previous lease's end.
+
+## Observers
+
+`Runtime::with_observer(Arc<dyn Observer>)` adds an observer of the
+runtime's events; several are called in the order they were added, after
+the built-in OpenTelemetry observer. An `ouro_runtime::Event` carries the
+run's id, its parent (an owned child's) and root, the definition and
+version, the task path (none for the run's own events), the span the
+OpenTelemetry observer opened for it (`SpanRef`, hex ids; for an admission,
+the span the run was admitted in), the runtime clock's time and its kind:
+
+| Kind | When |
+| --- | --- |
+| `run_admitted` | The commit that stores the run (`start`, a child, a schedule slot) |
+| `run_started`, `run_resumed` | An execution begins: the first, or one after an earlier one (a wake-up, a takeover, a recovery) |
+| `run_suspended`, `run_interrupted`, `run_ended` | The execution ends: waiting, without a terminal state, or with the run's end (`limit_exceeded` when its jump budget ended it) |
+| `task_entered`, `task_skipped` | A task is entered (its parent, kind and input) or its `if` is false |
+| `task_exited` | Its committed result (output or error), or, for this execution only, suspended or interrupted |
+| `switch_taken`, `jumped`, `retry_scheduled`, `timer_set` | A switch case; a `then` jump, granted or refused; a retry and its delay; a `wait` timer |
+| `call_started`, `call_finished` | A call's dispatch (function, delivery, attempt, arguments) and answer (outcome, result or error, annotations) |
+| `listening`, `event_consumed`, `event_emitted` | A listen waits; a task consumes an event (a listen's, a joined child's outcome); `emit` hands one over |
+| `breaker_tripped` | The definition's breaker tripped, once, when the worker hands the notice on |
+
+**Each fact once.** Replaying what an earlier execution recorded reports
+nothing: after a crash or a restart, the execution that takes the run over
+reports one `run_resumed` and goes on from there. A task an earlier
+execution entered is re-entered silently; restored calls, timers, retry
+decisions, jumps and consumed events, a switch case a re-entered task
+evaluates again and the listen position it waits at again are not
+reported. What the execution does is: a task it enters, every dispatch (a
+call left without an answer by the crash is dispatched again, at least
+once, and reported again), every exit it commits. A task suspended or
+interrupted in one execution reports that exit there and its final one in
+the execution that finishes it. `run_started` means the execution found no
+record of an earlier one, so it repeats only if an earlier execution ended
+before saving anything.
+
+**Delivery.** Events that follow a commit (a task's result, a call's saved
+answer, a timer, a retry decision, a jump, a consumed event, the run's end)
+are delivered after it, so a crash between the commit and its event loses
+the event and nothing delivers it later: at most once per fact. Each
+observer is called synchronously on the task that established the fact,
+under a panic guard: a panic ends only that call, and nothing an observer
+does reaches the run, whose only cost is the time the observer takes. An
+observer therefore returns promptly and never blocks; a slow or
+asynchronous sink sits behind `ouro_runtime::buffered(capacity)`, an
+observer whose `observe` is a clone and a non-blocking enqueue, with a
+`BufferedEvents` receiver the host drains on its own task (a full queue
+drops the event and counts it in `Buffered::dropped`; the order is kept).
+An observer sees one run's events in the order its execution produced
+them (concurrent branches interleave); runs are not ordered with each
+other. Dry runs and replays are not reported to the host's observers.
+
+**Payloads.** Inputs, outputs, arguments, results and events are copied
+only when the host has an observer, and left out (`None`) when their JSON
+exceeds `Config::event_payload_bytes` (16 KiB by default; 0 leaves every
+one out). The run's secrets are redacted from every value and error. A run
+cancelled while no execution holds it (an operator's or a parent's
+cancellation of a waiting run), a schedule slot the host refuses and a
+buffered slot the store promotes report nothing; the store has them
+(`Control::history`).
+
+```rust
+// A host's trace store, fed without slowing a run.
+let (observer, mut events) = ouro_runtime::buffered(10_000);
+let runtime = runtime.with_observer(observer.clone());
+// …in the host's task, beside `worker`:
+while let Some(event) = events.recv().await {
+    trace_store.append(serde_json::to_value(&event)?).await?; // the host's client
+}
+```
+
+Events are `Serialize`/`Deserialize` (`kind` is tagged by `type`), so a
+host can keep them as they are.
+
+Breaking changes (issue #26), for hosts written before it:
+
+- `ows::run::Event` is `#[non_exhaustive]` and reports facts: an execution
+  no longer reports `TaskStarted`, `SwitchCase` or `TaskRetrying` again
+  for what an earlier one did; `TaskCompleted` and `TaskFaulted` follow
+  the result's commit; a task dropped without an outcome is
+  `TaskInterrupted` (was `TaskFaulted`); `Jumped`, `Timer`, `CallStarted`,
+  `CallFinished`, `Listening`, `EventConsumed` and `EventEmitted` are new.
+- `Config` gains `event_payload_bytes`.
+- The OpenTelemetry spans follow the events: a drive opens no `task` span
+  for a task it resumed, and `ouro.step.duration` records only the tasks
+  a drive entered. `ouro.runs` no longer counts a run another worker ended
+  after this one lost its lease (that drive reports `run_interrupted`).
+  The run, step, call, breaker and budget metrics belong to the
+  OpenTelemetry observer; the schedule and backlog metrics stay with the
+  meter.
+- A drive reads the run's records before its start check.
 
 ## Operator control
 
