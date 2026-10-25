@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/ows", "crates/durable", "crates/runtime", "examples/restart"]
+members = ["crates/ows", "crates/durable", "crates/runtime", "examples/restart", "examples/quickstart"]
 
 [profile.dev]
 debug = "line-tables-only"
