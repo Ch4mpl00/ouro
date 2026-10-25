@@ -24,7 +24,7 @@ Two mutants cover the new rule (`L7/order`: a firing that does not drain first,
 
 `spec/contract_temporal.py` (native Apalache 0.62.4 server, TLC from the same
 jar on a portable JDK 21, three TLC processes of two workers; not the Docker
-stage `check.sh --only temporal`), all three quotients, all 33 variants met
+stage `check.sh --only temporal`), all three quotients, all 32 variants met
 their targets; 451.7 s wall. Trigger quotient: 824,475 generated / 41,920
 distinct states, depth 22. Baseline holds every property; mutants `L7`,
 `L7/capacity`, `L7/stop`, `L7/order`, `L7/order/start` violate L7 (`L7/order`
