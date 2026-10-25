@@ -171,6 +171,14 @@ module contract_witnesses {
   run queuedRefusalTest = queuedRefusal.expect(checked and m.db.admissions == [1,1,0] and
     m.db.runs.nth(1).outcome == 2 and m.db.runs.nth(1).input == 7 and m.db.catalog.tripped and
     m.db.catalog.faults == 2 and m.db.catalog.notices == [1] and m.db.catalog.queued == -1)
+  // An operation that targets the buffered slot's run id but is refused admits
+  // nothing: the promotion still counts its refusal.
+  action queuedTargeted = init.then(execute("policy",0,0,1,2,0)).then(ticks(2)).then(do("fire"))
+    .then(ticks(2)).then(execute("refuse",1,0,0,7,0)).then(do("crash")).then(execute("admit",1,0,0,1,9))
+    .then(do("claim")).then(execute("finish",0,0,0,1,0))
+  run queuedTargetedTest = queuedTargeted.expect(checked and m.db.admissions == [1,1,0] and
+    m.db.runs.nth(1).outcome == 2 and m.db.runs.nth(1).input == 7 and m.db.catalog.tripped and
+    m.db.catalog.faults == 2 and m.db.catalog.notices == [1] and m.db.catalog.queued == -1)
   // Stop blocks claim, admission, child admission and a due firing, then
   // clearing it permits the same run and slot to progress.
   action emergencyStop = init.then(do("admit")).then(execute("stop",0,0,0,1,0))
@@ -269,11 +277,15 @@ module contract_witnesses {
   run resumeKeepsTripTest = resumeKeepsTrip.expect(checked and m.db.catalog.tripped and not(m.db.catalog.manual))
   // Every history above in one trace (each starts with init), replayed
   // against the stores by crates/durable/tests/quint.rs.
+  // The tail of the suite, a run of its own: a single chain this long exceeds
+  // the evaluator's recursion limit.
+  run bridgeTail = emergencyStop.then(clearStop).then(stoppedQueue).then(resumedQueue).then(oneShot).then(oneShotBusy)
+    .then(pinnedAdmitted).then(sameContentRefused).then(pinnedUncounted).then(heldReleased).then(heldDispatched)
+    .then(heldChild).then(heldCancelled).then(heldClaimed).then(resumed).then(pauseActivated).then(resumeKeepsTrip)
   run bridgeSuite = continuation.then(unknown).then(mailbox).then(expiry).then(child).then(childFinish).then(grandchild).then(activation)
     .then(deadline).then(compatibility).then(dry).then(replay).then(schedule).then(breaker).then(rearm)
     .then(noCatchup).then(overlap).then(ingress).then(ingressExpiry).then(redispatch).then(protectedUnknown)
     .then(notExecuted).then(errorResponse).then(conflict).then(release).then(staleFence).then(admission)
-    .then(successResetsBreaker).then(noRollback).then(reactivation).then(broadcast).then(retention).then(budget).then(skipPolicy).then(allowPolicy).then(queuePolicy).then(replacePolicy).then(ceilingPolicy).then(skipCrash).then(allowCrash).then(queueCrash).then(replaceCrash).then(refused).then(oldCompletionPromotes).then(queuedRefusal).then(emergencyStop).then(clearStop).then(stoppedQueue).then(resumedQueue).then(oneShot).then(oneShotBusy).then(pinnedAdmitted).then(sameContentRefused).then(pinnedUncounted)
-    .then(heldReleased).then(heldDispatched).then(heldChild).then(heldCancelled).then(heldClaimed).then(resumed)
-    .then(pauseActivated).then(resumeKeepsTrip)
+    .then(successResetsBreaker).then(noRollback).then(reactivation).then(broadcast).then(retention).then(budget).then(skipPolicy).then(allowPolicy).then(queuePolicy).then(replacePolicy).then(ceilingPolicy).then(skipCrash).then(allowCrash).then(queueCrash).then(replaceCrash).then(refused).then(oldCompletionPromotes).then(queuedRefusal).then(queuedTargeted)
+    .then(bridgeTail)
 }

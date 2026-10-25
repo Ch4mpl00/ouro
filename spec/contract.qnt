@@ -45,7 +45,9 @@ module contract {
   type Observation = { op: str, execution: int, invocation: int, value: int, result: int }
   type Machine = { db: Durable, workers: List[Local], now: int,
     sends: List[List[int]], observations: List[Observation],
-    violations: Set[str], faultsSeen: Set[int] }
+    violations: Set[str], faultsSeen: Set[int],
+    // The run id a buffered slot promoted in the latest transition (-1: none).
+    promoted: int }
   pure val emptyRun: Run = { admitted: false, input: 0, version: 0, epoch: 0, app: 0, mode: 0,
     outcome: 0, ended: -1, deadline: -1, owner: -1, generation: 0, lease: -1,
     records: [0,0,0], values: [0,0,0], frontier: Set(), continuation: 0,
@@ -56,7 +58,7 @@ module contract {
       faults: 0, tripped: false, manual: false, trippedDigest: 0, triggerEpoch: 1, due: 2, slot: 0, running: -1, catchup: 0, rearm:false, once:false,
       armed: true, notices: [], overlap:0, maxRuns:2, queued:-1, queueSlot:-1, queueInput:0, queueRefused:false } }
   pure val initial: Machine = { db: initialDb, workers: [emptyLocal,emptyLocal], now: 0,
-    sends: [[0,0,0],[0,0,0],[0,0,0]], observations: [], violations: Set(), faultsSeen: Set() }
+    sends: [[0,0,0],[0,0,0],[0,0,0]], observations: [], violations: Set(), faultsSeen: Set(), promoted: -1 }
   var m: Machine
   // The command just executed and its choices, for the model-based tests.
   type Command = { r: int, w: int, i: int, value: int, fault: int }
@@ -109,7 +111,7 @@ module contract {
       fired:if (fresh) admitted.db.fired.union(Set((c.epoch,c.queueSlot))) else admitted.db.fired,
       catalog:{ ...c,queued:-1,queueSlot:-1,running:if (fresh) c.queued else c.running } } } else admitted
     val ended = if (fresh and c.queueRefused) refuseRun(promoted,c.queued,0) else promoted
-    { ...ended, db: { ...ended.db, budget: Runs.fold(ended.db.budget,(a,k) =>
+    { ...ended, promoted:if (fresh) c.queued else -1, db: { ...ended.db, budget: Runs.fold(ended.db.budget,(a,k) =>
       if (ended.db.runs.nth(k).outcome != 0 and ended.db.runs.nth(k).parent < 0) a.replaceAt(k,0) else a) } }
   }
   pure def update(s: Machine, r: int, execution: Run): Machine =
@@ -473,10 +475,11 @@ module contract {
     val queueStable = c.queued < 0 or d.queued < 0 or
       (c.queued == d.queued and c.queueSlot == d.queueSlot and c.queueInput == d.queueInput and c.queueRefused == d.queueRefused)
     // A buffered slot's run id may also be admitted directly by the operation
-    // itself (the model has three run ids): that is no promotion, and the
-    // promotion monitors below do not apply to it.
-    val admittedByOp = c.queued >= 0 and ((Set("admit","dry","replay","pin","ingress","fire","refuse").contains(op) and r == c.queued) or
-      (op == "child" and r+1 == c.queued))
+    // itself (the model has three run ids): that is no promotion. Excused only
+    // when the operation's own transition admits that id; an operation that
+    // targets it and is refused is checked like any other.
+    val admittedByOp = c.queued >= 0 and not(b.db.runs.nth(c.queued).admitted) and
+      a.db.runs.nth(c.queued).admitted and a.promoted != c.queued
     val queueReady = not(a.db.stopped) and c.queued >= 0 and not(admittedByOp) and not(b.db.runs.nth(c.queued).admitted) and d.armed and not(d.tripped) and
       op != "activate" and not(Runs.exists(k => k != c.queued and live(a.db.runs.nth(k)) and a.db.runs.nth(k).scheduled)) and
       Runs.filter(k => k != c.queued and live(a.db.runs.nth(k))).size() < c.maxRuns
