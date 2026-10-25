@@ -134,7 +134,9 @@ async fn run(rows: &mut dyn Transaction, id: &str) -> anyhow::Result<StoredRun> 
 /// 5: each version's content digest, and the digest a trip refuses by.
 /// 6: whether the breaker tripped (`Trip::breaker`), so a pause can stand on
 /// top of a breaker's trip and `resume` lift only the pause.
-const DEFINITIONS_VERSION: u64 = 6;
+/// 7: the stored YAML keeps the engine's extensions under `metadata.ouro`;
+/// layout 6 read with this parser would lose them.
+const DEFINITIONS_VERSION: u64 = 7;
 async fn load_definitions(rows: &mut dyn Transaction, name: &str) -> anyhow::Result<Option<Definitions>> {
     let Some(value) = rows.get("definitions", name).await? else { return Ok(None) };
     Ok(Some(decode_definitions(name, value)?))

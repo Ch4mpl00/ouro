@@ -380,7 +380,7 @@ async fn delivery_is_declared_per_function() {
     for (name, task) in [
         ("default", "  - post: { call: post }"),
         ("declared", "  - send: { call: send }"),
-        ("tightened", "  - post: { call: post, metadata: { delivery: at_most_once } }"),
+        ("tightened", "  - post: { call: post, metadata: { ouro: { delivery: at_most_once } } }"),
     ] {
         let d = rt.save(name, &yaml(task)).await.unwrap();
         rt.activate(name, d.version).await.unwrap();
@@ -1054,7 +1054,7 @@ async fn invalid_definitions_and_event_schedules_are_refused_per_definition() {
     };
     save_as(
         "bounded",
-        "document: { dsl: '1.0.4', namespace: test, name: bounded, version: '1.0.0', metadata: { limits: { max_jumps: 30 } } }\nschedule: { every: PT1S }\ndo:\n  - ok: { set: { ok: true } }\n",
+        "document: { dsl: '1.0.4', namespace: test, name: bounded, version: '1.0.0', metadata: { ouro: { limits: { max_jumps: 30 } } } }\nschedule: { every: PT1S }\ndo:\n  - ok: { set: { ok: true } }\n",
     ).await;
     save_as(
         "orders",
@@ -1244,7 +1244,7 @@ async fn control_lists_a_one_shot_with_its_instant_until_it_fires() {
     let clock = Arc::new(Time::default());
     let rt = runtime(Arc::new(durable::sqlite::open(&path).unwrap()), Registry::new(), clock.clone());
     let definition = yaml("  - done: { set: { ok: true } }")
-        .replace("version: '1.0.0'", "version: '1.0.0', metadata: { at: '1970-01-01T00:00:05Z' }");
+        .replace("version: '1.0.0'", "version: '1.0.0', metadata: { ouro: { at: '1970-01-01T00:00:05Z' } }");
     save(&rt, &definition).await;
     let control = Control::new(Arc::new(durable::sqlite::open(&path).unwrap()), clock.clone());
     let due = |summary: ouro_runtime::control::DefinitionSummary| {
@@ -1264,7 +1264,7 @@ async fn store_only_control_lists_definition_schedules_and_suspended_slots() {
     let clock = Arc::new(Time::default());
     let rt = runtime(Arc::new(durable::sqlite::open(&path).unwrap()), Registry::new(), clock.clone());
     let definition = yaml("  - wait: { wait: PT1H }")
-        .replace("version: '1.0.0'", "version: '1.0.0', metadata: { overlap: queue }")
+        .replace("version: '1.0.0'", "version: '1.0.0', metadata: { ouro: { overlap: queue } }")
         .replace("\ndo:", "\nschedule: { every: PT1S, after: PT2S, on: { one: { with: { type: start } } } }\ndo:");
     save(&rt, &definition).await;
     let control = Control::new(Arc::new(durable::sqlite::open(&path).unwrap()), clock.clone());

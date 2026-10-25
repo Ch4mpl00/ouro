@@ -163,7 +163,7 @@ pub trait Functions: Send + Sync {
     }
     async fn call(&self, name: &str, args: Value, info: &CallInfo<'_>) -> Result<Value, WorkflowError>;
     /// Whether this invocation is at most once whatever its task says: the
-    /// function's declared delivery. A task's `metadata.delivery` can only
+    /// function's declared delivery. A task's `metadata.ouro.delivery` can only
     /// tighten it.
     fn at_most_once(&self, _name: &str, _args: &Value) -> bool {
         false
@@ -497,7 +497,7 @@ pub fn validate(wf: &Workflow, functions: &dyn Functions) -> Result<(), Invalid>
 pub fn validate_limits(wf: &Workflow, limits: &Limits) -> Result<(), Invalid> {
     match wf.budget.max_jumps {
         Some(n) if n > limits.max_jumps => Err(Invalid(vec![Problem {
-            at: "/document/metadata/limits/max_jumps".into(),
+            at: "/document/metadata/ouro/limits/max_jumps".into(),
             message: format!("{n} is above this host's ceiling of {} jumps", limits.max_jumps),
         }])),
         _ => Ok(()),
@@ -3520,7 +3520,7 @@ do:
 
     fn limited(on_exceeded: &str, max: u64) -> String {
         format!(
-            "document: {{ dsl: '1.0.4', namespace: test, name: w, version: '0.1.0', metadata: {{ limits: {{ max_jumps: {max}{on_exceeded} }} }} }}\n{LOOP}"
+            "document: {{ dsl: '1.0.4', namespace: test, name: w, version: '0.1.0', metadata: {{ ouro: {{ limits: {{ max_jumps: {max}{on_exceeded} }} }} }} }}\n{LOOP}"
         )
     }
 
@@ -3596,7 +3596,7 @@ do:
         assert!(validate_limits(&wf, &Limits::default()).is_ok());
         let wf = model::parse_yaml(&limited("", 101)).unwrap();
         let e = validate_limits(&wf, &Limits::default()).unwrap_err().to_string();
-        assert!(e.contains("/document/metadata/limits/max_jumps") && e.contains("ceiling of 100"), "{e}");
+        assert!(e.contains("/document/metadata/ouro/limits/max_jumps") && e.contains("ceiling of 100"), "{e}");
     }
 
     #[tokio::test]

@@ -429,7 +429,7 @@ async fn the_runtime_records_run_step_call_schedule_breaker_and_budget_metrics()
     // A loop that ends through its jump budget.
     save(
         "loop",
-        "document: { dsl: '1.0.4', namespace: test, name: loop, version: '1.0.0', metadata: { limits: { max_jumps: 3, on_exceeded: end } } }\ndo:\n  - tick: { call: noop }\n  - again: { switch: [ { stop: { when: '${ false }', then: exit } }, { more: { then: tick } } ] }\n",
+        "document: { dsl: '1.0.4', namespace: test, name: loop, version: '1.0.0', metadata: { ouro: { limits: { max_jumps: 3, on_exceeded: end } } } }\ndo:\n  - tick: { call: noop }\n  - again: { switch: [ { stop: { when: '${ false }', then: exit } }, { more: { then: tick } } ] }\n",
     )
     .await;
     rt.start("loop", "loop", json!({})).await.unwrap();
@@ -439,7 +439,7 @@ async fn the_runtime_records_run_step_call_schedule_breaker_and_budget_metrics()
     // `catchup: none`.
     let every = |name: &str, metadata: &str| {
         format!(
-            "document: {{ dsl: '1.0.4', namespace: test, name: {name}, version: '1.0.0', metadata: {{ {metadata} }} }}\nschedule: {{ every: PT1S }}\ndo:\n  - hold: {{ wait: PT1H }}\n"
+            "document: {{ dsl: '1.0.4', namespace: test, name: {name}, version: '1.0.0', metadata: {{ ouro: {{ {metadata} }} }} }}\nschedule: {{ every: PT1S }}\ndo:\n  - hold: {{ wait: PT1H }}\n"
         )
     };
     save("ticking", &every("ticking", "overlap: skip")).await;

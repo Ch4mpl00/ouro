@@ -266,7 +266,7 @@ async fn at_most_once_never_dispatches_twice_at_any_crash_boundary() {
   - loop:
       for: { in: [1, 2, 3] }
       do:
-        - send: { call: echo, metadata: { delivery: at_most_once } }
+        - send: { call: echo, metadata: { ouro: { delivery: at_most_once } } }
 "#,
     );
     for after_commit in [false, true] {
@@ -295,7 +295,7 @@ async fn unknown_bypasses_catch_but_proven_non_dispatch_can_retry() {
         let wf = workflow(&format!(
             r#"do:
   - guarded:
-      try: [ {{ send: {{ call: {name}, metadata: {{ delivery: at_most_once }} }} }} ]
+      try: [ {{ send: {{ call: {name}, metadata: {{ ouro: {{ delivery: at_most_once }} }} }} }} ]
       catch:
         retry: {{ limit: {{ attempt: {{ count: 3 }} }} }}
         do: [ {{ fallback: {{ call: echo }} }} ]
@@ -347,7 +347,7 @@ async fn an_interrupted_call_is_not_recorded_and_is_called_again_on_resume() {
 
 #[tokio::test]
 async fn an_interrupted_at_most_once_call_is_an_unknown_outcome() {
-    let wf = workflow("do: [ { send: { call: stopped, metadata: { delivery: at_most_once } } } ]");
+    let wf = workflow("do: [ { send: { call: stopped, metadata: { ouro: { delivery: at_most_once } } } } ]");
     let world = Arc::new(World::default());
     let time = Arc::new(Time(AtomicI64::new(1_000)));
     let result = drive(&host(world.clone(), time.clone()), &time, &wf, &Store::default()).await;
@@ -408,7 +408,7 @@ async fn then_visits_keep_their_identity_across_durable_waits() {
     let wf = workflow(
         r#"do:
   - init: { set: { n: 0 } }
-  - send: { call: echo, with: { n: '${ .n + 1 }' }, metadata: { delivery: at_most_once } }
+  - send: { call: echo, with: { n: '${ .n + 1 }' }, metadata: { ouro: { delivery: at_most_once } } }
   - wait: { wait: PT0.001S }
   - again: { switch: [ { more: { when: '.n < 3', then: send } }, { done: { then: end } } ] }
 "#,
@@ -438,7 +438,8 @@ async fn saved_call_response_is_reused_when_the_tool_disappears_before_task_comm
             panic!("must use saved response")
         }
     }
-    let wf = workflow("do: [ { send: { call: echo, with: { n: 7 }, metadata: { delivery: at_most_once } } } ]");
+    let wf =
+        workflow("do: [ { send: { call: echo, with: { n: 7 }, metadata: { ouro: { delivery: at_most_once } } } } ]");
     // execution, task start, intent, response, then crash before task commit.
     let store = Store { fail_at: AtomicUsize::new(5), ..Default::default() };
     let time = Arc::new(Time(AtomicI64::new(1_000)));
@@ -458,9 +459,9 @@ fn delivery_is_validated_as_call_metadata() {
             "document: {{ dsl: '1.0.4', namespace: t, name: w, version: '0.1.0' }}\ndo: [ {{ t: {task} }} ]"
         ))
     };
-    assert!(parse("{ call: echo, metadata: { delivery: at_most_once } }").is_ok());
-    assert!(parse("{ call: echo, metadata: { delivery: exactly_once } }").is_err());
-    assert!(parse("{ set: { x: 1 }, metadata: { delivery: at_most_once } }").is_err());
+    assert!(parse("{ call: echo, metadata: { ouro: { delivery: at_most_once } } }").is_ok());
+    assert!(parse("{ call: echo, metadata: { ouro: { delivery: exactly_once } } }").is_err());
+    assert!(parse("{ set: { x: 1 }, metadata: { ouro: { delivery: at_most_once } } }").is_err());
 }
 
 #[tokio::test(start_paused = true)]
@@ -479,7 +480,7 @@ async fn a_timeout_cannot_turn_an_unknown_dispatch_into_a_catchable_retry() {
     let wf = workflow(
         r#"do:
   - guarded:
-      try: [ { send: { call: slow, timeout: { after: PT0.001S }, metadata: { delivery: at_most_once } } } ]
+      try: [ { send: { call: slow, timeout: { after: PT0.001S }, metadata: { ouro: { delivery: at_most_once } } } } ]
       catch: { retry: { limit: { attempt: { count: 5 } } }, do: [ { fallback: { set: { fallback: true } } } ] }
 "#,
     );
@@ -660,7 +661,7 @@ fn delivery_policies(value: &mut Value, policies: &[bool], index: &mut usize) {
         Value::Object(object) => {
             if object.get("call").and_then(Value::as_str).is_some_and(|name| support::program::HOST.contains(&name)) {
                 let policy = if policies[*index % policies.len()] { "at_most_once" } else { "at_least_once" };
-                object.insert("metadata".into(), json!({"delivery":policy}));
+                object.insert("metadata".into(), json!({"ouro":{"delivery":policy}}));
                 *index += 1;
             }
             for child in object.values_mut() {
@@ -1045,8 +1046,8 @@ async fn nested_retries_reuse_a_write_the_inner_retry_got_through() {
 
 #[tokio::test]
 async fn an_at_most_once_write_that_succeeded_no_longer_blocks_the_retry() {
-    let body =
-        SEND_THEN_CHECK.replace("with: { text: hi },", "with: { text: hi }, metadata: { delivery: at_most_once },");
+    let body = SEND_THEN_CHECK
+        .replace("with: { text: hi },", "with: { text: hi }, metadata: { ouro: { delivery: at_most_once } },");
     for delay in DELAYS {
         let tools = Tools::new(check_fails_once);
         let status = retried(&tools, &body, delay).await;
@@ -1061,7 +1062,7 @@ async fn an_at_most_once_write_the_tool_rejected_is_not_retried() {
     let body = r#"
 do:
   - guard:
-      try: [ { send: { call: send, with: { text: hi }, metadata: { delivery: at_most_once } } } ]
+      try: [ { send: { call: send, with: { text: hi }, metadata: { ouro: { delivery: at_most_once } } } } ]
       catch:
         retry: { delay: DELAY, limit: { attempt: { count: 3 } } }
         do: [ { handled: { set: { handled: true } } } ]
@@ -1092,7 +1093,9 @@ async fn an_ephemeral_run_still_never_retries_an_attempt_that_wrote() {
 // the run always completes.
 #[tokio::test]
 async fn retried_writes_survive_a_crash_at_every_checkpoint() {
-    for (delivery, extra) in [("at_most_once", ", metadata: { delivery: at_most_once }"), ("at_least_once", "")] {
+    for (delivery, extra) in
+        [("at_most_once", ", metadata: { ouro: { delivery: at_most_once } }"), ("at_least_once", "")]
+    {
         let mut body = NESTED.replace("with: { text: hi } }", &format!("with: {{ text: hi }}{extra} }}"));
         let function = if delivery == "at_least_once" { "post" } else { "send" };
         body = body.replace("call: send", &format!("call: {function}"));
@@ -1175,7 +1178,7 @@ fn dispatch_host(functions: Arc<Dispatch>, time: Arc<Time>) -> Host {
 const ROUND: &str = r#"do:
   - round:
       for: { each: call, in: [ read, send, read ] }
-      metadata: { concurrency: 3 }
+      metadata: { ouro: { concurrency: 3 } }
       do:
         - one: { call: tool, with: { name: '${ $call }' } }
 "#;
@@ -1227,7 +1230,7 @@ async fn a_concurrent_for_runs_its_iterations_at_once_on_its_input() {
   - init: { set: { base: 10 }, export: { as: '${ . }' } }
   - round:
       for: { each: n, in: [ 3, 1, 2 ] }
-      metadata: { concurrency: 2 }
+      metadata: { ouro: { concurrency: 2 } }
       do:
         - echo: { call: slow, with: { v: '${ $n + .base }' }, export: { as: '${ { leaked: true } }' } }
   - after: { set: { round: '${ . }', context: '${ $context }' } }
@@ -1258,10 +1261,10 @@ fn concurrency_is_validated_as_for_metadata() {
         ))
     };
     let each = "for: { in: [1] }, do: [ { e: { call: echo } } ]";
-    assert!(parse(&format!("{{ {each}, metadata: {{ concurrency: 4 }} }}")).is_ok());
-    assert!(parse(&format!("{{ {each}, metadata: {{ concurrency: 0 }} }}")).is_err());
-    assert!(parse(&format!("{{ {each}, while: '.go', metadata: {{ concurrency: 2 }} }}")).is_err());
-    assert!(parse("{ call: echo, metadata: { concurrency: 2 } }").is_err());
+    assert!(parse(&format!("{{ {each}, metadata: {{ ouro: {{ concurrency: 4 }} }} }}")).is_ok());
+    assert!(parse(&format!("{{ {each}, metadata: {{ ouro: {{ concurrency: 0 }} }} }}")).is_err());
+    assert!(parse(&format!("{{ {each}, while: '.go', metadata: {{ ouro: {{ concurrency: 2 }} }} }}")).is_err());
+    assert!(parse("{ call: echo, metadata: { ouro: { concurrency: 2 } } }").is_err());
 }
 
 // The event adapter shares the journal transaction: a crash can occur after
@@ -1422,9 +1425,9 @@ async fn ephemeral_listen_consumes_an_available_event_but_never_waits() {
 fn listen_hold_requires_a_literal_duration_on_a_listen() {
     for hold in ["wrong", "42", "'${ .delay }'", "{}"] {
         let yaml = format!(
-            "document: {{ dsl: '1.0.4', namespace: t, name: w, version: '0.1.0' }}\ndo: [ {{ w: {{ listen: {{ to: {{ one: {{ with: {{ type: x }} }} }} }}, metadata: {{ hold: {hold} }} }} }} ]"
+            "document: {{ dsl: '1.0.4', namespace: t, name: w, version: '0.1.0' }}\ndo: [ {{ w: {{ listen: {{ to: {{ one: {{ with: {{ type: x }} }} }} }}, metadata: {{ ouro: {{ hold: {hold} }} }} }} }} ]"
         );
-        assert!(model::parse_yaml(&yaml).unwrap_err().to_string().contains("metadata/hold"));
+        assert!(model::parse_yaml(&yaml).unwrap_err().to_string().contains("metadata/ouro/hold"));
     }
 }
 
@@ -1437,7 +1440,7 @@ async fn listen_holds_until_delivery_or_the_shorter_deadline_and_replays_a_crash
         let h = event_host(inbox.clone(), time);
         let timeout = if mode == "timeout" { ", timeout: { after: PT0.02S }" } else { "" };
         let wf = workflow(&format!(
-            "do: [ {{ w: {{ listen: {{ to: {{ one: {{ with: {{ type: x }} }} }}, read: envelope }}, metadata: {{ hold: PT0.1S }}{timeout} }} }} ]"
+            "do: [ {{ w: {{ listen: {{ to: {{ one: {{ with: {{ type: x }} }} }}, read: envelope }}, metadata: {{ ouro: {{ hold: PT0.1S }} }}{timeout} }} }} ]"
         ));
         let token = CancellationToken::new();
         let mut future = Box::pin(run::resume(&h, &wf, "run", json!({}), &token, &*inbox.journal));
@@ -1478,7 +1481,7 @@ async fn listen_holds_until_delivery_or_the_shorter_deadline_and_replays_a_crash
 async fn a_listen_ceiling_takes_a_delivered_event_or_fires_the_timeout_at_once() {
     use std::time::Duration;
     let wf = workflow(
-        "do:\n - t:\n     try: [ { w: { listen: { to: { one: { with: { type: x } } }, read: envelope }, metadata: { hold: PT5S }, timeout: { after: PT24H } } } ]\n     catch: { errors: { with: { status: 408 } }, do: [ { expired: { set: { expired: true } } } ] }\n",
+        "do:\n - t:\n     try: [ { w: { listen: { to: { one: { with: { type: x } } }, read: envelope }, metadata: { ouro: { hold: PT5S } }, timeout: { after: PT24H } } } ]\n     catch: { errors: { with: { status: 408 } }, do: [ { expired: { set: { expired: true } } } ] }\n",
     );
     for early in [true, false] {
         let inbox = Arc::new(Inbox::default());
@@ -1770,7 +1773,7 @@ fn generated_jump_budgets_end_every_run_within_the_budget_across_crashes() {
             if !on_exceeded.is_null() {
                 limits["on_exceeded"] = on_exceeded;
             }
-            definition["document"]["metadata"] = json!({ "limits": limits });
+            definition["document"]["metadata"] = json!({ "ouro": { "limits": limits } });
             let wf = model::parse(definition).map_err(|e| TestCaseError::fail(e.to_string()))?;
             run::validate(&wf, &support::host::Known).map_err(|e| TestCaseError::fail(e.to_string()))?;
             let (baseline, exceeded, records) = budgeted(&wf, input.clone(), &[]).map_err(TestCaseError::fail)?;
@@ -2143,7 +2146,7 @@ async fn a_not_executed_answer_is_restored_on_recovery_and_retried_only_by_a_new
         r#"do:
   - checked:
       try:
-        - check: { call: check, metadata: { delivery: at_most_once } }
+        - check: { call: check, metadata: { ouro: { delivery: at_most_once } } }
       catch:
         errors: { with: { type: urn:ouro:errors:call.not_executed } }
         retry: { limit: { attempt: { count: 2 } } }

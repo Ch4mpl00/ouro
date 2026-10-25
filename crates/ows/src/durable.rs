@@ -65,7 +65,7 @@
 //!    third-party functions without requiring service changes. Every call
 //!    defaults to `at least once`; `at most once` is declared by the function
 //!    (`Functions::at_most_once`) and a task may tighten it
-//!    (`metadata.delivery`), never loosen it. This is no external exactly-once
+//!    (`metadata.ouro.delivery`), never loosen it. This is no external exactly-once
 //!    guarantee and does not require a host-side idempotency guard.
 //! 10. `At least once`: durably save the received result before using it. Without
 //!     a saved result, recovery may resend the call, so effects can be duplicated.
@@ -191,7 +191,10 @@ use std::collections::BTreeMap;
 /// 13: an unknown at-most-once outcome is `CALL_UNKNOWN`, which a `catch`
 /// naming that type handles, and recovery returns a saved not-executed
 /// answer instead of sending the call again (record formats unchanged).
-pub const VERSION: u32 = 13;
+/// 14: the engine's extensions are read from `metadata.ouro`, not from the
+/// flat `metadata` keys (record formats unchanged; a stored definition or
+/// admitted run of 13 would lose its settings).
+pub const VERSION: u32 = 14;
 
 /// The key of a run's `Record::Exceeded`.
 pub const EXCEEDED: &str = "exceeded";

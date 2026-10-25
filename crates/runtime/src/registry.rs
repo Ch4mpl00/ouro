@@ -129,7 +129,7 @@ pub struct Function {
     /// unknown after a crash may be dispatched again under the same
     /// idempotency key. A function that must not be repeated (sending a
     /// message, charging a card) declares `AtMostOnce`; a call in YAML may
-    /// tighten it (`metadata.delivery: at_most_once`), never loosen it.
+    /// tighten it (`metadata.ouro.delivery: at_most_once`), never loosen it.
     pub delivery: Delivery,
     pub handler: Arc<dyn Handler>,
 }

@@ -12,14 +12,14 @@
 // section 7), wait;
 // input/output/export transforms and schemas (inline or a host-resolved
 // `resource`); if/then/timeout; schedule (every, cron, after, on; extensions
-// in `document.metadata`: `at`, a one-shot instant; `timezone`, the IANA zone
+// in `document.metadata.ouro`: `at`, a one-shot instant; `timezone`, the IANA zone
 // of `cron`; `catchup` for missed slots: `latest` | `none`; `overlap`:
 // `skip` | `allow` | `queue` | `replace`);
 // use.functions/errors/retries/timeouts/extensions/secrets; evaluate (jq,
 // strict). Runtime arguments: $context, $input, $output, $task, $workflow,
 // $runtime, $run (an extension: jump and visit counts, the trigger's slot), and $secrets in
 // `input.from` only. The jump budget's tightening and its `on_exceeded`
-// handling live in `document.metadata.limits` (an extension).
+// handling live in `document.metadata.ouro.limits` (an extension).
 //
 // Not the core's, rejected here: use.authentications and use.catalogs
 // (protocol functions and packs carry credentials and resolve their own
@@ -45,14 +45,14 @@ pub struct Workflow {
     pub timeout: Option<DurationSpec>,
     /// When a host's scheduler starts runs; the interpreter ignores it.
     pub schedule: Option<Schedule>,
-    /// `document.metadata.limits`: a tighter jump budget, and what happens
+    /// `document.metadata.ouro.limits`: a tighter jump budget, and what happens
     /// when it runs out.
     pub budget: Budget,
     /// The definition as parsed, exposed as `$workflow.definition`.
     pub definition: Value,
 }
 
-/// `document.metadata.limits` (an extension: the OWS document admits no other
+/// `document.metadata.ouro.limits` (an extension: the OWS document admits no other
 /// property, and `metadata` is free-form). Only jumps to a named task count
 /// (`then: <task>` on a task, a switch case or a catch): `for` is bounded by
 /// its collection and `retry` by its attempts. The host's ceiling
@@ -136,15 +136,15 @@ pub struct Schedule {
     pub after: Option<Duration>,
     pub on: Option<Strategy>,
     pub read: Read,
-    /// `document.metadata.at` (an extension): the instant of a one-shot
+    /// `document.metadata.ouro.at` (an extension): the instant of a one-shot
     /// schedule, in epoch milliseconds. It is a schedule of its own: the
     /// official `schedule` object has no such property, so it never combines
     /// with `every`, `cron`, `after` or `on`.
     pub at: Option<i64>,
-    /// `document.metadata.timezone` (an extension): the IANA zone `cron` is
+    /// `document.metadata.ouro.timezone` (an extension): the IANA zone `cron` is
     /// evaluated in. `None`: UTC.
     pub timezone: Option<chrono_tz::Tz>,
-    /// `document.metadata.catchup` (an extension): what becomes of `every`
+    /// `document.metadata.ouro.catchup` (an extension): what becomes of `every`
     /// and `cron` slots missed while no scheduler ran.
     pub catchup: Catchup,
     /// How a slot overlaps unfinished runs of this trigger.
@@ -291,7 +291,7 @@ pub enum Kind {
         with: Option<Value>,
     },
     Do(TaskList),
-    /// `concurrency` (`metadata.concurrency`, an extension): iterations run
+    /// `concurrency` (`metadata.ouro.concurrency`, an extension): iterations run
     /// at once, at most that many, each on the `for`'s input and a copy of
     /// the context; the output is their outputs in item order.
     For {
@@ -498,6 +498,10 @@ fn problem(at: &str, message: impl Into<String>) -> Problem {
     Problem { at: at.to_string(), message: message.into() }
 }
 
+/// The keys of `document.metadata.ouro` and of a task's `metadata.ouro`: the
+/// engine's extensions, the only members of `metadata` it reads.
+const DOCUMENT_EXTENSIONS: &[&str] = &["limits", "at", "timezone", "catchup", "overlap"];
+const TASK_EXTENSIONS: &[&str] = &["delivery", "concurrency", "hold"];
 const COMMON: &[&str] = &["if", "input", "output", "export", "timeout", "then", "metadata"];
 
 #[derive(Default)]
@@ -521,6 +525,17 @@ impl Parser {
                 None
             }
         }
+    }
+
+    /// The engine's extensions in an owner's `metadata`: its `ouro` object,
+    /// checked against the keys known at that level. The rest of `metadata`
+    /// belongs to the host and is never read. `at` is the pointer of the
+    /// owner; `None` when there is no (valid) `ouro` object.
+    fn ouro<'v>(&mut self, owner: &'v Map<String, Value>, at: &str, known: &[&str]) -> Option<&'v Map<String, Value>> {
+        let ouro = owner.get("metadata")?.as_object()?.get("ouro")?;
+        let ouro = self.object(ouro, &format!("{at}/metadata/ouro"))?;
+        self.only(ouro, &format!("{at}/metadata/ouro"), known);
+        Some(ouro)
     }
 
     fn only(&mut self, m: &Map<String, Value>, at: &str, allowed: &[&str]) {
@@ -607,12 +622,17 @@ impl Parser {
         let mut schedule = m.get("schedule").and_then(|s| self.schedule(s));
         // CHOICE: the OWS `schedule` object admits no extra property, so the
         // extensions of a schedule (its time zone, a one-shot instant, the
-        // missed-slot and overlap policies) are the document's metadata.
-        let metadata = |key: &str| m.get("document").and_then(|d| d.get("metadata")).and_then(|d| d.get(key));
+        // missed-slot and overlap policies) live in `document.metadata.ouro`.
+        let empty = Map::new();
+        let ouro = match m.get("document").and_then(Value::as_object) {
+            Some(d) => self.ouro(d, "/document", DOCUMENT_EXTENSIONS).unwrap_or(&empty),
+            None => &empty,
+        };
+        let metadata = |key: &str| ouro.get(key);
         match (metadata("at"), schedule.as_mut()) {
             (None, _) => {}
             (Some(at), None) => {
-                let at = self.instant(at, "/document/metadata/at");
+                let at = self.instant(at, "/document/metadata/ouro/at");
                 if m.contains_key("schedule") {
                     // The schedule object failed on its own; nothing to add.
                 } else if let Some(at) = at {
@@ -630,7 +650,7 @@ impl Parser {
                 }
             }
             (Some(_), Some(_)) => self.fail(
-                "/document/metadata/at",
+                "/document/metadata/ouro/at",
                 "a one-shot `at` is a schedule of its own: remove `schedule` (every, cron, after, on)",
             ),
         }
@@ -638,31 +658,35 @@ impl Parser {
             (None, _) => {}
             (Some(zone), Some(s)) if s.cron.is_some() => match zone.as_str().map(str::parse::<chrono_tz::Tz>) {
                 Some(Ok(zone)) => s.timezone = Some(zone),
-                _ => self.fail("/document/metadata/timezone", "expected an IANA time zone name, e.g. Europe/Berlin"),
+                _ => {
+                    self.fail("/document/metadata/ouro/timezone", "expected an IANA time zone name, e.g. Europe/Berlin")
+                }
             },
-            (Some(_), _) => self.fail("/document/metadata/timezone", "timezone applies only with a `cron` schedule"),
+            (Some(_), _) => {
+                self.fail("/document/metadata/ouro/timezone", "timezone applies only with a `cron` schedule")
+            }
         }
-        match m.get("document").and_then(|d| d.get("metadata")).and_then(|d| d.get("catchup")) {
+        match metadata("catchup") {
             None => {}
             Some(c) => match (c.as_str(), schedule.as_mut()) {
-                (Some(_), None) => self.fail("/document/metadata/catchup", "catchup applies only with a schedule"),
+                (Some(_), None) => self.fail("/document/metadata/ouro/catchup", "catchup applies only with a schedule"),
                 (Some("latest"), Some(s)) => s.catchup = Catchup::Latest,
                 (Some("none"), Some(s)) => s.catchup = Catchup::None,
-                _ => self.fail("/document/metadata/catchup", "expected latest or none"),
+                _ => self.fail("/document/metadata/ouro/catchup", "expected latest or none"),
             },
         }
-        match m.get("document").and_then(|d| d.get("metadata")).and_then(|d| d.get("overlap")) {
+        match metadata("overlap") {
             None => {}
             Some(value) => match (value.as_str(), schedule.as_mut()) {
-                (Some(_), None) => self.fail("/document/metadata/overlap", "overlap applies only with a schedule"),
+                (Some(_), None) => self.fail("/document/metadata/ouro/overlap", "overlap applies only with a schedule"),
                 (Some("skip"), Some(s)) => s.overlap = Overlap::Skip,
                 (Some("allow"), Some(s)) => s.overlap = Overlap::Allow,
                 (Some("queue"), Some(s)) => s.overlap = Overlap::Queue,
                 (Some("replace"), Some(s)) => s.overlap = Overlap::Replace,
-                _ => self.fail("/document/metadata/overlap", "expected skip, allow, queue or replace"),
+                _ => self.fail("/document/metadata/ouro/overlap", "expected skip, allow, queue or replace"),
             },
         }
-        let budget = match m.get("document").and_then(|d| d.get("metadata")).and_then(|d| d.get("limits")) {
+        let budget = match metadata("limits") {
             Some(l) => self.budget(l),
             None => Budget::default(),
         };
@@ -680,7 +704,7 @@ impl Parser {
     }
 
     fn budget(&mut self, v: &Value) -> Budget {
-        const AT: &str = "/document/metadata/limits";
+        const AT: &str = "/document/metadata/ouro/limits";
         let Some(m) = self.object(v, AT) else {
             return Budget::default();
         };
@@ -831,9 +855,11 @@ impl Parser {
 
     fn task(&mut self, v: &Value, at: &str) -> Option<Task> {
         let m = self.object(v, at)?;
+        let empty = Map::new();
+        let ouro = self.ouro(m, at, TASK_EXTENSIONS).unwrap_or(&empty);
         let kind = if m.contains_key("for") {
             self.only(m, at, &[COMMON, &["for", "while", "do"]].concat());
-            self.for_task(m, at)
+            self.for_task(m, ouro.get("concurrency"), at)
         } else if m.contains_key("try") {
             self.only(m, at, &[COMMON, &["try", "catch"]].concat());
             self.try_task(m, at)
@@ -893,32 +919,32 @@ impl Parser {
         let export = m.get("export").map(|o| self.output(o, &format!("{at}/export")));
         let timeout = m.get("timeout").and_then(|t| self.timeout(t, &format!("{at}/timeout")));
         let then = m.get("then").and_then(|t| self.flow(t, &format!("{at}/then")));
-        if m.get("metadata").and_then(|m| m.get("concurrency")).is_some() && !m.contains_key("for") {
-            self.fail(&format!("{at}/metadata/concurrency"), "concurrency belongs on a for task");
+        if ouro.contains_key("concurrency") && !m.contains_key("for") {
+            self.fail(&format!("{at}/metadata/ouro/concurrency"), "concurrency belongs on a for task");
         }
-        let delivery = match m.get("metadata").and_then(|m| m.get("delivery")) {
+        let delivery = match ouro.get("delivery") {
             None => crate::durable::Delivery::AtLeastOnce,
             Some(v) => match serde_json::from_value(v.clone()) {
                 Ok(policy) if m.contains_key("call") => policy,
                 _ => {
                     self.fail(
-                        &format!("{at}/metadata/delivery"),
+                        &format!("{at}/metadata/ouro/delivery"),
                         "expected at_least_once or at_most_once on a call task",
                     );
                     crate::durable::Delivery::AtLeastOnce
                 }
             },
         };
-        let hold = match m.get("metadata").and_then(|m| m.get("hold")) {
+        let hold = match ouro.get("hold") {
             None => Duration::ZERO,
             Some(v) => {
                 if !m.contains_key("listen") {
-                    self.fail(&format!("{at}/metadata/hold"), "hold belongs on a listen task");
+                    self.fail(&format!("{at}/metadata/ouro/hold"), "hold belongs on a listen task");
                 }
                 match v.as_str().and_then(parse_iso_duration) {
                     Some(d) => d,
                     None => {
-                        self.fail(&format!("{at}/metadata/hold"), "expected an ISO 8601 duration (e.g. PT5S)");
+                        self.fail(&format!("{at}/metadata/ouro/hold"), "expected an ISO 8601 duration (e.g. PT5S)");
                         Duration::ZERO
                     }
                 }
@@ -1181,7 +1207,7 @@ impl Parser {
         })
     }
 
-    fn for_task(&mut self, m: &Map<String, Value>, at: &str) -> Option<Kind> {
+    fn for_task(&mut self, m: &Map<String, Value>, concurrency: Option<&Value>, at: &str) -> Option<Kind> {
         let f = self.object(&m["for"], &format!("{at}/for"))?;
         self.only(f, &format!("{at}/for"), &["each", "in", "at"]);
         let items = match f.get("in") {
@@ -1199,16 +1225,16 @@ impl Parser {
         let each = self.string(f, "each", &format!("{at}/for")).unwrap_or_else(|| "item".into());
         let index = self.string(f, "at", &format!("{at}/for")).unwrap_or_else(|| "index".into());
         let condition = self.string(m, "while", at).map(|s| expr::bare(&s).to_string());
-        let concurrency = match m.get("metadata").and_then(|m| m.get("concurrency")) {
+        let concurrency = match concurrency {
             None => None,
             Some(n) => match n.as_u64().filter(|n| *n > 0).and_then(|n| usize::try_from(n).ok()) {
                 Some(_) if condition.is_some() => {
-                    self.fail(&format!("{at}/metadata/concurrency"), "a concurrent for has no `while`");
+                    self.fail(&format!("{at}/metadata/ouro/concurrency"), "a concurrent for has no `while`");
                     None
                 }
                 Some(n) => Some(n),
                 None => {
-                    self.fail(&format!("{at}/metadata/concurrency"), "expected a positive integer");
+                    self.fail(&format!("{at}/metadata/ouro/concurrency"), "expected a positive integer");
                     None
                 }
             },
@@ -1734,7 +1760,7 @@ pub fn validate(wf: &Workflow, catalog: &dyn Catalog) -> Result<(), Invalid> {
     }
     if let Exceeded::Task(handler) = &wf.budget.on_exceeded {
         // Alone in its scope: it cannot jump back into the workflow's lists.
-        v.task(handler, "/document/metadata/limits/on_exceeded", &args, &[]);
+        v.task(handler, "/document/metadata/ouro/limits/on_exceeded", &args, &[]);
     }
     v.list(&wf.tasks, "/do", &args);
     if v.problems.is_empty() { Ok(()) } else { Err(Invalid(v.problems)) }
@@ -1917,7 +1943,7 @@ impl Validator<'_> {
                 let local = self.wf.uses.functions.iter().any(|(n, _)| n == name);
                 if local && t.delivery != crate::durable::Delivery::AtLeastOnce {
                     self.problems.push(problem(
-                        &format!("{at}/metadata/delivery"),
+                        &format!("{at}/metadata/ouro/delivery"),
                         "put delivery on the external call inside the reusable function",
                     ));
                 }
@@ -2610,7 +2636,7 @@ do:
         assert_eq!(w.budget.max_jumps(100), 100);
         let limited = |limits: &str| {
             format!(
-                "document: {{ dsl: '1.0.4', namespace: t, name: w, version: '0.1.0', metadata: {{ limits: {limits} }} }}\ndo: [ {{ a: {{ set: {{ x: 1 }} }} }} ]\n"
+                "document: {{ dsl: '1.0.4', namespace: t, name: w, version: '0.1.0', metadata: {{ ouro: {{ limits: {limits} }} }} }}\ndo: [ {{ a: {{ set: {{ x: 1 }} }} }} ]\n"
             )
         };
         let w = parse_yaml(&limited("{ max_jumps: 30, on_exceeded: end }")).unwrap();
@@ -2620,7 +2646,7 @@ do:
         assert!(matches!(&w.budget.on_exceeded, Exceeded::Task(t) if matches!(t.kind, Kind::Call { .. })));
         assert!(validate(&w, &Names(&["report"])).is_ok());
         let p = validate(&w, &Names(&[])).unwrap_err().to_string();
-        assert!(p.contains("/document/metadata/limits/on_exceeded/call"), "{p}");
+        assert!(p.contains("/document/metadata/ouro/limits/on_exceeded/call"), "{p}");
         for (limits, expected) in [
             ("{ max_jumps: -1 }", "non-negative integer"),
             ("{ max_jumps: 3, every: 1 }", "unknown property"),
@@ -2641,7 +2667,7 @@ do:
     fn overlap_is_schedule_metadata_with_a_strict_policy() {
         let yaml = |policy: &str, schedule: &str| {
             format!(
-                "document: {{ dsl: '1.0.4', namespace: t, name: w, version: '1.0.0', metadata: {{ overlap: {policy} }} }}\n{schedule}\ndo: [ {{ a: {{ set: {{ ok: true }} }} }} ]"
+                "document: {{ dsl: '1.0.4', namespace: t, name: w, version: '1.0.0', metadata: {{ ouro: {{ overlap: {policy} }} }} }}\n{schedule}\ndo: [ {{ a: {{ set: {{ ok: true }} }} }} ]"
             )
         };
         for (name, policy) in [
@@ -2660,7 +2686,10 @@ do:
             [("allow", ""), ("unknown", "schedule: { every: PT1S }"), ("42", "schedule: { every: PT1S }")]
         {
             assert!(
-                parse_yaml(&yaml(policy, schedule)).unwrap_err().to_string().contains("/document/metadata/overlap")
+                parse_yaml(&yaml(policy, schedule))
+                    .unwrap_err()
+                    .to_string()
+                    .contains("/document/metadata/ouro/overlap")
             );
         }
     }
@@ -2669,7 +2698,7 @@ do:
     fn timezone_and_one_shot_are_schedule_metadata() {
         let yaml = |metadata: &str, schedule: &str| {
             format!(
-                "document: {{ dsl: '1.0.4', namespace: t, name: w, version: '1.0.0', metadata: {{ {metadata} }} }}\n{schedule}\ndo: [ {{ a: {{ set: {{ ok: true }} }} }} ]"
+                "document: {{ dsl: '1.0.4', namespace: t, name: w, version: '1.0.0', metadata: {{ ouro: {{ {metadata} }} }} }}\n{schedule}\ndo: [ {{ a: {{ set: {{ ok: true }} }} }} ]"
             )
         };
         let cron = "schedule: { cron: '0 9 * * *' }";
@@ -2677,10 +2706,10 @@ do:
         assert_eq!(s.timezone, Some(chrono_tz::Tz::Europe__Berlin));
         assert_eq!(parse_yaml(&yaml("", cron)).unwrap().schedule.unwrap().timezone, None);
         for (metadata, schedule, at) in [
-            ("timezone: Mars/Olympus", cron, "/document/metadata/timezone"),
-            ("timezone: 42", cron, "/document/metadata/timezone"),
-            ("timezone: Europe/Berlin", "schedule: { every: PT1M }", "/document/metadata/timezone"),
-            ("timezone: Europe/Berlin", "", "/document/metadata/timezone"),
+            ("timezone: Mars/Olympus", cron, "/document/metadata/ouro/timezone"),
+            ("timezone: 42", cron, "/document/metadata/ouro/timezone"),
+            ("timezone: Europe/Berlin", "schedule: { every: PT1M }", "/document/metadata/ouro/timezone"),
+            ("timezone: Europe/Berlin", "", "/document/metadata/ouro/timezone"),
         ] {
             let e = parse_yaml(&yaml(metadata, schedule)).unwrap_err().to_string();
             assert!(e.contains(at), "{metadata} {schedule}: {e}");
@@ -2699,7 +2728,7 @@ do:
             ("at: '2030-01-31T09:00:00Z', timezone: Europe/Berlin", ""),
         ] {
             let e = parse_yaml(&yaml(metadata, schedule)).unwrap_err().to_string();
-            assert!(e.contains("/document/metadata/"), "{metadata} {schedule}: {e}");
+            assert!(e.contains("/document/metadata/ouro/"), "{metadata} {schedule}: {e}");
         }
     }
 
