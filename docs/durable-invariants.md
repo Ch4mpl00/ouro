@@ -499,7 +499,9 @@ refuses to admit is admitted with that run already terminal, in the same transit
 survive recovery. An identified ingress event is accepted at most once per trigger
 epoch; once used, it cannot satisfy another match position or firing in that epoch
 unless the declared strategy explicitly permits reuse. New event-trigger runs
-cannot evade ingress deduplication by having new recipient IDs.
+cannot evade ingress deduplication by having new recipient IDs. A one-shot
+trigger (no next slot) is consumed by its slot however the slot ends (admission,
+skip, buffer, refusal): it is left dormant in that transition.
 
 Advancing a cursor must not lose a run. **Source:** [README][README], [API][API].
 **Fault:** concurrent firing, ambiguous commits, reordered trigger events.
@@ -513,6 +515,8 @@ When a rearming run finishes, its still-current dormant trigger becomes due at
 `end_time + delay` in the same transition. Duplicate finish cannot rearm twice or
 move an already due trigger. A removed or replaced activation epoch cannot be
 resurrected by an old completion. Each next firing has a new slot identity.
+A dormant trigger with no rearm (a consumed one-shot) is never due again except
+by an activation.
 
 An old run cannot rearm a new schedule accidentally. **Source:** rearm contract
 in [API][API], scheduling promise in [README][README]; epoch guard is derived.

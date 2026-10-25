@@ -480,10 +480,10 @@ per version stays bounded by the versions it already holds. Reactivating
 an older version replaces its entry; the epochs order activations across
 versions.
 `schedules` has one entry per kind configured by the active version (`every`,
-`cron`, `after`, `on`), with its next due time, overlap policy, catch-up policy
+`cron`, `after`, `at`, `on`), with its next due time, overlap policy, catch-up policy
 and buffered slot's pinned run identity/version when present. An `on` trigger
 normally has no next due time; an `after` trigger has none while waiting for
-its run to end. Manual pauses expose the suspended due times and queues;
+its run to end; an `at` trigger has none once its slot has been consumed. Manual pauses expose the suspended due times and queues;
 the trip report identifies that they are paused. Automatic trips leave the
 configured kinds with no due time or queue. Activation replaces this state.
 Each page reads only its bounded `definitions` range and those definitions'
@@ -521,6 +521,18 @@ Breaking changes (issue #22), for hosts and adapters written before it:
   `TestStore` gains `read_only`, the factory's read-only open.
 - The writable SQLite and Postgres opens refuse a newer schema with
   `SchemaError::Unsupported` instead of a message.
+
+Breaking changes (issue #24), for hosts written before it:
+
+- `ows::model::Schedule` gains `at` and `timezone`, and `ScheduleKind` gains
+  `At`; code matching them exhaustively or building a `Schedule` must add
+  them.
+- `Admitter::triggered` takes the trigger's `schedule` value (`$run.schedule`,
+  stored in the admission's `runtime`), and `ows::run::Host::runtime` carries
+  it as a `schedule` member, which is not part of `$runtime`.
+- Stored rows keep their layout: a trigger's state gains `previous` and
+  `done`, an admission's runtime gains `schedule`, all optional, so rows
+  written earlier are read as they were (no first slot has a previous one).
 
 ## The DSL
 
@@ -612,7 +624,7 @@ is bounded by its collection and `retry` by its attempts.
   readable as `$secrets` in `input.from` only and are redacted from records,
   spans, errors and outcomes. `schema.resource` resolves through a
   `ResourceResolver` (`with_resources`) and is pinned at admission.
-- `schedule` (`every`, `cron` in UTC, `after`, `on`) keeps generic
+- `schedule` (`every`, `cron`, `after`, `on`, and the one-shot `at`) keeps generic
   triggers in the store, armed in the commit that activates the version
   (a version without a schedule removes them, and so does a breaker trip,
   in its own commit): indexed by the time they are next due and by the
@@ -673,6 +685,55 @@ is bounded by its collection and `retry` by its attempts.
   ingress by at most one trigger (a tombstone kept for
   `Policy::ingress_ms`, default seven days): one event starts at most one
   run.
+
+  Three extensions of a schedule live in `document.metadata`, because the
+  official `schedule` object admits no other property:
+
+  ```yaml
+  document:
+    metadata:
+      timezone: Europe/Berlin          # cron on this IANA zone's wall clock; default UTC
+      at: '2030-01-31T09:00:00+01:00'  # a one-shot, instead of a `schedule`
+  ```
+
+  `timezone` applies to `cron` only (the compiled-in tz database of
+  `chrono-tz`; an unknown name is a validation error, so is the combination
+  with `every`, `after` or `on`). A daylight saving transition makes some
+  local times not exist (a gap, the clock jumps forward) or exist twice (an
+  overlap, it goes back). The rule is the one of `croner` (after Vixie cron),
+  pinned by tests. A job is fixed-time when its second, minute and hour are
+  single values (`30 2 * * *`); anything with a wildcard, list, range or
+  step (`0 * * * *`, `*/15 2 * * *`) is an interval job.
+
+  | | gap (02:30 skipped) | overlap (02:30 twice) |
+  | --- | --- | --- |
+  | fixed-time | once, at the first instant after the gap (03:00) | once, at the first of the two instants |
+  | interval | no occurrence inside the gap, none made up | at both passes |
+
+  Every slot is a distinct instant after the previous one, so none repeats.
+
+  `at` is a schedule of its own (an RFC 3339 timestamp with an offset; a
+  `schedule` next to it is a validation error) and follows the same `catchup`
+  and `overlap` metadata. Its single slot consumes the trigger however it
+  ends: a run, an overlap or ceiling skip (recorded in the trigger's state),
+  a queue (the buffered slot starts later, from the queue, not the trigger)
+  or a refusal. The trigger then stays as a dormant record (`done`, no due
+  time) that nothing re-arms, not even the end of its run; only a new
+  activation arms the version's instant again, in a new epoch and under a new
+  run id (`schedule:<name>:at:<epoch>:<ms>`). An instant already past at
+  activation fires at the next tick, whatever `catchup` says: nothing follows
+  a one-shot, so it can only run late or not at all.
+
+  A run started by a trigger reads `$run.schedule`: `{ kind, slot,
+  previous }` (`every`, `cron`, `after`, `at` or `on`), with `slot` and
+  `previous` as datetimes like `$workflow.startedAt` (`iso8601`, `epoch`).
+  `slot` is the scheduled instant, not the start time, so a late run still
+  sees the slot it is for (for `on`, the instant the matching event
+  completed the strategy). `previous` is the last slot the trigger started a
+  run for (`null` for the first, always for `at`); a slot skipped by overlap
+  does not count, a refused one does. It is pinned in the admission, so a
+  recovered or replayed run sees the same values, and absent (`null`) for a
+  run that was not started by a trigger.
 
 ## Durability and storage
 
