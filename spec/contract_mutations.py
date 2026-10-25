@@ -20,6 +20,11 @@ CALL = [op("intent"),op("dispatch"),op("result")]
 TICKS = [op("tick")]*4
 # A breaker trip at threshold 2: two runs fault.
 TRIP = BOOT+[op("finish",value=1),op("admit",r=1),op("claim",r=1),op("finish",r=1,value=1)]
+# A queued refused slot, promoted when its predecessor's fault is counted.
+QUEUED = [op("policy",i=1,value=2)]+TICKS[:2]+[op("fire")]+TICKS[:2]+[op("refuse",r=1,value=7),op("crash"),op("claim"),op("finish",value=1)]
+# The initial breaker policies (versions 1 and 3, version 2) a mutant's history
+# starts with: 0 is `off`, n a threshold; the default is 2 (`initWith`).
+INITS = {"V2/off": (0,2), "V2/default-threshold": (3,2), "V2/queued-off": (0,2)}
 # Replacements affect transition mechanisms only, never the oracle formulas.
 MUTANTS = {
  "S1": ('else if (s.db.stopped and Set(', 'else if (false and Set(', [op("stop",value=1),op("admit")]),
@@ -84,6 +89,12 @@ MUTANTS = {
  # is still admitted; or resuming it lifts the breaker's trip as well (#31).
  "V2/pause-tripped": ('op == "pause" and value >= 0 and not(c.manual)','op == "pause" and value >= 0 and not(c.tripped)',TRIP+[op("pause"),op("pin",r=2,i=1,value=5)]),
  "V2/pause-resume": ('tripped:c.breaker,manual:false','tripped:false,manual:false',TRIP+[op("pause"),op("resume")]),
+ # A version's own breaker policy (design 04): `off` still trips at the
+ # default; the host default is used instead of the version's threshold; a
+ # queued refused slot promoted under `off` trips.
+ "V2/off": ('val trip = counted and trips(c,faults)','val trip = counted and faults >= (if (threshold(c) == 0) defaultThreshold else threshold(c))',TRIP),
+ "V2/default-threshold": ('val trip = counted and trips(c,faults)','val trip = counted and faults >= defaultThreshold',TRIP),
+ "V2/queued-off": ('val trip = trips(c,faults)\n    val ended = update(s,r,','val trip = faults >= defaultThreshold\n    val ended = update(s,r,',QUEUED),
  # A held run takes a step, is dispatched, or is claimed; a hold misses the
  # run's owned child, or a release changes more than the hold kept; an ended
  # run stays held.
@@ -111,21 +122,21 @@ MUTANTS = {
  "OverlapCeiling": ('val full = Runs.filter(k => live(replaced.db.runs.nth(k))).size() >= maxRuns', 'val full = false', [op("policy",i=0,value=1)]+[op("tick")]*2+[op("fire")]+[op("tick")]*2+[op("fire",r=1)]),
 }
 
-def harness(commands):
+def harness(commands, policy=(2,2)):
     values = ','.join('("%s",%d,%d,%d,%d,%d)' % command for command in commands)
     return '''module mutation_trace {
   import contract.* from "./contract"
   export contract.*
   var cursor: int
   pure val commands = [%s]
-  action traceInit = all { init, cursor'=0 }
+  action traceInit = all { initWith(%d,%d), cursor'=0 }
   action traceStep = {
     val c = commands.nth(cursor)
     all { cursor < commands.length(),execute(c._1,c._2,c._3,c._4,c._5,c._6),cursor'=cursor+1 }
   }
   val exportTrace = cursor < commands.length()
 }
-''' % values
+''' % (values, policy[0], policy[1])
 
 def run_case(name, old, new, commands, output):
     # A name `ID/variant` is a further mutant of one ID's mechanism.
@@ -136,7 +147,7 @@ def run_case(name, old, new, commands, output):
         source = (ROOT / "contract.qnt").read_text()
         assert source.count(old) == 1, (name, source.count(old))
         (dest / "contract.qnt").write_text(source.replace(old,new))
-        (dest / "mutation_trace.qnt").write_text(harness(commands))
+        (dest / "mutation_trace.qnt").write_text(harness(commands, INITS.get(name, (2, 2))))
         trace = output / f"contract-mutant-{file}.itf.json"
         trace.unlink(missing_ok=True)
         command = [QUINT,"run",str(dest / "mutation_trace.qnt"),"--init","traceInit","--step","traceStep",
