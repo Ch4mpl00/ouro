@@ -530,7 +530,7 @@ fn problem(at: &str, message: impl Into<String>) -> Problem {
 
 /// The keys of `document.metadata.ouro` and of a task's `metadata.ouro`: the
 /// engine's extensions, the only members of `metadata` it reads.
-const DOCUMENT_EXTENSIONS: &[&str] = &["limits", "at", "timezone", "catchup", "overlap"];
+const DOCUMENT_EXTENSIONS: &[&str] = &["limits", "at", "timezone", "catchup", "overlap", "breaker"];
 const TASK_EXTENSIONS: &[&str] = &["delivery", "concurrency", "hold"];
 const COMMON: &[&str] = &["if", "input", "output", "export", "timeout", "then", "metadata"];
 
@@ -720,6 +720,10 @@ impl Parser {
             Some(l) => self.budget(l),
             None => Budget::default(),
         };
+        let breaker = match metadata("breaker") {
+            Some(b) => self.breaker(b),
+            None => Breaker::Inherit,
+        };
         Some(Workflow {
             document: document?,
             input,
@@ -729,9 +733,41 @@ impl Parser {
             timeout,
             schedule,
             budget,
-            breaker: Breaker::default(),
+            breaker,
             definition: v.clone(),
         })
+    }
+
+    /// `breaker: off` or `breaker: { threshold: n }`, `1 <= n <= MAX_THRESHOLD`.
+    fn breaker(&mut self, v: &Value) -> Breaker {
+        const AT: &str = "/document/metadata/ouro/breaker";
+        if v.as_str() == Some("off") {
+            return Breaker::Off;
+        }
+        let Some(m) = v.as_object() else {
+            self.fail(AT, "expected `off` or `{ threshold: <n> }`");
+            return Breaker::Inherit;
+        };
+        self.only(m, AT, &["threshold"]);
+        match m.get("threshold") {
+            Some(n) => {
+                let n =
+                    n.as_u64().and_then(|n| u32::try_from(n).ok()).filter(|n| (1..=Breaker::MAX_THRESHOLD).contains(n));
+                if n.is_none() {
+                    self.fail(
+                        &format!("{AT}/threshold"),
+                        format!("expected an integer from 1 to {}", Breaker::MAX_THRESHOLD),
+                    );
+                }
+                n.map_or(Breaker::Inherit, Breaker::Threshold)
+            }
+            None => {
+                if m.is_empty() {
+                    self.fail(AT, "expected `off` or `{ threshold: <n> }`");
+                }
+                Breaker::Inherit
+            }
+        }
     }
 
     fn budget(&mut self, v: &Value) -> Budget {

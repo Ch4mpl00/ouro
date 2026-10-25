@@ -461,7 +461,8 @@ pub struct Refused {
     pub admission: Admission,
     /// Why it was refused: the run's terminal fault.
     pub error: WorkflowError,
-    /// The breaker threshold the fault counts against, as for `finish`.
+    /// The host's default breaker threshold, as for `finish`: the active
+    /// version's own policy (`Definition::breaker`) takes precedence.
     pub breaker_threshold: u32,
 }
 
@@ -763,7 +764,9 @@ pub trait RunStore: Send + Sync {
     /// epoch feed its breaker in the same commit: a fault (an unhandled
     /// error, a timeout, an unknown outcome) counts, a success resets the
     /// count; cancellation and running out of interruptions do not count.
-    /// At `breaker_threshold` it trips: the definition records the `Trip`,
+    /// At the active version's effective threshold (`Definition::breaker`:
+    /// `Inherit` takes `breaker_threshold`, the host's default; `Off` counts
+    /// and never trips) it trips: the definition records the `Trip`,
     /// its triggers are removed and a `TRIPPED` notice is stored, in that
     /// commit. A tripped breaker observes nothing more until an activation.
     /// It never changes the active version or the epoch.
