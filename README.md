@@ -78,6 +78,16 @@ persists before execution; `start` enqueues and is idempotent by run ID.
 Every call that reaches the store is `async` (below, Async seams); a
 `current_thread` Tokio runtime is enough.
 
+`start_at(id, name, version, input)` starts a run at a stored version without
+activating it: the active version, the epoch and the schedule stay as they
+are. The same checks apply (registry, validation), the run keeps that
+version's definition for recovery and replay, and `Control::inspect` shows
+`pinned: true` beside the admitted version. A pinned run counts toward the
+breaker only if its version is the active one. A tripped definition refuses
+a pinned start like any admission (`DefinitionTripped`) until an activation.
+Starting an existing ID returns the run if it has the same version and
+fails otherwise.
+
 Every run starts with a check that each function it can call is registered:
 the functions its calls name, the process runners its `run:` tasks need
 (`run:<kind>`), and, transitively, those of the child workflows its
@@ -577,10 +587,10 @@ per version stays bounded by the versions it already holds. Reactivating
 an older version replaces its entry; the epochs order activations across
 versions.
 `schedules` has one entry per kind configured by the active version (`every`,
-`cron`, `after`, `on`), with its next due time, overlap policy, catch-up policy
+`cron`, `after`, `at`, `on`), with its next due time, overlap policy, catch-up policy
 and buffered slot's pinned run identity/version when present. An `on` trigger
 normally has no next due time; an `after` trigger has none while waiting for
-its run to end. Manual pauses expose the suspended due times and queues;
+its run to end; an `at` trigger has none once its slot has been consumed. Manual pauses expose the suspended due times and queues;
 the trip report identifies that they are paused. Automatic trips leave the
 configured kinds with no due time or queue. Activation replaces this state.
 Each page reads only its bounded `definitions` range and those definitions'
@@ -601,6 +611,10 @@ wait closes; changing its payload or wait is a conflict. Matching contexts
 are redacted before persistence; a response requiring secret values is
 refused rather than guessed without the host's secret resolver.
 
+Breaking change (issue #23): `control::Inspection` gains `pinned`; a host
+that builds one by hand adds the field. The stored shape is unchanged (an
+admission's `runtime` gains an optional `pinned` binding).
+
 Breaking changes (issue #22), for hosts and adapters written before it:
 
 - `Control` methods and `Runtime::control` return `ControlError` instead
@@ -618,6 +632,18 @@ Breaking changes (issue #22), for hosts and adapters written before it:
   `TestStore` gains `read_only`, the factory's read-only open.
 - The writable SQLite and Postgres opens refuse a newer schema with
   `SchemaError::Unsupported` instead of a message.
+
+Breaking changes (issue #24), for hosts written before it:
+
+- `ows::model::Schedule` gains `at` and `timezone`, and `ScheduleKind` gains
+  `At`; code matching them exhaustively or building a `Schedule` must add
+  them.
+- `Admitter::triggered` takes the trigger's `schedule` value (`$run.schedule`,
+  stored in the admission's `runtime`), and `ows::run::Host::runtime` carries
+  it as a `schedule` member, which is not part of `$runtime`.
+- Stored rows keep their layout: a trigger's state gains `previous` and
+  `done`, an admission's runtime gains `schedule`, all optional, so rows
+  written earlier are read as they were (no first slot has a previous one).
 
 ## The DSL
 
@@ -709,7 +735,7 @@ is bounded by its collection and `retry` by its attempts.
   readable as `$secrets` in `input.from` only and are redacted from records,
   spans, errors and outcomes. `schema.resource` resolves through a
   `ResourceResolver` (`with_resources`) and is pinned at admission.
-- `schedule` (`every`, `cron` in UTC, `after`, `on`) keeps generic
+- `schedule` (`every`, `cron`, `after`, `on`, and the one-shot `at`) keeps generic
   triggers in the store, armed in the commit that activates the version
   (a version without a schedule removes them, and so does a breaker trip,
   in its own commit): indexed by the time they are next due and by the
@@ -770,6 +796,55 @@ is bounded by its collection and `retry` by its attempts.
   ingress by at most one trigger (a tombstone kept for
   `Policy::ingress_ms`, default seven days): one event starts at most one
   run.
+
+  Three extensions of a schedule live in `document.metadata`, because the
+  official `schedule` object admits no other property:
+
+  ```yaml
+  document:
+    metadata:
+      timezone: Europe/Berlin          # cron on this IANA zone's wall clock; default UTC
+      at: '2030-01-31T09:00:00+01:00'  # a one-shot, instead of a `schedule`
+  ```
+
+  `timezone` applies to `cron` only (the compiled-in tz database of
+  `chrono-tz`; an unknown name is a validation error, so is the combination
+  with `every`, `after` or `on`). A daylight saving transition makes some
+  local times not exist (a gap, the clock jumps forward) or exist twice (an
+  overlap, it goes back). The rule is the one of `croner` (after Vixie cron),
+  pinned by tests. A job is fixed-time when its second, minute and hour are
+  single values (`30 2 * * *`); anything with a wildcard, list, range or
+  step (`0 * * * *`, `*/15 2 * * *`) is an interval job.
+
+  | | gap (02:30 skipped) | overlap (02:30 twice) |
+  | --- | --- | --- |
+  | fixed-time | once, at the first instant after the gap (03:00) | once, at the first of the two instants |
+  | interval | no occurrence inside the gap, none made up | at both passes |
+
+  Every slot is a distinct instant after the previous one, so none repeats.
+
+  `at` is a schedule of its own (an RFC 3339 timestamp with an offset; a
+  `schedule` next to it is a validation error) and follows the same `catchup`
+  and `overlap` metadata. Its single slot consumes the trigger however it
+  ends: a run, an overlap or ceiling skip (recorded in the trigger's state),
+  a queue (the buffered slot starts later, from the queue, not the trigger)
+  or a refusal. The trigger then stays as a dormant record (`done`, no due
+  time) that nothing re-arms, not even the end of its run; only a new
+  activation arms the version's instant again, in a new epoch and under a new
+  run id (`schedule:<name>:at:<epoch>:<ms>`). An instant already past at
+  activation fires at the next tick, whatever `catchup` says: nothing follows
+  a one-shot, so it can only run late or not at all.
+
+  A run started by a trigger reads `$run.schedule`: `{ kind, slot,
+  previous }` (`every`, `cron`, `after`, `at` or `on`), with `slot` and
+  `previous` as datetimes like `$workflow.startedAt` (`iso8601`, `epoch`).
+  `slot` is the scheduled instant, not the start time, so a late run still
+  sees the slot it is for (for `on`, the instant the matching event
+  completed the strategy). `previous` is the last slot the trigger started a
+  run for (`null` for the first, always for `at`); a slot skipped by overlap
+  does not count, a refused one does. It is pinned in the admission, so a
+  recovered or replayed run sees the same values, and absent (`null`) for a
+  run that was not started by a trigger.
 
 ## Durability and storage
 
@@ -887,6 +962,25 @@ refused with an error rather than read as a run without evidence. Likewise a
 the earlier unversioned layout, which kept a predecessor for a breaker
 rollback, is refused rather than read as a definition that never tripped,
 and so is layout 3, which kept no activation times.
+
+### Coexisting in a host database
+
+The SQLite adapter can share a file with the host's own tables. Every engine
+object is `ouro_`-prefixed (`ouro_rows`, `ouro_migrations`), and the schema
+version lives in `ouro_migrations`, as in Postgres: the file's
+`PRAGMA user_version` belongs to the host and is neither read nor set. The
+host's migrations never touch `ouro_` objects, and the engine never touches
+anything else. `open` sets `journal_mode = WAL` and `synchronous = FULL` for
+the whole file (a host that prefers other settings runs with its own and
+still gets engine durability only under these) and a 30-second busy timeout
+on its own connection. The adapter keeps one connection of its own: give the
+host another connection per thread rather than sharing it, and set a busy
+timeout there too, since SQLite admits one writer and the engine's
+transactions begin immediately. A read-only open checks `ouro_migrations`.
+
+Breaking change (issue #27): stores written by v0.1.0 recorded their schema in
+`user_version`. They are not converted; opening one fails (its `ouro_rows`
+exists without a recorded version), so start a new file.
 
 ### Async seams
 

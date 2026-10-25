@@ -112,7 +112,14 @@ deadline fixed at admission and epoch.
   stability and promotion. Every policy and the ceiling has a witness and
   a mutant; every policy's decision/admission crash is in `bridgeSuite`.
   An `after` trigger re-arms at any end of its run (finish, timeout, conflict,
-  cancellation) unless a later epoch replaced it. `refuse` is a firing whose
+  cancellation) unless a later epoch replaced it. A one-shot (activation
+  value 4, `once`) is consumed by its slot however the slot ends (run, skip,
+  buffer, refusal): the trigger stays armed in the catalog but dormant
+  (`due` below zero) and no run's end re-arms it; only an activation does.
+  T1 checks the dormancy after the slot, T2 that nothing else wakes it;
+  `oneShotTest` and `oneShotBusyTest` witness it and the `T1/once` and
+  `T2/once` mutants separate it. The values 2 and 3 select `after` re-arm
+  (value 4 did before); cron arithmetic and time zones stay outside the model. `refuse` is a firing whose
   run the host cannot admit (#15), subject to the same overlap policy. Its
   run is admitted already ended with an unhandled failure when the policy
   admits it (on promotion for a buffer), and the breaker observes that fault.

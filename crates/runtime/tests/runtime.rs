@@ -1237,6 +1237,26 @@ fn operator(id: &str) -> ouro_runtime::control::Request {
 }
 
 #[tokio::test]
+async fn control_lists_a_one_shot_with_its_instant_until_it_fires() {
+    use ouro_runtime::control::{Control, ScheduleKind};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("definitions.sqlite");
+    let clock = Arc::new(Time::default());
+    let rt = runtime(Arc::new(durable::sqlite::open(&path).unwrap()), Registry::new(), clock.clone());
+    let definition = yaml("  - done: { set: { ok: true } }")
+        .replace("version: '1.0.0'", "version: '1.0.0', metadata: { at: '1970-01-01T00:00:05Z' }");
+    save(&rt, &definition).await;
+    let control = Control::new(Arc::new(durable::sqlite::open(&path).unwrap()), clock.clone());
+    let due = |summary: ouro_runtime::control::DefinitionSummary| {
+        summary.schedules.iter().map(|s| (s.kind, s.next_due_ms)).collect::<Vec<_>>()
+    };
+    assert_eq!(due(control.definition("workflow").await.unwrap().unwrap()), [(ScheduleKind::At, Some(5000))]);
+    clock.0.store(5000, Ordering::SeqCst);
+    assert_eq!(rt.fire_due().await.unwrap(), ["schedule:workflow:at:1:5000"]);
+    assert_eq!(due(control.definition("workflow").await.unwrap().unwrap()), [(ScheduleKind::At, None)]);
+}
+
+#[tokio::test]
 async fn store_only_control_lists_definition_schedules_and_suspended_slots() {
     use ouro_runtime::control::{Control, ControlError, ScheduleCatchup, ScheduleKind};
     let dir = tempfile::tempdir().unwrap();
@@ -1657,4 +1677,77 @@ fn sqlite_runs_crash_and_resume_on_a_current_thread_runtime() {
     // Each runtime opens its own connection to the same file, as a restarted
     // process would.
     current_thread_crash_and_resume(|| Arc::new(durable::sqlite::open(&path).unwrap()));
+}
+
+#[tokio::test]
+async fn a_run_started_at_a_version_keeps_it_without_activating_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("pinned.sqlite");
+    let time = Arc::new(Time::default());
+    let open = || {
+        let counted = counter_registry(Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        runtime(Arc::new(durable::sqlite::open(&path).unwrap()), counted, time.clone())
+    };
+    let rt = open();
+    let first =
+        rt.save("workflow", &yaml("  - wait: { wait: PT1S }\n  - done: { set: { result: first } }")).await.unwrap();
+    let second = rt.save("workflow", &yaml("  - done: { set: { result: second } }")).await.unwrap();
+    rt.activate("workflow", second.version).await.unwrap();
+    let before = rt.definitions("workflow").await.unwrap();
+
+    let saved = rt.start_at("p", "workflow", first.version, json!({})).await.unwrap();
+    assert_eq!(saved.admission.version, first.version);
+    assert_eq!(rt.definitions("workflow").await.unwrap(), before, "starting a version activates nothing");
+    let control = ouro_runtime::control::Control::new(Arc::new(durable::sqlite::open(&path).unwrap()), time.clone());
+    let inspection = control.inspect("p").await.unwrap().unwrap();
+    assert!(inspection.pinned);
+    assert_eq!(inspection.snapshot.run.admission.version, first.version);
+    // Starting again returns the run; another version or definition is refused.
+    assert_eq!(rt.start_at("p", "workflow", first.version, json!({})).await.unwrap().admission, saved.admission);
+    assert!(rt.start_at("p", "workflow", second.version, json!({})).await.is_err());
+    assert!(rt.start_at("q", "workflow", 99, json!({})).await.is_err(), "an unknown version");
+    // The ordinary start follows the active version and is not pinned.
+    rt.start("a", "workflow", json!({})).await.unwrap();
+    assert!(!control.inspect("a").await.unwrap().unwrap().pinned);
+    assert_eq!(rt.get("a").await.unwrap().unwrap().admission.version, second.version);
+
+    // A restart resumes the pinned run at its own version.
+    assert!(matches!(rt.drive("p", &CancellationToken::new()).await.unwrap(), Some(Status::Waiting { .. })));
+    drop(rt);
+    time.0.store(1000, Ordering::SeqCst);
+    let rt = open();
+    rt.recover_once(&CancellationToken::new()).await.unwrap();
+    assert_eq!(rt.get("p").await.unwrap().unwrap().outcome, Some(Status::Completed(json!({"result":"first"}))));
+}
+#[tokio::test]
+async fn a_pinned_start_is_checked_like_any_start_and_a_trip_refuses_it() {
+    let store = Arc::new(durable::memory::memory());
+    let time: Arc<dyn Clock> = Arc::new(Time::default());
+    let counted = counter_registry(Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+    let unregistered = runtime(store.clone(), counted, time.clone())
+        .save("workflow", &yaml("  - r: { call: read, with: {} }"))
+        .await
+        .unwrap();
+    let rt = runtime(store, Registry::new(), time);
+    let e = rt.start_at("m", "workflow", unregistered.version, json!({})).await.unwrap_err();
+    assert_eq!(missing(&e), &MissingFunction { function: "read".into(), path: vec![("workflow".into(), 1)] });
+    assert!(rt.get("m").await.unwrap().is_none());
+
+    let good = rt.save("workflow", &yaml("  - ok: { set: { result: ok } }")).await.unwrap();
+    let bad = rt
+        .save("workflow", &yaml("  - fail: { raise: { error: { type: 'urn:test:failure', status: 500 } } }"))
+        .await
+        .unwrap();
+    rt.activate("workflow", bad.version).await.unwrap();
+    let stop = CancellationToken::new();
+    for id in ["f0", "f1", "f2"] {
+        rt.start(id, "workflow", json!({})).await.unwrap();
+        rt.drive(id, &stop).await.unwrap();
+    }
+    assert!(rt.definitions("workflow").await.unwrap().tripped.is_some());
+    let e = rt.start_at("p", "workflow", good.version, json!({})).await.unwrap_err();
+    assert!(e.is::<durable::DefinitionTripped>(), "{e:#}");
+    // An activation clears the trip; the pinned start then works again.
+    rt.activate("workflow", good.version).await.unwrap();
+    rt.start_at("p", "workflow", bad.version, json!({})).await.unwrap();
 }

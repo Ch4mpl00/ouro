@@ -49,6 +49,9 @@ MUTANTS = {
    BOOT+[op("child")]+TICKS+[op("claim",r=1,w=1),op("child",r=1,w=1),op("release",r=1,w=1),op("claim"),op("finish",value=1)]),
  "T1": ('fired:if (skip or buffer) s.db.fired else s.db.fired.union(Set(slot))','fired:s.db.fired',[op("tick"),op("tick"),op("fire")]),
  "T2": ('val epoch = c.epoch+1','val epoch = c.epoch',[op("activate",i=1)]),
+ # A one-shot's slot does not consume it, or its run's end re-arms it.
+ "T1/once": ('due:if (c.once or (c.rearm and not(skip) and not(refused))) -1 else s.now+2,','due:if (c.rearm and not(skip) and not(refused)) -1 else s.now+2,',[op("activate",value=4),op("tick"),op("tick"),op("fire")]),
+ "T2/once": ('else if (c.armed and c.rearm and c.due < 0','else if (c.armed and (c.rearm or c.once) and c.due < 0',[op("activate",value=4),op("tick"),op("tick"),op("fire"),op("claim"),op("finish")]),
  "T3": ('owner:w, generation:execution.generation+1, lease:s.now+4','owner:w, generation:execution.generation+1, lease:s.now+4, deadline:s.now+8',BOOT+TICKS+[op("claim")]),
  "V1": ('active:i+1,epoch:epoch','active:c.active,epoch:epoch',[op("activate",i=1)]),
  "V2": ('val counted = execution.epoch == c.epoch','val counted = true',BOOT+[op("activate"),op("finish",value=1)]),

@@ -355,6 +355,18 @@ pub async fn run_all(factory: impl AsyncFn(&str) -> anyhow::Result<TestStore>) -
     s.activate("workflow", second.version, 0).await?;
     let pinned = s.get("absent").await?;
     assert!(pinned.is_none());
+    // A run pinned at the older version while the second is active: it
+    // records the pin, has no epoch, and its fault is not the breaker's
+    // observation.
+    let mut pinned_at_first = admission("pinned");
+    pinned_at_first.version = first.version;
+    pinned_at_first.definition = first.yaml.clone();
+    pinned_at_first.runtime = json!({ PINNED: true });
+    let f = s.start(&pinned_at_first, 0).await?.unwrap();
+    let seen = s.inspect_control("pinned").await?.unwrap();
+    assert!(seen.pinned && seen.snapshot.run.admission.version == first.version && seen.snapshot.run.epoch.is_none());
+    s.finish(&f, &Status::Faulted(WorkflowError::runtime("fault")), 0, 3).await?;
+    assert_eq!(s.definitions("workflow").await?.consecutive_faults, 0);
     for n in 0..3 {
         let mut a = admission(&format!("fault{n}"));
         a.version = second.version;
@@ -369,6 +381,13 @@ pub async fn run_all(factory: impl AsyncFn(&str) -> anyhow::Result<TestStore>) -
     assert_eq!(trip.run, "fault2");
     assert_eq!(s.get("fault0").await?.unwrap().admission.version, second.version);
     assert!(s.activate("workflow", 99, 0).await.is_err());
+    // A trip refuses a pinned admission too: V2 admits nothing, of any version.
+    let mut again = pinned_at_first.clone();
+    again.id = "pinned-again".into();
+    assert!(s.start(&again, 0).await.unwrap_err().is::<DefinitionTripped>());
+    assert!(s.inspect_control("pinned").await?.unwrap().pinned, "the run admitted before the trip is kept");
+    report.operations += 2;
+    report.witnesses.insert("a pinned run is not the breaker's observation and a trip refuses a pinned admission");
     report.operations += 13;
     report.witnesses.insert("breaker trips without changing the active version or pinned runs");
     decisions(&factory, &mut report).await?;
@@ -668,7 +687,7 @@ pub async fn run_all(factory: impl AsyncFn(&str) -> anyhow::Result<TestStore>) -
         audit(&*s).await?;
     }
     report.witnesses.insert("finite histories drain every live listener");
-    assert_eq!(report.witnesses.len(), 26);
+    assert_eq!(report.witnesses.len(), 28);
     let t = factory("concurrent-claims").await?;
     report.cases += 1;
     t.store.admit(&admission("r"), 0).await?;
@@ -1916,6 +1935,38 @@ async fn decisions(
     assert_eq!(s.trigger("after").await?, Some(dormant(2)), "a replaced trigger is not re-armed");
     report.operations += 8;
     report.witnesses.insert("an old epoch's completion cannot rearm its replacement");
+
+    // A one-shot trigger: its only firing admits the run, with what the
+    // trigger told it, and leaves the trigger dormant, with no rearm. Neither
+    // the run's end nor a reopen makes it due again.
+    let t = factory("one-shot").await?;
+    report.cases += 1;
+    let s = &t.store;
+    let armed = Trigger { at_ms: Some(10), types: vec![], state: json!({ "kind": "at", "epoch": 1 }) };
+    let done = Trigger {
+        at_ms: None,
+        types: vec![],
+        state: json!({ "kind": "at", "epoch": 1, "done": true, "previous": 10 }),
+    };
+    let mut shot = admission("shot");
+    shot.runtime = json!({ "schedule": { "kind": "at", "slot": 10, "previous": null } });
+    assert!(s.swap_trigger("once", None, Some(&armed), &[], None, 0).await?);
+    assert_eq!(s.due_triggers(9, 10).await?, vec![]);
+    assert_eq!(s.due_triggers(10, 10).await?, vec![("once".to_string(), armed.clone())]);
+    let firing =
+        Firing { key: "once", expected: Some(&armed), next: Some(&done), admit: &[shot.clone()], ..Firing::default() };
+    assert_eq!(s.fire(&firing, 10).await?, Fired::Committed);
+    assert_eq!(s.fire(&firing, 10).await?, Fired::Changed, "the slot is consumed once");
+    assert_eq!(s.get("shot").await?.unwrap().admission, shot, "the run keeps what its trigger told it");
+    let f = s.claim("shot", 11).await?.unwrap();
+    s.finish(&f, &Status::Completed(json!(0)), 12, 3).await?;
+    let reopened = (t.reopen)().await?;
+    assert_eq!(reopened.trigger("once").await?, Some(done));
+    assert!(reopened.due_triggers(i64::MAX, 10).await?.is_empty());
+    assert_eq!(reopened.get("shot").await?.unwrap().admission, shot);
+    audit(&*reopened).await?;
+    report.operations += 8;
+    report.witnesses.insert("a one-shot trigger fires once and stays dormant");
     Ok(())
 }
 

@@ -98,20 +98,60 @@ fn next_every(every: i64, after: i64) -> i64 {
     after - after.rem_euclid(every) + every
 }
 
-/// The first `cron` occurrence (UTC) after `after`.
-fn next_cron(cron: &str, after: i64) -> anyhow::Result<i64> {
+/// The first `cron` occurrence after `after`, read on the wall clock of
+/// `zone` (UTC when `None`).
+///
+/// Daylight saving time makes some wall-clock times not exist (a gap, when
+/// the clock jumps forward) or exist twice (an overlap, when it goes back).
+/// The rule is `croner`'s, which follows Vixie cron and is pinned by the
+/// tests below. A job is fixed-time when its second, minute and hour are
+/// single values (`30 2 * * *`, `0 9 * * 1-5`); anything with a wildcard,
+/// a list, a range or a step (`*/15 * * * *`, `0 * * * *`) is an interval job.
+/// - Gap: a fixed-time job whose time falls in the gap runs once, at the
+///   first instant after the gap (02:30 skipped: 03:00). An interval job
+///   has no occurrence inside the gap and none is made up.
+/// - Overlap: a fixed-time job runs once, at the first of the two instants.
+///   An interval job runs at both (every 15 minutes stays every 15 minutes).
+///
+/// Either way every slot is a distinct instant after the previous one, so a
+/// slot is never repeated and never fires before the instant it follows.
+fn next_cron(cron: &str, zone: Option<chrono_tz::Tz>, after: i64) -> anyhow::Result<i64> {
     let cron: croner::Cron = cron.parse()?;
     let at = chrono::DateTime::from_timestamp_millis(after).ok_or_else(|| anyhow::anyhow!("invalid time"))?;
-    Ok(cron.find_next_occurrence(&at, false)?.timestamp_millis())
+    Ok(match zone {
+        Some(zone) => cron.find_next_occurrence(&at.with_timezone(&zone), false)?.timestamp_millis(),
+        None => cron.find_next_occurrence(&at, false)?.timestamp_millis(),
+    })
 }
 
-/// The first slot of a time trigger after `after`.
+/// The first slot of a time trigger after `after`. A one-shot has none: its
+/// only slot is the instant it was armed with.
 fn next_slot(schedule: &Schedule, kind: &str, after: i64) -> anyhow::Result<Option<i64>> {
     Ok(match (kind, schedule) {
         ("every", Schedule { every: Some(every), .. }) => Some(next_every(millis(*every), after)),
-        ("cron", Schedule { cron: Some(cron), .. }) => Some(next_cron(cron, after)?),
+        ("cron", Schedule { cron: Some(cron), timezone, .. }) => Some(next_cron(cron, *timezone, after)?),
         _ => None,
     })
+}
+
+/// A datetime as `$workflow.startedAt` shows it.
+fn datetime(ms: i64) -> Value {
+    let t = chrono::DateTime::from_timestamp_millis(ms).unwrap_or_default();
+    json!({
+        "iso8601": t.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        "epoch": { "seconds": t.timestamp(), "milliseconds": ms },
+    })
+}
+
+/// `$run.schedule` of the run `slot` starts: its kind, the slot, and the
+/// slot the trigger started a run for before it (`null`: the first).
+fn run_schedule(kind: &str, slot: i64, previous: Option<i64>) -> Value {
+    json!({ "kind": kind, "slot": datetime(slot), "previous": previous.map(datetime) })
+}
+
+/// The slot the trigger last started a run for (skipped slots do not count).
+fn previous(t: &Trigger) -> Option<i64> {
+    t.state["previous"].as_i64()
 }
 
 /// The active version's schedule.
@@ -151,6 +191,10 @@ fn arming(name: &str, yaml: &str, epoch: u64, now: i64) -> anyhow::Result<BTreeM
     if s.after.is_some() {
         let trigger = Trigger { at_ms: Some(now), types: Vec::new(), state: state("after", json!({ "n": 1 })) };
         out.insert(key(name, "after"), trigger);
+    }
+    if let Some(at) = s.at {
+        let trigger = Trigger { at_ms: Some(at), types: Vec::new(), state: state("at", json!({})) };
+        out.insert(key(name, "at"), trigger);
     }
     if let Some(on) = &s.on {
         let types = events::routes(on, &Args::new());
@@ -226,8 +270,9 @@ async fn triggered(
     id: &str,
     name: &str,
     input: Value,
+    schedule: Value,
 ) -> anyhow::Result<Option<Result<Admission, Refused>>> {
-    match admitter.triggered(id, name, input).await {
+    match admitter.triggered(id, name, input, schedule).await {
         Ok(admitted) => Ok(Some(admitted)),
         Err(e) if e.is::<DefinitionTripped>() => Ok(None),
         Err(e) => Err(e),
@@ -323,11 +368,28 @@ impl Runtime {
                 busy.at_ms = Some(now.saturating_add(millis(after)));
                 format!("schedule:{name}:after:{}:{n:010}", definitions.epoch)
             }
+            "at" => {
+                if schedule.at.is_none() {
+                    return Ok(None);
+                }
+                // A one-shot is consumed by its slot, whatever becomes of it:
+                // run, skip, queue or refusal. It stays as a dormant record
+                // (`done`, with its skip) and nothing re-arms it; only a new
+                // activation arms the version's instant again. Its slot is
+                // never "missed": nothing follows it, so it runs late rather
+                // than not at all, whatever `catchup` says.
+                for trigger in [&mut next, &mut busy] {
+                    trigger.at_ms = None;
+                    trigger.state["done"] = json!(true);
+                }
+                format!("schedule:{name}:at:{}:{slot}", definitions.epoch)
+            }
             _ => return Ok(None),
         };
         let ceiling = skipped(busy.clone(), slot, "overlap: ceiling");
         let busy = skipped(busy, slot, "overlap");
-        let admission = match triggered(&self.admitter(), &id, name, json!({})).await {
+        let schedule_of_run = run_schedule(kind, slot, previous(t));
+        let admission = match triggered(&self.admitter(), &id, name, json!({}), schedule_of_run).await {
             Ok(Some(admission)) => admission,
             Ok(None) => return Ok(None),
             Err(e) if e.is::<ResourceUnavailable>() => return self.interrupted(k, t, slot, &e, now).await,
@@ -341,6 +403,9 @@ impl Runtime {
             // due again one delay from now.
             next.at_ms = Some(now.saturating_add(rearm.delay_ms));
         }
+        // Only a slot that created a run is the next one's previous; a slot
+        // skipped by overlap leaves it (`busy`, `ceiling`) untouched.
+        next.state["previous"] = json!(slot);
         let mut firing = moved(k, t, &next, Some(&busy));
         match &admission {
             Ok(admission) => {
@@ -565,7 +630,9 @@ async fn offer(
                 let input: Vec<Value> = consumed.iter().map(|e| events::read(e, read)).collect();
                 // Refused like a time slot's run (`fire_due`): the match is
                 // consumed and the failed run recorded in its place.
-                let Some(triggered) = triggered(admitter, &run, &name, Value::Array(input)).await? else {
+                // The run's slot is the instant the last event completed the match.
+                let schedule = run_schedule("on", now, previous(&trigger));
+                let Some(triggered) = triggered(admitter, &run, &name, Value::Array(input), schedule).await? else {
                     return Ok(Taken::No);
                 };
                 id = triggered.is_ok().then_some(run);
@@ -575,6 +642,9 @@ async fn offer(
         }
         let busy = skipped(next.clone(), now, "overlap");
         let ceiling = skipped(next.clone(), now, "overlap: ceiling");
+        if admission.is_some() {
+            next.state["previous"] = json!(now);
+        }
         let mut firing = Firing {
             key: k,
             expected: Some(&trigger),
@@ -752,9 +822,97 @@ impl Runtime {
 
 #[cfg(test)]
 mod tests {
+    use super::{next_cron, retry_at};
+    use chrono_tz::Tz;
+
     #[test]
     fn notice_retries_back_off_exponentially_up_to_a_cap() {
-        let delays: Vec<i64> = [1, 2, 3, 9, 10, u32::MAX].iter().map(|n| super::retry_at(0, *n)).collect();
+        let delays: Vec<i64> = [1, 2, 3, 9, 10, u32::MAX].iter().map(|n| retry_at(0, *n)).collect();
         assert_eq!(delays, vec![1_000, 2_000, 4_000, 256_000, 300_000, 300_000]);
+    }
+
+    fn ms(t: &str) -> i64 {
+        chrono::DateTime::parse_from_rfc3339(t).unwrap().timestamp_millis()
+    }
+
+    /// The next `n` occurrences of `cron` in `zone` after `after`, as UTC.
+    fn slots(cron: &str, zone: Option<Tz>, after: &str, n: usize) -> Vec<String> {
+        let mut at = ms(after);
+        (0..n)
+            .map(|_| {
+                at = next_cron(cron, zone, at).unwrap();
+                chrono::DateTime::from_timestamp_millis(at).unwrap().format("%Y-%m-%dT%H:%MZ").to_string()
+            })
+            .collect()
+    }
+
+    const BERLIN: Option<Tz> = Some(Tz::Europe__Berlin);
+
+    #[test]
+    fn a_zone_moves_the_wall_clock_and_none_is_utc() {
+        assert_eq!(slots("0 9 * * *", None, "2025-01-01T00:00:00Z", 2), ["2025-01-01T09:00Z", "2025-01-02T09:00Z"]);
+        // Berlin is UTC+1 in winter and UTC+2 in summer.
+        assert_eq!(slots("0 9 * * *", BERLIN, "2025-01-01T00:00:00Z", 1), ["2025-01-01T08:00Z"]);
+        assert_eq!(slots("0 9 * * *", BERLIN, "2025-07-01T00:00:00Z", 1), ["2025-07-01T07:00Z"]);
+        // A half-hour offset.
+        assert_eq!(slots("0 9 * * *", Some(Tz::Asia__Kolkata), "2025-01-01T00:00:00Z", 1), ["2025-01-01T03:30Z"]);
+        // The slot after a late one is still the first after it.
+        assert_eq!(slots("0 9 * * *", BERLIN, "2025-07-01T20:00:00Z", 1), ["2025-07-02T07:00Z"]);
+    }
+
+    /// Spring forward: Berlin skipped 02:00-03:00 on 2025-03-30 (01:00Z).
+    #[test]
+    fn a_fixed_time_in_a_gap_runs_once_right_after_it() {
+        assert_eq!(
+            slots("30 2 * * *", BERLIN, "2025-03-29T12:00:00Z", 3),
+            // 02:30 CET on the 29th does not exist on the 30th: 03:00 CEST.
+            ["2025-03-30T01:00Z", "2025-03-31T00:30Z", "2025-04-01T00:30Z"]
+        );
+        // Asked from inside the gap's day, before it: the same single run.
+        assert_eq!(slots("30 2 * * *", BERLIN, "2025-03-30T00:59:00Z", 2), ["2025-03-30T01:00Z", "2025-03-31T00:30Z"]);
+        // From the run itself: not repeated.
+        assert_eq!(slots("30 2 * * *", BERLIN, "2025-03-30T01:00:00Z", 1), ["2025-03-31T00:30Z"]);
+    }
+
+    #[test]
+    fn an_interval_job_has_no_occurrence_in_a_gap_and_none_is_made_up() {
+        // 02:00, 02:20 and 02:40 do not exist on 2025-03-30: nothing runs
+        // that day, and nothing is moved to 03:00.
+        assert_eq!(
+            slots("*/20 2 * * *", BERLIN, "2025-03-29T01:30:00Z", 3),
+            ["2025-03-29T01:40Z", "2025-03-31T00:00Z", "2025-03-31T00:20Z"]
+        );
+    }
+
+    /// Fall back: Berlin repeated 02:00-03:00 on 2025-10-26 (00:00Z-01:00Z
+    /// is the CEST pass, 01:00Z-02:00Z the CET pass).
+    #[test]
+    fn a_fixed_time_in_an_overlap_runs_once_at_the_first_instant() {
+        assert_eq!(
+            slots("30 2 * * *", BERLIN, "2025-10-25T12:00:00Z", 3),
+            ["2025-10-26T00:30Z", "2025-10-27T01:30Z", "2025-10-28T01:30Z"]
+        );
+        // After the first pass, the repeated 02:30 is not a second run.
+        assert_eq!(slots("30 2 * * *", BERLIN, "2025-10-26T00:30:00Z", 1), ["2025-10-27T01:30Z"]);
+    }
+
+    #[test]
+    fn an_interval_job_in_an_overlap_runs_on_both_passes() {
+        assert_eq!(
+            slots("*/30 2 * * *", BERLIN, "2025-10-25T23:59:00Z", 5),
+            ["2025-10-26T00:00Z", "2025-10-26T00:30Z", "2025-10-26T01:00Z", "2025-10-26T01:30Z", "2025-10-27T01:00Z"]
+        );
+    }
+
+    #[test]
+    fn every_hour_stays_every_hour_across_both_transitions() {
+        assert_eq!(
+            slots("0 * * * *", BERLIN, "2025-03-30T00:00:00Z", 3),
+            ["2025-03-30T01:00Z", "2025-03-30T02:00Z", "2025-03-30T03:00Z"]
+        );
+        assert_eq!(
+            slots("0 * * * *", BERLIN, "2025-10-26T00:00:00Z", 3),
+            ["2025-10-26T01:00Z", "2025-10-26T02:00Z", "2025-10-26T03:00Z"]
+        );
     }
 }

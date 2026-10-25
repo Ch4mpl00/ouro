@@ -128,11 +128,27 @@ fn ingress_event(i: usize, payload: i64) -> Value {
     json!({"source": "ingress", "id": i.to_string(), "type": INGRESS, "data": payload})
 }
 /// The schedule's trigger: due at tick `at` (`None`: until a run ends).
-pub fn schedule_trigger(at: Option<i64>, epoch: u64, slot: i64, catchup: i64, rearm: bool) -> Trigger {
+pub fn schedule_trigger(at: Option<i64>, epoch: u64, slot: i64, mode: Mode) -> Trigger {
     Trigger {
         at_ms: at.map(|t| t * TICK),
         types: vec![],
-        state: json!({"epoch": epoch, "slot": slot, "catchup": catchup, "rearm": rearm, "overlap": 0, "maxRuns": 2}),
+        state: json!({
+            "epoch": epoch, "slot": slot, "catchup": mode.catchup, "rearm": mode.rearm, "once": mode.once,
+            "overlap": 0, "maxRuns": 2,
+        }),
+    }
+}
+/// What an activation's value chooses of the trigger: `catchup` (odd values),
+/// `after`-style `rearm` (2, 3) or a `once` one-shot (4), as the model reads it.
+#[derive(Clone, Copy, Default)]
+pub struct Mode {
+    pub catchup: i64,
+    pub rearm: bool,
+    pub once: bool,
+}
+impl Mode {
+    pub fn of(value: i64) -> Self {
+        Self { catchup: value % 2, rearm: value == 2 || value == 3, once: value == 4 }
     }
 }
 fn overlap_policy(policy: i64) -> anyhow::Result<Overlap> {
@@ -213,6 +229,7 @@ struct TriggerView {
     slot: i64,
     catchup: i64,
     rearm: bool,
+    once: bool,
 }
 #[derive(Debug, PartialEq, Eq)]
 struct QueueView {
@@ -319,6 +336,7 @@ struct ModelCatalog {
     slot: i64,
     catchup: i64,
     rearm: bool,
+    once: bool,
     armed: bool,
     notices: Vec<i64>,
 }
@@ -404,6 +422,7 @@ impl From<Machine> for View {
                     slot: c.slot,
                     catchup: c.catchup,
                     rearm: c.rearm,
+                    once: c.once,
                 }),
                 notices: c.notices,
             },
@@ -461,6 +480,7 @@ impl State<StoreDriver> for View {
                     slot: number("slot")?,
                     catchup: number("catchup")?,
                     rearm: t.state["rearm"].as_bool().context("trigger rearm")?,
+                    once: t.state["once"].as_bool().context("trigger once")?,
                 })
             })
             .transpose()?;
@@ -663,8 +683,9 @@ impl StoreDriver {
         for v in 1..=3 {
             self.block(self.store.save_definition(NAME, &format!("definition{v}")))?;
         }
-        let arming =
-            Arming { triggers: BTreeMap::from([(SCHEDULE.to_string(), schedule_trigger(Some(2), 1, 0, 0, false))]) };
+        let arming = Arming {
+            triggers: BTreeMap::from([(SCHEDULE.to_string(), schedule_trigger(Some(2), 1, 0, Mode::default()))]),
+        };
         ensure!(
             self.block(self.store.activate_with(NAME, 1, 0, &arming, &Activation::at(0)))?.is_some(),
             "initial activation"
@@ -1156,11 +1177,10 @@ impl StoreDriver {
                 }
                 let defs = self.block(self.store.definitions(NAME))?;
                 let version = i as u64 + 1;
-                let (catchup, rearm) = (value % 2, value >= 2);
                 // Version 1 has the schedule.
                 let mut arming = Arming::default();
                 if version == 1 {
-                    let mut t = schedule_trigger(Some(self.now + 2), defs.epoch + 1, 0, catchup, rearm);
+                    let mut t = schedule_trigger(Some(self.now + 2), defs.epoch + 1, 0, Mode::of(value));
                     t.state["overlap"] = json!(self.overlap);
                     t.state["maxRuns"] = json!(self.max_runs);
                     arming.triggers.insert(SCHEDULE.into(), t);
@@ -1183,13 +1203,16 @@ impl StoreDriver {
                 let slot = t.state["slot"].as_i64().context("slot")?;
                 let catchup = t.state["catchup"].as_i64().context("catchup")?;
                 let rearm = t.state["rearm"].as_bool().context("rearm")?;
+                let once = t.state["once"].as_bool().context("once")?;
+                // A one-shot's slot consumes it however it ends: it is never
+                // due again until an activation arms it.
                 let moved = |at: Option<i64>| {
                     let mut next = t.clone();
                     next.at_ms = at.map(|at| at * TICK);
                     next.state["slot"] = json!(slot + 1);
                     next
                 };
-                let skip = moved(Some(self.now + 2));
+                let skip = moved((!once).then_some(self.now + 2));
                 // A missed slot under `catchup: none`, or a slot whose run id
                 // is taken, is skipped; the next slot is two ticks on.
                 if (catchup == 1 && at < ms) || self.block(self.store.get(&run_id(r)))?.is_some() {
@@ -1213,7 +1236,7 @@ impl StoreDriver {
                 let admit = if refused.is_some() { vec![] } else { vec![admission] };
                 // A refused run never ends later to re-arm `after`.
                 let parked = rearm && refused.is_none();
-                let next = moved(if parked { None } else { Some(self.now + 2) });
+                let next = moved(if parked || once { None } else { Some(self.now + 2) });
                 let again = Rearm { trigger: SCHEDULE.into(), delay_ms: 2 * TICK };
                 let firing = Firing {
                     key: SCHEDULE,
