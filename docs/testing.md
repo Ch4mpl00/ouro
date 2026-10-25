@@ -2,6 +2,10 @@
 
 ## Checks and example
 
+Which rule is checked where (model, quotients, reference model and properties,
+regression tests), and the opt-in deep property stage
+`spec/check.sh --only properties`: [spec/README.md](../spec/README.md#what-is-checked-where).
+
 ```sh
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
