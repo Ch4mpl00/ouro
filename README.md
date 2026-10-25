@@ -791,6 +791,25 @@ the earlier unversioned layout, which kept a predecessor for a breaker
 rollback, is refused rather than read as a definition that never tripped,
 and so is layout 3, which kept no activation times.
 
+### Coexisting in a host database
+
+The SQLite adapter can share a file with the host's own tables. Every engine
+object is `ouro_`-prefixed (`ouro_rows`, `ouro_migrations`), and the schema
+version lives in `ouro_migrations`, as in Postgres: the file's
+`PRAGMA user_version` belongs to the host and is neither read nor set. The
+host's migrations never touch `ouro_` objects, and the engine never touches
+anything else. `open` sets `journal_mode = WAL` and `synchronous = FULL` for
+the whole file (a host that prefers other settings runs with its own and
+still gets engine durability only under these) and a 30-second busy timeout
+on its own connection. The adapter keeps one connection of its own: give the
+host another connection per thread rather than sharing it, and set a busy
+timeout there too, since SQLite admits one writer and the engine's
+transactions begin immediately. A read-only open checks `ouro_migrations`.
+
+Breaking change (issue #27): stores written by v0.1.0 recorded their schema in
+`user_version`. They are not converted; opening one fails (its `ouro_rows`
+exists without a recorded version), so start a new file.
+
 ### Async seams
 
 Every persistence operation is asynchronous, from the interpreter down to the
