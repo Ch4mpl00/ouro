@@ -355,6 +355,18 @@ pub async fn run_all(factory: impl AsyncFn(&str) -> anyhow::Result<TestStore>) -
     s.activate("workflow", second.version, 0).await?;
     let pinned = s.get("absent").await?;
     assert!(pinned.is_none());
+    // A run pinned at the older version while the second is active: it
+    // records the pin, has no epoch, and its fault is not the breaker's
+    // observation.
+    let mut pinned_at_first = admission("pinned");
+    pinned_at_first.version = first.version;
+    pinned_at_first.definition = first.yaml.clone();
+    pinned_at_first.runtime = json!({ PINNED: true });
+    let f = s.start(&pinned_at_first, 0).await?.unwrap();
+    let seen = s.inspect_control("pinned").await?.unwrap();
+    assert!(seen.pinned && seen.snapshot.run.admission.version == first.version && seen.snapshot.run.epoch.is_none());
+    s.finish(&f, &Status::Faulted(WorkflowError::runtime("fault")), 0, 3).await?;
+    assert_eq!(s.definitions("workflow").await?.consecutive_faults, 0);
     for n in 0..3 {
         let mut a = admission(&format!("fault{n}"));
         a.version = second.version;
@@ -369,6 +381,13 @@ pub async fn run_all(factory: impl AsyncFn(&str) -> anyhow::Result<TestStore>) -
     assert_eq!(trip.run, "fault2");
     assert_eq!(s.get("fault0").await?.unwrap().admission.version, second.version);
     assert!(s.activate("workflow", 99, 0).await.is_err());
+    // A trip refuses a pinned admission too: V2 admits nothing, of any version.
+    let mut again = pinned_at_first.clone();
+    again.id = "pinned-again".into();
+    assert!(s.start(&again, 0).await.unwrap_err().is::<DefinitionTripped>());
+    assert!(s.inspect_control("pinned").await?.unwrap().pinned, "the run admitted before the trip is kept");
+    report.operations += 2;
+    report.witnesses.insert("a pinned run is not the breaker's observation and a trip refuses a pinned admission");
     report.operations += 13;
     report.witnesses.insert("breaker trips without changing the active version or pinned runs");
     decisions(&factory, &mut report).await?;

@@ -11,7 +11,8 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, pa
 use std::{path::Path, sync::Arc, time::Duration};
 use tokio::sync::{Mutex, OwnedMutexGuard};
 
-/// The schema version this build reads and migrates to (`user_version`).
+/// The schema version this build reads and migrates to (`ouro_migrations`).
+/// The file's own `user_version` belongs to the host and is never read or set.
 const SCHEMA: i64 = 1;
 
 pub struct SqliteBackend {
@@ -28,13 +29,14 @@ impl SqliteBackend {
         connection.busy_timeout(Duration::from_secs(30))?;
         connection.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL;")?;
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let version: i64 = tx.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        tx.execute_batch("CREATE TABLE IF NOT EXISTS ouro_migrations (version INTEGER PRIMARY KEY);")?;
+        let version: i64 = tx.query_row("SELECT COALESCE(MAX(version),0) FROM ouro_migrations", [], |r| r.get(0))?;
         if version > SCHEMA {
             return Err(SchemaError::Unsupported { found: version, supported: SCHEMA }.into());
         }
         if version == 0 {
             tx.execute_batch(include_str!("../migrations/sqlite/001_initial.sql"))?;
-            tx.execute_batch("PRAGMA user_version = 1;")?;
+            tx.execute("INSERT INTO ouro_migrations VALUES (1)", [])?;
         }
         tx.commit()?;
         Ok(Self::with(connection, false))
@@ -52,7 +54,17 @@ impl SqliteBackend {
         let connection = Connection::open_with_flags(path, flags)?;
         connection.busy_timeout(Duration::from_secs(30))?;
         connection.execute_batch("PRAGMA query_only = ON;")?;
-        let version: i64 = connection.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        // No migrations table (or no recorded version) is an unmigrated store.
+        let present: bool = connection.query_row(
+            "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type='table' AND name='ouro_migrations')",
+            [],
+            |r| r.get(0),
+        )?;
+        let version: i64 = if present {
+            connection.query_row("SELECT COALESCE(MAX(version),0) FROM ouro_migrations", [], |r| r.get(0))?
+        } else {
+            0
+        };
         SchemaError::check(version, SCHEMA)?;
         Ok(Self::with(connection, true))
     }

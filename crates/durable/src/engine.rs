@@ -1441,6 +1441,7 @@ impl RunStore for TransactionalStore {
                 let budget_limit = runtime["limits"]["max_jumps"].as_u64().map(|host| {
                     ows::model::parse_yaml(&s.run.admission.definition).map_or(host, |w| w.budget.max_jumps(host))
                 });
+                let pinned = s.run.admission.pinned();
                 let trace_id = runtime["trace_id"].as_str().map(str::to_owned);
                 let span_id = runtime["span_id"].as_str().map(str::to_owned);
                 let snapshot = snapshot(rows, s).await?;
@@ -1448,6 +1449,7 @@ impl RunStore for TransactionalStore {
                 let annotations = snapshot.run.annotations.clone();
                 Ok(Some(control::Inspection {
                     snapshot,
+                    pinned,
                     calls,
                     annotations,
                     waits,

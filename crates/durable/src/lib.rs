@@ -38,6 +38,9 @@ pub const CLOCK_SKEW_MS: i64 = 1_000;
 /// The admission's runtime binding that names the application version a run
 /// was admitted under (`Admission::application_version`).
 pub const APPLICATION_VERSION: &str = "application_version";
+/// The admission's runtime binding (`true`) of a run the host started at a
+/// named version instead of the active one (`Admission::pinned`).
+pub const PINNED: &str = "pinned";
 
 /// A store's time policy. Every time-related guarantee holds under clock
 /// skew between workers of at most `skew_ms`: an owner stops acting `skew_ms`
@@ -70,6 +73,11 @@ pub struct Admission {
     pub runtime: Value,
 }
 impl Admission {
+    /// Whether the host started this run at a version it named, rather than
+    /// at the active one.
+    pub fn pinned(&self) -> bool {
+        self.runtime.get(PINNED).and_then(Value::as_bool).unwrap_or(false)
+    }
     /// The declared application version; `None`: undeclared, so every worker
     /// is compatible (issue #3's default).
     pub fn application_version(&self) -> Option<&str> {

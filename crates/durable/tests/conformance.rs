@@ -32,10 +32,43 @@ async fn memory_conformance() {
 }
 #[tokio::test]
 async fn sqlite_conformance() {
+    sqlite_conformance_in(|_| {}).await;
+}
+
+/// Conformance on files a host already uses: its own tables, its own
+/// `user_version`, and a second connection of the host open on the file.
+#[tokio::test]
+async fn sqlite_conformance_in_a_host_database() {
+    let hosts = std::sync::Mutex::new(Vec::new());
+    let _dir = sqlite_conformance_in(|path| {
+        let host = rusqlite::Connection::open(path).unwrap();
+        host.execute_batch(
+            "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT); INSERT INTO users VALUES (1, 'a');\n             PRAGMA user_version = 41;",
+        )
+        .unwrap();
+        hosts.lock().unwrap().push((host, path.to_owned()));
+    })
+    .await;
+    for (host, path) in hosts.into_inner().unwrap() {
+        // The host's objects and its version are untouched, and the engine's
+        // objects are all its own.
+        let version: i64 = host.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(version, 41, "{path:?}");
+        let users: i64 = host.query_row("SELECT count(*) FROM users", [], |r| r.get(0)).unwrap();
+        assert_eq!(users, 1);
+        let foreign: i64 = host
+            .query_row("SELECT count(*) FROM sqlite_master WHERE name NOT LIKE 'ouro\\_%' ESCAPE '\\' AND name <> 'users' AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(foreign, 0);
+    }
+}
+
+async fn sqlite_conformance_in(prepare: impl Fn(&std::path::Path)) -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
     let count = std::sync::atomic::AtomicUsize::new(0);
     let report = conformance::run_all(async |_| {
         let path = dir.path().join(format!("case{}.sqlite", count.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
+        prepare(&path);
         let backend = Arc::new(SqliteBackend::open(&path)?);
         let shared_faults = backend.faults.clone();
         let reader = path.clone();
@@ -60,6 +93,7 @@ async fn sqlite_conformance() {
     .await
     .unwrap();
     eprintln!("sqlite: {report:?}");
+    dir
 }
 
 // A current-thread runtime: the async store needs no worker threads, and
@@ -267,7 +301,10 @@ async fn sqlite_read_only_open_never_creates_or_migrates() {
     // A newer schema is refused by both opens, and left as it is.
     let newer = dir.path().join("newer.sqlite");
     drop(SqliteBackend::open(&newer).unwrap());
-    rusqlite::Connection::open(&newer).unwrap().execute_batch("PRAGMA user_version = 2").unwrap();
+    rusqlite::Connection::open(&newer).unwrap().execute_batch("INSERT INTO ouro_migrations VALUES (2)").unwrap();
+    // The file's own `user_version` is not the schema version.
+    rusqlite::Connection::open(&empty).unwrap().execute_batch("PRAGMA user_version = 1").unwrap();
+    assert!(matches!(schema(SqliteBackend::open_read_only(&empty).err().unwrap()), SchemaError::Unmigrated));
     let expected = SchemaError::Unsupported { found: 2, supported: 1 };
     assert_eq!(schema(SqliteBackend::open_read_only(&newer).err().unwrap()), expected);
     assert_eq!(schema(SqliteBackend::open(&newer).err().unwrap()), expected);

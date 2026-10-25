@@ -78,6 +78,16 @@ persists before execution; `start` enqueues and is idempotent by run ID.
 Every call that reaches the store is `async` (below, Async seams); a
 `current_thread` Tokio runtime is enough.
 
+`start_at(id, name, version, input)` starts a run at a stored version without
+activating it: the active version, the epoch and the schedule stay as they
+are. The same checks apply (registry, validation), the run keeps that
+version's definition for recovery and replay, and `Control::inspect` shows
+`pinned: true` beside the admitted version. A pinned run counts toward the
+breaker only if its version is the active one. A tripped definition refuses
+a pinned start like any admission (`DefinitionTripped`) until an activation.
+Starting an existing ID returns the run if it has the same version and
+fails otherwise.
+
 Every run starts with a check that each function it can call is registered:
 the functions its calls name, the process runners its `run:` tasks need
 (`run:<kind>`), and, transitively, those of the child workflows its
@@ -504,6 +514,10 @@ wait closes; changing its payload or wait is a conflict. Matching contexts
 are redacted before persistence; a response requiring secret values is
 refused rather than guessed without the host's secret resolver.
 
+Breaking change (issue #23): `control::Inspection` gains `pinned`; a host
+that builds one by hand adds the field. The stored shape is unchanged (an
+admission's `runtime` gains an optional `pinned` binding).
+
 Breaking changes (issue #22), for hosts and adapters written before it:
 
 - `Control` methods and `Runtime::control` return `ControlError` instead
@@ -851,6 +865,25 @@ refused with an error rather than read as a run without evidence. Likewise a
 the earlier unversioned layout, which kept a predecessor for a breaker
 rollback, is refused rather than read as a definition that never tripped,
 and so is layout 3, which kept no activation times.
+
+### Coexisting in a host database
+
+The SQLite adapter can share a file with the host's own tables. Every engine
+object is `ouro_`-prefixed (`ouro_rows`, `ouro_migrations`), and the schema
+version lives in `ouro_migrations`, as in Postgres: the file's
+`PRAGMA user_version` belongs to the host and is neither read nor set. The
+host's migrations never touch `ouro_` objects, and the engine never touches
+anything else. `open` sets `journal_mode = WAL` and `synchronous = FULL` for
+the whole file (a host that prefers other settings runs with its own and
+still gets engine durability only under these) and a 30-second busy timeout
+on its own connection. The adapter keeps one connection of its own: give the
+host another connection per thread rather than sharing it, and set a busy
+timeout there too, since SQLite admits one writer and the engine's
+transactions begin immediately. A read-only open checks `ouro_migrations`.
+
+Breaking change (issue #27): stores written by v0.1.0 recorded their schema in
+`user_version`. They are not converted; opening one fails (its `ouro_rows`
+exists without a recorded version), so start a new file.
 
 ### Async seams
 
