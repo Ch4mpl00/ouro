@@ -20,7 +20,7 @@ use ouro_durable::{
     SystemClock,
 };
 use ows::{
-    durable::{Annotations, CallEntry, CallFailure, Delivery},
+    durable::{Annotations, CallEntry, CallFailure, CallStatus, Delivery},
     model::{self, Process, Workflow},
     run::{self, CallInfo, Child, ChildTarget, Functions, Host, Limits, Status, WorkflowError},
 };
@@ -1362,7 +1362,9 @@ impl ExecutionFunctions {
                 },
                 Mode::Replay { .. } => unreachable!("replay returns before dispatch"),
             }
-            .map_err(CallFailure::Response)?;
+            // The error's type says how far the call got: not executed,
+            // unknown, interrupted; any other error is a definite answer.
+            .map_err(CallFailure::answer)?;
             if let Some(f) = registered {
                 f.output
                     .validate(&output.value)
@@ -1384,7 +1386,7 @@ impl ExecutionFunctions {
     /// secrets back.
     fn replayed(&self, name: &str, args: &Value, info: &CallInfo<'_>) -> Result<Output, CallFailure> {
         let Mode::Replay { calls, used, .. } = &self.mode else { unreachable!("only replay mode has recorded calls") };
-        let call = calls.get(info.reference).ok_or_else(|| {
+        let (call, status) = calls.get(info.reference).ok_or_else(|| {
             CallFailure::NotExecuted(WorkflowError::runtime(format!("missing replay result at {}", info.reference)))
         })?;
         if call.function != name
@@ -1407,11 +1409,16 @@ impl ExecutionFunctions {
                     (Err(e), _) | (_, Err(e)) => Err(CallFailure::NotExecuted(e)),
                 }
             }
-            Err(e) => {
-                // An error answer keeps what it carried, as it was recorded.
-                info.annotations.extend(call.annotations.clone());
-                Err(CallFailure::Response(e.clone()))
-            }
+            // How far the recorded call got, as it was recorded.
+            Err(e) => match status {
+                CallStatus::NotExecuted => Err(CallFailure::NotExecuted(e.clone())),
+                CallStatus::Unknown | CallStatus::Pending => Err(CallFailure::Unknown(e.clone())),
+                CallStatus::Completed | CallStatus::Failed => {
+                    // An error answer keeps what it carried, as it was recorded.
+                    info.annotations.extend(call.annotations.clone());
+                    Err(CallFailure::Response(e.clone()))
+                }
+            },
         }
     }
     async fn builtin(&self, name: &str, args: Value, info: &CallInfo<'_>) -> anyhow::Result<Value> {
@@ -1628,7 +1635,7 @@ impl Functions for ExecutionFunctions {
                     v
                 };
                 match calls.get(info.reference) {
-                    Some(call)
+                    Some((call, _))
                         if call.function == "emit" && strip(&call.arguments) == strip(&info.secrets.value(event)) =>
                     {
                         used.lock().unwrap().insert(info.reference.to_string());

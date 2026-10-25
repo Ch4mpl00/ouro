@@ -5,7 +5,7 @@
 use crate::{FunctionContext, FunctionError, Output, Runtime};
 use ouro_durable::{Clock, RunStore};
 use ows::{
-    durable::{Annotations, CallEntry, CallState, Delivery, Record},
+    durable::{Annotations, CallEntry, CallState, CallStatus, Delivery, Record},
     run::{Status, WorkflowError},
 };
 use serde_json::Value;
@@ -83,7 +83,9 @@ pub(crate) enum Mode {
         mocked: Arc<Mutex<Vec<RecordedCall>>>,
     },
     Replay {
-        calls: Arc<BTreeMap<String, RecordedCall>>,
+        /// The recorded calls by reference, with how far each got: an
+        /// answer, a proven non-execution, or no answer (unknown).
+        calls: Arc<BTreeMap<String, (RecordedCall, CallStatus)>>,
         used: Arc<Mutex<BTreeSet<String>>>,
         events: Arc<BTreeMap<String, Value>>,
         /// The recorded jump decisions by key: granted or refused.
@@ -184,18 +186,20 @@ impl Runtime {
             original.run.admission.runtime["bindings"] = self.registry().bindings(&wf);
         }
         for (key, record) in original.records {
-            if let Record::Call {
-                logical,
-                function,
-                arguments,
-                delivery,
-                state: CallState::Done(result),
-                annotations,
-            } = record
-            {
-                let reference = key.strip_suffix("#call").ok_or_else(|| anyhow::anyhow!("invalid call record key"))?;
-                calls.insert(
-                    reference.to_string(),
+            let Some(status) = CallEntry::of(&key, &record).map(|entry| entry.state) else { continue };
+            let Record::Call { logical, function, arguments, delivery, state, annotations } = record else { continue };
+            // A call without an answer is replayed as the unknown outcome
+            // it was: an at-most-once one takes the branch the recorded run
+            // took (`call.unknown`), and nothing is dispatched for it.
+            let result = match state {
+                CallState::Done(result) => result,
+                CallState::NotExecuted(error) => Err(error),
+                CallState::Pending => Err(WorkflowError::unknown_outcome("the recorded call has no answer")),
+            };
+            let reference = key.strip_suffix("#call").ok_or_else(|| anyhow::anyhow!("invalid call record key"))?;
+            calls.insert(
+                reference.to_string(),
+                (
                     RecordedCall {
                         task_path: reference.into(),
                         logical,
@@ -205,8 +209,9 @@ impl Runtime {
                         result,
                         annotations,
                     },
-                );
-            }
+                    status,
+                ),
+            );
         }
         anyhow::ensure!(!calls.is_empty() || original.run.outcome.is_some(), "recorded results unavailable");
         let store = Arc::new(ouro_durable::memory::memory());
