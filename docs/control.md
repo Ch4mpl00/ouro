@@ -137,7 +137,12 @@ run row's annotation totals (which `list` and `history` items carry too, as
 journal), children (including ended children),
 and tree jump budget. A terminal run keeps the tree's spent count at its end.
 The `trace_id`/`span_id` the run was admitted in are exposed when there was
-one ([Observability](observability.md)). `workers` pages worker heartbeat rows, marking stale
+one ([Observability](observability.md)). `inspect` shows the run's host data
+(`Inspection::host`, also in its admission); it is the only query that does:
+`list`, `history` and an inspection's `children` carry `"<redacted>"`
+(`control::REDACTED`) in place of each run's `admission.runtime.host`, and a
+run without host data has none. Observer events and spans never carry it.
+`workers` pages worker heartbeat rows, marking stale
 ones.
 
 `list` filters by definition, state, admission time and parent; `history`

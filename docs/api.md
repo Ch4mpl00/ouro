@@ -9,7 +9,9 @@ with its own dry-run mock rule (below). Handlers receive arguments and
 `FunctionContext`: a
 cancellation token, run ID, task path, retry attempt, stable idempotency key,
 the call's span (current while the handler runs), the function, definition,
-version and delivery, and the runtime's meter ([Observability](observability.md)). Return
+version and delivery, the runtime's meter ([Observability](observability.md)),
+the run's host data (`host()`) and the capability to start host children
+(`start_child`, below). Return
 JSON, an annotated `Output`, or `FunctionError` (OWS Problem Details); YAML
 `try/catch` handles ordinary function and schema errors. Both input and
 output schemas are checked. An error can also say that the call did nothing,
@@ -76,6 +78,75 @@ It is computed once, when the version is saved, and stored; admissions and
 trips compare stored digests only.
 Starting an existing ID returns the run if it has the same version and
 fails otherwise.
+
+### Host data
+
+A host often must give a run facts the workflow must not be able to forge:
+the tenant, the user, permissions, a model preset, where confirmations go.
+`start_with(id, name, input, Start { version, host })` admits a run with
+host data (`start` is `Start::default()`: the active version, no host data;
+`start_at` names a version). It is stored with the admission
+(`admission.runtime["host"]`, `durable::HOST`), immutable, at most 16 KiB as
+JSON (`durable::MAX_HOST_BYTES`, else `HostDataTooLarge` and nothing is
+stored), and read by the run's functions through `FunctionContext::host()`.
+It is never part of `$input`, and `$runtime` does not show it: a workflow
+cannot read or set it (expose what a workflow may see through a function).
+What it means is the host's: the engine never interprets it.
+
+Starting an existing ID returns the run if it was admitted with the same
+definition, the same version when the start names one, and the same host
+data, absent against present included: a plain `start` of a run that has
+host data fails. Otherwise the typed `durable::AdmissionMismatch` (its
+`field`: name, version or host) is returned. The store compares in the
+transaction that reads the run, so of concurrent different starts one is
+stored and the others are refused. Scheduled and event-fired runs get no
+host data.
+
+Children a workflow starts itself (`run: workflow`, the reserved
+`start_child`) get **no** host data, whatever their parent has: the host
+vouches for a run, YAML cannot. A host function vouches for a child by
+starting it: `cx.start_child(ChildStart { key, name, version, input, host })`
+starts an owned child of the run the call serves and returns a `ChildRef`
+(`id`, `key`, `done`, `waiting`). It is committed through the run's lease,
+together with the parent's subscriptions to the child's end, under the same
+ownership, cascade, budget, nesting depth and trip/pause rules as the
+reserved `start_child`; `version` pins a stored version. The workflow joins
+it with `listen` on `done`, or reads its outcome with the reserved
+`child_outcome` (`id` and `key`). Its id is
+`hostchild:[<run>, <call idempotency key>, <key>]`, so a re-dispatch of the
+call joins the same child. **The first commit wins**: a join returns the child
+as it was admitted, whatever input, version or host data the re-dispatch
+computed (a handler may compute host data from live state); only another
+definition under the same key is refused (`ChildRefusal::Mismatch`).
+
+A refusal (`ChildError::Refused`: nesting depth, a tripped or paused
+definition, a mismatch, too much host data, a definition that cannot be
+admitted, no capability) means nothing happened; an interruption
+(`ChildError::Interrupted`: a lost lease, a hold, the emergency stop,
+storage) is no answer. `ChildError` converts into `FunctionError` as
+`not_executed` or `interrupted` respectively, so a handler can use `?`.
+Register a function that starts children **at least once** (the default):
+an at-most-once call whose outcome is unknown is never sent again, so it
+could not join the child it may have started. The capability
+(`FunctionContext::children`) is present for a registered function's handler
+in live runs and dry runs, and absent for a process runner and in a dry
+run's `Mock::response`; calling `start_child` without it is a refusal.
+
+```rust
+Function::new("delegate", input, output, |args: Value, cx: FunctionContext| async move {
+    let preset = presets.for_user(cx.host())?; // the host's own lookup
+    let child = cx
+        .start_child(ChildStart {
+            key: "worker".into(),
+            name: "worker".into(),
+            version: None,
+            input: args,
+            host: json!({ "preset": preset }),
+        })
+        .await?;
+    Ok(serde_json::to_value(child)?)
+})
+```
 
 Every run starts with a check that each function it can call is registered:
 the functions its calls name, the process runners its `run:` tasks need
@@ -191,7 +262,8 @@ visible (`Runtime::compatible`) instead of being failed. Undeclared, every run
 and worker are compatible, as before versions existed. This is separate from
 the durable state version, which refuses an incompatible persisted format.
 
-`start_child` is available through the host API and as a reserved
+`start_child` is available through the host API (`Runtime::start_child(parent,
+key, id, name, input, host)`, whose host data is the child's) and as a reserved
 workflow function, for a parent that starts a child, keeps working and
 joins it later: it returns `id`, `key`, `done` and `waiting` event types; a
 parent joins with `listen`, or reads the owned result with `child_outcome`.
@@ -201,16 +273,19 @@ commit, so a parent that finishes without joining stops its child.
 The worker drives children under the same bounds. Native `run: workflow`
 ([the DSL](dsl.md)) is the DSL's way to run a child and wait for it.
 
-`dry_run` takes the host's `Mock`: a rule over each call's function and
+`dry_run` takes the host's `Mock` (`dry_run_with` also takes host data for the
+root, as `start_with`): a rule over each call's function and
 arguments (`mocks`) and the answers to what it marks (`response`, a value or
-an annotated `Output`, whose annotations the dry run keeps);
+an annotated `Output`, whose annotations the dry run keeps; a mocked call runs
+no handler, so it starts no host child);
 `mock(rule, response)` builds one from two closures. Its guarantee: a dry run
 dispatches no call (function or process run, `run:<kind>`) the rule marks.
 Every other call is dispatched for real. Emitted events are recorded, never
 published or handed to the sink. `DryRun::mocked` lists the mocked calls and
 the emitted events; `DryRun::calls` is the dry run's whole call journal with
 annotations, so `annotation_totals` estimates what a run would use. A dry run
-or replay is traced but records no metrics: it is not a run of the host. All runs and definitions live in a private memory store;
+or replay is traced but records no metrics: it is not a run of the host. All runs and definitions live in a private memory store, children a
+handler starts included;
 child definitions are read from the host's catalog. Durable delays advance
 without sleeping. `replay` and `replay_definition` take function results, their
 annotations and event envelopes from a recorded run and execute in
