@@ -4,7 +4,12 @@ Ouro is a 0.x prerelease: breaking changes are allowed and are listed here. The
 durable state version and the store layouts they mention are refused, not converted, so a
 store written before such a change must be recreated unless the entry says otherwise.
 
-## Unreleased (since v0.1.0)
+## 0.2.0 (unreleased)
+
+Stored versions at the end of 0.2.0: durable run state 15, `definitions` row
+layout 7, trigger queue layout 1 (unchanged). Stores written by 0.1.0 are
+refused, not converted: their run rows and `definitions` rows by these
+versions, and a 0.1.0 SQLite file as a whole with `SchemaError::Legacy`.
 
 ### Child ids per attempt, fixed-size (design 03 amendment)
 
@@ -57,8 +62,9 @@ adapters:
   commit that counts the fault, and a queued refused slot is judged at
   promotion by the version active then. `Trip::threshold` is the effective
   one.
-- The public conformance suite counts four more witnesses; `spec/contract.qnt`
-  models the policy per version (`policy`, `initWith`).
+- The public conformance suite counts four more witnesses (its mid-suite
+  check moves from 29 to 33); `spec/contract.qnt` models the policy per version
+  (`policy`, `initWith`, `initAny`).
 
 ### Issue #34: host data at admission and host-started children (design 03)
 
@@ -68,11 +74,12 @@ which its functions read through `FunctionContext::host()` and no expression
 sees; `FunctionContext::start_child(ChildStart { .. })` starts an owned child
 the host vouches for (`hostchild:` ids, which `FunctionContext::child_id(key)`
 returns before the start); `Runtime::dry_run_with` gives a dry
-run's root host data; `Inspection::host`. Breaking changes, for hosts and
-store adapters:
+run's root host data. Breaking changes, for hosts and store adapters:
 
 - `FunctionContext` gains the public fields `host` and `children`: code that
   builds one with a struct literal adds them (`None` for both).
+- `control::Inspection` gains `host` (the inspected run's host data); a host
+  that builds one by hand adds the field.
 - `Runtime::start_child(parent, key, id, name, input, host)` takes the
   child's host data (`Value::Null`: none).
 - Starting a stored id is refused with the typed `durable::AdmissionMismatch`
@@ -89,6 +96,8 @@ store adapters:
   of a run's host data; only `inspect` of the run shows it.
 - No durable state or layout version changes: host data is an admission
   runtime binding, which stores keep as they always did.
+- The public conformance suite adds the `host_data` cases and one witness,
+  which only the final report counts (it comes after the mid-suite check).
 
 ### Issue #31, M-6: engine extensions under `metadata.ouro`
 
@@ -247,6 +256,11 @@ Breaking changes (issue #24), for hosts written before it:
 Breaking change (issue #23): `control::Inspection` gains `pinned`; a host
 that builds one by hand adds the field. The stored shape is unchanged (an
 admission's `runtime` gains an optional `pinned` binding).
+
+## 0.1.0
+
+The first tagged release. The entries below were merged before the tag; a
+store written before each of them is refused as it says.
 
 ### Issue #22
 
