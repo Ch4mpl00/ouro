@@ -429,16 +429,10 @@ async fn admitted(rows: &mut dyn Transaction, admission: &Admission, now: i64) -
     }
     running(rows).await?;
     let defs = load_definitions(rows, &admission.name).await?;
-    // Stored digests only (`Definition::digest`, `Trip::digest`): nothing is
-    // hashed here. A version the catalog does not hold has no digest and is
-    // never the tripped content.
-    let digest =
-        defs.as_ref().and_then(|d| d.versions.get(&admission.version)).map_or_else(String::new, |d| d.digest.clone());
-    if let Some(trip) = defs.as_ref().and_then(|d| d.tripped.as_ref())
-        && (trip.manual.is_some() || (!digest.is_empty() && digest == trip.digest))
-    {
-        return Err(trip.refusal(&admission.name).into());
+    if let Some(refusal) = barred(defs.as_ref(), admission) {
+        return Err(refusal.into());
     }
+    let digest = digest(defs.as_ref(), admission);
     let epoch = defs.filter(|d| d.active == Some(admission.version)).map(|d| d.epoch);
     Ok(Some(StoredRun {
         run: SavedRun {
@@ -474,6 +468,36 @@ async fn admitted(rows: &mut dyn Transaction, admission: &Admission, now: i64) -
         mailbox: None,
         evidence: false,
     }))
+}
+/// The content digest of the admitted version as the catalog stores it
+/// (`Definition::digest`): nothing is hashed here. Empty for a version the
+/// catalog does not hold.
+fn digest(defs: Option<&Definitions>, admission: &Admission) -> String {
+    defs.and_then(|d| d.versions.get(&admission.version)).map_or_else(String::new, |d| d.digest.clone())
+}
+/// The refusal a standing trip gives a new run of `admission`: a pause
+/// refuses every one; an automatic trip, the tripped content digest, compared
+/// as stored (`Trip::digest`).
+fn barred(defs: Option<&Definitions>, admission: &Admission) -> Option<DefinitionTripped> {
+    let trip = defs?.tripped.as_ref()?;
+    let digest = digest(defs, admission);
+    (trip.manual.is_some() || (!digest.is_empty() && digest == trip.digest)).then(|| trip.refusal(&admission.name))
+}
+/// After `drain_marked` drained (`drained`), the refusal the new run of
+/// `admission` now meets if the drain tripped its definition (a promoted
+/// refused slot reaching the threshold). The admission returns it inside a
+/// committed transaction (`Ok(Err(refusal))`) with nothing else written: the
+/// drain and its trip are kept, and the refusal names a stored trip.
+async fn drained_refusal(
+    rows: &mut dyn Transaction,
+    drained: bool,
+    admission: &Admission,
+) -> anyhow::Result<Option<anyhow::Error>> {
+    if !drained || find_run(rows, &admission.id).await?.is_some() {
+        return Ok(None);
+    }
+    let defs = load_definitions(rows, &admission.name).await?;
+    Ok(barred(defs.as_ref(), admission).map(Into::into))
 }
 /// A refused trigger run (`Firing::refused`): admitted under the same rules
 /// as `insert` and ended faulted in the same write, so it is never due and
@@ -918,12 +942,14 @@ async fn drain_queues(rows: &mut dyn Transaction, name: &str, now: i64) -> anyho
 /// `contract.qnt`'s `settle` promotes right after the clear, so a buffered slot
 /// always precedes later ones; this is the same order, reached lazily and in
 /// the admitting commit. One point read when nothing is deferred.
-async fn drain_marked(rows: &mut dyn Transaction, name: &str, now: i64) -> anyhow::Result<()> {
+/// Whether it drained anything (`drained_refusal`).
+async fn drain_marked(rows: &mut dyn Transaction, name: &str, now: i64) -> anyhow::Result<bool> {
     if get::<bool>(rows, "control_drain", name).await?.is_some() && !is_stopped(rows).await? {
         rows.delete("control_drain", name).await?;
         drain_queues(rows, name, now).await?;
+        return Ok(true);
     }
-    Ok(())
+    Ok(false)
 }
 
 async fn drain_pending(rows: &mut dyn Transaction, now: i64, limit: usize) -> anyhow::Result<()> {
@@ -1019,18 +1045,42 @@ async fn tombstone(
     };
     Ok((k, stored, used))
 }
-async fn fire(rows: &mut dyn Transaction, f: &Firing<'_>, now: i64, policy: &Policy) -> anyhow::Result<Fired> {
+/// `Ok(Err(refusal))`: refused by a trip its own deferred drain committed
+/// (`drained_refusal`); the drain is kept, nothing else is written.
+async fn fire(
+    rows: &mut dyn Transaction,
+    f: &Firing<'_>,
+    now: i64,
+    policy: &Policy,
+) -> anyhow::Result<anyhow::Result<Fired>> {
     if is_stopped(rows).await? {
-        return Ok(Fired::Changed);
+        return Ok(Ok(Fired::Changed));
     }
     anyhow::ensure!(f.refused.is_none() || f.admit.is_empty(), "a firing admits its runs or records a refusal");
+    let mut drained = false;
     if let Some(a) = f.admit.first().or(f.refused.map(|r| &r.admission)) {
-        drain_marked(rows, &a.name, now).await?;
+        drained = drain_marked(rows, &a.name, now).await?;
     }
     let current: Option<Trigger> = get(rows, "trigger", f.key).await?;
     if current.as_ref() != f.expected {
-        return Ok(Fired::Changed);
+        // A trip disarms the definition's triggers: a drain that tripped
+        // it lands here for any trigger it armed.
+        return Ok(Ok(Fired::Changed));
     }
+    for a in f.admit.iter().chain(f.refused.map(|r| &r.admission)) {
+        if let Some(refusal) = drained_refusal(rows, drained, a).await? {
+            return Ok(Err(refusal));
+        }
+    }
+    fire_checked(rows, f, current, now, policy).await.map(Ok)
+}
+async fn fire_checked(
+    rows: &mut dyn Transaction,
+    f: &Firing<'_>,
+    current: Option<Trigger>,
+    now: i64,
+    policy: &Policy,
+) -> anyhow::Result<Fired> {
     // Validate ingress before any policy outcome: a skipped or buffered event
     // is consumed too, and a conflicting payload must never cancel a run.
     if let Some(event) = f.ingress
@@ -1578,26 +1628,32 @@ impl RunStore for TransactionalStore {
     async fn admit(&self, a: &Admission, now: i64) -> anyhow::Result<bool> {
         self.update(|rows| {
             Box::pin(async move {
-                drain_marked(rows, &a.name, now).await?;
-                insert(rows, a, now).await
+                let drained = drain_marked(rows, &a.name, now).await?;
+                if let Some(refusal) = drained_refusal(rows, drained, a).await? {
+                    return Ok(Err(refusal));
+                }
+                insert(rows, a, now).await.map(Ok)
             })
         })
-        .await
+        .await?
     }
     async fn start(&self, a: &Admission, now: i64) -> anyhow::Result<Option<Fence>> {
         let owner = &uuid::Uuid::new_v4().to_string();
         self.update(|rows| {
             Box::pin(async move {
-                drain_marked(rows, &a.name, now).await?;
+                let drained = drain_marked(rows, &a.name, now).await?;
+                if let Some(refusal) = drained_refusal(rows, drained, a).await? {
+                    return Ok(Err(refusal));
+                }
                 let Some(mut s) = admitted(rows, a, now).await? else {
-                    return Ok(None);
+                    return Ok(Ok(None));
                 };
                 let fence = claim_run(&mut s, now, owner)?;
                 store_run(rows, &s).await?;
-                Ok(Some(fence))
+                Ok(Ok(Some(fence)))
             })
         })
-        .await
+        .await?
     }
     async fn claim_as(&self, id: &str, now: i64, worker: &Compatibility) -> anyhow::Result<Option<Fence>> {
         let owner = &uuid::Uuid::new_v4().to_string();
@@ -1864,7 +1920,7 @@ impl RunStore for TransactionalStore {
         self.read(|rows| Box::pin(async move { Ok(queued(rows, key).await?.map(|q| q.admission)) })).await
     }
     async fn fire(&self, firing: &Firing<'_>, now: i64) -> anyhow::Result<Fired> {
-        self.update(|rows| Box::pin(async move { fire(rows, firing, now, &self.policy).await })).await
+        self.update(|rows| Box::pin(async move { fire(rows, firing, now, &self.policy).await })).await?
     }
     async fn finish(&self, f: &Fence, outcome: &Status, now: i64, threshold: u32) -> anyhow::Result<Status> {
         self.update(|rows| {
@@ -1932,6 +1988,12 @@ impl RunStore for TransactionalStore {
             Box::pin(async move {
                 let mut p = checked(rows, parent, now, self.policy.skew_ms).await?;
                 anyhow::ensure!(link.parent == parent.run_id && a.id != parent.run_id, "invalid child parent");
+                // An owned child takes its definition's room like any start:
+                // the deferred buffered slot goes first.
+                let drained = drain_marked(rows, &a.name, now).await?;
+                if let Some(refusal) = drained_refusal(rows, drained, a).await? {
+                    return Ok(Err(refusal));
+                }
                 for t in [format!("done:{}", a.id), format!("waiting:{}", a.id)] {
                     p.awaits.entry(t).or_insert(now);
                 }
@@ -1955,10 +2017,10 @@ impl RunStore for TransactionalStore {
                 } else if c.run.state == RunState::Waiting {
                     lifecycle(rows, &a.id, &Status::Waiting { wake_at_ms: 0 }, now).await?;
                 }
-                Ok(fence)
+                Ok(Ok(fence))
             })
         })
-        .await
+        .await?
     }
     async fn child_outcome(&self, parent: &str, k: &str, child: &str) -> anyhow::Result<Option<Status>> {
         self.read(|rows| {

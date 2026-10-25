@@ -3711,7 +3711,9 @@ async fn control_overlap(
 /// A buffered slot keeps its place when the emergency stop is cleared: a clear
 /// drains a bounded batch of deferred definitions, and a definition past the
 /// batch must still promote its buffered slot before a later slot of its own
-/// trigger, or another start of the definition, is admitted.
+/// trigger, or another start of the definition (an owned child included), is
+/// admitted. A drain that trips the definition commits with the refusal it
+/// causes, whichever admission path drained it.
 async fn queue_order_after_clear(
     factory: &impl AsyncFn(&str) -> anyhow::Result<TestStore>,
     report: &mut Report,
@@ -3737,16 +3739,41 @@ async fn queue_order_after_clear(
         )
         .await
     };
-    // The fillers sort first and fill the batch; the two last names keep their
+    // The fillers sort first and fill the batch; the last names keep their
     // markers after the clear.
     let mut names: Vec<String> = (0..control::MAX_PAGE).map(|n| format!("fill{n:04}")).collect();
-    names.extend(["zlater".into(), "zstart".into()]);
+    let late = ["zchild", "zlater", "zstart", "ztrip-admit", "ztrip-child", "ztrip-start"];
+    names.extend(late.map(String::from));
     for name in &names {
         let d = s.save_definition(name, "yaml").await?;
         let armed = Arming { triggers: BTreeMap::from([(name.clone(), slot(0))]) };
         s.activate_with(name, d.version, 0, &armed, &Activation::at(0)).await?;
+        if name.starts_with("ztrip") {
+            // One fault short of the threshold, and a buffered slot whose run
+            // the host refuses: its promotion is the fault that trips.
+            let f = s.start(&named(name, &format!("{name}:fault")), 0).await?.unwrap();
+            s.finish(&f, &Status::Faulted(WorkflowError::runtime("fault")), 0, 2).await?;
+        }
         assert_eq!(fire(name, 0, &format!("{name}:first")).await?, Fired::Committed);
-        assert_eq!(fire(name, 1, &format!("{name}:buffered")).await?, Fired::Queued);
+        if name.starts_with("ztrip") {
+            let refused = Refused {
+                admission: named(name, &format!("{name}:buffered")),
+                error: WorkflowError::runtime("cannot admit"),
+                breaker_threshold: 2,
+            };
+            let firing = Firing {
+                key: name,
+                expected: Some(&slot(1)),
+                next: Some(&slot(2)),
+                busy: Some(&slot(2)),
+                refused: Some(&refused),
+                overlap: Some(OverlapGuard { policy: Overlap::Queue, max_concurrent_runs: 2, ceiling: &slot(2) }),
+                ..Firing::default()
+            };
+            assert_eq!(s.fire(&firing, 1).await?, Fired::Queued);
+        } else {
+            assert_eq!(fire(name, 1, &format!("{name}:buffered")).await?, Fired::Queued);
+        }
     }
     s.control(&control_request("stop"), &Command::Stop { enabled: true }, 2).await?;
     for name in &names {
@@ -3754,7 +3781,7 @@ async fn queue_order_after_clear(
             .await?;
     }
     s.control(&control_request("clear"), &Command::Stop { enabled: false }, 3).await?;
-    for name in ["zlater", "zstart"] {
+    for name in late {
         assert!(s.get(&format!("{name}:buffered")).await?.is_none(), "the clear's batch skipped {name}");
     }
     // A later slot of the same trigger is buffered behind the older one.
@@ -3766,6 +3793,38 @@ async fn queue_order_after_clear(
     s.admit(&named("zstart", "zstart:manual"), 3).await?;
     assert!(s.get("zstart:buffered").await?.is_some_and(|r| r.ended_ms.is_none()));
     assert!(s.queued("zstart").await?.is_none());
+    // Nor does an owned child of the definition, started by a run of another.
+    let parent = s.start(&named("parent", "parent"), 3).await?.unwrap();
+    let link = |key: &str| ChildLink { parent: "parent".into(), key: key.into(), reference: format!("/{key}") };
+    s.start_child(&parent, &named("zchild", "zchild:owned"), &link("owned"), 3).await?.unwrap();
+    assert!(s.get("zchild:buffered").await?.is_some_and(|r| r.ended_ms.is_none()));
+    assert!(s.queued("zchild").await?.is_none());
+    // Promoting the refused slot is the definition's second fault: the trip
+    // commits with the drain, and the admission that drained it is refused
+    // by that stored trip, its own changes (a child's parent side) rolled back.
+    let tripped = |e: anyhow::Error| e.downcast_ref::<DefinitionTripped>().map(|t| t.name.clone());
+    let before = s.inspect("parent").await?;
+    for (name, refusal) in [
+        ("ztrip-admit", s.admit(&named("ztrip-admit", "ztrip-admit:manual"), 3).await.map(drop)),
+        (
+            "ztrip-child",
+            s.start_child(&parent, &named("ztrip-child", "ztrip-child:owned"), &link("trip"), 3).await.map(drop),
+        ),
+        ("ztrip-start", s.start(&named("ztrip-start", "ztrip-start:manual"), 3).await.map(drop)),
+    ] {
+        assert_eq!(refusal.map_err(tripped).unwrap_err(), Some(name.to_string()), "{name}");
+        let d = s.definitions(name).await?;
+        let trip = d.tripped.as_ref().unwrap_or_else(|| panic!("{name}: the drain's trip was rolled back"));
+        assert_eq!((trip.faults, trip.run.as_str()), (2, format!("{name}:buffered").as_str()), "{name}");
+        assert!(s.get(&format!("{name}:buffered")).await?.is_some_and(|r| r.ended_ms == Some(3)), "{name}");
+        assert!(s.get(&format!("{name}:manual")).await?.is_none(), "{name}");
+        assert!(s.queued(name).await?.is_none(), "{name}");
+    }
+    assert_eq!(s.inspect("parent").await?, before, "the parent's side of a refused child is not committed");
+    let notices = s.notices(10).await?;
+    for name in ["ztrip-admit", "ztrip-child", "ztrip-start"] {
+        assert_eq!(notices.iter().filter(|(_, n)| n["subject"] == name).count(), 1, "{name}: one trip, one notice");
+    }
     audit(&**s).await?;
     Ok(())
 }

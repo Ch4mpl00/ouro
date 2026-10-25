@@ -232,8 +232,8 @@ by TLC exhaustively, with each fairness conjunct named and dropped in turn:
   queue policy with capacity 2, its live run and up to two other runs as
   counters (counted by the breaker or not), the breaker (threshold 2), the
   emergency stop with the deferred drain, interrupted admissions and host
-  refusals. Run outcomes, activations (any version and trigger kind) and
-  starts are adversarial environment steps.
+  refusals. Run outcomes, activations (any version and trigger kind),
+  starts and owned children are adversarial environment steps.
   - **L7** assumes that the trigger's live run and other runs eventually end,
     that every stop is eventually cleared (it may recur forever) and that a
     poll possible infinitely often happens (strong fairness). Not firing,
@@ -248,7 +248,9 @@ by TLC exhaustively, with each fairness conjunct named and dropped in turn:
     two run representatives: the runtime admits a start whatever else is live.
   - **L8_dormant** and **L10_stable** are stability monitors with no fairness:
     within an epoch a consumed one-shot stays dormant unless disarmed, and a trip
-    stays with its content refused (no admission of it).
+    stays with its content refused (no admission of it). **refusalStored**:
+    a start or child refused by a trip is refused by a stored one (a drain's
+    trip commits with the refusal it causes).
 
 What the quotients are connected to, and what not:
 
@@ -265,10 +267,13 @@ What the quotients are connected to, and what not:
   end of any run of the definition follow `drain_queues`, which `contract.qnt`
   simplifies to a promotion after every transition; the worker's notice
   follows the heartbeat renewal in the runtime's execution loop. A firing, an
-  `admit` and a `start` drain their definition's deferred marker in their own
-  commit (`drain_marked`) before they look at the room, so a buffered slot
-  waiting for a poll is never passed over by a later slot of its trigger or by
-  another start; the quotient's `settled` is that step.
+  `admit`, a `start` and an owned child's `start_child` drain their
+  definition's deferred marker in their own commit (`drain_marked`) before
+  they look at the room, so a buffered slot waiting for a poll is never passed
+  over by a later slot of its trigger or by another start; the quotient's
+  `settled` is that step (`firing`, `starting`, `spawning`). A drain that trips
+  the definition commits with the refusal it causes (`drained_refusal`); the
+  quotient's `refusalStored` monitor states it.
 - **Not modelled:** pause and resume, the skip/allow/replace policies (the
   contract's monitors cover them), event-triggered (`on`) schedules and ingress,
   missed slots under `catchup: none`, several triggers or buffered slots per

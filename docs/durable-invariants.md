@@ -835,17 +835,21 @@ promoted, or discarded by an activation or a trip. Promotion commits with the
 end that makes room for it, whichever run of the definition ends. A drain the
 stop deferred happens at clearing (a bounded batch of definitions), at a later
 poll, or in the commit of the next admission to the definition (a firing, a
-start): that admission drains the definition's deferred queue first, so no
-later slot of the trigger and no other start takes the room a buffered slot
-needs ahead of it. No fairness of firing, activation or admissions is assumed.
+start, an owned child): that admission drains the definition's deferred queue
+first, so no later slot of the trigger and no other start takes the room a
+buffered slot needs ahead of it. A drain that trips the definition (a promoted
+refused slot reaching the threshold) commits with the refusal of the admission
+that drained it: the refusal always names a stored trip. No fairness of firing,
+activation or admissions is assumed.
 
 A queue position cannot be stranded. **Source:** [#19][I19]. **Fault:** a crash
 at the predecessor's terminal commit, a stop between the end and the promotion,
 an activation or trip racing promotion. **Mutant:** never promote; promote only
 at the end of the trigger's own run; drop the deferred drain when the stop is
-cleared; admit a firing, or a start, without draining the deferred queue
-first. **Check:** `contract_progress_trigger::L7`; the overlap policy monitors
-of `contract.qnt`.
+cleared; admit a firing, a start or an owned child without draining the
+deferred queue first; roll a drain's trip back with the start it refuses.
+**Check:** `contract_progress_trigger::L7` and `refusalStored`; the overlap
+policy monitors of `contract.qnt`.
 
 #### L8 — A one-shot slot resolves and the trigger stays dormant [P/D, liveness]
 
