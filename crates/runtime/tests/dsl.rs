@@ -616,8 +616,8 @@ async fn a_one_shot_runs_once_at_its_instant_and_is_then_done() {
     f.time.set(59_999);
     assert!(f.rt.fire_due().await.unwrap().is_empty());
     f.time.set(60_000);
-    assert_eq!(f.rt.fire_due().await.unwrap(), vec!["schedule:once:at:1:60000".to_string()]);
-    assert_eq!(completed(settle(&f.rt, "schedule:once:at:1:60000").await), json!({"ok": true}));
+    assert_eq!(f.rt.fire_due().await.unwrap(), vec!["schedule:once:at:60000".to_string()]);
+    assert_eq!(completed(settle(&f.rt, "schedule:once:at:60000").await), json!({"ok": true}));
     // Done: nothing is due again, however late, or from another scheduler.
     for t in [60_001, 3_600_000, 86_400_000 * 365] {
         f.time.set(t);
@@ -626,9 +626,36 @@ async fn a_one_shot_runs_once_at_its_instant_and_is_then_done() {
     let (_, trigger) = f.rt.triggers("once").await.unwrap().pop().unwrap();
     assert_eq!((trigger.at_ms, &trigger.state["done"]), (None, &json!(true)));
     assert_eq!(f.rt.list(Some("once"), "").await.unwrap().len(), 1);
-    // A new activation arms the version's instant again, in a new epoch.
-    save(&f.rt, "once", &scheduled("once", "", "at: '1970-01-01T00:01:00Z'", body)).await;
-    assert_eq!(f.rt.fire_due().await.unwrap(), vec!["schedule:once:at:2:60000".to_string()]);
+}
+
+/// A one-shot fires once per `at` value (#31, M-4): activating the same
+/// instant again, whatever the reason, does not run it again, and a changed
+/// instant arms it.
+#[tokio::test]
+async fn a_one_shot_does_not_fire_again_for_the_same_instant_but_does_for_a_changed_one() {
+    let f = fixture();
+    let body = "{ set: { ok: true } }";
+    let at = |instant: &str| scheduled("once", "", &format!("at: '{instant}'"), body);
+    f.time.set(1_000_000);
+    save(&f.rt, "once", &at("1970-01-01T00:01:00Z")).await;
+    assert_eq!(f.rt.fire_due().await.unwrap(), vec!["schedule:once:at:60000".to_string()]);
+    settle(&f.rt, "schedule:once:at:60000").await;
+    // Several reactivations of the same instant (a deploy that activates its
+    // built-in definitions at every boot): nothing runs, and the trigger
+    // stays a dormant record.
+    for _ in 0..3 {
+        save(&f.rt, "once", &at("1970-01-01T00:01:00Z")).await;
+        assert!(f.rt.fire_due().await.unwrap().is_empty());
+        let (_, trigger) = f.rt.triggers("once").await.unwrap().pop().unwrap();
+        assert_eq!((trigger.at_ms, &trigger.state["done"]), (None, &json!(true)));
+    }
+    assert_eq!(f.rt.list(Some("once"), "").await.unwrap().len(), 1);
+    // Another instant is another one-shot.
+    save(&f.rt, "once", &at("1970-01-01T00:02:00Z")).await;
+    assert_eq!(f.rt.fire_due().await.unwrap(), vec!["schedule:once:at:120000".to_string()]);
+    // The earlier instant, armed again, ran already too.
+    save(&f.rt, "once", &at("1970-01-01T00:01:00Z")).await;
+    assert!(f.rt.fire_due().await.unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -637,7 +664,7 @@ async fn a_one_shot_in_the_past_runs_late_even_without_catchup() {
     f.time.set(1_000_000);
     save(&f.rt, "late", &scheduled("late", "", "at: '1970-01-01T00:01:00Z', catchup: none", "{ set: { ok: true } }"))
         .await;
-    assert_eq!(f.rt.fire_due().await.unwrap(), vec!["schedule:late:at:1:60000".to_string()]);
+    assert_eq!(f.rt.fire_due().await.unwrap(), vec!["schedule:late:at:60000".to_string()]);
 }
 
 #[tokio::test]

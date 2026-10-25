@@ -43,6 +43,8 @@ def main():
     if selected("simulation"):
         for source in sorted(ROOT.glob("*.qnt")):
             run(f"typecheck-{source.stem}", [QUINT, "typecheck", str(source)])
+        for script in ["test_evidence", "test_temporal"]:
+            run(script, ["python3", str(ROOT / f"{script}.py")])
         run("unit-contract", [QUINT, "test", str(ROOT / "contract_witnesses.qnt"), "--max-samples", "1", "--seed", "20261023"])
         run("contract-simulation", [QUINT, "run", str(ROOT / "contract.qnt"), "--invariant", "checked", "--max-samples", str(args.samples), "--max-steps", "150", "--seed", "20261023", "--verbosity", "1"])
         run("concurrent-table", [QUINT, "run", str(ROOT / "contract_concurrent.qnt"), "--init", "tableInit", "--step", "tableStep",

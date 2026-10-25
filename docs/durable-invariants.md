@@ -857,11 +857,19 @@ activation replaced it first. Dormancy is stable with no fairness at all:
 nothing but an activation makes the trigger due again (T2), no run's end
 included.
 
-A one-shot fires once per activation. **Source:** [#24][I24]. **Fault:** an
-interrupted admission, a stop at the due time, a crash at the firing commit.
-**Mutant:** a slot that does not consume the trigger; a one-shot's run that
-re-arms it at its end. **Check:** `contract_progress_trigger::L8` and
-`L8_dormant`; `oneShotTest` and the `T1/once`, `T2/once` mutants.
+A one-shot fires once per `at` value: its run id is the instant's, in every
+epoch, so an activation that arms the same instant again (a deploy, clearing a
+trip or a pause) meets the run it made and its slot is consumed as a skip,
+while a changed instant is another run (decision of 2026-10-25, review item
+M-4; the model's activation run index stands for the instant, and a firing of
+a one-shot is the instant's run only). **Source:** [#24][I24], [#31][I31].
+**Fault:** an interrupted admission, a stop at the due time, a crash at the
+firing commit. **Mutant:** a slot that does not consume the trigger; a
+one-shot's run that re-arms it at its end; a run id of the epoch's, which runs
+the same instant again after a reactivation. **Check:**
+`contract_progress_trigger::L8` and `L8_dormant`; `oneShotTest`,
+`oneShotReactivatedTest`, `oneShotChangedTest` and the `T1/once`, `T2/once`,
+`T1/once-id` mutants.
 
 #### L9 — A run's end reaches every owned descendant [P/D, liveness]
 
@@ -1108,6 +1116,7 @@ public runtime exports already implement that rule.
 [I23]: https://github.com/Ch4mpl00/ouro/issues/23
 [I24]: https://github.com/Ch4mpl00/ouro/issues/24
 [I28]: https://github.com/Ch4mpl00/ouro/issues/28
+[I31]: https://github.com/Ch4mpl00/ouro/issues/31
 [RMR]: https://arxiv.org/html/2608.03836
 [DF]: https://www.microsoft.com/en-us/research/uploads/prod/2021/10/DF-Semantics-With-Proofs.pdf
 [DBOS]: https://www.dbos.dev/blog/how-to-test-durable-execution
@@ -1270,9 +1279,12 @@ Addendum (2026-10-25, issue #29). An operator may hold one run and its live
 owned descendants, in one transition, and release them. A held run takes no
 step: it is never claimed nor due (its wake-up and timers are kept, not fired),
 its owner's fenced operations and dispatches are refused, and it starts no
-child; the only things it commits are the answer of a call already dispatched
-(the call is not retracted), the owner giving its lease back, mailbox
-acceptance of events and a cancellation, which ends the hold. A release
+child; the only things it commits are the owner's answer to a call (a call
+already dispatched is not retracted; the proof that a call did nothing is
+accepted whether or not it was dispatched, so a refusal before dispatch, such
+as an input validation, is committed under a hold too), the owner giving its
+lease back, mailbox acceptance of events and a cancellation, which ends the
+hold. A release
 restores exactly what the hold kept, so due work is due again in the same
 transition. A held run is live (overlap, the ceiling); an ended run is never
 held. The model states this as H1 (no step, no dispatch), H2 (no claim), H3

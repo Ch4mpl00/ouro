@@ -132,6 +132,9 @@ pub enum SchemaError {
     Unmigrated,
     /// A schema version other than the one this build reads.
     Unsupported { found: i64, supported: i64 },
+    /// The layout of an earlier release, which recorded no schema version
+    /// in the store itself (SQLite's v0.1.0 rows). It is not converted.
+    Legacy,
 }
 impl SchemaError {
     /// The refusal for a recorded schema `version` (0: none).
@@ -150,6 +153,7 @@ impl std::fmt::Display for SchemaError {
             Self::Unsupported { found, supported } => {
                 write!(f, "unsupported store schema version {found} (this build reads {supported})")
             }
+            Self::Legacy => f.write_str("the store has the layout of an earlier release, which is not converted"),
         }
     }
 }

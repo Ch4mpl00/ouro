@@ -532,6 +532,32 @@ async fn dry_runs_and_replays_report_nothing_to_observers() {
     assert_eq!(recorder.events().len(), heard);
 }
 
+/// A start pinned at a stored version is an admission like any other: the
+/// observers hear `run_admitted` once, and a runtime without telemetry
+/// counts nothing for it.
+#[tokio::test]
+async fn a_pinned_start_is_reported_as_an_admission() {
+    let recorder = Arc::new(Recorder::default());
+    let rt = Runtime::new(
+        Arc::new(durable::memory::memory()),
+        Arc::new(registry(Arc::default(), Arc::default(), Arc::default())),
+        Config::default(),
+        Arc::new(Time::default()),
+        noop(),
+    )
+    .unwrap()
+    .with_observer(recorder.clone());
+    save(&rt, "plain", &doc("plain", "do: [ { a: { call: echo } } ]")).await;
+    let first = rt.definitions("plain").await.unwrap().active.unwrap();
+    rt.start_at("p", "plain", first, json!({})).await.unwrap();
+    let admitted: Vec<Event> = recorder.events().into_iter().filter(|e| kind(e) == "run_admitted").collect();
+    assert_eq!(admitted.len(), 1, "{admitted:#?}");
+    assert_eq!((admitted[0].run_id.as_str(), admitted[0].root_id.as_deref()), ("p", Some("p")));
+    // The same start again admits nothing new.
+    rt.start_at("p", "plain", first, json!({})).await.unwrap();
+    assert_eq!(recorder.events().iter().filter(|e| kind(e) == "run_admitted").count(), 1);
+}
+
 struct Vault;
 impl SecretResolver for Vault {
     fn resolve(&self, name: &str) -> anyhow::Result<Option<Value>> {

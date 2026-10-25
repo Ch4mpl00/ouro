@@ -38,7 +38,9 @@ pub enum Command {
         note: String,
     },
     /// Lets a held run and its held descendants continue from the same
-    /// place; due work the hold kept is due again in the same commit.
+    /// place; due work the hold kept is due again in the same commit. The
+    /// operator's counterpart of `Hold`, not `RunStore::release` (a worker
+    /// giving its lease back).
     Release {
         run: String,
     },
@@ -305,6 +307,7 @@ pub struct Inspection {
     /// The content digest the admitted version had in the catalog when the
     /// run was admitted (stored with the run, not recomputed); empty when the
     /// catalog did not hold that version. What a trip compares admissions by.
+    #[serde(default)]
     pub digest: String,
     /// The call journal, each call with its annotations.
     pub calls: Vec<CallEntry>,

@@ -161,6 +161,10 @@ async fn race(store: &dyn RunStore, p: &Prepared, k: usize, c: &Cmd) -> (i64, Op
             let slot = t.state["slot"].as_i64().unwrap();
             let rearm = t.state["rearm"].as_bool().unwrap();
             let once = t.state["once"].as_bool().unwrap();
+            // A one-shot's run id is its instant's (the model's guard).
+            if once && i64::try_from(c.r).unwrap() != t.state["onceAt"].as_i64().unwrap() {
+                return (0, None);
+            }
             let at = |at: Option<i64>| {
                 let mut next = t.clone();
                 next.at_ms = at.map(|at| at * TICK);
@@ -206,9 +210,10 @@ async fn race(store: &dyn RunStore, p: &Prepared, k: usize, c: &Cmd) -> (i64, Op
             let version = c.i as u64 + 1;
             let mut arming = Arming::default();
             if version == 1 {
-                arming
-                    .triggers
-                    .insert(SCHEDULE.into(), schedule_trigger(Some(ms / TICK + 2), p.epoch + 1, 0, Mode::of(c.value)));
+                arming.triggers.insert(
+                    SCHEDULE.into(),
+                    schedule_trigger(Some(ms / TICK + 2), p.epoch + 1, 0, Mode::of(c.value, c.r)),
+                );
             }
             i64::from(store.activate_with(NAME, version, p.epoch, &arming, &Activation::at(0)).await.unwrap().is_some())
         }

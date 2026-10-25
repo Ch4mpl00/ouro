@@ -65,7 +65,7 @@ are the bridges in `crates/durable/tests/quint.rs` and `quint/concurrent.rs`.
 | X3 | `X3`: no silent readmission/reopening | Terminal/admission checks |
 | S1 | `S1`: emergency stop blocks claim, firing and admission (including children and ingress); clearing preserves evidence | Stop/clear witnesses, serial MBT, `S1` guard mutant, control conformance |
 | B1 | `B1`: tree counter within the ceiling, equal to a live root's granted decisions; immutable decisions; refusal only at the ceiling | Serial MBT (`spend`, decisions projected); `budgetTest` witness; budget conformance; generated interpreter budgets |
-| H1 | `H1`: a held run takes no fenced step and no dispatch (only the answer of a call already dispatched, and the owner giving its lease back) | `heldStepsTest`, `heldDispatchTest`; mutants `H1`, `H1/dispatch`; serial MBT; control conformance (`holds`: `Held` on every fenced operation, the answer recorded) |
+| H1 | `H1`: a held run takes no fenced step and no dispatch (only the owner's answer to a call, a result or a proof that it did nothing, which the model and the engine accept before dispatch too, and the owner giving its lease back) | `heldStepsTest`, `heldDispatchTest`; mutants `H1`, `H1/dispatch`; serial MBT; control conformance (`holds`: `Held` on every fenced operation, the answer recorded) |
 | H2 | `H2`: a held run is never claimed | `heldClaimTest`, `heldClaimedTest`; mutant `H2`; serial MBT audits `due` and `due_as` without held runs; conformance audits the due indexes |
 | H3 | `H3`: a hold marks the run and its live owned descendants in one transition and changes nothing else; a release restores exactly | `heldTreeTest`, `heldChildTest`, `heldReleasedTest`; mutants `H3` (misses the subtree), `H3/release` (changes more than the flags); conformance (`holds`, the commit-fault matrix); scalability bounds |
 | H4 | `H4`: an ended run is never held (a cancel or any end clears the hold) | `heldCancelledTest`; mutant `H4`; conformance audit |
@@ -133,9 +133,14 @@ deadline fixed at admission and epoch.
   value 4, `once`) is consumed by its slot however the slot ends (run, skip,
   buffer, refusal): the trigger stays armed in the catalog but dormant
   (`due` below zero) and no run's end re-arms it; only an activation does.
-  T1 checks the dormancy after the slot, T2 that nothing else wakes it;
-  `oneShotTest` and `oneShotBusyTest` witness it and the `T1/once` and
-  `T2/once` mutants separate it. The values 2 and 3 select `after` re-arm
+  The activation's run index `r` is the one-shot's instant (`onceAt`), and
+  its run id is the instant's in every epoch: a firing of a one-shot is run
+  `onceAt` only. Activating the same instant again therefore meets the run it
+  made (a skip, `oneShotReactivatedTest`), and a changed instant is another
+  run (`oneShotChangedTest`). T1 checks the dormancy after the slot and the
+  run id, T2 that nothing else wakes it; `oneShotTest` and `oneShotBusyTest`
+  witness it and the `T1/once`, `T1/once-id` and `T2/once` mutants separate
+  it. The values 2 and 3 select `after` re-arm
   (value 4 did before); cron arithmetic and time zones stay outside the model. `refuse` is a firing whose
   run the host cannot admit (#15), subject to the same overlap policy. Its
   run is admitted already ended with an unhandled failure when the policy
@@ -167,8 +172,8 @@ deadline fixed at admission and epoch.
   nothing (the `check_lease` boundary), and keeps everything else: its wake-up
   and lease, which `due` ignores; events are still accepted into its mailbox.
   `answers` (the owner's authority alone) lets the owner record the result
-  or proven non-execution of a call already dispatched and give its lease
-  back. Any end of a run, cancellation included, clears the flag. H1–H4 state
+  or proven non-execution of a call (a call not yet dispatched too: a
+  refusal before dispatch is the same record) and give its lease back. Any end of a run, cancellation included, clears the flag. H1–H4 state
   it.
 - **Pause** (V2). `pause` is a trip with `manual` set that reports no notice
   and refuses every admission whatever its content (`barred`); `resume` clears
@@ -385,7 +390,12 @@ lease expiry, bounded clock jump, storage disconnect, invalid value, intervening
 activation and alternate application version. `contract_faults.py` interleaves
 each switch with fault-free steps. `contract_fault_detection.py` couples each row
 to an explicit broken mechanism and records the observed bad-consequence
-footprint. `evidence.py` publishes the matrices in `contract-evidence.json`.
+footprint. `evidence.py` publishes the matrices in `contract-evidence.json`; on
+a checkout without `.results` it republishes the committed sections and sets
+`stale` when a model source changed since they ran (`test_evidence.py`).
+`test_temporal.py` pins the temporal stage's own rules: TLC's deadlock check
+stays on for every quotient but the run tree's (whose terminal states stutter)
+and a clean result needs exit code 0.
 
 ## Running
 

@@ -23,7 +23,7 @@
 //! trigger the run's firing stored).
 //!
 //! A slot's run id is derived from the slot (`schedule:<name>:every:<ms>`,
-//! `…:cron:<ms>`, `…:after:<epoch>:<n>`, `…:on:<digest of the events>`) and
+//! `…:cron:<ms>`, `…:at:<ms>`, `…:after:<epoch>:<n>`, `…:on:<digest of the events>`) and
 //! the trigger moves to the next slot in the commit that admits it, so
 //! several processes start each run once. `document.metadata.overlap` chooses
 //! skip, allow, queue (one durable slot) or replace (normal cancellation)
@@ -374,15 +374,26 @@ impl Runtime {
                 }
                 // A one-shot is consumed by its slot, whatever becomes of it:
                 // run, skip, queue or refusal. It stays as a dormant record
-                // (`done`, with its skip) and nothing re-arms it; only a new
-                // activation arms the version's instant again. Its slot is
+                // (`done`, with its skip) and nothing re-arms it. Its slot is
                 // never "missed": nothing follows it, so it runs late rather
                 // than not at all, whatever `catchup` says.
                 for trigger in [&mut next, &mut busy] {
                     trigger.at_ms = None;
                     trigger.state["done"] = json!(true);
                 }
-                format!("schedule:{name}:at:{}:{slot}", definitions.epoch)
+                // The run id is the instant's, not the activation's: an
+                // activation arms the instant again (a deploy, clearing a
+                // trip or a pause), and a run that exists under the id means
+                // the instant ran (or was refused, which records a run
+                // too). The slot is then consumed without a second run; a
+                // changed instant is another id and runs.
+                let id = format!("schedule:{name}:at:{slot}");
+                if self.store.get(&id).await?.is_some() {
+                    let ran = skipped(next, slot, "already run");
+                    self.store.fire(&moved(k, t, &ran, None), now).await?;
+                    return Ok(None);
+                }
+                id
             }
             _ => return Ok(None),
         };

@@ -308,6 +308,22 @@ async fn sqlite_read_only_open_never_creates_or_migrates() {
     let expected = SchemaError::Unsupported { found: 2, supported: 1 };
     assert_eq!(schema(SqliteBackend::open_read_only(&newer).err().unwrap()), expected);
     assert_eq!(schema(SqliteBackend::open(&newer).err().unwrap()), expected);
+    // A v0.1.0 file (rows, the schema in `user_version`, no recorded
+    // version) is a layout of an earlier release: both opens refuse it with
+    // its own typed error, and neither touches it.
+    let legacy = dir.path().join("legacy.sqlite");
+    rusqlite::Connection::open(&legacy)
+        .unwrap()
+        .execute_batch(&format!("{} PRAGMA user_version = 1;", include_str!("../migrations/sqlite/001_initial.sql")))
+        .unwrap();
+    assert_eq!(schema(SqliteBackend::open_read_only(&legacy).err().unwrap()), SchemaError::Legacy);
+    assert_eq!(schema(SqliteBackend::open(&legacy).err().unwrap()), SchemaError::Legacy);
+    let names: Vec<String> = {
+        let raw = rusqlite::Connection::open(&legacy).unwrap();
+        let mut query = raw.prepare("SELECT name FROM sqlite_master ORDER BY name").unwrap();
+        query.query_map([], |r| r.get(0)).unwrap().map(Result::unwrap).collect()
+    };
+    assert_eq!(names, ["ouro_rows"], "a refused open adds no table");
     // A store whose writer has closed (its WAL checkpointed away) still
     // opens read-only and answers; a write is refused by the backend and,
     // underneath it, by SQLite.
