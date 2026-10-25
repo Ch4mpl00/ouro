@@ -1,6 +1,6 @@
 # 02. Where error-handling rules are checked
 
-Status: approved · Issues: #32, H-1 of #31 · Review: goldfish round 1 (2026-10-25)
+Status: implemented (c7d5674) · Issues: #32, H-1 of #31 · Review: goldfish round 1 (2026-10-25)
 
 ## Problem
 
