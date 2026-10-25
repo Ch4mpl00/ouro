@@ -3548,7 +3548,7 @@ do:
     #[tokio::test]
     async fn a_retry_around_a_refused_jump_ends_at_the_attempt_ceiling() {
         let s = setup(Fake::default());
-        let doc = "document: { dsl: '1.0.4', namespace: test, name: w, version: '0.1.0', metadata: { limits: { max_jumps: 3 } } }\ndo:\n  - guard:\n      try:\n        - step: { set: { n: '${ .n + 1 }' } }\n        - again: { switch: [ { done: { when: '${ .n < 0 }', then: exit } }, { more: { then: step } } ] }\n      catch: { retry: {}, do: [ { h: { set: { r: gave_up } } } ] }\n";
+        let doc = "document: { dsl: '1.0.4', namespace: test, name: w, version: '0.1.0', metadata: { ouro: { limits: { max_jumps: 3 } } } }\ndo:\n  - guard:\n      try:\n        - step: { set: { n: '${ .n + 1 }' } }\n        - again: { switch: [ { done: { when: '${ .n < 0 }', then: exit } }, { more: { then: step } } ] }\n      catch: { retry: {}, do: [ { h: { set: { r: gave_up } } } ] }\n";
         let o = exec(&s, doc, json!({"n": 0})).await;
         assert_eq!(completed(&o)["r"], "gave_up");
         // The ceiling counts the first attempt: each later one is refused at once.
