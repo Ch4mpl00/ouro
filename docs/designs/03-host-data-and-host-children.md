@@ -67,8 +67,16 @@ elephant while the maintainer was away are logged in ouro-agent `docs/designs/LO
     refusals as the built-in. A pinned version uses a new
     `Admitter::pinned_in(lineage)` (R-M5).
   - Committed through the calling execution's fence, atomically with the
-    parent's subscriptions; on join the store compares the full admission
-    (name, version, host) and returns a typed mismatch error (R-H4).
+    parent's subscriptions. **A child join is "first commit wins"** (revised
+    2026-10-25, after the application's review found a crash problem): if a
+    child with that id exists, the store returns it and compares only the
+    definition name (another name is a typed mismatch error); input, version
+    and host data are not compared and the stored ones stay. Reason: a
+    child-starting function is at-least-once, and a re-dispatch after a crash
+    recomputes host data from live state (a clock, files); a full comparison
+    would refuse it, fault the parent and, by the cascade, cancel the healthy
+    child. Roots started with `Runtime::start_with` keep the full comparison
+    (R-H4): their ids are the host's, and a difference there is a bug.
   - Errors (R-M4): depth, trip, pause, mismatch → the handler gets a typed
     refusal and should answer `not_executed` (no effect happened); lease lost
     or storage failure → `interrupted`. Child-starting functions must be
@@ -76,7 +84,8 @@ elephant while the maintainer was away are logged in ouro-agent `docs/designs/LO
     id); registering one at-most-once is documented as wrong (an unknown
     outcome can't be joined).
   - The existing public `Runtime::start_child(parent_fence, key, id, name,
-    input)` gains a `host: Value` argument (R-M5).
+    input)` gains a `host: Value` argument (R-M5); it joins an existing child
+    by the same first-commit-wins rule.
 - **Built-in children** (`run: workflow`, built-in `start_child`) get no host
   data — unchanged code paths, now asserted by tests.
 - **Visibility (R-H1):** the control API redacts host data everywhere except
@@ -110,8 +119,10 @@ elephant while the maintainer was away are logged in ouro-agent `docs/designs/LO
   child-starting functions at-least-once.
 - Lease lost between handler start and commit: the commit is refused, the
   call fails without a child.
-- Mismatch on join (same key, different name/version/host): typed error, no
-  second child.
+- Join with the same key and another definition name: typed error, no
+  second child. Another version, input or host data on a join (a
+  re-dispatch that recomputed them): the existing child is returned with
+  what it was first admitted with; no error, no second child.
 
 ## Tests
 
@@ -122,8 +133,9 @@ Test-first; each must fail before the change.
   `host == null` even when the parent has host data.
 - `FunctionContext::start_child`: child owned (cascade on parent end), budget
   shared, depth limit, pinned version honoured, trip refusal by digest, pause
-  refusal; replay/re-dispatch joins the same child; mismatch error; lease-lost
-  refusal. Conformance on memory/SQLite/Postgres incl. crash points around the
+  refusal; replay/re-dispatch joins the same child; a re-dispatch with
+  different host data joins the existing child and keeps the first host data;
+  another definition name is a mismatch error; lease-lost refusal. Conformance on memory/SQLite/Postgres incl. crash points around the
   child commit.
 - Control redaction in `list`/`history`/`children`, visible in `inspect`.
 - Size bound; `start` on an existing run with host data errors.
