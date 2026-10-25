@@ -1922,3 +1922,38 @@ async fn refused_slots_follow_the_selected_overlap_policy() {
         }
     }
 }
+
+#[tokio::test]
+async fn a_held_run_keeps_its_timer_counts_as_live_and_resumes_on_release() {
+    use ouro_runtime::control::{Control, Reply};
+    let store = Arc::new(durable::memory::memory());
+    let f = fixture_on(store.clone(), Arc::default(), Arc::default(), Arc::default());
+    let control = Control::new(store, f.time.clone());
+    let operator =
+        |id: &str| ouro_runtime::control::Request { id: id.into(), actor: "operator".into(), reason: "review".into() };
+    let yaml =
+        doc("held", "schedule: { every: PT1M }\ndo: [ { pause: { wait: PT1M } }, { done: { set: { ok: true } } } ]")
+            .replace("version: '1.0.0' }", "version: '1.0.0', metadata: { overlap: skip } }");
+    save(&f.rt, "held", &yaml).await;
+    f.time.set(60_000);
+    let first = f.rt.fire_due().await.unwrap().pop().unwrap();
+    assert_eq!(settle(&f.rt, &first).await, None, "waiting on its timer");
+    assert_eq!(control.hold(&operator("hold"), &first, "look").await.unwrap(), Reply::Changed(true));
+    // The timer ends and nothing fires the run: it is due to nobody.
+    f.time.set(130_000);
+    assert_eq!(f.rt.recover_once(&CancellationToken::new()).await.unwrap(), 0);
+    // It still counts as live: the overlap policy skips the next slot.
+    assert!(f.rt.fire_due().await.unwrap().is_empty());
+    assert_eq!(f.rt.list(Some("held"), "").await.unwrap().len(), 1);
+    // Released, the overdue timer resumes the run under the existing rules.
+    control.release(&operator("release"), &first).await.unwrap();
+    assert_eq!(completed(settle(&f.rt, &first).await), json!({"ok": true}));
+    // A held run can be cancelled, which frees its slot.
+    f.time.set(190_000);
+    let second = f.rt.fire_due().await.unwrap().pop().unwrap();
+    control.hold(&operator("hold-second"), &second, "look").await.unwrap();
+    f.rt.cancel(&second).await.unwrap();
+    assert!(f.rt.get(&second).await.unwrap().unwrap().held.is_none());
+    f.time.set(250_000);
+    assert_eq!(f.rt.fire_due().await.unwrap().len(), 1);
+}

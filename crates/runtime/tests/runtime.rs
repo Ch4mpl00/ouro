@@ -1771,3 +1771,192 @@ async fn a_pinned_start_is_checked_like_any_start_and_a_trip_refuses_only_its_co
     rt.activate("workflow", copy.version).await.unwrap();
     rt.start_at("q", "workflow", bad.version, json!({})).await.unwrap();
 }
+
+#[tokio::test]
+async fn a_hold_stops_the_run_at_the_next_step_records_the_answer_in_flight_and_release_continues() {
+    use ouro_runtime::control::Control;
+    for delivery in [Delivery::AtLeastOnce, Delivery::AtMostOnce] {
+        let store = Arc::new(durable::memory::memory());
+        let clock = Arc::new(Time::default());
+        let control = Arc::new(Control::new(store.clone(), clock.clone()));
+        let (first, second) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let mut registry = Registry::new();
+        let (hold, calls) = (control.clone(), first.clone());
+        registry
+            .register(
+                Function::new("hold", json!({}), json!({}), move |_: Value, _: FunctionContext| {
+                    let first = calls.fetch_add(1, Ordering::SeqCst) == 0;
+                    let hold = hold.clone();
+                    async move {
+                        // The operator holds the run while its call is out.
+                        if first {
+                            hold.hold(&operator("hold"), "r", "while it runs").await.unwrap();
+                        }
+                        Ok(json!({}))
+                    }
+                })
+                .with_delivery(delivery),
+            )
+            .unwrap();
+        let calls = second.clone();
+        registry
+            .register(Function::new("next", json!({}), json!({}), move |_: Value, _: FunctionContext| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                async { Ok(json!({})) }
+            }))
+            .unwrap();
+        let rt = runtime(store.clone(), registry, clock);
+        save(&rt, &yaml("  - hold: { call: hold }\n  - next: { call: next }")).await;
+        rt.start("r", "workflow", json!({})).await.unwrap();
+        let token = CancellationToken::new();
+        assert!(matches!(rt.drive("r", &token).await.unwrap(), Some(Status::Interrupted(_))));
+        // The step after the answer never ran; the answer was recorded.
+        assert_eq!(second.load(Ordering::SeqCst), 0);
+        let held = rt.get("r").await.unwrap().unwrap();
+        assert_eq!(held.state, durable::RunState::Ready);
+        assert_eq!(held.held.as_ref().map(|h| h.note.as_str()), Some("while it runs"));
+        assert_eq!(rt.calls("r").await.unwrap()[0].state, CallStatus::Completed);
+        // Not due, not claimed, and a counted state of its own.
+        assert_eq!(rt.recover_once(&token).await.unwrap(), 0);
+        assert_eq!(rt.drive("r", &token).await.unwrap(), None);
+        let filter = ouro_runtime::control::Runs { definition: Some("workflow".into()), ..Default::default() };
+        assert_eq!(control.counts(&filter, false, None, 10).await.unwrap().states["held"], 1);
+        assert_eq!(control.inspect("r").await.unwrap().unwrap().snapshot.run.held, held.held);
+        // The same request repeats its reply; a second hold changes nothing.
+        let again = control.hold(&operator("again"), "r", "x").await.unwrap();
+        assert_eq!(again, ouro_runtime::control::Reply::Changed(false));
+        control.release(&operator("release"), "r").await.unwrap();
+        assert_eq!(rt.drive("r", &token).await.unwrap(), Some(Status::Completed(json!({}))));
+        // Neither step repeated: the recorded answer stood, whatever the delivery.
+        assert_eq!((first.load(Ordering::SeqCst), second.load(Ordering::SeqCst)), (1, 1));
+    }
+}
+
+#[tokio::test]
+async fn a_hold_reaches_a_busy_worker_through_its_lease_renewal_and_keeps_the_calls_delivery_rules() {
+    use ouro_runtime::control::Control;
+    for delivery in [Delivery::AtLeastOnce, Delivery::AtMostOnce] {
+        let store = Arc::new(durable::memory::memory());
+        let clock = Arc::new(Time::default());
+        let control = Arc::new(Control::new(store.clone(), clock.clone()));
+        let started = Arc::new(tokio::sync::Notify::new());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut registry = Registry::new();
+        let (signal, count) = (started.clone(), calls.clone());
+        registry
+            .register(
+                Function::new("slow", json!({}), json!({}), move |_: Value, _: FunctionContext| {
+                    // The first dispatch never answers; the next one does.
+                    let first = count.fetch_add(1, Ordering::SeqCst) == 0;
+                    let signal = signal.clone();
+                    async move {
+                        if first {
+                            signal.notify_one();
+                            std::future::pending::<()>().await;
+                        }
+                        Ok(json!({}))
+                    }
+                })
+                .with_delivery(delivery),
+            )
+            .unwrap();
+        let rt = Runtime::new(
+            store,
+            Arc::new(registry),
+            Config { heartbeat_interval: Duration::from_millis(20), ..Config::default() },
+            clock,
+            tracer(),
+        )
+        .unwrap();
+        save(&rt, &yaml("  - slow: { call: slow }")).await;
+        rt.start("r", "workflow", json!({})).await.unwrap();
+        let token = CancellationToken::new();
+        let operate = async {
+            started.notified().await;
+            control.hold(&operator("hold"), "r", "busy").await.unwrap();
+        };
+        let (driven, ()) = tokio::join!(rt.drive("r", &token), operate);
+        // Seen at the next renewal, given one heartbeat to answer, then
+        // dropped like any stopped run and its lease given back.
+        assert!(matches!(driven.unwrap(), Some(Status::Interrupted(_))), "{delivery:?}");
+        let held = rt.get("r").await.unwrap().unwrap();
+        assert!(held.held.is_some() && held.state == durable::RunState::Ready && held.fence.is_none());
+        let pending = if delivery == Delivery::AtLeastOnce { CallStatus::Pending } else { CallStatus::Unknown };
+        assert_eq!(rt.calls("r").await.unwrap()[0].state, pending);
+        assert_eq!(rt.get("r").await.unwrap().unwrap().interruptions, 0, "a hold spends no interruption");
+        control.release(&operator("release"), "r").await.unwrap();
+        let outcome = rt.drive("r", &token).await.unwrap();
+        if delivery == Delivery::AtLeastOnce {
+            assert_eq!(outcome, Some(Status::Completed(json!({}))));
+            assert_eq!(calls.load(Ordering::SeqCst), 2, "the pending call is sent again, as after a stop");
+        } else {
+            assert!(matches!(outcome, Some(Status::Faulted(_))));
+            assert_eq!(calls.load(Ordering::SeqCst), 1, "an at most once call is never sent again");
+            assert_eq!(rt.calls("r").await.unwrap()[0].state, CallStatus::Unknown);
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_hold_and_a_release_are_reported_once_and_the_pause_of_a_definition_refuses_every_version() {
+    use ouro_runtime::{
+        control::{Control, Reply},
+        observer::{EventKind, Observer},
+    };
+    struct Seen(Mutex<Vec<(String, EventKind)>>);
+    impl Observer for Seen {
+        fn observe(&self, event: &ouro_runtime::observer::Event) {
+            self.0.lock().unwrap().push((event.run_id.clone(), event.kind.clone()));
+        }
+    }
+    let store = Arc::new(durable::memory::memory());
+    let clock = Arc::new(Time::default());
+    let seen = Arc::new(Seen(Mutex::default()));
+    let rt = Runtime::new(store.clone(), Arc::new(Registry::new()), Config::default(), clock.clone(), tracer())
+        .unwrap()
+        .with_observer(seen.clone());
+    let control = Control::new(store, clock);
+    save(&rt, &yaml("  - done: { set: { ok: true } }")).await;
+    rt.start("r", "workflow", json!({})).await.unwrap();
+    let (hold, release) = (operator("hold"), operator("release"));
+    assert_eq!(
+        rt.control(&hold, &ouro_runtime::control::Command::Hold { run: "r".into(), note: "n".into() }).await.unwrap(),
+        Reply::Changed(true)
+    );
+    // A retry of the committed request repeats the reply, not the event.
+    rt.control(&hold, &ouro_runtime::control::Command::Hold { run: "r".into(), note: "n".into() }).await.unwrap();
+    rt.control(&operator("again"), &ouro_runtime::control::Command::Hold { run: "r".into(), note: "n".into() })
+        .await
+        .unwrap();
+    rt.control(&release, &ouro_runtime::control::Command::Release { run: "r".into() }).await.unwrap();
+    let events: Vec<_> = seen
+        .0
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(_, k)| matches!(k, EventKind::RunHeld { .. } | EventKind::RunReleased { .. }))
+        .cloned()
+        .collect();
+    assert_eq!(
+        events,
+        [
+            (
+                "r".to_owned(),
+                EventKind::RunHeld { actor: "operator".into(), reason: "review".into(), note: "n".into() }
+            ),
+            ("r".to_owned(), EventKind::RunReleased { actor: "operator".into(), reason: "review".into() }),
+        ]
+    );
+    // A manual pause refuses every version, pinned or not.
+    let other = rt.save("workflow", &yaml("  - other: { set: { ok: false } }")).await.unwrap();
+    control.pause(&operator("pause"), "workflow", "look").await.unwrap();
+    for refused in [
+        rt.start_at("p", "workflow", other.version, json!({})).await,
+        rt.start_at("q", "workflow", 1, json!({})).await,
+        rt.start("s", "workflow", json!({})).await.map(|_| unreachable!()),
+    ] {
+        assert!(refused.unwrap_err().downcast_ref::<durable::DefinitionTripped>().is_some_and(|t| t.paused));
+    }
+    control.resume(&operator("resume"), "workflow").await.unwrap();
+    rt.start_at("p", "workflow", other.version, json!({})).await.unwrap();
+}
