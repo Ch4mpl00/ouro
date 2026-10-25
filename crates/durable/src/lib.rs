@@ -562,12 +562,26 @@ pub struct Swept {
 /// lease simply ends at its expiry.
 #[async_trait::async_trait]
 pub trait RunStore: Send + Sync {
+    /// Executes an attributed operator command; its effect, its audit entry
+    /// and its reply commit together. A request id already committed changes
+    /// nothing and returns the stored reply, `Applied::repeated` saying so in
+    /// that same transaction: of two concurrent submissions of one new
+    /// request, exactly one is not a repeat.
+    async fn apply_control(
+        &self,
+        request: &control::Request,
+        command: &control::Command,
+        now_ms: i64,
+    ) -> anyhow::Result<control::Applied>;
+    /// `apply_control`'s reply alone.
     async fn control(
         &self,
         request: &control::Request,
         command: &control::Command,
         now_ms: i64,
-    ) -> anyhow::Result<control::Reply>;
+    ) -> anyhow::Result<control::Reply> {
+        Ok(self.apply_control(request, command, now_ms).await?.reply)
+    }
     async fn stopped(&self) -> anyhow::Result<bool>;
     async fn control_entry(&self, id: &str) -> anyhow::Result<Option<control::Entry>>;
     async fn control_history(

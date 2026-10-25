@@ -1388,12 +1388,12 @@ async fn breaker(
 
 #[async_trait::async_trait]
 impl RunStore for TransactionalStore {
-    async fn control(
+    async fn apply_control(
         &self,
         request: &control::Request,
         command: &control::Command,
         now: i64,
-    ) -> anyhow::Result<control::Reply> {
+    ) -> anyhow::Result<control::Applied> {
         self.update(|rows| Box::pin(async move { control_command(rows, request, command, now, &self.policy).await }))
             .await
     }
@@ -2512,8 +2512,8 @@ async fn control_command(
     command: &control::Command,
     now: i64,
     policy: &Policy,
-) -> anyhow::Result<control::Reply> {
-    use control::{Command, ControlError, Entity, Reply};
+) -> anyhow::Result<control::Applied> {
+    use control::{Applied, Command, ControlError, Entity, Reply};
     if request.id.trim().is_empty() || request.actor.trim().is_empty() || request.reason.trim().is_empty() {
         return Err(ControlError::InvalidInput("control request requires id, actor and reason".into()).into());
     }
@@ -2522,7 +2522,7 @@ async fn control_command(
         if entry.request != *request || entry.command != canonical {
             return Err(ControlError::RequestConflict { id: request.id.clone() }.into());
         }
-        return Ok(entry.reply);
+        return Ok(Applied { reply: entry.reply, repeated: true });
     }
     let unknown = |name: &str| ControlError::NotFound { entity: Entity::Definition, id: name.into() };
     let reply = match command {
@@ -2712,7 +2712,7 @@ async fn control_command(
     {
         put(rows, &partition("control_history_run", run), &k, &entry).await?;
     }
-    Ok(reply)
+    Ok(Applied { reply, repeated: false })
 }
 
 async fn snapshot(rows: &mut dyn Transaction, s: StoredRun) -> anyhow::Result<RunSnapshot> {

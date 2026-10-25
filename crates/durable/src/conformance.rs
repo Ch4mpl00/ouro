@@ -2210,14 +2210,14 @@ impl RunStore for Offloaded {
         let name = name.to_owned();
         offloaded!(self, |s| s.definitions(&name))
     }
-    async fn control(
+    async fn apply_control(
         &self,
         request: &control::Request,
         command: &control::Command,
         now: i64,
-    ) -> anyhow::Result<control::Reply> {
+    ) -> anyhow::Result<control::Applied> {
         let (request, command) = (request.clone(), command.clone());
-        offloaded!(self, |s| s.control(&request, &command, now))
+        offloaded!(self, |s| s.apply_control(&request, &command, now))
     }
     async fn stopped(&self) -> anyhow::Result<bool> {
         offloaded!(self, |s| s.stopped())
@@ -3555,7 +3555,11 @@ async fn holds(factory: &impl AsyncFn(&str) -> anyhow::Result<TestStore>, report
     // One transaction freezes the run and its live descendants, with the
     // attribution; the free run and the waiter are untouched.
     let now = 10;
-    assert_eq!(s.control(&control_request("hold-p"), &hold("p"), now).await?, Reply::Changed(true));
+    let applied = |reply, repeated| control::Applied { reply, repeated };
+    assert_eq!(
+        s.apply_control(&control_request("hold-p"), &hold("p"), now).await?,
+        applied(Reply::Changed(true), false)
+    );
     let held =
         control::Hold { actor: "operator".into(), reason: "maintenance".into(), note: "look".into(), at_ms: now };
     for id in ["p", "c", "g"] {
@@ -3563,9 +3567,12 @@ async fn holds(factory: &impl AsyncFn(&str) -> anyhow::Result<TestStore>, report
     }
     assert!(remote.get("free").await?.unwrap().held.is_none());
     assert_eq!(remote.inspect_control("p").await?.unwrap().snapshot.run.held, Some(held.clone()));
-    // Idempotent: a repeat, by any request, changes nothing and keeps the first attribution.
-    assert_eq!(s.control(&control_request("hold-p"), &hold("p"), now + 1).await?, Reply::Changed(true));
-    assert_eq!(s.control(&control_request("hold-again"), &hold("p"), now + 1).await?, Reply::Changed(false));
+    // Idempotent: a repeat, by any request, changes nothing and keeps the
+    // first attribution; the store says which request is a repeat.
+    let repeat = s.apply_control(&control_request("hold-p"), &hold("p"), now + 1).await?;
+    assert_eq!(repeat, applied(Reply::Changed(true), true));
+    let again = s.apply_control(&control_request("hold-again"), &hold("p"), now + 1).await?;
+    assert_eq!(again, applied(Reply::Changed(false), false));
     assert_eq!(remote.get("c").await?.unwrap().held.as_ref(), Some(&held));
     assert_eq!(s.control_history(Some("p"), None, 10).await?.items.len(), 2);
     assert!(matches!(

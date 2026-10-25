@@ -56,6 +56,14 @@ pub enum Reply {
     Changed(bool),
     Responded(Option<String>),
 }
+/// A command's reply and whether its request was a repeat of one already
+/// committed (`RunStore::apply_control`): a host that reports each request
+/// once reports it when `repeated` is false.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Applied {
+    pub reply: Reply,
+    pub repeated: bool,
+}
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Entry {
     pub request: Request,

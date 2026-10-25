@@ -1897,6 +1897,97 @@ async fn a_hold_reaches_a_busy_worker_through_its_lease_renewal_and_keeps_the_ca
     }
 }
 
+/// A memory backend whose first writing transaction after `arm` waits at its
+/// commit until `release`: the window between deciding and committing.
+#[derive(Default)]
+struct Gated {
+    inner: durable::memory::MemoryBackend,
+    armed: std::sync::atomic::AtomicBool,
+    parked: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+struct GatedTransaction<'a> {
+    inner: Box<dyn durable::Transaction + 'a>,
+    gate: &'a Gated,
+    writes: bool,
+}
+#[async_trait::async_trait]
+impl durable::AtomicBackend for Gated {
+    async fn begin(&self) -> anyhow::Result<Box<dyn durable::Transaction + '_>> {
+        Ok(Box::new(GatedTransaction { inner: self.inner.begin().await?, gate: self, writes: false }))
+    }
+    async fn snapshot(&self) -> anyhow::Result<durable::Snapshot> {
+        self.inner.snapshot().await
+    }
+}
+#[async_trait::async_trait]
+impl durable::Transaction for GatedTransaction<'_> {
+    async fn get(&mut self, kind: &str, id: &str) -> anyhow::Result<Option<Value>> {
+        self.inner.get(kind, id).await
+    }
+    async fn scan(
+        &mut self,
+        kind: &str,
+        start: &str,
+        end: Option<&str>,
+        limit: usize,
+    ) -> anyhow::Result<durable::Rows> {
+        self.inner.scan(kind, start, end, limit).await
+    }
+    async fn put(&mut self, kind: &str, id: &str, value: &Value) -> anyhow::Result<()> {
+        self.writes = true;
+        self.inner.put(kind, id, value).await
+    }
+    async fn delete(&mut self, kind: &str, id: &str) -> anyhow::Result<()> {
+        self.writes = true;
+        self.inner.delete(kind, id).await
+    }
+    async fn commit(self: Box<Self>) -> anyhow::Result<()> {
+        if self.writes && self.gate.armed.swap(false, Ordering::SeqCst) {
+            self.gate.parked.notify_one();
+            self.gate.release.notified().await;
+        }
+        self.inner.commit().await
+    }
+}
+
+// Two submissions of one new request race: the store decides which one is
+// the repeat in the command's own commit, so the event is reported once.
+#[tokio::test]
+async fn concurrent_submissions_of_one_hold_request_report_it_once() {
+    use ouro_runtime::observer::{EventKind, Observer};
+    struct Seen(Mutex<Vec<EventKind>>);
+    impl Observer for Seen {
+        fn observe(&self, event: &ouro_runtime::observer::Event) {
+            if matches!(event.kind, EventKind::RunHeld { .. }) {
+                self.0.lock().unwrap().push(event.kind.clone());
+            }
+        }
+    }
+    let gate = Arc::new(Gated::default());
+    let store = Arc::new(durable::TransactionalStore::new(gate.clone()));
+    let seen = Arc::new(Seen(Mutex::default()));
+    let rt = Runtime::new(store, Arc::new(Registry::new()), Config::default(), Arc::new(Time::default()), tracer())
+        .unwrap()
+        .with_observer(seen.clone());
+    save(&rt, &yaml("  - done: { set: { ok: true } }")).await;
+    rt.start("r", "workflow", json!({})).await.unwrap();
+    let hold = operator("hold");
+    let command = ouro_runtime::control::Command::Hold { run: "r".into(), note: "n".into() };
+    gate.armed.store(true, Ordering::SeqCst);
+    let first = rt.control(&hold, &command);
+    let second = async {
+        gate.parked.notified().await;
+        let reply = rt.control(&hold, &command).await;
+        gate.release.notify_one();
+        reply
+    };
+    let (first, second) = tokio::join!(first, second);
+    let changed = ouro_runtime::control::Reply::Changed(true);
+    assert_eq!((first.unwrap(), second.unwrap()), (changed.clone(), changed));
+    assert_eq!(seen.0.lock().unwrap().len(), 1, "one request, one event");
+}
+
 #[tokio::test]
 async fn a_hold_and_a_release_are_reported_once_and_the_pause_of_a_definition_refuses_every_version() {
     use ouro_runtime::{

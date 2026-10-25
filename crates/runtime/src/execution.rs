@@ -447,14 +447,11 @@ impl Runtime {
         request: &ouro_durable::control::Request,
         command: &ouro_durable::control::Command,
     ) -> Result<ouro_durable::control::Reply, ouro_durable::control::ControlError> {
-        use ouro_durable::control::{Command, Reply};
-        // A retry of a committed request repeats its reply, not its event.
-        let repeated = match command {
-            Command::Hold { .. } | Command::Release { .. } => self.store.control_entry(&request.id).await?.is_some(),
-            _ => false,
-        };
+        use ouro_durable::control::{Applied, Command, Reply};
+        // A retry of a committed request repeats its reply, not its event;
+        // the store tells which in the command's own commit.
         let now = self.clock.now_ms();
-        let reply = self.store.control(request, command, now).await?;
+        let Applied { reply, repeated } = self.store.apply_control(request, command, now).await?;
         match (command, &reply) {
             (Command::Cancel { .. }, _) => self.signal_cancelled().await?,
             (Command::Hold { run, note }, Reply::Changed(true)) if !repeated => {

@@ -644,7 +644,10 @@ attribution; a hold or release that changes nothing answers
 `Changed(false)`), an ended run is never held, and `cancel` works on a held
 run and ends the hold. Both commands are audited like the others, appear in
 the run's journal, and `Runtime::control` reports a change once as a
-`run_held` or `run_released` event.
+`run_held` or `run_released` event: the store says whether a request repeats
+one already committed (`RunStore::apply_control`, `control::Applied`) in the
+command's own commit, so two concurrent submissions of one request report it
+once.
 
 `emergency_stop(request, true)` sets a store-wide flag. Admissions return
 `control::Stopped`; claim and due queries return no work; firings consume no
