@@ -2297,10 +2297,13 @@ dependencies = [
  "ouro-durable",
  "ows",
  "proptest",
+ "serde",
  "serde_json",
  "serde_yaml_ng",
  "tempfile",
+ "testcontainers",
  "tokio",
+ "tokio-postgres",
  "tokio-util",
  "uuid",
 ]

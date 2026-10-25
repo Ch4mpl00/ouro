@@ -130,7 +130,19 @@ impl Runtime {
         runtime.activate(&d.name, d.version).await?;
         runtime.start("dry-run", "dry-run", input).await?;
         runtime.definition_source = self.store.clone();
+        // Traced with the host's tracer, unless the host removed its
+        // OpenTelemetry observer; counted nowhere, and no host observer
+        // hears it: a dry run is no run of the host.
         runtime.tracer = self.tracer.clone();
+        runtime.observers = Arc::new(crate::observer::Observers {
+            telemetry: self
+                .observers
+                .telemetry
+                .as_ref()
+                .map(|_| Arc::new(crate::telemetry::Telemetry::new(self.tracer.clone(), runtime.metrics.clone()))),
+            host: Vec::new(),
+            payload_bytes: 0,
+        });
         let mocked = Arc::new(Mutex::new(Vec::new()));
         let status =
             run_isolated(&runtime, "dry-run", Mode::Dry { mock, mocked: mocked.clone() }, &clock, stop).await?;

@@ -367,7 +367,9 @@ impl Runtime {
                 }
                 None => {
                     self.metrics.fired(name, kind, "admitted");
-                    self.metrics.started(name);
+                    if let Ok(admission) = &admission {
+                        self.observers.admitted(admission, None, &id, now);
+                    }
                     Ok(Some(id))
                 }
             },
@@ -598,9 +600,9 @@ async fn offer(
         let metrics = &admitter.metrics;
         match &result {
             Fired::Committed => match &admission {
-                Some(Ok(_)) => {
+                Some(Ok(admitted)) => {
                     metrics.fired(&name, "on", "admitted");
-                    metrics.started(&name);
+                    admitter.observers.admitted(admitted, None, &admitted.id, now);
                 }
                 Some(Err(_)) => metrics.fired(&name, "on", "refused"),
                 None => {}
@@ -725,11 +727,9 @@ impl Runtime {
             self.noticed(&event, None);
             if self.store.acknowledge(&k).await? {
                 acknowledged += 1;
-                // Counted by the one hand-off whose acknowledgement removed
+                // Reported by the one hand-off whose acknowledgement removed
                 // the notice: once per trip, whichever worker hands it on.
-                if event["type"] == ouro_durable::TRIPPED {
-                    self.metrics.tripped(event["subject"].as_str().unwrap_or_default());
-                }
+                self.observers.tripped(&event, self.clock.now_ms());
             }
             self.notice_backoff.lock().unwrap().remove(&k);
         }

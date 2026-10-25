@@ -1,24 +1,30 @@
-//! Standard OpenTelemetry API only: 1. spans of runs, tasks and calls;
-//! 2. the runtime's metrics. The embedding host supplies its tracer, meter
-//! and exporters. Contexts are attached while polling futures, never across
-//! an await with a thread-local context guard.
+//! The built-in OpenTelemetry observer (standard API only): 1. spans of
+//! runs, tasks and calls, opened and closed by the runtime's events; 2. the
+//! runtime's metrics. The embedding host supplies its tracer, meter and
+//! exporters. Contexts are attached while polling futures, never across an
+//! await with a thread-local context guard.
+//!
+//! The observer sees what every observer sees (`crate::observer`): each fact
+//! once. A drive's spans are what that drive did: a task an earlier drive
+//! entered and this one resumed has no span in it, and its calls hang under
+//! the drive's root. It is the one observer the runtime asks for a trace
+//! context: the drive's root span for the interpreter, the call's span for
+//! its handler (`FunctionContext::span`).
 //!
 //! Metric attributes come from bounded sets only: definition names, outcomes,
 //! function names, deliveries, task kinds, schedule kinds and skip reasons,
 //! annotation names. Run ids and task paths are span attributes, never
 //! metric attributes: each would make a series per run.
+use crate::observer::{CallOutcome, Event, EventKind, Observer, RunOutcome, SpanRef, TaskOutcome};
 use opentelemetry::{
     Context, KeyValue,
     global::BoxedTracer,
     metrics::{Counter, Gauge, Histogram, InstrumentProvider, Meter},
-    trace::{Link, Span, SpanContext, Status, TraceContextExt, TraceId, Tracer},
+    trace::{Link, Span, Status, TraceContextExt, Tracer},
 };
-use ows::{
-    durable::{Annotation, Annotations, Delivery},
-    run::{Event, Observer},
-};
+use ows::durable::{Annotation, Annotations, Delivery};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     sync::{Arc, Mutex},
     time::Instant,
 };
@@ -47,125 +53,237 @@ pub(crate) fn pin_trace(runtime: &mut serde_json::Value) {
     }
 }
 
-/// The admission's pinned span context, linked from every drive's root span.
-fn pinned(run: &ouro_durable::Admission) -> Option<SpanContext> {
-    let trace = TraceId::from_hex(run.runtime["trace_id"].as_str()?).ok()?;
-    let span = opentelemetry::trace::SpanId::from_hex(run.runtime["span_id"].as_str()?).ok()?;
-    let context = SpanContext::new(trace, span, Default::default(), true, Default::default());
-    context.is_valid().then_some(context)
+fn span_ref(context: &Context) -> Option<SpanRef> {
+    SpanRef::of(context.span().span_context())
 }
 
 /// One open task span: its context, kind and when it started, for the
 /// step duration.
 struct OpenTask {
     context: Context,
-    kind: &'static str,
+    kind: String,
     started: Instant,
 }
 
-pub(crate) struct Spans {
-    pub tracer: Arc<BoxedTracer>,
+/// One dispatched call's span, its metric attributes and when it started.
+struct OpenCall {
+    span: ActiveSpan,
+    attributes: Vec<KeyValue>,
+    started: Instant,
+}
+
+/// One drive of a run: its root span and the task and call spans open in
+/// it, by task path.
+struct Drive {
     root: Context,
     attributes: Vec<KeyValue>,
-    tasks: Mutex<BTreeMap<String, OpenTask>>,
-    metrics: Arc<Metrics>,
     definition: String,
+    admitted_ms: i64,
+    tasks: Mutex<BTreeMap<String, OpenTask>>,
+    calls: Mutex<BTreeMap<String, OpenCall>>,
 }
-impl Spans {
-    pub fn new(
-        tracer: Arc<BoxedTracer>,
-        metrics: Arc<Metrics>,
-        parent: &Context,
-        run: &ouro_durable::Admission,
-    ) -> Self {
-        let attributes = vec![
-            KeyValue::new("ouro.run.id", run.id.clone()),
-            KeyValue::new("ouro.definition.name", run.name.clone()),
-            KeyValue::new("ouro.definition.version", run.version.to_string()),
-        ];
-        let mut builder = tracer.span_builder(format!("workflow {}", run.name));
-        if let Some(admitted) = pinned(run) {
-            builder = builder.with_links(vec![Link::with_context(admitted)]);
-        }
-        let root = parent.with_span(tracer.build_with_context(builder, parent));
-        root.span().set_attributes(attributes.clone());
-        root.span().set_attributes([KeyValue::new("ouro.task.path", "/"), KeyValue::new("ouro.attempt", 1_i64)]);
-        Self { tracer, root, attributes, tasks: Mutex::new(BTreeMap::new()), metrics, definition: run.name.clone() }
-    }
-    pub fn root(&self) -> Context {
-        self.root.clone()
-    }
-    pub fn task(&self, path: &str) -> Context {
+impl Drive {
+    fn task(&self, path: &str) -> Context {
         self.tasks.lock().unwrap().get(path).map(|t| t.context.clone()).unwrap_or_else(|| self.root.clone())
     }
-    /// A function call's span. The engine adds no read/write attribute: a
-    /// host that classifies its functions adds its own through the context.
-    pub fn function(&self, name: &str, path: &str, attempt: u32) -> ActiveSpan {
-        let parent = self.task(path);
-        parent.span().set_attribute(KeyValue::new("ouro.attempt", i64::from(attempt)));
-        let context = parent.with_span(self.tracer.start_with_context(format!("function {name}"), &parent));
-        context.span().set_attributes(self.attributes.clone());
-        context.span().set_attributes([
-            KeyValue::new("ouro.task.path", path.to_string()),
-            KeyValue::new("ouro.function.name", name.to_string()),
-            KeyValue::new("ouro.attempt", i64::from(attempt)),
-        ]);
-        ActiveSpan { context, finished: false }
-    }
-    /// The run ended through its jump budget (`Outcome::limit_exceeded`).
-    pub fn limit_exceeded(&self) {
-        self.root.span().set_attribute(KeyValue::new("ouro.limit_exceeded", true));
-    }
-    pub fn finish(&self, outcome: &str) {
+    fn finish(&self, metrics: &Metrics, outcome: &str) {
         self.root.span().set_attribute(KeyValue::new("ouro.outcome", outcome.to_string()));
-        self.close_tasks();
+        self.close(metrics);
         self.root.span().end();
     }
-    fn close_tasks(&self) {
+    /// Calls and tasks still open when the drive ends: interrupted.
+    fn close(&self, metrics: &Metrics) {
+        drop(std::mem::take(&mut *self.calls.lock().unwrap()));
         for (_, task) in std::mem::take(&mut *self.tasks.lock().unwrap()) {
-            self.metrics.step(&self.definition, task.kind, "interrupted", task.started);
+            metrics.step(&self.definition, task.kind, "interrupted", task.started);
             task.context.span().set_attribute(KeyValue::new("ouro.outcome", "interrupted"));
             task.context.span().end();
         }
     }
-    fn end_task(&self, reference: &str, outcome: &'static str, error: Option<String>) {
-        let task = self.tasks.lock().unwrap().remove(reference);
-        if let Some(task) = task {
-            self.metrics.step(&self.definition, task.kind, outcome, task.started);
-            let cx = task.context;
-            cx.span().set_attribute(KeyValue::new("ouro.outcome", outcome));
-            if let Some(error) = error {
-                cx.span().set_status(Status::error(error));
-            }
-            cx.span().end();
+    fn end_task(&self, metrics: &Metrics, path: &str, outcome: &'static str, error: Option<String>) -> Option<SpanRef> {
+        let task = self.tasks.lock().unwrap().remove(path)?;
+        metrics.step(&self.definition, task.kind, outcome, task.started);
+        let cx = task.context;
+        cx.span().set_attribute(KeyValue::new("ouro.outcome", outcome));
+        if let Some(error) = error {
+            cx.span().set_status(Status::error(error));
         }
+        cx.span().end();
+        span_ref(&cx)
     }
 }
-impl Observer for Spans {
-    fn event(&self, event: &Event<'_>) {
-        match event {
-            Event::TaskStarted { reference, parent, kind, .. } => {
-                let parent = parent.map(|p| self.task(p)).unwrap_or_else(|| self.root.clone());
-                let cx = parent.with_span(self.tracer.start_with_context(format!("task {reference}"), &parent));
-                cx.span().set_attributes(self.attributes.clone());
+
+/// Spans and run metrics from the runtime's events: the default observer.
+pub(crate) struct Telemetry {
+    tracer: Arc<BoxedTracer>,
+    metrics: Arc<Metrics>,
+    drives: Mutex<HashMap<String, Arc<Drive>>>,
+}
+impl Telemetry {
+    pub fn new(tracer: Arc<BoxedTracer>, metrics: Arc<Metrics>) -> Self {
+        Self { tracer, metrics, drives: Mutex::new(HashMap::new()) }
+    }
+    fn drive(&self, run: &str) -> Option<Arc<Drive>> {
+        self.drives.lock().unwrap().get(run).cloned()
+    }
+    /// The root span of the run's current drive.
+    pub fn root(&self, run: &str) -> Option<Context> {
+        self.drive(run).map(|d| d.root.clone())
+    }
+    /// The span of the call dispatched at `path` in the run's drive.
+    pub fn call(&self, run: &str, path: &str) -> Option<Context> {
+        self.drive(run)?.calls.lock().unwrap().get(path).map(|c| c.span.context.clone())
+    }
+    /// Records `event` and returns the span it belongs to.
+    pub fn record(&self, event: &Event) -> Option<SpanRef> {
+        let definition = &event.definition;
+        let path = event.task_path.as_deref();
+        match &event.kind {
+            EventKind::RunAdmitted { .. } => {
+                self.metrics.started(definition);
+                None
+            }
+            EventKind::BreakerTripped { .. } => {
+                self.metrics.tripped(definition);
+                None
+            }
+            EventKind::RunStarted { admitted_ms, due_ms, admitted_in }
+            | EventKind::RunResumed { admitted_ms, due_ms, admitted_in } => {
+                // Due since `due_ms`: a waiting or ready run's wake-up, a
+                // taken over run's lease expiry (the store records it at the
+                // claim).
+                self.metrics.claimed(definition, event.time_ms.saturating_sub(*due_ms));
+                let attributes = vec![
+                    KeyValue::new("ouro.run.id", event.run_id.clone()),
+                    KeyValue::new("ouro.definition.name", definition.clone()),
+                    KeyValue::new("ouro.definition.version", event.version.to_string()),
+                ];
+                // Under the context the drive was called in, linked to the
+                // one the run was admitted in.
+                let parent = Context::current();
+                let mut builder = self.tracer.span_builder(format!("workflow {definition}"));
+                if let Some(admitted) = admitted_in.as_ref().and_then(SpanRef::context) {
+                    builder = builder.with_links(vec![Link::with_context(admitted)]);
+                }
+                let root = parent.with_span(self.tracer.build_with_context(builder, &parent));
+                root.span().set_attributes(attributes.clone());
+                root.span()
+                    .set_attributes([KeyValue::new("ouro.task.path", "/"), KeyValue::new("ouro.attempt", 1_i64)]);
+                let span = span_ref(&root);
+                let drive = Arc::new(Drive {
+                    root,
+                    attributes,
+                    definition: definition.clone(),
+                    admitted_ms: *admitted_ms,
+                    tasks: Mutex::default(),
+                    calls: Mutex::default(),
+                });
+                if let Some(earlier) = self.drives.lock().unwrap().insert(event.run_id.clone(), drive) {
+                    earlier.finish(&self.metrics, "interrupted");
+                }
+                span
+            }
+            EventKind::RunSuspended { .. } | EventKind::RunInterrupted { .. } | EventKind::RunEnded { .. } => {
+                let drive = self.drives.lock().unwrap().remove(&event.run_id)?;
+                let span = span_ref(&drive.root);
+                let outcome = match &event.kind {
+                    EventKind::RunSuspended { .. } => "waiting",
+                    EventKind::RunEnded { outcome, limit_exceeded } => {
+                        // The run ended through its jump budget.
+                        if *limit_exceeded {
+                            drive.root.span().set_attribute(KeyValue::new("ouro.limit_exceeded", true));
+                            self.metrics.budget_exhausted(definition);
+                        }
+                        let label = match outcome {
+                            RunOutcome::Completed { .. } => "completed",
+                            RunOutcome::Faulted { .. } => "faulted",
+                            RunOutcome::Cancelled => "cancelled",
+                        };
+                        self.metrics.ended(definition, label, event.time_ms.saturating_sub(drive.admitted_ms));
+                        label
+                    }
+                    _ => "interrupted",
+                };
+                drive.finish(&self.metrics, outcome);
+                span
+            }
+            EventKind::TaskEntered { parent, kind, .. } => {
+                let drive = self.drive(&event.run_id)?;
+                let path = path?;
+                let parent = parent.as_deref().map(|p| drive.task(p)).unwrap_or_else(|| drive.root.clone());
+                let cx = parent.with_span(self.tracer.start_with_context(format!("task {path}"), &parent));
+                cx.span().set_attributes(drive.attributes.clone());
                 cx.span().set_attribute(KeyValue::new("ouro.attempt", 1_i64));
-                cx.span().set_attribute(KeyValue::new("ouro.task.path", reference.to_string()));
-                let task = OpenTask { context: cx, kind, started: Instant::now() };
-                self.tasks.lock().unwrap().insert(reference.to_string(), task);
+                cx.span().set_attribute(KeyValue::new("ouro.task.path", path.to_string()));
+                let span = span_ref(&cx);
+                let task = OpenTask { context: cx, kind: kind.clone(), started: Instant::now() };
+                drive.tasks.lock().unwrap().insert(path.to_string(), task);
+                span
             }
-            Event::TaskCompleted { reference, .. } => self.end_task(reference, "completed", None),
-            Event::TaskFaulted { reference, error } | Event::TaskInterrupted { reference, error } => {
-                self.end_task(reference, "faulted", Some(error.to_string()))
+            EventKind::TaskExited { outcome } => {
+                let drive = self.drive(&event.run_id)?;
+                let path = path?;
+                match outcome {
+                    TaskOutcome::Completed { .. } => drive.end_task(&self.metrics, path, "completed", None),
+                    TaskOutcome::Suspended { .. } => drive.end_task(&self.metrics, path, "waiting", None),
+                    TaskOutcome::Faulted { error } | TaskOutcome::Interrupted { error } => {
+                        drive.end_task(&self.metrics, path, "faulted", Some(error.to_string()))
+                    }
+                }
             }
-            Event::TaskSuspended { reference, .. } => self.end_task(reference, "waiting", None),
-            _ => {}
+            // A function call's span. The engine adds no read/write
+            // attribute: a host that classifies its functions adds its own
+            // through the context.
+            EventKind::CallStarted { function, delivery, attempt, .. } => {
+                let drive = self.drive(&event.run_id)?;
+                let path = path?;
+                let parent = drive.task(path);
+                parent.span().set_attribute(KeyValue::new("ouro.attempt", i64::from(*attempt)));
+                let context = parent.with_span(self.tracer.start_with_context(format!("function {function}"), &parent));
+                context.span().set_attributes(drive.attributes.clone());
+                context.span().set_attributes([
+                    KeyValue::new("ouro.task.path", path.to_string()),
+                    KeyValue::new("ouro.function.name", function.clone()),
+                    KeyValue::new("ouro.attempt", i64::from(*attempt)),
+                ]);
+                let span = span_ref(&context);
+                let call = OpenCall {
+                    span: ActiveSpan { context, finished: false },
+                    attributes: call_attributes(definition, function, *delivery),
+                    started: Instant::now(),
+                };
+                drive.calls.lock().unwrap().insert(path.to_string(), call);
+                span
+            }
+            EventKind::CallFinished { outcome, error, annotations, .. } => {
+                let drive = self.drive(&event.run_id)?;
+                let mut call = drive.calls.lock().unwrap().remove(path?)?;
+                // A result's annotations; an error answer's stay with its record.
+                let empty = Annotations::new();
+                let annotations = if *outcome == CallOutcome::Completed { annotations } else { &empty };
+                self.metrics.call(&call.attributes, outcome.label(), call.started, annotations);
+                call.span.annotate(annotations);
+                // As the call's failure prints itself (`CallFailure`).
+                let variant = match outcome {
+                    CallOutcome::Completed | CallOutcome::Failed => "Response",
+                    CallOutcome::NotExecuted => "NotExecuted",
+                    CallOutcome::Unknown => "Unknown",
+                    CallOutcome::Interrupted => "Interrupted",
+                };
+                let failure = error.as_ref().map(|e| format!("{variant}({e:?})"));
+                call.span.finish(if failure.is_none() { "completed" } else { "faulted" }, failure);
+                span_ref(&call.span.context)
+            }
+            _ => {
+                let drive = self.drive(&event.run_id)?;
+                span_ref(&path.map(|p| drive.task(p)).unwrap_or_else(|| drive.root.clone()))
+            }
         }
     }
 }
-impl Drop for Spans {
-    fn drop(&mut self) {
-        self.close_tasks();
-        self.root.span().end();
+impl Observer for Telemetry {
+    fn observe(&self, event: &Event) {
+        self.record(event);
     }
 }
 
@@ -360,7 +478,7 @@ impl Metrics {
     pub fn budget_exhausted(&self, name: &str) {
         self.budget.add(1, &[definition(name)]);
     }
-    fn step(&self, name: &str, kind: &'static str, outcome: &'static str, started: Instant) {
+    fn step(&self, name: &str, kind: String, outcome: &'static str, started: Instant) {
         let attributes =
             [definition(name), KeyValue::new("ouro.task.kind", kind), KeyValue::new("ouro.outcome", outcome)];
         self.steps.record(started.elapsed().as_secs_f64(), &attributes);
