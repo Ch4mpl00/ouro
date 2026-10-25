@@ -635,7 +635,7 @@ module contract {
     // a hold never turns an answer into an unknown outcome (#31).
     val errorH1 = flag(error30,"H1",(not(steps) or not(frozen) or b.db == a.db) and
       (op != "dispatch" or not(frozen) or a.sends == b.sends) and
-      (op != "renew" or not(frozen) or not(authority(b,r,w)) or
+      (op != "renew" or not(frozen) or b.db.stopped or not(authority(b,r,w)) or
         a.db == { ...b.db,runs:b.db.runs.replaceAt(r,{ ...old,lease:b.now+4 }) }))
     val errorH2 = flag(errorH1,"H2",op != "claim" or not(frozen) or b.db == a.db)
     // A hold freezes the run and its live owned descendants in one transition
