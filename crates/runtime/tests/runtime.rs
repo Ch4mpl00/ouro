@@ -1252,7 +1252,7 @@ async fn control_lists_a_one_shot_with_its_instant_until_it_fires() {
     };
     assert_eq!(due(control.definition("workflow").await.unwrap().unwrap()), [(ScheduleKind::At, Some(5000))]);
     clock.0.store(5000, Ordering::SeqCst);
-    assert_eq!(rt.fire_due().await.unwrap(), ["schedule:workflow:at:1:5000"]);
+    assert_eq!(rt.fire_due().await.unwrap(), ["schedule:workflow:at:5000"]);
     assert_eq!(due(control.definition("workflow").await.unwrap().unwrap()), [(ScheduleKind::At, None)]);
 }
 
