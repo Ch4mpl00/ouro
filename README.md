@@ -989,11 +989,15 @@ is bounded by its collection and `retry` by its attempts.
   ends: a run, an overlap or ceiling skip (recorded in the trigger's state),
   a queue (the buffered slot starts later, from the queue, not the trigger)
   or a refusal. The trigger then stays as a dormant record (`done`, no due
-  time) that nothing re-arms, not even the end of its run; only a new
-  activation arms the version's instant again, in a new epoch and under a new
-  run id (`schedule:<name>:at:<epoch>:<ms>`). An instant already past at
-  activation fires at the next tick, whatever `catchup` says: nothing follows
-  a one-shot, so it can only run late or not at all.
+  time) that nothing re-arms, not even the end of its run. A one-shot fires
+  once per `at` value: its run id is the instant's
+  (`schedule:<name>:at:<ms>`), and an activation (a deploy, clearing a breaker
+  trip or a pause) arms the instant again, but a run that exists under that id
+  means it ran, so the slot is consumed (recorded as skipped, `already run`)
+  without a second run. A changed `at` is another id and runs. An instant
+  already past at its first activation fires at the next tick, whatever
+  `catchup` says: nothing follows a one-shot, so it can only run late or not
+  at all.
 
   A run started by a trigger reads `$run.schedule`: `{ kind, slot,
   previous }` (`every`, `cron`, `after`, `at` or `on`), with `slot` and
