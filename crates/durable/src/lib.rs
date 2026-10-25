@@ -661,6 +661,9 @@ pub trait RunStore: Send + Sync {
     async fn claim_as(&self, id: &str, now_ms: i64, worker: &Compatibility) -> anyhow::Result<Option<Fence>>;
     /// A dispatch boundary: current ownership and the global stop gate.
     async fn check_lease(&self, fence: &Fence, now_ms: i64) -> anyhow::Result<()>;
+    /// Extends the owner's lease. On a held run it extends it too and then
+    /// fails with `control::Held`: the owner keeps its authority to record
+    /// the answer of a call already dispatched, and learns to stop.
     async fn renew(&self, fence: &Fence, now_ms: i64) -> anyhow::Result<()>;
     async fn release(&self, fence: &Fence, now_ms: i64) -> anyhow::Result<()>;
     async fn load_records(&self, fence: &Fence, now_ms: i64) -> anyhow::Result<BTreeMap<String, Record>>;

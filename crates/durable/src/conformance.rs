@@ -3627,23 +3627,30 @@ async fn holds(factory: &impl AsyncFn(&str) -> anyhow::Result<TestStore>, report
     assert!(s.claim("w", 61).await?.is_some());
 
     // The answer of a call already dispatched is recorded under a hold, and
-    // it is the only step that is: nothing else commits.
+    // it is the only step that is: nothing else commits. Its owner keeps the
+    // lease while it waits for that answer, however long the call takes: a
+    // renewal still answers `Held`, and extends the lease all the same.
     let q = s.start(&admission("q"), 0).await?.unwrap();
     s.save_record(&q, "fetch#call", &call(CallState::Pending), 1).await?;
     s.control(&control_request("hold-q"), &hold("q"), 2).await?;
     assert!(is_held(s.save_record(&q, "other#call", &call(CallState::Pending), 3).await.unwrap_err()));
     assert!(is_held(s.save_record(&q, "task", &Record::Timer { deadline_ms: 9 }, 3).await.unwrap_err()));
-    s.save_record(&q, "fetch#call", &call(CallState::Done(Ok(json!("ok")))), 3).await?;
+    let kept = LEASE_MS / 2;
+    assert!(is_held(s.renew(&q, kept).await.unwrap_err()));
+    assert_eq!(s.get("q").await?.unwrap().lease_until_ms, Some(kept + LEASE_MS), "the held owner keeps its lease");
+    assert!(!s.due(kept + LEASE_MS, 10).await?.contains(&"q".to_string()), "and the run is still due to nobody");
+    let answered = LEASE_MS + 100;
+    s.save_record(&q, "fetch#call", &call(CallState::Done(Ok(json!("ok")))), answered).await?;
     assert!(matches!(
         s.inspect("q").await?.unwrap().records.get("fetch#call"),
         Some(Record::Call { state: CallState::Done(Ok(v)), .. }) if v == &json!("ok")
     ));
-    assert!(is_held(s.finish(&q, &Status::Completed(json!(1)), 4, 3).await.unwrap_err()));
+    assert!(is_held(s.finish(&q, &Status::Completed(json!(1)), answered + 1, 3).await.unwrap_err()));
     // A pending call keeps its delivery rules: released, the run resumes
     // from the same evidence.
-    s.release(&q, 4).await?;
-    s.control(&control_request("release-q"), &release("q"), 5).await?;
-    assert!(s.claim("q", 5).await?.is_some());
+    s.release(&q, answered + 1).await?;
+    s.control(&control_request("release-q"), &release("q"), answered + 2).await?;
+    assert!(s.claim("q", answered + 2).await?.is_some());
 
     // A cancel reaches a held run and its descendants, and ends the hold.
     assert_eq!(

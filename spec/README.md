@@ -65,7 +65,7 @@ are the bridges in `crates/durable/tests/quint.rs` and `quint/concurrent.rs`.
 | X3 | `X3`: no silent readmission/reopening | Terminal/admission checks |
 | S1 | `S1`: emergency stop blocks claim, firing and admission (including children and ingress); clearing preserves evidence | Stop/clear witnesses, serial MBT, `S1` guard mutant, control conformance |
 | B1 | `B1`: tree counter within the ceiling, equal to a live root's granted decisions; immutable decisions; refusal only at the ceiling | Serial MBT (`spend`, decisions projected); `budgetTest` witness; budget conformance; generated interpreter budgets |
-| H1 | `H1`: a held run takes no fenced step and no dispatch (only the answer of a call already dispatched, and the owner giving its lease back) | `heldStepsTest`, `heldDispatchTest`; mutants `H1`, `H1/dispatch`; serial MBT; control conformance (`holds`: `Held` on every fenced operation, the answer recorded) |
+| H1 | `H1`: a held run takes no fenced step and no dispatch (only the answer of a call already dispatched, and the owner keeping its lease while it waits for it or giving it back: a hold never turns an answer into an unknown outcome) | `heldStepsTest`, `heldDispatchTest`, `heldAnsweredTest`; mutants `H1`, `H1/dispatch`, `H1/renew` (the hold takes the owner's lease); serial MBT; control conformance (`holds`: `Held` on every fenced operation, the answer recorded) |
 | H2 | `H2`: a held run is never claimed | `heldClaimTest`, `heldClaimedTest`; mutant `H2`; serial MBT audits `due` and `due_as` without held runs; conformance audits the due indexes |
 | H3 | `H3`: a hold marks the run and its live owned descendants in one transition and changes nothing else; a release restores exactly | `heldTreeTest`, `heldChildTest`, `heldReleasedTest`; mutants `H3` (misses the subtree), `H3/release` (changes more than the flags); conformance (`holds`, the commit-fault matrix); scalability bounds |
 | H4 | `H4`: an ended run is never held (a cancel or any end clears the hold) | `heldCancelledTest`; mutant `H4`; conformance audit |
@@ -163,13 +163,14 @@ deadline fixed at admission and epoch.
 - **Hold** (#29). `hold` marks the run and its live owned descendants `held`
   in one transition; `unhold` clears them (the store's `Release`; `release` is
   the worker giving its lease back). A held run is never claimed, takes none
-  of the owner's fenced operations (renew, intent, recovery, checkpoint,
+  of the owner's fenced operations (intent, recovery, checkpoint,
   subscribe, take, spend, child, finish, timeout, conflict), dispatches
   nothing (the `check_lease` boundary), and keeps everything else: its wake-up
   and lease, which `due` ignores; events are still accepted into its mailbox.
   `answers` (the owner's authority alone) lets the owner record the result
-  or proven non-execution of a call already dispatched and give its lease
-  back. Any end of a run, cancellation included, clears the flag. H1–H4 state
+  or proven non-execution of a call already dispatched, keep its lease
+  (`renew`, so the answer is recorded however long the call takes) and give
+  it back. Any end of a run, cancellation included, clears the flag. H1–H4 state
   it.
 - **Pause** (V2). `pause` is a trip with `manual` set that reports no notice
   and refuses every admission whatever its content (`barred`); `resume` clears

@@ -631,12 +631,15 @@ commit, under the existing catch-up rules, with the run exactly as it was.
 A worker driving it stops at the next fenced step or dispatch boundary (every
 fenced operation and `check_lease` refuse with `control::Held`) or at its
 next lease renewal, within one heartbeat, and gives the lease back without
-spending an interruption. A call already dispatched is not retracted: its
-answer is still recorded (the only step a held run commits), a call still in
-flight when the renewal sees the hold gets one heartbeat to answer, and a
-call left pending keeps its delivery rules (an at-least-once call is sent
-again after the release, an at-most-once one has an unknown outcome and never
-is). A held run starts no child. It stays live: it counts for overlap
+spending an interruption. A call already dispatched is not retracted, and a
+hold never changes an outcome: the worker keeps its lease (a held run's
+renewal extends it and still answers `Held`) until every call it dispatched
+has answered, however long that takes (the call's own timeout is the only
+bound), records the answer (the only step a held run commits) and then lets
+the run go. Released, the run goes on from that answer. A call left without
+an answer by a worker stop keeps its delivery rules (an at-least-once call is
+sent again after the release, an at-most-once one has an unknown outcome and
+never is). A held run starts no child. It stays live: it counts for overlap
 policies and the host ceiling, `inspect` and `list` show `held` (actor,
 reason, note, instant) on the run, and `counts` reports it as `held` instead
 of its frozen state. Holding is idempotent (a second hold keeps the first

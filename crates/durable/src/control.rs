@@ -32,7 +32,8 @@ pub enum Command {
     /// claimed or returned as due until `Release`, and a worker driving one
     /// stops at its next fenced step or dispatch boundary and releases it.
     /// A call already dispatched is not retracted and its answer is still
-    /// recorded. Idempotent; an ended run is left alone.
+    /// recorded: the owner keeps its lease until it has (`RunStore::renew`).
+    /// Idempotent; an ended run is left alone.
     Hold {
         run: String,
         note: String,

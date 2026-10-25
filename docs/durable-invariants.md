@@ -1277,8 +1277,9 @@ owned descendants, in one transition, and release them. A held run takes no
 step: it is never claimed nor due (its wake-up and timers are kept, not fired),
 its owner's fenced operations and dispatches are refused, and it starts no
 child; the only things it commits are the answer of a call already dispatched
-(the call is not retracted), the owner giving its lease back, mailbox
-acceptance of events and a cancellation, which ends the hold. A release
+(the call is not retracted), the owner keeping its lease while it waits for
+that answer (amended by #31) or giving it back, mailbox acceptance of events
+and a cancellation, which ends the hold. A release
 restores exactly what the hold kept, so due work is due again in the same
 transition. A held run is live (overlap, the ceiling); an ended run is never
 held. The model states this as H1 (no step, no dispatch), H2 (no claim), H3

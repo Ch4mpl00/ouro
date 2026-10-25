@@ -258,6 +258,14 @@ module contract_witnesses {
   action heldReleased = heldSteps.then(do("unhold")).then(do("claim"))
   run heldReleasedTest = heldReleased.expect(checked and not(m.db.runs.nth(0).held) and m.db.runs.nth(0).generation == 2 and
     m.db.runs.nth(0).owner == 0 and m.db.runs.nth(0).records == [2,0,0])
+  // A hold never changes an outcome (#31): the owner keeps its lease while the
+  // call it dispatched is out, past the lease it had when the hold came, and
+  // records the answer; released, recovery restores that answer.
+  action heldAnswered = init.then(boot).then(do("intent")).then(do("dispatch")).then(do("hold")).then(ticks(2))
+    .then(do("renew")).then(ticks(2)).then(do("result")).then(do("release")).then(do("unhold")).then(ticks(5))
+    .then(do("claim")).then(do("recover"))
+  run heldAnsweredTest = heldAnswered.expect(checked and not(m.db.runs.nth(0).held) and m.db.runs.nth(0).records == [2,0,0] and
+    m.observations.nth(m.observations.length()-1).result == 2 and m.sends == [[1,0,0],[0,0,0],[0,0,0]])
   // A dispatch waits for the release: the intent is saved, the world is not touched.
   action heldDispatch = init.then(boot).then(do("intent")).then(do("hold")).then(do("dispatch"))
   run heldDispatchTest = heldDispatch.expect(checked and m.sends == [[0,0,0],[0,0,0],[0,0,0]])
@@ -311,7 +319,7 @@ module contract_witnesses {
   run bridgeTail = emergencyStop.then(clearStop).then(stoppedQueue).then(resumedQueue).then(oneShot).then(oneShotBusy)
     .then(pinnedAdmitted).then(sameContentRefused).then(pinnedUncounted).then(heldReleased).then(heldDispatched)
     .then(heldChild).then(heldCancelled).then(heldClaimed).then(resumed).then(pauseActivated).then(resumeKeepsTrip)
-    .then(pauseTrippedResumed).then(absentAdmitted).then(absentRefused)
+    .then(pauseTrippedResumed).then(absentAdmitted).then(absentRefused).then(heldAnswered)
   run bridgeSuite = continuation.then(unknown).then(mailbox).then(expiry).then(child).then(childFinish).then(grandchild).then(activation)
     .then(deadline).then(compatibility).then(dry).then(replay).then(schedule).then(breaker).then(rearm)
     .then(noCatchup).then(overlap).then(ingress).then(ingressExpiry).then(redispatch).then(protectedUnknown)

@@ -1682,15 +1682,22 @@ impl RunStore for TransactionalStore {
     async fn check_lease(&self, f: &Fence, now: i64) -> anyhow::Result<()> {
         self.update(|rows| Box::pin(async move { checked(rows, f, now, self.policy.skew_ms).await.map(|_| ()) })).await
     }
+    // A held run's owner keeps its lease: it may be waiting for the answer
+    // of a call it already dispatched, which the hold does not retract and
+    // whose answer it still records however long the call takes. The renewal
+    // commits and answers `Held` all the same, the worker's cue to let the
+    // run go once nothing is in flight; nobody can claim a held run anyway.
     async fn renew(&self, f: &Fence, now: i64) -> anyhow::Result<()> {
         self.update(|rows| {
             Box::pin(async move {
-                let mut s = checked(rows, f, now, self.policy.skew_ms).await?;
+                running(rows).await?;
+                let mut s = authority(rows, f, now, self.policy.skew_ms).await?;
                 s.run.lease_until_ms = Some(now.saturating_add(LEASE_MS));
-                store_run(rows, &s).await
+                store_run(rows, &s).await?;
+                Ok(not_held(&s))
             })
         })
-        .await
+        .await?
     }
     async fn release(&self, f: &Fence, now: i64) -> anyhow::Result<()> {
         self.update(|rows| {

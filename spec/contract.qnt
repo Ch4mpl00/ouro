@@ -190,7 +190,8 @@ module contract {
     // The fenced owner may act, unless an operator holds the run: a held run
     // takes no step (H1). `answers` is the owner's authority alone: a call
     // already dispatched is not retracted and its answer is still recorded,
-    // and the owner may always give its lease back.
+    // however long it takes (the owner keeps renewing its lease), and the
+    // owner may always give its lease back.
     val answers = authority(s,r,w)
     val authorized = answers and not(execution.held)
     val pending = s.db.copies.indices().filter(k => {
@@ -212,7 +213,7 @@ module contract {
       not(s.workers.elems().exists(x => x.permit))) {
       val updated = update(s,r,{ ...execution, owner:w, generation:execution.generation+1, lease:s.now+4 })
       { ...updated, workers: updated.workers.replaceAt(w,{ ...emptyLocal, execution:r, fence:execution.generation+1, permit:true }) }
-    } else if (op == "renew" and authorized)
+    } else if (op == "renew" and answers)
       update(s,r,{ ...execution, lease:s.now+4 })
     else if (op == "intent" and authorized and Set(0,4).contains(execution.records.nth(i)) and
       execution.mode != 2 and not(execution.mode == 1 and mocked(i)) and s.now < execution.deadline) {
@@ -617,12 +618,18 @@ module contract {
           (y.spends.nth(c) != 2 or y.spent.nth(c) == ceiling)
       })))
     // A held run takes no step but the answer of a call already dispatched
-    // (and giving its lease back): none of the owner's fenced operations, no
-    // dispatch, and no claim changes anything while it is held (#29).
-    val steps = Set("renew","intent","recover","checkpoint","subscribe","take","child","finish","timeout","conflict","spend").contains(op)
+    // (and giving its lease back or keeping it): none of the owner's other
+    // fenced operations, no dispatch, and no claim changes anything while it
+    // is held (#29).
+    val steps = Set("intent","recover","checkpoint","subscribe","take","child","finish","timeout","conflict","spend").contains(op)
     val frozen = b.db.runs.nth(r).held
+    // The owner of a held run keeps its lease, and nothing else, so the
+    // answer of a call it dispatched is recorded however long the call takes:
+    // a hold never turns an answer into an unknown outcome (#31).
     val errorH1 = flag(error30,"H1",(not(steps) or not(frozen) or b.db == a.db) and
-      (op != "dispatch" or not(frozen) or a.sends == b.sends))
+      (op != "dispatch" or not(frozen) or a.sends == b.sends) and
+      (op != "renew" or not(frozen) or not(authority(b,r,w)) or
+        a.db == { ...b.db,runs:b.db.runs.replaceAt(r,{ ...old,lease:b.now+4 }) }))
     val errorH2 = flag(errorH1,"H2",op != "claim" or not(frozen) or b.db == a.db)
     // A hold freezes the run and its live owned descendants in one transition
     // and changes nothing else; releasing them restores exactly what the hold

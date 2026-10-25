@@ -25,9 +25,9 @@ MUTANTS = {
  "S1": ('else if (s.db.stopped and Set(', 'else if (false and Set(', [op("stop",value=1),op("admit")]),
  "A1": ('Set("admit","dry","replay").contains(op) and value >= 0 and not(execution.admitted)', 'Set("admit","dry","replay").contains(op) and value >= 0', BOOT+[op("admit",value=1)]),
  "A2": ('val persisted = if (commits) proposed else before', 'val persisted = if (commits) { ...proposed,db:before.db } else before', [op("admit")]),
- "A3": ('else if (op == "renew" and authorized)', 'else if (op == "renew" and execution.outcome != 0) update(s,r,{ ...execution,outcome:1 })\n    else if (op == "renew" and authorized)', BOOT+[op("finish",value=1),op("renew")]),
+ "A3": ('else if (op == "renew" and answers)', 'else if (op == "renew" and execution.outcome != 0) update(s,r,{ ...execution,outcome:1 })\n    else if (op == "renew" and answers)', BOOT+[op("finish",value=1),op("renew")]),
  "A4": ('values:execution.values.replaceAt(i,execution.input+i)', 'values:execution.values.replaceAt(i,-1)', BOOT+CALL),
- "A5": ('op == "renew" and authorized', 'op == "renew"', BOOT+TICKS+[op("renew")]),
+ "A5": ('op == "renew" and answers', 'op == "renew"', BOOT+TICKS+[op("renew")]),
  "E1": ('observe(updated,op,r,i,execution.input+i,1)', 'observe(updated,op,r,i,execution.input+i+execution.generation,1)', BOOT+CALL[:2]),
  "E2": ('{ ...local, phase:2 }', '{ ...local, phase:1 }', BOOT+CALL[:2]+[op("dispatch")]),
  # An at-most-once call whose outcome is unknown is dispatched again (#25).
@@ -86,6 +86,9 @@ MUTANTS = {
  # run stays held.
  "H1": ('val authorized = answers and not(execution.held)','val authorized = answers',BOOT+[op("hold"),op("intent")]),
  "H1/dispatch": ('and not(local.stopped) and not(execution.held) and Set(1,4)','and not(local.stopped) and Set(1,4)',BOOT+[op("intent"),op("hold"),op("dispatch")]),
+ # A held run's owner loses its lease to the hold, so a call in flight past
+ # it ends with an unknown outcome (#31).
+ "H1/renew": ('op == "renew" and answers', 'op == "renew" and authorized',BOOT+[op("intent"),op("dispatch"),op("hold"),op("tick"),op("renew")]),
  "H2": ('live(execution) and not(execution.held) and execution.lease <= s.now','live(execution) and execution.lease <= s.now',[op("admit"),op("hold"),op("claim")]),
  "H3": ('val closed = Set(r).union(descendants(s,r))\n      { ...s,db:{ ...s.db,runs:Runs.fold(s.db.runs,(a,k) => if (closed.contains(k)) a.replaceAt(k,{ ...a.nth(k),held:true })','val closed = Set(r)\n      { ...s,db:{ ...s.db,runs:Runs.fold(s.db.runs,(a,k) => if (closed.contains(k)) a.replaceAt(k,{ ...a.nth(k),held:true })',BOOT+[op("child"),op("hold")]),
  "H3/release": ('a.replaceAt(k,{ ...a.nth(k),held:false })','a.replaceAt(k,{ ...a.nth(k),held:false,lease:-1 })',BOOT+[op("hold"),op("unhold")]),
