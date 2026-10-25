@@ -1702,6 +1702,11 @@ async fn a_run_started_at_a_version_keeps_it_without_activating_it() {
     let inspection = control.inspect("p").await.unwrap().unwrap();
     assert!(inspection.pinned);
     assert_eq!(inspection.snapshot.run.admission.version, first.version);
+    // An inspection a host stored without the optional members still reads.
+    let mut stored = serde_json::to_value(&inspection).unwrap();
+    stored.as_object_mut().unwrap().retain(|k, _| k != "pinned" && k != "digest");
+    let read: ouro_runtime::control::Inspection = serde_json::from_value(stored).unwrap();
+    assert_eq!((read.pinned, read.digest.as_str()), (false, ""));
     // Starting again returns the run; another version or definition is refused.
     assert_eq!(rt.start_at("p", "workflow", first.version, json!({})).await.unwrap().admission, saved.admission);
     assert!(rt.start_at("p", "workflow", second.version, json!({})).await.is_err());
@@ -1710,6 +1715,9 @@ async fn a_run_started_at_a_version_keeps_it_without_activating_it() {
     rt.start("a", "workflow", json!({})).await.unwrap();
     assert!(!control.inspect("a").await.unwrap().unwrap().pinned);
     assert_eq!(rt.get("a").await.unwrap().unwrap().admission.version, second.version);
+    // `start_at` returns an existing run of that name and version, pinned or not.
+    assert_eq!(rt.start_at("a", "workflow", second.version, json!({})).await.unwrap().admission.id, "a");
+    assert!(rt.start_at("a", "workflow", first.version, json!({})).await.is_err());
 
     // A restart resumes the pinned run at its own version.
     assert!(matches!(rt.drive("p", &CancellationToken::new()).await.unwrap(), Some(Status::Waiting { .. })));
