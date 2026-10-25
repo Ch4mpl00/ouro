@@ -68,15 +68,169 @@ pub struct FunctionContext {
     /// The runtime's meter (`Runtime::with_meter`), for a function's own
     /// metrics; label them with `attributes`, never with the run id.
     pub meter: Meter,
+    /// The run's host data (`FunctionContext::host`).
+    pub host: Option<Arc<Value>>,
+    /// Starts owned children the host vouches for (`FunctionContext::start_child`):
+    /// present for a registered function's handler, in live runs and dry runs;
+    /// `None` for a process runner and for a dry run's `Mock::response`.
+    pub children: Option<Arc<dyn ChildStarter>>,
 }
 impl FunctionContext {
+    /// The run id `start_child` with `key` gives the child in this call, and
+    /// in every re-dispatch of it (it derives from the run, the call's
+    /// idempotency key and `key`): a host can key its own records by it
+    /// before it starts the child. Pure: it starts and reads nothing.
+    pub fn child_id(&self, key: &str) -> String {
+        host_child_id(&self.run_id, &self.idempotency_key, key)
+    }
     /// The call's bounded metric attributes: `ouro.definition`,
     /// `ouro.function` and `ouro.delivery`. Run ids and task paths belong
     /// on spans only: they would make a series per run.
     pub fn attributes(&self) -> Vec<KeyValue> {
         crate::telemetry::call_attributes(&self.definition, &self.function, self.delivery)
     }
+    /// The host data the run was admitted with (`Runtime::start_with`, or
+    /// the host function that started it as a child): what the host vouches
+    /// for, which no workflow can set. `None`: the run has none, as every run
+    /// a workflow started itself (`run: workflow`, the built-in `start_child`).
+    pub fn host(&self) -> Option<&Value> {
+        self.host.as_deref()
+    }
+    /// Starts an owned child of the run this call serves, which the host
+    /// vouches for: with its definition (the active version, or `version`),
+    /// input and host data. It is committed with the parent's subscriptions
+    /// to its end, through the run's lease, under the same ownership,
+    /// cascade, budget, nesting depth and trip/pause rules as the built-in
+    /// `start_child`. Its id is derived from the run, this call's idempotency
+    /// key and `key`, so a re-dispatch of the call joins the same child. The
+    /// first commit wins: a join returns the child as it was admitted, whatever
+    /// input, version or host data the re-dispatch computed (only another
+    /// definition is refused, `ChildRefusal::Mismatch`). The
+    /// workflow joins it with `listen` (`ChildRef::done`) or reads its outcome
+    /// with the built-in `child_outcome` (`ChildRef::id`, `ChildRef::key`).
+    ///
+    /// Register a function that starts children at least once (the default):
+    /// an at-most-once call whose outcome is unknown is never sent again, so
+    /// it could not join the child it may have started.
+    ///
+    /// A refusal (`ChildError::Refused`) means nothing happened: answer it
+    /// as not executed. `ChildError` converts into exactly that, or into an
+    /// interruption for a lost lease or a storage failure, so `?` does.
+    pub async fn start_child(&self, child: ChildStart) -> Result<ChildRef, ChildError> {
+        match &self.children {
+            Some(children) => children.start_child(child).await,
+            None => Err(ChildError::Refused(ChildRefusal::Unavailable)),
+        }
+    }
 }
+
+/// A host child's id: `hostchild:[<run>, <call idempotency key>, <key>]`,
+/// distinct from the built-in children's `child:` ids.
+pub(crate) fn host_child_id(run_id: &str, idempotency_key: &str, key: &str) -> String {
+    format!("hostchild:{}", serde_json::to_string(&(run_id, idempotency_key, key)).expect("strings serialize"))
+}
+
+/// An owned child a host function starts (`FunctionContext::start_child`).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ChildStart {
+    /// Distinguishes the children one call starts; part of the child's id.
+    pub key: String,
+    /// The child's definition.
+    pub name: String,
+    /// A stored version to run instead of the active one.
+    pub version: Option<u64>,
+    pub input: Value,
+    /// The child's host data (`null`: none), at most `durable::MAX_HOST_BYTES`.
+    pub host: Value,
+}
+
+/// A started (or joined) host child: its run id, the link key the built-in
+/// `child_outcome` takes with the id, and the event types of its end and of
+/// its waiting, as the built-in `start_child` returns them.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ChildRef {
+    pub id: String,
+    pub key: String,
+    pub done: String,
+    pub waiting: String,
+}
+
+/// The capability behind `FunctionContext::start_child`, which the runtime
+/// supplies for each call.
+#[async_trait]
+pub trait ChildStarter: Send + Sync {
+    async fn start_child(&self, child: ChildStart) -> Result<ChildRef, ChildError>;
+}
+
+/// Why `FunctionContext::start_child` started no child.
+#[derive(Debug)]
+pub enum ChildError {
+    /// Refused before anything happened: no child was admitted.
+    Refused(ChildRefusal),
+    /// Stopped without an answer: the run's lease is lost, it is held or
+    /// stopped, or storage failed. A commit may have happened; a re-dispatch
+    /// of the call joins the child if it did.
+    Interrupted(anyhow::Error),
+}
+
+/// What refused a host child (`ChildError::Refused`).
+#[derive(Debug)]
+pub enum ChildRefusal {
+    /// The call has no child capability (a process runner, a mocked call).
+    Unavailable,
+    /// Its host data is larger than `durable::MAX_HOST_BYTES`.
+    HostData(HostDataTooLarge),
+    /// It would nest deeper than the host's `Limits::max_depth`.
+    Depth(WorkflowError),
+    /// Its definition is tripped by its breaker or paused by an operator.
+    Tripped(ouro_durable::DefinitionTripped),
+    /// The id is taken by a child of another definition.
+    Mismatch(ouro_durable::AdmissionMismatch),
+    /// The definition cannot be admitted: no active or no such version, a
+    /// function it calls is not registered (`MissingFunction`), or it does not
+    /// validate against the host (`InvalidDefinition`).
+    Inadmissible(anyhow::Error),
+}
+
+impl std::fmt::Display for ChildError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ChildError::Refused(ChildRefusal::Unavailable) => {
+                f.write_str("this call cannot start child runs (a process run or a mocked call)")
+            }
+            ChildError::Refused(ChildRefusal::HostData(e)) => e.fmt(f),
+            ChildError::Refused(ChildRefusal::Depth(e)) => e.fmt(f),
+            ChildError::Refused(ChildRefusal::Tripped(e)) => e.fmt(f),
+            ChildError::Refused(ChildRefusal::Mismatch(e)) => e.fmt(f),
+            ChildError::Refused(ChildRefusal::Inadmissible(e)) | ChildError::Interrupted(e) => write!(f, "{e:#}"),
+        }
+    }
+}
+impl std::error::Error for ChildError {}
+
+/// A refusal is a proof that the call did nothing (`not_executed`); an
+/// interruption is no answer (`interrupted`).
+impl From<ChildError> for FunctionError {
+    fn from(error: ChildError) -> Self {
+        match &error {
+            ChildError::Refused(_) => FunctionError::not_executed(error.to_string()),
+            ChildError::Interrupted(_) => FunctionError::interrupted(error.to_string()),
+        }
+    }
+}
+
+/// Host data larger than `durable::MAX_HOST_BYTES` (`Runtime::start_with`,
+/// `FunctionContext::start_child`): refused before anything is stored.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HostDataTooLarge {
+    pub bytes: usize,
+}
+impl std::fmt::Display for HostDataTooLarge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "host data of {} bytes exceeds {} bytes", self.bytes, ouro_durable::MAX_HOST_BYTES)
+    }
+}
+impl std::error::Error for HostDataTooLarge {}
 
 /// What a function returns: its result and the annotations it carries
 /// beside it (`ows::durable::Annotation`: numbers and short strings), saved

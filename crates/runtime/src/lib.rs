@@ -9,7 +9,7 @@ mod schedule;
 mod telemetry;
 mod testing;
 pub use capabilities::{EventSink, ProcessRunner, ResourceResolver, SecretResolver};
-pub use execution::{Config, InvalidDefinition, ResourceUnavailable, Runtime};
+pub use execution::{Config, InvalidDefinition, ResourceUnavailable, Runtime, Start};
 pub use observer::{Buffered, BufferedEvents, Event, EventKind, Observer, buffered};
 pub use opentelemetry;
 #[cfg(feature = "otlp")]
@@ -20,5 +20,8 @@ pub use ows::durable::{
     Annotation, Annotations, CALL_INTERRUPTED, CALL_NOT_EXECUTED, CALL_UNKNOWN, CallEntry, CallStatus,
     annotation_totals,
 };
-pub use registry::{Delivery, Function, FunctionContext, FunctionError, Handler, MissingFunction, Output, Registry};
+pub use registry::{
+    ChildError, ChildRef, ChildRefusal, ChildStart, ChildStarter, Delivery, Function, FunctionContext, FunctionError,
+    Handler, HostDataTooLarge, MissingFunction, Output, Registry,
+};
 pub use testing::{DryRun, Mock, RecordedCall, Replay, mock};
