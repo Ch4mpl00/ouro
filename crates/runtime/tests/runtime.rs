@@ -2310,7 +2310,8 @@ async fn a_dry_run_cuts_holds_short_and_max_hold_suspends_a_live_listen() {
     let held = runtime(Arc::new(durable::memory::memory()), Registry::new(), Arc::new(Time::default()));
     save(&held, &listen).await;
     held.start("held", "workflow", json!({})).await.unwrap();
-    let (within, delivered) = tokio::join!(held.drive("held", &CancellationToken::new()), async {
+    let stop = CancellationToken::new();
+    let (within, delivered) = tokio::join!(held.drive("held", &stop), async {
         tokio::time::sleep(Duration::from_millis(50)).await;
         held.deliver(answer.clone(), Some("held")).await
     });

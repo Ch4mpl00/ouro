@@ -6,6 +6,7 @@
 //! terminal storage transaction. Lease loss always stops forward progress.
 use crate::{
     ChildError, ChildRef, ChildRefusal, ChildStart, ChildStarter, FunctionContext, HostDataTooLarge, Output, Registry,
+    RunAccess, RunAccessError,
     capabilities::{Capabilities, EventSink, ProcessRunner, ResourceResolver, SecretResolver},
     observer::{EventKind, Observer, Observers, RunEvents},
     registry::{Checks, Installed, MissingFunction},
@@ -18,6 +19,7 @@ use opentelemetry::{Context, global::BoxedTracer, trace::FutureExt};
 use ouro_durable::{
     Admission, AdmissionMismatch, ChildLink, Clock, Compatibility, Definition, DefinitionTripped, Fence, Lease,
     RunStore, SavedRun, Swept, SystemClock,
+    control::{Cursor, Page},
 };
 use ows::{
     durable::{Annotations, CallEntry, CallFailure, CallStatus, Delivery},
@@ -153,6 +155,7 @@ impl Runtime {
             telemetry: Some(Arc::new(Telemetry::new(tracer.clone(), metrics.clone()))),
             host: Vec::new(),
             payload_bytes: config.event_payload_bytes,
+            admissions: None,
         });
         Ok(Self {
             definition_source: store.clone(),
@@ -640,6 +643,7 @@ impl Runtime {
         if matches!(mode, Mode::Dry { .. }) {
             limits.max_sleep = Some(Duration::ZERO);
             limits.max_listen = Some(Duration::ZERO);
+            limits.max_hold = Some(Duration::ZERO);
         }
         // The budget the run was admitted with: the host's ceiling then, or
         // its parent's budget. The definition tightens it in the interpreter.
@@ -1480,6 +1484,16 @@ impl ExecutionFunctions {
             })),
             _ => None,
         };
+        // The same calls reach the store driving them (X1: in a dry run, its
+        // private store, like their children).
+        let runs: Option<Arc<dyn RunAccess>> = match (&self.mode, process) {
+            (Mode::Live | Mode::Dry { .. }, None) => Some(Arc::new(CallRuns {
+                lease: self.lease.clone(),
+                run: info.run_id.into(),
+                max_depth: self.admitter.limits.max_depth,
+            })),
+            _ => None,
+        };
         let context = FunctionContext {
             cancel: info.cancel.clone(),
             run_id: info.run_id.into(),
@@ -1495,6 +1509,7 @@ impl ExecutionFunctions {
             meter: self.metrics.meter.clone(),
             host: self.host.clone(),
             children,
+            runs,
         };
         let result = async {
             if let Mode::Replay { .. } = &self.mode {
@@ -1533,8 +1548,10 @@ impl ExecutionFunctions {
                 // The dry run's guarantee: a call the host's rule marks is
                 // answered here and never reaches its handler or runner.
                 Mode::Dry { mock, mocked } if mock.mocks(name, &args) => {
-                    // A mocked call runs no handler, so it starts no child.
-                    let output = mock.response(name, &args, &FunctionContext { children: None, ..context.clone() });
+                    // A mocked call runs no handler, so it starts no child
+                    // and reaches no run.
+                    let output =
+                        mock.response(name, &args, &FunctionContext { children: None, runs: None, ..context.clone() });
                     mocked.lock().unwrap().push(RecordedCall {
                         task_path: info.reference.into(),
                         logical: info.logical.into(),
@@ -1723,6 +1740,102 @@ impl ChildStarter for HostChildren {
         Ok(ChildRef { done: format!("done:{id}"), waiting: format!("waiting:{id}"), id, key })
     }
 }
+/// `FunctionContext::runs` for one call of a registered function: the
+/// store its lease is on (the dry run's private one in a dry run), within
+/// the call's lineage. Lineage is found by walking child links up, from the
+/// asked run to the call's (a descendant) or from the call's run to the
+/// asked one (an ancestor), each walk bounded by the host's nesting depth.
+/// `await: false` runs have no child link: independent roots, out of scope.
+struct CallRuns {
+    lease: Arc<Lease>,
+    run: String,
+    max_depth: u32,
+}
+impl CallRuns {
+    /// `id`, when it is the call's run or a descendant of it.
+    async fn below(&self, id: &str) -> anyhow::Result<Option<SavedRun>> {
+        let store = &self.lease.store;
+        let Some(found) = store.get(id).await? else { return Ok(None) };
+        let mut link = found.child.clone();
+        if id == self.run {
+            return Ok(Some(found));
+        }
+        for _ in 0..=self.max_depth {
+            let Some(up) = link else { return Ok(None) };
+            if up.parent == self.run {
+                return Ok(Some(found));
+            }
+            link = match store.get(&up.parent).await? {
+                Some(parent) => parent.child,
+                None => return Ok(None),
+            };
+        }
+        Ok(None)
+    }
+    /// `id`, when it is the call's run, a descendant or an ancestor.
+    async fn lineage(&self, id: &str) -> anyhow::Result<Option<SavedRun>> {
+        if let Some(found) = self.below(id).await? {
+            return Ok(Some(found));
+        }
+        let store = &self.lease.store;
+        let mut link = store.get(&self.run).await?.and_then(|r| r.child);
+        for _ in 0..=self.max_depth {
+            let Some(up) = link else { return Ok(None) };
+            let parent = store.get(&up.parent).await?;
+            if up.parent == id {
+                return Ok(parent);
+            }
+            link = parent.and_then(|p| p.child);
+        }
+        Ok(None)
+    }
+}
+#[async_trait]
+impl RunAccess for CallRuns {
+    async fn get(&self, id: &str) -> anyhow::Result<Option<SavedRun>> {
+        self.lineage(id).await
+    }
+    async fn records(&self, id: &str) -> anyhow::Result<Option<BTreeMap<String, ows::durable::Record>>> {
+        if self.lineage(id).await?.is_none() {
+            return Ok(None);
+        }
+        Ok(self.lease.store.inspect(id).await?.map(|snapshot| snapshot.records))
+    }
+    async fn children(
+        &self,
+        parent: &str,
+        cursor: Option<Cursor>,
+        limit: usize,
+    ) -> Result<Page<SavedRun>, RunAccessError> {
+        if self.lineage(parent).await.map_err(RunAccessError::Storage)?.is_none() {
+            return Err(RunAccessError::OutOfScope);
+        }
+        let filter = ouro_durable::control::Runs { parent: Some(parent.into()), ..Default::default() };
+        self.lease.store.query_runs(&filter, false, cursor.as_ref(), limit).await.map_err(RunAccessError::Storage)
+    }
+    async fn deliver(&self, mut event: Value, target: &str) -> Result<String, RunAccessError> {
+        if self.below(target).await.map_err(RunAccessError::Storage)?.is_none() {
+            return Err(RunAccessError::OutOfScope);
+        }
+        let store = &self.lease.store;
+        store.check_lease(&self.lease.fence, self.lease.clock.now_ms()).await.map_err(RunAccessError::Interrupted)?;
+        // The engine's lifecycle types (a child's end and waiting, `done:`
+        // and `waiting:`, and the `child:` keys its joins listen under) are
+        // its own to send: a handler would forge a child's outcome.
+        let type_ = event.get("type").and_then(Value::as_str).unwrap_or_default();
+        if ["done:", "waiting:", "child:"].iter().any(|reserved| type_.starts_with(reserved)) {
+            return Err(RunAccessError::ReservedEventType);
+        }
+        let now = self.lease.clock.now_ms();
+        crate::schedule::complete(&mut event, now).map_err(RunAccessError::Storage)?;
+        match store.deliver(&event, Some(target), now).await {
+            Ok(Some(recipient)) => Ok(recipient),
+            Ok(None) => Err(RunAccessError::TargetEnded),
+            Err(e) => Err(RunAccessError::Storage(e)),
+        }
+    }
+}
+
 /// A deterministic refusal (nothing was admitted) or, for anything else (a
 /// lost lease, a hold, the emergency stop, storage, a schema resolver that
 /// failed now), an interruption.

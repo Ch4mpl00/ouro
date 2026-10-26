@@ -275,6 +275,9 @@ pub(crate) struct Observers {
     pub host: Vec<Arc<dyn Observer>>,
     /// The largest payload an event carries, as JSON bytes.
     pub payload_bytes: usize,
+    /// Where a dry run records the runs it admits, in the order it admits
+    /// them (`DryRun::runs`): an internal hook, no observer of the host's.
+    pub admissions: Option<Arc<std::sync::Mutex<Vec<String>>>>,
 }
 impl Observers {
     fn silent(&self) -> bool {
@@ -300,6 +303,9 @@ impl Observers {
     }
     /// A run admitted in a commit of this runtime, in its tree.
     pub fn admitted(&self, admission: &Admission, parent: Option<&str>, root: &str, now_ms: i64) {
+        if let Some(admissions) = &self.admissions {
+            admissions.lock().unwrap_or_else(|e| e.into_inner()).push(admission.id.clone());
+        }
         if self.silent() {
             return;
         }

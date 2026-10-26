@@ -9,8 +9,12 @@
 use crate::capabilities::{Capabilities, HostCatalog};
 use async_trait::async_trait;
 use opentelemetry::{Context as SpanContext, KeyValue, metrics::Meter};
+use ouro_durable::{
+    SavedRun,
+    control::{Cursor, Page},
+};
 pub use ows::durable::Delivery;
-use ows::durable::{Annotation, Annotations};
+use ows::durable::{Annotation, Annotations, Record};
 use ows::{
     model::{self, Catalog, Process, Workflow},
     run::WorkflowError,
@@ -74,6 +78,13 @@ pub struct FunctionContext {
     /// present for a registered function's handler, in live runs and dry runs;
     /// `None` for a process runner and for a dry run's `Mock::response`.
     pub children: Option<Arc<dyn ChildStarter>>,
+    /// The store driving this call, within the run's lineage
+    /// (`FunctionContext::run`, `records`, `children`, `deliver`): the host's
+    /// in a live run, the dry run's private one in a dry run. Present
+    /// wherever `children` is (a registered function's handler, live and
+    /// dry); `None` for a process runner, a dry run's `Mock::response` and
+    /// replay.
+    pub runs: Option<Arc<dyn RunAccess>>,
 }
 impl FunctionContext {
     /// The run id `start_child` with `key` gives the child in this call, and
@@ -125,7 +136,117 @@ impl FunctionContext {
             None => Err(ChildError::Refused(ChildRefusal::Unavailable)),
         }
     }
+    /// A run of this call's lineage as the store driving the call holds it
+    /// (`RunAccess::get`): its own run, an ancestor or a descendant, host
+    /// data included; `None` for any other id. Use it, not a handle the host
+    /// captured, for anything about the call's own run tree: in a dry run
+    /// that tree lives in the dry run's private store.
+    ///
+    /// A handler that needs another run's progress joins it in the workflow
+    /// (`listen`, a child's `done`) and reads its outcome afterwards: a dry
+    /// run drives its runs one after another, so a handler polling here for
+    /// another run's progress would wait forever.
+    pub async fn run(&self, id: &str) -> Result<Option<SavedRun>, RunAccessError> {
+        self.access()?.get(id).await.map_err(RunAccessError::Storage)
+    }
+    /// A lineage run's records (`RunAccess::records`), `None` outside it.
+    pub async fn records(&self, id: &str) -> Result<Option<BTreeMap<String, Record>>, RunAccessError> {
+        self.access()?.records(id).await.map_err(RunAccessError::Storage)
+    }
+    /// A page of the children of `parent`, a run of the call's lineage
+    /// (`RunAccess::children`).
+    pub async fn children(
+        &self,
+        parent: &str,
+        cursor: Option<Cursor>,
+        limit: usize,
+    ) -> Result<Page<SavedRun>, RunAccessError> {
+        self.access()?.children(parent, cursor, limit).await
+    }
+    /// Delivers an identified CloudEvent to the mailbox of `target`, the
+    /// call's own run or a descendant (`RunAccess::deliver`), where its next
+    /// matching `listen` takes it, however soon. Returns the recipient.
+    ///
+    /// A handler is dispatched at least once: derive the event's `id` from
+    /// `idempotency_key`, so a re-dispatch delivers the same identity and the
+    /// store keeps one copy.
+    pub async fn deliver(&self, event: Value, target: &str) -> Result<String, RunAccessError> {
+        self.access()?.deliver(event, target).await
+    }
+    fn access(&self) -> Result<&dyn RunAccess, RunAccessError> {
+        self.runs.as_deref().ok_or(RunAccessError::Unavailable)
+    }
 }
+
+/// The store driving a call, as its handler may use it
+/// (`FunctionContext::runs`): narrow by design. It reads the call's lineage,
+/// its own run, its ancestors up the child links and its descendants, and
+/// delivers to its own run or a descendant. No other run is visible (their
+/// host data stays private), no definition, and no start, cancel or control;
+/// children start only through `start_child`.
+#[async_trait]
+pub trait RunAccess: Send + Sync {
+    /// A run of the call's lineage: its own run, an ancestor (up the child
+    /// links) or a descendant (whose child links lead up to it); full
+    /// `SavedRun`, host data included. `None` for any other id (unknown or
+    /// unrelated alike: siblings and other trees are out of scope).
+    async fn get(&self, id: &str) -> anyhow::Result<Option<SavedRun>>;
+    /// Its records (`Runtime::records`), same scope as `get`.
+    async fn records(&self, id: &str) -> anyhow::Result<Option<BTreeMap<String, Record>>>;
+    /// Its children by parent link (`Control::list` filtered by parent, host
+    /// data redacted as there), bounded and paged; `parent` in the same
+    /// scope as `get`, else `OutOfScope`.
+    async fn children(
+        &self,
+        parent: &str,
+        cursor: Option<Cursor>,
+        limit: usize,
+    ) -> Result<Page<SavedRun>, RunAccessError>;
+    /// Delivers `event` (an identified CloudEvent) to `target`'s mailbox:
+    /// `target` must be the call's own run or a descendant. Lease-checked;
+    /// reserved types refused (`ReservedEventType`).
+    async fn deliver(&self, event: Value, target: &str) -> Result<String, RunAccessError>;
+}
+
+/// Why run access answered nothing.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum RunAccessError {
+    /// No capability here (process runner, mock response, replay).
+    Unavailable,
+    /// The target is outside the call's own run and its descendants (deliver)
+    /// or outside its lineage (`children` of an unrelated parent).
+    OutOfScope,
+    /// A reserved event type (`done:`, `waiting:`, `child:`): the engine's
+    /// own lifecycle events, which no handler can forge.
+    ReservedEventType,
+    /// The target run has ended: the store took no delivery.
+    TargetEnded,
+    /// The call no longer holds its run (lease lost, cancelled, emergency
+    /// stop): no answer, like `ChildError::Interrupted`.
+    Interrupted(anyhow::Error),
+    /// Storage failed, or the store refused the event: not an identified
+    /// CloudEvent, or an identity already delivered to the target with
+    /// another payload (`durable::IdentityConflict` in the error's chain).
+    Storage(anyhow::Error),
+}
+
+impl std::fmt::Display for RunAccessError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RunAccessError::Unavailable => {
+                f.write_str("this call has no run access (a process run, a mocked call or a replay)")
+            }
+            RunAccessError::OutOfScope => f.write_str("the run is outside this call's lineage"),
+            RunAccessError::ReservedEventType => {
+                f.write_str("event types starting with done:, waiting: or child: are the engine's")
+            }
+            RunAccessError::TargetEnded => f.write_str("the target run has ended"),
+            RunAccessError::Interrupted(e) | RunAccessError::Storage(e) => write!(f, "{e:#}"),
+        }
+    }
+}
+impl std::error::Error for RunAccessError {}
 
 /// A host child's id: `hostchild:<32 hex>` of `[<run>, <call reference>,
 /// <key>]` (`hashed_id`), distinct from the built-in children's `child:` ids.

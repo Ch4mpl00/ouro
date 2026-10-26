@@ -22,6 +22,6 @@ pub use ows::durable::{
 };
 pub use registry::{
     ChildError, ChildRef, ChildRefusal, ChildStart, ChildStarter, Delivery, Function, FunctionContext, FunctionError,
-    Handler, HostDataTooLarge, MissingFunction, Output, Registry,
+    Handler, HostDataTooLarge, MissingFunction, Output, Registry, RunAccess, RunAccessError,
 };
-pub use testing::{DryRun, Mock, RecordedCall, Replay, mock};
+pub use testing::{DryRun, DryRunOptions, DryRunRun, Mock, RecordedCall, Replay, mock};

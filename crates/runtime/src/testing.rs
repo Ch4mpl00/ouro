@@ -2,7 +2,7 @@
 //! run dispatches every call except those its host's mock rule marks, which
 //! the mock answers; replay dispatches nothing and takes results from
 //! durable call records.
-use crate::{FunctionContext, FunctionError, Output, Runtime};
+use crate::{FunctionContext, FunctionError, Observer, Output, Runtime};
 use ouro_durable::{Clock, RunStore};
 use ows::{
     durable::{Annotations, CallEntry, CallState, CallStatus, Delivery, Record},
@@ -60,14 +60,58 @@ pub struct RecordedCall {
     /// The annotations the answer carried.
     pub annotations: Annotations,
 }
+/// What a dry run did. `#[non_exhaustive]`: it grows as dry runs report more.
+#[non_exhaustive]
 pub struct DryRun {
     pub status: Status,
     /// The calls the mock answered and the events the run emitted (as
-    /// `emit`; a dry run publishes none), in the order they happened.
+    /// `emit`; a dry run publishes none), in the order they happened. A
+    /// delivery through run access (`FunctionContext::deliver`) is no
+    /// mocked call: it shows when a `listen` takes it, in the receiving
+    /// run's records and as `EventConsumed` to the dry run's observer.
     pub mocked: Vec<RecordedCall>,
-    /// The dry run's call journal, mocked and dispatched calls alike, with
-    /// their annotations (`annotation_totals` sums what it would cost).
+    /// The root's call journal, mocked and dispatched calls alike, with
+    /// their annotations (`annotation_totals` sums what it would cost);
+    /// equals `runs[0].calls` (kept for compatibility).
     pub calls: Vec<CallEntry>,
+    /// Every run the dry run admitted, in admission order (the root first).
+    pub runs: Vec<DryRunRun>,
+}
+/// A run a dry run admitted (`DryRun::runs`).
+#[non_exhaustive]
+#[derive(Clone, Debug, PartialEq)]
+pub struct DryRunRun {
+    pub id: String,
+    /// The parent run and `ChildLink::key` (as `ChildRef::key`, what
+    /// `child_outcome` takes); `None` for the root and for `await: false` runs.
+    pub parent: Option<String>,
+    pub key: Option<String>,
+    /// True for a run started by `run: workflow` with `await: false`: a root
+    /// of its own, not the dry run's root.
+    pub independent: bool,
+    pub name: String,
+    pub version: u64,
+    /// The content digest of its definition (`ouro_durable::digest_of`).
+    pub digest: String,
+    /// `None`: still live when the dry run ended (it waits, or was stopped).
+    /// Owned descendants live when the root ended were cancelled with it.
+    pub outcome: Option<Status>,
+    pub calls: Vec<CallEntry>,
+}
+/// How to dry-run (`Runtime::dry_run_opts`). Exhaustive, so a host writes
+/// `DryRunOptions { observer, ..Default::default() }`.
+#[derive(Default)]
+pub struct DryRunOptions {
+    /// The root's run id and definition name in the private store;
+    /// `dry-run` for both when `None`, whatever the YAML's `document.name`.
+    pub id: Option<String>,
+    pub name: Option<String>,
+    /// Host data for the root (`Runtime::start_with`).
+    pub host: Option<Value>,
+    /// Hears every event of this dry run's runs, root and children, root
+    /// admission included, with payloads as a live observer gets them;
+    /// nothing else of the host does.
+    pub observer: Option<Arc<dyn Observer>>,
 }
 pub struct Replay {
     pub status: Status,
@@ -107,6 +151,7 @@ impl TestClock {
     }
 }
 impl Runtime {
+    /// `dry_run_opts` with the default options.
     pub async fn dry_run(
         &self,
         yaml: &str,
@@ -114,9 +159,9 @@ impl Runtime {
         mock: Arc<dyn Mock>,
         stop: &CancellationToken,
     ) -> anyhow::Result<DryRun> {
-        self.dry_run_with(yaml, input, None, mock, stop).await
+        self.dry_run_opts(yaml, input, mock, DryRunOptions::default(), stop).await
     }
-    /// `dry_run` with host data for its root (`Runtime::start_with`).
+    /// `dry_run_opts` with host data for its root (`Runtime::start_with`).
     pub async fn dry_run_with(
         &self,
         yaml: &str,
@@ -125,12 +170,31 @@ impl Runtime {
         mock: Arc<dyn Mock>,
         stop: &CancellationToken,
     ) -> anyhow::Result<DryRun> {
+        self.dry_run_opts(yaml, input, mock, DryRunOptions { host, ..DryRunOptions::default() }, stop).await
+    }
+    /// Runs `yaml` and every run it starts in a private in-memory store on
+    /// a virtual clock: calls the mock rule marks are answered by `mock`,
+    /// every other call is dispatched. Waits, listen timeouts and holds are
+    /// cut to nothing; the driver drives each due run in turn until the root
+    /// ends, nothing is due, or `stop`. Handlers reach the private store
+    /// through their run access (`FunctionContext::run`, `deliver`).
+    pub async fn dry_run_opts(
+        &self,
+        yaml: &str,
+        input: Value,
+        mock: Arc<dyn Mock>,
+        options: DryRunOptions,
+        stop: &CancellationToken,
+    ) -> anyhow::Result<DryRun> {
         self.validate(yaml)?;
+        let id = options.id.unwrap_or_else(|| "dry-run".into());
+        let name = options.name.unwrap_or_else(|| "dry-run".into());
         let store = Arc::new(ouro_durable::memory::memory());
         let clock = Arc::new(TestClock(std::sync::atomic::AtomicI64::new(self.clock.now_ms())));
         let mut config = self.config.clone();
         config.limits.max_sleep = Some(Duration::ZERO);
         config.limits.max_listen = Some(Duration::ZERO);
+        config.limits.max_hold = Some(Duration::ZERO);
         let mut runtime = Runtime::new(
             store.clone(),
             self.registry(),
@@ -139,30 +203,50 @@ impl Runtime {
             opentelemetry::global::BoxedTracer::new(Box::new(opentelemetry::trace::noop::NoopTracer::new())),
         )?;
         runtime.capabilities = self.capabilities.clone();
-        let d = runtime.save("dry-run", yaml).await?;
-        runtime.activate(&d.name, d.version).await?;
-        let start = crate::Start { version: None, host: host.unwrap_or(Value::Null) };
-        runtime.start_with("dry-run", "dry-run", input, start).await?;
-        runtime.definition_source = self.store.clone();
         // Traced with the host's tracer, unless the host removed its
-        // OpenTelemetry observer; counted nowhere, and no host observer
-        // hears it: a dry run is no run of the host.
+        // OpenTelemetry observer; counted nowhere, and no observer of the
+        // host's hears it: a dry run is no run of the host. Its own observer
+        // hears all of it, from the root's admission on.
         runtime.tracer = self.tracer.clone();
+        let admissions = Arc::new(Mutex::new(Vec::new()));
         runtime.observers = Arc::new(crate::observer::Observers {
             telemetry: self
                 .observers
                 .telemetry
                 .as_ref()
                 .map(|_| Arc::new(crate::telemetry::Telemetry::new(self.tracer.clone(), runtime.metrics.clone()))),
-            host: Vec::new(),
-            payload_bytes: 0,
+            host: options.observer.into_iter().collect(),
+            payload_bytes: self.config.event_payload_bytes,
+            admissions: Some(admissions.clone()),
         });
+        let d = runtime.save(&name, yaml).await?;
+        runtime.activate(&d.name, d.version).await?;
+        let start = crate::Start { version: None, host: options.host.unwrap_or(Value::Null) };
+        runtime.start_with(&id, &name, input, start).await?;
+        // Children's definitions come from the host's catalog.
+        runtime.definition_source = self.store.clone();
         let mocked = Arc::new(Mutex::new(Vec::new()));
-        let status =
-            run_isolated(&runtime, "dry-run", Mode::Dry { mock, mocked: mocked.clone() }, &clock, stop).await?;
+        let status = run_isolated(&runtime, &id, Mode::Dry { mock, mocked: mocked.clone() }, &clock, stop).await?;
         let mocked = mocked.lock().unwrap().clone();
-        let calls = runtime.calls("dry-run").await?;
-        Ok(DryRun { status, mocked, calls })
+        let admitted = admissions.lock().unwrap().clone();
+        let mut runs = Vec::with_capacity(admitted.len());
+        for run_id in admitted {
+            let saved = runtime.get(&run_id).await?.ok_or_else(|| anyhow::anyhow!("a dry run's run disappeared"))?;
+            let link = saved.child;
+            runs.push(DryRunRun {
+                independent: link.is_none() && run_id != id,
+                parent: link.as_ref().map(|l| l.parent.clone()),
+                key: link.map(|l| l.key),
+                name: saved.admission.name,
+                version: saved.admission.version,
+                digest: ouro_durable::digest_of(&saved.admission.definition),
+                outcome: saved.outcome,
+                calls: runtime.calls(&run_id).await?,
+                id: run_id,
+            });
+        }
+        let calls = runs.first().map(|root| root.calls.clone()).unwrap_or_default();
+        Ok(DryRun { status, mocked, calls, runs })
     }
     pub async fn replay(&self, id: &str, stop: &CancellationToken) -> anyhow::Result<Replay> {
         self.replay_inner(id, None, stop).await

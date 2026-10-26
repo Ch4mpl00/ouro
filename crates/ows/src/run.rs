@@ -414,11 +414,26 @@ pub struct Limits {
     /// dry run's `ZERO`: an event not already delivered has expired).
     /// `None`: the listen holds and suspends as the definition says.
     pub max_listen: Option<Duration>,
+    /// The longest a `listen` holds its drive waiting for an event
+    /// (`metadata.ouro.hold`); past it the run suspends and the delivery
+    /// wakes it, as past a hold. A hold only spares a suspension, so this
+    /// changes when a run suspends, never an outcome (a dry run's `ZERO`:
+    /// a join suspends at once and the dry run drives the child).
+    /// `None`: as long as the definition says.
+    pub max_hold: Option<Duration>,
 }
 
 impl Default for Limits {
     fn default() -> Self {
-        Self { max_tasks: 10_000, max_jumps: 100, max_depth: 10, max_attempts: 10, max_sleep: None, max_listen: None }
+        Self {
+            max_tasks: 10_000,
+            max_jumps: 100,
+            max_depth: 10,
+            max_attempts: 10,
+            max_sleep: None,
+            max_listen: None,
+            max_hold: None,
+        }
     }
 }
 
@@ -2467,9 +2482,9 @@ impl Run<'_> {
     }
 
     /// One event for `key`: available now, or delivered within the task's
-    /// hold. Otherwise the run suspends until a delivery wakes it, or the
-    /// listen times out: its deadline has come, or the host's ceiling
-    /// (`Limits::max_listen`) cut the hold short of it.
+    /// hold (at most `Limits::max_hold`). Otherwise the run suspends until a
+    /// delivery wakes it, or the listen times out: its deadline has come, or
+    /// the host's ceiling (`Limits::max_listen`) cut the hold short of it.
     #[allow(clippy::too_many_arguments)]
     async fn next_event(
         &self,
@@ -2520,6 +2535,14 @@ impl Run<'_> {
                 };
                 expires = Some(limit);
             }
+        }
+        // A listen that times out at the end of its hold keeps it: cutting
+        // it would time out sooner. Any other hold ends in a suspension the
+        // delivery wakes from, so the host may cut it short.
+        if expires.is_none()
+            && let Some(max) = self.host.limits.max_hold
+        {
+            hold = hold.min(max);
         }
         let until = tokio::time::Instant::now() + hold;
         loop {
