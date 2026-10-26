@@ -573,11 +573,26 @@ fn subscribed(snapshot: &StoredRun, event: &StoredEvent) -> bool {
             .values()
             .any(|types| types.contains(&event.type_) || (published(event) && types.iter().any(|t| t == "*")))
 }
+/// Whether a pending copy of `type_` wakes the run: the one rule of `notify`,
+/// `accept` and `pending_wanted`. A CloudEvent (`cloud`) wakes a run that
+/// awaits its type, whatever the type looks like. A lifecycle notice wakes it
+/// only if a current listen or an addressed wait names the exact type: the
+/// automatic `awaits` of `start_child` and its internal `child:*` listener
+/// keep the notice deliverable, not waking, and a `*` listen cannot take a
+/// notice. A stale listener can only cause an extra wake; the copy stays
+/// pending either way, for a later listen to take.
+fn wakes(snapshot: &StoredRun, type_: &str, cloud: bool) -> bool {
+    if cloud {
+        return snapshot.awaits.contains_key(type_);
+    }
+    snapshot.addressed_waits.contains(type_)
+        || snapshot.listeners.iter().any(|(k, types)| !k.starts_with("child:") && types.iter().any(|t| t == type_))
+}
 /// A pending, unexpired copy the run is waiting or subscribed for.
 fn wanted(snapshot: &StoredRun, event: &StoredEvent, now: i64) -> bool {
     event.consumed_key.is_none()
         && !expired(event, now)
-        && (snapshot.awaits.contains_key(&event.type_) || subscribed(snapshot, event))
+        && (wakes(snapshot, &event.type_, event.envelope.is_some()) || subscribed(snapshot, event))
 }
 /// The event as taken: the accepted CloudEvent with its delivery `time`, or
 /// a lifecycle notification's `type`, `data` and `time`.
@@ -704,8 +719,15 @@ async fn pending_wanted(rows: &mut dyn Transaction, s: &StoredRun, now: i64) -> 
     let fresh = s.mailbox.is_none_or(|at| at > now);
     // Copies expiring after `now` (or never), at most `limit` of them.
     let until = until(now);
-    for t in s.awaits.keys() {
-        if s.pending.contains_key(t) && (fresh || !rows.scan(&live_of(id, t), &until, None, 1).await?.is_empty()) {
+    for (t, p) in s.awaits.keys().filter_map(|t| s.pending.get(t).map(|p| (t, p))) {
+        // Lifecycle notices never expire; the live scan is for CloudEvents.
+        if p.copies > p.cloud && wakes(s, t, false) {
+            return Ok(true);
+        }
+        if p.cloud > 0
+            && wakes(s, t, true)
+            && (fresh || rows.scan(&live_of(id, t), &until, None, 2).await?.values().any(|cloud| cloud == &json!(true)))
+        {
             return Ok(true);
         }
     }
@@ -810,8 +832,12 @@ async fn notify(rows: &mut dyn Transaction, parent: &str, t: &str, data: &Value,
         delivered: false,
         expires_at_ms: None,
     };
+    // The notice is stored either way; only a listen that can take it wakes
+    // the parent, so a join on `done:` sleeps through the child's waiting.
+    if wakes(&snapshot, t, false) {
+        snapshot.run.wake_at_ms = now;
+    }
     push(rows, &mut snapshot, event).await?;
-    snapshot.run.wake_at_ms = now;
     store_run(rows, &snapshot).await
 }
 /// Reads only the runs indexed under the event's type and `*` (or the
