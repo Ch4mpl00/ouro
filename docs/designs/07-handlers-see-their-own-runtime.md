@@ -365,3 +365,44 @@ Each fails before the change unless noted.
 ## Open questions
 
 - Issue #40: should `Runtime::deliver` refuse reserved event types too?
+
+## Deviations
+
+Found during implementation (executor, branch `feat/run-access`); for the
+maintainer to confirm or change.
+
+1. **`DeliverError` is not defined.** The trait's `deliver` returns
+   `Result<String, DeliverError>` and the Rollout exports `DeliverError`, but
+   the document defines no such type; its delivery failures are all variants
+   of `RunAccessError` (R2-L), and `children` must answer `OutOfScope`, which
+   the trait's `anyhow::Result` cannot carry typed. Implemented: the trait's
+   `children` and `deliver` return `Result<_, RunAccessError>` (`get` and
+   `records` keep `anyhow::Result`, mapped to `Storage` by the
+   `FunctionContext` methods); no `DeliverError` type and no such export.
+   Proposed change: replace `DeliverError` with `RunAccessError` in the trait
+   signature and drop it from the export list.
+2. **An event the store refuses has no variant.** `RunAccessError` has no
+   case for an event that is not an identified CloudEvent (`id`, `source`,
+   `type`) or whose identity was already delivered to the target with another
+   payload (`durable::IdentityConflict`). Implemented without inventing API:
+   both are `Storage`, the cause in the error's chain, and the doc comment of
+   `Storage` says so. Proposed change (additive, the enum is
+   `#[non_exhaustive]`): a variant `InvalidEvent(anyhow::Error)` for both.
+
+## Implementation notes
+
+- **Hold-related invariants (A-H2).** No invariant in
+  `docs/durable-invariants.md` mentions a hold's length. Those that concern
+  a listen's in-memory wait, L3 (an accepted matching event eventually
+  resolves its wait; notifications are not assumed reliable, durable polling
+  suffices) and L5 (no permanent in-memory waiter), are kept: `max_hold`
+  only ends the in-memory wait sooner, and the run then suspends on the
+  durable path those invariants already cover. A listen whose hold ends in a
+  timeout (`Limits::max_listen` reached) keeps its hold, so `max_hold` never
+  turns a wait into a timeout.
+- **X1 mutant (test 7).** Built by giving the run access a lease on the
+  host's store (`admitter.definitions`, the host's catalog store in a dry
+  run): `x1_run_access_in_generated_dry_runs_stays_in_the_private_store`
+  fails at once (the handler reads the host's run under the root's id),
+  while the existing `x1_x2_generated_dry_runs_and_replays_are_isolated`
+  passes under it.

@@ -19,7 +19,7 @@ does not validate on an older engine).
 | `document.metadata.ouro` | `limits`, `at`, `timezone`, `catchup`, `overlap`, `breaker` |
 | a call task's `metadata.ouro` | `delivery`: `at_least_once` or `at_most_once` (tighten only) |
 | a `for` task's `metadata.ouro` | `concurrency`: a positive integer, not with `while` |
-| a `listen` task's `metadata.ouro` | `hold`: a literal ISO 8601 duration |
+| a `listen` task's `metadata.ouro` | `hold`: a literal ISO 8601 duration (the host may cap it, `Limits::max_hold`) |
 
 A known key on another kind of task is a validation error at its
 `…/metadata/ouro/<key>` pointer.

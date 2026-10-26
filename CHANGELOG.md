@@ -4,6 +4,42 @@ Ouro is a 0.x prerelease: breaking changes are allowed and are listed here. The
 durable state version and the store layouts they mention are refused, not converted, so a
 store written before such a change must be recreated unless the entry says otherwise.
 
+## Unreleased / 0.3.0
+
+Stored versions unchanged (durable run state 15, `definitions` row layout 7,
+trigger queue layout 1). No migration required (design 07, issue #39).
+
+### Handlers reach the store that drives them; a dry run reports its tree
+
+- `FunctionContext::runs` (`RunAccess`): a handler reads its call's lineage
+  (`cx.run`, `cx.records`, `cx.children`: its own run, its ancestors and its
+  descendants) and delivers an identified event to its own run or a
+  descendant (`cx.deliver`), in the store driving the call: the host's live,
+  the dry run's private one in a dry run. Deliveries are lease-checked and
+  refuse the engine's reserved types (`done:`, `waiting:`, `child:`);
+  failures are typed (`RunAccessError`). Present wherever `children` is;
+  absent for a process runner, a dry run's `Mock::response` and replay.
+- `Runtime::dry_run_opts` with `DryRunOptions { id, name, host, observer }`:
+  the host names the dry run's root (`dry-run` by default), and an observer
+  of the dry run's own hears every event of its runs, root admission
+  included; the host's observers still hear nothing. `dry_run` and
+  `dry_run_with` are thin wrappers over it.
+- `DryRun::runs`: every run a dry run admitted, in admission order, with its
+  parent and link key, definition, digest, outcome and call journal.
+- `ows::run::Limits::max_hold`: the longest a `listen` holds its drive; past
+  it the run suspends and the delivery wakes it, with the same outcome. A dry
+  run sets it to zero, so a join no longer holds its whole hold in real time
+  while the child it waits for is not driven.
+
+### Breaking changes
+
+- `FunctionContext` gains the public field `runs`; code that builds a
+  `FunctionContext` with a struct literal adds it.
+- `DryRun` gains `runs` and is `#[non_exhaustive]`, like the new `DryRunRun`:
+  code outside the crate reads them and no longer builds them.
+- `ows::run::Limits` gains `max_hold`; a struct literal without
+  `..Limits::default()` adds it.
+
 ## 0.2.2 (2026-10-26)
 
 Stored versions unchanged (durable run state 15, `definitions` row layout 7,

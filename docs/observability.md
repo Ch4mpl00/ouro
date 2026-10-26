@@ -156,7 +156,11 @@ observer whose `observe` is a clone and a non-blocking enqueue, with a
 drops the event and counts it in `Buffered::dropped`; the order is kept).
 An observer sees one run's events in the order its execution produced
 them (concurrent branches interleave); runs are not ordered with each
-other. Dry runs and replays are not reported to the host's observers.
+other. Dry runs and replays are not reported to the host's observers,
+except to the observer given in `DryRunOptions`: a dry run's own, which
+hears every event of that dry run's runs, the root's admission included,
+with payloads as a live observer gets them and times on the dry run's
+virtual clock.
 
 **Payloads.** Inputs, outputs, arguments, results and events are copied
 only when the host has an observer, and left out (`None`) when their JSON

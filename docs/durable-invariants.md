@@ -681,16 +681,21 @@ actual handler lifetime and permits separately. Limit scope is an open choice.
 
 For dry-run history `H_d` with mock rule `M`, the production state delta is empty
 and `count(Dispatch(i,_) | M(i)) = 0`. Calls `M` marks go only to the injected mock;
-every other call is dispatched for real. Owned children and process calls inherit
-dry mode and `M`; emitted events are recorded and never reach publication or sinks;
+every other call is dispatched for real. Owned children, process calls and the run
+access a handler is given inherit dry mode and `M`; emitted events are recorded and
+never reach publication or sinks;
 definition reads may use the host catalog, but admissions, activation, triggers and
 events stay private. Whatever a dispatched call does is under the host's truthful
 rule.
 
 Dry mode must propagate through every escape path. **Source:** [README][README],
 [I1P][I1P]. **Fault:** unmocked child/process/event side channel.
-**Mutant:** dry-run children use the production runtime. **Check:** deny/count
-production writes at all injected seams, including indirect children and emit.
+**Mutant:** dry-run children use the production runtime; in a dry run the run
+access reads and delivers into the host's store (design 07). **Check:** deny/count
+production writes at all injected seams, including indirect children, emit and a
+handler's reads and deliveries through its run access. The Quint model is
+unchanged by run access: a targeted delivery is the existing `Deliver`, reads are
+reads, and the X1 monitor counts mocked dispatches.
 
 #### X2 — Replay dispatches no handlers and consumes only supplied evidence [P, safety]
 

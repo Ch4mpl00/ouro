@@ -10,8 +10,9 @@ with its own dry-run mock rule (below). Handlers receive arguments and
 cancellation token, run ID, task path, retry attempt, stable idempotency key,
 the call's span (current while the handler runs), the function, definition,
 version and delivery, the runtime's meter ([Observability](observability.md)),
-the run's host data (`host()`) and the capability to start host children
-(`start_child`, below). Return
+the run's host data (`host()`), the capability to start host children
+(`start_child`, below) and access to the store that drives the call, within
+its run's lineage (`runs`: `run`, `records`, `children`, `deliver`, below). Return
 JSON, an annotated `Output`, or `FunctionError` (OWS Problem Details); YAML
 `try/catch` handles ordinary function and schema errors. Both input and
 output schemas are checked. An error can also say that the call did nothing,
@@ -161,6 +162,51 @@ Function::new("delegate", input, output, |args: Value, cx: FunctionContext| asyn
 })
 ```
 
+**Run access.** A handler reaches the store that drives its call through
+`FunctionContext::runs` (a `RunAccess`), most simply with `cx.run(id)`,
+`cx.records(id)`, `cx.children(parent, cursor, limit)` and
+`cx.deliver(event, target)`: the host's store in a live run, the dry run's
+private store in a dry run. It is narrow. It reads the call's lineage: its own
+run, its ancestors up the child links and its descendants, the full `SavedRun`
+with host data and the run's records; any other id answers `None`, and the
+children of a parent outside the lineage `RunAccessError::OutOfScope`
+(`children` pages redact host data as `Control::list` does). It delivers an
+identified CloudEvent to the mailbox of the call's own run or a descendant
+(`OutOfScope` for any other target, an ancestor included), where the target's
+next matching `listen` takes it. A delivery checks the call's lease first
+(`Interrupted` once the call no longer holds its run: a lost lease, a
+cancellation, the emergency stop), refuses the engine's reserved types
+(`done:`, `waiting:`, `child:`: `ReservedEventType`) and answers `TargetEnded`
+when the target has ended; anything the store refuses or fails, an event that
+is not an identified CloudEvent included, is `Storage`. `await: false` runs
+have no child link and are out of scope. There is no start, cancel, control or
+definition access; children start only through `start_child`. The capability
+is present wherever `children` is, and absent (`Unavailable`) for a process
+runner, a dry run's `Mock::response` and replay. A handle the host captured
+when it built its registry still works in a live run, but reads the host's
+store in a dry run: use the context's for anything about the call's own run
+tree.
+
+A handler is dispatched at least once, so it derives a delivered event's `id`
+from `idempotency_key`: a re-dispatch then delivers the same identity, and the
+store keeps one copy. The confirmation pattern: a handler that would send a
+card and wait for the user's answer, when the answer is known at once (a dry
+run, an approving policy), delivers the answer to its own run before it
+returns, and the run's next `listen` takes it from the mailbox:
+
+```rust
+Function::new("ask", input, output, |args: Value, cx: FunctionContext| async move {
+    let answer = json!({
+        "id": format!("{}#answer", cx.idempotency_key), // the same on a re-dispatch
+        "source": "host",
+        "type": "answer",
+        "data": { "approved": true },
+    });
+    cx.deliver(answer, &cx.run_id).await.map_err(|e| FunctionError::runtime(e.to_string()))?;
+    Ok(json!({ "asked": args }))
+})
+```
+
 Every run starts with a check that each function it can call is registered:
 the functions its calls name, the process runners its `run:` tasks need
 (`run:<kind>`), and, transitively, those of the child workflows its
@@ -302,21 +348,51 @@ commit, so a parent that finishes without joining stops its child.
 The worker drives children under the same bounds. Native `run: workflow`
 ([the DSL](dsl.md)) is the DSL's way to run a child and wait for it.
 
-`dry_run` takes the host's `Mock` (`dry_run_with` also takes host data for the
-root, as `start_with`): a rule over each call's function and
+`dry_run_opts(yaml, input, mock, options, stop)` dry-runs a definition;
+`dry_run` (default options) and `dry_run_with` (host data for the root, as
+`start_with`) are thin wrappers over it. It takes the host's `Mock`: a rule
+over each call's function and
 arguments (`mocks`) and the answers to what it marks (`response`, a value or
 an annotated `Output`, whose annotations the dry run keeps; a mocked call runs
-no handler, so it starts no host child);
+no handler, so it starts no host child and has no run access);
 `mock(rule, response)` builds one from two closures. Its guarantee: a dry run
 dispatches no call (function or process run, `run:<kind>`) the rule marks.
 Every other call is dispatched for real. Emitted events are recorded, never
 published or handed to the sink. `DryRun::mocked` lists the mocked calls and
-the emitted events; `DryRun::calls` is the dry run's whole call journal with
-annotations, so `annotation_totals` estimates what a run would use. A dry run
-or replay is traced but records no metrics: it is not a run of the host. All runs and definitions live in a private memory store, children a
-handler starts included;
+the emitted events; a delivery through run access is not among them, and
+shows when a `listen` takes it (in the receiving run's records). `DryRun::runs`
+lists every run the dry run admitted, in admission order, the root first
+(`DryRunRun`: id, parent and link key, `None` for the root and for `await:
+false` runs, which are `independent`; name, version, digest, outcome and call
+journal with annotations, so `annotation_totals` estimates what a run would
+use). An outcome is `None` for a run still live when the dry run ended: it
+waits, the dry run was stopped, or it is an `await: false` run the driver no
+longer drives once the root ended; owned descendants live at the root's end
+are cancelled with it. `DryRun::calls` is the root's journal (`runs[0].calls`).
+`DryRunOptions` names the root (`id`, `name`; `dry-run` for both by default,
+whatever the YAML's `document.name`), gives it host data (`host`), and may
+carry an observer of the dry run's own (`observer`, [Observability](observability.md)).
+A dry run or replay is traced but records no metrics, and the host's
+observers hear nothing of it: it is not a run of the host. All runs and
+definitions live in a private memory store, children a handler starts
+included, and a handler's run access reaches that store;
 child definitions are read from the host's catalog. Durable delays advance
-without sleeping. `replay` and `replay_definition` take function results, their
+without sleeping on a virtual clock that jumps to the next wake-up; waits,
+listen timeouts and holds are cut to nothing (`Limits::max_sleep`,
+`max_listen` and `max_hold` are zero), so a `listen` takes an event already in
+its mailbox or, without one, times out (with a `timeout`) or suspends, and the
+driver drives the due runs one after another: a join suspends at once and the
+child it waits for is driven. Three consequences: a handler that waits for
+another run's progress by polling `cx.run` never lets that run be driven, and
+the dry run ends only at `stop` (join with `listen`, or a child's `done`, and
+read the outcome afterwards); a mailbox copy can pass the store's
+`Policy::mailbox_ms` before a `listen` that follows a long timer takes it,
+which cannot happen on the same timeline live; and a handler dispatched again
+delivers again, deduplicated only by an `id` derived from `idempotency_key`.
+A live host may cap holds too (`Config.limits.max_hold`): past it a `listen`
+suspends, and the delivery wakes the run with the same outcome.
+
+`replay` and `replay_definition` take function results, their
 annotations and event envelopes from a recorded run and execute in
 isolation, with no handler dispatch (`Replay::calls` is the replayed
 journal). Replay rejects missing or changed call bindings and requires evidence
