@@ -4,7 +4,7 @@ Ouro is a 0.x prerelease: breaking changes are allowed and are listed here. The
 durable state version and the store layouts they mention are refused, not converted, so a
 store written before such a change must be recreated unless the entry says otherwise.
 
-## Unreleased / 0.3.0
+## 0.3.0 (2026-10-26)
 
 Stored versions unchanged (durable run state 15, `definitions` row layout 7,
 trigger queue layout 1). No migration required (design 07, issue #39).

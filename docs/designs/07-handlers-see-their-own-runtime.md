@@ -1,6 +1,6 @@
 # 07. Handlers reach the store that drives them; a dry run reports its tree and takes an observer
 
-Status: implemented (feat/run-access) after goldfish rounds 1 and 2 (R-n, R2-n) and the ouro-agent design 05 review (A-n) · Issue: #39
+Status: implemented (0.3.0) after goldfish rounds 1 and 2 (R-n, R2-n) and the ouro-agent design 05 review (A-n) · Issue: #39
 
 ## Problem
 
