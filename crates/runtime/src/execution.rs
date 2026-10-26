@@ -1827,10 +1827,13 @@ impl RunAccess for CallRuns {
             return Err(RunAccessError::ReservedEventType);
         }
         let now = self.lease.clock.now_ms();
-        crate::schedule::complete(&mut event, now).map_err(RunAccessError::Storage)?;
+        crate::schedule::complete(&mut event, now).map_err(RunAccessError::InvalidEvent)?;
         match store.deliver(&event, Some(target), now).await {
             Ok(Some(recipient)) => Ok(recipient),
             Ok(None) => Err(RunAccessError::TargetEnded),
+            Err(e) if e.chain().any(|c| c.is::<ouro_durable::IdentityConflict>()) => {
+                Err(RunAccessError::InvalidEvent(e))
+            }
             Err(e) => Err(RunAccessError::Storage(e)),
         }
     }

@@ -855,6 +855,7 @@ fn refusal(error: &RunAccessError) -> String {
         RunAccessError::ReservedEventType => "reserved".into(),
         RunAccessError::TargetEnded => "ended".into(),
         RunAccessError::Interrupted(_) => "interrupted".into(),
+        RunAccessError::InvalidEvent(_) => "invalid".into(),
         RunAccessError::Storage(e) => format!("storage: {e:#}"),
         other => format!("{other:?}"),
     }
@@ -1087,7 +1088,8 @@ async fn a_dry_parent_wakes_its_listening_child() {
 }
 
 /// Test 5: a delivery is refused, each with its type: to an unrelated run,
-/// with a reserved type, and after the call's lease is lost.
+/// with a reserved type, an event that is not identified or whose identity
+/// was delivered with another payload, and after the call's lease is lost.
 #[tokio::test]
 async fn a_handler_delivery_is_refused_out_of_scope_reserved_or_without_a_lease() {
     let time = Arc::new(Time::default());
@@ -1102,6 +1104,10 @@ async fn a_handler_delivery_is_refused_out_of_scope_reserved_or_without_a_lease(
                 for reserved in ["done:c", "waiting:c", "child:c"] {
                     seen.push(delivered(&cx, event(&cx, reserved), &cx.run_id).await);
                 }
+                seen.push(delivered(&cx, json!({ "source": "test", "type": "x" }), &cx.run_id).await);
+                let same = |n: u32| json!({ "id": "same", "source": "test", "type": "y", "data": n });
+                seen.push(delivered(&cx, same(1), &cx.run_id).await);
+                seen.push(delivered(&cx, same(2), &cx.run_id).await);
                 // The lease ends while the handler works.
                 time.advance(durable::LEASE_MS + 1);
                 seen.push(delivered(&cx, event(&cx, "x"), &cx.run_id).await);
@@ -1117,10 +1123,11 @@ async fn a_handler_delivery_is_refused_out_of_scope_reserved_or_without_a_lease(
     rt.start("unrelated", "idle", json!({})).await.unwrap();
     rt.start("p", "refusing", json!({})).await.unwrap();
     let _ = rt.drive("p", &CancellationToken::new()).await;
-    assert_eq!(*answers.lock().unwrap(), ["out-of-scope", "reserved", "reserved", "reserved", "interrupted"]);
-    for id in ["unrelated", "p"] {
-        assert!(store.inspect(id).await.unwrap().unwrap().events.is_empty(), "{id} got no event");
-    }
+    assert_eq!(
+        *answers.lock().unwrap(),
+        ["out-of-scope", "reserved", "reserved", "reserved", "invalid", "p", "invalid", "interrupted"]
+    );
+    assert!(store.inspect("unrelated").await.unwrap().unwrap().events.is_empty(), "unrelated got no event");
 }
 
 /// Test 6: a delivering handler dispatched again (at least once) with an

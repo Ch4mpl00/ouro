@@ -1,6 +1,6 @@
 # 07. Handlers reach the store that drives them; a dry run reports its tree and takes an observer
 
-Status: approved after goldfish rounds 1 and 2 (R-n, R2-n) and the ouro-agent design 05 review (A-n) · Issue: #39
+Status: implemented (feat/run-access) after goldfish rounds 1 and 2 (R-n, R2-n) and the ouro-agent design 05 review (A-n) · Issue: #39
 
 ## Problem
 
@@ -113,7 +113,7 @@ pub trait RunAccess: Send + Sync {
     /// Delivers `event` (an identified CloudEvent) to `target`'s mailbox:
     /// `target` must be the call's own run or a descendant. Lease-checked;
     /// reserved types refused (`ReservedEventType`).
-    async fn deliver(&self, event: Value, target: &str) -> Result<String, DeliverError>;
+    async fn deliver(&self, event: Value, target: &str) -> Result<String, RunAccessError>;
 }
 
 pub struct FunctionContext {
@@ -150,6 +150,9 @@ pub enum RunAccessError {
     /// The call no longer holds its run (lease lost, cancelled, emergency
     /// stop): no answer, like `ChildError::Interrupted`.
     Interrupted(anyhow::Error),
+    /// Not an identified CloudEvent, or an identity already delivered with
+    /// another payload (`durable::IdentityConflict`) (deviation 2).
+    InvalidEvent(anyhow::Error),
     /// Storage failed.
     Storage(anyhow::Error),
 }
@@ -360,7 +363,7 @@ Each fails before the change unless noted.
   "except to the observer given in `DryRunOptions`".
 - docs/durable-invariants.md X1: the restated sentence and the new mutant.
 - `crates/runtime/src/lib.rs` exports `RunAccess`, `RunAccessError`,
-  `DeliverError`, `DryRunOptions`, `DryRunRun`.
+  `DryRunOptions`, `DryRunRun`.
 
 ## Open questions
 
@@ -368,8 +371,9 @@ Each fails before the change unless noted.
 
 ## Deviations
 
-Found during implementation (executor, branch `feat/run-access`); for the
-maintainer to confirm or change.
+Found during implementation (executor, branch `feat/run-access`). Both
+accepted by the elephant: the document above is changed to match (1), and
+`InvalidEvent` is added with test 5 extended to it (2).
 
 1. **`DeliverError` is not defined.** The trait's `deliver` returns
    `Result<String, DeliverError>` and the Rollout exports `DeliverError`, but

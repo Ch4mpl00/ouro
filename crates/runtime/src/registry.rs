@@ -225,9 +225,11 @@ pub enum RunAccessError {
     /// The call no longer holds its run (lease lost, cancelled, emergency
     /// stop): no answer, like `ChildError::Interrupted`.
     Interrupted(anyhow::Error),
-    /// Storage failed, or the store refused the event: not an identified
-    /// CloudEvent, or an identity already delivered to the target with
+    /// The event cannot be delivered as given: not an identified CloudEvent
+    /// (`id`, `source`, `type`), or an identity already delivered with
     /// another payload (`durable::IdentityConflict` in the error's chain).
+    InvalidEvent(anyhow::Error),
+    /// Storage failed.
     Storage(anyhow::Error),
 }
 
@@ -242,7 +244,9 @@ impl std::fmt::Display for RunAccessError {
                 f.write_str("event types starting with done:, waiting: or child: are the engine's")
             }
             RunAccessError::TargetEnded => f.write_str("the target run has ended"),
-            RunAccessError::Interrupted(e) | RunAccessError::Storage(e) => write!(f, "{e:#}"),
+            RunAccessError::Interrupted(e) | RunAccessError::InvalidEvent(e) | RunAccessError::Storage(e) => {
+                write!(f, "{e:#}")
+            }
         }
     }
 }

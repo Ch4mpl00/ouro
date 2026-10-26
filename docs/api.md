@@ -177,8 +177,9 @@ next matching `listen` takes it. A delivery checks the call's lease first
 (`Interrupted` once the call no longer holds its run: a lost lease, a
 cancellation, the emergency stop), refuses the engine's reserved types
 (`done:`, `waiting:`, `child:`: `ReservedEventType`) and answers `TargetEnded`
-when the target has ended; anything the store refuses or fails, an event that
-is not an identified CloudEvent included, is `Storage`. `await: false` runs
+when the target has ended; an event that is not an identified CloudEvent, or
+an identity already delivered with another payload, is `InvalidEvent`; a store
+failure is `Storage`. `await: false` runs
 have no child link and are out of scope. There is no start, cancel, control or
 definition access; children start only through `start_child`. The capability
 is present wherever `children` is, and absent (`Unavailable`) for a process
