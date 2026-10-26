@@ -1,5 +1,6 @@
 use ouro_runtime::{
-    CALL_UNKNOWN, CallStatus, Config, Function, FunctionContext, MissingFunction, Mock, Registry, Runtime,
+    CALL_UNKNOWN, CallStatus, Config, DryRunOptions, Function, FunctionContext, MissingFunction, Mock, Registry,
+    Runtime,
     durable::{self, Clock, RunStore},
     ows::{
         durable::{CallState, Delivery, Record},
@@ -2258,4 +2259,282 @@ async fn a_scheduled_definition_with_the_breaker_off_keeps_firing_after_faults()
     assert!(!rt.triggers("forever").await.unwrap().is_empty(), "its schedule is still armed");
     let tripped = rt.definitions("default").await.unwrap();
     assert!(tripped.tripped.is_some() && rt.triggers("default").await.unwrap().is_empty(), "the control case trips");
+}
+
+// ── design 07: run access, the dry run's tree, holds and its root's name ────
+
+/// A host function that starts the child its arguments name (`name`, key
+/// `k`) and answers its `ChildRef`.
+fn spawn_function() -> Function {
+    Function::new("spawn", json!({}), json!({}), |args: Value, cx: FunctionContext| async move {
+        let child = ouro_runtime::ChildStart {
+            key: "k".into(),
+            name: args["name"].as_str().unwrap_or_default().into(),
+            ..ouro_runtime::ChildStart::default()
+        };
+        Ok(serde_json::to_value(cx.start_child(child).await?).unwrap())
+    })
+}
+
+/// Design 07, test 13 (A-H2): a dry run cuts a join's hold short, so the
+/// driver drives the child instead of waiting out the hold in real time.
+#[tokio::test]
+async fn a_dry_run_cuts_holds_short_and_max_hold_suspends_a_live_listen() {
+    let mut registry = Registry::new();
+    registry.register(spawn_function()).unwrap();
+    let rt = runtime(Arc::new(durable::memory::memory()), registry, Arc::new(Time::default()));
+    let d = rt.save("child", &yaml("  - done: { set: { answer: 42 } }")).await.unwrap();
+    rt.activate("child", d.version).await.unwrap();
+    let parent = yaml(
+        "  - spawn: { call: spawn, with: { name: child }, export: { as: '${ . }' } }\n  - join: { listen: { to: { one: { with: { type: '${ $context.done }' } } } }, metadata: { ouro: { hold: PT15M } } }",
+    );
+    let started = std::time::Instant::now();
+    let dry = tokio::time::timeout(
+        Duration::from_secs(10),
+        rt.dry_run(&parent, json!({}), writes_mocked(), &CancellationToken::new()),
+    )
+    .await
+    .expect("a dry run does not hold a join for its 15 minutes")
+    .unwrap();
+    assert!(matches!(dry.status, Status::Completed(_)), "{:?}", dry.status);
+    assert!(started.elapsed() < Duration::from_secs(1), "{:?}", started.elapsed());
+
+    // Live: a `max_hold` shorter than a listen's hold suspends the run at
+    // `max_hold`, and the delivery wakes it with the outcome a delivery
+    // within the hold gives.
+    let listen = yaml(
+        "  - answer: { listen: { to: { one: { with: { type: answer } } } }, metadata: { ouro: { hold: PT15M } } }",
+    );
+    let answer =
+        json!({ "id": "a-1", "source": "test", "type": "answer", "time": "2026-01-01T00:00:00Z", "data": { "n": 1 } });
+    let held = runtime(Arc::new(durable::memory::memory()), Registry::new(), Arc::new(Time::default()));
+    save(&held, &listen).await;
+    held.start("held", "workflow", json!({})).await.unwrap();
+    let (within, delivered) = tokio::join!(held.drive("held", &CancellationToken::new()), async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        held.deliver(answer.clone(), Some("held")).await
+    });
+    assert_eq!(delivered.unwrap().as_deref(), Some("held"));
+    let within = within.unwrap();
+    assert!(matches!(within, Some(Status::Completed(_))), "{within:?}");
+    let mut config = Config::default();
+    config.limits.max_hold = Some(Duration::from_millis(20));
+    let cut = Runtime::new(
+        Arc::new(durable::memory::memory()),
+        Arc::new(Registry::new()),
+        config,
+        Arc::new(Time::default()),
+        tracer(),
+    )
+    .unwrap();
+    save(&cut, &listen).await;
+    cut.start("cut", "workflow", json!({})).await.unwrap();
+    let started = std::time::Instant::now();
+    let suspended = tokio::time::timeout(Duration::from_secs(10), cut.drive("cut", &CancellationToken::new()))
+        .await
+        .expect("max_hold cuts the 15 minute hold")
+        .unwrap();
+    assert!(matches!(suspended, Some(Status::Waiting { .. })), "{suspended:?}");
+    assert!(started.elapsed() >= Duration::from_millis(20), "it held up to max_hold: {:?}", started.elapsed());
+    assert_eq!(cut.deliver(answer, Some("cut")).await.unwrap().as_deref(), Some("cut"));
+    assert_eq!(cut.drive("cut", &CancellationToken::new()).await.unwrap(), within);
+}
+
+/// Design 07, test 14 (A-H3): the host names the dry run's root.
+#[tokio::test]
+async fn a_dry_runs_root_takes_the_id_and_name_the_host_gives() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let mut registry = Registry::new();
+    let s = seen.clone();
+    registry
+        .register(Function::new("whoami", json!({}), json!({}), move |_: Value, cx: FunctionContext| {
+            s.lock().unwrap().push((cx.run_id.clone(), cx.definition.clone()));
+            async { Ok(json!({})) }
+        }))
+        .unwrap();
+    let rt = runtime(Arc::new(durable::memory::memory()), registry, Arc::new(Time::default()));
+    let options =
+        DryRunOptions { id: Some("signal:0".into()), name: Some("signal".into()), ..DryRunOptions::default() };
+    let dry = rt
+        .dry_run_opts(
+            &yaml("  - who: { call: whoami }"),
+            json!({}),
+            writes_mocked(),
+            options,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(dry.status, Status::Completed(_)), "{:?}", dry.status);
+    assert_eq!(*seen.lock().unwrap(), [("signal:0".to_owned(), "signal".to_owned())]);
+    assert_eq!((dry.runs[0].id.as_str(), dry.runs[0].name.as_str()), ("signal:0", "signal"));
+    assert!(rt.list(None, "").await.unwrap().is_empty(), "nothing reached the host's store");
+}
+
+/// Design 07, test 8: `DryRun::runs` lists every run the dry run admitted,
+/// in admission order (all at one virtual instant here), with its link,
+/// definition, outcome and call journal.
+#[tokio::test]
+async fn a_dry_run_reports_every_run_it_admitted_in_admission_order() {
+    let reads = Arc::new(AtomicUsize::new(0));
+    let mut registry = counter_registry(reads.clone(), Arc::default());
+    registry.register(spawn_function()).unwrap();
+    let rt = runtime(Arc::new(durable::memory::memory()), registry, Arc::new(Time::default()));
+    let named = |name: &str, body: &str| yaml(body).replace("name: workflow", &format!("name: {name}"));
+    let mut host = std::collections::BTreeMap::new();
+    for (name, body) in [
+        ("child", "  - read: { call: read, with: { n: 1 } }"),
+        ("kid", "  - read: { call: read, with: { n: 2 } }"),
+        ("free", "  - pause: { wait: P1D }"),
+    ] {
+        let d = rt.save(name, &named(name, body)).await.unwrap();
+        rt.activate(name, d.version).await.unwrap();
+        host.insert(name, d);
+    }
+    let root = yaml(
+        "  - spawn: { call: spawn, with: { name: child }, export: { as: '${ . }' } }
+  - join: { listen: { to: { one: { with: { type: '${ $context.done }' } } } } }
+  - kid: { run: { workflow: { namespace: test, name: kid, version: latest } } }
+  - free: { run: { workflow: { namespace: test, name: free, version: latest }, await: false } }
+  - write: { call: write, with: { n: 3 } }",
+    );
+    let dry = rt.dry_run(&root, json!({}), writes_mocked(), &CancellationToken::new()).await.unwrap();
+    assert!(matches!(dry.status, Status::Completed(_)), "{:?}", dry.status);
+    let runs = &dry.runs;
+    assert_eq!(runs.len(), 4, "{:#?}", runs.iter().map(|r| &r.id).collect::<Vec<_>>());
+    let (r, c, k, f) = (&runs[0], &runs[1], &runs[2], &runs[3]);
+    // The root: named `dry-run` whatever its document says.
+    assert_eq!((r.id.as_str(), r.name.as_str(), r.version), ("dry-run", "dry-run", 1));
+    assert_eq!((r.parent.as_deref(), r.key.as_deref(), r.independent), (None, None, false));
+    assert_eq!(r.digest, durable::digest_of(&root));
+    assert_eq!(r.outcome, Some(dry.status.clone()));
+    assert_eq!(r.calls, dry.calls, "`calls` is the root's journal");
+    let functions = |run: &ouro_runtime::DryRunRun| run.calls.iter().map(|c| c.function.clone()).collect::<Vec<_>>();
+    assert_eq!(functions(r), ["spawn", "write"]);
+    // The host child, under the call's link key.
+    assert!(c.id.starts_with("hostchild:"), "{}", c.id);
+    assert_eq!((c.parent.as_deref(), c.key.as_deref(), c.independent), (Some("dry-run"), Some("/do/0/spawn/k"), false));
+    assert_eq!(
+        (c.name.as_str(), c.version, c.digest.as_str()),
+        ("child", host["child"].version, &*host["child"].digest)
+    );
+    assert!(matches!(c.outcome, Some(Status::Completed(_))), "{:?}", c.outcome);
+    assert_eq!(functions(c), ["read"]);
+    // The `run: workflow` child, under its task's reference.
+    assert!(k.id.starts_with("child:"), "{}", k.id);
+    assert_eq!((k.parent.as_deref(), k.key.as_deref(), k.independent), (Some("dry-run"), Some("/do/2/kid"), false));
+    assert_eq!((k.name.as_str(), k.version, k.digest.as_str()), ("kid", host["kid"].version, &*host["kid"].digest));
+    assert!(matches!(k.outcome, Some(Status::Completed(_))), "{:?}", k.outcome);
+    assert_eq!(functions(k), ["read"]);
+    // The `await: false` run: a root of its own, not driven once the root ended.
+    assert_eq!((f.parent.as_deref(), f.key.as_deref(), f.independent), (None, None, true));
+    assert_eq!((f.name.as_str(), f.version, f.digest.as_str()), ("free", host["free"].version, &*host["free"].digest));
+    assert_eq!(f.outcome, None);
+    assert!(f.calls.is_empty());
+    assert_eq!(reads.load(Ordering::SeqCst), 2);
+}
+
+/// Design 07, test 9: a dry run stopped by its token lists the live child
+/// with no outcome.
+#[tokio::test]
+async fn a_stopped_dry_run_lists_its_live_child_without_an_outcome() {
+    let stop = CancellationToken::new();
+    let mut registry = Registry::new();
+    registry.register(spawn_function()).unwrap();
+    let s = stop.clone();
+    registry
+        .register(Function::new("halt", json!({}), json!({}), move |_: Value, _: FunctionContext| {
+            // The host stops the dry run while the child works.
+            s.cancel();
+            std::future::pending::<Result<Value, ouro_runtime::FunctionError>>()
+        }))
+        .unwrap();
+    let rt = runtime(Arc::new(durable::memory::memory()), registry, Arc::new(Time::default()));
+    let d = rt.save("child", &yaml("  - halt: { call: halt }")).await.unwrap();
+    rt.activate("child", d.version).await.unwrap();
+    let root = yaml(
+        "  - spawn: { call: spawn, with: { name: child }, export: { as: '${ . }' } }
+  - join: { listen: { to: { one: { with: { type: '${ $context.done }' } } } } }",
+    );
+    let dry = tokio::time::timeout(Duration::from_secs(10), rt.dry_run(&root, json!({}), writes_mocked(), &stop))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(dry.status, Status::Interrupted(_)), "{:?}", dry.status);
+    assert_eq!(dry.runs.len(), 2);
+    assert_eq!(dry.runs[0].outcome, None, "the root still waits");
+    assert!(dry.runs[1].id.starts_with("hostchild:"));
+    assert_eq!(dry.runs[1].outcome, None, "the child is still live");
+}
+
+/// Design 07, test 7: X1 with a handler that reads its run and delivers to
+/// it. The dry run's root takes the id of a run the host's store holds, so
+/// run access reaching the host's store would read that run (another
+/// definition) and change its mailbox: the host backend's rows stay as
+/// they were.
+#[test]
+fn x1_run_access_in_generated_dry_runs_stays_in_the_private_store() {
+    use durable::AtomicBackend;
+    use proptest::{prelude::*, test_runner::TestRunner};
+    let strategy = (prop::collection::vec(0u8..3, 1..12), 0i64..100);
+    let config = proptest::test_runner::Config { cases: 32, ..Default::default() };
+    TestRunner::new(config)
+        .run(&strategy, |(steps, input)| {
+            let executor = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            executor.block_on(async {
+                let reads = Arc::new(AtomicUsize::new(0));
+                let writes = Arc::new(AtomicUsize::new(0));
+                let mut registry = counter_registry(reads.clone(), writes.clone());
+                registry
+                    .register(Function::new(
+                        "touch",
+                        json!({}),
+                        json!({}),
+                        |_: Value, cx: FunctionContext| async move {
+                            let own = cx.run(&cx.run_id).await.map_err(|e| WorkflowError::runtime(e.to_string()))?;
+                            let own = own.ok_or_else(|| WorkflowError::runtime("no run of my own"))?;
+                            if own.admission.name != "dry" {
+                                return Err(WorkflowError::runtime(format!("read {}'s run", own.admission.name)));
+                            }
+                            let event = json!({ "id": cx.idempotency_key, "source": "test", "type": "touched" });
+                            cx.deliver(event, &cx.run_id).await.map_err(|e| WorkflowError::runtime(e.to_string()))?;
+                            Ok(json!({}))
+                        },
+                    ))
+                    .unwrap();
+                let backend = Arc::new(durable::memory::MemoryBackend::default());
+                let store = Arc::new(durable::TransactionalStore::new(backend.clone()));
+                let rt = runtime(store.clone(), registry, Arc::new(Time::default()));
+                // The host's own run under the id the dry run's root takes,
+                // listening for what `touch` delivers.
+                let listener = yaml("  - touched: { listen: { to: { one: { with: { type: touched } } } } }");
+                let d = rt.save("listener", &listener).await.unwrap();
+                rt.activate("listener", d.version).await.unwrap();
+                rt.start("recorded", "listener", json!({})).await.unwrap();
+                let waiting = rt.drive("recorded", &CancellationToken::new()).await.unwrap();
+                prop_assert!(matches!(waiting, Some(Status::Waiting { .. })), "{:?}", waiting);
+                let body = steps
+                    .iter()
+                    .enumerate()
+                    .map(|(i, step)| {
+                        let function = ["read", "write", "touch"][usize::from(*step)];
+                        format!("  - step{i}: {{ call: {function}, with: {{ n: '${{ .n + 1 }}' }} }}")
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let definition = yaml(&body.replace("call: touch, with: { n: '${ .n + 1 }' }", "call: touch"));
+                let before = backend.snapshot().await.unwrap().rows;
+                let options =
+                    DryRunOptions { id: Some("recorded".into()), name: Some("dry".into()), ..DryRunOptions::default() };
+                let dry = rt
+                    .dry_run_opts(&definition, json!({"n":input}), writes_mocked(), options, &CancellationToken::new())
+                    .await
+                    .unwrap();
+                prop_assert!(matches!(dry.status, Status::Completed(_)), "{:?}", dry.status);
+                prop_assert_eq!(writes.load(Ordering::SeqCst), 0);
+                prop_assert_eq!(backend.snapshot().await.unwrap().rows, before);
+                Ok(())
+            })
+        })
+        .unwrap();
 }

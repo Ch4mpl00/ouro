@@ -1,18 +1,22 @@
 //! Host data at admission and host-started children (design 03): the host
 //! vouches for a run's facts, which no workflow can set, and a host function
-//! starts owned children it vouches for.
+//! starts owned children it vouches for. A handler reaches the store that
+//! drives its call, live and dry, within its run's lineage (design 07).
 use ouro_runtime::{
-    ChildError, ChildRef, ChildRefusal, ChildStart, Config, Function, FunctionContext, FunctionError, HostDataTooLarge,
-    Registry, Runtime, Start,
+    ChildError, ChildRef, ChildRefusal, ChildStart, Config, DryRunOptions, Function, FunctionContext, FunctionError,
+    HostDataTooLarge, ProcessRunner, Registry, RunAccessError, Runtime, Start,
     control::{Control, REDACTED, Request, Runs},
-    durable::{self, AdmissionField, AdmissionMismatch, Clock, RunStore},
-    ows::run::Status,
+    durable::{self, AdmissionField, AdmissionMismatch, Clock, RunState, RunStore},
+    ows::{durable::Record, run::Status},
 };
 use serde_json::{Value, json};
 use sha2::Digest;
-use std::sync::{
-    Arc, Mutex,
-    atomic::{AtomicI64, AtomicUsize, Ordering},
+use std::{
+    collections::BTreeMap,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicI64, AtomicUsize, Ordering},
+    },
 };
 use tokio_util::sync::CancellationToken;
 
@@ -839,4 +843,518 @@ async fn dry_runs_and_replays_start_children_only_in_their_private_store() {
     assert!(matches!(replay.status, Status::Completed(_)), "{:?}", replay.status);
     assert_eq!(store.list(None, "").await.unwrap(), before);
     assert_eq!(starts.lock().unwrap().len(), calls);
+}
+
+// ── design 07: a handler's run access ──────────────────────────────────────
+
+/// Why run access answered nothing, as a label.
+fn refusal(error: &RunAccessError) -> String {
+    match error {
+        RunAccessError::Unavailable => "unavailable".into(),
+        RunAccessError::OutOfScope => "out-of-scope".into(),
+        RunAccessError::ReservedEventType => "reserved".into(),
+        RunAccessError::TargetEnded => "ended".into(),
+        RunAccessError::Interrupted(_) => "interrupted".into(),
+        RunAccessError::Storage(e) => format!("storage: {e:#}"),
+        other => format!("{other:?}"),
+    }
+}
+/// The id of the run `cx.run(id)` returned, `none`, or why it answered nothing.
+async fn seen_run(cx: &FunctionContext, id: &str) -> String {
+    match cx.run(id).await {
+        Ok(Some(run)) => run.admission.id,
+        Ok(None) => "none".into(),
+        Err(e) => refusal(&e),
+    }
+}
+/// `cx.records(id)`: `none`, the event types its consumed events carry, or why nothing.
+async fn seen_records(cx: &FunctionContext, id: &str) -> String {
+    match cx.records(id).await {
+        Ok(Some(records)) => {
+            let types: Vec<_> = records
+                .values()
+                .filter_map(|r| match r {
+                    Record::Event { event } => event["type"].as_str().map(str::to_owned),
+                    _ => None,
+                })
+                .collect();
+            format!("events:{}", types.join(","))
+        }
+        Ok(None) => "none".into(),
+        Err(e) => refusal(&e),
+    }
+}
+/// `cx.children(parent)`: the children's ids, or why none.
+async fn seen_children(cx: &FunctionContext, parent: &str) -> String {
+    match cx.children(parent, None, 10).await {
+        Ok(page) => page.items.iter().map(|r| r.admission.id.clone()).collect::<Vec<_>>().join(","),
+        Err(e) => refusal(&e),
+    }
+}
+/// `cx.deliver(event, target)`: the recipient, or why none.
+async fn delivered(cx: &FunctionContext, event: Value, target: &str) -> String {
+    match cx.deliver(event, target).await {
+        Ok(recipient) => recipient,
+        Err(e) => refusal(&e),
+    }
+}
+/// An identified event of `type_`, its id derived from the call's
+/// idempotency key: a re-dispatch delivers the same identity.
+fn event(cx: &FunctionContext, type_: &str) -> Value {
+    json!({ "id": format!("{}#{type_}", cx.idempotency_key), "source": "test", "type": type_, "data": { "ok": true } })
+}
+/// `(caller, asked, answer)` for every run a `look` call read.
+type Looks = Arc<Mutex<Vec<(String, String, String)>>>;
+/// Reads the caller's own run and the runs its arguments name (`others`).
+fn look(looks: Looks) -> Function {
+    Function::new("look", json!({}), json!({}), move |args: Value, cx: FunctionContext| {
+        let looks = looks.clone();
+        async move {
+            let mut asked = vec![cx.run_id.clone()];
+            asked.extend(args["others"].as_array().into_iter().flatten().filter_map(Value::as_str).map(str::to_owned));
+            for id in asked {
+                let answer = seen_run(&cx, &id).await;
+                looks.lock().unwrap().push((cx.run_id.clone(), id, answer));
+            }
+            Ok(json!({}))
+        }
+    })
+}
+/// Delivers an event of `type` to the run `id`, after reading its state.
+type Pokes = Arc<Mutex<Vec<(String, String)>>>;
+fn poke(pokes: Pokes) -> Function {
+    Function::new("poke", json!({}), json!({}), move |args: Value, cx: FunctionContext| {
+        let pokes = pokes.clone();
+        async move {
+            let id = args["id"].as_str().unwrap_or_default().to_owned();
+            let state = match cx.run(&id).await {
+                Ok(Some(run)) => format!("{:?}", run.state),
+                other => format!("{:?}", other.map(|_| ()).map_err(|e| refusal(&e))),
+            };
+            let answer = delivered(&cx, event(&cx, args["type"].as_str().unwrap_or("poke")), &id).await;
+            pokes.lock().unwrap().push((state, answer));
+            Ok(json!({}))
+        }
+    })
+}
+
+/// Test 1: live, a handler reads its own run and its child's; an unrelated
+/// run answers `None`.
+#[tokio::test]
+async fn a_live_handler_reads_its_own_run_and_its_child() {
+    let time = Arc::new(Time::default());
+    let looks = Looks::default();
+    let starts = Starts::default();
+    let mut registry = Registry::new();
+    registry.register(look(looks.clone())).unwrap();
+    registry.register(spawner(starts.clone(), vouched)).unwrap();
+    let rt = runtime(Arc::new(durable::memory::memory()), registry, Config::default(), time.clone());
+    save(&rt, "child", &doc("child", "do:\n  - look: { call: look }")).await;
+    let parent = "do:
+  - spawn: { call: spawn, with: { name: child }, export: { as: '${ . }' } }
+  - join: { listen: { to: { one: { with: { type: '${ $context.done }' } } } } }
+  - look: { call: look, with: { others: [ '${ $context.id }', unrelated ] } }";
+    save(&rt, "parent", &doc("parent", parent)).await;
+    save(&rt, "idle", &doc("idle", "do:\n  - pause: { wait: P1D }")).await;
+    rt.start("unrelated", "idle", json!({})).await.unwrap();
+    rt.start("p", "parent", json!({})).await.unwrap();
+    assert!(matches!(settle(&rt, &time, "p").await, Some(Status::Completed(_))));
+    let child = starts.lock().unwrap()[0].clone().unwrap().id;
+    let looks = looks.lock().unwrap().clone();
+    for expected in [
+        ("p", "p", "p"),
+        ("p", child.as_str(), child.as_str()),
+        ("p", "unrelated", "none"),
+        (child.as_str(), child.as_str(), child.as_str()),
+    ] {
+        let expected = (expected.0.to_owned(), expected.1.to_owned(), expected.2.to_owned());
+        assert!(looks.contains(&expected), "{expected:?} in {looks:#?}");
+    }
+}
+
+/// Test 2: dry, the same through `dry_run_opts`, for the root, a host child
+/// and a `run: workflow` child; the host's store is out of sight.
+#[tokio::test]
+async fn a_dry_handler_reads_its_own_run_and_its_children_in_the_private_store() {
+    let time = Arc::new(Time::default());
+    let looks = Looks::default();
+    let starts = Starts::default();
+    let mut registry = Registry::new();
+    registry.register(look(looks.clone())).unwrap();
+    registry.register(spawner(starts.clone(), vouched)).unwrap();
+    let store: Arc<dyn RunStore> = Arc::new(durable::memory::memory());
+    let rt = runtime(store.clone(), registry, Config::default(), time.clone());
+    save(&rt, "child", &doc("child", "do:\n  - look: { call: look }")).await;
+    save(&rt, "kid", &doc("kid", "do:\n  - look: { call: look }")).await;
+    save(&rt, "idle", &doc("idle", "do:\n  - pause: { wait: P1D }")).await;
+    rt.start("unrelated", "idle", json!({})).await.unwrap();
+    let root = doc(
+        "root",
+        "do:
+  - spawn: { call: spawn, with: { name: child }, export: { as: '${ . }' } }
+  - join: { listen: { to: { one: { with: { type: '${ $context.done }' } } } } }
+  - kid: { run: { workflow: { namespace: test, name: kid, version: latest } } }
+  - look: { call: look, with: { others: [ '${ $context.id }', unrelated ] } }",
+    );
+    let nothing =
+        ouro_runtime::mock(|_: &str, _: &Value| false, |_: &str, _: &Value, _: &FunctionContext| Ok(json!({})));
+    let rows = store.list(None, "").await.unwrap();
+    let dry =
+        rt.dry_run_opts(&root, json!({}), nothing, DryRunOptions::default(), &CancellationToken::new()).await.unwrap();
+    assert!(matches!(dry.status, Status::Completed(_)), "{:?}", dry.status);
+    assert_eq!(store.list(None, "").await.unwrap(), rows, "the host's store is untouched");
+    let child = starts.lock().unwrap()[0].clone().unwrap().id;
+    let looks = looks.lock().unwrap().clone();
+    let kid = looks.iter().map(|l| l.0.clone()).find(|caller| caller.starts_with("child:")).expect("the kid looked");
+    for expected in [
+        ("dry-run", "dry-run", "dry-run"),
+        ("dry-run", child.as_str(), child.as_str()),
+        ("dry-run", "unrelated", "none"),
+        (child.as_str(), child.as_str(), child.as_str()),
+        (kid.as_str(), kid.as_str(), kid.as_str()),
+    ] {
+        let expected = (expected.0.to_owned(), expected.1.to_owned(), expected.2.to_owned());
+        assert!(looks.contains(&expected), "{expected:?} in {looks:#?}");
+    }
+}
+
+/// Test 3: dry, a handler delivers to its own run before a `listen` with a
+/// timeout; the listen takes it from the mailbox under the zero listen
+/// ceiling and the dry run completes instead of timing out (the
+/// confirmation pattern).
+#[tokio::test]
+async fn a_dry_handler_answers_its_own_listen() {
+    let answers = Arc::new(Mutex::new(Vec::new()));
+    let mut registry = Registry::new();
+    let a = answers.clone();
+    registry
+        .register(Function::new("confirm", json!({}), json!({}), move |_: Value, cx: FunctionContext| {
+            let answers = a.clone();
+            async move {
+                let answer = delivered(&cx, event(&cx, "answer"), &cx.run_id).await;
+                answers.lock().unwrap().push(answer);
+                Ok(json!({}))
+            }
+        }))
+        .unwrap();
+    let rt = runtime(Arc::new(durable::memory::memory()), registry, Config::default(), Arc::new(Time::default()));
+    let definition = doc(
+        "confirming",
+        "do:
+  - ask: { call: confirm }
+  - answer: { listen: { to: { one: { with: { type: answer } } } }, timeout: { after: PT1H } }",
+    );
+    let nothing =
+        ouro_runtime::mock(|_: &str, _: &Value| false, |_: &str, _: &Value, _: &FunctionContext| Ok(json!({})));
+    let dry = rt
+        .dry_run_opts(&definition, json!({}), nothing, DryRunOptions::default(), &CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(dry.status, Status::Completed(json!([{ "ok": true }])));
+    assert_eq!(*answers.lock().unwrap(), ["dry-run"]);
+    assert!(dry.mocked.is_empty(), "a delivery is not a mocked call");
+}
+
+/// Test 4: dry, a parent's handler delivers to a child suspended on a
+/// `listen` without a timeout; the child wakes and the dry run completes.
+#[tokio::test]
+async fn a_dry_parent_wakes_its_listening_child() {
+    let pokes = Pokes::default();
+    let mut registry = Registry::new();
+    registry.register(poke(pokes.clone())).unwrap();
+    registry.register(spawner(Starts::default(), vouched)).unwrap();
+    let rt = runtime(Arc::new(durable::memory::memory()), registry, Config::default(), Arc::new(Time::default()));
+    save(&rt, "sleeper", &doc("sleeper", "do:\n  - wake: { listen: { to: { one: { with: { type: poke } } } } }")).await;
+    let root = doc(
+        "root",
+        "do:
+  - spawn: { call: spawn, with: { name: sleeper }, export: { as: '${ . }' } }
+  - asleep: { listen: { to: { one: { with: { type: '${ $context.waiting }' } } } } }
+  - poke: { call: poke, with: { id: '${ $context.id }', type: poke } }
+  - join: { listen: { to: { one: { with: { type: '${ $context.done }' } } } } }",
+    );
+    let nothing =
+        ouro_runtime::mock(|_: &str, _: &Value| false, |_: &str, _: &Value, _: &FunctionContext| Ok(json!({})));
+    let dry =
+        rt.dry_run_opts(&root, json!({}), nothing, DryRunOptions::default(), &CancellationToken::new()).await.unwrap();
+    assert!(matches!(dry.status, Status::Completed(_)), "{:?}", dry.status);
+    let pokes = pokes.lock().unwrap().clone();
+    assert_eq!(pokes.len(), 1);
+    assert_eq!(pokes[0].0, format!("{:?}", RunState::Waiting), "the child was suspended on its listen");
+    assert!(pokes[0].1.starts_with("hostchild:"), "delivered to the child: {pokes:?}");
+    let child = dry.runs.iter().find(|r| r.id == pokes[0].1).unwrap();
+    assert!(matches!(child.outcome, Some(Status::Completed(_))), "{:?}", child.outcome);
+}
+
+/// Test 5: a delivery is refused, each with its type: to an unrelated run,
+/// with a reserved type, and after the call's lease is lost.
+#[tokio::test]
+async fn a_handler_delivery_is_refused_out_of_scope_reserved_or_without_a_lease() {
+    let time = Arc::new(Time::default());
+    let answers = Arc::new(Mutex::new(Vec::new()));
+    let mut registry = Registry::new();
+    let (a, t) = (answers.clone(), time.clone());
+    registry
+        .register(Function::new("refused", json!({}), json!({}), move |_: Value, cx: FunctionContext| {
+            let (answers, time) = (a.clone(), t.clone());
+            async move {
+                let mut seen = vec![delivered(&cx, event(&cx, "x"), "unrelated").await];
+                for reserved in ["done:c", "waiting:c", "child:c"] {
+                    seen.push(delivered(&cx, event(&cx, reserved), &cx.run_id).await);
+                }
+                // The lease ends while the handler works.
+                time.advance(durable::LEASE_MS + 1);
+                seen.push(delivered(&cx, event(&cx, "x"), &cx.run_id).await);
+                answers.lock().unwrap().extend(seen);
+                Ok(json!({}))
+            }
+        }))
+        .unwrap();
+    let store: Arc<dyn RunStore> = Arc::new(durable::memory::memory());
+    let rt = runtime(store.clone(), registry, Config::default(), time.clone());
+    save(&rt, "idle", &doc("idle", "do:\n  - pause: { wait: P1D }")).await;
+    save(&rt, "refusing", &doc("refusing", "do:\n  - refused: { call: refused }")).await;
+    rt.start("unrelated", "idle", json!({})).await.unwrap();
+    rt.start("p", "refusing", json!({})).await.unwrap();
+    let _ = rt.drive("p", &CancellationToken::new()).await;
+    assert_eq!(*answers.lock().unwrap(), ["out-of-scope", "reserved", "reserved", "reserved", "interrupted"]);
+    for id in ["unrelated", "p"] {
+        assert!(store.inspect(id).await.unwrap().unwrap().events.is_empty(), "{id} got no event");
+    }
+}
+
+/// Test 6: a delivering handler dispatched again (at least once) with an
+/// event id derived from its idempotency key leaves one pending copy.
+#[tokio::test]
+async fn a_redispatched_delivery_leaves_one_pending_copy() {
+    let time = Arc::new(Time::default());
+    let dispatches = Arc::new(AtomicUsize::new(0));
+    let answers = Arc::new(Mutex::new(Vec::new()));
+    let mut registry = Registry::new();
+    let (d, a) = (dispatches.clone(), answers.clone());
+    registry
+        .register(Function::new("confirm", json!({}), json!({}), move |_: Value, cx: FunctionContext| {
+            let (dispatch, answers) = (d.fetch_add(1, Ordering::SeqCst), a.clone());
+            async move {
+                let answer = delivered(&cx, event(&cx, "answer"), &cx.run_id).await;
+                answers.lock().unwrap().push(answer);
+                if dispatch == 0 {
+                    // The delivery committed, the answer is lost.
+                    return Err(FunctionError::interrupted("the host is shutting down"));
+                }
+                Ok(json!({}))
+            }
+        }))
+        .unwrap();
+    let store: Arc<dyn RunStore> = Arc::new(durable::memory::memory());
+    let rt = runtime(store.clone(), registry, Config::default(), time.clone());
+    save(&rt, "confirming", &doc("confirming", "do:\n  - ask: { call: confirm }\n  - later: { wait: P7D }")).await;
+    rt.start("p", "confirming", json!({})).await.unwrap();
+    for _ in 0..20 {
+        let run = rt.get("p").await.unwrap().unwrap();
+        if dispatches.load(Ordering::SeqCst) == 2 && run.state == RunState::Waiting {
+            break;
+        }
+        if rt.recover_once(&CancellationToken::new()).await.unwrap() == 0 {
+            time.advance(60_000);
+        }
+    }
+    assert_eq!(dispatches.load(Ordering::SeqCst), 2, "the call was dispatched again");
+    assert_eq!(*answers.lock().unwrap(), ["p", "p"]);
+    let pending = store.inspect("p").await.unwrap().unwrap().events;
+    assert_eq!(pending.len(), 1, "{pending:#?}");
+}
+
+/// Test 11: a dry run's `Mock::response`, a process runner and replay get
+/// no run access; `cx.run` answers `Unavailable` there.
+#[tokio::test]
+async fn mocked_calls_process_runs_and_replays_have_no_run_access() {
+    struct Runner(Arc<Mutex<Vec<String>>>);
+    #[async_trait::async_trait]
+    impl ProcessRunner for Runner {
+        fn runs(&self, kind: &str) -> bool {
+            kind == "shell"
+        }
+        async fn run(&self, _: &str, _: Value, cx: FunctionContext) -> Result<Value, FunctionError> {
+            let answer = seen_run(&cx, &cx.run_id).await;
+            self.0.lock().unwrap().push(format!("process:{}:{answer}", cx.runs.is_some()));
+            Ok(json!({ "code": 0, "stdout": "", "stderr": "" }))
+        }
+    }
+    let time = Arc::new(Time::default());
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let looks = Looks::default();
+    let mut registry = Registry::new();
+    registry.register(look(looks.clone())).unwrap();
+    registry
+        .register(Function::new("marked", json!({}), json!({}), |_: Value, _: FunctionContext| async { Ok(json!({})) }))
+        .unwrap();
+    let rt = runtime(Arc::new(durable::memory::memory()), registry, Config::default(), time.clone())
+        .with_process_runner(Arc::new(Runner(seen.clone())));
+    let definition =
+        doc("mixed", "do:\n  - s: { run: { shell: { command: ls } } }\n  - m: { call: marked }\n  - l: { call: look }");
+    let s = seen.clone();
+    let mock = ouro_runtime::mock(
+        |function: &str, _: &Value| function == "marked",
+        move |_: &str, _: &Value, cx: &FunctionContext| {
+            let answer = futures::executor::block_on(seen_run(cx, &cx.run_id));
+            s.lock().unwrap().push(format!("mock:{}:{answer}", cx.runs.is_some()));
+            Ok(json!({}))
+        },
+    );
+    let dry = rt.dry_run(&definition, json!({}), mock, &CancellationToken::new()).await.unwrap();
+    assert!(matches!(dry.status, Status::Completed(_)), "{:?}", dry.status);
+    assert_eq!(*seen.lock().unwrap(), ["process:false:unavailable", "mock:false:unavailable"]);
+    // A registered function's handler in the same dry run has it.
+    assert_eq!(*looks.lock().unwrap(), [("dry-run".to_owned(), "dry-run".to_owned(), "dry-run".to_owned())]);
+    // Replay dispatches nothing: no handler or runner gets a context at all.
+    save(&rt, "mixed", &definition).await;
+    rt.start("r", "mixed", json!({})).await.unwrap();
+    assert!(matches!(settle(&rt, &time, "r").await, Some(Status::Completed(_))));
+    let (heard, looked) = (seen.lock().unwrap().len(), looks.lock().unwrap().len());
+    let replay = rt.replay("r", &CancellationToken::new()).await.unwrap();
+    assert!(matches!(replay.status, Status::Completed(_)), "{:?}", replay.status);
+    assert_eq!((seen.lock().unwrap().len(), looks.lock().unwrap().len()), (heard, looked));
+}
+
+/// A run: workflow child's id (`child:` and the first 128 bits of the
+/// SHA-256 of `[run, task reference]`).
+fn workflow_child_id(run: &str, reference: &str) -> String {
+    let digest = sha2::Sha256::digest(serde_json::to_string(&[run, reference]).unwrap().as_bytes());
+    format!("child:{}", digest[..16].iter().map(|b| format!("{b:02x}")).collect::<String>())
+}
+
+/// Test 12: dry, run access covers the call's lineage: a handler reads a
+/// child's records (a consumed event) and lists its children; a grandchild's
+/// handler reads its parent and its grandparent; a sibling's and an
+/// unrelated run's records answer `None` and their children `OutOfScope`; a
+/// delivery to an ancestor is `OutOfScope`, to an ended child `TargetEnded`.
+#[tokio::test]
+async fn run_access_covers_the_lineage_and_nothing_else() {
+    // label -> answer, from every handler of the tree.
+    let checks = Arc::new(Mutex::new(BTreeMap::<String, String>::new()));
+    let ids = Arc::new(Mutex::new(BTreeMap::<String, String>::new()));
+    let mut registry = Registry::new();
+    registry.register(poke(Pokes::default())).unwrap();
+    registry.register(spawner(Starts::default(), vouched)).unwrap();
+    let i = ids.clone();
+    // The root's: starts the sibling `s`, then `a`, and answers both refs.
+    registry
+        .register(Function::new("family", json!({}), json!({}), move |_: Value, cx: FunctionContext| {
+            let ids = i.clone();
+            async move {
+                let start = |key: &str| ChildStart { key: key.into(), name: key.into(), ..ChildStart::default() };
+                let s = cx.start_child(start("s")).await?;
+                let a = cx.start_child(start("a")).await?;
+                let mut ids = ids.lock().unwrap();
+                ids.insert("root".into(), cx.run_id.clone());
+                ids.insert("s".into(), s.id.clone());
+                ids.insert("a".into(), a.id.clone());
+                ids.insert("free".into(), workflow_child_id(&cx.run_id, "/do/1/free"));
+                Ok(json!({ "a": a, "s": s }))
+            }
+        }))
+        .unwrap();
+    let (c, i) = (checks.clone(), ids.clone());
+    // `a`'s: its sibling, an unrelated run and its parent are out of scope.
+    registry
+        .register(Function::new("sibling", json!({}), json!({}), move |_: Value, cx: FunctionContext| {
+            let (checks, ids) = (c.clone(), i.clone());
+            async move {
+                let ids = ids.lock().unwrap().clone();
+                let mut seen = BTreeMap::new();
+                seen.insert("a reads s's records".into(), seen_records(&cx, &ids["s"]).await);
+                seen.insert("a lists s's children".into(), seen_children(&cx, &ids["s"]).await);
+                seen.insert("a reads free's records".into(), seen_records(&cx, &ids["free"]).await);
+                seen.insert("a lists free's children".into(), seen_children(&cx, &ids["free"]).await);
+                seen.insert("a reads free".into(), seen_run(&cx, &ids["free"]).await);
+                seen.insert("a delivers to root".into(), delivered(&cx, event(&cx, "up"), &ids["root"]).await);
+                checks.lock().unwrap().extend(seen);
+                Ok(json!({}))
+            }
+        }))
+        .unwrap();
+    let (c, i) = (checks.clone(), ids.clone());
+    // `g`'s: its parent `a` and its grandparent, the root.
+    registry
+        .register(Function::new("lineage", json!({}), json!({}), move |_: Value, cx: FunctionContext| {
+            let (checks, ids) = (c.clone(), i.clone());
+            async move {
+                let ids = ids.lock().unwrap().clone();
+                let mut seen = BTreeMap::new();
+                seen.insert("g".into(), cx.run_id.clone());
+                seen.insert("g reads a".into(), seen_run(&cx, &ids["a"]).await);
+                seen.insert("g reads root".into(), seen_run(&cx, &ids["root"]).await);
+                seen.insert("g reads root's records".into(), seen_records(&cx, &ids["root"]).await);
+                seen.insert("g reads s".into(), seen_run(&cx, &ids["s"]).await);
+                checks.lock().unwrap().extend(seen);
+                Ok(json!({}))
+            }
+        }))
+        .unwrap();
+    let c = checks.clone();
+    // The root's, after `a` ended: its records, its children, a delivery.
+    registry
+        .register(Function::new("examine", json!({}), json!({}), move |args: Value, cx: FunctionContext| {
+            let checks = c.clone();
+            async move {
+                let a = args["a"].as_str().unwrap_or_default().to_owned();
+                let mut seen = BTreeMap::new();
+                seen.insert("root reads a's records".into(), seen_records(&cx, &a).await);
+                seen.insert("root lists a's children".into(), seen_children(&cx, &a).await);
+                seen.insert("root delivers to a".into(), delivered(&cx, event(&cx, "late"), &a).await);
+                checks.lock().unwrap().extend(seen);
+                Ok(json!({}))
+            }
+        }))
+        .unwrap();
+    let rt = runtime(Arc::new(durable::memory::memory()), registry, Config::default(), Arc::new(Time::default()));
+    save(&rt, "s", &doc("s", "do:\n  - done: { set: { s: 1 } }")).await;
+    let a = "do:
+  - ping: { listen: { to: { one: { with: { type: ping } } } } }
+  - spawn: { call: spawn, with: { name: g }, export: { as: '${ . }' } }
+  - join: { listen: { to: { one: { with: { type: '${ $context.done }' } } } } }
+  - sibling: { call: sibling }";
+    save(&rt, "a", &doc("a", a)).await;
+    save(&rt, "g", &doc("g", "do:\n  - lineage: { call: lineage }")).await;
+    save(&rt, "idle", &doc("idle", "do:\n  - pause: { wait: P1D }")).await;
+    let root = doc(
+        "root",
+        "do:
+  - family: { call: family, export: { as: '${ . }' } }
+  - free: { run: { workflow: { namespace: test, name: idle, version: latest }, await: false } }
+  - ping: { call: poke, with: { id: '${ $context.a.id }', type: ping } }
+  - join: { listen: { to: { one: { with: { type: '${ $context.a.done }' } } } } }
+  - examine: { call: examine, with: { a: '${ $context.a.id }' } }",
+    );
+    let nothing =
+        ouro_runtime::mock(|_: &str, _: &Value| false, |_: &str, _: &Value, _: &FunctionContext| Ok(json!({})));
+    let dry =
+        rt.dry_run_opts(&root, json!({}), nothing, DryRunOptions::default(), &CancellationToken::new()).await.unwrap();
+    assert!(matches!(dry.status, Status::Completed(_)), "{:?}", dry.status);
+    let ids = ids.lock().unwrap().clone();
+    assert!(dry.runs.iter().any(|r| r.id == ids["free"] && r.independent), "the free run is admitted and unrelated");
+    let checks = checks.lock().unwrap().clone();
+    let g = checks["g"].clone();
+    let consumed = format!("events:ping,done:{g}");
+    let expected: BTreeMap<String, String> = [
+        ("a reads s's records", "none"),
+        ("a lists s's children", "out-of-scope"),
+        ("a reads free's records", "none"),
+        ("a lists free's children", "out-of-scope"),
+        ("a reads free", "none"),
+        ("a delivers to root", "out-of-scope"),
+        ("g", g.as_str()),
+        ("g reads a", ids["a"].as_str()),
+        ("g reads root", ids["root"].as_str()),
+        ("g reads root's records", "events:"),
+        ("g reads s", "none"),
+        ("root reads a's records", consumed.as_str()),
+        ("root lists a's children", g.as_str()),
+        ("root delivers to a", "ended"),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_owned(), v.to_owned()))
+    .collect();
+    assert_eq!(checks, expected);
 }

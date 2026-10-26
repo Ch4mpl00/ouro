@@ -532,6 +532,52 @@ async fn dry_runs_and_replays_report_nothing_to_observers() {
     assert_eq!(recorder.events().len(), heard);
 }
 
+/// Design 07, test 10: an observer given in `DryRunOptions` hears every
+/// event of the dry run's runs, root and child, with payloads as a live
+/// observer gets them; the host's observers still hear nothing.
+#[tokio::test]
+async fn a_dry_runs_own_observer_hears_its_runs_and_the_hosts_hear_nothing() {
+    let host = Arc::new(Recorder::default());
+    let own = Arc::new(Recorder::default());
+    let rt = Runtime::new(
+        Arc::new(durable::memory::memory()),
+        Arc::new(registry(Arc::default(), Arc::default(), Arc::default())),
+        Config::default(),
+        Arc::new(Time::default()),
+        noop(),
+    )
+    .unwrap()
+    .with_observer(host.clone());
+    save(&rt, "kid", &doc("kid", "do: [ { a: { call: echo, with: { n: 1 } } } ]")).await;
+    let definition = doc(
+        "root",
+        "do:
+  - pick: { switch: [ { yes: { when: '${ .go }', then: continue } }, { no: { then: end } } ] }
+  - kid: { run: { workflow: { namespace: test, name: kid, version: latest } } }",
+    );
+    let nothing =
+        ouro_runtime::mock(|_: &str, _: &Value| false, |_: &str, _: &Value, _: &FunctionContext| Ok(json!({})));
+    let options = ouro_runtime::DryRunOptions { observer: Some(own.clone()), ..Default::default() };
+    let dry =
+        rt.dry_run_opts(&definition, json!({ "go": true }), nothing, options, &CancellationToken::new()).await.unwrap();
+    assert!(matches!(dry.status, Status::Completed(_)), "{:?}", dry.status);
+    assert!(host.events().is_empty(), "{:#?}", host.events());
+    let events = own.events();
+    let kid = dry.runs[1].id.clone();
+    let of = |run: &str, kind_: &str| events.iter().filter(|e| e.run_id == run && kind(e) == kind_).count();
+    for run in ["dry-run", kid.as_str()] {
+        assert_eq!(of(run, "run_admitted"), 1, "{run}: {events:#?}");
+        assert_eq!(of(run, "run_ended"), 1, "{run}: {events:#?}");
+    }
+    let admitted = events.iter().find(|e| e.run_id == "dry-run" && kind(e) == "run_admitted").unwrap();
+    assert_eq!(admitted.kind, EventKind::RunAdmitted { input: Some(json!({ "go": true })) });
+    assert_eq!(events.iter().position(|e| kind(e) == "run_admitted"), Some(0), "the root's admission comes first");
+    let child = events.iter().find(|e| e.run_id == kid && kind(e) == "run_admitted").unwrap();
+    assert_eq!(child.parent_id.as_deref(), Some("dry-run"));
+    assert!(events.iter().any(|e| matches!(&e.kind, EventKind::TaskEntered { input: Some(_), .. })), "{events:#?}");
+    assert!(events.iter().any(|e| e.kind == EventKind::SwitchTaken { case: "yes".into() }), "{events:#?}");
+}
+
 /// A start pinned at a stored version is an admission like any other: the
 /// observers hear `run_admitted` once, and a runtime without telemetry
 /// counts nothing for it.
