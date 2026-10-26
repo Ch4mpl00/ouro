@@ -23,8 +23,12 @@ kept for seven days by default; outcomes and version history remain.
 
 `RunStore` describes transactions, without SQL. Third-party adapters may
 implement it directly or reuse `TransactionalStore` over `AtomicBackend`.
-That seam opens a serializable transaction with point reads, ordered
-`[start, end)` scans with a limit, writes, deletes and a durable atomic commit.
+That seam opens serializable transactions with point reads, ordered
+`[start, end)` scans with a limit and a durable atomic commit. `begin` permits
+writes and deletes; `begin_read` serves pure queries and refuses both with
+`ReadOnlyTransaction` before touching data. Its default wraps `begin`, so
+existing adapters retain their isolation and validation; an override must
+provide the same write refusal.
 Full `snapshot` and `compare_exchange` methods serve persisted-state audits
 and corruption injection only; runtime operations never call them.
 
@@ -93,8 +97,14 @@ the workflow's open listens (waits, listeners, subscriptions, per-type pending
 counts and current listen matching contexts), plus one `waiting:` wait per owned child (which keeps the notice deliverable; it wakes the parent only if a current listen or addressed wait names that exact type); JSON work there scales with
 those, and with the versions of the affected definition name.
 
-SQLite uses `BEGIN IMMEDIATE`, WAL and `synchronous = FULL`. Postgres uses
-`SERIALIZABLE`; memory validates per-key versions and limited range results,
+SQLite uses WAL and `synchronous = FULL`. Pure queries use `BEGIN DEFERRED`:
+the first read fixes one serializable snapshot for all point and range reads
+in that transaction, without reserving the WAL writer lock. Updates use
+`BEGIN IMMEDIATE`. Any decision based on a query is revalidated in the update
+transaction (leases, fences, compare-and-swap), as with multiple Postgres
+workers. `due`/`due_as` may promote deferred queues and remain updates;
+`due_triggers`, control queries, inspection and listings are pure reads.
+Postgres uses `SERIALIZABLE`; memory validates per-key versions and limited range results,
 including missing keys and phantoms. The engine retries only definite
 serialization/deadlock aborts, at most 128 attempts with capped jittered backoff.
 Unrelated runs share no revision or validation counter. Runs finishing against
@@ -138,8 +148,13 @@ only, sets `synchronous = FULL` and a 30-second busy timeout: the host's
 connections keep their own settings, and engine durability holds for the
 commits made through the adapter's connection. The adapter keeps one connection of its own: give the
 host another connection per thread rather than sharing it, and set a busy
-timeout there too, since SQLite admits one writer and the engine's
-transactions begin immediately. A read-only open checks `ouro_migrations`.
+timeout there too, since SQLite admits one writer. Pure engine reads use
+deferred transactions and do not block a host connection from committing
+writes in WAL mode. Engine updates still reserve the writer lock immediately
+and keep it until the transaction ends, including across async statement
+hops; they compete with host writes. A long read retains its WAL snapshot
+until it ends and may delay checkpoint reclamation. A read-only open checks
+`ouro_migrations` and uses deferred transactions too.
 
 ## Async seams
 

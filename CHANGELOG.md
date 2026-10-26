@@ -4,6 +4,22 @@ Ouro is a 0.x prerelease: breaking changes are allowed and are listed here. The
 durable state version and the store layouts they mention are refused, not converted, so a
 store written before such a change must be recreated unless the entry says otherwise.
 
+## Unreleased / 0.2.2
+
+Stored versions unchanged (durable run state 15, `definitions` row layout 7,
+trigger queue layout 1). No migration required (design 06).
+
+- Pure SQLite queries use `BEGIN DEFERRED` and read one consistent WAL snapshot
+  without reserving the writer lock, so a host sharing the file can commit
+  writes while an engine read is open. Updates retain `BEGIN IMMEDIATE`;
+  `due`/`due_as` remain updates because they may promote deferred queues.
+- `AtomicBackend::begin_read` is an additive entry point whose default wraps
+  `begin`, preserving memory and Postgres behavior. Writes and deletes through
+  a read transaction fail with the typed `ReadOnlyTransaction` error before
+  touching data. `TransactionalStore` also enforces this boundary for adapter
+  overrides. Existing read-only opens still refuse mutating store operations
+  with `ReadOnly`.
+
 ## 0.2.1 (2026-10-26)
 
 Stored versions unchanged (durable run state 15, `definitions` row layout 7,
