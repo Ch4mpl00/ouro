@@ -1,6 +1,6 @@
 # 06. SQLite reads without the writer lock
 
-Status: approved · Related issue: #27 (sharing a host database)
+Status: implemented (5b29826) · Related issue: #27 (sharing a host database)
 
 ## Problem
 
