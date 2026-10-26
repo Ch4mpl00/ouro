@@ -92,11 +92,31 @@ async fn audit(store: &dyn RunStore) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Queries must refuse both mutation methods before touching persisted rows.
+async fn read_mutations(backend: &Arc<dyn AtomicBackend>) -> anyhow::Result<()> {
+    let mut tx = backend.begin().await?;
+    tx.put("read_guard", "existing", &json!(1)).await?;
+    tx.commit().await?;
+    let before = backend.snapshot().await?;
+    let store = TransactionalStore::new(backend.clone());
+    let put = store.read(|tx| Box::pin(async move { tx.put("read_guard", "new", &json!(2)).await })).await;
+    let after_put = backend.snapshot().await?;
+    let delete = store.read(|tx| Box::pin(async move { tx.delete("read_guard", "existing").await })).await;
+    let after_delete = backend.snapshot().await?;
+    assert!(put.is_err() && delete.is_err(), "read mutations must fail: put={put:?}, delete={delete:?}");
+    assert_eq!(after_put, before);
+    assert_eq!(after_delete, before);
+    Ok(())
+}
+
 /// Run the full contract against any adapter. The factory label is suitable
 /// for naming a fresh database. Panics are assertion failures; storage errors
 /// are returned with their original cause.
 pub async fn run_all(factory: impl AsyncFn(&str) -> anyhow::Result<TestStore>) -> anyhow::Result<Report> {
     let mut report = Report::default();
+    let t = factory("read_mutations").await?;
+    read_mutations(&t.backend).await?;
+    report.cases += 1;
     let t = factory("leases").await?;
     report.cases += 1;
     let s = &t.store;

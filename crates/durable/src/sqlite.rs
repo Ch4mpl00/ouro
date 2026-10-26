@@ -264,3 +264,51 @@ pub fn open(path: impl AsRef<Path>) -> anyhow::Result<TransactionalStore> {
 pub fn open_read_only(path: impl AsRef<Path>) -> anyhow::Result<TransactionalStore> {
     Ok(TransactionalStore::new(Arc::new(SqliteBackend::open_read_only(path)?)))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use tokio::sync::Barrier;
+
+    #[tokio::test]
+    async fn store_read_allows_independent_host_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("host.sqlite");
+        let backend = Arc::new(SqliteBackend::open(&path).unwrap());
+        let host = Connection::open(&path).unwrap();
+        host.busy_timeout(Duration::from_millis(200)).unwrap();
+        host.execute_batch("CREATE TABLE host_rows (id INTEGER PRIMARY KEY)").unwrap();
+        let mut seed = backend.begin().await.unwrap();
+        seed.put("probe", "a", &json!(1)).await.unwrap();
+        seed.commit().await.unwrap();
+        let store = TransactionalStore::new(backend);
+        let ready = Arc::new(Barrier::new(2));
+        let finished = Arc::new(Barrier::new(2));
+        let reader = store.read(|tx| {
+            let (ready, finished) = (ready.clone(), finished.clone());
+            Box::pin(async move {
+                assert_eq!(tx.get("probe", "a").await?, Some(json!(1)));
+                assert_eq!(tx.scan("probe", "a", Some("z"), 2).await?.len(), 1);
+                ready.wait().await;
+                finished.wait().await;
+                Ok(())
+            })
+        });
+        let writer = async {
+            ready.wait().await;
+            let result = tokio::task::spawn_blocking(move || {
+                let result = host.execute("INSERT INTO host_rows VALUES (1)", []);
+                (host, result)
+            })
+            .await
+            .unwrap();
+            finished.wait().await;
+            result
+        };
+        let (read, (host, write)) = tokio::join!(reader, writer);
+        read.unwrap();
+        write.expect("a pure store read must not reserve the WAL writer");
+        assert_eq!(host.query_row("SELECT count(*) FROM host_rows", [], |row| row.get::<_, i64>(0)).unwrap(), 1);
+    }
+}
