@@ -1,6 +1,6 @@
 # 07. Handlers reach the store that drives them; a dry run reports its tree and takes an observer
 
-Status: approved after goldfish round 1 (resolutions marked R-n) · Issue: #39
+Status: revised after goldfish round 1 (R-n) and the ouro-agent design 05 review (A-n) · Issue: #39
 
 ## Problem
 
@@ -23,6 +23,16 @@ Second gap: `DryRun::calls` is the root's call journal only. A host whose
 work happens in children (a dispatcher that starts a loop that starts a guard
 and workers) gets no journal, outcome or version for any child.
 
+Fourth gap (A-H2): a dry run drives its due runs one after another, and only
+`wait`s and `listen`s **with a timeout** are cut short. A `listen` with a
+`hold` and no timeout (an agent loop joining its guard child, `PT60S`, or a
+worker, `PT15M`) keeps its drive for the whole hold in real time while the
+child that would answer is not driven: every such join costs the full hold.
+
+Fifth gap (A-H3): the root is always admitted as id and name `dry-run`. A host
+whose handlers find the root by its id (`signal:<n>`) or trace by its name
+cannot dry-run the same chain it runs live.
+
 Third gap: no host observer hears a dry run (by design: it is no run of the
 host, so it must not reach the host's lifecycle, metrics or journal). But the
 host that asked for the dry run wants its steps: which task ran, which case a
@@ -35,9 +45,11 @@ host that asked for the dry run wants its steps: which task ran, which case a
    (R-M1). The host's captured handle keeps working in live runs; the context
    handle is right in every mode.
 2. **The handle is narrow (R-L1):** read the call's own run and its
-   descendants, and deliver an event **targeted** at one of them. No
+   descendants (the run, its records, its children by parent), and deliver
+   an event **targeted** at one of them (A-H1: a host's handlers read a
+   child's records for consumed events and list a run's children). No
    untargeted delivery, no reads of unrelated runs (their host data stays
-   private), no call journals or definitions (no user for them yet). No start
+   private), no definitions. No start
    of roots, save, activate, cancel or control. Children still start only
    through `start_child`.
 3. **Delivery through the handle is fenced and cannot forge lifecycle
@@ -58,6 +70,14 @@ host that asked for the dry run wants its steps: which task ran, which case a
    public fields; code that builds them with struct literals adds them.
    `DryRun` and `DryRunRun` become `#[non_exhaustive]`; `DryRunOptions` stays
    exhaustive (so `..Default::default()` works from other crates).
+8. **Holds are cut in a dry run (A-H2):** `Limits` gains `max_hold:
+   Option<Duration>`, the longest a `listen` holds its drive waiting; past it
+   the run suspends (a hold is an optimisation, never a change of outcome).
+   A dry run sets it to `ZERO`, so a join suspends at once and the driver
+   drives the child.
+9. **The host names the dry run's root (A-H3):** `DryRunOptions` gains `id`
+   and `name` (default `dry-run` for both). The root is saved and admitted
+   under them in the private store.
 
 ## Non-goals
 
@@ -80,6 +100,12 @@ pub trait RunAccess: Send + Sync {
     /// The call's own run, or a run whose child links lead up to it; `None`
     /// for any other id (unknown or unrelated alike).
     async fn get(&self, id: &str) -> anyhow::Result<Option<SavedRun>>;
+    /// Its records (`Runtime::records`), same scope as `get`.
+    async fn records(&self, id: &str) -> anyhow::Result<Option<BTreeMap<String, Record>>>;
+    /// Its children by parent link (`Control::list` filtered by parent),
+    /// bounded and paged; `parent` in the same scope as `get`.
+    async fn children(&self, parent: &str, cursor: Option<&str>, limit: usize)
+        -> anyhow::Result<Page<SavedRun>>;
     /// Delivers `event` (an identified CloudEvent) to `target`'s mailbox:
     /// `target` must be the call's own run or a descendant. Lease-checked;
     /// reserved types refused (`ReservedEventType`).
@@ -131,6 +157,10 @@ targeted delivery waits in the mailbox whether or not the run listens yet.
 ```rust
 #[derive(Default)]
 pub struct DryRunOptions {
+    /// The root's run id and definition name in the private store;
+    /// `dry-run` for both when `None` (A-H3).
+    pub id: Option<String>,
+    pub name: Option<String>,
     /// Host data for the root (`Runtime::start_with`).
     pub host: Option<Value>,
     /// Hears every event of this dry run's runs, root and children, with
@@ -143,6 +173,11 @@ impl Runtime {
         options: DryRunOptions, stop: &CancellationToken) -> anyhow::Result<DryRun>;
 }
 ```
+
+Limits: the private runtime's config sets `max_sleep`, `max_listen` and
+`max_hold` to `ZERO` (A-H2). A `listen` with a hold then takes an event
+already in its mailbox, else suspends at once, and the run wakes on the
+delivery the driver makes when it drives the child.
 
 Wiring (R-M2): the private runtime's `Observers { telemetry: <as today>,
 host: options.observer.into_iter().collect(), payload_bytes:
@@ -186,8 +221,8 @@ pub struct DryRunRun {
 Admission order (R-M3) is recorded in memory by the private runtime as it
 admits runs (an internal hook beside `Observers::admitted`, not a host
 observer), so it does not depend on hashed ids or the virtual clock. The
-root's name and id are `dry-run`, whatever the YAML's `document.name`
-(R-L6). Size: the dry run's passes are bounded by `max_tasks`; each pass can
+root's name and id are `DryRunOptions::id`/`name`, `dry-run` by default,
+whatever the YAML's `document.name` (R-L6, A-H3). Size: the dry run's passes are bounded by `max_tasks`; each pass can
 admit what its runs' tasks start under `max_depth`, so the number of runs is
 bounded by both, not by `max_tasks` alone (R-L6).
 
@@ -202,6 +237,10 @@ reported (R-L3).
   is given** inherit dry mode and `M`." New Rust-level mutant next to the
   existing one: *in a dry run the run access reads and delivers into the
   host's store* (R-M8.7).
+- `max_hold` (A-H2) changes when a run suspends, never an outcome: a
+  suspended listen resumes on the same delivery. The executor checks the
+  hold-related invariants in `durable-invariants.md` and states in the
+  document which (if any) mention a hold's length.
 - No Quint change: the handle adds no transition (a targeted delivery is the
   existing `Deliver`; reads are reads); the X1 monitor counts mocked
   dispatches and is unaffected. Noted under X1 in `durable-invariants.md`.
@@ -260,11 +299,23 @@ Each fails before the change unless noted.
     hears nothing (R-M8.6).
 11. `host.rs`: `Mock::response`, a process runner and replay get `runs: None`;
     `cx.run` answers `Unavailable` there (R-M8.3).
+12. `host.rs`: dry, a handler reads a child's records (a consumed event)
+    and lists its children by parent; an unrelated run's records and
+    children answer `None`/empty (A-H1).
+13. `runtime.rs`: dry, a parent joins a host child with `listen` holding
+    `PT15M` and no timeout; the dry run completes in well under a second of
+    wall time (fails before: it holds 15 minutes) (A-H2). Live, a
+    `max_hold` shorter than a listen's hold suspends the run at `max_hold`
+    and the delivery wakes it with the same outcome.
+14. `runtime.rs`: `DryRunOptions { id: "signal:0", name: "signal" }`: the
+    root's `cx.run_id` and `cx.definition` are those, and `DryRun::runs[0]`
+    carries them (A-H3).
 
 ## Rollout (R-L4)
 
 - CHANGELOG 0.3.0, "Breaking changes": `FunctionContext` gains `runs`;
-  `DryRun` gains `runs` and is `#[non_exhaustive]`.
+  `DryRun` gains `runs` and is `#[non_exhaustive]`; `ows::run::Limits` gains
+  `max_hold`.
 - docs/api.md: the `FunctionContext` field list; the dry-run paragraph
   (`dry_run_opts`, `DryRunOptions`, `DryRun::runs`, run access, the
   confirmation pattern, the three failure modes).
