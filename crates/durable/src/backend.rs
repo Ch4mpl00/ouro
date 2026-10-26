@@ -122,6 +122,39 @@ impl std::fmt::Display for ReadOnly {
 }
 impl std::error::Error for ReadOnly {}
 
+/// A mutation attempted inside a read transaction, refused before touching data.
+#[derive(Debug)]
+pub struct ReadOnlyTransaction;
+impl std::fmt::Display for ReadOnlyTransaction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("a read transaction cannot mutate data")
+    }
+}
+impl std::error::Error for ReadOnlyTransaction {}
+
+pub(crate) struct ReadTransaction<'a>(pub(crate) Box<dyn Transaction + 'a>);
+#[async_trait]
+impl Transaction for ReadTransaction<'_> {
+    async fn get(&mut self, kind: &str, id: &str) -> anyhow::Result<Option<Value>> {
+        self.0.get(kind, id).await
+    }
+    async fn scan(&mut self, kind: &str, start: &str, end: Option<&str>, limit: usize) -> anyhow::Result<Rows> {
+        self.0.scan(kind, start, end, limit).await
+    }
+    async fn put(&mut self, _kind: &str, _id: &str, _value: &Value) -> anyhow::Result<()> {
+        Err(ReadOnlyTransaction.into())
+    }
+    async fn delete(&mut self, _kind: &str, _id: &str) -> anyhow::Result<()> {
+        Err(ReadOnlyTransaction.into())
+    }
+    async fn commit(self: Box<Self>) -> anyhow::Result<()> {
+        self.0.commit().await
+    }
+    async fn rollback(self: Box<Self>) {
+        self.0.rollback().await;
+    }
+}
+
 /// Why a store cannot be opened without migrating it: an adapter's
 /// read-only open never creates or migrates a schema, so it refuses a
 /// database that has none yet or one this build does not read.
@@ -162,9 +195,15 @@ impl std::error::Error for SchemaError {}
 #[async_trait]
 pub trait AtomicBackend: Send + Sync {
     async fn begin(&self) -> anyhow::Result<Box<dyn Transaction + '_>>;
-    /// Opened read-only: every `put` and `delete` fails with `ReadOnly`
-    /// before it touches data, and `TransactionalStore` refuses its
-    /// mutating operations before opening a transaction.
+    /// A serializable read transaction, including absence and bounded ranges.
+    /// Both mutation methods fail with `ReadOnlyTransaction` before touching
+    /// data. The default preserves `begin`'s isolation and ending behavior.
+    async fn begin_read(&self) -> anyhow::Result<Box<dyn Transaction + '_>> {
+        Ok(Box::new(ReadTransaction(self.begin().await?)))
+    }
+    /// Opened read-only: `begin` transactions refuse `put` and `delete`
+    /// with `ReadOnly` before touching data, and `TransactionalStore`
+    /// refuses mutating operations before opening a transaction.
     fn is_read_only(&self) -> bool {
         false
     }
@@ -216,19 +255,34 @@ impl TransactionalStore {
         if self.backend.is_read_only() {
             return Err(ReadOnly.into());
         }
-        self.read(operation).await
+        self.transact(false, operation).await
     }
-    /// Runs `operation` in a transaction and commits it, retrying definite
-    /// conflicts only. The operation is called again on each attempt, so it
-    /// must derive everything from what it reads. A dropped call rolls its
-    /// open transaction back (`Transaction`). Queries run here directly, so
-    /// they serve a read-only backend too.
+    /// Runs a pure query in a guarded read transaction, including on a
+    /// read-only backend. The store guard also protects against adapters
+    /// whose `begin_read` override forgets to refuse mutations.
     pub(crate) async fn read<'c, T: Send>(
         &'c self,
         operation: impl for<'t> Fn(&'t mut (dyn Transaction + 'c)) -> BoxFuture<'t, anyhow::Result<T>> + Send + Sync,
     ) -> anyhow::Result<T> {
+        self.transact(true, operation).await
+    }
+    /// Retries definite conflicts only. Each attempt derives its result
+    /// from its own reads. Dropping the call rolls the open transaction back.
+    async fn transact<'c, T: Send>(
+        &'c self,
+        read: bool,
+        operation: impl for<'t> Fn(&'t mut (dyn Transaction + 'c)) -> BoxFuture<'t, anyhow::Result<T>> + Send + Sync,
+    ) -> anyhow::Result<T> {
         for attempt in 0..128 {
-            let result = match self.backend.begin().await {
+            let transaction = if read {
+                self.backend.begin_read().await.map(|tx| {
+                    let guarded: Box<dyn Transaction> = Box::new(ReadTransaction(tx));
+                    guarded
+                })
+            } else {
+                self.backend.begin().await
+            };
+            let result = match transaction {
                 Ok(mut tx) => match operation(&mut *tx).await {
                     Ok(value) => tx.commit().await.map(|()| value),
                     Err(e) => {
@@ -260,4 +314,41 @@ pub(crate) fn changes<'a>(before: &'a Rows, after: &'a Rows) -> Vec<(&'a Key, Op
         .map(|(k, v)| (k, Some(v)))
         .chain(before.keys().filter(|k| !after.contains_key(*k)).map(|k| (k, None)))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::memory::MemoryBackend;
+    use serde_json::json;
+
+    struct UnguardedBackend(MemoryBackend);
+    #[async_trait]
+    impl AtomicBackend for UnguardedBackend {
+        async fn begin(&self) -> anyhow::Result<Box<dyn Transaction + '_>> {
+            self.0.begin().await
+        }
+        async fn begin_read(&self) -> anyhow::Result<Box<dyn Transaction + '_>> {
+            self.begin().await
+        }
+        async fn snapshot(&self) -> anyhow::Result<Snapshot> {
+            self.0.snapshot().await
+        }
+    }
+
+    #[tokio::test]
+    async fn store_read_guards_unguarded_backend_override() {
+        let backend = Arc::new(UnguardedBackend(MemoryBackend::default()));
+        let mut tx = backend.begin().await.unwrap();
+        tx.put("guard", "existing", &json!(1)).await.unwrap();
+        tx.commit().await.unwrap();
+        let before = backend.snapshot().await.unwrap();
+        let store = TransactionalStore::new(backend.clone());
+        let put = store.read(|tx| Box::pin(async move { tx.put("guard", "new", &json!(2)).await })).await;
+        assert!(put.unwrap_err().is::<ReadOnlyTransaction>());
+        assert_eq!(backend.snapshot().await.unwrap(), before);
+        let delete = store.read(|tx| Box::pin(async move { tx.delete("guard", "existing").await })).await;
+        assert!(delete.unwrap_err().is::<ReadOnlyTransaction>());
+        assert_eq!(backend.snapshot().await.unwrap(), before);
+    }
 }

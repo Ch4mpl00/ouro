@@ -103,9 +103,23 @@ async fn read_mutations(backend: &Arc<dyn AtomicBackend>) -> anyhow::Result<()> 
     let after_put = backend.snapshot().await?;
     let delete = store.read(|tx| Box::pin(async move { tx.delete("read_guard", "existing").await })).await;
     let after_delete = backend.snapshot().await?;
-    assert!(put.is_err() && delete.is_err(), "read mutations must fail: put={put:?}, delete={delete:?}");
+    assert!(put.unwrap_err().is::<ReadOnlyTransaction>());
+    assert!(delete.unwrap_err().is::<ReadOnlyTransaction>());
     assert_eq!(after_put, before);
     assert_eq!(after_delete, before);
+    for commit in [true, false] {
+        let mut tx = backend.begin_read().await?;
+        assert!(tx.put("read_guard", "new", &json!(2)).await.unwrap_err().is::<ReadOnlyTransaction>());
+        assert!(tx.delete("read_guard", "existing").await.unwrap_err().is::<ReadOnlyTransaction>());
+        assert_eq!(tx.get("read_guard", "existing").await?, Some(json!(1)));
+        assert_eq!(tx.scan("read_guard", "", Some("z"), 2).await?.len(), 1);
+        if commit {
+            tx.commit().await?;
+        } else {
+            tx.rollback().await;
+        }
+        assert_eq!(backend.snapshot().await?, before);
+    }
     Ok(())
 }
 

@@ -76,6 +76,16 @@ impl SqliteBackend {
             metrics: Arc::new(Metrics::default()),
         }
     }
+    async fn transaction(&self, begin: &'static str) -> anyhow::Result<Box<dyn Transaction + '_>> {
+        let connection = self.connection.clone().lock_owned().await;
+        let (session, ()) = blocking(Session { connection, open: false }, move |s| {
+            s.connection.execute_batch(begin)?;
+            s.open = true;
+            Ok(())
+        })
+        .await?;
+        Ok(Box::new(SqliteTransaction { session: Some(session), backend: self, writes: 0 }))
+    }
 }
 
 fn has_table(connection: &Connection, name: &str) -> rusqlite::Result<bool> {
@@ -152,15 +162,14 @@ impl AtomicBackend for SqliteBackend {
         self.read_only
     }
     async fn begin(&self) -> anyhow::Result<Box<dyn Transaction + '_>> {
-        let connection = self.connection.clone().lock_owned().await;
-        let begin = if self.read_only { "BEGIN DEFERRED" } else { "BEGIN IMMEDIATE" };
-        let (session, ()) = blocking(Session { connection, open: false }, move |s| {
-            s.connection.execute_batch(begin)?;
-            s.open = true;
-            Ok(())
-        })
-        .await?;
-        Ok(Box::new(SqliteTransaction { session: Some(session), backend: self, writes: 0 }))
+        self.transaction(if self.read_only { "BEGIN DEFERRED" } else { "BEGIN IMMEDIATE" }).await
+    }
+    /// The first read fixes one WAL snapshot for points, absence and ranges.
+    /// A pure snapshot is serializable at that instant; any later claim,
+    /// fence, lease, CAS or firing decision revalidates in its write
+    /// transaction, just as it must with independent Postgres workers.
+    async fn begin_read(&self) -> anyhow::Result<Box<dyn Transaction + '_>> {
+        Ok(Box::new(crate::backend::ReadTransaction(self.transaction("BEGIN DEFERRED").await?)))
     }
     async fn snapshot(&self) -> anyhow::Result<Snapshot> {
         let connection = self.connection.clone().lock_owned().await;
@@ -298,6 +307,100 @@ mod tests {
         let writer = async {
             ready.wait().await;
             let result = tokio::task::spawn_blocking(move || {
+                let start = std::time::Instant::now();
+                let result = host.execute("INSERT INTO host_rows VALUES (1)", []);
+                (host, result, start.elapsed())
+            })
+            .await
+            .unwrap();
+            finished.wait().await;
+            result
+        };
+        let (read, (host, write, elapsed)) =
+            tokio::time::timeout(Duration::from_secs(5), async { tokio::join!(reader, writer) })
+                .await
+                .expect("reader and host writer must finish");
+        read.unwrap();
+        write.expect("a pure store read must not reserve the WAL writer");
+        assert!(elapsed < Duration::from_millis(500), "host commit took {elapsed:?}");
+        assert_eq!(host.query_row("SELECT count(*) FROM host_rows", [], |row| row.get::<_, i64>(0)).unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn deferred_read_keeps_point_absence_and_range_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("snapshot.sqlite");
+        let backend = SqliteBackend::open(&path).unwrap();
+        let host = Connection::open(&path).unwrap();
+        host.busy_timeout(Duration::from_millis(200)).unwrap();
+        let mut read = backend.begin_read().await.unwrap();
+        // BEGIN alone fixes no snapshot: a host commit before the first
+        // observation is visible, and also proves the deferred lock mode.
+        let host = tokio::task::spawn_blocking(move || {
+            host.execute_batch("INSERT INTO ouro_rows VALUES ('probe','a','1'), ('probe','c','3'), ('probe','z','26')")
+                .unwrap();
+            host
+        })
+        .await
+        .unwrap();
+        assert_eq!(read.get("probe", "a").await.unwrap(), Some(json!(1)));
+        assert_eq!(read.get("probe", "b").await.unwrap(), None);
+        let before = read.scan("probe", "a", Some("z"), 2).await.unwrap();
+        assert_eq!(
+            before,
+            Rows::from([(("probe".into(), "a".into()), json!(1)), (("probe".into(), "c".into()), json!(3))])
+        );
+        let host = tokio::task::spawn_blocking(move || {
+            host.execute_batch("BEGIN IMMEDIATE; UPDATE ouro_rows SET value='10' WHERE kind='probe' AND id='a'; INSERT INTO ouro_rows VALUES ('probe','b','2'); DELETE FROM ouro_rows WHERE kind='probe' AND id='c'; COMMIT").unwrap();
+            host
+        }).await.unwrap();
+        assert_eq!(read.get("probe", "a").await.unwrap(), Some(json!(1)));
+        assert_eq!(read.get("probe", "b").await.unwrap(), None);
+        assert_eq!(read.scan("probe", "a", Some("z"), 2).await.unwrap(), before);
+        read.commit().await.unwrap();
+        let mut next = backend.begin_read().await.unwrap();
+        assert_eq!(next.get("probe", "a").await.unwrap(), Some(json!(10)));
+        assert_eq!(next.get("probe", "b").await.unwrap(), Some(json!(2)));
+        assert_eq!(next.get("probe", "c").await.unwrap(), None);
+        assert_eq!(
+            next.scan("probe", "a", Some("z"), 2).await.unwrap(),
+            Rows::from([(("probe".into(), "a".into()), json!(10)), (("probe".into(), "b".into()), json!(2))])
+        );
+        next.rollback().await;
+        drop(host);
+    }
+
+    #[tokio::test]
+    async fn begin_and_store_update_retain_immediate_writer_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("writer.sqlite");
+        let backend = Arc::new(SqliteBackend::open(&path).unwrap());
+        let host = Connection::open(&path).unwrap();
+        host.busy_timeout(Duration::from_millis(200)).unwrap();
+        host.execute_batch("CREATE TABLE host_rows (id INTEGER PRIMARY KEY)").unwrap();
+        let tx = backend.begin().await.unwrap();
+        let (host, blocked) = tokio::task::spawn_blocking(move || {
+            let result = host.execute("INSERT INTO host_rows VALUES (1)", []);
+            (host, result)
+        })
+        .await
+        .unwrap();
+        assert_eq!(blocked.unwrap_err().sqlite_error_code(), Some(rusqlite::ErrorCode::DatabaseBusy));
+        tx.rollback().await;
+        let store = TransactionalStore::new(backend.clone());
+        let ready = Arc::new(Barrier::new(2));
+        let finished = Arc::new(Barrier::new(2));
+        let update = store.update(|tx| {
+            let (ready, finished) = (ready.clone(), finished.clone());
+            Box::pin(async move {
+                ready.wait().await;
+                finished.wait().await;
+                tx.put("probe", "a", &json!(1)).await
+            })
+        });
+        let writer = async {
+            ready.wait().await;
+            let result = tokio::task::spawn_blocking(move || {
                 let result = host.execute("INSERT INTO host_rows VALUES (1)", []);
                 (host, result)
             })
@@ -306,9 +409,15 @@ mod tests {
             finished.wait().await;
             result
         };
-        let (read, (host, write)) = tokio::join!(reader, writer);
-        read.unwrap();
-        write.expect("a pure store read must not reserve the WAL writer");
-        assert_eq!(host.query_row("SELECT count(*) FROM host_rows", [], |row| row.get::<_, i64>(0)).unwrap(), 1);
+        let (update, (host, blocked)) =
+            tokio::time::timeout(Duration::from_secs(5), async { tokio::join!(update, writer) })
+                .await
+                .expect("update and host writer must finish");
+        update.unwrap();
+        assert_eq!(blocked.unwrap_err().sqlite_error_code(), Some(rusqlite::ErrorCode::DatabaseBusy));
+        tokio::task::spawn_blocking(move || host.execute("INSERT INTO host_rows VALUES (1)", []).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(backend.snapshot().await.unwrap().rows.get(&("probe".into(), "a".into())), Some(&json!(1)));
     }
 }
