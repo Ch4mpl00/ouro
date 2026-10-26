@@ -859,6 +859,11 @@ async fn host_data(
     let mut renamed = child.clone();
     renamed.name = "other".into();
     assert_eq!(mismatch(s.start_child(&p, &renamed, &link, 2).await), Some(AdmissionField::Name));
+    // An id held under another link (another key of the parent, or a root
+    // run of the same definition) is refused, typed, too.
+    let elsewhere = ChildLink { key: "/spawn/other".into(), ..link.clone() };
+    assert_eq!(mismatch(s.start_child(&p, &child, &elsewhere, 2).await), Some(AdmissionField::Link));
+    assert_eq!(mismatch(s.start_child(&p, &admission("plain"), &elsewhere, 2).await), Some(AdmissionField::Link));
     assert_eq!(t.backend.snapshot().await?, before, "a refused child writes nothing");
     assert_eq!(s.list(None, "hostchild:").await?.len(), 1);
     assert_eq!(s.get("hostchild:k").await?.unwrap().admission, child);
@@ -886,7 +891,7 @@ async fn host_data(
     assert_eq!(ended.items.iter().filter(|r| shown(r) == Some(json!(control::REDACTED))).count(), 1);
     assert_eq!(s.get("hostchild:k").await?.unwrap().admission, child, "the stored run is not redacted");
     audit(&**s).await?;
-    report.operations += 24;
+    report.operations += 26;
 
     // Racing starts of one id with two host data: one is stored, the starts
     // with the same host data join it and the others are refused.

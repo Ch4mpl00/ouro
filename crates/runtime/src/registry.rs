@@ -77,11 +77,12 @@ pub struct FunctionContext {
 }
 impl FunctionContext {
     /// The run id `start_child` with `key` gives the child in this call, and
-    /// in every re-dispatch of it (it derives from the run, the call's
-    /// idempotency key and `key`): a host can key its own records by it
-    /// before it starts the child. Pure: it starts and reads nothing.
+    /// in every re-dispatch of it in the same attempt (it derives from the
+    /// run, the call's per-attempt `task_path` and `key`): a host can key its
+    /// own records by it before it starts the child. A DSL retry attempt has
+    /// another task path, so another id. Pure: it starts and reads nothing.
     pub fn child_id(&self, key: &str) -> String {
-        host_child_id(&self.run_id, &self.idempotency_key, key)
+        host_child_id(&self.run_id, &self.task_path, key)
     }
     /// The call's bounded metric attributes: `ouro.definition`,
     /// `ouro.function` and `ouro.delivery`. Run ids and task paths belong
@@ -101,11 +102,13 @@ impl FunctionContext {
     /// input and host data. It is committed with the parent's subscriptions
     /// to its end, through the run's lease, under the same ownership,
     /// cascade, budget, nesting depth and trip/pause rules as the built-in
-    /// `start_child`. Its id is derived from the run, this call's idempotency
-    /// key and `key`, so a re-dispatch of the call joins the same child. The
-    /// first commit wins: a join returns the child as it was admitted, whatever
-    /// input, version or host data the re-dispatch computed (only another
-    /// definition is refused, `ChildRefusal::Mismatch`). The
+    /// `start_child`. Its id (`child_id`) is derived from the run, this
+    /// call's per-attempt task path and `key`, so a re-dispatch of the call in
+    /// the same attempt joins the same child, and a DSL retry attempt starts
+    /// its own. The first commit wins: a join returns the child as it was
+    /// admitted, whatever input, version or host data the re-dispatch computed
+    /// (host data past the size bound included); only another definition, or
+    /// the id held under another link, is refused (`ChildRefusal::Mismatch`). The
     /// workflow joins it with `listen` (`ChildRef::done`) or reads its outcome
     /// with the built-in `child_outcome` (`ChildRef::id`, `ChildRef::key`).
     ///
@@ -124,10 +127,35 @@ impl FunctionContext {
     }
 }
 
-/// A host child's id: `hostchild:[<run>, <call idempotency key>, <key>]`,
-/// distinct from the built-in children's `child:` ids.
-pub(crate) fn host_child_id(run_id: &str, idempotency_key: &str, key: &str) -> String {
-    format!("hostchild:{}", serde_json::to_string(&(run_id, idempotency_key, key)).expect("strings serialize"))
+/// A host child's id: `hostchild:<32 hex>` of `[<run>, <call reference>,
+/// <key>]` (`hashed_id`), distinct from the built-in children's `child:` ids.
+pub(crate) fn host_child_id(run_id: &str, reference: &str, key: &str) -> String {
+    hashed_id("hostchild:", &[run_id, reference, key])
+}
+/// A child a workflow starts (`run: workflow`, the reserved `start_child`):
+/// `child:<32 hex>` of `[<run>, <task or call reference>]` (`hashed_id`).
+pub(crate) fn child_id(run_id: &str, reference: &str) -> String {
+    hashed_id("child:", &[run_id, reference])
+}
+/// `prefix` and the first 128 bits, in lowercase hex, of the SHA-256 of
+/// `parts` as a compact JSON array of strings. The reference is the raw,
+/// per-attempt one (`ows::run::CallInfo::reference`): a re-dispatch or
+/// recovery of the same attempt derives the same id and joins the child it
+/// started, while a DSL retry attempt, which re-runs the work, starts its
+/// own (joining attempt one's child under another attempt's link would
+/// contradict the link). The hash keeps the id fixed-size at any depth,
+/// although a child's own id is part of its children's; ids are stored in
+/// every index key of the run, so their length must not grow with nesting.
+fn hashed_id(prefix: &str, parts: &[&str]) -> String {
+    use sha2::{Digest, Sha256};
+    let canonical = serde_json::to_string(parts).expect("strings serialize");
+    let digest = Sha256::digest(canonical.as_bytes());
+    let mut id = String::with_capacity(prefix.len() + 32);
+    id.push_str(prefix);
+    for byte in &digest[..16] {
+        id.push_str(&format!("{byte:02x}"));
+    }
+    id
 }
 
 /// An owned child a host function starts (`FunctionContext::start_child`).
@@ -184,7 +212,8 @@ pub enum ChildRefusal {
     Depth(WorkflowError),
     /// Its definition is tripped by its breaker or paused by an operator.
     Tripped(ouro_durable::DefinitionTripped),
-    /// The id is taken by a child of another definition.
+    /// The id is taken by a child of another definition, or by a run that is
+    /// not this call's child under this key (`AdmissionField::Link`).
     Mismatch(ouro_durable::AdmissionMismatch),
     /// The definition cannot be admitted: no active or no such version, a
     /// function it calls is not registered (`MissingFunction`), or it does not

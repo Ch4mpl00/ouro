@@ -913,6 +913,12 @@ struct Queued {
 async fn queued(rows: &mut dyn Transaction, k: &str) -> anyhow::Result<Option<Queued>> {
     rows.get("trigger_queue", k).await?.map(decode_queue).transpose()
 }
+/// Layout 1 has not changed, although an entry holds a whole admission (its
+/// YAML included): a buffered slot is promoted only through `admitted`, which
+/// loads its definition's row first (`load_definitions`), so an entry buffered
+/// before a `definitions` layout change (7: `metadata.ouro`) is refused with
+/// that row and never admitted under the new parser. A change to what an
+/// entry itself means needs a layout of its own.
 fn decode_queue(value: Value) -> anyhow::Result<Queued> {
     let q: Queued = serde_json::from_value(value)?;
     anyhow::ensure!(q.version == 1, "unsupported trigger queue layout");
@@ -2067,7 +2073,12 @@ impl RunStore for TransactionalStore {
                     c.run.child = Some(link.clone());
                     c.run.root = Some(p.run.root.clone().unwrap_or_else(|| parent.run_id.clone()));
                 }
-                anyhow::ensure!(c.run.child.as_ref() == Some(link), "child belongs to another invocation");
+                // The id is held by a run that is not this invocation's
+                // child (another key or attempt, another parent, a root):
+                // typed, so a caller refuses instead of retrying for ever.
+                if c.run.child.as_ref() != Some(link) {
+                    return Err(AdmissionMismatch { id: a.id.clone(), field: AdmissionField::Link }.into());
+                }
                 let fence = if inserted { Some(claim_run(&mut c, now, owner)?) } else { None };
                 store_run(rows, &c).await?;
                 if let Some(outcome) = c.run.outcome {

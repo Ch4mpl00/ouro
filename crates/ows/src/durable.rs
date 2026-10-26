@@ -194,7 +194,11 @@ use std::collections::BTreeMap;
 /// 14: the engine's extensions are read from `metadata.ouro`, not from the
 /// flat `metadata` keys (record formats unchanged; a stored definition or
 /// admitted run of 13 would lose its settings).
-pub const VERSION: u32 = 14;
+/// 15: a child's run id is a hash of its parent, the per-attempt reference
+/// that started it and (a host child) its key, `child:<32 hex>` and
+/// `hostchild:<32 hex>` (record formats unchanged; a run of 14 resumed now
+/// would derive other ids and start its children again).
+pub const VERSION: u32 = 15;
 
 /// The key of a run's `Record::Exceeded`.
 pub const EXCEEDED: &str = "exceeded";

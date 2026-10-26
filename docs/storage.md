@@ -101,23 +101,29 @@ Unrelated runs share no revision or validation counter. Runs finishing against
 the same active definition intentionally share its breaker transaction.
 Ambiguous commits and transport errors propagate without retry.
 
-Both initial migrations were replaced before any release or deployment. This
-layout requires a fresh database from the earlier development checkout; there
-is no conversion of that unreleased layout. Applied migrations are immutable
-from the next release onward. The SQL schema is a generic key/value table, so
-the row shapes above (and the interpreter's durable state version, now 14; 12:
-a run row may be held by an operator; 13: an unknown at-most-once
-outcome is catchable by its type, and recovery restores a refusal; 14: the
-engine's extensions are read from `metadata.ouro`) can
-change without a migration; nothing persisted before them is converted. Each
-run row records the durable state version it was written under, and a row of
-another version (including the earlier one-aggregate-per-run layout) is
-refused with an error rather than read as a run without evidence. Likewise a
-`definitions` row records its layout (4: each version's latest activation;
-7: the stored YAML keeps the engine's extensions under `metadata.ouro`);
-the earlier unversioned layout, which kept a predecessor for a breaker
-rollback, is refused rather than read as a definition that never tripped,
-and so is layout 3, which kept no activation times.
+The initial migrations were replaced before v0.1.0, the first release; since
+then applied migrations never change, and a schema change is the next
+numbered file. The SQL schema itself has not changed since v0.1.0, but a
+v0.1.0 SQLite file recorded its schema version in `user_version` instead of
+`ouro_migrations`: both opens refuse it with `SchemaError::Legacy` and leave
+it as it is. The SQL schema is a generic key/value table, so the row shapes
+above can change without a migration; nothing persisted before such a change
+is converted, and the [changelog](../CHANGELOG.md) lists each one. Each run
+row records the durable state version it was written under (now 15; 12: a
+run row may be held by an operator; 13: an unknown at-most-once outcome is
+catchable by its type, and recovery restores a refusal; 14: the engine's
+extensions are read from `metadata.ouro`; 15: child ids are hashed per
+attempt), and a row of another version (including the earlier
+one-aggregate-per-run layout) is refused with an error rather than read as a
+run without evidence. Likewise a `definitions` row records its layout (now 7;
+4: each version's latest activation; 5: each version's content digest; 6: a
+trip says whether it is the breaker's; 7: the stored YAML keeps the engine's
+extensions under `metadata.ouro`); the earlier unversioned layout, which kept
+a predecessor for a breaker rollback, is refused rather than read as a
+definition that never tripped, and so is every earlier numbered layout. A
+buffered trigger slot (`trigger_queue`, layout 1) holds a whole admission; it
+is promoted only through its definition's row, so an entry buffered before a
+`definitions` layout change is refused with that row.
 
 ## Coexisting in a host database
 
