@@ -4,6 +4,22 @@ Ouro is a 0.x prerelease: breaking changes are allowed and are listed here. The
 durable state version and the store layouts they mention are refused, not converted, so a
 store written before such a change must be recreated unless the entry says otherwise.
 
+## 0.2.1 (unreleased)
+
+Stored versions unchanged (durable run state 15, `definitions` row layout 7,
+trigger queue layout 1). Behaviour fix, no breaking change (design 05).
+
+- A parent that waits for a child's end no longer wakes while the child only
+  waits. The `waiting:<child>` notice a suspended child commits was always
+  awaited by the parent automatically, so a parent joined on `done:<child>`
+  was due on every pass until the child ended: it replayed, found nothing to
+  take and suspended again, and could take every slot of a pass
+  (`max_concurrency`, 4 by default) ahead of the run that could progress. A
+  lifecycle notice now wakes a run only when a current listen (not the internal
+  `child:*` registration, not `*`) or an addressed wait names its exact type.
+  The notice stays pending and is taken by a later listen; CloudEvents keep
+  their rule. Runs stored with a stale wake heal at their next pass.
+
 ## 0.2.0 (2026-10-26)
 
 Stored versions at the end of 0.2.0: durable run state 15, `definitions` row

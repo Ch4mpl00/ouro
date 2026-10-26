@@ -784,7 +784,10 @@ eligible live wait eventually is consumed, or receives the declared cancellation
 expiry disposition. With no expiry/cancellation and a persistently eligible
 consumer, consumption is mandatory. A TTL does not promise consumption if the
 consumer appears only after expiry. Notification delivery is not assumed reliable;
-durable polling or equivalent recovery must suffice.
+durable polling or equivalent recovery must suffice. The converse is not
+required: a pending copy with no eligible wait (a lifecycle notice that none of
+the run's current listens names) need not wake the run, and stays pending for a
+later listen.
 
 Durably accepted input cannot be stranded by a lost wakeup. **Source:**
 [API][API], [DBOS][DBOS], [I1S][I1S]. **Fault:** lost notification, takeover between

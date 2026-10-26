@@ -90,7 +90,7 @@ A take reads one indexed row per listed type and consumes the copy with a
 constant number of writes; expiry reads only the expired copies. A copy's
 identity and type are point lookups. The run row still holds what is bounded by
 the workflow's open listens (waits, listeners, subscriptions, per-type pending
-counts and current listen matching contexts), plus one `waiting:` wait per owned child; JSON work there scales with
+counts and current listen matching contexts), plus one `waiting:` wait per owned child (which keeps the notice deliverable; it wakes the parent only if a current listen or addressed wait names that exact type); JSON work there scales with
 those, and with the versions of the affected definition name.
 
 SQLite uses `BEGIN IMMEDIATE`, WAL and `synchronous = FULL`. Postgres uses

@@ -1234,11 +1234,7 @@ async fn a_dsl_retry_starts_a_reserved_child_per_attempt_and_recovery_joins_it()
 
 #[tokio::test]
 async fn child_ids_have_a_fixed_length_at_the_depth_limit() {
-    // Room for every run of the chain in one pass: a waiting parent of a
-    // waiting child stays due (its child's `waiting:` notice is never taken),
-    // and with the default four slots such parents can take every slot of
-    // a pass ahead of the one run that can progress, depending on id order.
-    let config = Config { max_concurrency: 16, ..Config::default() };
+    let config = Config::default();
     let depth = config.limits.max_depth;
     let registry = registry(Arc::default(), Arc::default());
     let rt = Runtime::new(

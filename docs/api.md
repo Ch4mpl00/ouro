@@ -114,7 +114,10 @@ together with the parent's subscriptions to the child's end, under the same
 ownership, cascade, budget, nesting depth and trip/pause rules as the
 reserved `start_child`; `version` pins a stored version. The workflow joins
 it with `listen` on `done`, or reads its outcome with the reserved
-`child_outcome` (`id` and `key`). Its id is `hostchild:` and 32 lowercase
+`child_outcome` (`id` and `key`). A parent wakes for a child's `done` or
+`waiting` notice only while one of its listens (or an addressed wait) names
+that type: a parent joined on `done` sleeps while the child merely waits, and
+a notice nothing listens for stays pending until a later listen takes it. Its id is `hostchild:` and 32 lowercase
 hex digits: the first 128 bits of the SHA-256 of the JSON array
 `[<run>, <call reference>, <key>]`, where the call reference is the raw,
 per-attempt one (`FunctionContext::task_path`). A re-dispatch of the call in

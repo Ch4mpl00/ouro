@@ -71,7 +71,7 @@ are the bridges in `crates/durable/tests/quint.rs` and `quint/concurrent.rs`.
 | H4 | `H4`: an ended run is never held (a cancel or any end clears the hold) | `heldCancelledTest`; mutant `H4`; conformance audit |
 | L1 | `contract_progress::L1`: ready work eventually completes under F | Finite drains; temporal quotient |
 | L2 | `L2`: abandoned ownership eventually claimed/completed under F | Temporal quotient |
-| L3 | `L3`: accepted event eventually consumed under F | Temporal quotient; event/recovery conformance |
+| L3 | `L3`: accepted event eventually consumed under F | Temporal quotient; event/recovery conformance. The model has no pending copies or wake condition: that a lifecycle notice no listen can take does not wake its parent (design 05) is pinned by conformance only (`waiting_parents`; mutant: wake on any awaited type) |
 | L4 | `L4`: due slot and deadline resolve under F | Temporal quotient |
 | L5 | `L5`: failed owner's waiter becomes reclaimable | Temporal quotient only |
 | L6 | `contract_progress_tree::L6`: a runnable run ends or waits, whatever its program picks | Temporal quotient; B1 evidence; generated interpreter budgets |

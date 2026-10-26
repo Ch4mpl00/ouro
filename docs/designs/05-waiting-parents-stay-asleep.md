@@ -1,6 +1,6 @@
 # 05. A parent waiting for a child's end stays asleep while the child waits
 
-Status: approved (goldfish round 1 resolved) · Found by: the v0.2.0 pre-tag fix work (child-ids report)
+Status: implemented (9c74ac4) · Found by: the v0.2.0 pre-tag fix work (child-ids report)
 
 ## Problem
 

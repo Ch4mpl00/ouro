@@ -791,6 +791,7 @@ pub async fn run_all(factory: impl AsyncFn(&str) -> anyhow::Result<TestStore>) -
     read_only(&factory, &mut report).await?;
     dropped(&factory, &mut report).await?;
     host_data(&factory, &mut report).await?;
+    waiting_parents(&factory, &mut report).await?;
     Ok(report)
 }
 
@@ -4230,5 +4231,152 @@ async fn queue_order_after_clear(
         assert_eq!(notices.iter().filter(|(_, n)| n["subject"] == name).count(), 1, "{name}: one trip, one notice");
     }
     audit(&**s).await?;
+    Ok(())
+}
+
+/// A parent waits for what it listens for: a child's lifecycle notice no
+/// listen of the parent can take leaves the parent asleep (design 05). The
+/// notice stays pending and is taken by a later listen; only the wake is
+/// gated. Mutant: wake on any awaited type (the old rule), caught by the
+/// `due` assertions of the first and the timer cases.
+async fn waiting_parents(
+    factory: &impl AsyncFn(&str) -> anyhow::Result<TestStore>,
+    report: &mut Report,
+) -> anyhow::Result<()> {
+    use control::{Command, Reply};
+    let link = |parent: &str, child: &str| ChildLink {
+        parent: parent.into(),
+        key: child.into(),
+        reference: format!("/{child}"),
+    };
+    let due = async |s: &dyn RunStore, now: i64| -> anyhow::Result<Vec<String>> { s.due(now, 100).await };
+    let types = |t: &[&str]| t.iter().map(|t| t.to_string()).collect::<Vec<_>>();
+
+    // A join on `done:c`: the child's waiting does not wake the parent, even
+    // once; its end does.
+    let t = factory("waiting-join").await?;
+    report.cases += 1;
+    let s = &t.store;
+    let p = s.start(&admission("p"), 0).await?.unwrap();
+    let c = s.start_child(&p, &admission("c"), &link("p", "c"), 0).await?.unwrap();
+    assert!(s.take_event(&p, "join", &types(&["done:c"]), 0).await?.is_none());
+    s.finish(&p, &Status::Waiting { wake_at_ms: i64::MAX }, 0, 3).await?;
+    s.finish(&c, &Status::Waiting { wake_at_ms: 0 }, 1, 3).await?;
+    assert_eq!(due(&**s, 1000).await?, vec!["c".to_string()], "the parent sleeps while the child waits");
+    assert!(s.inspect("p").await?.unwrap().events.iter().any(|e| e.type_ == "waiting:c"), "the notice stays pending");
+    let c = s.claim("c", 1000).await?.unwrap();
+    s.finish(&c, &Status::Completed(json!(1)), 1001, 3).await?;
+    assert_eq!(due(&**s, 1001).await?, vec!["p".to_string()], "the child's end wakes the join");
+    let p = s.claim("p", 1001).await?.unwrap();
+    assert!(s.take_event(&p, "join", &types(&["done:c"]), 1001).await?.is_some());
+    audit(&**s).await?;
+
+    // A parent that listens for `waiting:c` is woken by it.
+    let t = factory("waiting-listen").await?;
+    report.cases += 1;
+    let s = &t.store;
+    let p = s.start(&admission("p"), 0).await?.unwrap();
+    let c = s.start_child(&p, &admission("c"), &link("p", "c"), 0).await?.unwrap();
+    assert!(s.take_event(&p, "w", &types(&["waiting:c"]), 0).await?.is_none());
+    s.finish(&p, &Status::Waiting { wake_at_ms: i64::MAX }, 0, 3).await?;
+    assert!(due(&**s, 1000).await?.is_empty());
+    s.finish(&c, &Status::Waiting { wake_at_ms: i64::MAX }, 1, 3).await?;
+    assert_eq!(due(&**s, 1000).await?, vec!["p".to_string()]);
+    audit(&**s).await?;
+
+    // `any` over a child's notice and another type wakes; a listen over other
+    // types, or a wildcard (which cannot take a notice), does not.
+    for (case, listen, wakes) in [
+        ("any", types(&["waiting:c", "e"]), true),
+        ("other", types(&["done:c", "e"]), false),
+        ("wildcard", types(&["*"]), false),
+    ] {
+        let t = factory("waiting-any").await?;
+        report.cases += 1;
+        let s = &t.store;
+        let p = s.start(&admission("p"), 0).await?.unwrap();
+        let c = s.start_child(&p, &admission("c"), &link("p", "c"), 0).await?.unwrap();
+        assert!(s.take_event(&p, "any", &listen, 0).await?.is_none(), "{case}");
+        s.finish(&p, &Status::Waiting { wake_at_ms: i64::MAX }, 0, 3).await?;
+        s.finish(&c, &Status::Waiting { wake_at_ms: i64::MAX }, 1, 3).await?;
+        assert_eq!(due(&**s, 1000).await?.contains(&"p".to_string()), wakes, "{case}");
+    }
+
+    // `all` and fork branches: the union of the open listens decides.
+    let t = factory("waiting-union").await?;
+    report.cases += 1;
+    let s = &t.store;
+    let p = s.start(&admission("p"), 0).await?.unwrap();
+    let c = s.start_child(&p, &admission("c"), &link("p", "c"), 0).await?.unwrap();
+    let d = s.start_child(&p, &admission("d"), &link("p", "d"), 0).await?.unwrap();
+    assert!(s.take_event(&p, "branch#0", &types(&["done:c"]), 0).await?.is_none());
+    assert!(s.take_event(&p, "branch#1", &types(&["done:d", "e"]), 0).await?.is_none());
+    s.finish(&p, &Status::Waiting { wake_at_ms: i64::MAX }, 0, 3).await?;
+    s.finish(&c, &Status::Waiting { wake_at_ms: i64::MAX }, 1, 3).await?;
+    s.finish(&d, &Status::Waiting { wake_at_ms: i64::MAX }, 1, 3).await?;
+    assert!(due(&**s, 1000).await?.is_empty(), "no branch listens for a waiting notice");
+    let p = s.claim("p", i64::MAX).await?.unwrap();
+    assert!(s.take_event(&p, "branch#2", &types(&["waiting:d"]), 2000).await?.is_some(), "a later listen takes it");
+    s.finish(&p, &Status::Waiting { wake_at_ms: i64::MAX }, 2000, 3).await?;
+    assert!(!due(&**s, 3000).await?.contains(&"p".to_string()));
+    audit(&**s).await?;
+
+    // A notice that lands between a listen and the parent's suspension.
+    for (listen, wakes) in [("done:c", false), ("waiting:c", true)] {
+        let t = factory("waiting-window").await?;
+        report.cases += 1;
+        let s = &t.store;
+        let p = s.start(&admission("p"), 0).await?.unwrap();
+        let c = s.start_child(&p, &admission("c"), &link("p", "c"), 0).await?.unwrap();
+        assert!(s.take_event(&p, "window", &types(&[listen]), 0).await?.is_none());
+        s.finish(&c, &Status::Waiting { wake_at_ms: i64::MAX }, 1, 3).await?;
+        s.finish(&p, &Status::Waiting { wake_at_ms: i64::MAX }, 2, 3).await?;
+        assert_eq!(due(&**s, 1000).await?.contains(&"p".to_string()), wakes, "{listen}");
+    }
+
+    // A parent on an unrelated timer is not woken by its child's end, which
+    // it does not listen for, before the timer.
+    let t = factory("waiting-timer").await?;
+    report.cases += 1;
+    let s = &t.store;
+    let p = s.start(&admission("p"), 0).await?.unwrap();
+    let c = s.start_child(&p, &admission("c"), &link("p", "c"), 0).await?.unwrap();
+    s.finish(&p, &Status::Waiting { wake_at_ms: 5000 }, 0, 3).await?;
+    s.finish(&c, &Status::Completed(json!(1)), 1, 3).await?;
+    assert!(due(&**s, 1000).await?.is_empty());
+    assert_eq!(due(&**s, 5000).await?, vec!["p".to_string()]);
+    let p = s.claim("p", 5000).await?.unwrap();
+    assert!(s.take_event(&p, "late", &types(&["done:c"]), 5000).await?.is_some(), "nothing was lost");
+    audit(&**s).await?;
+
+    // A CloudEvent keeps its rule whatever its type looks like.
+    let t = factory("waiting-cloud").await?;
+    report.cases += 1;
+    let s = &t.store;
+    let p = s.start(&admission("p"), 0).await?.unwrap();
+    s.start_child(&p, &admission("c"), &link("p", "c"), 0).await?;
+    s.finish(&p, &Status::Waiting { wake_at_ms: i64::MAX }, 0, 3).await?;
+    assert!(due(&**s, 1000).await?.is_empty());
+    assert_eq!(s.deliver(&event("look-alike", "waiting:c", json!(1)), Some("p"), 1000).await?, Some("p".into()));
+    assert_eq!(due(&**s, 1000).await?, vec!["p".to_string()], "a delivered event of that type wakes the run");
+    audit(&**s).await?;
+
+    // A held run released with a notice nothing listens for stays asleep.
+    let t = factory("waiting-held").await?;
+    report.cases += 1;
+    let s = &t.store;
+    let p = s.start(&admission("p"), 0).await?.unwrap();
+    let c = s.start_child(&p, &admission("c"), &link("p", "c"), 0).await?.unwrap();
+    assert!(s.take_event(&p, "join", &types(&["done:c"]), 0).await?.is_none());
+    s.finish(&p, &Status::Waiting { wake_at_ms: i64::MAX }, 0, 3).await?;
+    s.finish(&c, &Status::Waiting { wake_at_ms: i64::MAX }, 1, 3).await?;
+    let hold = Command::Hold { run: "p".into(), note: "look".into() };
+    assert_eq!(s.control(&control_request("hold"), &hold, 2).await?, Reply::Changed(true));
+    let release = Command::Release { run: "p".into() };
+    assert_eq!(s.control(&control_request("release"), &release, 3).await?, Reply::Changed(true));
+    assert!(due(&**s, 1000).await?.is_empty());
+    audit(&**s).await?;
+    report.operations += 120;
+    report.witnesses.insert("a parent sleeps through a child's notice that none of its listens can take");
     Ok(())
 }
