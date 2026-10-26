@@ -1,6 +1,6 @@
 # 07. Handlers reach the store that drives them; a dry run reports its tree and takes an observer
 
-Status: revised after goldfish round 1 (R-n) and the ouro-agent design 05 review (A-n) · Issue: #39
+Status: approved after goldfish rounds 1 and 2 (R-n, R2-n) and the ouro-agent design 05 review (A-n) · Issue: #39
 
 ## Problem
 
@@ -44,9 +44,11 @@ host that asked for the dry run wants its steps: which task ran, which case a
    per-call handle in `FunctionContext`, built from the call's own lease store
    (R-M1). The host's captured handle keeps working in live runs; the context
    handle is right in every mode.
-2. **The handle is narrow (R-L1):** read the call's own run and its
-   descendants (the run, its records, its children by parent), and deliver
-   an event **targeted** at one of them (A-H1: a host's handlers read a
+2. **The handle is narrow (R-L1, R2-H1):** read the call's **lineage** — its
+   own run, its ancestors up the child links and its descendants (the run,
+   its records, its children by parent) — and deliver an event **targeted**
+   at the call's own run or a descendant (R2-H1: a loop reads the signal run
+   that started it, its ancestor; nobody needs to deliver upwards) (A-H1: a host's handlers read a
    child's records for consumed events and list a run's children). No
    untargeted delivery, no reads of unrelated runs (their host data stays
    private), no definitions. No start
@@ -97,14 +99,16 @@ host that asked for the dry run wants its steps: which task ran, which case a
 /// The store driving a call, as its handler may use it (`FunctionContext::run_access`).
 #[async_trait]
 pub trait RunAccess: Send + Sync {
-    /// The call's own run, or a run whose child links lead up to it; `None`
-    /// for any other id (unknown or unrelated alike).
+    /// A run of the call's lineage: its own run, an ancestor (up the child
+    /// links) or a descendant (whose child links lead up to it); full
+    /// `SavedRun`, host data included. `None` for any other id (unknown or
+    /// unrelated alike: siblings and other trees are out of scope).
     async fn get(&self, id: &str) -> anyhow::Result<Option<SavedRun>>;
     /// Its records (`Runtime::records`), same scope as `get`.
     async fn records(&self, id: &str) -> anyhow::Result<Option<BTreeMap<String, Record>>>;
     /// Its children by parent link (`Control::list` filtered by parent),
     /// bounded and paged; `parent` in the same scope as `get`.
-    async fn children(&self, parent: &str, cursor: Option<&str>, limit: usize)
+    async fn children(&self, parent: &str, cursor: Option<Cursor>, limit: usize)
         -> anyhow::Result<Page<SavedRun>>;
     /// Delivers `event` (an identified CloudEvent) to `target`'s mailbox:
     /// `target` must be the call's own run or a descendant. Lease-checked;
@@ -125,6 +129,29 @@ impl FunctionContext {
     pub async fn run(&self, id: &str) -> Result<Option<SavedRun>, RunAccessError>;
     /// `runs.deliver`, or `Unavailable` without the capability.
     pub async fn deliver(&self, event: Value, target: &str) -> Result<String, RunAccessError>;
+    /// `runs.records` and `runs.children`, the same way (R2-L).
+    pub async fn records(&self, id: &str) -> Result<Option<BTreeMap<String, Record>>, RunAccessError>;
+    pub async fn children(&self, parent: &str, cursor: Option<Cursor>, limit: usize)
+        -> Result<Page<SavedRun>, RunAccessError>;
+}
+
+/// Why run access answered nothing (R2-L).
+#[non_exhaustive]
+pub enum RunAccessError {
+    /// No capability here (process runner, mock response, replay).
+    Unavailable,
+    /// The target is outside the call's own run and its descendants (deliver)
+    /// or outside its lineage (`children` of an unrelated parent).
+    OutOfScope,
+    /// A reserved event type (`done:`, `waiting:`, `child:`).
+    ReservedEventType,
+    /// The target run has ended: the store took no delivery.
+    TargetEnded,
+    /// The call no longer holds its run (lease lost, cancelled, emergency
+    /// stop): no answer, like `ChildError::Interrupted`.
+    Interrupted(anyhow::Error),
+    /// Storage failed.
+    Storage(anyhow::Error),
 }
 ```
 
@@ -136,7 +163,10 @@ walks `child.parent` up (bounded by `Limits::max_depth`) until it meets the
 call's run, else answers `None`. `deliver` checks the target the same way,
 then `check_lease(fence, now)`, refuses reserved prefixes, then
 `schedule::complete(&mut event, clock.now_ms())` and `store.deliver(event,
-Some(target))`, as `Runtime::deliver` does. In a dry run, `lease.store` is the
+Some(target))`, as `Runtime::deliver` does; a `None` from the store (the
+target ended) is `TargetEnded`. `get`/`records` walk up from the asked id to
+the call's run (a descendant) or up from the call's run to the asked id (an
+ancestor), both bounded by `Limits::max_depth`. In a dry run, `lease.store` is the
 private store for every run it drives (root, host children, `run: workflow`
 children, `await: false` runs), so the handle is right in every mode.
 
@@ -265,6 +295,11 @@ reported (R-L3).
 - A delivery after the call lost its lease (cancel, emergency stop, takeover)
   is refused as an interruption (decision 3).
 - `DryRun::runs` on a stopped dry run lists live runs with `outcome: None`.
+- **Runs left when the root ends (R2-L):** owned descendants are cancelled
+  in the root's terminal commit and listed with `outcome:
+  Some(Cancelled)` (no `RunEnded` reaches the observer for them, as live);
+  `await: false` runs are not driven further and are listed with
+  `outcome: None`.
 
 ## Tests
 
@@ -300,8 +335,10 @@ Each fails before the change unless noted.
 11. `host.rs`: `Mock::response`, a process runner and replay get `runs: None`;
     `cx.run` answers `Unavailable` there (R-M8.3).
 12. `host.rs`: dry, a handler reads a child's records (a consumed event)
-    and lists its children by parent; an unrelated run's records and
-    children answer `None`/empty (A-H1).
+    and lists its children by parent; a child's handler reads its parent
+    and its grandparent (lineage, R2-H1); a sibling's and an unrelated run's
+    records answer `None`, their children `OutOfScope`; a delivery to an
+    ancestor is `OutOfScope`; to an ended child, `TargetEnded` (A-H1, R2-L).
 13. `runtime.rs`: dry, a parent joins a host child with `listen` holding
     `PT15M` and no timeout; the dry run completes in well under a second of
     wall time (fails before: it holds 15 minutes) (A-H2). Live, a
