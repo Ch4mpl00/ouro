@@ -1005,6 +1005,38 @@ async fn host_data(
         audit(&*reopened).await?;
         report.operations += 3;
     }
+    // Store admissions are trusted: the runtime selects inheritance. Audit
+    // the selected opaque value across commit boundaries and a fresh adapter.
+    for host in [json!({ "opaque": [null, { "tenant": "a", "rights": ["read"] }] }),
+        json!("x".repeat(MAX_HOST_BYTES - 2)), Value::Null] {
+        for point in [CommitFault::BeforeCommit, CommitFault::AfterCommit] {
+            let t = factory("inherited-child-crash").await?;
+            report.cases += 1;
+            let parent = hosted("p", host.clone());
+            let p = t.store.start(&parent, 0).await?.unwrap();
+            let inherited = hosted("child:inherited", host.clone());
+            let inherited_link = ChildLink { parent: "p".into(), key: "/inherited".into(), reference: "/inherited".into() };
+            let before = t.backend.snapshot().await?;
+            t.faults.arm(point);
+            assert!(t.store.start_child(&p, &inherited, &inherited_link, 0).await.is_err());
+            t.faults.clear();
+            let reopened = (t.reopen)().await?;
+            let proposal = if point == CommitFault::AfterCommit { admission("child:inherited") } else { inherited.clone() };
+            let joined = reopened.start_child(&p, &proposal, &inherited_link, 1).await?;
+            assert_eq!(joined.is_none(), point == CommitFault::AfterCommit);
+            assert_eq!(reopened.get("p").await?.unwrap().admission, parent);
+            assert_eq!(reopened.get("child:inherited").await?.unwrap().admission, inherited);
+            assert_eq!(reopened.get("child:inherited").await?.unwrap().child.as_ref(), Some(&inherited_link));
+            assert!(reopened.inspect("p").await?.unwrap().awaits.contains_key("done:child:inherited"));
+            if point == CommitFault::BeforeCommit {
+                assert_ne!(t.backend.snapshot().await?, before);
+            }
+            audit(&*reopened).await?;
+            report.crash_points += 1;
+            report.operations += 5;
+        }
+    }
+    report.witnesses.insert("inherited host data survives reopening and ambiguous child commits");
     report.witnesses.insert("host data: roots join an equal admission, a child's first commit wins");
     Ok(())
 }
