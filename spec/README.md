@@ -30,7 +30,7 @@ are the bridges in `crates/durable/tests/quint.rs` and `quint/concurrent.rs`.
 
 | Contract ID | Model predicate / checked scope | Adapter or interpreter evidence |
 | --- | --- | --- |
-| A1 | `contract::A1`: admission fields and occurrence counts | Serial MBT (admission projection, readmission witness); admission conformance; host data (design 03: a conflicting root admission is a typed mismatch, racing starts store one) in conformance `host_data` only, the model treats admission content as opaque |
+| A1 | `contract::A1`: admission fields, opaque host representative and occurrence counts | Serial MBT (admission projection, readmission and host-join witnesses); admission conformance; full JSON host-data equality and conflicting root starts in conformance `host_data` |
 | A2 | `A2`: abort atomicity and acknowledged evidence | Serial MBT under faults 1, 2, 8; concurrent replies; commit-fault conformance |
 | A3 | `A3`: outcome/end-time absorption | Serial MBT; terminal replay properties |
 | A4 | `A4`: representative result schema | Existing schema and corruption tests; arbitrary format evolution is not modeled |
@@ -48,7 +48,7 @@ are the bridges in `crates/durable/tests/quint.rs` and `quint/concurrent.rs`.
 | W3 | `W3`: addressed mailbox, explicit expiry with a record | Serial MBT (expiry record audited); `gaps::w3_mailbox_expiry_is_observable` |
 | W4 | `W4`: FIFO among pending matching copies | Serial MBT; delivery conformance; one type in the model |
 | W5 | `W5`: publication recipients and subscription survival | Concurrent publish/finish; existing multi-take DSL tests |
-| C1 | `C1`: acyclic owned link and one child admission | Serial MBT; native-child recovery tests; host data of children (design 03: none for a workflow-started child, exactly the host function's for a host child, a join keeps the first commit's, also around the child commit), the typed link conflict and per-attempt child ids (a re-dispatch joins, a DSL retry starts its own) in conformance `host_data`, `crates/runtime/tests/host.rs` and `dsl.rs`, not in the model (ids are opaque there) |
+| C1 | `C1`: acyclic owned link, one child admission, default-absent or unchanged inherited host representative | Serial MBT audits persisted host values and actual joins, including ambiguous commits; witnesses for inheritance/default/absence/joins. Full JSON equality, trusted host children, typed link conflict and per-attempt child ids are checked by conformance `host_data`, `crates/runtime/tests/host.rs` and `dsl.rs` (designs 03/08; ids remain opaque in the model) |
 | C2 | `C2`: terminal child has notification obligation | Serial MBT audits the parent's one notification; child conformance |
 | C3 | `C3`: any end of a run (completion, fault, cancellation) closes its owned subtree, transitively, in that transition | Serial MBT (`childTest`, `childFinishTest`, `grandchildTest`; the bridge audits that no owned child outlives its parent); conformance audit and commit faults; handler cancellation tests remain separate |
 | T1 | `T1`: slot disposition (a refused slot's run included), overlap and global ingress identity | Concurrent firings and ingress; serial MBT; `t1_*` runtime regressions |
@@ -411,6 +411,27 @@ a checkout without `.results` it republishes the committed sections and sets
 `test_temporal.py` pins the temporal stage's own rules: TLC's deadlock check
 stays on for every quotient but the run tree's (whose terminal states stutter)
 and a clean result needs exit code 0.
+
+Design 08 changes the host-data abstraction. Its current checks and three hand
+mutants are recorded in [design 08](../docs/designs/08-inheritable-host-data.md).
+The committed automatic-mutant, fault-matrix and temporal evidence retains its
+previous source hashes: those stages were not rerun for this change. Consequently
+`test_evidence.py` reports stale retained evidence; it must not be presented as
+verification of the new model. The simulation commands were run separately
+after the wrapper stopped at this freshness check. Deep symbolic/temporal
+verification remains deferred.
+
+With `TEST_DATABASE_URL` pointing to a disposable Postgres test server, run the
+host-admission witnesses directly:
+
+```sh
+cargo test -p ouro-durable --test quint quint_postgres_host_inheritance -- --ignored --exact
+```
+
+This also runs inside the existing serial suite. The dedicated entry point
+does not replace its random histories. Design 08 records intermittent
+contention in that optional Postgres random run and the retained exact prefix;
+the new host witnesses, concurrent bridge and full adapter conformance pass.
 
 ## Running
 

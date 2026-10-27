@@ -4,6 +4,25 @@ Ouro is a 0.x prerelease: breaking changes are allowed and are listed here. The
 durable state version and the store layouts they mention are refused, not converted, so a
 store written before such a change must be recreated unless the entry says otherwise.
 
+## Unreleased
+
+- Workflow children can opt in to unchanged host-data inheritance:
+  `metadata.ouro.host: inherit` on a native workflow-run task, or
+  `with.host: inherit` on reserved `start_child`. Default remains no host
+  data; YAML cannot supply host data. Narrowing stays host policy, requested
+  through untrusted child input and enforced across delegation by the host.
+- Inheritance follows the existing owned/independent lifetime rules, private
+  dry-run storage and first-admission-wins recovery. No migration or durable
+  state-version change.
+- Reserved `start_child` admission refusals are catchable; transient failures
+  and ownership loss remain interruptions (#42).
+- **Source compatibility:** public `ows::model::RunTask` and
+  `ows::run::ChildTarget` struct literals gain `inherit_host` (default `false`).
+- **Deployment:** drain old workers before introducing either opt-in.
+  Old reserved-start handlers silently ignore `host: inherit`. A configured
+  application-version fence is an alternative only when every old worker
+  declares compatibility and excludes the new version.
+
 ## 0.3.0 (2026-10-26)
 
 Stored versions unchanged (durable run state 15, `definitions` row layout 7,

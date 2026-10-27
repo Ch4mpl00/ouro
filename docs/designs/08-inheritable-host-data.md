@@ -1,6 +1,6 @@
 # 08. Inheritable host data for workflow children
 
-Status: approved after goldfish rounds 1 and 2 · Issue: #43
+Status: implemented (`c70593d`, `54b1f55`) after goldfish rounds 1 and 2 · Issue: #43
 
 ## Problem
 
@@ -61,6 +61,13 @@ The same paths run in a dry run's private store; `DryRunOptions.host` supplies
 the root and descendants opt in normally. Replay uses stored call results and
 child events without dispatching handlers or starting live children. Redaction,
 observer payloads and expression visibility remain as before.
+
+Execution finding: native replay currently attempts catalog resolution even
+though it already has the recorded child event. In `Mode::Replay`, the native
+child starter returns only the deterministic id/done reference without
+resolution or admission; `Events::take` restores the recorded event. Independent
+native starts likewise do no work during replay. The all-route replay test
+pins this bug before the shortcut is implemented.
 
 Admission refusals are catchable `NotExecuted`; storage failure, lease loss,
 holds and emergency stops interrupt. The reserved start path is directly on
@@ -161,5 +168,80 @@ None.
 Round 1 (Codex Sol, high): R1-H1 mixed-version rollout, R1-M2 executable join
 witness, R1-M3 typed refusal classification/coverage. Resolved above without
 adding a new deployment mechanism. Round 2: no remaining high or medium findings;
-ready for implementation. Test-first evidence,
-checks and hand-mutant results follow during execution.
+ready for implementation.
+
+Test-first evidence (tests commit `24cc893`):
+
+```text
+CARGO_HOME=/private/tmp/ouro-cargo cargo test -p ouro-runtime --test host
+24 passed; 9 failed (compiled successfully).
+Inherited native starts: unknown property /metadata/ouro/host.
+reserved_child_admission_refusals_are_catchable: missing target interrupted.
+reserved_host_modes_are_validation_refusals_without_admission: host:null admitted.
+Existing default-no-host regression and transient resolver interruption passed.
+
+quint test spec/contract_witnesses.qnt --match childInheritedHostTest \
+  --max-samples 1 --seed 20261023
+QNT508: inheritance and recursive-inheritance witnesses expected host 1, got 0
+(absence-only host field scaffolding, before inheritance/monitor implementation).
+```
+
+After inheritance was implemented, the replay regression also failed with
+`no workflow test/child version latest to run`, exposing the catalog lookup
+described above; the native replay shortcut fixes it.
+
+Verification:
+
+- Targeted Rust: 34 host integration tests and 11 runtime unit tests pass.
+  The unchanged `children_a_workflow_starts_get_no_host_data` pins the default;
+  explicit inheritance extends that rule rather than replacing its oracle.
+  Memory/SQLite conformance pass (460 cases each), including snapshots before
+  retry, reopened admissions and before/after-commit faults.
+- Reserved guard tests audit a failed child commit, expired lease, hold and
+  emergency stop as interruptions with no child. The direct join test submits
+  default-off after both normal and ambiguous inherited commits and preserves
+  the first input/version/host. The resolver regression retains interruption.
+- Quint: all seven modules typecheck, all 98 witnesses pass, concurrent table
+  and two temporal-helper unit tests pass. Both 10,000 × 150 simulations find
+  no violation (seeds 20261023 and 20261026, default and varied breaker policy).
+  Memory/SQLite bridges pass 100 random histories each plus old/new witnesses;
+  coverage requires successful conflicting joins after normal and ambiguous
+  commits, not merely attempted/no-op joins.
+- Final workspace formatting and Clippy (`--workspace --all-targets -- -D
+  warnings`) pass. `OURO_REQUIRE_QUINT=1 cargo test --workspace` passes, including
+  Postgres conformance/scalability and all 21 CTK scenarios (103 steps). The
+  restart example passes: worker killed/recovered, value 42, one write dispatch.
+  Ignored concurrent Postgres bridge and the dedicated
+  `quint_postgres_host_inheritance` bridge pass. The latter checks actual
+  conflicting joins after normal and ambiguous commits on Postgres.
+
+The optional full random Postgres bridge hit `storage contention exceeded
+transaction retry limit` on two attempts with seed 20261023. Diagnostics isolate
+one failure to `ingress` with activation fault 10 (r=1, w=1, i=0, value=3), trace
+12 step 66. Its exact 67-command prefix passes alone (9.91 s); it contains only
+host-absent roots and no valid child start, and this feature changes neither
+the store engine nor Postgres adapter. The prefix is retained in
+`spec/regressions/postgres-ingress-activation-prefix.json`. The cause of this
+intermittent contention remains unresolved; no assertion, retry limit or
+existing test was changed to conceal it. Full random Postgres verification is
+not claimed green. Command/phase/projection diagnostics are retained, and the
+new host-only Postgres entry point permits focused verification without
+changing the existing random test.
+
+Exactly three hand mutants, all restored (no mutation tool):
+
+1. Ignore inheritance in both Rust admission paths: killed by
+   `inherited_host_is_exact_for_owned_independent_and_reserved_children`
+   (absent instead of the parent's opaque value).
+2. Remove both Rust opt-in guards: killed by unchanged
+   `children_a_workflow_starts_get_no_host_data` (unexpected inherited host).
+3. Overwrite an admitted child's host with the next proposal in a temporary
+   model copy: killed by `childHostJoinTest` and a dedicated `expect(A1)`
+   control (QNT508). Restoring the original transition passes both controls.
+
+The simulation wrapper's retained-evidence test detects old source hashes in
+`contract-evidence.json` after the model changes. Keep that check and the old
+evidence unchanged: refreshing automatic-mutant/temporal evidence would run
+stages excluded by this task. Run the allowed simulation commands separately,
+record the stale-provenance failure, and do not claim old evidence verifies
+design 08. This is deferred verification, not an invariant relaxation.

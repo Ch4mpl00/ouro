@@ -2,6 +2,10 @@
 
 Status: implemented (67b906a, b29475b) · Issue: 34 · Review: goldfish round 1 (2026-10-25), resolved below · Requested by: ouro-agent migration (its design 01, finding H2)
 
+The workflow-child no-host rule below is extended by
+[design 08](08-inheritable-host-data.md): it remains the default, with an
+explicit opt-in to unchanged inheritance. The other admission guarantees stand.
+
 ## Problem
 
 A host often must give a run facts the workflow must not be able to forge:

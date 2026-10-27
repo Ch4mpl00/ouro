@@ -93,7 +93,7 @@ host data (`start` is `Start::default()`: the active version, no host data;
 JSON (`durable::MAX_HOST_BYTES`, else `HostDataTooLarge` and nothing is
 stored), and read by the run's functions through `FunctionContext::host()`.
 It is never part of `$input`, and `$runtime` does not show it: a workflow
-cannot read or set it (expose what a workflow may see through a function).
+cannot read or write it (expose what a workflow may see through a function).
 What it means is the host's: the engine never interprets it.
 
 Starting an existing ID returns the run if it was admitted with the same
@@ -105,10 +105,35 @@ transaction that reads the run, so of concurrent different starts one is
 stored and the others are refused. Scheduled and event-fired runs get no
 host data.
 
-Children a workflow starts itself (`run: workflow`, the reserved
-`start_child`) get **no** host data, whatever their parent has: the host
-vouches for a run, YAML cannot. A host function vouches for a child by
-starting it: `cx.start_child(ChildStart { key, name, version, input, host })`
+Children a workflow starts itself get **no** host data by default. A
+`run: workflow` task may opt in with `metadata.ouro.host: inherit`; the reserved
+`start_child` takes `host: inherit` in `with`. Either copies the parent's
+admitted host data unchanged, including absence. No other value is accepted:
+YAML can request a copy, never supply or modify host data. Inheritance uses
+the child's existing admission storage, survives recovery and joins, and
+applies equally in a dry run with `DryRunOptions.host`. The 16 KiB bound is
+already enforced on the parent's admission; copying does not enlarge it.
+
+The engine treats host data as opaque. Requested narrowing travels in the
+child's input; the host validates or intersects it with inherited authority
+before performing work. Input cannot grant rights. The host must preserve
+effective restrictions across further delegation, including when a descendant
+omits a narrowing request. If a narrower context must itself be host-vouched,
+use a host function to start that child with new host data.
+
+Inheritance changes no lifetime: awaited native children and reserved
+`start_child` children are owned and cannot outlive the parent. `await: false`
+may inherit, but remains an independent root with its own budget and lifetime.
+
+Before deploying workflows using either opt-in, drain all older workers.
+Older engines reject the metadata extension but silently ignore the reserved
+call's `host` argument, permanently admitting a child without host data. An
+alternative is a new `Config.application` version excluded by every old
+worker's compatibility declaration; undeclared workers accept all versions
+and cannot provide this fence.
+
+A host function vouches for a child by starting it:
+`cx.start_child(ChildStart { key, name, version, input, host })`
 starts an owned child of the run the call serves and returns a `ChildRef`
 (`id`, `key`, `done`, `waiting`). It is committed through the run's lease,
 together with the parent's subscriptions to the child's end, under the same
@@ -343,6 +368,12 @@ attempt joins it and a DSL `retry` attempt starts its own. An id held by a run
 that is not the parent's child under that key is refused with the typed
 `durable::AdmissionMismatch` (`AdmissionField::Link`), never retried as an
 interruption.
+
+The reserved start's admission refusals (invalid host mode, depth,
+missing/inadmissible definition, pause/trip or mismatch) are catchable
+`not_executed`/validation answers; storage, transient resolution failures,
+lease loss, holds and the emergency stop remain interruptions.
+
 An owned child never outlives its parent: when the parent ends (completes,
 faults or is cancelled), its live owned descendants are cancelled in the same
 commit, so a parent that finishes without joining stops its child.

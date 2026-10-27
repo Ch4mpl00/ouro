@@ -20,9 +20,51 @@ does not validate on an older engine).
 | a call task's `metadata.ouro` | `delivery`: `at_least_once` or `at_most_once` (tighten only) |
 | a `for` task's `metadata.ouro` | `concurrency`: a positive integer, not with `while` |
 | a `listen` task's `metadata.ouro` | `hold`: a literal ISO 8601 duration (the host may cap it, `Limits::max_hold`) |
+| a `run: workflow` task's `metadata.ouro` | `host`: literal `inherit` (absent: no host data) |
 
 A known key on another kind of task is a validation error at its
 `…/metadata/ouro/<key>` pointer.
+
+## Passing host data to a workflow child
+
+An explicit opt-in copies the parent's admitted host data unchanged:
+
+```yaml
+do:
+  - joined:
+      metadata: { ouro: { host: inherit } }
+      run:
+        workflow:
+          namespace: example
+          name: child
+          version: latest
+          input: { mode: restricted }
+  - started:
+      call: start_child
+      with:
+        name: child
+        host: inherit
+        input: { mode: restricted }
+      export: { as: '${ . }' }
+  - join:
+      listen: { to: { one: { with: { type: '${ $context.done }' } } } }
+```
+
+Without the opt-in, the child has no host data even if the parent has it.
+Inheritance from a parent without host data preserves absence. Other host
+values, including objects and null, are rejected; the metadata is literal,
+while the reserved call validates its rendered `with.host` at execution time.
+There is no host-data expression binding. Every generation opts in separately.
+
+The input may request narrower behaviour, but the host enforces it against the
+inherited authority and preserves effective restrictions across descendants.
+The engine never interprets the data or considers input trusted. See
+[Host data](api.md#host-data) for this boundary and the deployment requirement
+to drain old workers before introducing the opt-in.
+
+The joined and reserved-start children above are owned: ending their parent
+cancels them. Adding `await: false` to the native `run` may also inherit, but
+starts an independent root that can outlive the starter, as without inheritance.
 
 ## The breaker policy (an ouro extension)
 

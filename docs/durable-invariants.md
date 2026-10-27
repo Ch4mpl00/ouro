@@ -454,9 +454,13 @@ re-dispatch of the same attempt joins it and a DSL retry attempt, a new
 invocation, starts its own; an id held by a run that is not the parent's child
 under that link is refused with a typed `AdmissionMismatch`. Owned links are acyclic, and owned outcome
 queries must match the actual parent/key/child relation. Host data (part of
-`A(r)`, design 03): a child the workflow starts (`run: workflow`, the reserved
-`start_child`) is admitted without host data, whatever its parent's; a child a
-host function starts keeps exactly the host data that function gave in the
+`A(r)`, designs 03 and 08): a child the workflow starts (`run: workflow`, the
+reserved `start_child`) is admitted without host data by default. An explicit
+inheritance request copies the parent's admitted host data byte-equal,
+including absence; the workflow can neither supply nor modify it. An
+independent native start may inherit too, retaining its independent-root
+lifetime (C3 does not apply). A child a host function starts keeps exactly
+the host data that function gave in the
 commit that admitted it. A join of an existing child compares only its
 definition (first commit wins: a re-dispatch with other input, version or host
 data joins the stored child unchanged); a root's join compares definition,
@@ -1366,6 +1370,10 @@ root's id is refused with a typed `AdmissionMismatch` (another definition,
 another version a pinned start names, other host data), decided in the
 transaction that reads the stored run (D12: an explicit conflict). A child's
 join is first commit wins: only another definition is a conflict, and the stored
-admission is kept (C1). Children a workflow starts carry no host data. These
-are checked by the conformance suite on every adapter (`host_data`) and the
-runtime tests, not by the model, which treats admission content as opaque.
+admission is kept (C1). Design 08 (#43) extends the original no-host rule:
+children a workflow starts carry no host data unless explicitly inherited,
+then exactly the parent's admitted value. The conformance suite on every
+adapter (`host_data`) and runtime tests check the actual stored JSON, default,
+inheritance, joins and crash boundaries. Quint abstracts host data as opaque
+representatives, checks inheritance selection under C1 and immutability under
+A1, and the Rust bridge audits those values in persisted admissions.
