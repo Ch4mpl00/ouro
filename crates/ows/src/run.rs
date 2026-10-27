@@ -365,6 +365,8 @@ pub trait Children: Send + Sync {
 
 /// `run.workflow`'s reference: the version is a semantic version or `latest`.
 pub struct ChildTarget<'a> {
+    /// Copy the parent's admitted host data; false keeps the no-host default.
+    pub inherit_host: bool,
     pub namespace: &'a str,
     pub name: &'a str,
     pub version: &'a str,
@@ -2750,7 +2752,7 @@ impl Run<'_> {
             Some(t) => expr::render(t, input, args).map_err(expression)?,
             None => Value::Object(Map::new()),
         };
-        let target = ChildTarget { namespace, name, version };
+        let target = ChildTarget { namespace, name, version, inherit_host: run.inherit_host };
         let children = self
             .host
             .functions

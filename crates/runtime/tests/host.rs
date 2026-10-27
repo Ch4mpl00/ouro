@@ -1366,7 +1366,6 @@ async fn run_access_covers_the_lineage_and_nothing_else() {
     assert_eq!(checks, expected);
 }
 
-
 // ── design 08: explicitly inherited, opaque host data ─────────────────────
 const INHERITED_PARENT: &str = "do:
   - native: { metadata: { ouro: { host: inherit } }, run: { workflow: { namespace: test, name: child, version: latest, input: { forged: true } } } }
@@ -1376,8 +1375,11 @@ const INHERITED_PARENT: &str = "do:
 
 #[tokio::test]
 async fn inherited_host_is_exact_for_owned_independent_and_reserved_children() {
-    for host in [json!({ "opaque": [null, true, { "tenant": "t", "rights": ["read"] }], "n": 7 }),
-        json!("x".repeat(durable::MAX_HOST_BYTES - 2)), Value::Null] {
+    for host in [
+        json!({ "opaque": [null, true, { "tenant": "t", "rights": ["read"] }], "n": 7 }),
+        json!("x".repeat(durable::MAX_HOST_BYTES - 2)),
+        Value::Null,
+    ] {
         let time = Arc::new(Time::default());
         let seen = Seen::default();
         let mut registry = Registry::new();
@@ -1385,7 +1387,14 @@ async fn inherited_host_is_exact_for_owned_independent_and_reserved_children() {
         let rt = runtime(Arc::new(durable::memory::memory()), registry, Config::default(), time.clone());
         save(&rt, "child", &doc("child", CHILD)).await;
         save(&rt, "parent", &doc("parent", INHERITED_PARENT)).await;
-        rt.start_with("p", "parent", json!({ "host": { "forged": true } }), Start { version: None, host: host.clone() }).await.unwrap();
+        rt.start_with(
+            "p",
+            "parent",
+            json!({ "host": { "forged": true } }),
+            Start { version: None, host: host.clone() },
+        )
+        .await
+        .unwrap();
         assert!(matches!(settle(&rt, &time, "p").await, Some(Status::Completed(_))));
         while rt.recover_once(&CancellationToken::new()).await.unwrap() > 0 {}
         let children = rt.list(Some("child"), "").await.unwrap();
@@ -1429,7 +1438,9 @@ async fn inherited_host_requires_opt_in_at_every_generation() {
 #[test]
 fn inherited_host_metadata_is_literal_and_only_for_workflow_run_tasks() {
     let wf = "run: { workflow: { namespace: test, name: child, version: latest } }";
-    let yaml = |task: &str, mode: &str| doc("p", &format!("do: [ {{ a: {{ metadata: {{ ouro: {{ host: {mode} }} }}, {task} }} }} ]"));
+    let yaml = |task: &str, mode: &str| {
+        doc("p", &format!("do: [ {{ a: {{ metadata: {{ ouro: {{ host: {mode} }} }}, {task} }} }} ]"))
+    };
     assert!(ouro_runtime::ows::model::parse_yaml(&yaml(wf, "inherit")).is_ok());
     for mode in ["null", "{}", "[]", "true", "42", "copy", "'${ {tenant: \"forged\"} }'", "'${ \"inherit\" }'"] {
         let error = ouro_runtime::ows::model::parse_yaml(&yaml(wf, mode)).unwrap_err().to_string();
@@ -1441,13 +1452,18 @@ fn inherited_host_metadata_is_literal_and_only_for_workflow_run_tasks() {
 }
 
 fn reserved_catch(arguments: &str, error: &str) -> String {
-    doc("parent", &format!("do:
+    doc(
+        "parent",
+        &format!(
+            "do:
   - attempt:
       try:
         - spawn: {{ call: start_child, with: {{ {arguments} }} }}
       catch:
         errors: {{ with: {{ type: '{error}' }} }}
-        do: [ {{ refused: {{ set: {{ refused: true }} }} }} ]"))
+        do: [ {{ refused: {{ set: {{ refused: true }} }} }} ]"
+        ),
+    )
 }
 
 #[tokio::test]
@@ -1455,12 +1471,28 @@ async fn reserved_host_modes_are_validation_refusals_without_admission() {
     let time = Arc::new(Time::default());
     let rt = runtime(Arc::new(durable::memory::memory()), Registry::new(), Config::default(), time.clone());
     save(&rt, "child", &doc("child", "do: [ { done: { set: { ok: true } } } ]")).await;
-    for (i, mode) in ["null", "{}", "[]", "true", "42", "copy", "'${ {tenant: \"forged\"} }'", "'${ .host }'"].iter().enumerate() {
-        let parent = reserved_catch(&format!("name: child, host: {mode}"), "https://open-workflow-specification.org/spec/1.0.0/errors/validation");
+    for (i, mode) in
+        ["null", "{}", "[]", "true", "42", "copy", "'${ {tenant: \"forged\"} }'", "'${ .host }'"].iter().enumerate()
+    {
+        let parent = reserved_catch(
+            &format!("name: child, host: {mode}"),
+            "https://open-workflow-specification.org/spec/1.0.0/errors/validation",
+        );
         save(&rt, "parent", &parent).await;
         let id = format!("p{i}");
-        rt.start_with(&id, "parent", json!({ "host": { "forged": true } }), Start { host: json!({ "tenant": "real" }), ..Start::default() }).await.unwrap();
-        assert_eq!(rt.drive(&id, &CancellationToken::new()).await.unwrap(), Some(Status::Completed(json!({ "refused": true }))), "{mode}");
+        rt.start_with(
+            &id,
+            "parent",
+            json!({ "host": { "forged": true } }),
+            Start { host: json!({ "tenant": "real" }), ..Start::default() },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            rt.drive(&id, &CancellationToken::new()).await.unwrap(),
+            Some(Status::Completed(json!({ "refused": true }))),
+            "{mode}"
+        );
         assert!(rt.list(Some("child"), "").await.unwrap().is_empty());
     }
 }
@@ -1471,35 +1503,79 @@ async fn reserved_child_admission_refusals_are_catchable() {
         let time = Arc::new(Time::default());
         let store: Arc<dyn RunStore> = Arc::new(durable::memory::memory());
         let mut config = Config { breaker_threshold: 1, ..Config::default() };
-        if case == "depth" { config.limits.max_depth = 0; }
+        if case == "depth" {
+            config.limits.max_depth = 0;
+        }
         let mut registry = Registry::new();
-        registry.register(Function::new("boom", json!({}), json!({}), |_: Value, _: FunctionContext| async {
-            Err::<Value, _>(FunctionError::communication(500, "boom"))
-        })).unwrap();
+        registry
+            .register(Function::new("boom", json!({}), json!({}), |_: Value, _: FunctionContext| async {
+                Err::<Value, _>(FunctionError::communication(500, "boom"))
+            }))
+            .unwrap();
         let rt = runtime(store.clone(), registry, config, time.clone());
         if case != "missing" {
-            save(&rt, "child", &doc("child", if case == "tripped" { "do: [ { fail: { call: boom } } ]" } else { "do: [ { wait: { wait: P1D } } ]" })).await;
+            save(
+                &rt,
+                "child",
+                &doc(
+                    "child",
+                    if case == "tripped" {
+                        "do: [ { fail: { call: boom } } ]"
+                    } else {
+                        "do: [ { wait: { wait: P1D } } ]"
+                    },
+                ),
+            )
+            .await;
         }
         if case == "inadmissible" {
-            let version = store.save_definition("child", &doc("child", "do: [ { absent: { call: absent } } ]"), durable::Breaker::default()).await.unwrap().version;
+            let version = store
+                .save_definition(
+                    "child",
+                    &doc("child", "do: [ { absent: { call: absent } } ]"),
+                    durable::Breaker::default(),
+                )
+                .await
+                .unwrap()
+                .version;
             store.activate("child", version, 0).await.unwrap();
         }
-        if case == "paused" { Control::new(store.clone(), time.clone()).pause(&operator("pause"), "child", "maintenance").await.unwrap(); }
+        if case == "paused" {
+            Control::new(store.clone(), time.clone()).pause(&operator("pause"), "child", "maintenance").await.unwrap();
+        }
         if case == "tripped" {
             rt.start("trip", "child", json!({})).await.unwrap();
             assert!(matches!(rt.drive("trip", &CancellationToken::new()).await.unwrap(), Some(Status::Faulted(_))));
         }
-        let error = if case == "paused" || case == "tripped" { "urn:ouro:errors:definition.tripped" } else { "urn:ouro:errors:call.not_executed" };
+        let error = if case == "paused" || case == "tripped" {
+            "urn:ouro:errors:definition.tripped"
+        } else if case == "depth" {
+            "https://open-workflow-specification.org/spec/1.0.0/errors/budget.exhausted"
+        } else {
+            "urn:ouro:errors:call.not_executed"
+        };
         save(&rt, "parent", &reserved_catch("name: child, host: inherit", error)).await;
-        rt.start_with("p", "parent", json!({}), Start { host: json!({ "tenant": "real" }), ..Start::default() }).await.unwrap();
+        rt.start_with("p", "parent", json!({}), Start { host: json!({ "tenant": "real" }), ..Start::default() })
+            .await
+            .unwrap();
         if case == "name" || case == "link" {
             let mut a = rt.get("p").await.unwrap().unwrap().admission;
             a.id = workflow_child_id("p", "/do/0/attempt/try/0/spawn");
-            if case == "link" { a.name = "child".into(); }
+            if case == "link" {
+                a.name = "child".into();
+            }
             store.admit(&a, 0).await.unwrap();
         }
-        assert_eq!(rt.drive("p", &CancellationToken::new()).await.unwrap(), Some(Status::Completed(json!({ "refused": true }))), "{case}");
-        assert_eq!(rt.list(None, "child:").await.unwrap().len(), usize::from(case == "name" || case == "link"), "{case}: no new child");
+        assert_eq!(
+            rt.drive("p", &CancellationToken::new()).await.unwrap(),
+            Some(Status::Completed(json!({ "refused": true }))),
+            "{case}"
+        );
+        assert_eq!(
+            rt.list(None, "child:").await.unwrap().len(),
+            usize::from(case == "name" || case == "link"),
+            "{case}: no new child"
+        );
     }
 }
 
@@ -1514,8 +1590,18 @@ async fn inherited_host_dry_runs_and_replays_use_private_admissions() {
     save(&rt, "child", &doc("child", CHILD)).await;
     let parent = doc("parent", INHERITED_PARENT);
     let host = json!({ "opaque": ["private", 2] });
-    let mock = ouro_runtime::mock(|_: &str, _: &Value| false, |_: &str, _: &Value, _: &FunctionContext| Ok(Value::Null));
-    let dry = rt.dry_run_opts(&parent, json!({}), mock, DryRunOptions { host: Some(host.clone()), ..DryRunOptions::default() }, &CancellationToken::new()).await.unwrap();
+    let mock =
+        ouro_runtime::mock(|_: &str, _: &Value| false, |_: &str, _: &Value, _: &FunctionContext| Ok(Value::Null));
+    let dry = rt
+        .dry_run_opts(
+            &parent,
+            json!({}),
+            mock,
+            DryRunOptions { host: Some(host.clone()), ..DryRunOptions::default() },
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
     assert!(matches!(dry.status, Status::Completed(_)), "{:?}", dry.status);
     assert!(seen.lock().unwrap().iter().all(|(_, h)| h.as_ref() == Some(&host)));
     assert!(!seen.lock().unwrap().is_empty());
@@ -1538,11 +1624,16 @@ async fn inherited_owned_children_survive_restart_with_their_version_and_cancel_
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("runs.sqlite");
         let time = Arc::new(Time::default());
-        let open = || runtime(Arc::new(durable::sqlite::open(&path).unwrap()), Registry::new(), Config::default(), time.clone());
+        let open = || {
+            runtime(Arc::new(durable::sqlite::open(&path).unwrap()), Registry::new(), Config::default(), time.clone())
+        };
         let rt = open();
         let version = save(&rt, "child", &doc("child", "do: [ { pause: { wait: P1D } } ]")).await;
-        let body = if reserved { "do:\n  - spawn: { call: start_child, with: { name: child, host: inherit }, export: { as: '${ . }' } }\n  - join: { listen: { to: { one: { with: { type: '${ $context.done }' } } } } }" }
-            else { "do:\n  - spawn: { metadata: { ouro: { host: inherit } }, run: { workflow: { namespace: test, name: child, version: latest } } }" };
+        let body = if reserved {
+            "do:\n  - spawn: { call: start_child, with: { name: child, host: inherit }, export: { as: '${ . }' } }\n  - join: { listen: { to: { one: { with: { type: '${ $context.done }' } } } } }"
+        } else {
+            "do:\n  - spawn: { metadata: { ouro: { host: inherit } }, run: { workflow: { namespace: test, name: child, version: latest } } }"
+        };
         save(&rt, "parent", &doc("parent", body)).await;
         let host = json!({ "tenant": "kept" });
         rt.start_with("p", "parent", json!({}), Start { host: host.clone(), ..Start::default() }).await.unwrap();
@@ -1565,7 +1656,17 @@ async fn inherited_owned_children_survive_restart_with_their_version_and_cancel_
 async fn inherited_workflows_wait_for_the_configured_application_version() {
     let store: Arc<dyn RunStore> = Arc::new(durable::memory::memory());
     let time = Arc::new(Time::default());
-    let at = |version: &str| runtime(store.clone(), Registry::new(), Config { application: durable::Compatibility { version: Some(version.into()), accepts: vec![] }, ..Config::default() }, time.clone());
+    let at = |version: &str| {
+        runtime(
+            store.clone(),
+            Registry::new(),
+            Config {
+                application: durable::Compatibility { version: Some(version.into()), accepts: vec![] },
+                ..Config::default()
+            },
+            time.clone(),
+        )
+    };
     let new = at("inherit-v2");
     save(&new, "child", &doc("child", "do: [ { done: { set: { ok: true } } } ]")).await;
     save(&new, "parent", &doc("parent", INHERITED_PARENT)).await;
@@ -1593,14 +1694,21 @@ async fn reserved_child_transient_resolution_interrupts_without_admission() {
     let failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let mut registry = Registry::new();
     let f = failed.clone();
-    registry.register(Function::new("offline", json!({}), json!({}), move |_: Value, _: FunctionContext| {
-        f.store(true, Ordering::SeqCst);
-        async { Ok(json!({})) }
-    })).unwrap();
+    registry
+        .register(Function::new("offline", json!({}), json!({}), move |_: Value, _: FunctionContext| {
+            f.store(true, Ordering::SeqCst);
+            async { Ok(json!({})) }
+        }))
+        .unwrap();
     let time = Arc::new(Time::default());
-    let rt = runtime(Arc::new(durable::memory::memory()), registry, Config::default(), time.clone()).with_resources(Arc::new(Resolver(failed)));
+    let rt = runtime(Arc::new(durable::memory::memory()), registry, Config::default(), time.clone())
+        .with_resources(Arc::new(Resolver(failed)));
     save(&rt, "child", &doc("child", "input: { schema: { format: json, resource: { endpoint: 'https://schema.test/input' } } }\ndo: [ { done: { set: { ok: true } } } ]")).await;
-    let parent = reserved_catch("name: child, host: inherit", "https://open-workflow-specification.org/spec/1.0.0/errors/validation").replace("do:\n  - attempt:", "do:\n  - offline: { call: offline }\n  - attempt:");
+    let parent = reserved_catch(
+        "name: child, host: inherit",
+        "https://open-workflow-specification.org/spec/1.0.0/errors/validation",
+    )
+    .replace("do:\n  - attempt:", "do:\n  - offline: { call: offline }\n  - attempt:");
     save(&rt, "parent", &parent).await;
     rt.start("p", "parent", json!({})).await.unwrap();
     let status = rt.drive("p", &CancellationToken::new()).await.unwrap();
@@ -1623,4 +1731,33 @@ async fn inherited_independent_child_outlives_its_starter() {
     assert!(child.child.is_none());
     assert!(child.root.is_none());
     assert!(child.outcome.is_none());
+}
+
+#[tokio::test]
+async fn recursive_workflow_opt_ins_preserve_the_admitted_host() {
+    let time = Arc::new(Time::default());
+    let seen = Seen::default();
+    let mut registry = Registry::new();
+    registry.register(whoami(seen.clone())).unwrap();
+    let mut config = Config::default();
+    config.limits.max_depth = 2;
+    let rt = runtime(Arc::new(durable::memory::memory()), registry, config, time.clone());
+    let body = "do:
+  - who: { call: whoami, output: { as: '${ $input }' } }
+  - recurse:
+      if: '${ .depth < 2 }'
+      metadata: { ouro: { host: inherit } }
+      run: { workflow: { namespace: test, name: recursive, version: latest, input: { depth: '${ .depth + 1 }' } } }";
+    save(&rt, "recursive", &doc("recursive", body)).await;
+    let host = json!({ "opaque": ["recursive", { "rights": ["read"] }] });
+    rt.start_with("p", "recursive", json!({ "depth": 0 }), Start { host: host.clone(), ..Start::default() })
+        .await
+        .unwrap();
+    let status = settle(&rt, &time, "p").await;
+    assert!(matches!(status, Some(Status::Completed(_))), "{status:?}");
+    let runs = rt.list(Some("recursive"), "").await.unwrap();
+    assert_eq!(runs.len(), 3);
+    assert!(runs.iter().all(|r| r.admission.host() == Some(&host)));
+    assert_eq!(seen.lock().unwrap().len(), 3);
+    assert!(seen.lock().unwrap().iter().all(|(_, h)| h.as_ref() == Some(&host)));
 }

@@ -1383,7 +1383,9 @@ impl Admitter {
                 return Err(MissingFunction { function: function.clone(), path: path.clone() }.into());
             }
             for (namespace, child, version) in &needs.children {
-                if let Some(d) = self.target(&ChildTarget { namespace, name: child, version }).await? {
+                if let Some(d) =
+                    self.target(&ChildTarget { namespace, name: child, version, inherit_host: false }).await?
+                {
                     self.check_tree((&d.name, d.version, &d.yaml), path, seen).await?;
                 }
             }
@@ -1642,7 +1644,13 @@ impl ExecutionFunctions {
             let key = args["key"].as_str().ok_or_else(|| anyhow::anyhow!("child_outcome requires key"))?;
             return Ok(serde_json::to_value(store.child_outcome(info.run_id, key, id).await?)?);
         }
-        let name = args["name"].as_str().ok_or_else(|| anyhow::anyhow!("start_child requires name"))?;
+        let invalid = |detail: &str| anyhow::Error::new(Refused(WorkflowError::validation(detail)));
+        let name = args["name"].as_str().ok_or_else(|| invalid("start_child requires name"))?;
+        let inherit_host = match args.get("host") {
+            None => false,
+            Some(Value::String(mode)) if mode == "inherit" => true,
+            Some(_) => return Err(invalid("start_child host must be inherit")),
+        };
         // The raw reference: a DSL retry attempt starts its own child, a
         // re-dispatch of this attempt joins the one it started.
         let id = crate::registry::child_id(info.run_id, info.reference);
@@ -1652,23 +1660,40 @@ impl ExecutionFunctions {
             saved.admission
         } else {
             let lineage = self.lineage.child(&self.admitter.limits).map_err(Refused)?;
-            self.admitter.active_in(&id, name, args.get("input").cloned().unwrap_or(Value::Null), &lineage).await?
+            let mut a = self
+                .admitter
+                .active_in(&id, name, args.get("input").cloned().unwrap_or(Value::Null), &lineage)
+                .await
+                .map_err(reserved_child_error)?;
+            if inherit_host && let Some(host) = &self.host {
+                a.runtime[ouro_durable::HOST] = host.as_ref().clone();
+            }
+            a
         };
         let now = self.lease.clock.now_ms();
         let link = ChildLink { parent: info.run_id.into(), key: info.logical.into(), reference: info.reference.into() };
         let started = store.start_child(&self.lease.fence, &a, &link, now).await;
-        if let Some(fence) = started.map_err(|e| match e.downcast::<AdmissionMismatch>() {
-            Ok(m) => mismatch(m),
-            Err(e) => e,
-        })? {
+        if let Some(fence) = started.map_err(reserved_child_error)? {
             self.events.observers().admitted(&a, Some(info.run_id), self.events.root(), now);
             store.release(&fence, now).await?;
         }
         Ok(json!({"id":id,"key":info.logical,"done":format!("done:{id}"),"waiting":format!("waiting:{id}")}))
     }
 }
-/// A child the host refused to start (its nesting depth): an answer the
-/// workflow can catch, not a stop.
+/// Reserved starts share host-child admission classification, retaining
+/// the typed breaker error and leaving ownership/storage errors interrupting.
+fn reserved_child_error(error: anyhow::Error) -> anyhow::Error {
+    match child_error(error) {
+        ChildError::Refused(ChildRefusal::Tripped(trip)) => Refused(trip.error()).into(),
+        ChildError::Refused(reason) => {
+            Refused(WorkflowError::not_executed(ChildError::Refused(reason).to_string())).into()
+        }
+        ChildError::Interrupted(error) => error,
+    }
+}
+
+/// A validation or admission refusal: an answer the workflow can catch,
+/// never an infrastructure interruption.
 #[derive(Debug)]
 struct Refused(WorkflowError);
 impl std::fmt::Display for Refused {
@@ -1946,6 +1971,11 @@ impl run::Children for ExecutionFunctions {
         // `key` is the task's raw reference: a DSL retry starts a new child.
         let id = crate::registry::child_id(run_id, key);
         let done = format!("done:{id}");
+        if matches!(self.mode, Mode::Replay { .. }) {
+            // The caller consumes its recorded child event through `take`.
+            // Replay never resolves definitions or admits another child.
+            return Ok(Child { id, done });
+        }
         // A started child keeps the version it was admitted with.
         let a = match store.get(&id).await.map_err(interrupted)? {
             Some(saved) => saved.admission,
@@ -1963,14 +1993,21 @@ impl run::Children for ExecutionFunctions {
                         format!("no workflow {}/{} version {} to run", target.namespace, target.name, target.version),
                     ))
                 })?;
-                self.admitter.of(&id, &d, input.clone(), &lineage).await.map_err(|e| {
+                let mut a = self.admitter.of(&id, &d, input.clone(), &lineage).await.map_err(|e| {
                     CallFailure::NotExecuted(WorkflowError::standard(
                         "configuration",
                         400,
                         "Configuration Error",
                         e.to_string(),
                     ))
-                })?
+                })?;
+                // Only the parent's persisted admission can supply authority.
+                if target.inherit_host
+                    && let Some(host) = &self.host
+                {
+                    a.runtime[ouro_durable::HOST] = host.as_ref().clone();
+                }
+                a
             }
         };
         let now = self.lease.clock.now_ms();
@@ -2089,5 +2126,136 @@ impl Functions for ExecutionFunctions {
             | CallFailure::Unknown(e)
             | CallFailure::Interrupted(e) => e,
         })
+    }
+}
+
+#[cfg(test)]
+mod inheritance_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicI64, Ordering};
+
+    #[derive(Default)]
+    struct Time(AtomicI64);
+    impl Clock for Time {
+        fn now_ms(&self) -> i64 {
+            self.0.load(Ordering::SeqCst)
+        }
+    }
+    fn doc(name: &str, value: u32) -> String {
+        format!(
+            "document: {{ dsl: '1.0.4', namespace: test, name: {name}, version: '1.0.0' }}\ndo: [ {{ done: {{ set: {{ value: {value} }} }} }} ]"
+        )
+    }
+    async fn fixture() -> (Runtime, ExecutionFunctions, Arc<ouro_durable::memory::MemoryBackend>, Arc<Time>) {
+        let backend = Arc::new(ouro_durable::memory::MemoryBackend::default());
+        let store = Arc::new(ouro_durable::TransactionalStore::new(backend.clone()));
+        let clock = Arc::new(Time::default());
+        let tracer = BoxedTracer::new(Box::new(opentelemetry::trace::noop::NoopTracer::new()));
+        let rt =
+            Runtime::new(store.clone(), Arc::new(Registry::new()), Config::default(), clock.clone(), tracer).unwrap();
+        for name in ["parent", "child"] {
+            let d = rt.save(name, &doc(name, 1)).await.unwrap();
+            rt.activate(name, d.version).await.unwrap();
+        }
+        let run = rt
+            .start_with(
+                "p",
+                "parent",
+                json!({}),
+                Start { host: json!({ "tenant": ["opaque", 7] }), ..Start::default() },
+            )
+            .await
+            .unwrap();
+        let fence = store.claim("p", 0).await.unwrap().unwrap();
+        let functions = ExecutionFunctions {
+            registry: rt.registry(),
+            admitter: rt.admitter(),
+            schemas: Pinned(BTreeMap::new()),
+            lease: Arc::new(Lease { store, fence, clock: clock.clone() }),
+            events: Arc::new(RunEvents::new(rt.observers.clone(), clock.clone(), &run)),
+            metrics: rt.metrics.clone(),
+            definition: (run.admission.name.clone(), run.admission.version),
+            function_permits: rt.function_permits.clone(),
+            lineage: Lineage::of(&run.admission, &rt.config.limits),
+            mode: Mode::Live,
+            host: run.admission.host().cloned().map(Arc::new),
+        };
+        (rt, functions, backend, clock)
+    }
+    async fn start(functions: &ExecutionFunctions, inherit: bool) -> anyhow::Result<Value> {
+        let cancel = CancellationToken::new();
+        let input = json!({});
+        let redaction = ows::secrets::Redaction::default();
+        let annotations = run::Annotator::default();
+        let info = CallInfo {
+            run_id: "p",
+            reference: "/spawn",
+            logical: "/spawn",
+            attempt: 1,
+            cancel: &cancel,
+            delivery: Delivery::AtLeastOnce,
+            input: &input,
+            secrets: &redaction,
+            annotations: &annotations,
+        };
+        let mut args = json!({ "name": "child", "input": { "untrusted": "never authority" } });
+        if inherit {
+            args["host"] = json!("inherit");
+        }
+        functions.builtin("start_child", args, &info).await
+    }
+
+    #[tokio::test]
+    async fn reserved_inherited_start_keeps_storage_and_ownership_failures_interrupting() {
+        for case in ["storage", "lease", "hold", "stop"] {
+            let (rt, functions, backend, time) = fixture().await;
+            let control = crate::control::Control::new(rt.store.clone(), time.clone());
+            let request = crate::control::Request { id: case.into(), actor: "operator".into(), reason: "test".into() };
+            match case {
+                "storage" => backend.faults.arm(ouro_durable::CommitFault::BeforeWrite(0)),
+                "lease" => time.0.store(ouro_durable::LEASE_MS + 1, Ordering::SeqCst),
+                "hold" => {
+                    control.hold(&request, "p", "test").await.unwrap();
+                }
+                "stop" => {
+                    control.emergency_stop(&request, true).await.unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let error = start(&functions, true).await.unwrap_err();
+            assert!(!error.is::<Refused>(), "{case}: must interrupt, not answer: {error}");
+            assert!(rt.list(None, "child:").await.unwrap().is_empty(), "{case}: no child committed");
+        }
+    }
+
+    #[tokio::test]
+    async fn reserved_inherited_start_joins_after_ambiguous_commit_with_first_admission() {
+        for ambiguous in [false, true] {
+            let (rt, functions, backend, _) = fixture().await;
+            if ambiguous {
+                // Inject at the child transaction itself; read transactions
+                // also have commits, so arming before lookup hits a read.
+                let id = crate::registry::child_id("p", "/spawn");
+                let lineage = functions.lineage.child(&functions.admitter.limits).unwrap();
+                let mut admission =
+                    functions.admitter.active_in(&id, "child", json!({ "first": true }), &lineage).await.unwrap();
+                admission.runtime[ouro_durable::HOST] = functions.host.as_deref().unwrap().clone();
+                let link = ChildLink { parent: "p".into(), key: "/spawn".into(), reference: "/spawn".into() };
+                backend.faults.arm(ouro_durable::CommitFault::AfterCommit);
+                let error = rt.store.start_child(&functions.lease.fence, &admission, &link, 0).await.unwrap_err();
+                assert!(!reserved_child_error(error).is::<Refused>());
+            } else {
+                start(&functions, true).await.unwrap();
+            }
+            let child = rt.list(None, "child:").await.unwrap().pop().unwrap();
+            assert_eq!(child.admission.host(), rt.get("p").await.unwrap().unwrap().admission.host());
+            let next = rt.save("child", &doc("child", 2)).await.unwrap();
+            rt.activate("child", next.version).await.unwrap();
+            // Recovery proposes the default mode: the committed admission wins.
+            let result = start(&functions, false).await.unwrap();
+            assert_eq!(result["id"], child.admission.id);
+            assert_eq!(rt.get(&child.admission.id).await.unwrap().unwrap().admission, child.admission);
+            assert_eq!(rt.list(None, "child:").await.unwrap().len(), 1);
+        }
     }
 }

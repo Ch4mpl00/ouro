@@ -103,8 +103,9 @@ impl FunctionContext {
     }
     /// The host data the run was admitted with (`Runtime::start_with`, or
     /// the host function that started it as a child): what the host vouches
-    /// for, which no workflow can set. `None`: the run has none, as every run
-    /// a workflow started itself (`run: workflow`, the built-in `start_child`).
+    /// for, which no workflow can set. Workflow starts have none by default;
+    /// an explicit `host: inherit` copies the parent's admitted data unchanged.
+    /// `None`: the run was admitted without host data.
     pub fn host(&self) -> Option<&Value> {
         self.host.as_deref()
     }

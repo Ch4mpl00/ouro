@@ -267,6 +267,8 @@ pub struct Foreach {
 #[derive(Clone, Debug)]
 pub struct RunTask {
     pub process: Process,
+    /// Copy the parent's admitted host data on a workflow start.
+    pub inherit_host: bool,
     pub await_: bool,
     pub return_: Return,
 }
@@ -531,7 +533,7 @@ fn problem(at: &str, message: impl Into<String>) -> Problem {
 /// The keys of `document.metadata.ouro` and of a task's `metadata.ouro`: the
 /// engine's extensions, the only members of `metadata` it reads.
 const DOCUMENT_EXTENSIONS: &[&str] = &["limits", "at", "timezone", "catchup", "overlap", "breaker"];
-const TASK_EXTENSIONS: &[&str] = &["delivery", "concurrency", "hold"];
+const TASK_EXTENSIONS: &[&str] = &["delivery", "concurrency", "hold", "host"];
 const COMMON: &[&str] = &["if", "input", "output", "export", "timeout", "then", "metadata"];
 
 #[derive(Default)]
@@ -924,7 +926,7 @@ impl Parser {
         let m = self.object(v, at)?;
         let empty = Map::new();
         let ouro = self.ouro(m, at, TASK_EXTENSIONS).unwrap_or(&empty);
-        let kind = if m.contains_key("for") {
+        let mut kind = if m.contains_key("for") {
             self.only(m, at, &[COMMON, &["for", "while", "do"]].concat());
             self.for_task(m, ouro.get("concurrency"), at)
         } else if m.contains_key("try") {
@@ -988,6 +990,16 @@ impl Parser {
         let then = m.get("then").and_then(|t| self.flow(t, &format!("{at}/then")));
         if ouro.contains_key("concurrency") && !m.contains_key("for") {
             self.fail(&format!("{at}/metadata/ouro/concurrency"), "concurrency belongs on a for task");
+        }
+        if let Some(host) = ouro.get("host") {
+            match kind.as_mut() {
+                Some(Kind::Run(run))
+                    if matches!(run.process, Process::Workflow { .. }) && host.as_str() == Some("inherit") =>
+                {
+                    run.inherit_host = true;
+                }
+                _ => self.fail(&format!("{at}/metadata/ouro/host"), "expected literal inherit on a workflow run task"),
+            }
         }
         let delivery = match ouro.get("delivery") {
             None => crate::durable::Delivery::AtLeastOnce,
@@ -1196,7 +1208,7 @@ impl Parser {
         } else {
             Process::External { kind: kind.to_string(), definition: Value::Object(definition.clone()) }
         };
-        Some(Kind::Run(Box::new(RunTask { process, await_, return_ })))
+        Some(Kind::Run(Box::new(RunTask { process, inherit_host: false, await_, return_ })))
     }
 
     fn extensions(&mut self, v: &Value) -> Vec<(String, Extension)> {
