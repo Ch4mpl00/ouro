@@ -1,6 +1,6 @@
 # 08. Inheritable host data for workflow children
 
-Status: implemented (`c70593d`, `54b1f55`) after goldfish rounds 1 and 2 · Issue: #43
+Status: implemented (0.4.0) after goldfish rounds 1 and 2 · Issue: #43
 
 ## Problem
 

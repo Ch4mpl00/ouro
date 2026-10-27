@@ -4,7 +4,7 @@ Ouro is a 0.x prerelease: breaking changes are allowed and are listed here. The
 durable state version and the store layouts they mention are refused, not converted, so a
 store written before such a change must be recreated unless the entry says otherwise.
 
-## Unreleased
+## 0.4.0 (2026-10-27)
 
 - Workflow children can opt in to unchanged host-data inheritance:
   `metadata.ouro.host: inherit` on a native workflow-run task, or
