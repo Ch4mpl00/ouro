@@ -527,6 +527,11 @@ impl From<Machine> for View {
 
 impl State<StoreDriver> for View {
     fn from_driver(d: &StoreDriver) -> anyhow::Result<Self> {
+        Self::from_store(d).with_context(|| format!("projecting state after {}", d.last_command))
+    }
+}
+impl View {
+    fn from_store(d: &StoreDriver) -> anyhow::Result<Self> {
         let store = d.store.as_ref();
         let mut runs = Vec::new();
         let mut copies = Vec::new();
@@ -711,6 +716,7 @@ pub struct StoreDriver {
     /// Fence owners by worker, to name a run's current owner.
     owners: BTreeMap<String, i64>,
     ambiguous_children: BTreeSet<String>,
+    last_command: String,
 }
 impl StoreDriver {
     /// A store with the default time policy.
@@ -765,6 +771,7 @@ impl StoreDriver {
             refusals: [[0; CALLS]; RUNS],
             owners: BTreeMap::new(),
             ambiguous_children: BTreeSet::new(),
+            last_command: "driver construction".into(),
         })
     }
     /// Another handle to the same database (SQLite: an independent connection).
@@ -899,7 +906,9 @@ impl Driver for StoreDriver {
             self.coverage = coverage;
             // The model chose the versions' policies; they travel in the
             // command's `i` (versions 1 and 3) and `value` (version 2).
-            return self.initialize([pick!("i", i64), pick!("value", i64)]);
+            let policies = [pick!("i", i64), pick!("value", i64)];
+            self.last_command = format!("init policies={policies:?}");
+            return self.initialize(policies).with_context(|| self.last_command.clone());
         }
         let command = Command {
             op: step.action_taken.clone(),
@@ -909,10 +918,12 @@ impl Driver for StoreDriver {
             value: pick!("value", i64),
             fault: pick!("fault", i64),
         };
-        self.execute(&command)
+        self.last_command = format!("{command:?}");
+        self.execute(&command).with_context(|| self.last_command.clone())
     }
 }
 
+#[derive(Debug)]
 struct Command {
     op: String,
     r: usize,
@@ -929,7 +940,7 @@ impl StoreDriver {
         match c.fault {
             6 => self.now += 4,
             7 => self.now += 1,
-            10 => self.apply("activate", c.r, c.w, c.i, c.value, None)?,
+            10 => self.apply("activate", c.r, c.w, c.i, c.value, None).context("fault-10 activation before command")?,
             _ => {}
         }
         let actor = if matches!(c.fault, 5 | 11) { 1 - c.w } else { c.w };
@@ -945,9 +956,9 @@ impl StoreDriver {
             _ => None,
         };
         let before = (self.workers.clone(), self.now, self.sends, self.refusals);
-        self.apply(op, c.r, actor, c.i, value, injected)?;
+        self.apply(op, c.r, actor, c.i, value, injected).with_context(|| format!("applying {op}"))?;
         if c.fault == 3 {
-            self.apply(op, c.r, actor, c.i, c.value, None)?;
+            self.apply(op, c.r, actor, c.i, c.value, None).with_context(|| format!("duplicate {op}"))?;
         }
         self.faults.clear();
         if matches!(c.fault, 1 | 8) {
@@ -1771,6 +1782,32 @@ pub fn with_quint(name: &str, run: impl FnOnce() -> anyhow::Result<()>) {
 }
 /// Every command of the contract model, and initialization.
 const COMMANDS: usize = 40;
+fn host_witnesses(hosts: StoreDriver) -> anyhow::Result<()> {
+    use quint_connect::runner::{self, TestConfig};
+    let coverage = hosts.coverage.clone();
+    runner::run_test(
+        hosts,
+        runner::Config {
+            test_name: "host inheritance witnesses".into(),
+            gen_config: TestConfig {
+                spec: spec_path("contract_witnesses.qnt").to_string_lossy().into_owned(),
+                main: None,
+                test: "bridgeHost".into(),
+                max_samples: Some(1),
+                seed: "20261023".into(),
+            },
+        },
+    )?;
+    let coverage = coverage.lock().unwrap();
+    eprintln!("Quint host join coverage: {:?}", coverage.joined_hosts);
+    for ambiguous in [false, true] {
+        ensure!(
+            coverage.joined_hosts.contains(&(1, 0, ambiguous)),
+            "the suite never joined a conflicting host proposal (ambiguous admission: {ambiguous})"
+        );
+    }
+    Ok(())
+}
 fn simulation(adapter: Adapter) -> anyhow::Result<()> {
     use quint_connect::runner::{self, RunConfig};
     let seed = std::env::var("QUINT_SEED").unwrap_or_else(|_| "20261023".into());
@@ -1809,28 +1846,10 @@ fn simulation(adapter: Adapter) -> anyhow::Result<()> {
     )?;
     let mut hosts = StoreDriver::model(adapter)?;
     hosts.coverage = coverage.clone();
-    runner::run_test(
-        hosts,
-        runner::Config {
-            test_name: "host inheritance witnesses".into(),
-            gen_config: runner::TestConfig {
-                spec: spec_path("contract_witnesses.qnt").to_string_lossy().into_owned(),
-                main: None,
-                test: "bridgeHost".into(),
-                max_samples: Some(1),
-                seed: "20261023".into(),
-            },
-        },
-    )?;
+    host_witnesses(hosts)?;
     let coverage = coverage.lock().unwrap();
     eprintln!("Quint combined coverage: {coverage:?}");
     ensure!(coverage.actions.len() == COMMANDS, "the suite missed a contract command");
-    for ambiguous in [false, true] {
-        ensure!(
-            coverage.joined_hosts.contains(&(1, 0, ambiguous)),
-            "the suite never joined a conflicting host proposal (ambiguous admission: {ambiguous})"
-        );
-    }
     Ok(())
 }
 #[test]
@@ -1846,6 +1865,12 @@ fn quint_sqlite() {
 #[ignore = "requires TEST_DATABASE_URL with permission to create disposable databases"]
 fn quint_postgres() {
     with_quint("quint_postgres", || simulation(Adapter::Postgres));
+}
+
+#[test]
+#[ignore = "requires TEST_DATABASE_URL with permission to create disposable databases"]
+fn quint_postgres_host_inheritance() {
+    with_quint("quint_postgres_host_inheritance", || host_witnesses(StoreDriver::model(Adapter::Postgres)?));
 }
 
 #[path = "quint/concurrent.rs"]
