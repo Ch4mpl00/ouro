@@ -19,8 +19,11 @@ module contract {
   // A run tree's jump budget (issue #8): its root's counter, which an owned
   // child spends too. Spend keys are the invocation IDs.
   pure val ceiling = 2
+  // Opaque admitted host representatives: 0 absent, 1 and 2 distinct JSON
+  // values. Root admit/dry/replay reuse `i` (also application compatibility);
+  // child value 1 opts into inheritance, every other value defaults off.
   type Run = {
-    admitted: bool, input: int, version: int, epoch: int, app: int, mode: int,
+    admitted: bool, input: int, host: int, version: int, epoch: int, app: int, mode: int,
     outcome: int, ended: int, deadline: int, owner: int, generation: int, lease: int,
     records: List[int], values: List[int], frontier: Set[int], continuation: int,
     subscription: bool, parent: int, notified: bool, retained: bool,
@@ -55,7 +58,7 @@ module contract {
     violations: Set[str], faultsSeen: Set[int],
     // The run id a buffered slot promoted in the latest transition (-1: none).
     promoted: int }
-  pure val emptyRun: Run = { admitted: false, input: 0, version: 0, epoch: 0, app: 0, mode: 0,
+  pure val emptyRun: Run = { admitted: false, input: 0, host: 0, version: 0, epoch: 0, app: 0, mode: 0,
     outcome: 0, ended: -1, deadline: -1, owner: -1, generation: 0, lease: -1,
     records: [0,0,0], values: [0,0,0], frontier: Set(), continuation: 0,
     subscription: false, parent: -1, notified: false, retained: true, spends: [0,0,0], spent: [0,0,0], scheduled: false, held: false }
@@ -212,7 +215,10 @@ module contract {
     if (op == "stop" and value >= 0) { ...s,db:{ ...s.db,stopped:value != 0 } }
     else if (s.db.stopped and Set("admit","dry","replay","pin","pinAbsent","claim","fire","refuse","ingress","renew","intent","dispatch","result","notExecuted","rejected","recover","checkpoint","conflict","subscribe","take","child","finish","timeout","spend","policy").contains(op)) s
     else if (Set("admit","dry","replay").contains(op) and value >= 0 and not(execution.admitted) and not(c.tripped))
-      observe(admitRun(s,r,value,i,if (op == "dry") 1 else if (op == "replay") 2 else 0),"admit",r,i,value,1)
+      {
+        val admitted = admitRun(s,r,value,i,if (op == "dry") 1 else if (op == "replay") 2 else 0)
+        observe(update(admitted,r,{ ...admitted.db.runs.nth(r),host:i }),"admit",r,i,value,1)
+      }
     else if (op == "pin" and value >= 0 and not(execution.admitted) and not(barred(c,i+1)))
       observe(pinRun(s,r,value,i+1),"admit",r,0,value,1)
     // A pinned admission of a version the catalog does not hold, possible
@@ -297,12 +303,19 @@ module contract {
       val copies = s.db.copies.mapped(e => if (e.disposition == 0 and e.expires <= s.now)
         { ...e, disposition:2 } else e)
       { ...s, db: { ...s.db, copies:copies } }
-    } else if (op == "child" and authorized and Runs.contains(r+1) and not(s.db.runs.nth(r+1).admitted) and not(c.tripped)) {
-      // Run r's child is run r + 1. The parent's host holds the child's first
-      // lease, which it may let expire. A tripped definition admits no child
-      // (nor any other run).
-      val updated = admitRun(s,r+1,execution.input,execution.app,execution.mode)
-      observe(update(updated,r+1,{ ...updated.db.runs.nth(r+1), generation:1, lease:s.now+4, parent:r }),op,r+1,i,execution.input,1)
+    } else if (op == "child" and authorized and Runs.contains(r+1)) {
+      val child = s.db.runs.nth(r+1)
+      val proposedHost = if (value == 1) execution.host else 0
+      // An admitted child joins without changing its first admission, even
+      // when the new proposal differs. Unrelated run ids cannot be joined.
+      if (child.admitted) s
+      else if (c.tripped) s
+      else {
+        // The parent's host holds the child's first lease until it expires.
+        val updated = admitRun(s,r+1,execution.input,execution.app,execution.mode)
+        observe(update(updated,r+1,{ ...updated.db.runs.nth(r+1), host:proposedHost,
+          generation:1, lease:s.now+4, parent:r }),op,r+1,i,execution.input,1)
+      }
     } else if ((op == "finish" and authorized and value >= 0) or (op == "timeout" and authorized and s.now >= execution.deadline) or
       (op == "conflict" and authorized and execution.records.nth(i) != 0)) {
       // 1 success, 2 unhandled failure (a changed binding too), 3 timeout,
@@ -424,7 +437,7 @@ module contract {
     val admissionStable = Runs.forall(k => {
       val x = b.db.runs.nth(k)
       val y = a.db.runs.nth(k)
-      not(x.admitted) or (y.admitted and x.input == y.input and x.app == y.app and x.mode == y.mode and
+      not(x.admitted) or (y.admitted and x.input == y.input and x.host == y.host and x.app == y.app and x.mode == y.mode and
         x.epoch == y.epoch and x.version == y.version)
     })
     val terminalStable = Runs.forall(k => {
@@ -488,8 +501,11 @@ module contract {
         a.db.copies.elems().exists(e => e.recipient == k and e.id == i))) and
       (op != "take" or old.subscription == execution.subscription))
     val error16 = flag(error15,"C1",Runs.forall(k => {
-      val x = a.db.runs.nth(k)
-      x.parent == -1 or (x.parent < k and a.db.runs.nth(x.parent).admitted)
+      val x = b.db.runs.nth(k)
+      val y = a.db.runs.nth(k)
+      (y.parent == -1 or (y.parent < k and a.db.runs.nth(y.parent).admitted)) and
+        (x.admitted or y.parent < 0 or (op == "child" and k == r+1 and y.parent == r and old.admitted and
+          y.host == (if (value == 1) old.host else 0)))
     }))
     val error17 = flag(error16,"C2",Runs.forall(k => {
       val x = a.db.runs.nth(k)

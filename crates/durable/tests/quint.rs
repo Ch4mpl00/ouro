@@ -93,6 +93,14 @@ fn policy_of(breaker: Breaker) -> i64 {
 fn definition_text(version: u64) -> String {
     format!("definition{}", content(version))
 }
+/// Host representatives are opaque JSON, rather than expression-visible data.
+fn host_value(host: i64) -> Value {
+    json!({"opaque": {"representative": host, "nested": [true, "vouched"]}})
+}
+fn host_of(admission: &Admission) -> anyhow::Result<i64> {
+    let Some(host) = admission.host() else { return Ok(0) };
+    (1..=2).find(|n| *host == host_value(*n)).context("host data differs from every model representative")
+}
 /// The model's content number of a stored digest.
 fn content_of(digest: &str) -> anyhow::Result<i64> {
     (1..=2)
@@ -219,6 +227,7 @@ fn ticks(ms: Option<i64>) -> i64 {
 struct RunView {
     admitted: bool,
     input: i64,
+    host: i64,
     version: i64,
     epoch: i64,
     app: i64,
@@ -345,6 +354,7 @@ struct Durable {
 struct ModelRun {
     admitted: bool,
     input: i64,
+    host: i64,
     version: i64,
     epoch: i64,
     app: i64,
@@ -430,6 +440,7 @@ impl From<Machine> for View {
                 RunView {
                     admitted: true,
                     input: x.input,
+                    host: x.host,
                     version: x.version,
                     epoch: x.epoch,
                     app: x.app,
@@ -673,6 +684,8 @@ impl Drop for TestDatabase {
 struct Coverage {
     actions: BTreeMap<String, usize>,
     rejected: usize,
+    /// Stored host, proposed host, and whether first admission was ambiguous.
+    joined_hosts: BTreeSet<(i64, i64, bool)>,
 }
 pub struct StoreDriver {
     /// Drives the store's operations: the model's histories are serial
@@ -697,6 +710,7 @@ pub struct StoreDriver {
     refusals: [[usize; CALLS]; RUNS],
     /// Fence owners by worker, to name a run's current owner.
     owners: BTreeMap<String, i64>,
+    ambiguous_children: BTreeSet<String>,
 }
 impl StoreDriver {
     /// A store with the default time policy.
@@ -750,6 +764,7 @@ impl StoreDriver {
             sends: [[0; CALLS]; RUNS],
             refusals: [[0; CALLS]; RUNS],
             owners: BTreeMap::new(),
+            ambiguous_children: BTreeSet::new(),
         })
     }
     /// Another handle to the same database (SQLite: an independent connection).
@@ -1022,7 +1037,10 @@ impl StoreDriver {
                     "replay" => 2,
                     _ => 0,
                 };
-                let a = self.admission(r, value, i as i64, mode, None)?;
+                let mut a = self.admission(r, value, i as i64, mode, None)?;
+                if i > 0 {
+                    a.runtime[ouro_durable::HOST] = host_value(i as i64);
+                }
                 expect(self.write(fault, self.store.admit(&a, ms)).0.map(drop))?;
             }
             // A pinned start: the stored version `i + 1`, active or not, or
@@ -1246,18 +1264,38 @@ impl StoreDriver {
             }
             "child" => {
                 let Some(f) = self.fence(w, r) else { return Ok(()) };
-                if r + 1 >= RUNS || self.block(self.store.get(&run_id(r + 1)))?.is_some() {
+                if r + 1 >= RUNS {
                     return Ok(());
                 }
+                let existing = self.block(self.store.get(&run_id(r + 1)))?;
                 let parent = self.block(self.store.get(&run_id(r)))?.context("leased parent missing")?.admission;
                 let app = parent.application_version().map_or(Ok(0), str::parse)?;
                 let mode = parent.runtime["mode"].as_i64().unwrap_or(0);
-                let a = self.admission(r + 1, parent.input.as_i64().context("input")?, app, mode, None)?;
+                let mut a = self.admission(r + 1, parent.input.as_i64().context("input")?, app, mode, None)?;
+                if value == 1
+                    && let Some(host) = parent.host()
+                {
+                    a.runtime[ouro_durable::HOST] = host.clone();
+                }
                 let link = ChildLink { parent: run_id(r), key: "child".into(), reference: "child".into() };
                 // The child's first lease stays with the parent's host. A
                 // tripped definition refuses it, typed, in the same commit.
-                let refusal = self.block(self.store.definitions(NAME))?.tripped.is_some() && self.valid(&f)?;
-                let (result, _) = self.write(fault, self.store.start_child(&f, &a, &link, ms));
+                let refusal = existing.is_none()
+                    && self.block(self.store.definitions(NAME))?.tripped.is_some()
+                    && self.valid(&f)?;
+                let (result, committed) = self.write(fault, self.store.start_child(&f, &a, &link, ms));
+                if existing.is_none() && committed && fault == Some(CommitFault::AfterCommit) {
+                    self.ambiguous_children.insert(a.id.clone());
+                }
+                if result.is_ok()
+                    && let Some(existing) = existing
+                {
+                    self.coverage.lock().unwrap().joined_hosts.insert((
+                        host_of(&existing.admission)?,
+                        host_of(&a)?,
+                        self.ambiguous_children.contains(&a.id),
+                    ));
+                }
                 if refusal {
                     ensure!(
                         result.err().is_some_and(|e| e.is::<DefinitionTripped>()),
@@ -1515,6 +1553,7 @@ impl StoreDriver {
         let mut view = RunView {
             admitted: true,
             input: r.admission.input.as_i64().context("admission input")?,
+            host: host_of(&r.admission)?,
             version: r.admission.version as i64,
             epoch: r.epoch.map_or(0, |e| e as i64),
             app: r.admission.application_version().map_or(Ok(0), str::parse)?,
@@ -1768,9 +1807,30 @@ fn simulation(adapter: Adapter) -> anyhow::Result<()> {
             },
         },
     )?;
+    let mut hosts = StoreDriver::model(adapter)?;
+    hosts.coverage = coverage.clone();
+    runner::run_test(
+        hosts,
+        runner::Config {
+            test_name: "host inheritance witnesses".into(),
+            gen_config: runner::TestConfig {
+                spec: spec_path("contract_witnesses.qnt").to_string_lossy().into_owned(),
+                main: None,
+                test: "bridgeHost".into(),
+                max_samples: Some(1),
+                seed: "20261023".into(),
+            },
+        },
+    )?;
     let coverage = coverage.lock().unwrap();
     eprintln!("Quint combined coverage: {coverage:?}");
     ensure!(coverage.actions.len() == COMMANDS, "the suite missed a contract command");
+    for ambiguous in [false, true] {
+        ensure!(
+            coverage.joined_hosts.contains(&(1, 0, ambiguous)),
+            "the suite never joined a conflicting host proposal (ambiguous admission: {ambiguous})"
+        );
+    }
     Ok(())
 }
 #[test]

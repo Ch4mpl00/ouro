@@ -20,6 +20,48 @@ module contract_witnesses {
   run expiryTest = expiry.expect(checked and m.db.copies.nth(0).disposition == 2)
   action child = init.then(boot).then(do("child")).then(do("cancel"))
   run childTest = child.expect(checked and m.db.runs.nth(1).notified and m.db.runs.nth(1).outcome == 5)
+  action hostParent = init.then(execute("admit",0,0,1,7,0)).then(do("claim"))
+  action childDefaultHost = hostParent.then(do("child"))
+  run childDefaultHostTest = childDefaultHost.expect(checked and m.db.runs.nth(0).host == 1 and
+    m.db.runs.nth(1).admitted and m.db.runs.nth(1).host == 0)
+  action childInheritedHost = hostParent.then(execute("child",0,0,0,1,0))
+  run childInheritedHostTest = childInheritedHost.expect(checked and m.db.runs.nth(1).host == 1)
+  action childAbsentHost = init.then(boot).then(execute("child",0,0,0,1,0))
+  run childAbsentHostTest = childAbsentHost.expect(checked and m.db.runs.nth(1).admitted and m.db.runs.nth(1).host == 0)
+  action childHostJoin = childInheritedHost.then(do("child"))
+  run childHostJoinTest = childHostJoin.expect(checked and m.db.runs.nth(1).host == 1 and
+    m.db.admissions == [1,1,0] and m.db.runs.nth(1).generation == 1)
+  action childHostAmbiguousJoin = hostParent.then(execute("child",0,0,0,1,2)).then(ticks(4))
+    .then(do("claim")).then(do("child"))
+  run childHostAmbiguousJoinTest = childHostAmbiguousJoin.expect(checked and m.faultsSeen.contains(2) and
+    m.db.runs.nth(1).host == 1 and m.db.admissions == [1,1,0] and m.db.runs.nth(1).generation == 1)
+  action grandchildInheritedHost = childInheritedHost.then(ticks(4)).then(execute("claim",1,0,0,0,0))
+    .then(execute("child",1,0,0,1,0))
+  run grandchildInheritedHostTest = grandchildInheritedHost.expect(checked and m.db.runs.nth(2).host == 1)
+  action grandchildDefaultHost = childInheritedHost.then(ticks(4)).then(execute("claim",1,0,0,0,0))
+    .then(execute("child",1,0,0,0,0))
+  run grandchildDefaultHostTest = grandchildDefaultHost.expect(checked and m.db.runs.nth(1).host == 1 and
+    m.db.runs.nth(2).admitted and m.db.runs.nth(2).host == 0)
+  action dryInheritedHost = init.then(execute("dry",0,0,1,7,0)).then(do("claim")).then(execute("child",0,0,0,1,0))
+  run dryInheritedHostTest = dryInheritedHost.expect(checked and m.db.runs.nth(1).mode == 1 and m.db.runs.nth(1).host == 1)
+  // An independent inherited start has root ownership and its selected host.
+  action independentHost = hostParent.then(execute("admit",1,0,1,8,0))
+  run independentHostTest = independentHost.expect(checked and m.db.runs.nth(1).parent == -1 and m.db.runs.nth(1).host == 1)
+  // A parent and child changed together must not satisfy C1 by comparison
+  // with the post-state parent; A1 independently rejects the parent's change.
+  run childHostPrestateTest = hostParent.expect({
+    val admitted = transition(m,"child",0,0,0,1)
+    val parent = update(admitted,0,{ ...admitted.db.runs.nth(0),host:2 })
+    val forged = update(parent,1,{ ...parent.db.runs.nth(1),host:2 })
+    val errors = audit(m,forged,"child",0,0,0,1)
+    errors.contains("C1") and errors.contains("A1")
+  })
+  run childHostImmutableTest = childInheritedHost.expect({
+    val overwritten = update(m,1,{ ...m.db.runs.nth(1),host:0 })
+    audit(m,overwritten,"child",0,0,0,0).contains("A1")
+  })
+  run bridgeHost = childDefaultHost.then(childInheritedHost).then(childAbsentHost).then(childHostJoin)
+    .then(childHostAmbiguousJoin).then(grandchildInheritedHost).then(grandchildDefaultHost).then(dryInheritedHost).then(independentHost)
   // An owned child never outlives its parent (#14): the parent's success
   // cancels it, and a fault of the root cancels its grandchild too. Run 1
   // (claimed after its first lease, held by the parent's host, expires)
